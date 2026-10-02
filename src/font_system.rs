@@ -62,6 +62,9 @@ impl AsRef<[u8]> for EmbeddedFont {
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 static SVG_CATALOG: OnceLock<SvgCatalog> = OnceLock::new();
 static PAGE_FONT_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Case-folded families `install_page_fonts` installed for the foreground
+/// page, so its document need not download them again.
+static PAGE_FONT_FAMILIES: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
 static NEXT_FONT_SET: AtomicU64 = AtomicU64::new(1);
 static FONT_SOURCES: OnceLock<SourceCache> = OnceLock::new();
 
@@ -257,6 +260,14 @@ pub(crate) fn font_context() -> FontContext {
 pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
     #[cfg(test)]
     let _inputs = crate::layout2::global_layout_input_change();
+    *PAGE_FONT_FAMILIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+        fonts
+            .iter()
+            .map(|font| font.family.trim().case_fold().collect())
+            .collect(),
+    );
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         let catalog = catalog();
@@ -283,6 +294,16 @@ pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
     {
         let _ = fonts;
     }
+}
+
+/// Whether the foreground page's load installed a face of `family`.
+pub(crate) fn page_font_family_installed(family: &str) -> bool {
+    let family: String = family.trim().case_fold().collect();
+    PAGE_FONT_FAMILIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|families| families.contains(&family))
 }
 
 pub(crate) fn page_font_epoch() -> u64 {

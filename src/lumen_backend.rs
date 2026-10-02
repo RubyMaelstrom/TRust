@@ -105,6 +105,12 @@ enum LumenResourceKind {
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum LumenHostTask {
     PortReady,
+    /// A network `@font-face` source the page's font sets awaited (`None`
+    /// when it could not be fetched).
+    FontDone {
+        url: String,
+        bytes: Option<Vec<u8>>,
+    },
     ParserResourceTiming(LumenResourceTiming),
     ImageDone {
         id: usize,
@@ -3548,7 +3554,59 @@ mod desktop {
             rendered = extract_live(page);
         }
         let _ = trust_number(page, "updateIntersections");
+        start_font_fetches(page);
         rendered
+    }
+
+    /// CSS Fonts 4 #font-fetching-requirements: fetch the network `@font-face`
+    /// sources this rendering's font sets awaited, from sheets the page added
+    /// or child documents. Text renders in fallback fonts meanwhile; each
+    /// completion is a task that rebuilds the font sets.
+    fn start_font_fetches(page: &mut LumenPage) {
+        let urls = page.dom.borrow().take_font_requests();
+        if urls.is_empty() {
+            return;
+        }
+        let client = request_context_url(page.engine.ctx(), 0);
+        let Some((handle, cache, events)) =
+            page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+                let network = state.network.as_ref()?;
+                Some((
+                    network.handle.clone(),
+                    network.cache.clone(),
+                    state.task_events.clone()?,
+                ))
+            })
+        else {
+            return;
+        };
+        for url in urls {
+            let name = url.to_string();
+            if !crate::http::subresource_allowed(&client, &url) {
+                let _ = events.send(LumenHostTask::FontDone {
+                    url: name,
+                    bytes: None,
+                });
+                continue;
+            }
+            let fetched = cache.fetch_resource_with_cookies(
+                &handle,
+                url,
+                &client,
+                "font",
+                Some(crate::http::CredentialsMode::SameOrigin),
+                crate::http::CookieContext::subresource(&client),
+            );
+            let events = events.clone();
+            cache.spawn(&handle, async move {
+                let bytes = fetched
+                    .await
+                    .ok()
+                    .filter(|response| (200..300).contains(&response.status))
+                    .map(|response| response.body.clone());
+                let _ = events.send(LumenHostTask::FontDone { url: name, bytes });
+            });
+        }
     }
 
     /// SVG 2 §5.6: a same-origin external `<use href="sheet.svg#symbol">` obtains the external
@@ -11855,6 +11913,15 @@ fn settle_network_task(
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
     match task {
         LumenHostTask::PortReady => {}
+        LumenHostTask::FontDone { url, bytes } => {
+            let dom = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .expect("HostState installed before host tasks")
+                .dom
+                .clone();
+            dom.borrow_mut().install_downloaded_font(&url, bytes);
+        }
         LumenHostTask::ParserResourceTiming(timing) => {
             record_resource_timing_ref(engine.ctx(), &timing);
         }
