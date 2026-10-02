@@ -223,6 +223,42 @@ mod tests {
     "#;
 
     #[test]
+    fn css_opacity_animations_fade_on_the_document_timeline() {
+        // CSS Animations 1: the mixed-case keyframes name matches exactly,
+        // and the fade-out overlay is opaque at first, half faded midway and
+        // gone once its forwards fill holds the last keyframe.
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><style>body{margin:0;background:#f00}
+            #o{position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;
+               animation:fadeOut 1s linear forwards}
+            @keyframes fadeOut{from{opacity:1}to{opacity:0}}</style><div id=o></div>"#,
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(20., 20.),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let at = |seconds| {
+            let frame = render_paint_with_images(
+                &layout.paint,
+                CssSize::new(20., 20.),
+                ImageStore::default(),
+                seconds,
+            )
+            .unwrap();
+            frame.pixels[(10 * 20 + 10) * 4..(10 * 20 + 10) * 4 + 3].to_vec()
+        };
+        assert_eq!(at(0.0), [255, 255, 255]);
+        let midway = at(0.5);
+        assert!((100..160).contains(&midway[1]), "{midway:?}");
+        assert_eq!(at(2.0), [255, 0, 0]);
+    }
+
+    #[test]
     fn transformed_generated_image_keeps_ancestor_clip_in_parent_coordinates() {
         let base = Url::parse("https://example.test/").unwrap();
         let mut dom = crate::dom::Dom::parse_document(

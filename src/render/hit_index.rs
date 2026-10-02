@@ -763,6 +763,7 @@ mod tests {
                 fill_mode: "both".into(),
                 timing_function: "linear".into(),
                 running: true,
+                opacity: Vec::new(),
                 position: Vec::new(),
                 transform: vec![
                     CssAnimationPoint {

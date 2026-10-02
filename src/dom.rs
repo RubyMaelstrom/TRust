@@ -3940,10 +3940,12 @@ impl Dom {
                 let rule = style_index.keyframes.get(&name)?;
                 let tops = rule.properties.get("top");
                 let transforms = rule.properties.get("transform");
+                let opacities = rule.properties.get("opacity");
                 let mut offsets = tops
                     .into_iter()
                     .flatten()
                     .chain(transforms.into_iter().flatten())
+                    .chain(opacities.into_iter().flatten())
                     .map(|frame| frame.offset)
                     .collect::<Vec<_>>();
                 offsets.sort_by(f32::total_cmp);
@@ -3956,6 +3958,9 @@ impl Dom {
                             .and_then(|values| values.iter().find(|frame| frame.offset == offset))
                             .map(|frame| frame.value.clone()),
                         transform: transforms
+                            .and_then(|values| values.iter().find(|frame| frame.offset == offset))
+                            .map(|frame| frame.value.clone()),
+                        opacity: opacities
                             .and_then(|values| values.iter().find(|frame| frame.offset == offset))
                             .map(|frame| frame.value.clone()),
                     })
@@ -14231,6 +14236,7 @@ pub(crate) struct CssAnimationKeyframe {
     pub offset: f32,
     pub top: Option<String>,
     pub transform: Option<String>,
+    pub opacity: Option<String>,
 }
 
 /// A cheap could-match test for the compound that carries a `:hover` — the

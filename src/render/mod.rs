@@ -463,7 +463,7 @@ impl DisplayCommand {
                                 * std::mem::size_of::<CssAnimationPoint>(),
                         )
                         .saturating_add(
-                            animation.transform.capacity()
+                            (animation.transform.capacity() + animation.opacity.capacity())
                                 * std::mem::size_of::<CssAnimationPoint>(),
                         );
                 }
@@ -1061,6 +1061,9 @@ pub struct CssPaintAnimation {
     pub position: Vec<CssAnimationPoint>,
     /// Translation contributed by a supported `transform` keyframe.
     pub transform: Vec<CssAnimationPoint>,
+    /// Group opacity relative to the element's static opacity layer, in
+    /// each point's `x`.
+    pub opacity: Vec<CssAnimationPoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2282,6 +2285,7 @@ impl Scene {
         // CSS Overflow scroll scopes retain their offsets between paints.
         // Resolve each scope by identity, without scanning every unrelated
         // scrollport for every command on a large page.
+        let mut animation_layers = Vec::new();
         for command in commands {
             match command {
                 Primitive::BeginSticky(constraint) => {
@@ -2334,8 +2338,22 @@ impl Scene {
                             translation.x,
                             translation.y,
                         )));
+                    let opacity = sample_css_animation_opacity(scope, elapsed_seconds);
+                    if let Some(opacity) = opacity {
+                        self.primitives.push(Primitive::PushLayer(CompositingLayer {
+                            opacity,
+                            blend: BlendMode::Normal,
+                            color_filters: Arc::from([]),
+                        }));
+                    }
+                    animation_layers.push(opacity.is_some());
                 }
-                Primitive::EndCssAnimation => self.primitives.push(Primitive::PopTransform),
+                Primitive::EndCssAnimation => {
+                    if animation_layers.pop().unwrap_or(false) {
+                        self.primitives.push(Primitive::PopLayer);
+                    }
+                    self.primitives.push(Primitive::PopTransform);
+                }
                 Primitive::BeginMarquee(scope) => {
                     let translation = sample_marquee_scope(scope, elapsed_seconds);
                     self.primitives
@@ -2513,6 +2531,28 @@ fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -
     let position = position.unwrap_or_default();
     let transform = transform.unwrap_or_default();
     CssPoint::new(position.x + transform.x, position.y + transform.y)
+}
+
+/// The group opacity of a scope's last active opacity animation (CSS
+/// Animations 1 §4.2), relative to the element's static opacity.
+fn sample_css_animation_opacity(scope: &CssAnimationScope, elapsed_seconds: f32) -> Option<f32> {
+    scope
+        .animations
+        .iter()
+        .filter(|animation| !animation.opacity.is_empty())
+        .filter_map(|animation| {
+            let progress = css_animation_progress(animation, elapsed_seconds)?;
+            Some(
+                sample_css_animation_track(
+                    &animation.opacity,
+                    progress,
+                    &animation.timing_function,
+                )
+                .x,
+            )
+        })
+        .last()
+        .map(|opacity| opacity.clamp(0.0, 1.0))
 }
 
 fn css_animation_progress(animation: &CssPaintAnimation, elapsed_seconds: f32) -> Option<f32> {
@@ -4051,6 +4091,7 @@ mod tests {
                     fill_mode: "none".into(),
                     timing_function: "linear".into(),
                     running: true,
+                    opacity: Vec::new(),
                     position: vec![
                         CssAnimationPoint {
                             offset: 0.0,
@@ -4072,6 +4113,7 @@ mod tests {
                     fill_mode: "none".into(),
                     timing_function: "linear".into(),
                     running: true,
+                    opacity: Vec::new(),
                     position: Vec::new(),
                     transform: vec![
                         CssAnimationPoint {
