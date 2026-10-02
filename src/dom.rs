@@ -11399,6 +11399,11 @@ fn parse_complex(input: &str) -> Option<Complex> {
             pending = Combinator::Descendant;
         }
 
+        // Selectors 4 #pseudo-element-structure: no supported pseudo-element
+        // has internal structure, so no combinator may follow one.
+        if parts.last().is_some_and(|(_, c)| c.has_pseudo_element()) {
+            return None;
+        }
         let compound = parse_compound(&mut chars)?;
         if compound.is_empty() {
             return None;
@@ -11414,7 +11419,21 @@ fn parse_complex(input: &str) -> Option<Complex> {
 
 fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Compound> {
     let mut compound = Compound::default();
+    // CSS Pseudo 4 #element-backed: every pseudo-class and pseudo-element is
+    // syntactically allowed after an element-backed pseudo-element.
+    let mut element_backed = false;
     while let Some(&c) = chars.peek() {
+        // Selectors 4 #grammar: `<pseudo-compound-selector> =
+        // <pseudo-element-selector> <pseudo-class-selector>*`, so no type,
+        // id, class or attribute selector may follow a pseudo-element.
+        let after_pseudo_element = compound.has_pseudo_element();
+        if after_pseudo_element
+            && c != ':'
+            && !c.is_ascii_whitespace()
+            && !matches!(c, '>' | '+' | '~')
+        {
+            return None;
+        }
         match c {
             '#' => {
                 chars.next();
@@ -11477,28 +11496,47 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     chars.next();
                 }
                 let name = take_name(chars)?.to_ascii_lowercase();
-                let mut arg = None;
-                if chars.peek() == Some(&'(') {
-                    chars.next();
-                    let mut depth = 1u32;
-                    let mut inner = String::new();
-                    for c in chars.by_ref() {
-                        match c {
-                            '(' => depth += 1,
-                            ')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        inner.push(c);
+                let arg = take_pseudo_arg(chars)?;
+                // Selectors 4 #pseudo-element-states and
+                // #pseudo-element-structure: a pseudo-element may be followed
+                // only by the pseudo-classes (and sub-pseudo-elements) that a
+                // specification explicitly allows. These describe the
+                // pseudo-element itself, never its originating element.
+                if after_pseudo_element && !element_backed {
+                    let pseudo_element = double_colon
+                        || matches!(
+                            name.as_str(),
+                            "before" | "after" | "first-letter" | "first-line"
+                        );
+                    if !pseudo_element {
+                        let (matches, specificity) =
+                            pseudo_element_state_class(&name, arg.as_deref())?;
+                        compound.never |= !matches;
+                        compound.pseudos += specificity;
+                        continue;
                     }
-                    if depth != 0 {
+                    // CSS Shadow 1 §3.2.4 allows the tree-abiding
+                    // pseudo-elements after ::slotted(); CSS Pseudo 4
+                    // defines the ::before::marker / ::after::marker
+                    // sub-pseudo-elements, which this engine does not
+                    // render. Any other pseudo-element after a
+                    // pseudo-element is invalid (Selectors 4
+                    // #sub-pseudo-elements).
+                    let slotted_only = compound.slotted.is_some()
+                        && compound.pseudo.is_none()
+                        && !compound.inert_pseudo_element;
+                    if !slotted_only {
+                        if double_colon
+                            && name == "marker"
+                            && arg.is_none()
+                            && matches!(compound.pseudo, Some(PseudoEl::Before | PseudoEl::After))
+                        {
+                            compound.never = true;
+                            compound.inert_pseudo_element = true;
+                            continue;
+                        }
                         return None;
                     }
-                    arg = Some(inner);
                 }
                 // Selectors 4 #invalid / #compat (local snapshot 2026-09-06):
                 // unsupported pseudos invalidate a selector, except for the
@@ -11522,6 +11560,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         // reset rule or `h1, p::first-line`.
                         compound.never = true;
                         compound.inert_pseudo_element = true;
+                        element_backed = matches!(name.as_str(), "part" | "details-content");
                         continue;
                     }
                     if name.starts_with("-webkit-") && arg.is_none() {
@@ -11732,6 +11771,87 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
         }
     }
     Some(compound)
+}
+
+/// The `(…)` argument of a functional pseudo-class or pseudo-element, or
+/// `Some(None)` when none follows. `None` for an unbalanced argument.
+fn take_pseudo_arg(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Option<String>> {
+    if chars.peek() != Some(&'(') {
+        return Some(None);
+    }
+    chars.next();
+    let mut depth = 1u32;
+    let mut inner = String::new();
+    for c in chars.by_ref() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(Some(inner));
+                }
+            }
+            _ => {}
+        }
+        inner.push(c);
+    }
+    None
+}
+
+/// One pseudo-class following a pseudo-element. Selectors 4
+/// #pseudo-element-states allows only the user action pseudo-classes
+/// (§10) and the logical combinations, which pass that restriction to their
+/// arguments (§4): `:not()` rejects the selector for a disallowed argument,
+/// while the forgiving `:is()`/`:where()` drop it. Any other combination is
+/// an invalid selector (`None`).
+///
+/// Otherwise returns whether the pseudo-element can match and the
+/// pseudo-class specificity it adds. The engine does not track user action
+/// state on generated boxes, so a pseudo-element is never hovered, active
+/// or focused itself; testing the originating element instead would select
+/// the wrong box.
+fn pseudo_element_state_class(name: &str, arg: Option<&str>) -> Option<(bool, u32)> {
+    let Some(arg) = arg else {
+        return matches!(
+            name,
+            "hover" | "active" | "focus" | "focus-visible" | "focus-within"
+        )
+        .then_some((false, 1));
+    };
+    let arguments = split_top_level(arg, ',')
+        .into_iter()
+        .map(|part| pseudo_element_state_compound(part.trim()));
+    let arguments: Vec<_> = match name {
+        "not" => arguments.collect::<Option<_>>()?,
+        "is" | "where" | "matches" => arguments.flatten().collect(),
+        _ => return None,
+    };
+    let any = arguments.iter().any(|&(m, _)| m);
+    let specificity = arguments.iter().map(|&(_, s)| s).max().unwrap_or(0);
+    Some(match name {
+        "not" => (!any, specificity),
+        "where" => (any, 0),
+        _ => (any, specificity),
+    })
+}
+
+/// A compound argument of a logical combination after a pseudo-element: a
+/// sequence of allowed pseudo-classes, all of which must hold.
+fn pseudo_element_state_compound(text: &str) -> Option<(bool, u32)> {
+    let mut chars = text.chars().peekable();
+    let (mut matches, mut specificity) = (true, 0);
+    chars.peek()?;
+    while let Some(c) = chars.next() {
+        if c != ':' || chars.peek() == Some(&':') {
+            return None;
+        }
+        let name = take_name(&mut chars)?.to_ascii_lowercase();
+        let arg = take_pseudo_arg(&mut chars)?;
+        let (m, s) = pseudo_element_state_class(&name, arg.as_deref())?;
+        matches &= m;
+        specificity += s;
+    }
+    Some((matches, specificity))
 }
 
 /// Pseudo-elements defined by CSS Pseudo 4, Shadow Parts, Highlight API,
@@ -17804,6 +17924,73 @@ mod tests {
         assert_ne!(color("c").as_deref(), Some("red"));
         assert!(selector_parses("p::first-line"));
         assert!(!selector_parses("p::bogus"));
+    }
+
+    #[test]
+    fn only_allowed_pseudo_classes_follow_a_pseudo_element() {
+        // Selectors 4 #pseudo-element-states: after a pseudo-element only the
+        // user action and logical combination pseudo-classes are valid, and
+        // the logical combinations pass that restriction to their arguments.
+        // #grammar allows no other simple selector there, and
+        // #pseudo-element-structure no combinator.
+        for selector in [
+            "a:before:not(.x)",
+            "a::before:not(.x)",
+            "a::before.x",
+            "a::before#i",
+            "a::before[href]",
+            "a::before:first-child",
+            "a::after:not(:first-child)",
+            "a::before span",
+            "a::before > span",
+            "a::first-letter.x",
+            "a:first-letter:checked",
+            "a::before::before",
+            "a::before:after",
+            "a::before:not(.x), a::before",
+            "::backdrop.x",
+            "::slotted(span).x",
+        ] {
+            assert!(!selector_parses(selector), "{selector}");
+        }
+        for selector in [
+            "a::before:hover",
+            "a::after:focus-visible",
+            "a::before:not(:hover)",
+            "a::before:is(.x)",
+            "a::before:where(:hover, .x)",
+            "a::before::marker",
+            "p::first-line:active",
+            "::part(label):checked",
+            "::slotted(span)::before",
+        ] {
+            assert!(selector_parses(selector), "{selector}");
+        }
+
+        let mut dom = Dom::parse_document(
+            "<!DOCTYPE html><style>\
+             #a1:before:not(.x), #a2::before:not(.x), #a3::before.x, \
+             #a4::before:not(.x), #a4::before, #a5::before:is(.x), \
+             #a6::before:where(.x), #a7::before:hover { content: \"X\" } \
+             #a8::before:not(:focus) { content: \"Y\" }\
+             </style><a id=a1 class=x>1</a><a id=a2>2</a><a id=a3 class=x>3</a>\
+             <a id=a4>4</a><a id=a5 class=x>5</a><a id=a6 class=x>6</a>\
+             <a id=a7>7</a><a id=a8>8</a>",
+        );
+        for id in ["a1", "a2", "a3", "a4", "a5", "a6"] {
+            let element = dom.get_by_id(id).unwrap();
+            assert_eq!(dom.pseudo_content(element, PseudoEl::Before), None, "{id}");
+        }
+        // User action state belongs to the pseudo-element, never to its
+        // originating element: hovering #a7 does not hover its ::before.
+        let a7 = dom.get_by_id("a7").unwrap();
+        dom.set_hover_chain(Some(a7));
+        assert_eq!(dom.pseudo_content(a7, PseudoEl::Before), None);
+        let a8 = dom.get_by_id("a8").unwrap();
+        assert_eq!(
+            dom.pseudo_content(a8, PseudoEl::Before).as_deref(),
+            Some("Y")
+        );
     }
 
     #[test]
