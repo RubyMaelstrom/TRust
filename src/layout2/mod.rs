@@ -5330,6 +5330,39 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn sourceless_images_with_alt_render_their_text_inline() {
+        // HTML Rendering #images-3: an img with no src and a non-empty alt
+        // represents the text and is not expected to change, so outside
+        // quirks mode it is a non-replaced phrasing element holding the
+        // text, whatever its dimension attributes or aspect ratio. In quirks
+        // mode an img that already has both dimensions stays replaced.
+        let body = r#"<body style="margin:0;font:16px/19px sans-serif">
+            <div id=a style="display:flex;width:250px"><img id=ia width=125 height=125
+                alt="Album Cover" style="width:auto;height:auto"><span>text</span></div>
+            <div id=d><img id=id width=125 height=125 alt="Album Cover"></div>
+            <div id=e><img id=ie alt="Album Cover" style="aspect-ratio:1/1"></div>
+            <div id=n><img id=in width=30 height=20 alt=""></div></body>"#;
+        for (doctype, quirks) in [("<!DOCTYPE html>", false), ("", true)] {
+            let html = format!("{doctype}{body}");
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+            for id in ["a", "e"] {
+                assert!(rect(id).height < 25.0, "{id} {quirks}: {}", rect(id).height);
+            }
+            assert!(rect("ia").width < 125.0, "{quirks}");
+            if quirks {
+                assert_eq!((rect("id").width, rect("id").height), (125.0, 125.0));
+            } else {
+                assert!(rect("d").height < 25.0, "{}", rect("d").height);
+            }
+            // An empty alt represents nothing: a replaced box of its size.
+            assert_eq!((rect("in").width, rect("in").height), (30.0, 20.0));
+            graphical_text(&layout, "Album Cover");
+        }
+    }
+
+    #[test]
     fn undecoded_image_with_aspect_ratio_reserves_box() {
         let out = lay(
             r#"<body style="margin:0"><img src="i.png" style="width:160px;aspect-ratio:2/1" alt="x"></body>"#,
