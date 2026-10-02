@@ -4095,6 +4095,35 @@ mod tests {
     }
 
     #[test]
+    fn ratio_only_svg_flex_items_take_their_cross_size_through_the_view_box() {
+        // CSS Flexbox 1 #algo-cross-item: an unstretched replaced flex item's
+        // hypothetical cross size comes through its natural ratio. For a
+        // viewBox-only SVG that is the viewBox's, not the decoder's default
+        // object size: blog.google's 24px icons drew 24x12, or not at all.
+        let svg = "data:image/svg+xml,%3csvg%20viewBox='0%200%2024%2024'%20xmlns='http://www.w3.org/2000/svg'%3e%3c/svg%3e";
+        let images: ImageSizes = [(svg.to_string(), (300u32, 150u32))].into_iter().collect();
+        for item in [
+            format!("<img id=icon style='width:100%' src=\"{svg}\">"),
+            format!("<i style='display:inline-flex;align-items:center'><img id=icon style='width:100%;height:100%' src=\"{svg}\"></i>"),
+            "<svg id=icon style='width:100%;height:100%' viewBox='0 0 24 24'><path d='M0 0h24v24H0z'/></svg>".to_string(),
+        ] {
+            let dom = Dom::parse_document(&format!(
+                "<body style='margin:0'><div style='display:flex;align-items:center;width:24px;height:24px'>{item}</div></body>"
+            ));
+            let layout = lay_out_graphical(
+                &dom,
+                &Url::parse("https://example.test/").unwrap(),
+                Viewport::new(200., 100.),
+                &[],
+                &Default::default(),
+                &images,
+            );
+            let icon = layout.boxes[&dom.get_by_id("icon").unwrap()];
+            assert_eq!((icon.width, icon.height), (24., 24.), "{item}");
+        }
+    }
+
+    #[test]
     fn external_ratio_only_svg_sizes_to_the_containing_block() {
         // An EXTERNAL ratio-only SVG (layout can't read its markup): the image
         // loader records its ratio by URL as it decodes it, and replaced sizing

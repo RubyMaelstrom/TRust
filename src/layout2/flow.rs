@@ -3907,9 +3907,14 @@ impl Flow<'_> {
             url.and_then(|url| super::memo::image_size(self.dom, self.images, url)),
             density,
         );
-        let ratio = super::replaced::ratio_of(self.dom, node, dimension_source, natural);
+        // CSS Flexbox 1 #algo-cross-item: without a definite height the
+        // hypothetical cross size comes through the natural ratio, which for
+        // a ratio-only SVG is its viewBox's, not the default object size's.
         let box_h = def_h
-            .or_else(|| ratio.map(|r| content_w / r))
+            .or_else(|| {
+                super::replaced::natural_ratio(self.dom, node, dimension_source, url, natural)
+                    .map(|r| content_w / r)
+            })
             .or(natural.map(|(_, nh)| nh))
             .unwrap_or_else(|| (content_w / 2.0).min(150.0));
         let r =

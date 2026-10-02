@@ -162,9 +162,7 @@ pub(crate) fn size(
     // object-fit still receives the decoded natural size independently.
     // Test the resolved dimensions: an indefinite percentage remains auto.
     let svg_ratio = if spec_w.is_none() || spec_h.is_none() {
-        url.and_then(crate::img::svg_url_ratio_only)
-            .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
-            .filter(|&r| r > 0.0)
+        svg_view_box_ratio(url)
     } else {
         None
     };
@@ -177,14 +175,8 @@ pub(crate) fn size(
     // SVG 2 §8.12: an inline SVG retains its exact viewBox ratio when only
     // one CSS dimension is definite. Baking that dimension into the image
     // resource must not hide the ratio before asynchronous raster decoding.
-    let inline_svg_ratio = (dom.tag_name(node) == Some("svg"))
-        .then(|| {
-            dom.attr(node, "viewBox")
-                .and_then(crate::img::view_box_ratio)
-        })
-        .flatten();
     let ratio = svg_ratio
-        .or(inline_svg_ratio)
+        .or_else(|| inline_svg_ratio(dom, node))
         .or_else(|| ratio_of(dom, node, dimension_source, natural))
         .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
 
@@ -395,6 +387,39 @@ pub(crate) fn dimension_attribute_ratio(dom: &Dom, dimension_source: NodeId) -> 
         _ => None,
     };
     Some(attr("width")? / attr("height")?).filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+}
+
+/// SVG 2 intrinsic sizing: the exact `viewBox` ratio of an SVG image that
+/// supplies a ratio but no natural width or height.
+fn svg_view_box_ratio(url: Option<&str>) -> Option<f32> {
+    url.and_then(crate::img::svg_url_ratio_only)
+        .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
+        .filter(|&r| r > 0.0)
+}
+
+/// SVG 2 §8.12: an inline `svg` retains its exact `viewBox` ratio.
+fn inline_svg_ratio(dom: &Dom, node: NodeId) -> Option<f32> {
+    (dom.tag_name(node) == Some("svg"))
+        .then(|| {
+            dom.attr(node, "viewBox")
+                .and_then(crate::img::view_box_ratio)
+        })
+        .flatten()
+}
+
+/// The natural ratio `size` uses: a ratio-only SVG's `viewBox` before the
+/// decoder's default object size, then `ratio_of`.
+pub(crate) fn natural_ratio(
+    dom: &Dom,
+    node: NodeId,
+    dimension_source: NodeId,
+    url: Option<&str>,
+    natural: Option<(f32, f32)>,
+) -> Option<f32> {
+    svg_view_box_ratio(url)
+        .or_else(|| inline_svg_ratio(dom, node))
+        .or_else(|| ratio_of(dom, node, dimension_source, natural))
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
 }
 
 /// The natural-ratio chain a replaced element sizes through: intrinsic,
