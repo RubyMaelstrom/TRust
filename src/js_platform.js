@@ -5678,6 +5678,37 @@
             };
         }
         get outerHTML() { return __dom_outer_html(this.__id); }
+        // HTML #dom-element-outerhtml setter steps: fragment-parse in the
+        // parent's context and replace this element with the result. As with
+        // innerHTML, the fragment parser leaves its script elements inert.
+        set outerHTML(v) {
+            v = v === null ? "" : String(v);
+            const parent = this.parentNode;
+            if (!parent) return;
+            if (parent.nodeType === 9)
+                throw new DOMException("Failed to set the 'outerHTML' property on 'Element': This element's parent is of type '#document'.", "NoModificationAllowedError");
+            const prev = this.previousSibling, next = this.nextSibling;
+            const before = MO.length ? new Set(__dom_children(parent.__id)) : null;
+            // A DocumentFragment parent parses in a body context; the native
+            // insertion falls back to an equivalent flow-content context.
+            __dom_insert_adjacent(this.__id, "beforebegin", v);
+            baseHrefCache = null;
+            const added = before ? Array.from(parent.childNodes).filter((k) => !before.has(k.__id)) : [];
+            // DOM #concept-node-replace: remove this, then report one record
+            // with the inserted nodes and this element.
+            rangesRemove(this, parent, rangeIndex(this));
+            if (CE.defs.size) ceDisconnect(this);
+            if (MO.length) moRetainTransient(parent, this);
+            __dom_detach(this.__id);
+            destroyFrameNavigablesIn(this);
+            syncWrapperSubtreeRetention(this.__id);
+            slotQueueCheck(parent);
+            if (MO.length && moHasChildList) moNotify({ type: "childList", target: parent, addedNodes: added,
+                removedNodes: [this], previousSibling: prev, nextSibling: next });
+            else moEnqueue();
+            if (CE.defs.size) ceScan(parent);
+            queueFrameNavigationsIn(parent);
+        }
         get innerText() { return this.textContent; }
         set innerText(v) { this.textContent = v; }
         insertAdjacentHTML(p, h) {

@@ -29650,6 +29650,70 @@ mod tests {
     }
 
     #[test]
+    fn outer_html_setter_replaces_the_element_with_parsed_markup() {
+        // HTML #dom-element-outerhtml: parse in the parent's context and
+        // replace this element (DOM #concept-node-replace, one childList
+        // record); a parentless element is left alone and a Document parent
+        // throws NoModificationAllowedError. Webring widgets replace their
+        // own script with `document.currentScript.outerHTML = ...`.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#""use strict";
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const box = document.createElement("div");
+            body.appendChild(box);
+            const a = document.createElement("span");
+            box.append("x", a, "y");
+            globalThis.records = [];
+            new MutationObserver((list) => {
+                for (const r of list) records.push([r.target === box, r.addedNodes.length,
+                    r.removedNodes.length, r.removedNodes[0] === a,
+                    r.previousSibling && r.previousSibling.data,
+                    r.nextSibling && r.nextSibling.data].join());
+            }).observe(box, { childList: true });
+            a.outerHTML = '<b id=b1>1</b><i>2</i><script>globalThis.ran = true<\/script>';
+            const detached = document.createElement("p");
+            detached.outerHTML = "<b>ignored</b>";
+            let threw = "";
+            try { html.outerHTML = "<p>"; } catch (e) { threw = e.name; }
+            const fragment = document.createDocumentFragment();
+            const em = document.createElement("em");
+            fragment.appendChild(em);
+            em.outerHTML = "<u>u</u>";
+            const script = document.createElement("script");
+            script.textContent = "document.currentScript.outerHTML = '<div id=rep>replaced</div>'";
+            body.appendChild(script);
+            const replacement = document.getElementById("rep");
+            globalThis.outerResult = [
+                box.innerHTML,
+                a.parentNode === null,
+                typeof Object.getOwnPropertyDescriptor(Element.prototype, "outerHTML").set,
+                detached.outerHTML,
+                threw,
+                typeof globalThis.ran,
+                fragment.childNodes.length + ":" + fragment.firstChild.nodeName,
+                !!replacement && replacement.parentNode === body && script.parentNode === null,
+            ].join("|");
+            "#,
+            "outerHTML setter",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "outerResult"),
+            "x<b id=\"b1\">1</b><i>2</i><script>globalThis.ran = true</script>y|true|function|\
+             <p></p>|NoModificationAllowedError|undefined|1:U|true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "records.join(';')"),
+            "true,3,1,true,x,y"
+        );
+    }
+
+    #[test]
     fn inner_html_descendants_are_queryable_synchronously_after_insertion() {
         // HTML §13.3 appends text in script-data/raw-text parents literally
         // during fragment serialization; normal text is escaped. DOM §4.2.6
