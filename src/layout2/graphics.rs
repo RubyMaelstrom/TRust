@@ -4565,6 +4565,11 @@ enum DotEnd {
     /// The corner is shared with an equally thick dotted side: both runs end
     /// with a dot on the middle of the corner's center curve.
     Shared,
+    /// The side takes the whole corner, from a thinner dotted side or from a
+    /// side with no border, and its radii are at least the side's width: the
+    /// run follows the middle of the corner's band around its curve to the
+    /// other side, ending with a dot there.
+    Curve,
     /// The run ends `inset` along the side from the outer corner, with a dot
     /// there when `filled` and otherwise one gap from it.
     Edge { inset: f32, filled: bool },
@@ -4577,6 +4582,12 @@ enum DotEnd {
 /// thick dotted sides meet on one dot centered on their corner's curve. Dots
 /// at most two device pixels across are squares on the pixel grid, as in
 /// Gecko and Blink, since so small a circle only rasterizes as a blur.
+///
+/// #corner-shaping: every style follows the curve of the border, whose
+/// thickness around a rounded corner is interpolated from the adjoining
+/// sides. A dotted side that takes a whole rounded corner carries its dots
+/// around it, each as thick as the band where it lies, so they taper to
+/// the other side's width, or away where that side has no border.
 fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
     let BorderEdges {
         rect,
@@ -4592,6 +4603,14 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
     }
     let owners = corner_owners(widths, &styles);
     let ratio = builder.dom.device_pixel_ratio().max(f32::EPSILON);
+    // The thickness of each side's band, none where it has no border.
+    let bands: [f32; 4] = std::array::from_fn(|side| {
+        if visible_border(widths[side], styles[side]) {
+            widths[side]
+        } else {
+            0.
+        }
+    });
     // Outer corners and the directions into the box from each.
     let outer = [
         CssPoint::new(rect.x, rect.y),
@@ -4611,11 +4630,11 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
             } else {
                 corner
             };
-            let along = if horizontal {
-                radii.corners[corner].0
-            } else {
-                radii.corners[corner].1
-            };
+            let (rx, ry) = radii.corners[corner];
+            let along = if horizontal { rx } else { ry };
+            // Whether the side owning the corner has a curve to follow; one
+            // under its width is little more than a square corner.
+            let curved = |owner: usize| rx.min(ry) >= widths[owner];
             let ours = match owners[corner] {
                 CornerOwner::Split => true,
                 CornerOwner::Incoming => corner != side,
@@ -4623,19 +4642,30 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
             };
             if owners[corner] == CornerOwner::Split && dotted(other) {
                 DotEnd::Shared
+            } else if ours && curved(side) {
+                DotEnd::Curve
             } else if ours || !visible_border(widths[other], styles[other]) {
                 DotEnd::Edge {
                     inset: along.max(width / 2.),
                     filled: true,
                 }
             } else {
+                // One gap past the other side's part of the corner. A
+                // dotted side carrying its dots around the corner ends on
+                // that part's edge with a dot of this side's width.
+                let gap = if dotted(other) && curved(other) {
+                    width
+                } else {
+                    width / 2.
+                };
                 DotEnd::Edge {
-                    inset: along.max(widths[other]) + width / 2.,
+                    inset: along.max(widths[other]) + gap,
                     filled: false,
                 }
             }
         });
-        // The centerline of this side from its start anchor to its end.
+        // The centerline of this side from its start anchor to its end,
+        // with the thickness of the band at each point.
         let (dx, dy) = direction[side];
         let mut run = Vec::new();
         for (position, corner) in [side, (side + 1) % 4].into_iter().enumerate() {
@@ -4673,7 +4703,38 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
                             far + (middle - far) * t
                         }
                     });
-                    run.extend(angles.map(point));
+                    run.extend(angles.map(|angle| (point(angle), width)));
+                }
+                DotEnd::Curve => {
+                    // The corner's band runs from its vertical side (left or
+                    // right) to its horizontal side (top or bottom), between
+                    // outer and inner curves centered on the same point.
+                    let vertical = if corner == 0 || corner == 3 { 3 } else { 1 };
+                    let (wv, wh) = (bands[vertical], bands[if corner < 2 { 0 } else { 2 }]);
+                    let (rx, ry) = radii.corners[corner];
+                    let center = CssPoint::new(origin.x + sx * rx, origin.y + sy * ry);
+                    // Halfway between corresponding points of the two curves,
+                    // and the distance between them, from the vertical side
+                    // (0) to the horizontal side (90°).
+                    let point = |angle: f32| {
+                        let (cos, sin) = (angle.cos(), angle.sin());
+                        let middle = CssPoint::new(
+                            center.x - sx * (rx - wv / 2.) * cos,
+                            center.y - sy * (ry - wh / 2.) * sin,
+                        );
+                        (middle, (wv * cos).hypot(wh * sin))
+                    };
+                    // From the other side's end of the curve to this side's.
+                    let far = if horizontal { 0. } else { FRAC_PI_2 };
+                    let near = FRAC_PI_2 - far;
+                    let steps = 16;
+                    let mut curve = (0..=steps)
+                        .map(|step| point(far + (near - far) * step as f32 / steps as f32))
+                        .collect::<Vec<_>>();
+                    if !at_start {
+                        curve.reverse();
+                    }
+                    run.extend(curve);
                 }
                 DotEnd::Edge { inset, .. } => {
                     let offset = if at_start { inset } else { -inset };
@@ -4682,15 +4743,18 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
                     } else {
                         (sx * width / 2., 0.)
                     };
-                    run.push(CssPoint::new(
-                        origin.x + dx * offset + across_x,
-                        origin.y + dy * offset + across_y,
+                    run.push((
+                        CssPoint::new(
+                            origin.x + dx * offset + across_x,
+                            origin.y + dy * offset + across_y,
+                        ),
+                        width,
                     ));
                 }
             }
         }
         let filled = ends.map(|end| match end {
-            DotEnd::Shared => true,
+            DotEnd::Shared | DotEnd::Curve => true,
             DotEnd::Edge { filled, .. } => filled,
         });
         let thin = width * ratio <= 2.0 + 1e-3;
@@ -4704,16 +4768,16 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
                 continue;
             }
             let anchor = if position == 0 {
-                run[0]
+                run[0].0
             } else {
-                run[run.len() - 1]
+                run[run.len() - 1].0
             };
             let index = if position == 0 {
                 0
             } else {
                 centers.len().saturating_sub(1)
             };
-            let Some(&center) = centers.get(index) else {
+            let Some(&(center, _)) = centers.get(index) else {
                 continue;
             };
             if (center.x - anchor.x).abs() > 0.01 || (center.y - anchor.y).abs() > 0.01 {
@@ -4754,8 +4818,12 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
             ));
         }
         let mut path = Vec::new();
-        for center in centers {
-            push_dot(&mut path, center, width, thin, ratio);
+        // A dot where the band has tapered under half a device pixel would
+        // only be a stray speck.
+        for (center, size) in centers {
+            if size * ratio >= 0.5 {
+                push_dot(&mut path, center, size, thin, ratio);
+            }
         }
         let brush = PaintBrush::Solid(colors[side]);
         if !path.is_empty() {
@@ -4780,20 +4848,29 @@ fn paint_dotted_sides(builder: &mut Builder<'_>, edges: BorderEdges<'_>) {
 /// Dot centers along the polyline `run`, which is divided into an even
 /// number of steps of about `width` (odd when exactly one end is unfilled)
 /// that alternate dot and gap. Thin steps are never shorter than `width`, so
-/// that every dot and gap keeps a whole pixel on the grid.
+/// that every dot and gap keeps a whole pixel on the grid. Each point of
+/// `run` carries the band's thickness there, which sizes the dots near it;
+/// where the band tapers, so do the steps, down to half of `width`.
 fn dot_centers(
-    run: &[CssPoint],
+    run: &[(CssPoint, f32)],
     width: f32,
     start_filled: bool,
     end_filled: bool,
     thin: bool,
-) -> Vec<CssPoint> {
+) -> Vec<(CssPoint, f32)> {
     if run.is_empty() || width <= 0. {
         return Vec::new();
     }
+    // Distances along the run, scaled so that a step of `width` covers a
+    // step of the band's own thickness.
     let mut lengths = vec![0f32];
     for pair in run.windows(2) {
-        let step = (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+        let ((from, a), (to, b)) = (pair[0], pair[1]);
+        let mut step = (to.x - from.x).hypot(to.y - from.y);
+        let size = (a + b) / 2.;
+        if size != width {
+            step *= width / size.max(width / 2.);
+        }
         lengths.push(lengths[lengths.len() - 1] + step);
     }
     let total = lengths[lengths.len() - 1];
@@ -4802,7 +4879,8 @@ fn dot_centers(
             .windows(2)
             .position(|pair| distance <= pair[1])
             .unwrap_or(lengths.len().saturating_sub(2));
-        let (Some(&from), Some(&to)) = (run.get(index), run.get(index + 1)) else {
+        let (Some(&(from, from_size)), Some(&(to, to_size))) = (run.get(index), run.get(index + 1))
+        else {
             return run[0];
         };
         let span = lengths[index + 1] - lengths[index];
@@ -4811,7 +4889,10 @@ fn dot_centers(
         } else {
             0.
         };
-        CssPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+        (
+            CssPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
+            from_size + (to_size - from_size) * t,
+        )
     };
     if total < width {
         // Too short for two dots: one in the middle, if neither end is a gap.
@@ -6863,6 +6944,44 @@ mod tests {
         let dots = ink_runs((100..160).map(|y| (y, blue(23, y))));
         assert!(dots.len() >= 3, "{dots:?}");
         assert!((112..=114).contains(&dots[0].0), "{dots:?}");
+    }
+
+    #[test]
+    fn dotted_sides_carry_their_dots_around_rounded_corners() {
+        // CSS Backgrounds 3 #corner-shaping: every style follows the curve
+        // of the border. A dotted side taking a whole rounded corner, from a
+        // thinner dotted side or from a side with no border, stopped where
+        // the curve begins and the other side began after it, so the curve
+        // was bare.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="position:absolute;left:20px;top:20px;width:200px;height:120px;
+                box-sizing:border-box;border:6px dotted #00f;border-top-width:3px;
+                border-radius:40px"></div>
+            <div style="position:absolute;left:300px;top:20px;width:200px;height:60px;
+                box-sizing:border-box;border-bottom:4px dotted #00f;
+                border-radius:12px"></div>"#,
+        );
+        let blue = |x: usize, y: usize| {
+            let [r, _, b] = pixel(x, y);
+            b > 200 && r < 160
+        };
+        let inked = |xs: std::ops::Range<usize>, ys: std::ops::Range<usize>| {
+            xs.flat_map(|x| ys.clone().map(move |y| (x, y)))
+                .filter(|&(x, y)| blue(x, y))
+                .count()
+        };
+        // Both top corners, short of the left/right sides' straight runs
+        // (from y = 60) and the top's (from x = 60 and to x = 180).
+        let left = inked(20..57, 20..57);
+        let right = inked(183..220, 20..57);
+        assert!(left > 40 && right > 40, "{left} {right}");
+        // Around the bottom side's curves, before its straight run.
+        let left = inked(300..309, 66..80);
+        let right = inked(491..500, 66..80);
+        assert!(left > 4 && right > 4, "{left} {right}");
+        // The dots stay within the band, off the padding box.
+        assert_eq!(inked(42..56, 42..56), 0);
     }
 
     #[test]
