@@ -591,6 +591,30 @@ impl VelloCpuRenderer {
                         .with_stops(stops.as_slice()),
                 );
             }
+            PaintBrush::ConicGradient {
+                center,
+                rotation,
+                start_angle,
+                end_angle,
+                stops,
+                interpolation,
+                repeat,
+            } => {
+                let stops = vello_stops(stops);
+                self.context
+                    .set_paint_transform(conic_transform(*center, *rotation));
+                self.context.set_paint(
+                    Gradient::new_sweep(
+                        (f64::from(center.x), f64::from(center.y)),
+                        *start_angle,
+                        *end_angle,
+                    )
+                    .with_extend(gradient_extend(*repeat))
+                    .with_interpolation_cs(interpolation.space)
+                    .with_hue_direction(interpolation.hue)
+                    .with_stops(stops.as_slice()),
+                );
+            }
         }
     }
 
@@ -1095,6 +1119,17 @@ pub(super) fn gradient_extend(repeat: bool) -> vello_cpu::peniko::Extend {
 pub(super) fn radial_gradient(center: CssPoint, start: f32, end: f32) -> Gradient {
     let center = (f64::from(center.x), f64::from(center.y));
     Gradient::new_two_point_radial(center, start.max(0.0), center, end.max(f32::EPSILON))
+}
+
+/// CSS Images 4 #conic-color-stops: 0deg points up and angles increase
+/// clockwise. A Vello sweep starts on the positive x axis, also clockwise in
+/// y-down space, so its paint turns about the center by the gradient's
+/// rotation less a quarter turn.
+pub(super) fn conic_transform(center: CssPoint, rotation: f32) -> Affine {
+    Affine::rotate_about(
+        f64::from(rotation) - std::f64::consts::FRAC_PI_2,
+        (f64::from(center.x), f64::from(center.y)),
+    )
 }
 
 /// Scales a circular gradient's paint vertically about its center into the

@@ -3129,7 +3129,8 @@ impl LayerTile {
                         *start = shift(*start);
                         *end = shift(*end);
                     }
-                    PaintBrush::RadialGradient { center, .. } => *center = shift(*center),
+                    PaintBrush::RadialGradient { center, .. }
+                    | PaintBrush::ConicGradient { center, .. } => *center = shift(*center),
                     PaintBrush::Solid(_) => {}
                 }
                 DisplayCommand::Fill {
@@ -3148,6 +3149,8 @@ fn is_gradient(layer: &str) -> bool {
         "radial-gradient(",
         "repeating-linear-gradient(",
         "repeating-radial-gradient(",
+        "conic-gradient(",
+        "repeating-conic-gradient(",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
@@ -4996,6 +4999,11 @@ fn gradient_interpolation(value: &str) -> Option<(String, GradientInterpolation,
 
 fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<PaintBrush> {
     let lower = value.to_ascii_lowercase();
+    if lower.starts_with("conic-gradient(") {
+        return parse_conic_gradient(function_body(value)?, false, rect, lengths);
+    } else if lower.starts_with("repeating-conic-gradient(") {
+        return parse_conic_gradient(function_body(value)?, true, rect, lengths);
+    }
     let (radial, repeating, body) = if lower.starts_with("linear-gradient(") {
         (false, false, function_body(value)?)
     } else if lower.starts_with("repeating-linear-gradient(") {
@@ -5101,6 +5109,95 @@ fn parse_gradient(value: &str, rect: CssRect, lengths: LengthBasis) -> Option<Pa
             repeat: repeating,
         })
     }
+}
+
+/// CSS Images 4 #conic-gradient-syntax:
+/// `[ [ from <angle> ]? [ at <position> ]? ] || <color-interpolation-method>`,
+/// then an `<angular-color-stop-list>`. Stop and hint positions are angles or
+/// percentages of a full turn (#conic-color-stops); the center defaults to
+/// the middle of the gradient box.
+fn parse_conic_gradient(
+    body: &str,
+    repeating: bool,
+    rect: CssRect,
+    lengths: LengthBasis,
+) -> Option<PaintBrush> {
+    let mut parts = split_top_level(body, ',');
+    if parts.len() < 2 {
+        return None;
+    }
+    let (header, interpolation, explicit_interpolation) = gradient_interpolation(parts[0])?;
+    let header = header.to_ascii_lowercase();
+    let tokens = split_ws(&header);
+    let (mut rotation, mut position) = (0.0, "center".to_string());
+    if explicit_interpolation || matches!(tokens.first(), Some(&("from" | "at"))) {
+        let mut rest = &tokens[..];
+        if let ["from", turn, more @ ..] = rest {
+            rotation = angle(turn)?;
+            rest = more;
+        }
+        if let ["at", more @ ..] = rest {
+            if more.is_empty() {
+                return None;
+            }
+            position = more.join(" ");
+            rest = &[];
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+        parts.remove(0);
+    }
+    let local = CssRect::new(0.0, 0.0, rect.width, rect.height);
+    let (x, y) = background_position(&position, local, (0.0, 0.0), lengths);
+    let center = CssPoint::new(rect.x + x, rect.y + y);
+    let (stops, hints) = parse_stops_at(&parts, |token: &str| {
+        if let Some(percent) = token.strip_suffix('%') {
+            return percent
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|value| value / 100.0);
+        }
+        angle(token).map(|radians| radians / (2.0 * PI))
+    })?;
+    let interpolation =
+        if !explicit_interpolation && stops.iter().all(|stop| legacy_srgb(&stop.color)) {
+            GradientInterpolation {
+                space: color::ColorSpaceTag::Srgb,
+                ..interpolation
+            }
+        } else {
+            interpolation
+        };
+    let mut stops = expand_color_hints(stops, &hints, interpolation);
+    // Only 0deg to 360deg is painted. A repeating gradient repeats its first
+    // to last stop (CSS Images 3 #repeating-gradients); otherwise stops
+    // outside that turn still shape the colors inside it.
+    let (first, last) = (stops.first()?.offset, stops.last()?.offset);
+    let (from, to) = if repeating {
+        if last - first <= f32::EPSILON || !(last - first).is_finite() {
+            return Some(PaintBrush::Solid(average_stop_color(&stops)));
+        }
+        (first, last)
+    } else {
+        (first.min(0.0), last.max(1.0))
+    };
+    if !(to - from).is_finite() {
+        return None;
+    }
+    for stop in &mut stops {
+        stop.offset = (stop.offset - from) / (to - from);
+    }
+    Some(PaintBrush::ConicGradient {
+        center,
+        rotation,
+        start_angle: from * 2.0 * PI,
+        end_angle: to * 2.0 * PI,
+        stops,
+        interpolation,
+        repeat: repeating,
+    })
 }
 
 /// CSS Images 3 #radial-gradient-syntax: the center and horizontal and
@@ -5246,10 +5343,15 @@ type StopsAndHints = (Vec<GradientStop>, Vec<(usize, f32)>);
 /// positions, make positions non-decreasing and space unpositioned stops
 /// evenly. Hints are returned as (index of the stop they precede, position).
 fn parse_stops(parts: &[&str], line: f32, lengths: LengthBasis) -> Option<StopsAndHints> {
-    let position = |token: &str| {
+    parse_stops_at(parts, |token: &str| {
         let px = lengths.resolve(token, line)?;
         Some(if line > 0.0 { px / line } else { 0.0 })
-    };
+    })
+}
+
+/// [`parse_stops`] with `position` resolving a stop or hint position to a
+/// fraction of the gradient line.
+fn parse_stops_at(parts: &[&str], position: impl Fn(&str) -> Option<f32>) -> Option<StopsAndHints> {
     let mut colors: Vec<(color::DynamicColor, Option<f32>)> = Vec::new();
     let mut hints: Vec<(usize, f32)> = Vec::new();
     for part in parts {
@@ -5395,6 +5497,8 @@ fn angle(value: &str) -> Option<f32> {
     let value = value.trim();
     if let Some(v) = value.strip_suffix("deg") {
         v.trim().parse::<f32>().ok().map(f32::to_radians)
+    } else if let Some(v) = value.strip_suffix("grad") {
+        v.trim().parse::<f32>().ok().map(|v| v / 400.0 * 2.0 * PI)
     } else if let Some(v) = value.strip_suffix("rad") {
         v.trim().parse().ok()
     } else if let Some(v) = value.strip_suffix("turn") {
@@ -8401,6 +8505,55 @@ mod tests {
                 "glyph background must remain visible with transparent text"
             );
         }
+    }
+
+    #[test]
+    fn conic_gradients_sweep_clockwise_from_the_top() {
+        // CSS Images 4 #conic-gradients: stops run clockwise around the
+        // center from 0deg, which points up, after turning by `from`; `at`
+        // moves the center, and a repeating gradient tiles its first to last
+        // stop around the turn. Expected pixels were measured in Blink.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white} div{width:100px;height:100px}</style>\
+             <div style='background:conic-gradient(red 25%, lime 0 50%, blue 0 75%, yellow 0)'></div>\
+             <div style='background:conic-gradient(from 90deg, red 25%, lime 0)'></div>\
+             <div style='background:conic-gradient(at 25% 25%, red 25%, lime 0)'></div>\
+             <div style='background:repeating-conic-gradient(from 45deg, #421d2c 0% 25%, \
+             #2d1b1b 0% 50%) 0 0/50px 50px'></div>\
+             <div style='background:conic-gradient(red, blue)'></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let pixel = |x: usize, y: usize| frame.pixels[(y * 800 + x) * 4..][..3].to_vec();
+        let (red, lime, blue) = ([255, 0, 0], [0, 255, 0], [0, 0, 255]);
+        for (x, y, expected) in [
+            (75, 25, red),
+            (75, 75, lime),
+            (25, 75, blue),
+            (25, 25, [255, 255, 0]),
+            (75, 175, red),
+            (75, 125, lime),
+            (25, 175, lime),
+            (75, 210, red),
+            (75, 275, lime),
+            (10, 210, lime),
+            (45, 325, [66, 29, 44]),
+            (5, 325, [66, 29, 44]),
+            (95, 325, [66, 29, 44]),
+            (25, 305, [45, 27, 27]),
+            (25, 345, [45, 27, 27]),
+            (75, 305, [45, 27, 27]),
+        ] {
+            assert_eq!(pixel(x, y), expected, "({x}, {y})");
+        }
+        // Halfway round, straight down, sRGB interpolation is mid purple.
+        let down = pixel(50, 495);
+        assert!(
+            down.iter()
+                .zip([128, 0, 128])
+                .all(|(a, e)| a.abs_diff(e) <= 3),
+            "{down:?}"
+        );
     }
 
     #[test]
