@@ -94,6 +94,74 @@ pub(super) fn is_color(text: &str) -> bool {
     values::computed_color(text).is_some()
 }
 
+/// CSS Conditional 5 #container-lengths: container query length units in a
+/// property value compute to absolute lengths, each against its axis's
+/// nearest eligible query container (recorded as a dependency, so layout
+/// settles again when that container resizes) or the small viewport size.
+/// `None` when `value` has no such unit. Strings and URLs are untouched.
+pub(crate) fn resolve_container_units(dom: &Dom, id: NodeId, value: &str) -> Option<String> {
+    if !value
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair.eq_ignore_ascii_case(b"cq"))
+    {
+        return None;
+    }
+    let ctx = Context {
+        dom: Some(dom),
+        id,
+        pseudo: None,
+        base: None,
+        independent: false,
+    };
+    fn rewrite<'i>(
+        p: &mut Parser<'i, '_>,
+        ctx: &Context<'_>,
+        out: &mut String,
+        changed: &mut bool,
+    ) -> ParseResult<'i, cssparser::SourcePosition> {
+        let mut start = p.position();
+        loop {
+            let before = p.position();
+            let Ok(token) = p.next_including_whitespace_and_comments() else {
+                break;
+            };
+            match token.clone() {
+                Token::Dimension { value, unit, .. } => {
+                    let unit = unit.to_ascii_lowercase();
+                    if matches!(
+                        unit.as_str(),
+                        "cqw" | "cqh" | "cqi" | "cqb" | "cqmin" | "cqmax"
+                    ) && let Some(scale) = values::length_scale(&unit, ctx)
+                    {
+                        out.push_str(p.slice(start..before));
+                        out.push_str(&math::number(f64::from(value) * scale));
+                        out.push_str("px");
+                        start = p.position();
+                        *changed = true;
+                    }
+                }
+                Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock => {
+                    out.push_str(p.slice_from(start));
+                    start = p.parse_nested_block(|p| rewrite(p, ctx, out, changed))?;
+                }
+                _ => {}
+            }
+        }
+        out.push_str(p.slice_from(start));
+        Ok(p.position())
+    }
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let mut out = String::with_capacity(value.len());
+    let mut changed = false;
+    rewrite(&mut parser, &ctx, &mut out, &mut changed).ok()?;
+    changed.then_some(out)
+}
+
 /// CSS Color 4 #resolving-color-values for CSSOM: sRGB-family colors as
 /// `rgb()`/`rgba()`, other spaces in their own notation. `None` for
 /// `currentcolor`, system colors and non-colors, which the caller resolves.

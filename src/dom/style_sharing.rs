@@ -308,6 +308,10 @@ impl Dom {
         // values while finishing it. Keep their existing computation intact.
         !index.has_revert_layer
             && !index.has_container_queries
+            && !index.has_container_units
+            && !self
+                .attr(id, "style")
+                .is_some_and(super::mentions_container_unit)
             && index.slotted_rules.is_empty()
             && !self
                 .attr(id, "style")

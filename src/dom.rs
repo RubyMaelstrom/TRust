@@ -4568,6 +4568,13 @@ impl Dom {
         } else {
             self.resolve_vars_owned(id, value)
         };
+        // CSS Conditional 5 #container-lengths: cq units compute to lengths;
+        // custom properties keep their token streams until substituted.
+        let value = if name.starts_with("--") {
+            value
+        } else {
+            properties::resolve_container_units(self, id, &value).unwrap_or(value)
+        };
         let inherited = || prop_index(name).is_some_and(|index| PROPS[index].inherited);
         match resolved_wide_keyword(&value) {
             Some(WideKeyword::Initial) => None,
@@ -6824,6 +6831,11 @@ impl Dom {
                 .any(|(_, (_, value))| value.to_ascii_lowercase().contains("revert-layer"))
         });
         index.has_container_queries = unique.iter().copied().any(|r| !r.containers.is_empty());
+        index.has_container_units = unique.iter().copied().any(|r| {
+            r.decls
+                .iter()
+                .any(|(_, (_, value))| mentions_container_unit(value))
+        });
         index.has_focus_rules = index
             .scopes
             .values()
@@ -10719,6 +10731,14 @@ enum VarResult {
     Resolved(String),
     Undefined,
     Cycle,
+}
+
+/// Whether a declaration value may contain a container query length unit
+/// (`cqw`, `cqh`, `cqi`, `cqb`, `cqmin`, `cqmax`) after a number.
+pub(crate) fn mentions_container_unit(value: &str) -> bool {
+    value.as_bytes().windows(3).any(|window| {
+        (window[0].is_ascii_digit() || window[0] == b'.') && window[1..].eq_ignore_ascii_case(b"cq")
+    })
 }
 
 fn needs_var_substitution(value: &str) -> bool {
@@ -15300,6 +15320,10 @@ struct StyleIndex {
     has_focus_rules: bool,
     font_sets: FxHashMap<NodeId, std::sync::Arc<crate::text::FontSet>>,
     has_container_queries: bool,
+    /// Some declaration uses a container query length unit, whose computed
+    /// value depends on laid-out container sizes (CSS Conditional 5
+    /// #container-lengths), so shared style records cannot be reused.
+    has_container_units: bool,
     has_revert_layer: bool,
     selector_dependencies: invalidation::SelectorDependencyIndex,
     scopes: FxHashMap<NodeId, Vec<StyleRule>>,
@@ -15573,6 +15597,7 @@ impl StyleIndex {
             has_focus_rules: _,
             font_sets,
             has_container_queries,
+            has_container_units,
             has_revert_layer,
             selector_dependencies,
             scopes,
@@ -15596,6 +15621,7 @@ impl StyleIndex {
             has_first_letter,
             has_marker,
             has_container_queries,
+            has_container_units,
             has_revert_layer,
             boxless_content_may_escape,
         );

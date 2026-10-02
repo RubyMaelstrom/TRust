@@ -1280,6 +1280,42 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn container_units_compute_to_lengths_in_ordinary_properties() {
+        // CSS Conditional 5 #container-lengths: cq units are lengths in any
+        // property, not only through registered custom properties. A carousel
+        // image capped at `max-width:100cqw` rendered at its natural size.
+        let mut dom = Dom::parse_document(
+            r#"<style>
+            #container { container-type:inline-size; width:200px }
+            #child { width:1000px; max-width:calc(100cqw - 10px); height:11px }
+            #flat { width:5cqi; height:11px }
+        </style><div id=container><div id=child></div><div id=flat></div></div>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let vp = Viewport::new(640., 480.);
+        let child = dom.get_by_id("child").unwrap();
+        let flat = dom.get_by_id("flat").unwrap();
+        let container = dom.get_by_id("container").unwrap();
+        for width in [200, 350, 120] {
+            dom.set_attr(container, "style", &format!("width:{width}px"));
+            let layout = measure_retained_layout(
+                &dom,
+                &base,
+                vp,
+                &[],
+                &ControlMap::new(),
+                &ImageSizes::new(),
+            );
+            assert_eq!(layout.boxes[&child].width, f64::from(width) - 10.);
+            assert_eq!(layout.boxes[&flat].width, f64::from(width) / 20.);
+            assert_eq!(
+                dom.computed_value_resolved(child, "max-width"),
+                Some(format!("calc({}px - 10px)", width))
+            );
+        }
+    }
+
+    #[test]
     fn gallery_edit_reuses_independent_cards_with_bounded_storage() {
         use super::super::diagnostics::{Op, measure};
         let base = Url::parse("https://gallery.test/").unwrap();
