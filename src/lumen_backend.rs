@@ -128,6 +128,10 @@ enum LumenHostTask {
         name: String,
         kind: LumenResourceKind,
         result: LumenResourceResult,
+        /// A fetched style sheet's text with its imports expanded and its
+        /// URLs resolved against the response URL
+        /// (`http::fetched_stylesheet_text`).
+        stylesheet: Option<String>,
         timing: Option<LumenResourceTiming>,
         external: bool,
     },
@@ -9800,6 +9804,7 @@ fn send_resource_completion(
             name,
             kind,
             result,
+            stylesheet: None,
             timing: None,
             external,
         })
@@ -9849,6 +9854,7 @@ fn spawn_resource_fetch(
     let shared = cache.consume_resource(&request.url, &client, destination, credentials);
     let trace_fetch = std::env::var_os("TRUST_TRACE_FETCH").is_some();
     cache.spawn(&handle, async move {
+        let mut response_url = request.url.clone();
         let (result, timing) = match shared {
             Some((shared, preloaded)) => match shared.await {
                 Ok(response) => {
@@ -9862,6 +9868,9 @@ fn spawn_resource_fetch(
                             started,
                         )
                     };
+                    if let Some(url) = response.url_list.last() {
+                        response_url = url.clone();
+                    }
                     (
                         Some((
                             response.status,
@@ -9883,6 +9892,7 @@ fn spawn_resource_fetch(
                         response.timing,
                         started,
                     );
+                    response_url = response.url;
                     (
                         Some((
                             response.status,
@@ -9898,6 +9908,16 @@ fn spawn_resource_fetch(
                     LumenResourceTiming::fetched(name.clone(), initiator, error.timing, started),
                 ),
             },
+        };
+        let stylesheet = match &result {
+            Some((status, content_type, body, headers))
+                if matches!(kind, LumenResourceKind::Stylesheet)
+                    && crate::http::stylesheet_response_allowed(*status, content_type, headers) =>
+            {
+                let css = crate::http::decode_body(content_type, body);
+                Some(crate::http::fetched_stylesheet_text(css, response_url, client).await)
+            }
+            _ => None,
         };
         if trace_fetch {
             match &result {
@@ -9915,6 +9935,7 @@ fn spawn_resource_fetch(
             name,
             kind,
             result,
+            stylesheet,
             timing,
             external: true,
         });
@@ -11732,6 +11753,7 @@ fn run_resource_task(
     name: String,
     kind: LumenResourceKind,
     result: LumenResourceResult,
+    stylesheet: Option<String>,
     external: bool,
 ) -> Result<(), String> {
     match kind {
@@ -11789,7 +11811,11 @@ fn run_resource_task(
             Some((status, content_type, body, headers))
                 if crate::http::stylesheet_response_allowed(status, &content_type, &headers) =>
             {
-                let css = crate::http::decode_body(&content_type, &body);
+                // CSS Values 4 #relative-urls: a fetched sheet arrives with
+                // its URLs resolved against its own response URL. Only an
+                // undelivered (`data:`) sheet is decoded here.
+                let css =
+                    stylesheet.unwrap_or_else(|| crate::http::decode_body(&content_type, &body));
                 let dom = engine
                     .ctx()
                     .host_mut::<HostState>()
@@ -11987,6 +12013,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             name,
             kind,
             result,
+            stylesheet,
             timing,
             external,
         } => {
@@ -12004,7 +12031,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             // against the wrong Realm-local listener registry.
             if context == engine.ctx().host_job_context() {
                 record_resource_timing(engine.ctx(), timing);
-                run_resource_task(engine, node_id, name, kind, result, external)?;
+                run_resource_task(engine, node_id, name, kind, result, stylesheet, external)?;
             } else {
                 let realm = engine
                     .ctx()
@@ -12018,7 +12045,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 };
                 match engine.with_embed_realm(&realm, move |engine| {
                     record_resource_timing(engine.ctx(), timing);
-                    run_resource_task(engine, node_id, name, kind, result, external)
+                    run_resource_task(engine, node_id, name, kind, result, stylesheet, external)
                 }) {
                     Ok(result) => result?,
                     Err(error) => {
@@ -23609,6 +23636,116 @@ mod tests {
                 .host_mut::<HostState>()
                 .map(|state| state.pending_resources),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn injected_stylesheets_resolve_urls_against_their_response_url() {
+        // CSS Values 4 #relative-urls: a style sheet's own URL, after
+        // redirects, is the base of its url() tokens and @import rules,
+        // whether the parser or a script inserted its <link>.
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let page = url::Url::parse(&format!("{origin}/page/index.html")).unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut request = Vec::new();
+                let mut bytes = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    match stream.read(&mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => request.extend_from_slice(&bytes[..count]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request);
+                let path = head.split_whitespace().nth(1).unwrap_or("");
+                let (status, location, body) = match path {
+                    "/old/frame.css" => (302, "Location: /a/sheets/frame.css\r\n", ""),
+                    "/a/sheets/frame.css" => (
+                        200,
+                        "",
+                        "@import 'deep/child.css'; #t { background-image: url('../g.png') }",
+                    ),
+                    "/a/sheets/deep/child.css" => (200, "", "#u { background-image: url(c.png) }"),
+                    _ => (404, "", ""),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} Status\r\n{location}Content-Type: text/css\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            r#"
+                const html = document.createElement('html');
+                const head = document.createElement('head');
+                const body = document.createElement('body');
+                document.appendChild(html); html.appendChild(head); html.appendChild(body);
+                for (const id of ['t', 'u']) {
+                    const target = document.createElement('div');
+                    target.id = id;
+                    body.appendChild(target);
+                }
+                globalThis.sheetEvents = [];
+                const link = document.createElement('link');
+                link.rel = 'stylesheet'; link.href = '/old/frame.css';
+                link.onload = () => sheetEvents.push('load');
+                link.onerror = () => sheetEvents.push('error');
+                head.appendChild(link);
+            "#,
+            "insert a stylesheet",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        while engine
+            .ctx()
+            .host_mut::<HostState>()
+            .is_some_and(|state| state.pending_resources > 0)
+        {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(10), task_rx.recv()).await
+                })
+                .expect("stylesheet task completes")
+                .expect("resource task channel remains open");
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(string_value(&mut engine, "sheetEvents.join()"), "load");
+        let image = |engine: &mut lumen::Engine, id: &str| {
+            string_value(
+                engine,
+                &format!("getComputedStyle(document.getElementById('{id}')).backgroundImage"),
+            )
+        };
+        let sheet = image(&mut engine, "t");
+        assert!(sheet.contains(&format!("{origin}/a/g.png")), "{sheet}");
+        let imported = image(&mut engine, "u");
+        assert!(
+            imported.contains(&format!("{origin}/a/sheets/deep/c.png")),
+            "{imported}"
         );
     }
 
