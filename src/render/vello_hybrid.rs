@@ -10,7 +10,9 @@
 //! non-isolated destructive blends are unsupported, glyph-atlas caching is
 //! still experimental, and several allocation failures panic instead of
 //! returning `RenderError`. TRust uses isolated single-primitive color filters;
-//! complex graphs and masks are not emitted. The desktop contains a
+//! complex graphs and Vello mask layers are not emitted. CSS masks instead
+//! composite as isolated destination-in/source-in/source-out layers, which
+//! Hybrid schedules over their parent group. The desktop contains a
 //! backend panic/error by dropping Hybrid and replaying the unchanged list on
 //! CPU. Making those failure paths fallible and stabilizing resource lifetime
 //! APIs are good upstream Vello contributions.
@@ -821,8 +823,8 @@ impl VelloHybridRenderer {
                     }
                     apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     target.push_layer(
-                        None,
-                        Some(vello_blend(layer.blend)),
+                        layer.clip.map(rect_path).as_ref(),
+                        Some(vello_blend(layer.blend, layer.compose)),
                         Some(layer.opacity.clamp(0.0, 1.0)),
                         None,
                         None,

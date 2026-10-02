@@ -17,9 +17,10 @@ use vello_cpu::peniko::{
 use vello_cpu::{ImageSource, Pixmap, RenderContext, Resources};
 
 use super::{
-    Affine2d, BlendMode, CssFilter, CssRect, DecorationStyle, DisplayCommand, ImageFit,
-    ImageHandle, ImageSampling, LineCap, LineJoin, PaintBrush, PaintColor, PaintShape, PathElement,
-    Primitive, RasterBackend, RasterFrame, Scene, StrokeStyle, is_desktop_heart_image_handle,
+    Affine2d, BlendMode, CompositeOperator, CssFilter, CssRect, DecorationStyle, DisplayCommand,
+    ImageFit, ImageHandle, ImageSampling, LineCap, LineJoin, PaintBrush, PaintColor, PaintShape,
+    PathElement, Primitive, RasterBackend, RasterFrame, Scene, StrokeStyle,
+    is_desktop_heart_image_handle,
 };
 use crate::core::{CssPoint, PhysicalSize};
 
@@ -274,8 +275,8 @@ impl VelloCpuRenderer {
                     }
                     apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.context.push_layer(
-                        None,
-                        Some(vello_blend(layer.blend)),
+                        layer.clip.map(rect_path).as_ref(),
+                        Some(vello_blend(layer.blend, layer.compose)),
                         Some(layer.opacity.clamp(0.0, 1.0)),
                         None,
                         None,
@@ -1068,7 +1069,12 @@ pub(super) fn vello_stroke(style: &StrokeStyle) -> Stroke {
         )
 }
 
-pub(super) fn vello_blend(mode: BlendMode) -> vello_cpu::peniko::BlendMode {
+/// A group's CSS Compositing 1 blending (#blending) and Porter-Duff
+/// compositing (#porterduffcompositingoperators) as one Vello blend mode.
+pub(super) fn vello_blend(
+    mode: BlendMode,
+    compose: CompositeOperator,
+) -> vello_cpu::peniko::BlendMode {
     let mix = match mode {
         BlendMode::Normal => Mix::Normal,
         BlendMode::Multiply => Mix::Multiply,
@@ -1087,7 +1093,14 @@ pub(super) fn vello_blend(mode: BlendMode) -> vello_cpu::peniko::BlendMode {
         BlendMode::Color => Mix::Color,
         BlendMode::Luminosity => Mix::Luminosity,
     };
-    vello_cpu::peniko::BlendMode::new(mix, Compose::SrcOver)
+    let compose = match compose {
+        CompositeOperator::SourceOver => Compose::SrcOver,
+        CompositeOperator::SourceIn => Compose::SrcIn,
+        CompositeOperator::SourceOut => Compose::SrcOut,
+        CompositeOperator::DestinationIn => Compose::DestIn,
+        CompositeOperator::Xor => Compose::Xor,
+    };
+    vello_cpu::peniko::BlendMode::new(mix, compose)
 }
 
 /// CSS Text Decoration 4 §4 and CSS Backgrounds 3 #shadow-blur: a blurred
@@ -1690,11 +1703,11 @@ mod tests {
             scene.primitives.extend([
                 DisplayCommand::PushTransform(Affine2d::translate(0., 1_000. + row as f32 * 40.)),
                 DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 90., 30.))),
-                DisplayCommand::PushLayer(CompositingLayer {
-                    opacity: 0.6,
-                    blend: BlendMode::Multiply,
-                    filters: Arc::from([]),
-                }),
+                DisplayCommand::PushLayer(CompositingLayer::new(
+                    0.6,
+                    BlendMode::Multiply,
+                    Arc::from([]),
+                )),
                 DisplayCommand::PushTransform(Affine2d::translate(3., 2.)),
                 DisplayCommand::FillRect {
                     rect: CssRect::new(0., 0., 90., 30.),
@@ -1740,11 +1753,11 @@ mod tests {
                     },
                 }),
                 DisplayCommand::PopTransform,
-                DisplayCommand::PushLayer(super::super::CompositingLayer {
-                    opacity: 0.6,
-                    blend: BlendMode::Multiply,
-                    filters: Default::default(),
-                }),
+                DisplayCommand::PushLayer(super::super::CompositingLayer::new(
+                    0.6,
+                    BlendMode::Multiply,
+                    Default::default(),
+                )),
                 DisplayCommand::PushTransform(Affine2d([0.9, 0.2, -0.1, 0.8, -3.5, 6.25])),
                 DisplayCommand::PushClip(PaintShape::Polygon {
                     points: vec![

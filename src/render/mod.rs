@@ -26,6 +26,8 @@ pub mod vello_hybrid;
 #[cfg(test)]
 mod image_raster_tests;
 #[cfg(test)]
+mod mask_raster_tests;
+#[cfg(test)]
 mod text_raster_tests;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -290,12 +292,54 @@ pub enum BlendMode {
     Luminosity,
 }
 
+/// CSS Compositing 1 #porterduffcompositingoperators: how a group's pixels
+/// combine with the backdrop inside its parent group. Masking is the only
+/// user of the operators other than source-over: CSS Masking 1 #MaskValues
+/// multiplies the masked group by the mask's alpha (destination-in), and
+/// #the-mask-composite combines mask layers with the others.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompositeOperator {
+    /// #porterduffcompositingoperators_srcover (and `mask-composite: add`).
+    #[default]
+    SourceOver,
+    /// #porterduffcompositingoperators_srcin (`mask-composite: intersect`).
+    SourceIn,
+    /// #porterduffcompositingoperators_srcout (`mask-composite: subtract`).
+    SourceOut,
+    /// #porterduffcompositingoperators_dstin: the backdrop's alpha is
+    /// multiplied by the group's, and its color is kept.
+    DestinationIn,
+    /// #porterduffcompositingoperators_xor (`mask-composite: exclude`).
+    Xor,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompositingLayer {
     pub opacity: f32,
     pub blend: BlendMode,
     /// Ordered CSS filter functions, applied before group opacity.
     pub filters: Arc<[CssFilter]>,
+    /// The Porter-Duff operator that composites the group, with `blend` as
+    /// its mixing function.
+    pub compose: CompositeOperator,
+    /// A paint-only clip in the layer's local coordinates: group pixels
+    /// outside it are discarded. Unlike `PushClip` it does not restrict hit
+    /// testing, as CSS Masking 1 #the-mask-image-rendering-model requires
+    /// for a mask (whose painting areas this bounds).
+    pub clip: Option<CssRect>,
+}
+
+impl CompositingLayer {
+    /// A source-over group with this opacity, blend mode and filters.
+    pub fn new(opacity: f32, blend: BlendMode, filters: Arc<[CssFilter]>) -> Self {
+        Self {
+            opacity,
+            blend,
+            filters,
+            compose: CompositeOperator::SourceOver,
+            clip: None,
+        }
+    }
 }
 
 /// One CSS Filter Effects 1 filter function, in the element's local CSS px.
@@ -1640,6 +1684,9 @@ fn bounded_scope_change(old: &DisplayCommand, new: &DisplayCommand) -> bool {
                 && b.blend == BlendMode::Normal
                 && a.filters.is_empty()
                 && b.filters.is_empty()
+                && a.compose == CompositeOperator::SourceOver
+                && b.compose == CompositeOperator::SourceOver
+                && a.clip == b.clip
         }
         _ => false,
     }
@@ -2604,11 +2651,12 @@ impl Scene {
                         )));
                     let opacity = sample_css_animation_opacity(scope, elapsed_seconds);
                     if let Some(opacity) = opacity {
-                        self.primitives.push(Primitive::PushLayer(CompositingLayer {
-                            opacity,
-                            blend: BlendMode::Normal,
-                            filters: Arc::from([]),
-                        }));
+                        self.primitives
+                            .push(Primitive::PushLayer(CompositingLayer::new(
+                                opacity,
+                                BlendMode::Normal,
+                                Arc::from([]),
+                            )));
                     }
                     animation_layers.push(opacity.is_some());
                 }
@@ -4271,11 +4319,11 @@ mod tests {
                 color: PaintColor::Accent,
             },
             DisplayCommand::PopClip,
-            DisplayCommand::PushLayer(CompositingLayer {
-                opacity: 0.6,
-                blend: BlendMode::Multiply,
-                filters: Default::default(),
-            }),
+            DisplayCommand::PushLayer(CompositingLayer::new(
+                0.6,
+                BlendMode::Multiply,
+                Default::default(),
+            )),
             DisplayCommand::FillRect {
                 rect: CssRect::new(40.0, 15.0, 3.0, 16.0),
                 color: PaintColor::Accent,
@@ -4336,11 +4384,11 @@ mod tests {
             ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
         let mut old = desktop_shell(viewport, &snapshot());
         old.primitives.extend([
-            DisplayCommand::PushLayer(CompositingLayer {
-                opacity: 0.5,
-                blend: BlendMode::Normal,
-                filters: Default::default(),
-            }),
+            DisplayCommand::PushLayer(CompositingLayer::new(
+                0.5,
+                BlendMode::Normal,
+                Default::default(),
+            )),
             DisplayCommand::PushTransform(Affine2d::translate(0., 500.)),
             DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(0., 0., 30., 30.))),
             DisplayCommand::FillRect {

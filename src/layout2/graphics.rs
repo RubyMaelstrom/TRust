@@ -2653,11 +2653,11 @@ fn push_layer(fragment: &Frag, builder: &mut Builder<'_>) -> bool {
     {
         builder
             .commands
-            .push(DisplayCommand::PushLayer(CompositingLayer {
+            .push(DisplayCommand::PushLayer(CompositingLayer::new(
                 opacity,
                 blend,
-                filters: fragment.paint.filters.clone(),
-            }));
+                fragment.paint.filters.clone(),
+            )));
         true
     } else {
         false
@@ -2965,11 +2965,11 @@ fn paint_background_images_for_style(
         if blend != BlendMode::Normal {
             builder
                 .commands
-                .push(DisplayCommand::PushLayer(CompositingLayer {
-                    opacity: 1.0,
+                .push(DisplayCommand::PushLayer(CompositingLayer::new(
+                    1.0,
                     blend,
-                    filters: std::sync::Arc::from([]),
-                }));
+                    std::sync::Arc::from([]),
+                )));
             blending = true;
         }
         let shape = if fixed && canvas.is_some() {
@@ -6376,11 +6376,11 @@ fn background_blends(dom: &Dom, style: PaintStyle) -> bool {
 /// Open a CSS Compositing 1 #isolatedgroups group: normal blending, full
 /// opacity, and a transparent black initial backdrop.
 fn isolated_group() -> DisplayCommand {
-    DisplayCommand::PushLayer(CompositingLayer {
-        opacity: 1.0,
-        blend: BlendMode::Normal,
-        filters: std::sync::Arc::from([]),
-    })
+    DisplayCommand::PushLayer(CompositingLayer::new(
+        1.0,
+        BlendMode::Normal,
+        std::sync::Arc::from([]),
+    ))
 }
 
 /// `top` composited over an opaque `bottom` (CSS Compositing 1 #simplealphacompositing).
