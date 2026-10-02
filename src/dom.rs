@@ -1299,9 +1299,8 @@ impl Dom {
                 let inline_cursor = self.cssom_inline.get(&id).map_or_else(
                     || {
                         self.attr(id, "style").is_some_and(|style| {
-                            split_top_level(style, ';')
+                            parse_declaration_block(style, false)
                                 .into_iter()
-                                .filter_map(parse_decl)
                                 .any(|(name, _, _)| name == "cursor")
                         })
                     },
@@ -5411,10 +5410,7 @@ impl Dom {
                 Some(declarations) => declarations,
                 None => {
                     let quirks = self.in_quirks_mode(id);
-                    parsed = split_top_level(style, ';')
-                        .into_iter()
-                        .filter_map(|decl| parse_decl_in(decl, quirks))
-                        .collect::<Vec<_>>();
+                    parsed = parse_declaration_block(style, quirks);
                     &parsed
                 }
             };
@@ -15274,6 +15270,20 @@ impl RuleBuckets {
     }
 }
 
+/// CSSOM #parse-a-css-declaration-block for a `style` attribute (CSS Style
+/// Attributes §3 gives it the same syntax as a sheet's declaration block).
+/// CSS Syntax 3 #consume-comments runs before every token, so comments are
+/// removed from the whole block before it is split: a `;`, quote or
+/// parenthesis inside `/* ... */` neither separates nor swallows the
+/// declarations around it.
+fn parse_declaration_block(text: &str, quirks: bool) -> Vec<(String, String, bool)> {
+    let text = strip_css_comments(text);
+    split_top_level(&text, ';')
+        .into_iter()
+        .filter_map(|decl| parse_decl_in(decl, quirks))
+        .collect()
+}
+
 /// Parse one `prop: value [!important]` declaration. CSS keywords are ASCII
 /// case-insensitive, but strings and URL payloads are not: lowercasing a URL
 /// here changes the resource identity on case-sensitive servers (for example
@@ -24633,5 +24643,43 @@ mod tests {
             cv("gta", "grid-template-columns").as_deref(),
             Some("1fr 2fr")
         );
+    }
+
+    #[test]
+    fn style_attribute_comments_never_split_or_swallow_declarations() {
+        // CSS Syntax 3 #consume-comments: a `;`, quote or parenthesis inside
+        // a comment is not a separator, string or block, so the style
+        // attribute's declaration after the comment still applies (CSSOM
+        // #parse-a-css-declaration-block; CSS Style Attributes §3).
+        for doctype in ["<!DOCTYPE html>", ""] {
+            let dom = Dom::parse_document(&format!(
+                "{doctype}<body>\
+                 <div id=a style=\"width:50px;/* float: left; */padding-left:20px\">a</div>\
+                 <div id=b style=\"width:50px; /* float: left; */\n padding-left:20px\">b</div>\
+                 <div id=f style=\"width:5px;/* a: b; */padding-left:20px;/* c; */margin-left:5px\">f</div>\
+                 <div id=g style=\"width:5px;/* don't */padding-left:20px;margin-left:5px\">g</div>\
+                 <div id=p style=\"/* ( */padding-left:20px;/* [ */margin-left:5px\">p</div>\
+                 <div id=c style=\"/* ; */cursor:move\">c</div>\
+                 </body>"
+            ));
+            let id = |s: &str| dom.get_by_id(s).unwrap();
+            let cv = |s: &str, p: &str| dom.computed_value(id(s), p);
+            for el in ["a", "b", "f", "g", "p"] {
+                assert_eq!(
+                    cv(el, "padding-left").as_deref(),
+                    Some("20px"),
+                    "{el} {doctype:?}"
+                );
+            }
+            for el in ["f", "g", "p"] {
+                assert_eq!(
+                    cv(el, "margin-left").as_deref(),
+                    Some("5px"),
+                    "{el} {doctype:?}"
+                );
+            }
+            assert_eq!(cv("c", "cursor").as_deref(), Some("move"));
+            assert_eq!(dom.cursor_style_candidates(&[id("c")]), vec![id("c")]);
+        }
     }
 }
