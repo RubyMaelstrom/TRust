@@ -126,8 +126,9 @@ struct ComputationInput {
     ua: UaContext,
 }
 
-/// HTML Rendering, Phrasing content / Lists / Form controls / Details and
-/// summary (local HTML e5071a20, source lines 151202/151475/152031/152908). These are
+/// HTML Rendering, Phrasing content / Lists / Tables / Form controls / Details
+/// and summary (local HTML e5071a20, source lines 151202/151475/151665/152031/
+/// 152908). These are
 /// additional UA-cascade inputs, not reasons to make an entire subtree private.
 /// Store the resulting bounded UA state, never a node identity or attribute text.
 #[derive(Hash, PartialEq, Eq)]
@@ -137,6 +138,7 @@ enum UaContext {
     List(&'static str),
     Input(bool),
     Summary(Option<bool>),
+    Align(Option<&'static str>),
 }
 
 impl UaContext {
@@ -150,6 +152,9 @@ impl UaContext {
                 dom.is_details_summary(id)
                     .then(|| dom.attr(dom.nodes[id].parent.unwrap(), "open").is_some()),
             ),
+            "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                Self::Align(dom.ua_paragraph_align(id, tag))
+            }
             _ => Self::Ordinary,
         }
     }

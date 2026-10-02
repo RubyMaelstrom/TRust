@@ -786,7 +786,7 @@ fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
     let p0 = [0.0f32; 4];
     let em = fs;
     let block = |v: f32| [v, 0.0, v, 0.0];
-    match tag {
+    let (mut margin, padding) = match tag {
         // The live presentation serializer cannot place a second <body>
         // inside the parent document, so it emits this marker div for an
         // iframe's child BODY formatting box. HTML Rendering §15.3.2 gives
@@ -828,7 +828,68 @@ fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
             [0.35 * em, 0.75 * em, 0.625 * em, 0.75 * em],
         ),
         _ => (m0, p0),
+    };
+    let (trim_start, trim_end) = quirks_margin_trims(dom, id, tag);
+    if trim_start {
+        margin[TOP] = 0.0;
     }
+    if trim_end {
+        margin[BOTTOM] = 0.0;
+    }
+    (margin, padding)
+}
+
+/// HTML Rendering #margin-collapsing-quirks: in a quirks-mode document, the
+/// UA block-start/-end margins an element with default margins drops as the
+/// first or last substantial child of a body, td or th (blank elements and
+/// p elements only in some positions). Returns (block-start, block-end).
+fn quirks_margin_trims(dom: &Dom, id: NodeId, tag: &str) -> (bool, bool) {
+    let with_default_margins = matches!(
+        tag,
+        "blockquote"
+            | "dir"
+            | "dl"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "listing"
+            | "menu"
+            | "ol"
+            | "p"
+            | "plaintext"
+            | "pre"
+            | "ul"
+            | "xmp"
+    );
+    if !with_default_margins || !dom.in_quirks_mode(id) {
+        return (false, false);
+    }
+    let Some(parent) = dom.node(id).parent else {
+        return (false, false);
+    };
+    let cell = matches!(dom.tag_name(parent), Some("td" | "th"));
+    if !cell && dom.tag_name(parent) != Some("body") {
+        return (false, false);
+    }
+    let substantial = |node: NodeId| match &dom.node(node).data {
+        crate::dom::NodeData::Text(text) => !text
+            .chars()
+            .all(|c| matches!(c, ' ' | '\t' | '\n' | '\u{c}' | '\r')),
+        crate::dom::NodeData::Element { .. } => true,
+        _ => false,
+    };
+    let siblings = dom.children(parent);
+    let index = siblings.iter().position(|&node| node == id).unwrap_or(0);
+    let first = !siblings[..index].iter().any(|&node| substantial(node));
+    let last = !siblings[index + 1..].iter().any(|&node| substantial(node));
+    let blank = !dom.children(id).into_iter().any(substantial);
+    (
+        first || (cell && last && blank),
+        (first && blank) || (cell && last && tag == "p"),
+    )
 }
 
 /// Horizontal alignment of an IFC's line boxes (CSS Text §7.1). Unlike the
@@ -842,10 +903,8 @@ pub(crate) enum Align2 {
     Justify,
 }
 
-/// The alignment governing `id`'s line boxes: the cascade's inherited
-/// `text-align` when set anywhere up the chain (via `computed_value`), else
-/// the HTML presentational hints — an `align` attribute or a `<center>`
-/// ancestor — which inherit like text-align but never enter the cascade.
+/// The alignment governing `id`'s line boxes: its computed `text-align`,
+/// which includes HTML's `align` and `<center>` presentational hints.
 pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
     if id == NO_NODE {
         return Align2::Left;
@@ -859,16 +918,6 @@ pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
     // when the cascade resolved no author alignment.
     if dom.effective_display(id).as_deref() == Some("table-caption") {
         return Align2::Center;
-    }
-    let mut cur = Some(id);
-    while let Some(n) = cur {
-        if dom.tag_name(n) == Some("center") {
-            return Align2::Center;
-        }
-        if let Some(a) = dom.attr(n, "align").and_then(align_from_css) {
-            return a;
-        }
-        cur = dom.node(n).parent;
     }
     Align2::Left
 }

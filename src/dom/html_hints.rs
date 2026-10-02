@@ -231,6 +231,27 @@ impl Dom {
                 }
             }
         }
+        // HTML Rendering #flow-content-3 and #tables-2: `<center>` and the
+        // `align` attribute of a div or table part align its text. (They
+        // also align descendant blocks; layout's `legacy_descendant_align`.)
+        let table_part = matches!(tag, "thead" | "tbody" | "tfoot" | "tr" | "td" | "th");
+        if tag == "center" {
+            hint("text-align", "center".into());
+        } else if (tag == "div" || table_part)
+            && let Some(align) = self.attr(id, "align")
+        {
+            let align = align.to_ascii_lowercase();
+            let value = match align.as_str() {
+                "center" | "middle" => Some("center"),
+                // #tables-2's UA sheet: `td[align=absmiddle i]` and so on.
+                "absmiddle" if table_part => Some("center"),
+                "left" | "right" | "justify" => Some(align.as_str()),
+                _ => None,
+            };
+            if let Some(value) = value {
+                hint("text-align", value.to_string());
+            }
+        }
         // HTML Rendering #the-hr-element-2.
         if tag == "hr" {
             match self
@@ -756,6 +777,42 @@ mod tests {
         assert_eq!(value("tall", "margin-left"), "0");
         assert_eq!(value("thin", "border-top-style"), "solid");
         assert_eq!(value("thin", "border-top-width"), "0.5px");
+    }
+
+    #[test]
+    fn align_attributes_and_center_are_text_align_hints() {
+        // HTML Rendering #flow-content-3 and #tables-2.
+        let mut dom = Dom::parse_document(
+            r#"<div style="text-align:right"><center id=c><p id=p>x</p><p id=pa align=LEFT>x</p></center>
+            <div id=d align=middle>x</div><h2 id=h align=justify>x</h2><div id=bad align=absmiddle>x</div></div>
+            <table><caption id=cap>c</caption><tr id=tr align=right><th id=th1>h</th></tr>
+            <tr><th id=th2>h</th><td id=td align=absmiddle>d</td><td id=styled align=center style="text-align:left">s</td></tr></table>"#,
+        );
+        let value = |id: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "text-align")
+                .unwrap_or_default()
+        };
+        assert_eq!(value("c"), "center");
+        assert_eq!(value("p"), "center", "inherited from <center>");
+        assert_eq!(value("pa"), "left");
+        assert_eq!(value("d"), "center");
+        assert_eq!(value("h"), "justify");
+        assert_eq!(value("bad"), "right", "absmiddle is only for table parts");
+        assert_eq!(value("cap"), "center");
+        assert_eq!(
+            value("th1"),
+            "right",
+            "a th inherits a non-initial alignment"
+        );
+        assert_eq!(value("th2"), "center");
+        assert_eq!(value("td"), "center");
+        assert_eq!(value("styled"), "left", "author style beats the hint");
+        let (p, td) = (dom.get_by_id("p").unwrap(), dom.get_by_id("td").unwrap());
+        dom.set_attr(p, "align", "right");
+        dom.set_attr(td, "align", "left");
+        let value = |id: NodeId| dom.computed_value_resolved(id, "text-align");
+        assert_eq!(value(p).as_deref(), Some("right"));
+        assert_eq!(value(td).as_deref(), Some("left"));
     }
 
     #[test]
