@@ -56,13 +56,16 @@ impl Dom {
             }
         }
         // HTML Rendering #the-textarea-element-2: `wrap=off` (ASCII
-        // case-insensitive) is a presentational hint for `white-space: pre`.
+        // case-insensitive) is a presentational hint for `white-space: pre`,
+        // which sets both of its longhands (CSS Text 4 #white-space-property).
         if tag == "textarea"
             && self
                 .attr(id, "wrap")
                 .is_some_and(|wrap| wrap.eq_ignore_ascii_case("off"))
         {
             hint("white-space", "pre".into());
+            hint("white-space-collapse", "preserve".into());
+            hint("text-wrap-mode", "nowrap".into());
         }
         // HTML Rendering #the-page: the first of the body's own margin
         // attributes, else its container frame's, maps to a pixel length on

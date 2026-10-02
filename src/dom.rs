@@ -5047,7 +5047,13 @@ impl Dom {
         let v = match name {
             // HTML Rendering #tables-2: in quirks mode a table does not
             // inherit these from its context.
-            "font-weight" | "font-style" | "font-variant" | "line-height" | "white-space"
+            "font-weight"
+            | "font-style"
+            | "font-variant"
+            | "line-height"
+            | "white-space"
+            | "white-space-collapse"
+            | "text-wrap-mode"
             | "text-align"
                 if tag == "table"
                     && self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
@@ -5056,6 +5062,8 @@ impl Dom {
                 match name {
                     "font-weight" => "400",
                     "text-align" => "start",
+                    "white-space-collapse" => "collapse",
+                    "text-wrap-mode" => "wrap",
                     _ => "normal",
                 }
             }
@@ -5110,14 +5118,25 @@ impl Dom {
             {
                 "underline"
             }
-            // HTML Rendering #flow-content-3 and #phrasing-content-3.
+            // HTML Rendering #flow-content-3 and #phrasing-content-3. The
+            // shorthand sets its longhands (CSS Text 4 #white-space-property)
+            // on the element itself, so they too belong to the UA origin and
+            // outrank an ancestor's inherited longhands.
             "white-space" if matches!(tag, "listing" | "plaintext" | "pre" | "xmp") => "pre",
+            "white-space-collapse" if matches!(tag, "listing" | "plaintext" | "pre" | "xmp") => {
+                "preserve"
+            }
+            "text-wrap-mode" if matches!(tag, "listing" | "plaintext" | "pre" | "xmp") => "nowrap",
             "white-space" if tag == "nobr" => "nowrap",
+            "white-space-collapse" if tag == "nobr" => "collapse",
+            "text-wrap-mode" if tag == "nobr" => "nowrap",
             // HTML Rendering #form-controls: `textarea { white-space:
             // pre-wrap }`. Gecko's and Blink's UA sheets also give it
             // `overflow-wrap: break-word`, so an unbreakable word wraps
             // inside the control instead of overflowing it.
             "white-space" if tag == "textarea" => "pre-wrap",
+            "white-space-collapse" if tag == "textarea" => "preserve",
+            "text-wrap-mode" if tag == "textarea" => "wrap",
             "overflow-wrap" if tag == "textarea" => "break-word",
             // HTML Rendering #flow-content-3 and #phrasing-content-3; every
             // engine's UA stylesheet also makes textarea monospace.
