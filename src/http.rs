@@ -9766,9 +9766,10 @@ mod tests {
         // graphical path must provide that appearance independently of the
         // terminal-only bracket affordance. Contenteditable is an ordinary
         // CSS box, not a native textarea widget (CSS UI 4 appearance:auto).
+        // The dark page's controls take the dark scheme's ButtonFace.
         let base = Url::parse("https://chatgpt.com/").unwrap();
         let mut dom = crate::dom::Dom::parse_document(
-            r##"<html><body style="margin:0;background:#000;color:#fff"><form>
+            r##"<html style="color-scheme:dark"><body style="margin:0;background:#000;color:#fff"><form>
                 <div id="editor" contenteditable="true" aria-placeholder="Message"></div>
                 <button id="send" type="submit" aria-label="Send">
                     <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 20 21 12 3 4v6l12 2-12 2v6Z"/></svg>
@@ -9795,7 +9796,7 @@ mod tests {
                     command,
                     crate::render::DisplayCommand::Fill {
                         brush: crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
-                            31, 34, 38, 255
+                            43, 42, 51, 255
                         )),
                         ..
                     }

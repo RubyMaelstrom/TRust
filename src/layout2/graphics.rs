@@ -955,7 +955,11 @@ fn paint_in_spaces(
             Some(canvas),
             None,
         );
-        background_color(dom, style_node).filter(|color| !color.is_transparent())
+        // CSS Color Adjust 1 #color-scheme-effect: the root's color scheme
+        // sets the canvas surface.
+        background_color(dom, style_node)
+            .filter(|color| !color.is_transparent())
+            .or_else(|| canvas_surface(dom, root.node))
     } else {
         None
     };
@@ -2302,18 +2306,18 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
                 .is_some()
         })
     });
-    let foreground = text_color(builder.dom, node, false);
-    let light_foreground = paint_color_is_light(foreground);
-    let surface = if light_foreground {
-        PaintColor::Rgba(31, 34, 38, 255)
-    } else {
-        PaintColor::Rgba(255, 255, 255, 255)
-    };
-    let edge = if light_foreground {
-        PaintColor::Rgba(125, 130, 138, 255)
-    } else {
-        PaintColor::Rgba(118, 118, 118, 255)
-    };
+    // CSS Color Adjust 1 #color-scheme-effect: form controls take the
+    // default colors of the element's color scheme.
+    let scheme = builder.dom.color_scheme(node);
+    let surface = scheme_color(
+        scheme,
+        if builder.dom.tag_name(node) == Some("button") {
+            "buttonface"
+        } else {
+            "field"
+        },
+    );
+    let edge = scheme_color(scheme, "buttonborder");
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     if !background_declared {
         builder.commands.push(DisplayCommand::Fill {
@@ -2383,13 +2387,18 @@ fn paint_number_spin_buttons(fragment: &Frag, builder: &mut Builder<'_>) {
     }
 }
 
-fn paint_color_is_light(color: PaintColor) -> bool {
-    let (r, g, b) = match color {
-        PaintColor::Rgba(r, g, b, _) => (r, g, b),
-        PaintColor::Foreground | PaintColor::Content | PaintColor::Window => (220, 220, 220),
-        _ => (30, 30, 30),
-    };
-    (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) >= 128_000
+/// A system color of `scheme` (CSS Color 4 #css-system-colors).
+fn scheme_color(scheme: crate::dom::color_scheme::ColorScheme, name: &str) -> PaintColor {
+    crate::dom::color_scheme::system_color(name, scheme)
+        .and_then(PaintColor::parse_css)
+        .unwrap_or(PaintColor::Rgba(255, 255, 255, 255))
+}
+
+/// The canvas surface a root element's color scheme supplies when no
+/// background reaches the canvas: none for light, the page's default.
+fn canvas_surface(dom: &Dom, root: NodeId) -> Option<PaintColor> {
+    let scheme = dom.color_scheme(root);
+    (scheme == crate::dom::color_scheme::ColorScheme::Dark).then(|| scheme_color(scheme, "canvas"))
 }
 
 /// Paint a CSS Basic User Interface 4 §3 outline. Unlike a border, the
@@ -2595,7 +2604,7 @@ fn nested_canvas_background_source(dom: &Dom, node: NodeId) -> Option<NodeId> {
 }
 
 fn paint_nested_document_canvas(fragment: &Frag, builder: &mut Builder<'_>) {
-    let Some((_root, style_node)) = frame_canvas_background(builder.dom, fragment.node) else {
+    let Some((root, style_node)) = frame_canvas_background(builder.dom, fragment.node) else {
         return;
     };
     let Some(container) = builder
@@ -2624,8 +2633,13 @@ fn paint_nested_document_canvas(fragment: &Frag, builder: &mut Builder<'_>) {
     builder
         .commands
         .push(DisplayCommand::BeginScroll(container.node));
+    // CSS Color Adjust 1 #color-scheme-effect: an embedded document whose
+    // root's color scheme differs from the embedding element's gets an
+    // opaque Canvas instead of a transparent canvas.
+    let differs = builder.dom.color_scheme(root) != builder.dom.color_scheme(fragment.node);
     if let Some(color) = background_color(builder.dom, style_node)
-        && !color.is_transparent()
+        .filter(|color| !color.is_transparent())
+        .or_else(|| differs.then(|| scheme_color(builder.dom.color_scheme(root), "canvas")))
     {
         builder.commands.push(DisplayCommand::Fill {
             shape: PaintShape::Rect(canvas),
@@ -6597,6 +6611,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_color_scheme_sets_the_canvas_frames_and_control_surfaces() {
+        // CSS Color Adjust 1 #color-scheme-effect: a dark root paints a dark
+        // Canvas; an iframe whose document's scheme differs gets an opaque
+        // canvas; controls take Field. Light text alone changes nothing.
+        let pixels = |html: &str, frame: Option<&str>| {
+            let mut dom = Dom::parse_document(html);
+            if let Some(markup) = frame {
+                let id = dom.get_by_id("f").unwrap();
+                dom.install_frame_document(id, markup, "https://frame.test/")
+                    .unwrap();
+            }
+            let layout = crate::layout2::lay_out_graphical(
+                &dom,
+                &Url::parse("https://page.test/").unwrap(),
+                crate::layout2::Viewport::new(200., 120.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(200., 120.))
+                .unwrap()
+                .pixels
+        };
+        let at = |pixels: &[u8], x: usize, y: usize| pixels[(y * 200 + x) * 4..][..3].to_vec();
+        let dark = pixels(
+            "<meta name=color-scheme content=dark><body style=margin:0><textarea              style='width:80px;height:40px;margin:50px 0 0 50px'></textarea>",
+            None,
+        );
+        assert_eq!(at(&dark, 10, 10), [28, 27, 34], "dark Canvas");
+        assert_eq!(at(&dark, 90, 70), [43, 42, 51], "dark Field");
+        let light_text = pixels(
+            "<body style='margin:0;color:#eee'><textarea              style='width:80px;height:40px;margin:50px 0 0 50px'></textarea>",
+            None,
+        );
+        assert_eq!(at(&light_text, 10, 10), [255, 255, 255]);
+        assert_eq!(at(&light_text, 90, 70), [255, 255, 255], "light Field");
+        let framed = pixels(
+            "<body style='margin:0;background:#fc0'><iframe id=f              style='border:0;width:100px;height:100px'></iframe>",
+            Some("<meta name=color-scheme content=dark><body>"),
+        );
+        assert_eq!(at(&framed, 50, 50), [28, 27, 34], "opaque dark canvas");
+        assert_eq!(at(&framed, 150, 50), [255, 204, 0]);
+        let same = pixels(
+            "<body style='margin:0;background:#fc0'><iframe id=f              style='border:0;width:100px;height:100px'></iframe>",
+            Some("<body>"),
+        );
+        assert_eq!(at(&same, 50, 50), [255, 204, 0], "transparent canvas");
     }
 
     #[test]
