@@ -4905,6 +4905,23 @@ mod tests {
     }
 
     #[test]
+    fn a_tables_width_attribute_uses_html_dimension_parsing() {
+        // HTML Rendering #tables-2 maps the width attribute with the rules
+        // for parsing non-zero dimension values, which read leading digits:
+        // `width="450px;"` is 450 pixels in Gecko and Blink, not auto.
+        let html = r#"<!doctype html><body style="margin:0">
+            <table id=a width="450px;" border=0 cellspacing=0><tr><td>a</td></tr></table>
+            <table id=b width=" 60%junk" border=0 cellspacing=0><tr><td>b</td></tr></table>
+            <table id=c width="0" border=0 cellspacing=0><tr><td>c</td></tr></table>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1000.0, &HashMap::new());
+        let width = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+        assert_eq!(width("a"), 450.0);
+        assert_eq!(width("b"), 600.0);
+        assert!(width("c") < 50.0, "zero is ignored: {}", width("c"));
+    }
+
+    #[test]
     fn a_tables_width_attribute_includes_its_border() {
         // HTML Rendering #tables-2: `table { box-sizing: border-box }`, so
         // the width attribute, mapped to 'width', sets the border box.
