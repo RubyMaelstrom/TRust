@@ -894,8 +894,16 @@ pub(super) fn vello_blend(mode: BlendMode) -> vello_cpu::peniko::BlendMode {
         BlendMode::Overlay => Mix::Overlay,
         BlendMode::Darken => Mix::Darken,
         BlendMode::Lighten => Mix::Lighten,
+        BlendMode::ColorDodge => Mix::ColorDodge,
+        BlendMode::ColorBurn => Mix::ColorBurn,
+        BlendMode::HardLight => Mix::HardLight,
+        BlendMode::SoftLight => Mix::SoftLight,
         BlendMode::Difference => Mix::Difference,
         BlendMode::Exclusion => Mix::Exclusion,
+        BlendMode::Hue => Mix::Hue,
+        BlendMode::Saturation => Mix::Saturation,
+        BlendMode::Color => Mix::Color,
+        BlendMode::Luminosity => Mix::Luminosity,
     };
     vello_cpu::peniko::BlendMode::new(mix, Compose::SrcOver)
 }

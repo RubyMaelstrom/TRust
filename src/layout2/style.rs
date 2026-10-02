@@ -215,6 +215,9 @@ pub(crate) struct BoxStyle {
     /// CSS Masking 1 §5: a clipping path forms a stacking context, but
     /// unlike a transform it does not establish a containing block.
     pub has_clip_path: bool,
+    /// CSS Compositing 1 #mix-blend-mode / #isolation: a non-normal blend
+    /// mode or `isolation: isolate` forms a stacking context.
+    pub compositing_group: bool,
     pub color_filters: std::sync::Arc<[[f32; 20]]>,
     pub filter_containing_block: bool,
     /// Used `opacity`, clamped to the CSS `<alpha-value>` range. Retaining the
@@ -285,6 +288,7 @@ impl BoxStyle {
             child_viewport: false,
             has_transform: false,
             has_clip_path: false,
+            compositing_group: false,
             color_filters: Default::default(),
             filter_containing_block: false,
             opacity: 1.0,
@@ -420,6 +424,7 @@ impl BoxStyle {
             child_viewport: matches!(tag, "iframe" | "frame"),
             has_transform,
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
+            compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
             color_filters: cv("filter")
                 .as_deref()
                 .and_then(super::filter::color_filters)
@@ -573,6 +578,7 @@ impl BoxStyle {
                 .iter()
                 .any(|prop| cv(prop).is_some_and(|value| !matches!(value.trim(), "" | "none"))),
             has_clip_path: cv("clip-path").is_some_and(|value| super::clip_path::supports(&value)),
+            compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
             color_filters: cv("filter")
                 .as_deref()
                 .and_then(super::filter::color_filters)
@@ -607,10 +613,16 @@ impl BoxStyle {
             || matches!(self.position, Pos::Fixed | Pos::Sticky)
             || self.has_transform
             || self.has_clip_path
+            || self.compositing_group
             || !self.color_filters.is_empty()
             || self.opacity < 1.0
             || (item && self.z_index.is_some())
     }
+}
+
+fn compositing_group(blend: Option<String>, isolation: Option<String>) -> bool {
+    blend.is_some_and(|blend| !blend.trim().eq_ignore_ascii_case("normal"))
+        || isolation.is_some_and(|isolation| isolation.trim().eq_ignore_ascii_case("isolate"))
 }
 
 /// Whether the element declares a rendered background: a background-color
