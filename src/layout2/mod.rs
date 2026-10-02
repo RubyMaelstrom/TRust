@@ -991,6 +991,7 @@ pub fn lay_graphical_subtree(
         imemo: Default::default(),
         grid_tracks: Default::default(),
         subgrid_rows: Default::default(),
+        marker_line: Default::default(),
     };
     let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
     Flow::offset_frag(&mut frag, rect.x, rect.y);
@@ -1382,6 +1383,7 @@ pub fn lay_subtree_fragment(
         imemo: Default::default(),
         grid_tracks: Default::default(),
         subgrid_rows: Default::default(),
+        marker_line: Default::default(),
     };
     let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
     // A standalone patch still quantizes at the full document's original
@@ -1493,6 +1495,7 @@ pub fn lay_region_fragment(
         imemo: Default::default(),
         grid_tracks: Default::default(),
         subgrid_rows: Default::default(),
+        marker_line: Default::default(),
     };
     let (mut frag, _flow_bottom, _anchors, _fixed, _top_layer) = flow.layout(&root);
     terminal::region_buffer(dom, base, controls, &mut frag, cell_w, cell_h)
@@ -3363,6 +3366,227 @@ mod tests {
         assert!((image.y + image.height - line.baseline).abs() < 0.01);
         assert!((origin.y + shaped.baseline - line.baseline).abs() < 0.01);
         assert!(origin.x >= image.x + image.width - 0.01);
+    }
+
+    #[test]
+    fn an_outside_marker_gets_room_on_the_first_line() {
+        // CSS Lists 3 #list-style-position-outside leaves the marker's
+        // effect on the first line box undefined; Gecko and Blink grow a
+        // list item's first line to hold a taller marker, which sits on its
+        // baseline, and give an item without line boxes one for its marker.
+        // Heights measured in LibreWolf 153 and Chromium.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <ul style="margin:0;padding-left:40px;list-style-image:url(tall.png)">
+              <li id=a>a</li><li id=b><p style="margin:0">b</p></li><li id=c></li></ul>
+            <ul style="margin:0;padding-left:40px;list-style-image:url(dot.png)"><li id=d>d</li></ul>
+            <ul style="margin:0;padding-left:40px"><li id=e></li><li id=f style="padding:5px"></li>
+              <li id=g><div style="height:50px"></div></li><li id=h> <!-- --> </li></ul></body>"#;
+        let images = HashMap::from([
+            ("http://e.com/tall.png".to_string(), (20u32, 40u32)),
+            ("http://e.com/dot.png".to_string(), (7u32, 8u32)),
+        ]);
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &images);
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        let heights = ["a", "b", "c", "d", "e", "f", "g", "h"].map(|id| rect(id).height);
+        assert_eq!(heights, [45.0, 45.0, 45.0, 20.0, 20.0, 30.0, 50.0, 20.0]);
+        // The tall markers start at their items' tops and stand on the text
+        // baseline; every bullet lies within its item.
+        let markers: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::Primitive::Image { rect, .. } if rect.height == 40.0 => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 3);
+        for (marker, id) in markers.iter().zip(["a", "b", "c"]) {
+            assert_eq!(f64::from(marker.y), rect(id).top, "{id}");
+        }
+        let baseline = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { origin, shaped, .. } if shaped.text == "a" => {
+                    Some(origin.y + shaped.baseline)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!((markers[0].y + markers[0].height - baseline).abs() < 0.5);
+        for id in ["e", "f", "h"] {
+            let item = rect(id);
+            let bullet = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|primitive| match primitive {
+                    crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                        if shaped.text.starts_with('•')
+                            && f64::from(origin.y) >= item.top - 0.5
+                            && f64::from(origin.y) < item.top + item.height =>
+                    {
+                        Some(origin.y)
+                    }
+                    _ => None,
+                });
+            assert!(bullet.is_some(), "{id}: its bullet lies within it");
+        }
+    }
+
+    #[test]
+    fn a_marker_grows_lines_by_its_ascent_only_and_where_blink_does() {
+        // Blink adds an outside marker's ascent, not its descent, to the
+        // first line, also inside nested blocks (Gecko does not grow those):
+        // a 16px/20px bullet makes a 12px/14px paragraph's line 18px.
+        // Independent formatting contexts and vertical lines keep an
+        // enclosing marker out; an empty nested item seats both markers on
+        // its own line.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <ul style="margin:0;padding-left:40px"><li id=a><p style="margin:0;font:12px/14px sans-serif">a</p></li></ul>
+            <ul style="margin:0;padding-left:40px;list-style-image:url(tall.png)">
+              <li id=b><div style="display:flow-root">b</div></li>
+              <li><div style="writing-mode:vertical-rl;height:30px">v</div><p id=c style="margin:0">c</p></li></ul>
+            <ul style="margin:0;padding-left:40px"><li style="font-size:40px;line-height:normal">
+              <ul style="margin:0;font-size:16px;line-height:20px"><li id=e></li></ul><p id=d style="margin:0;font:16px/20px sans-serif">d</p></li></ul></body>"#;
+        let images = HashMap::from([("http://e.com/tall.png".to_string(), (20u32, 40u32))]);
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 400.0, &images);
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert!(
+            (rect("a").height - 18.0).abs() < 0.5,
+            "{}",
+            rect("a").height
+        );
+        assert_eq!(rect("b").height, 20.0);
+        assert_eq!(rect("c").height, 20.0);
+        assert_eq!(rect("d").height, 20.0);
+        // Both bullets of the empty nested item share one baseline.
+        let bullets: Vec<f32> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                    if shaped.text.starts_with('•') || shaped.text.starts_with('◦') =>
+                {
+                    Some(origin.y + shaped.baseline)
+                }
+                _ => None,
+            })
+            .collect();
+        let e = rect("e");
+        let seated: Vec<_> = bullets
+            .iter()
+            .filter(|y| f64::from(**y) > e.top && f64::from(**y) <= e.top + e.height)
+            .collect();
+        assert_eq!(seated.len(), 2, "{bullets:?} in {e:?}");
+        assert!((seated[0] - seated[1]).abs() < 0.5, "{seated:?}");
+    }
+
+    #[test]
+    fn a_list_items_flow_root_boundary_relays_like_the_full_document() {
+        // The incremental-layout contract: a boundary re-laid alone matches
+        // the full render, so an enclosing item's marker must not reach it.
+        let base = Url::parse("http://e.com/").unwrap();
+        let html = r#"<html><body style="margin:0"><ul><li style="font-size:40px"><div id="box" data-trust-node="7" style="display:flow-root;font-size:16px"><p style="margin:0">first</p><p style="margin:0">second</p></div></li></ul></body></html>"#;
+        let dom = Dom::parse_document(html);
+        let images = HashMap::new();
+        let viewport = TerminalViewport::new(40, 24, 8.0, 16.0);
+        let full = lay_out_document(
+            &dom,
+            &base,
+            viewport,
+            &[],
+            &HashMap::new(),
+            &images,
+            &HashMap::new(),
+        );
+        assert_eq!(full.boundaries.len(), 1);
+        let b = full.boundaries[0].clone();
+        let full_rows = &full.rows[b.row_range.clone()];
+        let frag = dom.serialize_patch(node_by_id(&dom, "box"), &std::collections::HashSet::new());
+        let fdom = Dom::parse_document(&frag);
+        let fnode = fdom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&n| fdom.attr(n, "data-trust-node").is_some())
+            .unwrap();
+        let sub = lay_subtree_fragment(
+            &fdom,
+            &base,
+            b.content_width as usize,
+            viewport,
+            &HashMap::new(),
+            &images,
+            fnode,
+            false,
+            b.quantization_phase,
+        );
+        assert_eq!(sub.rows.len(), b.row_range.len(), "same height");
+        // The full rows also hold the marker, outside the boundary.
+        for (fr, fullr) in sub.rows.iter().zip(full_rows.iter()) {
+            assert!(row_text(fullr).ends_with(&row_text(fr)), "{fr:?} {fullr:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_outside_markers_share_the_text_row() {
+        // In the cell grid a small marker image shares its item's text row;
+        // a tall one lays out like a tall inline image, the text on its last
+        // row.
+        let html = r#"<body style="font-size:15px"><ul style="list-style-image:url(m.gif)"><li>first</li><li>second</li></ul></body>"#;
+        let rows = |size: (u32, u32)| {
+            let images = HashMap::from([("http://e.com/m.gif".to_string(), size)]);
+            let out = lay_images(html, 80, &images);
+            out.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| !row.items.is_empty())
+                .map(|(index, row)| {
+                    let images = row.items.iter().filter(|item| item.image.is_some()).count();
+                    let text: String = row
+                        .items
+                        .iter()
+                        .filter(|item| item.image.is_none())
+                        .map(|item| item.text.trim())
+                        .collect();
+                    (index, images, text)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows((7, 8)),
+            [(1, 1, "first".to_string()), (2, 1, "second".to_string())]
+        );
+        let inline = lay_images(
+            r#"<body style="font-size:15px"><p><img src="m.gif"> first</p></body>"#,
+            80,
+            &HashMap::from([("http://e.com/m.gif".to_string(), (20, 40))]),
+        );
+        let tall = rows((20, 40));
+        let text_row = |rows: &[(usize, usize, String)], text: &str| {
+            rows.iter().find(|row| row.2 == text).unwrap().0
+        };
+        let inline_rows: Vec<_> = inline
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.items.is_empty())
+            .map(|(index, row)| (index, row.items.iter().any(|item| item.image.is_some())))
+            .collect();
+        let image_rows = |rows: &[(usize, usize, String)], text: &str| {
+            let end = text_row(rows, text);
+            rows.iter().filter(|row| row.1 > 0 && row.0 <= end).count()
+        };
+        assert_eq!(
+            image_rows(&tall, "first"),
+            inline_rows.iter().filter(|row| row.1).count(),
+            "{tall:?} {inline_rows:?}"
+        );
+        assert_eq!(text_row(&tall, "first"), inline_rows.last().unwrap().0);
     }
 
     #[test]
