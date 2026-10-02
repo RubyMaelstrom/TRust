@@ -4232,10 +4232,11 @@ fn paint_box_shadows(
         if tokens.iter().any(|t| t.eq_ignore_ascii_case("inset")) != inset {
             continue;
         }
+        // CSS Backgrounds 3 #shadow-color: an absent color is currentColor.
         let color = tokens
             .iter()
-            .find_map(|token| PaintColor::parse_css(token))
-            .unwrap_or(PaintColor::Rgba(0, 0, 0, 85));
+            .find_map(|token| resolve_color_for_style(builder.dom, style, token))
+            .unwrap_or_else(|| text_color_for_style(builder.dom, style));
         let lengths: Vec<f32> = tokens
             .iter()
             .filter_map(|token| lengths.resolve(token, 0.0))
@@ -7047,6 +7048,22 @@ mod tests {
         assert_eq!(pixel(108, 50), [0, 0, 255]);
         assert_eq!(pixel(50, 125), [255, 0, 0], "inner overlap");
         assert_eq!(pixel(50, 135), [0, 0, 255]);
+    }
+
+    #[test]
+    fn box_shadows_default_to_the_current_color() {
+        // CSS Backgrounds 3 #shadow-color: if the color is absent, it
+        // defaults to currentColor, as does the currentcolor keyword.
+        let (_, layout) = render_fixture(
+            "<style>body{margin:0;background:white} div{width:50px;height:50px;margin-bottom:20px}\
+             </style><div style='color:red;box-shadow:10px 0 0'></div>\
+             <div style='color:blue;box-shadow:inset 0 10px 0 currentcolor'></div>",
+        );
+        let frame =
+            crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.)).unwrap();
+        let pixel = |x: usize, y: usize| frame.pixels[(y * 800 + x) * 4..][..3].to_vec();
+        assert_eq!(pixel(55, 25), [255, 0, 0]);
+        assert_eq!(pixel(25, 75), [0, 0, 255]);
     }
 
     #[test]
