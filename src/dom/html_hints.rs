@@ -173,6 +173,28 @@ impl Dom {
         if let Some(height) = height {
             hint("height", height);
         }
+        // HTML Rendering #attributes-for-embedded-content-and-images: `align`
+        // on embed, iframe, img, object and an Image Button input floats the
+        // element or aligns it vertically; `middle`/`center` put its middle
+        // on the parent's baseline (Blink's -webkit-baseline-middle).
+        let embedded = matches!(tag, "embed" | "iframe" | "img" | "object")
+            || (tag == "input" && self.input_type(id) == "image");
+        if embedded && let Some(align) = self.attr(id, "align") {
+            let (property, value) = match align.trim().to_ascii_lowercase().as_str() {
+                "left" => ("float", "left"),
+                "right" => ("float", "right"),
+                "top" => ("vertical-align", "top"),
+                "baseline" => ("vertical-align", "baseline"),
+                "texttop" => ("vertical-align", "text-top"),
+                "absmiddle" | "abscenter" => ("vertical-align", "middle"),
+                "bottom" => ("vertical-align", "bottom"),
+                "middle" | "center" => ("vertical-align", "-webkit-baseline-middle"),
+                _ => ("", ""),
+            };
+            if !property.is_empty() {
+                hint(property, value.into());
+            }
+        }
         // HTML Rendering #the-marquee-element-2: width/height map to the
         // dimension properties, hspace/vspace to the margins, and an up/down
         // marquee's natural height is 200px. Horizontal marquees scroll a
@@ -1122,6 +1144,34 @@ mod tests {
             dom.computed_value(link, "color").as_deref(),
             Some("#0000ff")
         );
+    }
+
+    #[test]
+    fn embedded_content_align_attributes_float_and_align_vertically() {
+        // HTML Rendering #attributes-for-embedded-content-and-images.
+        let dom = Dom::parse_document(
+            "<img id=l align=LEFT><iframe id=r align=right></iframe>\
+             <input id=i type=image align=absmiddle><object id=t align=texttop></object>\
+             <img id=m align=middle><embed id=c align=abscenter><img id=b align=bottom>\
+             <div id=d align=left>d</div><input id=x type=text align=left>\
+             <img id=s align=left style='float:none'>",
+        );
+        let value =
+            |id: &str, property: &str| dom.computed_value(dom.get_by_id(id).unwrap(), property);
+        for (id, property, expected) in [
+            ("l", "float", Some("left")),
+            ("r", "float", Some("right")),
+            ("i", "vertical-align", Some("middle")),
+            ("t", "vertical-align", Some("text-top")),
+            ("m", "vertical-align", Some("-webkit-baseline-middle")),
+            ("c", "vertical-align", Some("middle")),
+            ("b", "vertical-align", Some("bottom")),
+            ("d", "float", None),
+            ("x", "float", None),
+            ("s", "float", Some("none")),
+        ] {
+            assert_eq!(value(id, property).as_deref(), expected, "{id} {property}");
+        }
     }
 
     #[test]

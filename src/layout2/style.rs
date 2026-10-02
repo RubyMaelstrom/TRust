@@ -1248,6 +1248,9 @@ impl InlineStyle {
                 Some("middle") => {
                     VerticalAlign::Middle(crate::text::x_height(&parent.text_style()) * 0.5)
                 }
+                // The box's middle on the parent's baseline (HTML Rendering
+                // #attributes-for-embedded-content-and-images, `align=middle`).
+                Some("-webkit-baseline-middle") => VerticalAlign::Middle(0.0),
                 Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
                 Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
                 Some(value) => css_length_px(value, u)
@@ -1448,6 +1451,7 @@ impl InlineStyle {
                 Some("middle") => {
                     VerticalAlign::Middle(crate::text::x_height(&self.text_style()) * 0.5)
                 }
+                Some("-webkit-baseline-middle") => VerticalAlign::Middle(0.0),
                 Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
                 Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
                 Some(v) => css_length_px(v, u)
