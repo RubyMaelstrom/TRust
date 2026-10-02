@@ -5865,6 +5865,12 @@ fn decoration_origin(dom: &Dom, mut node: NodeId) -> Option<NodeId> {
     None
 }
 
+/// What a border image paints: a decoded image or a gradient.
+enum BorderImagePaint {
+    Image(ImageHandle),
+    Gradient(PaintBrush),
+}
+
 /// How a border-image region repeats along one axis
 /// (CSS Backgrounds 3 #border-image-repeat).
 #[derive(Clone, Copy, PartialEq)]
@@ -5935,25 +5941,15 @@ fn border_image_tiles(
 /// image replaced the border styles; an image that is not available yet
 /// leaves them in place.
 fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<'_>) -> bool {
-    let Some(source) = style
-        .value(builder.dom, "border-image-source")
-        .as_deref()
-        .and_then(css_url)
-    else {
+    let Some(raw_source) = style.value(builder.dom, "border-image-source") else {
         return false;
     };
-    let base = builder.dom.style_resource_base(style.node(), builder.base);
-    let source = resolve_image_source(&base, &source);
-    let handle = builder.image(source.clone());
-    let Some((iw, ih)) = builder
-        .images
-        .get(&source)
-        .copied()
-        .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX)
-        .map(|(w, h)| (w as f32, h as f32))
-    else {
+    // #border-image-source takes any <image>, a gradient included.
+    let gradient = is_gradient(&raw_source);
+    let url = (!gradient).then(|| css_url(&raw_source)).flatten();
+    if !gradient && url.is_none() {
         return false;
-    };
+    }
     let lengths = LengthBasis::of(builder.dom, style.node(), builder.viewport());
     let value = |name: &str, initial: &str| {
         style
@@ -5970,6 +5966,51 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
             _ => return None,
         })
     }
+    let outset_value = value("border-image-outset", "0");
+    let outset_tokens: Vec<&str> = outset_value.split_whitespace().collect();
+    let outsets: [f32; 4] = match sides(&outset_tokens) {
+        Some(tokens) => std::array::from_fn(|side| {
+            let token = tokens[side];
+            match token.parse::<f32>() {
+                Ok(number) => number * fragment.border[side],
+                Err(_) => lengths.resolve(token, 0.0).unwrap_or(0.0),
+            }
+            .max(0.0)
+        }),
+        None => [0.0; 4],
+    };
+    let area = CssRect::new(
+        fragment.x - outsets[3],
+        fragment.y - outsets[0],
+        fragment.w + outsets[1] + outsets[3],
+        fragment.h + outsets[0] + outsets[2],
+    );
+    // #border-image-slice: an image without natural dimensions, such as a
+    // gradient, is sized to the border image area (its default object size).
+    let (paint, iw, ih) = match url {
+        Some(source) => {
+            let base = builder.dom.style_resource_base(style.node(), builder.base);
+            let source = resolve_image_source(&base, &source);
+            let handle = builder.image(source.clone());
+            let Some((iw, ih)) = builder
+                .images
+                .get(&source)
+                .copied()
+                .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX)
+                .map(|(w, h)| (w as f32, h as f32))
+            else {
+                return false;
+            };
+            (BorderImagePaint::Image(handle), iw, ih)
+        }
+        None => {
+            let size = CssRect::new(0.0, 0.0, area.width, area.height);
+            let Some(brush) = parse_gradient(raw_source.trim(), size, lengths) else {
+                return false;
+            };
+            (BorderImagePaint::Gradient(brush), area.width, area.height)
+        }
+    };
     let slice_value = value("border-image-slice", "100%");
     let fill = slice_value
         .split_whitespace()
@@ -5993,25 +6034,6 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
         };
         px.unwrap_or(0.0).clamp(0.0, image_size[side])
     });
-    let outset_value = value("border-image-outset", "0");
-    let outset_tokens: Vec<&str> = outset_value.split_whitespace().collect();
-    let outsets: [f32; 4] = match sides(&outset_tokens) {
-        Some(tokens) => std::array::from_fn(|side| {
-            let token = tokens[side];
-            match token.parse::<f32>() {
-                Ok(number) => number * fragment.border[side],
-                Err(_) => lengths.resolve(token, 0.0).unwrap_or(0.0),
-            }
-            .max(0.0)
-        }),
-        None => [0.0; 4],
-    };
-    let area = CssRect::new(
-        fragment.x - outsets[3],
-        fragment.y - outsets[0],
-        fragment.w + outsets[1] + outsets[3],
-        fragment.h + outsets[0] + outsets[2],
-    );
     let width_value = value("border-image-width", "1");
     let width_tokens: Vec<&str> = width_value.split_whitespace().collect();
     let Some(width_tokens) = sides(&width_tokens) else {
@@ -6120,16 +6142,43 @@ fn paint_border_image(fragment: &Frag, style: PaintStyle, builder: &mut Builder<
             let (top, height) = edges(y, tile_h, modes.1, region.y, bottom);
             for &x in &xs {
                 let (left, width) = edges(x, tile_w, modes.0, region.x, right);
-                builder.commands.push(DisplayCommand::Image {
-                    rect: CssRect::new(left, top, width, height),
-                    handle,
-                    source_rect: Some(source),
-                    fit: ImageFit::Fill,
-                    sampling,
-                    clip: None,
-                    node,
-                    link: None,
-                });
+                let tile = CssRect::new(left, top, width, height);
+                match &paint {
+                    BorderImagePaint::Image(handle) => {
+                        builder.commands.push(DisplayCommand::Image {
+                            rect: tile,
+                            handle: *handle,
+                            source_rect: Some(source),
+                            fit: ImageFit::Fill,
+                            sampling,
+                            clip: None,
+                            node,
+                            link: None,
+                        });
+                    }
+                    // The slice of the gradient, mapped onto the tile.
+                    BorderImagePaint::Gradient(brush) => {
+                        // `then` post-multiplies: the right-most applies first.
+                        let transform = Affine2d::translate(tile.x, tile.y)
+                            .then(Affine2d::scale(
+                                tile.width / source.width,
+                                tile.height / source.height,
+                            ))
+                            .then(Affine2d::translate(-source.x, -source.y));
+                        builder
+                            .commands
+                            .push(DisplayCommand::PushClip(PaintShape::Rect(tile)));
+                        builder
+                            .commands
+                            .push(DisplayCommand::PushTransform(transform));
+                        builder.commands.push(DisplayCommand::Fill {
+                            shape: PaintShape::Rect(source),
+                            brush: brush.clone(),
+                        });
+                        builder.commands.push(DisplayCommand::PopTransform);
+                        builder.commands.push(DisplayCommand::PopClip);
+                    }
+                }
             }
         }
         if clipped {
@@ -7978,6 +8027,42 @@ mod tests {
         assert!(!red_border(&layout.paint.primitives));
         let (_, pending) = render_fixture_with_images(html, &Default::default());
         assert!(red_border(&pending.paint.primitives));
+    }
+
+    #[test]
+    fn gradient_border_images_slice_the_border_image_area() {
+        // CSS Backgrounds 3 #border-image-source takes any <image>, and
+        // #border-image-slice sizes one without natural dimensions (a
+        // gradient) to the border image area. Each region paints its slice
+        // of the gradient, mapped onto it, in place of the border style.
+        let html = r#"<body style="margin:0"><div style="width:100px;height:40px;border:10px solid red;border-image:linear-gradient(blue, green) 10"></div></body>"#;
+        let (_, layout) = render_fixture_with_images(html, &Default::default());
+        let commands = &layout.paint.primitives;
+        let gradients: Vec<CssRect> = commands
+            .windows(3)
+            .filter_map(|window| match window {
+                [
+                    DisplayCommand::PushTransform(_),
+                    DisplayCommand::Fill {
+                        shape: PaintShape::Rect(source),
+                        brush: PaintBrush::LinearGradient { .. },
+                    },
+                    DisplayCommand::PopTransform,
+                ] => Some(*source),
+                _ => None,
+            })
+            .collect();
+        // Four corners and four stretched edges of the 120x60 gradient.
+        assert_eq!(gradients.len(), 8, "{gradients:?}");
+        assert!(gradients.contains(&CssRect::new(0.0, 0.0, 10.0, 10.0)));
+        assert!(gradients.contains(&CssRect::new(10.0, 0.0, 100.0, 10.0)));
+        assert!(gradients.contains(&CssRect::new(110.0, 50.0, 10.0, 10.0)));
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            DisplayCommand::Fill { brush: PaintBrush::Solid(color), .. }
+                | DisplayCommand::Stroke { brush: PaintBrush::Solid(color), .. }
+                if *color == PaintColor::Rgba(255, 0, 0, 255)
+        )));
     }
 
     #[test]
