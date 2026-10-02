@@ -5551,6 +5551,91 @@ mod tests {
     }
 
     #[test]
+    fn first_letter_styles_its_text_inline_or_as_a_drop_cap() {
+        // CSS Pseudo 4 #first-letter-pseudo: ::first-letter wraps the first
+        // letter (with adjacent punctuation, `O’`) of the first formatted
+        // line, inside any inline element, and floats when it floats.
+        let ink = |html: &str| {
+            let (dom, layout) = render_fixture(html);
+            let frame =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+                    .unwrap();
+            let mut red = (0, f32::MAX, 0.0f32, 0.0f32);
+            let mut blue_left_below = f32::MAX;
+            for (i, p) in frame.pixels.as_chunks::<4>().0.iter().enumerate() {
+                let (x, y) = ((i % 800) as f32, (i / 800) as f32);
+                if p[0] > 200 && p[1] < 80 && p[2] < 80 {
+                    red = (red.0 + 1, red.1.min(y), red.2.max(y), red.3.max(x));
+                }
+                if p[2] > 200 && p[0] < 80 && p[1] < 80 && y > 40.0 {
+                    blue_left_below = blue_left_below.min(x);
+                }
+            }
+            let p = layout
+                .boxes
+                .get(&dom.get_by_id("p").unwrap())
+                .unwrap()
+                .height;
+            (red, blue_left_below, p)
+        };
+        let page = |rule: &str, text: &str| {
+            format!(
+                "<style>body{{margin:0;background:white}} p{{margin:0;font:16px/20px sans-serif;color:blue;width:300px}} {rule}</style>\
+                 <p id=p><i>{text}</i></p>"
+            )
+        };
+        let text = "O’er the strange woods and over the sea, over spirits on the wing";
+        let (plain, _, plain_height) = ink(&page("", text));
+        assert_eq!(plain.0, 0);
+        let (inline, _, inline_height) = ink(&page(
+            "p::first-letter{color:red;font-size:48px;line-height:48px}",
+            text,
+        ));
+        assert!(inline.0 > 200, "the initial is red: {inline:?}");
+        assert!(inline.2 - inline.1 > 25.0, "and large: {inline:?}");
+        assert!(
+            inline_height > plain_height + 20.0,
+            "its line grows: {inline_height}"
+        );
+        let (cap, blue_left, cap_height) = ink(&page(
+            "p:first-letter{color:red;float:left;font-size:48px;line-height:48px}",
+            text,
+        ));
+        assert!(cap.0 > 200, "{cap:?}");
+        assert!(
+            blue_left > cap.3,
+            "lines beside the floated cap start after it: {blue_left} vs {cap:?}"
+        );
+        assert!(cap_height < inline_height, "a float does not grow the line");
+        let (spaced, spaced_left, _) = ink(&page(
+            "p::first-letter{color:red;float:left;font-size:48px;line-height:48px;margin-right:1em}",
+            text,
+        ));
+        assert!(
+            spaced_left - spaced.3 > 40.0,
+            "its em margin uses the letter's own font size: {spaced_left} vs {spaced:?}"
+        );
+        let (nested, _, _) = ink(&page(
+            ":first-letter{color:red;float:left;font-size:48px;line-height:48px}",
+            text,
+        ));
+        assert_eq!(
+            nested.3, cap.3,
+            "the html, body and p pseudo-elements share one first letter"
+        );
+        let (none, _, _) = ink(&page(
+            "p::first-letter{color:red}",
+            "<img width=1 height=1>Text",
+        ));
+        assert_eq!(none.0, 0, "an image precedes any first letter");
+        let (listed, _, _) = ink(
+            "<style>body{margin:0;background:white} h1{margin:0;font:40px sans-serif;color:blue} \
+             h1, p::first-letter{color:red}</style><h1>Title</h1><p id=p>x</p>",
+        );
+        assert!(listed.0 > 400, "the selector list stays valid: {listed:?}");
+    }
+
+    #[test]
     fn text_stroke_paints_transparent_glyphs_without_changing_layout() {
         let render = |style: &str| {
             render_fixture(&format!(

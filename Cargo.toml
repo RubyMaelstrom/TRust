@@ -164,6 +164,9 @@ unicode-segmentation = "1.13.3"
 # CSS Fonts 4 §5.1 requires Unicode Default Caseless Matching for every
 # localized family name. Lowercasing is not equivalent (for example, ß/SS).
 unicode-casefold = "0.2.0"
+# CSS Pseudo 4 #first-letter-pattern classifies text by Unicode general
+# category. Already in the graph through URL's IDNA support.
+icu_properties = "2.2.0"
 url = "2.5.8"
 vello_cpu = { version = "0.2.0", default-features = false, features = ["std", "text", "u8_pipeline"] }
 # Accelerated implementation of the same renderer-neutral display list.  Keep

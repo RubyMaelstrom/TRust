@@ -30,6 +30,7 @@ dependencies = [
  "html5ever",
  "http",
  "httpdate",
+ "icu_properties",
  "image",
  "khronos-egl",
  "libmimalloc-sys",

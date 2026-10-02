@@ -859,14 +859,46 @@ impl Builder<'_> {
                 oof,
             };
         }
-        self.assemble(
+        let mut node = self.assemble(
             id,
             BoxStyle::of(self.dom, id, self.vp),
             kids,
             marker,
             marker_image,
             inside,
-        )
+        );
+        if self.dom.has_first_letter_style(id) {
+            self.first_letter(id, &mut node.content);
+        }
+        node
+    }
+
+    /// CSS Pseudo 4 #first-letter-styling: the `::first-letter` box is an
+    /// inline box around its text, or a float when it floats; `display` and
+    /// `position` do not apply to it.
+    fn first_letter(&self, id: NodeId, content: &mut Content) {
+        let mut style = BoxStyle::of_pseudo(self.dom, id, PseudoEl::FirstLetter, self.vp);
+        style.position = Pos::Static;
+        style.inset = std::array::from_fn(|_| super::value::Len::Auto);
+        let _ = super::first_letter::wrap(content, &mut |kids| {
+            if style.float.is_some() {
+                Inline::Float(Arc::new(BoxNode {
+                    node: crate::layout2::NO_NODE,
+                    style: style.clone(),
+                    content: Content::Inlines(kids),
+                    marker: None,
+                    marker_image: None,
+                    marker_inside: false,
+                    oof: Vec::new(),
+                }))
+            } else {
+                Inline::Box {
+                    node: crate::layout2::NO_NODE,
+                    style: Arc::new(style.clone()),
+                    kids: kids.into(),
+                }
+            }
+        });
     }
 
     /// css-flexbox §4: each in-flow element child becomes a flex item
