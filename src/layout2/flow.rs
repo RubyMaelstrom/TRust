@@ -2102,6 +2102,18 @@ impl Flow<'_> {
                 .then(|| self.intrinsic_width_value(&Len::FitContent, b, Some(cb_w), inl))
                 .flatten()
             });
+        // CSS Sizing 4 #aspect-ratio-automatic: like a block-level replaced
+        // element's (CSS 2 §10.3.4 → §10.3.2), the auto width of a box with
+        // a preferred ratio and a definite height is that height through the
+        // ratio, not the containing block's width.
+        let ratio_width = width.is_none().then(|| {
+            let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
+            let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
+            self.ratio_auto_width(b, bp, bt, bb, cb_h)
+                .map(|w| w.max(self.ratio_auto_minimum(b, inl).min(max_w)))
+        });
+        let ratio_width = ratio_width.flatten();
+        let width = width.or(ratio_width);
         let (ml, w) = solve(width);
         let (ml, w) = if w > max_w {
             solve(Some(max_w))
@@ -2119,7 +2131,7 @@ impl Flow<'_> {
             bp_r,
             content_w: w,
             min_w,
-            auto_w: s.width.is_auto(),
+            auto_w: s.width.is_auto() && ratio_width.is_none(),
         }
     }
 
@@ -2145,6 +2157,49 @@ impl Flow<'_> {
         } else {
             v.max(0.0)
         })
+    }
+
+    /// CSS Sizing 4 #aspect-ratio-automatic: a box with a preferred aspect
+    /// ratio computes its automatic inline size like a replaced element with
+    /// that natural ratio and no natural size (CSS 2 §10.3.2, which floats
+    /// and inline-blocks reach through §10.3.6 and §10.3.10): a definite
+    /// height transfers through the ratio, in the box `box-sizing` selects.
+    /// Returns the content-box width before min/max; `None` when the width
+    /// is not auto, the height is not definite or there is no ratio.
+    /// Replaced content keeps its own natural-ratio sizing, and tables their
+    /// own width algorithm.
+    pub(super) fn ratio_auto_width(
+        &self,
+        b: &BoxNode,
+        bp_h: f32,
+        bt: f32,
+        bb: f32,
+        cb_h: Option<f32>,
+    ) -> Option<f32> {
+        let s = &b.style;
+        let ratio = s
+            .aspect_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)?;
+        if !s.width.is_auto() || matches!(b.content, Content::Atomic(_) | Content::Table(_)) {
+            return None;
+        }
+        let height = self.height_px(&s.height, s, bt, bb, cb_h)?;
+        Some(if s.border_box {
+            ((height + bt + bb) * ratio - bp_h).max(0.0)
+        } else {
+            height * ratio
+        })
+    }
+
+    /// css-sizing-4 #aspect-ratio-minimum: with `min-width: auto`, a
+    /// ratio-sized box that is not a scroll container in the inline axis is
+    /// at least its min-content width (the caller caps it by the maximum).
+    pub(super) fn ratio_auto_minimum(&self, b: &BoxNode, inl: &InlineStyle) -> f32 {
+        if b.style.min_width.is_auto() && !b.style.overflow[0].scrollable() {
+            self.intrinsic_w(b, super::intrinsic::IMode::Min, inl)
+        } else {
+            0.0
+        }
     }
 
     /// CSS Sizing 3 §§3.2.1 and 5.1: a percentage block size against an
@@ -4455,11 +4510,16 @@ impl Flow<'_> {
         .max(min_w);
         let content_w = match spec_w(&s.width) {
             Some(w) => w.clamp(min_w, max_w),
-            None => {
-                let avail = (cb_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
-                self.shrink_to_fit(fb, avail, parent_inl)
-                    .clamp(min_w, max_w)
-            }
+            None => match self.ratio_auto_width(fb, bp_h, bt, bb, cb_h) {
+                Some(w) => w
+                    .max(self.ratio_auto_minimum(fb, parent_inl).min(max_w))
+                    .clamp(min_w, max_w),
+                None => {
+                    let avail = (cb_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
+                    self.shrink_to_fit(fb, avail, parent_inl)
+                        .clamp(min_w, max_w)
+                }
+            },
         };
         let def_h = self.height_px(&s.height, s, bt, bb, cb_h);
         let (mut frag, mut anchors) = self.item_frag(fb, content_w, cb_w, def_h, parent_inl);
@@ -4538,6 +4598,9 @@ impl Flow<'_> {
                 // element; anonymous/generated atom boxes use shrink-to-fit.
                 if ab.node != NO_NODE && self.dom.tag_name(ab.node) == Some("marquee") {
                     avail.clamp(min_w, max_w)
+                } else if let Some(w) = self.ratio_auto_width(ab, bp_h, bt, bb, cb_h) {
+                    w.max(self.ratio_auto_minimum(ab, parent_inl).min(max_w))
+                        .clamp(min_w, max_w)
                 } else {
                     self.shrink_to_fit(ab, avail, parent_inl)
                         .clamp(min_w, max_w)
