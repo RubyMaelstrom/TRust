@@ -122,6 +122,31 @@ pub(crate) fn absolute_css_length(dom: &Dom, node: NodeId, text: &str) -> Option
         .filter(|value| value.is_finite())
 }
 
+/// CSS Values 4 #snap-a-length-as-a-line-width, which gives the computed
+/// `border-*-width` and `outline-width` (CSS Backgrounds 3 #border-width,
+/// CSS UI 4 #outline-width): a whole number of device pixels stays, a width
+/// under one device pixel grows to one, and any other rounds toward zero.
+pub(crate) fn snap_line_width(px: f32, device_pixel_ratio: f32) -> f32 {
+    let ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
+        device_pixel_ratio
+    } else {
+        1.0
+    };
+    let device = px * ratio;
+    if !device.is_finite() || device == 0.0 {
+        return px;
+    }
+    // Arithmetic on em and calc() lengths leaves whole values a hair off.
+    let whole = device.round();
+    if (device - whole).abs() < 1e-3 {
+        return whole / ratio;
+    }
+    if device.abs() < 1.0 {
+        return device.signum() / ratio;
+    }
+    device.trunc() / ratio
+}
+
 #[cfg(test)]
 pub(crate) use session::layout_pass_count;
 pub(crate) use session::{LayoutFragments, LayoutWork};
@@ -10216,6 +10241,45 @@ b</xmp></body>"#;
                 }
             }
         }
+    }
+
+    #[test]
+    fn border_and_outline_widths_snap_to_device_pixels() {
+        // CSS Values 4 #snap-a-length-as-a-line-width: whole device pixels
+        // stay, a width under one device pixel becomes one, and any other
+        // rounds toward zero.
+        for (px, ratio, snapped) in [
+            (6.48, 1.0, 6.0),
+            (0.5, 1.0, 1.0),
+            (2.7, 1.0, 2.0),
+            (3.0, 1.0, 3.0),
+            (0.0, 1.0, 0.0),
+            (1.5, 2.0, 1.5),
+            (0.3, 2.0, 0.5),
+            (1.3, 1.5, 1.0 / 1.5),
+            (2.9999998, 1.0, 3.0),
+        ] {
+            assert_eq!(snap_line_width(px, ratio), snapped, "{px} at {ratio}");
+        }
+        // The snapped widths are the computed widths, so they size the box
+        // and are what getComputedStyle reports.
+        let html = r#"<body style="margin:0">
+            <div id="a" style="width:100px;height:40px;border:6.48px solid blue"></div>
+            <div id="b" style="font-size:21.6px;width:100px;border:0.3em solid blue"></div>
+            <div id="c" style="width:100px;height:40px;border:0.5px solid blue;
+                outline:2.7px solid red"></div></body>"#;
+        let (dom, boxes) = measure(html, 100, 24);
+        assert_eq!(rect(&dom, &boxes, "a").width, 112.0);
+        assert_eq!(rect(&dom, &boxes, "b").width, 112.0);
+        assert_eq!(rect(&dom, &boxes, "c").width, 102.0);
+        let value = |id: &str, name: &str| {
+            dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), name)
+                .unwrap()
+        };
+        assert_eq!(value("a", "border-top-width"), "6px");
+        assert_eq!(value("b", "border-left-width"), "6px");
+        assert_eq!(value("c", "border-bottom-width"), "1px");
+        assert_eq!(value("c", "outline-width"), "2px");
     }
 
     #[test]
