@@ -11156,6 +11156,48 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn horizontal_marquees_have_no_min_content_width() {
+        // HTML Rendering #the-marquee-element-2 slides the contents across
+        // the box; Gecko and Blink give a horizontal marquee a zero
+        // min-content width and its contents' max-content width. A vertical
+        // marquee keeps its contents' min-content width (as in Blink).
+        let tiles = "<span style='display:inline-block;width:88px;height:31px'></span>".repeat(10);
+        let dom = Dom::parse_document(&format!(
+            r#"<body style="margin:0">
+               <div id=min style="width:min-content"><marquee style="padding:0 5px">{tiles}</marquee></div>
+               <div id=max style="width:max-content"><marquee>{tiles}</marquee></div>
+               <div id=up style="width:min-content"><marquee direction=up>{tiles}</marquee></div>
+               <div id=row style="display:flex;width:600px">
+                 <section id=main style="width:100%;display:flex"><marquee>{tiles}</marquee></section>
+                 <aside id=side style="width:100%;min-width:200px;max-width:200px">aside</aside>
+               </div></body>"#
+        ));
+        let base = Url::parse("https://example.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let rect = |id: &str| layout.boxes[&node_by_id(&dom, id)];
+        assert!((rect("min").width - 10.0).abs() < 0.5, "{:?}", rect("min"));
+        assert!(rect("max").width > 880.0 - 0.5, "{:?}", rect("max"));
+        assert!((rect("up").width - 88.0).abs() < 0.5, "{:?}", rect("up"));
+        assert!(
+            (rect("main").width - 400.0).abs() < 0.5,
+            "{:?}",
+            rect("main")
+        );
+        assert!(
+            (rect("side").left - 400.0).abs() < 0.5,
+            "{:?}",
+            rect("side")
+        );
+    }
+
+    #[test]
     fn graphical_marquee_uses_html_ua_viewport_and_wraps_descendant_paint() {
         let dom = Dom::parse_document(
             r#"<body style="margin:0"><marquee id=m direction=right scrollamount=9
