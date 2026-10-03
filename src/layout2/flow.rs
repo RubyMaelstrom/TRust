@@ -1570,12 +1570,17 @@ impl Flow<'_> {
                             // (height:auto, no separation): the strut keeps
                             // the trailing margins and gains ours.
                             let content_bottom = cur.y;
-                            let hc = (content_bottom - content_top_of(yb))
-                                .max(0.0)
-                                .clamp(min_h, max_h.max(min_h));
+                            let tentative = (content_bottom - content_top_of(yb)).max(0.0);
+                            let hc = tentative.clamp(min_h, max_h.max(min_h));
                             frag_h = bt + hc;
                             y_final = yb;
-                            if min_h > 0.0 || max_h < f32::INFINITY {
+                            // §8.3.1 lets only a zero min-height collapse
+                            // through. max-height takes over as the computed
+                            // height only when the tentative height exceeds
+                            // it (§10.7), so a max-height the content fits
+                            // under leaves the height auto and the margins
+                            // adjoining (damian-96's 70px header).
+                            if min_h > 0.0 || hc < tentative {
                                 // A clamp made the height definite-ish: the
                                 // box ends at its clamped edge.
                                 cur.y = content_top_of(yb) + hc;

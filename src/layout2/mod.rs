@@ -3262,6 +3262,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unreached_max_height_keeps_the_last_childs_bottom_margin_adjoining() {
+        // CSS 2 §8.3.1 collapses an auto-height parent's bottom margin with
+        // its last child's; §10.7 only substitutes max-height for the
+        // computed height when the tentative height exceeds it. LibreWolf and
+        // Chromium: the paragraph sits 24px below the 70px box, or right
+        // under a 50px box that clipped its content.
+        for (max, box_h, next) in [
+            ("70px", 70.0, 94.0),
+            ("200px", 70.0, 94.0),
+            ("50px", 50.0, 50.0),
+        ] {
+            let html = format!(
+                r#"<body style="margin:0"><div style="border-top:1px solid"><div id=h style="max-height:{max}"><div style="margin:24px 0;height:70px"></div></div><p id=p style="margin:0">next</p></div></body>"#
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 400.0, &HashMap::new());
+            let h = layout.boxes[&dom.get_by_id("h").unwrap()];
+            let p = layout.boxes[&dom.get_by_id("p").unwrap()];
+            assert_eq!((h.top, h.height), (25.0, box_h), "{max}");
+            assert_eq!(p.top, 25.0 + next, "{max}");
+        }
+    }
+
+    #[test]
     fn empty_block_self_collapses() {
         let out = lay(
             r#"<body style="margin:0"><div>a</div><div style="margin-top:16px;margin-bottom:16px"></div><div>b</div></body>"#,
