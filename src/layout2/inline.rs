@@ -213,6 +213,19 @@ impl InlineBoxEntry {
     }
 }
 
+/// An inline box holding no in-flow content on its line. CSS 2 §10.8: empty
+/// inline elements still generate (empty) inline boxes, with margins,
+/// padding, borders and a content area at their place on the line, and a
+/// positioned one establishes a containing block (CSS 2 §10.1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmptyInlineBox {
+    pub entry: InlineBoxEntry,
+    /// Border-box start and end edges from the line box origin, before the
+    /// box's relative offset.
+    pub x0: f32,
+    pub x1: f32,
+}
+
 /// One line fragment of an inline box: its border-box horizontal extent from
 /// the line box origin, including its relative offset, and whether the box
 /// begins and ends on this line (CSS Backgrounds 3 #box-decoration-break,
@@ -228,9 +241,10 @@ pub(crate) struct BoxFragment {
 
 /// The line fragments, on one line, of the inline boxes `keep` selects, in
 /// order of appearance. A box spans its pieces on the line, plus its start
-/// and end edges where it begins and ends.
+/// and end edges where it begins and ends; an empty box spans its edges.
 pub(crate) fn line_box_fragments<'p>(
     pieces: impl IntoIterator<Item = &'p Piece>,
+    empty: &[EmptyInlineBox],
     mut keep: impl FnMut(&InlineBoxEntry) -> bool,
 ) -> Vec<BoxFragment> {
     let mut runs: Vec<BoxFragment> = Vec::new();
@@ -268,6 +282,17 @@ pub(crate) fn line_box_fragments<'p>(
                 }
                 None => runs.push(run),
             }
+        }
+    }
+    for empty in empty {
+        if keep(&empty.entry) {
+            runs.push(BoxFragment {
+                entry: empty.entry,
+                x0: empty.x0 + empty.entry.offset[0],
+                x1: empty.x1 + empty.entry.offset[0],
+                starts: true,
+                ends: true,
+            });
         }
     }
     runs
@@ -519,6 +544,8 @@ pub(crate) struct LineOut {
     /// Space above this line box where it moved down past floats too close
     /// for any of its content (CSS 2 §9.5).
     pub gap_before: f32,
+    /// Inline boxes that hold no content on this line (CSS 2 §10.8).
+    pub empty_boxes: Vec<EmptyInlineBox>,
 }
 
 /// The inline formatting context builder. Feed it the IFC's inline content,
@@ -567,6 +594,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// in rotated inline/block coordinates.
     relative_offsets: bool,
     sideways: bool,
+    /// Tracked inline boxes that closed without content on the current
+    /// line.
+    cur_empty: Vec<EmptyInlineBox>,
     pen: f32,
     line_start: f32,
     pending_space: bool,
@@ -702,6 +732,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             oofs: Vec::new(),
             relative_offsets: false,
             sideways: false,
+            cur_empty: Vec::new(),
             pen: 0.0,
             line_start: 0.0,
             pending_space: false,
@@ -782,10 +813,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.line_left = left;
         self.line_right = right.max(left);
         let indent = if self.on_first_line { self.indent } else { 0.0 };
+        let moved = self.line_left + indent - self.line_start;
         self.line_start = self.line_left + indent;
         self.pen = self.line_start;
         self.pending_space = false;
         self.preserved_break = false;
+        // Empty boxes at the start of a line that moves past floats move
+        // with it.
+        for empty in &mut self.cur_empty {
+            empty.x0 += moved;
+            empty.x1 += moved;
+        }
     }
 
     /// CSS 2 §9.5: an empty line box shortened by floats so far that its next
@@ -908,6 +946,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             let shift = next_left - self.line_left;
             for piece in &mut self.cur {
                 piece.x += shift;
+            }
+            for empty in &mut self.cur_empty {
+                empty.x0 += shift;
+                empty.x1 += shift;
             }
             // Atomic-inline placeholders are in `cur` until flush_line, so
             // their eventual fragment placements receive the same translation.
@@ -1061,8 +1103,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     Some((*node, None))
                 };
                 // CSS Positioned Layout 3 #position-property: a relative or
-                // sticky inline box is offset after line layout (an
-                // absolute/fixed one was blockified).
+                // sticky inline box is offset after line layout and forms
+                // the containing block of its absolutely positioned
+                // descendants (an absolute/fixed one was blockified).
                 let positioned = style.position.positioned() && !self.sideways;
                 // Decorated boxes paint their line fragments; CSSOM View
                 // #dom-element-getclientrects also measures every element's
@@ -1125,7 +1168,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.walk(k, &inner, &rest);
                 }
                 if let Some(entry) = tracked {
-                    self.close_box(entry.key, style);
+                    self.close_box(entry, style, ctx);
                 }
                 self.pending_gap_px += self.edge_px(style, RIGHT);
             }
@@ -2667,14 +2710,37 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
 
     /// Close a tracked inline box: its end edge follows the last piece
     /// placed inside it, past any edges owed since. A box that received no
-    /// piece has no line fragment.
-    fn close_box(&mut self, node: InlineBoxKey, style: &BoxStyle) {
-        self.pending_opens.retain(|&(open, _)| open != node);
+    /// piece since it opened is an empty inline box at the pen (CSS 2
+    /// §10.8), past a collapsible space owed before it (`ctx` is the context
+    /// holding that space).
+    fn close_box(&mut self, entry: InlineBoxEntry, style: &BoxStyle, ctx: &InlineStyle) {
+        let node = entry.key;
         let end = self.pending_gap_px
             + style.border[RIGHT]
             + style.padding[RIGHT]
                 .resolve(Some(self.cb_w_px))
                 .unwrap_or(0.0);
+        if let Some(index) = self
+            .pending_opens
+            .iter()
+            .position(|&(open, _)| open == node)
+        {
+            let (_, start) = self.pending_opens.remove(index);
+            let space = if self.pending_space && self.pen > self.line_start {
+                Self::space_advance(ctx)
+            } else {
+                0.0
+            };
+            let origin = self.pen + space;
+            self.cur_empty.push(EmptyInlineBox {
+                entry,
+                x0: origin + start,
+                x1: origin + end,
+            });
+            self.box_stack.pop();
+            self.box_chain = (!self.box_stack.is_empty()).then(|| self.box_stack.as_slice().into());
+            return;
+        }
         let last = match self.cur.last_mut() {
             Some(piece) => Some(piece),
             None => self
@@ -2760,6 +2826,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let align = self.line_align(forced);
         if pieces.is_empty() && !forced {
             self.align_oof_marks(0.0, align);
+            // CSS 2 §9.4.2: a line holding only empty inline boxes is a
+            // zero-height line box that does not exist for other purposes.
+            self.cur_empty.clear();
             self.pen = self.line_start;
             self.pending_space = false;
             return;
@@ -2823,6 +2892,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             left: self.line_left,
             right: self.line_right,
             gap_before: std::mem::take(&mut self.line_gap),
+            empty_boxes: std::mem::take(&mut self.cur_empty),
         };
         // Center/right shift now, within this line's (float-shortened) band;
         // justification waits for `finish`, where "last line" is known.
@@ -2838,6 +2908,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 line.alignment_offset = off;
                 for p in &mut line.pieces {
                     p.x += off;
+                }
+                for empty in &mut line.empty_boxes {
+                    empty.x0 += off;
+                    empty.x1 += off;
                 }
             }
         }

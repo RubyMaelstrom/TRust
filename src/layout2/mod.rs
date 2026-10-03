@@ -9570,6 +9570,30 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn empty_inline_boxes_keep_their_line_fragments() {
+        // CSS 2 §10.8: an empty inline element still generates an inline box,
+        // with its edges and content area, at its place on the line: after a
+        // collapsible space kept before it (the one after it collapses).
+        // CSSOM View reports that fragment, as Gecko and Blink do.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <div>text <span id=e></span> <span id=after>after</span></div>
+            <div>text <span id=d style="padding:0 5px;border:1px solid"></span> <span id=after2>after</span></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        let (e, after) = (rect("e"), rect("after"));
+        assert_eq!(e.width, 0.0);
+        assert_near(e.left, after.left, "empty left");
+        assert_near(e.top, after.top, "empty top");
+        assert_near(e.height, after.height, "empty height");
+        let (d, after2) = (rect("d"), rect("after2"));
+        assert_near(d.width, 12.0, "edges");
+        assert_near(d.left + 12.0, after2.left, "edged left");
+        assert_near(d.top + 1.0, after2.top, "edged top");
+        assert_near(d.height, after2.height + 2.0, "edged height");
+    }
+
+    #[test]
     fn normalize_css_superscripts_rise_without_growing_their_line() {
         // normalize.css sets `sub, sup { position: relative; vertical-align:
         // baseline; line-height: 0 }` with `sup { top: -0.5em }` and

@@ -307,10 +307,13 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
 /// its start and end edges where the box begins and ends (CSS Backgrounds 3
 /// #box-decoration-break `slice`). Decorated boxes paint the same geometry.
 fn inline_box_fragments(f: &Frag, line: &LineFrag) -> Vec<(NodeId, Rect)> {
-    // A relatively positioned box is measured at its offset (CSS 2 §9.4.3).
-    super::inline::line_box_fragments(line.pieces.iter().chain(&line.atom_boxes), |entry| {
-        entry.key.1.is_none()
-    })
+    // CSS 2 §10.8: an empty inline box has a fragment too. A relatively
+    // positioned box is measured at its offset (CSS 2 §9.4.3).
+    super::inline::line_box_fragments(
+        line.pieces.iter().chain(&line.atom_boxes),
+        &line.empty_boxes,
+        |entry| entry.key.1.is_none(),
+    )
     .into_iter()
     .map(|run| {
         let (top, bottom) = run.entry.content_area(f.y, line.height, line.baseline);

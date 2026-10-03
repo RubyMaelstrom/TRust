@@ -4155,7 +4155,7 @@ fn paint_inline_box_decorations(
     }
     // A relatively positioned box paints at its offset (CSS 2 §9.4.3), which
     // its fragments and content area include.
-    let runs = super::inline::line_box_fragments(&line.pieces, |entry| entry.decorated)
+    let runs = super::inline::line_box_fragments(&line.pieces, &[], |entry| entry.decorated)
         .into_iter()
         .map(|run| {
             let (top, bottom) = run
@@ -4339,6 +4339,7 @@ fn text_clip_line(
             justification: line.justification,
             pieces,
             contains_atomic_inline: false,
+            empty_boxes: Vec::new(),
             width: line.width,
             height: line.height,
             baseline: line.baseline,
