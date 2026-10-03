@@ -1,5 +1,5 @@
 //! HTML input value/dirty-value state belongs to the arena, not JS wrappers.
-use super::{Dom, NodeId};
+use super::{Dom, NodeId, StyleView};
 use crate::input::{NumericInput, NumericType};
 
 #[derive(Clone, Debug)]
@@ -86,56 +86,20 @@ impl Dom {
             out.push('"');
         }
     }
-    fn input_value_mode(t: &str) -> bool {
+    pub(super) fn input_value_mode(t: &str) -> bool {
         !matches!(
             t,
             "hidden" | "submit" | "image" | "reset" | "button" | "checkbox" | "radio" | "file"
         )
     }
     pub(crate) fn numeric_input(&self, id: NodeId) -> Option<NumericInput> {
-        let kind = NumericType::from_type(&self.input_type(id))?;
-        Some(NumericInput::new(
-            kind,
-            self.attr(id, "min"),
-            self.attr(id, "max"),
-            self.attr(id, "step"),
-            self.attr(id, "value"),
-        ))
+        self.style_view().numeric_input(id)
     }
     fn sanitize_input_value(&self, id: NodeId, value: &str) -> String {
-        if let Some(config) = self.numeric_input(id) {
-            config.sanitize(value)
-        } else {
-            value.replace(['\r', '\n'], "")
-        }
+        self.style_view().sanitize_input_value(id, value)
     }
     pub fn input_value(&self, id: NodeId) -> String {
-        let ty = self.input_type(id);
-        if ty == "file" {
-            return String::new();
-        }
-        if !Self::input_value_mode(&ty) {
-            return self
-                .attr(id, "value")
-                .unwrap_or(if matches!(ty.as_str(), "checkbox" | "radio") {
-                    "on"
-                } else {
-                    ""
-                })
-                .into();
-        }
-        if let Some(state) = self.input_values.get(&id) {
-            return state.value.clone();
-        }
-        // A presentation snapshot transports the current value separately
-        // from the content attribute, which remains the numeric step base.
-        let value = if !self.render_live() {
-            self.attr(id, "data-trust-input-value")
-                .or_else(|| self.attr(id, "value"))
-        } else {
-            self.attr(id, "value")
-        };
-        self.sanitize_input_value(id, value.unwrap_or(""))
+        self.style_view().input_value(id)
     }
     pub fn set_input_value(&mut self, id: NodeId, value: &str, user: bool) -> bool {
         if !self.is_valid(id) {
@@ -187,13 +151,7 @@ impl Dom {
         self.input_values.get(&id).is_some_and(|s| s.bad_input)
     }
     pub(crate) fn input_editing_value(&self, id: NodeId) -> Option<&str> {
-        if let Some(state) = self.input_values.get(&id) {
-            state.editing.as_deref()
-        } else if !self.render_live() {
-            self.attr(id, "data-trust-input-edit")
-        } else {
-            None
-        }
+        self.style_view().input_editing_value(id)
     }
     pub fn input_mutable(&self, id: NodeId) -> bool {
         !self.actually_disabled(id, "input") && self.attr(id, "readonly").is_none()
@@ -307,6 +265,63 @@ impl Dom {
             state.dirty = dirty;
         }
         true
+    }
+}
+
+impl<'a> StyleView<'a> {
+    pub(super) fn numeric_input(&self, id: NodeId) -> Option<NumericInput> {
+        let kind = NumericType::from_type(&self.input_type(id))?;
+        Some(NumericInput::new(
+            kind,
+            self.attr(id, "min"),
+            self.attr(id, "max"),
+            self.attr(id, "step"),
+            self.attr(id, "value"),
+        ))
+    }
+    fn sanitize_input_value(&self, id: NodeId, value: &str) -> String {
+        if let Some(config) = self.numeric_input(id) {
+            config.sanitize(value)
+        } else {
+            value.replace(['\r', '\n'], "")
+        }
+    }
+    pub(super) fn input_value(&self, id: NodeId) -> String {
+        let ty = self.input_type(id);
+        if ty == "file" {
+            return String::new();
+        }
+        if !Dom::input_value_mode(&ty) {
+            return self
+                .attr(id, "value")
+                .unwrap_or(if matches!(ty.as_str(), "checkbox" | "radio") {
+                    "on"
+                } else {
+                    ""
+                })
+                .into();
+        }
+        if let Some(state) = self.state.input_values.get(&id) {
+            return state.value.clone();
+        }
+        // A presentation snapshot transports the current value separately
+        // from the content attribute, which remains the numeric step base.
+        let value = if !self.state.render_live {
+            self.attr(id, "data-trust-input-value")
+                .or_else(|| self.attr(id, "value"))
+        } else {
+            self.attr(id, "value")
+        };
+        self.sanitize_input_value(id, value.unwrap_or(""))
+    }
+    pub(super) fn input_editing_value(&self, id: NodeId) -> Option<&'a str> {
+        if let Some(state) = self.state.input_values.get(&id) {
+            state.editing.as_deref()
+        } else if !self.state.render_live {
+            self.attr(id, "data-trust-input-edit")
+        } else {
+            None
+        }
     }
 }
 

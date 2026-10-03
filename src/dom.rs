@@ -15,6 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, ns};
+use style_view::{ClassMemo, StyleView};
 
 #[cfg(feature = "architecture-diagnostics")]
 pub(crate) mod architecture_diagnostics;
@@ -36,6 +37,7 @@ mod media;
 mod properties;
 mod style_records;
 mod style_sharing;
+mod style_view;
 pub(crate) use style_records::BoxContext;
 
 pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
@@ -598,7 +600,7 @@ pub const DOCUMENT: NodeId = 0;
 /// costs O(1) amortized: first child, else next sibling, else the first
 /// ancestor below `root` with a next sibling.
 pub struct Descendants<'a> {
-    dom: &'a Dom,
+    nodes: style_view::NodesRef<'a>,
     root: NodeId,
     next: Option<NodeId>,
 }
@@ -608,17 +610,17 @@ impl Iterator for Descendants<'_> {
 
     fn next(&mut self) -> Option<NodeId> {
         let cur = self.next?;
-        let mut n = self.dom.nodes[cur].first_child;
+        let mut n = self.nodes.first_child(cur);
         if n.is_none() {
             let mut up = cur;
             while up != self.root {
-                if let Some(s) = self.dom.nodes[up].next_sibling {
+                if let Some(s) = self.nodes.next_sibling(up) {
                     n = Some(s);
                     break;
                 }
                 // Every visited node was reached from `root`, so the parent
                 // chain leads back to it; `None` is pure defense.
-                match self.dom.nodes[up].parent {
+                match self.nodes.parent(up) {
                     Some(p) => up = p,
                     None => break,
                 }
@@ -1325,7 +1327,7 @@ impl Dom {
                 candidates.clear();
                 let scope = self.tree_scope(id);
                 if let Some(buckets) = index.cursor_buckets.get(&scope) {
-                    buckets.candidates(self, id, &mut candidates);
+                    buckets.candidates(&self.style_view(), id, &mut candidates);
                 }
                 index.scopes.get(&scope).is_some_and(|rules| {
                     candidates.iter().any(|&rule| {
@@ -1415,7 +1417,7 @@ impl Dom {
                     continue;
                 };
                 let mut candidates = Vec::new();
-                buckets.candidates(self, id, &mut candidates);
+                buckets.candidates(&self.style_view(), id, &mut candidates);
                 if candidates
                     .into_iter()
                     .any(|rule| rule_is_paint_only(&rules[rule as usize]))
@@ -1475,7 +1477,7 @@ impl Dom {
     /// Live arenas own the state directly; serialized presentation arenas carry
     /// the internal order marker because open state is not an HTML attribute.
     pub fn is_popover_showing(&self, id: NodeId) -> bool {
-        self.popover_open.contains(&id) || self.attr(id, "data-trust-popover-open").is_some()
+        self.style_view().is_popover_showing(id)
     }
 
     /// Stable position in the document top layer, used by the painter. The
@@ -1508,7 +1510,7 @@ impl Dom {
     /// has no Fullscreen API, so no element has a fullscreen flag. Serialized
     /// presentation arenas carry the state as an internal marker.
     pub fn is_modal(&self, id: NodeId) -> bool {
-        self.modal_dialogs.contains(&id) || self.attr(id, "data-trust-modal").is_some()
+        self.style_view().is_modal(id)
     }
 
     /// The dialog removing steps set "is modal" to false. Removal is the only
@@ -1598,7 +1600,7 @@ impl Dom {
                 continue;
             };
             let mut candidates = Vec::new();
-            buckets.candidates(self, id, &mut candidates);
+            buckets.candidates(&self.style_view(), id, &mut candidates);
             if candidates.is_empty() {
                 continue;
             }
@@ -1722,11 +1724,7 @@ impl Dom {
     /// are associated with the host, and a slottable is associated with the
     /// first matching `<slot>` in its parent's shadow tree.
     pub(crate) fn parent_flat(&self, id: NodeId) -> Option<NodeId> {
-        if let Some(slot) = self.assigned_slot(id) {
-            return Some(slot);
-        }
-        let parent = self.nodes.get(id)?.parent?;
-        self.shadow_hosts.get(&parent).copied().or(Some(parent))
+        self.style_view().parent_flat(id)
     }
 
     /// Whether `id` is below an element omitted from CSS Display's flat-tree
@@ -1748,20 +1746,7 @@ impl Dom {
     /// event dispatcher uses this as Node's `get the parent` algorithm; the
     /// public `assignedSlot` IDL getter additionally hides closed-tree slots.
     pub fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
-        let host = self.nodes.get(id)?.parent?;
-        let shadow = self.shadow_root(host)?;
-        if self
-            .shadow_data
-            .get(&shadow)
-            .is_some_and(|data| data.manual_slot_assignment)
-        {
-            return None;
-        }
-        let wanted = self.attr(id, "slot").unwrap_or("").trim();
-        self.descendants(shadow).find(|&candidate| {
-            self.tag_name(candidate) == Some("slot")
-                && self.attr(candidate, "name").unwrap_or("").trim() == wanted
-        })
+        self.style_view().assigned_slot(id)
     }
 
     fn labeled_control(&self, label: NodeId) -> Option<NodeId> {
@@ -3282,10 +3267,7 @@ impl Dom {
     /// walks (the serializers, queries, text extraction). Use `children()`
     /// (materialized) when the tree is mutated mid-iteration.
     pub fn child_iter(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        std::iter::successors(
-            self.nodes.get(id).and_then(|node| node.first_child),
-            move |&c| self.nodes[c].next_sibling,
-        )
+        style_view::NodesRef::new(&self.nodes).child_iter(id)
     }
 
     /// The subtree under `root` in document (pre-)order, excluding `root`,
@@ -3296,21 +3278,14 @@ impl Dom {
     /// also makes mutation-during-iteration a compile error; callers that
     /// mutate mid-walk collect first (`rewrite_inline_svgs`).
     pub fn descendants(&self, root: NodeId) -> Descendants<'_> {
-        Descendants {
-            dom: self,
-            root,
-            next: self.nodes.get(root).and_then(|node| node.first_child),
-        }
+        style_view::NodesRef::new(&self.nodes).descendants(root)
     }
 
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub fn tag_name(&self, id: NodeId) -> Option<&str> {
         #[cfg(feature = "architecture-diagnostics")]
         architecture_diagnostics::tag_name();
-        match &self.nodes.get(id)?.data {
-            NodeData::Element { name, .. } => Some(&name.local),
-            _ => None,
-        }
+        style_view::NodesRef::new(&self.nodes).tag_name(id)
     }
 
     /// The element's namespace URI (DOM `Element.namespaceURI`): the full URI
@@ -3427,13 +3402,7 @@ impl Dom {
     }
 
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
-        match &self.nodes.get(id)?.data {
-            NodeData::Element { attrs, .. } => attrs
-                .iter()
-                .find(|a| str::eq_ignore_ascii_case(&a.name.local, name))
-                .map(|a| &*a.value),
-            _ => None,
-        }
+        style_view::NodesRef::new(&self.nodes).attr(id, name)
     }
 
     /// DOM getAttribute matches qualified names, folding only on HTML
@@ -5957,6 +5926,7 @@ impl Dom {
                 memo: None,
                 memo_prefixes: false,
                 ancestors: None,
+                classes: ClassMemo::Document(&self.class_cache),
             },
         )
     }
@@ -6396,17 +6366,7 @@ impl Dom {
     /// own scope's sheets (selector matching can't cross the boundary
     /// either — ancestor walks stop at fragment roots).
     fn tree_scope(&self, id: NodeId) -> NodeId {
-        let mut cur = id;
-        if matches!(self.nodes[cur].data, NodeData::Document) {
-            return cur;
-        }
-        while let Some(p) = self.nodes[cur].parent {
-            if matches!(self.nodes[p].data, NodeData::Document) {
-                return p;
-            }
-            cur = p;
-        }
-        cur
+        self.style_view().tree_scope(id)
     }
 
     /// HTML #reset-the-form-owner: resolve association in the element's own
@@ -6650,14 +6610,7 @@ impl Dom {
     /// embedding iframe. Shadow-tree inheritance still uses `parent_flat()`
     /// and crosses to its host; separate Document trees do not inherit.
     fn style_parent(&self, id: NodeId) -> Option<NodeId> {
-        let parent = self.parent_flat(id)?;
-        if matches!(self.nodes[id].data, NodeData::Document)
-            || matches!(self.nodes[parent].data, NodeData::Document)
-        {
-            None
-        } else {
-            Some(parent)
-        }
+        self.style_view().style_parent(id)
     }
 
     /// The parsed style index, built on first use after a STYLE-epoch
@@ -6946,14 +6899,6 @@ impl Dom {
         let mut candidate_count = 0u64;
         let index = self.style_index();
         let scope = self.tree_scope(id);
-        let memo = RefCell::new(rule_index::MatchMemo::default());
-        let context = SelectorContext {
-            scope: None,
-            shadow_host: self.shadow_hosts.get(&scope).copied(),
-            memo: Some(&memo),
-            memo_prefixes: false,
-            ancestors: None,
-        };
         let cached_selectors = self
             .selector_cache
             .borrow()
@@ -6965,28 +6910,23 @@ impl Dom {
         } else {
             let selectors = match (index.scopes.get(&scope), index.buckets.get(&scope)) {
                 (Some(rules), Some(b)) => {
-                    // A logical selector can have several alternative keys.
-                    // Deduplicate before matching so an element satisfying two
-                    // alternatives (or repeating a class) tests the rule once.
-                    let mut candidates = Vec::new();
-                    b.candidates(self, id, &mut candidates);
-                    // Amortize a lazy ancestor index on large candidate sets.
-                    // It is populated only if a descendant combinator needs it.
-                    let ancestors = (candidates.len() >= 32).then(|| {
-                        RefCell::new(rule_index::AncestorMatches::new(id, context.shadow_host))
-                    });
-                    let context = SelectorContext {
-                        ancestors: ancestors.as_ref(),
-                        ..context
-                    };
-                    let mut out: Vec<u32> = Vec::new();
-                    for ri in candidates {
-                        candidate_count += 1;
-                        let rule = &rules[ri as usize];
-                        if self.matches_complex_uncached(id, &rule.selector.0, context) {
-                            out.push(ri);
-                        }
-                    }
+                    let view = self.style_view();
+                    let mut ancestors = None;
+                    let mut out = Vec::new();
+                    candidate_count = view.match_rules(
+                        id,
+                        b,
+                        |ri| &rules[ri as usize].selector,
+                        self.shadow_hosts.get(&scope).copied(),
+                        ClassMemo::Document(&self.class_cache),
+                        |required| {
+                            ancestors
+                                .get_or_insert_with(|| rule_index::Ancestors::of(&view, id))
+                                .may_match(&view, required)
+                        },
+                        &mut Vec::new(),
+                        &mut out,
+                    );
                     std::rc::Rc::new(out)
                 }
                 _ => std::rc::Rc::new(Vec::new()),
@@ -7222,10 +7162,7 @@ impl Dom {
     /// Parent in the COMPOSED tree: shadow roots hand off to their host
     /// (event paths and ancestor checks cross shadow boundaries).
     pub fn parent_composed(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes
-            .get(id)?
-            .parent
-            .or_else(|| self.shadow_hosts.get(&id).copied())
+        self.style_view().parent_composed(id)
     }
 
     /// Whether `id` is connected to the document (a render-affecting node). A
@@ -7341,7 +7278,7 @@ impl Dom {
     }
 
     pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
-        self.shadow_roots.get(&host).copied()
+        self.style_view().shadow_root(host)
     }
 
     /// The composed-tree children of `id`: its light children plus, when it
@@ -7586,21 +7523,17 @@ impl Dom {
     /// an `<iframe>`, whose children the HTML parser treats as RAWTEXT. `None`
     /// for an unrealized or cross-origin frame.
     pub fn frame_body(&self, id: NodeId) -> Option<NodeId> {
-        let html = self.frame_root(id)?;
-        self.child_iter(html)
-            .find(|&c| self.tag_name(c) == Some("body"))
+        self.style_view().frame_body(id)
     }
 
     pub(crate) fn frame_root(&self, frame: NodeId) -> Option<NodeId> {
-        self.child_iter(self.frame_document(frame)?)
-            .find(|&child| self.tag_name(child).is_some())
+        self.style_view().frame_root(frame)
     }
 
     /// HTML #creating-a-new-browsing-context: each navigation creates a real, distinct
     /// Document. Its arena parent is a presentation-only edge to the navigable container.
     pub(crate) fn frame_document(&self, frame: NodeId) -> Option<NodeId> {
-        self.child_iter(frame)
-            .find(|&id| matches!(self.nodes[id].data, NodeData::Document))
+        self.style_view().frame_document(frame)
     }
 
     /// The nearest iframe/frame whose active nested document contains `id`.
@@ -9825,20 +9758,214 @@ impl Dom {
 
     fn selector_context(&self, id: NodeId, scope: Option<NodeId>) -> SelectorContext<'_> {
         SelectorContext {
+            classes: ClassMemo::Document(&self.class_cache),
+            ..self.style_view().selector_context(id, scope)
+        }
+    }
+
+    // The selector matcher lives on `StyleView`; these keep the DOM-facing
+    // entry points, with the document's class-token cache.
+
+    fn matches_complex_in(
+        &self,
+        id: NodeId,
+        parts: &[(Combinator, Compound)],
+        scope: SelectorContext<'_>,
+    ) -> bool {
+        self.style_view().matches_complex_in(id, parts, scope)
+    }
+
+    #[cfg(test)]
+    fn matches_complex_uncached(
+        &self,
+        id: NodeId,
+        parts: &[(Combinator, Compound)],
+        scope: SelectorContext<'_>,
+    ) -> bool {
+        self.style_view().matches_complex_uncached(id, parts, scope)
+    }
+
+    fn selector_parent(&self, id: NodeId) -> Option<NodeId> {
+        self.style_view().selector_parent(id)
+    }
+
+    fn prev_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        self.style_view().prev_element_sibling(id)
+    }
+
+    fn next_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        self.style_view().next_element_sibling(id)
+    }
+
+    fn is_element_empty(&self, id: NodeId) -> bool {
+        self.style_view().is_element_empty(id)
+    }
+
+    fn matches_compound(&self, id: NodeId, c: &Compound, scope: Option<NodeId>) -> bool {
+        self.matches_compound_in(id, c, self.selector_context(id, scope))
+    }
+
+    fn matches_compound_in(&self, id: NodeId, c: &Compound, scope: SelectorContext<'_>) -> bool {
+        self.style_view().matches_compound_in(id, c, scope)
+    }
+
+    pub(crate) fn input_type(&self, id: NodeId) -> String {
+        self.style_view().input_type(id)
+    }
+
+    fn actually_disabled(&self, id: NodeId, tag: &str) -> bool {
+        self.style_view().actually_disabled(id, tag)
+    }
+
+    pub(crate) fn inherited_lang(&self, id: NodeId) -> Option<&str> {
+        self.style_view().inherited_lang(id)
+    }
+}
+
+impl<'a> StyleView<'a> {
+    /// A fresh matching context for `id` (or the `scope` query root), with
+    /// no memo storage.
+    pub(super) fn selector_context<'c>(
+        &self,
+        id: NodeId,
+        scope: Option<NodeId>,
+    ) -> SelectorContext<'c> {
+        SelectorContext {
             scope,
             memo: None,
             memo_prefixes: false,
             ancestors: None,
-            shadow_host: if self.shadow_hosts.is_empty() {
+            classes: ClassMemo::None,
+            shadow_host: if self.state.shadow_hosts.is_empty() {
                 None
             } else {
-                self.shadow_hosts
+                self.state
+                    .shadow_hosts
                     .get(&self.tree_scope(scope.unwrap_or(id)))
                     .copied()
             },
         }
     }
 
+    #[inline]
+    pub(super) fn tag_name(&self, id: NodeId) -> Option<&'a str> {
+        self.nodes.tag_name(id)
+    }
+
+    #[inline]
+    pub(super) fn attr(&self, id: NodeId, name: &str) -> Option<&'a str> {
+        self.nodes.attr(id, name)
+    }
+
+    #[inline]
+    pub(super) fn child_iter(&self, id: NodeId) -> impl Iterator<Item = NodeId> + 'a {
+        self.nodes.child_iter(id)
+    }
+
+    #[inline]
+    pub(super) fn descendants(&self, root: NodeId) -> Descendants<'a> {
+        self.nodes.descendants(root)
+    }
+
+    pub(super) fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        self.state.shadow_roots.get(&host).copied()
+    }
+
+    /// See `Dom::tree_scope`.
+    pub(super) fn tree_scope(&self, id: NodeId) -> NodeId {
+        let mut cur = id;
+        if self.nodes.is_document(cur) {
+            return cur;
+        }
+        while let Some(p) = self.nodes.parent(cur) {
+            if self.nodes.is_document(p) {
+                return p;
+            }
+            cur = p;
+        }
+        cur
+    }
+
+    /// See `Dom::parent_composed`.
+    pub(super) fn parent_composed(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes
+            .try_parent(id)?
+            .or_else(|| self.state.shadow_hosts.get(&id).copied())
+    }
+
+    /// See `Dom::style_parent`.
+    pub(super) fn style_parent(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.parent_flat(id)?;
+        if self.nodes.is_document(id) || self.nodes.is_document(parent) {
+            None
+        } else {
+            Some(parent)
+        }
+    }
+
+    /// See `Dom::parent_flat`.
+    pub(super) fn parent_flat(&self, id: NodeId) -> Option<NodeId> {
+        if let Some(slot) = self.assigned_slot(id) {
+            return Some(slot);
+        }
+        let parent = self.nodes.parent_of(id)?;
+        self.state
+            .shadow_hosts
+            .get(&parent)
+            .copied()
+            .or(Some(parent))
+    }
+
+    /// See `Dom::assigned_slot`.
+    pub(super) fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
+        let host = self.nodes.parent_of(id)?;
+        let shadow = self.shadow_root(host)?;
+        if self
+            .state
+            .shadow_data
+            .get(&shadow)
+            .is_some_and(|data| data.manual_slot_assignment)
+        {
+            return None;
+        }
+        let wanted = self.attr(id, "slot").unwrap_or("").trim();
+        self.descendants(shadow).find(|&candidate| {
+            self.tag_name(candidate) == Some("slot")
+                && self.attr(candidate, "name").unwrap_or("").trim() == wanted
+        })
+    }
+
+    /// See `Dom::frame_body`.
+    pub(super) fn frame_body(&self, id: NodeId) -> Option<NodeId> {
+        let html = self.frame_root(id)?;
+        self.child_iter(html)
+            .find(|&c| self.tag_name(c) == Some("body"))
+    }
+
+    /// See `Dom::frame_root`.
+    pub(super) fn frame_root(&self, frame: NodeId) -> Option<NodeId> {
+        self.child_iter(self.frame_document(frame)?)
+            .find(|&child| self.tag_name(child).is_some())
+    }
+
+    /// See `Dom::frame_document`.
+    pub(super) fn frame_document(&self, frame: NodeId) -> Option<NodeId> {
+        self.child_iter(frame)
+            .find(|&id| self.nodes.is_document(id))
+    }
+
+    /// See `Dom::is_popover_showing`.
+    pub(super) fn is_popover_showing(&self, id: NodeId) -> bool {
+        self.state.popover_open.contains(&id) || self.attr(id, "data-trust-popover-open").is_some()
+    }
+
+    /// See `Dom::is_modal`.
+    pub(super) fn is_modal(&self, id: NodeId) -> bool {
+        self.state.modal_dialogs.contains(&id) || self.attr(id, "data-trust-modal").is_some()
+    }
+}
+
+impl<'a> StyleView<'a> {
     fn matches_complex_in(
         &self,
         id: NodeId,
@@ -9948,8 +10075,8 @@ impl Dom {
         if context.shadow_host == Some(id) {
             return None;
         }
-        let parent = self.nodes[id].parent?;
-        if self.shadow_hosts.get(&parent).copied() == context.shadow_host
+        let parent = self.nodes.parent(id)?;
+        if self.state.shadow_hosts.get(&parent).copied() == context.shadow_host
             && context.shadow_host.is_some()
         {
             return context.shadow_host;
@@ -9964,7 +10091,7 @@ impl Dom {
     /// for `>`/descendant selectors even though [`style_parent`] correctly
     /// returns the slot for inheritance.
     fn selector_parent(&self, id: NodeId) -> Option<NodeId> {
-        let parent = self.nodes[id].parent?;
+        let parent = self.nodes.parent(id)?;
         if matches!(self.tag_name(parent), Some("iframe" | "frame"))
             && self.frame_body(parent).is_some()
         {
@@ -9975,12 +10102,12 @@ impl Dom {
 
     /// The nearest preceding sibling that is an element (skips text/comments).
     fn prev_element_sibling(&self, id: NodeId) -> Option<NodeId> {
-        let mut p = self.nodes[id].prev_sibling;
+        let mut p = self.nodes.prev_sibling(id);
         while let Some(s) = p {
             if self.tag_name(s).is_some() {
                 return Some(s);
             }
-            p = self.nodes[s].prev_sibling;
+            p = self.nodes.prev_sibling(s);
         }
         None
     }
@@ -9988,14 +10115,17 @@ impl Dom {
     /// `:empty` — the element has no element children and no text children
     /// with non-whitespace content (comments don't count).
     fn is_element_empty(&self, id: NodeId) -> bool {
-        let mut child = self.nodes[id].first_child;
+        let mut child = self.nodes.first_child(id);
         while let Some(c) = child {
-            match &self.nodes[c].data {
-                NodeData::Element { .. } => return false,
-                NodeData::Text(t) if !t.chars().all(char::is_whitespace) => return false,
-                _ => {}
+            if self.nodes.is_element(c)
+                || self
+                    .nodes
+                    .text(c)
+                    .is_some_and(|t| !t.chars().all(char::is_whitespace))
+            {
+                return false;
             }
-            child = self.nodes[c].next_sibling;
+            child = self.nodes.next_sibling(c);
         }
         true
     }
@@ -10014,11 +10144,11 @@ impl Dom {
         of: Option<&[Complex]>,
         scope: SelectorContext<'_>,
     ) -> Option<i32> {
-        let parent = self.nodes[id].parent?;
+        let parent = self.nodes.parent(id)?;
         let my_tag = self.tag_name(id)?;
         let mut count = 0i32;
         let mut ordinal = None;
-        let mut child = self.nodes[parent].first_child;
+        let mut child = self.nodes.first_child(parent);
         while let Some(c) = child {
             if let Some(t) = self.tag_name(c)
                 && (!of_type || t == my_tag)
@@ -10032,7 +10162,7 @@ impl Dom {
                     ordinal = Some(count);
                 }
             }
-            child = self.nodes[c].next_sibling;
+            child = self.nodes.next_sibling(c);
         }
         let ordinal = ordinal?;
         Some(if from_end {
@@ -10099,10 +10229,10 @@ impl Dom {
         // per-element match memos are epoch-keyed and `set_hover_chain` bumps
         // the epoch whenever rendering could change, so a stale chain can
         // never serve from cache.
-        if c.hover && !self.hover_chain.contains(&id) {
+        if c.hover && !self.state.hover_chain.contains(&id) {
             return false;
         }
-        if c.target && self.fragment_target != Some(id) {
+        if c.target && self.state.fragment_target != Some(id) {
             return false;
         }
         // Live `:popover-open`: the element's popover is currently showing.
@@ -10128,7 +10258,7 @@ impl Dom {
         {
             return false;
         }
-        if !self.matches_classes(id, &c.classes) {
+        if !self.matches_classes(id, &c.classes, scope.classes) {
             return false;
         }
         for sel in &c.attrs {
@@ -10242,7 +10372,7 @@ impl Dom {
 
     /// An `<input>`'s effective type: the `type` attribute, ASCII-lowercased,
     /// defaulting to `text`.
-    pub(crate) fn input_type(&self, id: NodeId) -> String {
+    pub(super) fn input_type(&self, id: NodeId) -> String {
         let ty = self.attr(id, "type").unwrap_or("text").to_ascii_lowercase();
         if matches!(
             ty.as_str(),
@@ -10296,12 +10426,12 @@ impl Dom {
     /// The nearest `<form>` ancestor (the form owner for grouping; the `form`
     /// content attribute's id indirection is not modeled), else the document.
     fn nearest_form(&self, id: NodeId) -> NodeId {
-        let mut cur = self.nodes[id].parent;
+        let mut cur = self.nodes.parent(id);
         while let Some(a) = cur {
             if self.tag_name(a) == Some("form") {
                 return a;
             }
-            cur = self.nodes[a].parent;
+            cur = self.nodes.parent(a);
         }
         DOCUMENT
     }
@@ -10319,12 +10449,12 @@ impl Dom {
                 if self.attr(id, "disabled").is_some() {
                     return true;
                 }
-                let mut cur = self.nodes[id].parent;
+                let mut cur = self.nodes.parent(id);
                 while let Some(a) = cur {
                     if self.tag_name(a) == Some("optgroup") {
                         return self.attr(a, "disabled").is_some();
                     }
-                    cur = self.nodes[a].parent;
+                    cur = self.nodes.parent(a);
                 }
                 false
             }
@@ -10336,7 +10466,7 @@ impl Dom {
     /// from a disabled `<fieldset>` is disabled, unless it sits inside that
     /// fieldset's FIRST `<legend>` child.
     fn disabled_by_fieldset(&self, id: NodeId) -> bool {
-        let mut cur = self.nodes[id].parent;
+        let mut cur = self.nodes.parent(id);
         while let Some(a) = cur {
             if self.tag_name(a) == Some("fieldset") && self.attr(a, "disabled").is_some() {
                 let in_first_legend = self
@@ -10347,7 +10477,7 @@ impl Dom {
                     return true;
                 }
             }
-            cur = self.nodes[a].parent;
+            cur = self.nodes.parent(a);
         }
         false
     }
@@ -10359,7 +10489,7 @@ impl Dom {
             if n == anc {
                 return true;
             }
-            cur = self.nodes[n].parent;
+            cur = self.nodes.parent(n);
         }
         false
     }
@@ -10419,7 +10549,7 @@ impl Dom {
 
     /// The element's language: the nearest ancestor-or-self `lang` (or
     /// `xml:lang`) attribute.
-    pub(crate) fn inherited_lang(&self, id: NodeId) -> Option<&str> {
+    pub(super) fn inherited_lang(&self, id: NodeId) -> Option<&'a str> {
         let mut cur = Some(id);
         while let Some(n) = cur {
             if let Some(l) = self.attr(n, "lang").or_else(|| self.attr(n, "xml:lang")) {
@@ -10453,12 +10583,12 @@ impl Dom {
 
     /// The nearest following sibling that is an element (skips text/comments).
     fn next_element_sibling(&self, id: NodeId) -> Option<NodeId> {
-        let mut n = self.nodes[id].next_sibling;
+        let mut n = self.nodes.next_sibling(id);
         while let Some(s) = n {
             if self.tag_name(s).is_some() {
                 return Some(s);
             }
-            n = self.nodes[s].next_sibling;
+            n = self.nodes.next_sibling(s);
         }
         None
     }
@@ -10485,7 +10615,7 @@ impl Dom {
             v
         } else {
             self.child_iter(if scope.shadow_host == Some(subject) {
-                self.shadow_roots[&subject]
+                self.state.shadow_roots[&subject]
             } else {
                 subject
             })
@@ -10777,6 +10907,7 @@ fn find_var_function(value: &str) -> Option<usize> {
 
 /// Query scoping and the selector's tree context are distinct (CSS Shadow 1
 /// #selectors-data-model). Keep both stable across combinators and :is/:not.
+/// The memo fields are per-thread storage; results never depend on them.
 #[derive(Clone, Copy)]
 struct SelectorContext<'a> {
     scope: Option<NodeId>,
@@ -10784,6 +10915,7 @@ struct SelectorContext<'a> {
     memo: Option<&'a RefCell<rule_index::MatchMemo>>,
     memo_prefixes: bool,
     ancestors: Option<&'a RefCell<rule_index::AncestorMatches>>,
+    classes: ClassMemo<'a>,
 }
 
 #[derive(PartialEq)]
@@ -16066,30 +16198,45 @@ impl RuleBuckets {
         b
     }
 
-    fn candidates(&self, dom: &Dom, id: NodeId, out: &mut Vec<u32>) {
+    fn candidates(&self, view: &StyleView<'_>, id: NodeId, out: &mut Vec<u32>) {
+        let mut ancestors = None;
+        self.candidates_filtered(view, id, out, |required| {
+            ancestors
+                .get_or_insert_with(|| rule_index::Ancestors::of(view, id))
+                .may_match(view, required)
+        });
+    }
+
+    /// `candidates` with a caller-supplied ancestor-key rejection filter,
+    /// which must admit every requirement list all of whose keys occur on
+    /// `id`'s composed ancestors.
+    fn candidates_filtered(
+        &self,
+        view: &StyleView<'_>,
+        id: NodeId,
+        out: &mut Vec<u32>,
+        mut may_match_ancestors: impl FnMut(&[u16]) -> bool,
+    ) {
         out.extend(self.universal.iter().copied());
-        if let Some(value) = dom.attr(id, "id")
+        if let Some(value) = view.attr(id, "id")
             && let Some(indices) = self.by_id.get(value)
         {
             out.extend(indices.iter().copied());
         }
-        if let Some(classes) = dom.attr(id, "class") {
+        if let Some(classes) = view.attr(id, "class") {
             for class in classes.split_ascii_whitespace() {
                 if let Some(indices) = self.by_class.get(class) {
                     out.extend(indices.iter().copied());
                 }
             }
         }
-        if let Some(tag) = dom.tag_name(id)
+        if let Some(tag) = view.tag_name(id)
             && let Some(indices) = self.by_tag.get(tag)
         {
             out.extend(indices.iter().copied());
         }
-        if !self.by_attribute.is_empty()
-            && let NodeData::Element { attrs, .. } = &dom.node(id).data
-        {
-            for attribute in attrs {
-                let name = attribute.name.local.as_ref();
+        if !self.by_attribute.is_empty() {
+            for name in view.nodes.attr_names(id) {
                 let indices = self.by_attribute.get(name).or_else(|| {
                     name.bytes()
                         .any(|b| b.is_ascii_uppercase())
@@ -16107,13 +16254,10 @@ impl RuleBuckets {
             // Only candidates with ancestor requirements need the filter.
             // An unrelated descendant rule must not make universal/subject
             // rules repeatedly walk every ancestor of a deeply nested tree.
-            let mut ancestors = None;
             out.retain(|index| {
-                self.ancestors.get(index).is_none_or(|required| {
-                    ancestors
-                        .get_or_insert_with(|| rule_index::Ancestors::of(dom, id))
-                        .may_match(dom, required)
-                })
+                self.ancestors
+                    .get(index)
+                    .is_none_or(|required| may_match_ancestors(required))
             });
         }
     }
@@ -20030,6 +20174,7 @@ mod tests {
                         memo: None,
                         memo_prefixes: false,
                         ancestors: None,
+                        classes: ClassMemo::None,
                     }
                 ),
                 matches,
