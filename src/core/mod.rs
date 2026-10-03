@@ -2770,7 +2770,9 @@ impl BrowserController {
                     // reflows must not resurrect the server's pre-script DOM.
                     // This remains a presentation snapshot, never a second
                     // mutable DOM authority.
-                    if let FetchedDocument::Http(response) = &mut page.document {
+                    if let FetchedDocument::Http(response) = &mut page.document
+                        && !html.is_empty()
+                    {
                         response.body = html.into_bytes();
                     }
                     if let Some(rendered) = outcome.rendered.take() {
@@ -4457,6 +4459,20 @@ mod tests {
 
         assert!(browser.handle_page_event(crate::js::PageEvt::Static {
             html: String::from("<html><body><p>settled DOM</p></body></html>"),
+            outcome: Default::default(),
+        }));
+        let FetchedDocument::Http(response) = &browser.current.as_ref().unwrap().document else {
+            panic!("expected HTTP document");
+        };
+        assert_eq!(
+            response.body,
+            b"<html><body><p>settled DOM</p></body></html>"
+        );
+
+        // A retirement without a serialization keeps the last known source
+        // rather than leaving later static reflows an empty document.
+        assert!(browser.handle_page_event(crate::js::PageEvt::Static {
+            html: String::new(),
             outcome: Default::default(),
         }));
         let FetchedDocument::Http(response) = &browser.current.as_ref().unwrap().document else {
