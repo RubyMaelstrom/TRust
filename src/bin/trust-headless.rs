@@ -39,7 +39,10 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 use trust::accessibility::SemanticTree;
-use trust::core::{BrowserController, BrowserPage, CssSize, FetchedDocument, UserAction};
+use trust::core::{
+    BrowserController, BrowserPage, ButtonState, CssPoint, CssSize, FetchedDocument, PointerButton,
+    UserAction,
+};
 use trust::doc::{Doc, Link};
 use trust::render::{DisplayCommand, PagePaint};
 
@@ -73,6 +76,7 @@ enum Settle {
     Timeout,
 }
 
+#[derive(Clone)]
 struct Options {
     address: String,
     width: f32,
@@ -84,6 +88,10 @@ struct Options {
     max_chars: usize,
     js_diagnostics: bool,
     site_data: bool,
+    /// Viewport points to click, in order, after the page settles.
+    clicks: Vec<CssPoint>,
+    /// The quiet period after each click (default: `settle`).
+    click_settle: Option<Duration>,
 }
 
 const USAGE: &str = "\
@@ -102,6 +110,10 @@ usage: trust-headless [options] URL|FILE
                   output, module skips, panic flag, and fetch count
   --site-data     load the saved profile's bookmarked-site cookies and
                   storage (under XDG_DATA_HOME) and write changes back to it
+  --click X,Y     after the page settles, click this viewport point as the
+                  desktop does, then settle again (repeatable; the dump and
+                  snapshot show the final page)
+  --click-settle SECONDS  quiet period after each click (default: --settle)
   -h, --help      show this message
 
 Exit status: 0 when the dump is complete, 1 when no page loaded, 2 on a bad
@@ -121,6 +133,8 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut max_chars = 8000usize;
     let mut js_diagnostics = false;
     let mut site_data = false;
+    let mut clicks = Vec::new();
+    let mut click_settle = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -144,6 +158,20 @@ fn parse_args() -> Result<Option<Options>, String> {
             "--links" => list_links = true,
             "--js-diagnostics" => js_diagnostics = true,
             "--site-data" => site_data = true,
+            "--click" => {
+                let raw = string("--click", &mut args)?;
+                let point = raw
+                    .split_once(',')
+                    .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+                    .filter(|(x, y): &(f32, f32)| x.is_finite() && y.is_finite())
+                    .ok_or_else(|| format!("--click needs X,Y in CSS pixels, got {raw}"))?;
+                clicks.push(CssPoint::new(point.0, point.1));
+            }
+            "--click-settle" => {
+                click_settle = Some(Duration::from_secs_f32(
+                    number("--click-settle", &mut args)?.max(0.0),
+                ));
+            }
             "--max-chars" => {
                 let raw = string("--max-chars", &mut args)?;
                 max_chars = match raw.as_str() {
@@ -175,6 +203,8 @@ fn parse_args() -> Result<Option<Options>, String> {
         max_chars,
         js_diagnostics,
         site_data,
+        clicks,
+        click_settle,
     }))
 }
 
@@ -254,22 +284,16 @@ fn try_run(options: Options) -> Result<bool, Box<dyn Error>> {
     outcome
 }
 
-/// Drive one navigation to a settled page and print it.
-async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> {
-    let mut controller = BrowserController::new(
-        tokio::runtime::Handle::current(),
-        || {},
-        CssSize::new(options.width, options.height),
-    );
-
-    controller.handle_action(UserAction::Navigate(options.address.clone()));
-
-    let started = Instant::now();
+/// Process events until the current document settles (see [`Settle`]),
+/// measuring the timeout and quiet period from `started`.
+async fn settle_page(
+    controller: &mut BrowserController,
+    options: &Options,
+    started: Instant,
+    timeline_origin: &mut Option<Instant>,
+) -> Settle {
     let mut last_change = started;
-    let mut revision = 0u64;
-    // Web Animations #document-timelines: like the desktop frontend, the
-    // timeline starts once the navigation has produced its document.
-    let mut timeline_origin: Option<Instant> = None;
+    let mut revision = controller.snapshot().page_revision;
     let mut settled = Settle::Timeout;
     loop {
         let outcome = controller.process_async_events();
@@ -284,10 +308,9 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
         }
         revision = snapshot.page_revision;
         if timeline_origin.is_none() && controller.current_page().is_some() {
-            timeline_origin = Some(now);
+            *timeline_origin = Some(now);
         }
-        let elapsed = now - started;
-        if elapsed >= options.timeout {
+        if now - started >= options.timeout {
             break;
         }
         // Prefer the engine's own verdict: a document is final once its fetch
@@ -311,6 +334,125 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
         }
         // Yield so the fetch, image, and actor tasks can run between drains.
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    settled
+}
+
+/// Replay one primary click at a viewport point as the graphical frontend
+/// delivers it: pointer motion and hover, press and release to the page
+/// actor and the browser, then activation of the hit target. Describes the
+/// hit for the log.
+fn replay_click(controller: &mut BrowserController, options: &Options, point: CssPoint) -> String {
+    let viewport = CssSize::new(options.width, options.height);
+    let hit = controller
+        .current_page()
+        .and_then(BrowserPage::rendered_page)
+        .and_then(|rendered| {
+            trust::render::page_activation_hit_at(
+                &rendered.layout.paint,
+                viewport,
+                CssPoint::default(),
+                point,
+            )
+        });
+    let actor = hit.as_ref().and_then(|hit| {
+        hit.actor.or(match &hit.link {
+            Some(Link::JsClick { node, .. }) => Some(*node),
+            _ => None,
+        })
+    });
+    let metadata = trust::js::PointerMetadata::default();
+    controller.handle_action(UserAction::PointerMove(point));
+    controller.handle_action(UserAction::PageHover {
+        actor,
+        position: point,
+        metadata,
+    });
+    for pressed in [true, false] {
+        controller.handle_action(UserAction::PagePointerButton {
+            actor,
+            position: point,
+            pressed,
+            button: 0,
+            metadata,
+        });
+        controller.handle_action(UserAction::PointerButton {
+            position: point,
+            button: PointerButton::Primary,
+            state: if pressed {
+                ButtonState::Pressed
+            } else {
+                ButtonState::Released
+            },
+        });
+    }
+    let Some(hit) = hit else {
+        return String::from("nothing activatable");
+    };
+    // The desktop's page_hit_activation: a live page receives a script click
+    // on the hit actor, carrying the link's href for its default action.
+    let live = controller.page_is_live();
+    let activation = match (&hit.link, hit.actor) {
+        (Some(Link::Media(_)), _) => hit.link.clone(),
+        (link, Some(node)) if live => Some(Link::JsClick {
+            node,
+            href: match link {
+                Some(Link::JsClick { href, .. }) => href.clone(),
+                Some(Link::Form { .. }) | None => String::new(),
+                Some(link) => link.to_string(),
+            },
+        }),
+        (link, actor) => link.clone().or_else(|| {
+            actor.map(|node| Link::JsClick {
+                node,
+                href: String::new(),
+            })
+        }),
+    };
+    let description = format!(
+        "node {} link {:?} actor {:?}",
+        hit.node, hit.link, hit.actor
+    );
+    if let Some(link) = activation {
+        controller.handle_action(UserAction::Activate(link));
+    }
+    description
+}
+
+/// Drive one navigation to a settled page and print it.
+async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> {
+    let mut controller = BrowserController::new(
+        tokio::runtime::Handle::current(),
+        || {},
+        CssSize::new(options.width, options.height),
+    );
+
+    controller.handle_action(UserAction::Navigate(options.address.clone()));
+
+    let started = Instant::now();
+    // Web Animations #document-timelines: like the desktop frontend, the
+    // timeline starts once the navigation has produced its document.
+    let mut timeline_origin: Option<Instant> = None;
+    let mut settled = settle_page(&mut controller, options, started, &mut timeline_origin).await;
+    for &point in &options.clicks {
+        let target = replay_click(&mut controller, options, point);
+        eprintln!("[click] {},{} hit {target}", point.x, point.y);
+        let clicked = Instant::now();
+        let after = Options {
+            settle: options.click_settle.unwrap_or(options.settle),
+            ..options.clone()
+        };
+        settled = settle_page(&mut controller, &after, clicked, &mut timeline_origin).await;
+        let address = controller
+            .current_page()
+            .map_or_else(|| String::from("(no page)"), BrowserPage::address);
+        eprintln!(
+            "[click] {},{} settled after {} ms at {address}",
+            point.x,
+            point.y,
+            clicked.elapsed().as_millis()
+        );
     }
 
     let snapshot = controller.snapshot();
