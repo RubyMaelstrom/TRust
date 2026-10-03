@@ -22,8 +22,19 @@ pub(super) struct Budget(Rc<Cell<usize>>);
 
 impl Budget {
     pub(super) fn reserve(&self, bytes: usize) -> Option<Lease> {
+        self.reserve_within(bytes, MAX_BYTES)
+    }
+
+    /// Reserve only while the budget stays within half its size: records
+    /// made ahead of layout, in contexts layout may not ask for, must leave
+    /// room for the ones it computes itself.
+    pub(super) fn reserve_ahead(&self, bytes: usize) -> Option<Lease> {
+        self.reserve_within(bytes, MAX_BYTES / 2)
+    }
+
+    fn reserve_within(&self, bytes: usize, limit: usize) -> Option<Lease> {
         let total = self.0.get().checked_add(bytes)?;
-        if total > MAX_BYTES {
+        if total > limit {
             return None;
         }
         self.0.set(total);

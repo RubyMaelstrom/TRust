@@ -462,7 +462,7 @@ impl Values {
         if let Some(export) = export {
             rows.contextual = Row::from_export(export.contextual);
             if let Some(record) = export.inline
-                && let Some(lease) = self.record_budget.reserve(inline_record_bytes(
+                && let Some(lease) = self.record_budget.reserve_ahead(inline_record_bytes(
                     &record.base,
                     &record.parent,
                     &record.value,
