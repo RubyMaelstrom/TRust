@@ -1,6 +1,9 @@
 use crate::{Config, Engine, Linker, Module as WasmModule, Store};
 use alloc::{format, string::String};
 
+#[cfg(feature = "simd")]
+mod simd;
+
 fn run(source: &str, enabled: bool, input: (i32, i32)) -> (i32, Engine) {
     let mut config = Config::default();
     config.native_jit(enabled);
@@ -17,7 +20,7 @@ fn run(source: &str, enabled: bool, input: (i32, i32)) -> (i32, Engine) {
     (function.call(&mut store, input).unwrap(), engine)
 }
 
-fn compiled_regions(engine: &Engine) -> usize {
+pub(super) fn compiled_regions(engine: &Engine) -> usize {
     engine
         .inner
         .code_map
@@ -584,7 +587,7 @@ fn native_compile_module_diagnostic() {
         let instrs = function.instrs();
         if instrs.iter().take(4).all(|op| super::decode(*op).is_some()) {
             eligible += 1;
-            if super::compile(instrs, 0).is_some() {
+            if super::compile(instrs, function.consts(), 0).is_some() {
                 compiled += 1;
             }
         }
