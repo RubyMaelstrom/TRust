@@ -530,6 +530,62 @@ impl State {
     }
 }
 
+/// CSS Transitions 1 #starting: the transitioned properties' computed
+/// values as animatable endpoints.
+fn endpoints<D: crate::layout2::UnitSource + ?Sized>(dom: &D, id: NodeId, vp: Vp) -> Values {
+    std::array::from_fn(|i| {
+        // Transition endpoints are computed values, not CSSOM's
+        // used-value serialization. Resolve relative lengths only
+        // when needed; px, percentages and initial values do not
+        // require selecting/shaping a font for every element.
+        let value = dom.computed_value_resolved(id, PROPERTIES[i]);
+        let value = value
+            .as_deref()
+            .or_else(|| cssom_initial_value(PROPERTIES[i]))?
+            .trim();
+        if i == 19 {
+            return Transform::parse(value, dom, id, vp).map(Animated::Transform);
+        }
+        if i == 18 {
+            return parse_alpha(value).map(|px| {
+                Animated::Linear(Linear {
+                    px: px.clamp(0., 1.),
+                    pct: 0.,
+                })
+            });
+        }
+        if matches!(
+            value,
+            "auto" | "none" | "min-content" | "max-content" | "fit-content"
+        ) {
+            return None;
+        }
+        if let Some(px) = value
+            .strip_suffix("px")
+            .unwrap_or(value)
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+        {
+            return Some(Animated::Linear(Linear { px, pct: 0. }));
+        }
+        if let Some(pct) = value
+            .strip_suffix('%')
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+        {
+            return Some(Animated::Linear(Linear {
+                px: 0.,
+                pct: pct / 100.,
+            }));
+        }
+        match Len::parse(value, crate::layout2::Units::of(dom, id), vp)? {
+            Len::Val(Length::Lin { k, b }) => Some(Animated::Linear(Linear { px: b, pct: k })),
+            _ => None,
+        }
+    })
+}
+
 /// Resolve participation only along paths whose styles/tree membership changed.
 /// CSS Transitions 1 #starting: detached or non-rendered elements have no
 /// before/after pair. Memoizing common ancestors keeps a large dirty subtree
@@ -537,7 +593,11 @@ impl State {
 /// Ancestors are resolved first: nothing below a non-rendered ancestor needs
 /// its own `display`, which layout never computes either (a full pass visits
 /// every element, so hidden menus would otherwise each pay a cascade).
-pub(super) fn participates(dom: &Dom, node: NodeId, memo: &mut FxHashMap<NodeId, bool>) -> bool {
+pub(super) fn participates<B: StyleBackend + ?Sized>(
+    dom: ComputeView<'_, B>,
+    node: NodeId,
+    memo: &mut FxHashMap<NodeId, bool>,
+) -> bool {
     let mut path = Vec::new();
     let mut cursor = Some(node);
     let mut result = loop {
@@ -654,7 +714,7 @@ impl Dom {
                 if self.tag_name(id).is_none() {
                     continue;
                 }
-                if !participates(self, id, &mut participation) {
+                if !participates(ComputeView(&*self), id, &mut participation) {
                     state.before.remove(&id);
                     for property in 0..PROPERTIES.len() {
                         state.cancel((id, property), now);
@@ -666,59 +726,7 @@ impl Dom {
                 {
                     state.last_recomputed += 1;
                 }
-                let values = std::array::from_fn(|i| {
-                    // Transition endpoints are computed values, not CSSOM's
-                    // used-value serialization. Resolve relative lengths only
-                    // when needed; px, percentages and initial values do not
-                    // require selecting/shaping a font for every element.
-                    let value = self.computed_value_resolved(id, PROPERTIES[i]);
-                    let value = value
-                        .as_deref()
-                        .or_else(|| cssom_initial_value(PROPERTIES[i]))?
-                        .trim();
-                    if i == 19 {
-                        return Transform::parse(value, self, id, vp).map(Animated::Transform);
-                    }
-                    if i == 18 {
-                        return parse_alpha(value).map(|px| {
-                            Animated::Linear(Linear {
-                                px: px.clamp(0., 1.),
-                                pct: 0.,
-                            })
-                        });
-                    }
-                    if matches!(
-                        value,
-                        "auto" | "none" | "min-content" | "max-content" | "fit-content"
-                    ) {
-                        return None;
-                    }
-                    if let Some(px) = value
-                        .strip_suffix("px")
-                        .unwrap_or(value)
-                        .parse::<f32>()
-                        .ok()
-                        .filter(|v| v.is_finite())
-                    {
-                        return Some(Animated::Linear(Linear { px, pct: 0. }));
-                    }
-                    if let Some(pct) = value
-                        .strip_suffix('%')
-                        .and_then(|s| s.parse::<f32>().ok())
-                        .filter(|v| v.is_finite())
-                    {
-                        return Some(Animated::Linear(Linear {
-                            px: 0.,
-                            pct: pct / 100.,
-                        }));
-                    }
-                    match Len::parse(value, crate::layout2::Units::of(self, id), vp)? {
-                        Len::Val(Length::Lin { k, b }) => {
-                            Some(Animated::Linear(Linear { px: b, pct: k }))
-                        }
-                        _ => None,
-                    }
-                });
+                let values = endpoints(&*self, id, vp);
                 if let Some(before) = state.before.get(&id).cloned() {
                     if before == values
                         && !active_nodes.contains(&id)

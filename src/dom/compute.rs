@@ -559,6 +559,10 @@ impl<B: StyleBackend + ?Sized> crate::layout2::StyleSource for ComputeView<'_, B
 // The DOM's entry points into style computation (`ComputeView`).
 impl Dom {
     #[inline]
+    pub(super) fn subtree_omitted_from_box_tree(&self, id: NodeId) -> bool {
+        ComputeView(self).subtree_omitted_from_box_tree(id)
+    }
+    #[inline]
     pub fn is_hidden(&self, id: NodeId) -> bool {
         ComputeView(self).is_hidden(id)
     }

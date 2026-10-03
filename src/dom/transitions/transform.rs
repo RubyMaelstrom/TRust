@@ -3,7 +3,7 @@
 //! Preserve the function list and percentage basis; `none` pads with matching
 //! identities. Matching primitives interpolate numerically, so rotations keep
 //! their authored turns. Non-matching lists and 3D projection remain unsupported.
-use super::{Dom, Len, Length, Linear, NodeId, Vp};
+use super::{Len, Length, Linear, NodeId, Vp};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Transform(Vec<Primitive>);
@@ -40,7 +40,12 @@ impl Primitive {
     }
 }
 impl Transform {
-    pub(super) fn parse(value: &str, dom: &Dom, id: NodeId, vp: Vp) -> Option<Self> {
+    pub(super) fn parse<D: crate::layout2::UnitSource + ?Sized>(
+        value: &str,
+        dom: &D,
+        id: NodeId,
+        vp: Vp,
+    ) -> Option<Self> {
         if value.eq_ignore_ascii_case("none") {
             return Some(Self(Vec::new()));
         }
