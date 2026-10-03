@@ -786,6 +786,7 @@ dependencies = [
  "wasmi_core",
  "wasmi_ir",
  "wasmparser 0.239.0",
+ "wast",
  "wat",
 ]
 

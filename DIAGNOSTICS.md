@@ -84,10 +84,21 @@ rejects a browser.
 Compare native WebAssembly execution against the interpreter with the same
 release artifact: `TRUST_WASM_NATIVE_JIT=0` (or `false`) disables the optional
 native compiler. It is enabled by default on little-endian AArch64 and x86-64;
-unsupported instructions and fuel-metered engines use the interpreter.
-`WASMI_JIT_TRACE=1` reports compiled instruction counts, native code sizes, and
-compilation times. The per-engine cache accepts at most 128 native regions of
-256 Wasmi instruction words each and 2,048 candidate addresses. Native code
+unsupported instructions and fuel-metered engines use the interpreter. Native
+regions cover scalar integer arithmetic, globals, branches, selects and
+default-memory loads/stores, plus v128 instructions: lane-wise integer and
+float arithmetic, bitwise operations, comparisons, shifts, shuffle/swizzle,
+splat/extract/replace lane, narrowing/widening, conversions and v128
+loads/stores (full, lane, splat, zero and extending forms). Relaxed SIMD, scalar
+float instructions, calls, non-default memories and offsets above 4 GiB end a
+region. `WASMI_JIT_TRACE=1` reports compiled instruction counts, region starts,
+native code sizes, compilation times, declined regions, and the instruction that
+ended each region, with a histogram of those stops every 64 attempts.
+`WASMI_JIT_DUMP=1` prints each region's Cranelift IR and machine code.
+`WASMI_JIT_EAGER=1` is a conformance stress mode only: it compiles every
+control-flow entry at its first visit, including one-instruction regions, without
+the region and candidate caps. The per-engine cache accepts at most 128 native
+regions of 256 Wasmi instruction words each and 2,048 candidate addresses. Native code
 allocations are released when the engine and its active calls are dropped.
 Compilation counters persist across host/JavaScript calls. The bounded cache
 recycles cold counters so one-shot startup code cannot exclude later hot functions;
@@ -117,6 +128,13 @@ cargo test --manifest-path vendor/wasmi-1.1.0/Cargo.toml \
   --config "patch.crates-io.wasmi_ir.path='$PWD/vendor/wasmi_ir-1.1.0'" \
   --config "patch.crates-io.wasmi_collections.path='$PWD/vendor/wasmi_collections-1.1.0'"
 ```
+
+The same command also compiles every SIMD test region for baseline x86-64,
+x86-64-v2, x86-64-v3 and AArch64. Run the official SIMD scripts with the
+interpreter and with every region compiled natively by adding
+`WASMI_SPEC_DIR=/big/web-standards/repositories/WebAssembly/spec/test/core/simd`
+in front of it and `--release --lib native_simd_spec -- --ignored --nocapture`
+after it; the test fails on any native-only failure.
 
 Trace a normal Lumen page load and its network requests:
 

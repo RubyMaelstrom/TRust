@@ -5,18 +5,22 @@
 //! declared width; global accesses observe the shared store in instruction
 //! order. Calls, traps, fuel, and unsupported instructions remain interpreter
 //! boundaries. Native code never keeps store pointers across such a boundary.
+//! With the `simd` feature, v128 instructions are lowered in `simd.rs`.
 
 use super::code_map::CodeMap;
 use crate::{
     core::UntypedVal,
     ir::{Op, Slot, index},
 };
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
+#[cfg(feature = "simd")]
+use cranelift_codegen::ir::Endianness;
 use cranelift_codegen::{
     ir::{
-        AbiParam, Block, InstBuilder, MemFlagsData as MemFlags, Type, UserFuncName, Value,
-        condcodes::IntCC, types,
+        AbiParam, Block, Function, InstBuilder, MemFlagsData as MemFlags, Type, UserFuncName,
+        Value, condcodes::IntCC, types,
     },
+    isa::TargetFrontendConfig,
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -25,15 +29,24 @@ use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const MAX_REGIONS: usize = 128;
 pub(crate) const MAX_CANDIDATES: usize = 2048;
 const MAX_INSTRUCTIONS: usize = 256;
+/// Shorter regions rarely repay their entry and exit costs.
+const MIN_INSTRUCTIONS: usize = 4;
 pub(crate) const MAX_GLOBALS: usize = 16;
 const BACKEDGE_BUDGET: i64 = 16_384;
 
+#[cfg(feature = "simd")]
+mod simd;
+#[cfg(all(test, feature = "simd"))]
+mod spec;
 #[cfg(test)]
 mod tests;
 
@@ -42,6 +55,14 @@ pub(crate) struct NativeJit {
     pub enabled: bool,
     regions: Mutex<HashMap<usize, Candidate>>,
     trace: bool,
+    /// Diagnostic stress mode (`WASMI_JIT_EAGER`): compile every control-flow
+    /// entry at its first visit, including single-instruction regions, without
+    /// the region and candidate caps, so that conformance suites whose
+    /// functions run once still execute natively.
+    eager: AtomicBool,
+    /// `WASMI_JIT_TRACE` histogram of the Wasmi instructions that ended a
+    /// region or declined it, so unsupported hot instructions can be found.
+    stops: Mutex<BTreeMap<String, (usize, usize)>>,
 }
 
 #[derive(Debug, Default)]
@@ -57,7 +78,13 @@ impl NativeJit {
             enabled,
             regions: Mutex::new(HashMap::new()),
             trace: std::env::var_os("WASMI_JIT_TRACE").is_some(),
+            eager: AtomicBool::new(std::env::var_os("WASMI_JIT_EAGER").is_some()),
+            stops: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn eager(&self) -> bool {
+        self.eager.load(Ordering::Relaxed)
     }
 
     /// Observe one invocation's first visit. Hotness belongs to the Engine, just like
@@ -65,7 +92,7 @@ impl NativeJit {
     /// None means still warming; Some(None) is a checked interpreter fallback.
     pub fn observe(&self, code_map: &CodeMap, address: usize) -> Option<Option<Arc<NativeRegion>>> {
         let mut regions = self.regions.lock().ok()?;
-        if !regions.contains_key(&address) && !Self::make_room(&mut regions) {
+        if !regions.contains_key(&address) && !self.make_room(&mut regions) {
             return Some(None);
         }
         let candidate = regions.entry(address).or_default();
@@ -73,7 +100,7 @@ impl NativeJit {
             return Some(candidate.region.clone());
         }
         candidate.visits = candidate.visits.saturating_add(1);
-        if candidate.visits <= 32 {
+        if candidate.visits <= 32 && !self.eager() {
             return None;
         }
         Some(self.compile_candidate(code_map, address, &mut regions))
@@ -81,7 +108,7 @@ impl NativeJit {
 
     pub fn get_or_compile(&self, code_map: &CodeMap, address: usize) -> Option<Arc<NativeRegion>> {
         let mut regions = self.regions.lock().ok()?;
-        if !regions.contains_key(&address) && !Self::make_room(&mut regions) {
+        if !regions.contains_key(&address) && !self.make_room(&mut regions) {
             return None;
         }
         self.compile_candidate(code_map, address, &mut regions)
@@ -90,8 +117,8 @@ impl NativeJit {
     /// One-shot startup code must not fill the counter budget and disable later hot functions.
     /// Recycle the coldest warming batch at capacity; completed compilation attempts, including
     /// checked fallbacks, keep their identities. The scan is amortized over cold admissions.
-    fn make_room(regions: &mut HashMap<usize, Candidate>) -> bool {
-        if regions.len() < MAX_CANDIDATES {
+    fn make_room(&self, regions: &mut HashMap<usize, Candidate>) -> bool {
+        if regions.len() < MAX_CANDIDATES || self.eager() {
             return true;
         }
         let Some(coldest) = regions
@@ -118,34 +145,88 @@ impl NativeJit {
         {
             return candidate.region.clone();
         }
-        let full = regions
-            .values()
-            .filter(|candidate| candidate.region.is_some())
-            .count()
-            >= MAX_REGIONS;
+        let full = !self.eager()
+            && regions
+                .values()
+                .filter(|candidate| candidate.region.is_some())
+                .count()
+                >= MAX_REGIONS;
         let candidate = regions.entry(address).or_default();
         candidate.attempted = true;
         if full {
+            if self.trace {
+                std::eprintln!("[wasmi-jit] declined: {MAX_REGIONS} native regions already exist");
+            }
             return None;
         }
         let started = std::time::Instant::now();
+        let mut report = Report::default();
         let region = code_map
             .function_at(address)
-            .and_then(|(instrs, start)| compile(instrs, start))
+            .and_then(|(instrs, consts, start)| {
+                let min_ops = if self.eager() { 1 } else { MIN_INSTRUCTIONS };
+                compile_region(instrs, consts, start, min_ops, &mut report)
+            })
             .map(Arc::new);
-        if self.trace {
-            if let Some(region) = &region {
-                std::eprintln!(
-                    "[wasmi-jit] compiled {} instructions, {} code bytes in {:?}",
-                    region.instructions,
-                    region.code_bytes,
-                    started.elapsed()
-                );
-            }
-        }
         candidate.region = region.clone();
+        if self.trace {
+            self.trace_attempt(region.as_deref(), &report, started.elapsed());
+        }
         region
     }
+
+    /// Diagnostic only: called once per compilation attempt with `WASMI_JIT_TRACE`.
+    fn trace_attempt(
+        &self,
+        region: Option<&NativeRegion>,
+        report: &Report,
+        elapsed: std::time::Duration,
+    ) {
+        let stop = report.stop.map_or_else(
+            || String::from("(end of function)"),
+            |op| {
+                let name = std::format!("{op:?}");
+                let end = name.find([' ', '{', '(']).unwrap_or(name.len());
+                String::from(&name[..end])
+            },
+        );
+        match region {
+            Some(region) => std::eprintln!(
+                "[wasmi-jit] compiled {} instructions at +{}, {} code bytes in {elapsed:?}; stopped before {stop}",
+                region.instructions,
+                region.start,
+                region.code_bytes,
+            ),
+            None => std::eprintln!(
+                "[wasmi-jit] declined after {} instructions before {stop}: {}",
+                report.decoded,
+                report.decline.unwrap_or("not compiled"),
+            ),
+        }
+        let Ok(mut stops) = self.stops.lock() else {
+            return;
+        };
+        let entry = stops.entry(stop).or_default();
+        entry.0 += 1;
+        entry.1 += usize::from(region.is_none());
+        let attempts: usize = stops.values().map(|(count, _)| count).sum();
+        if attempts % 64 == 0 {
+            let mut sorted: Vec<_> = stops.iter().collect();
+            sorted.sort_by_key(|(_, (count, _))| core::cmp::Reverse(*count));
+            std::eprintln!("[wasmi-jit] region stops after {attempts} attempts (stops, declined):");
+            for (name, (count, declined)) in sorted.into_iter().take(24) {
+                std::eprintln!("[wasmi-jit]   {name}: {count} ({declined})");
+            }
+        }
+    }
+}
+
+/// Where and why region decoding ended, for `WASMI_JIT_TRACE`.
+#[derive(Default)]
+struct Report {
+    decoded: usize,
+    stop: Option<Op>,
+    decline: Option<&'static str>,
 }
 
 // JITModule is Send, but not Sync. Its mutex owns the executable allocation;
@@ -174,6 +255,8 @@ pub(crate) struct NativeRegion {
         unsafe extern "C" fn(*mut UntypedVal, *const *mut UntypedVal, *mut NativeMemory) -> usize,
     pub globals: Vec<index::Global>,
     function_base: usize,
+    /// Index of the region's first instruction word in its function.
+    start: usize,
     instructions: usize,
     code_bytes: usize,
 }
@@ -213,7 +296,7 @@ pub(crate) struct NativeMemory {
     pub dirty_end: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Operand {
     Slot(Slot),
     Constant(i64),
@@ -305,6 +388,8 @@ enum NativeOp {
         comparison: Comparison,
         values: [Slot; 2],
     },
+    #[cfg(feature = "simd")]
+    Vector(simd::VectorOp),
     Parameter,
 }
 
@@ -1937,30 +2022,72 @@ fn decode_select(instrs: &[Op], index: usize) -> Option<NativeOp> {
     })
 }
 
-fn compile(instrs: &[Op], start: usize) -> Option<NativeRegion> {
+#[cfg(test)]
+fn compile(instrs: &[Op], consts: &[UntypedVal], start: usize) -> Option<NativeRegion> {
+    compile_region(
+        instrs,
+        consts,
+        start,
+        MIN_INSTRUCTIONS,
+        &mut Report::default(),
+    )
+}
+
+/// Decodes the complete instruction at `index` and the number of instruction
+/// words it occupies, or `None` if it must remain an interpreter boundary.
+#[cfg_attr(not(feature = "simd"), allow(unused_variables))]
+fn decode_at(instrs: &[Op], consts: &[UntypedVal], index: usize) -> Option<(NativeOp, usize)> {
+    if let Some(op) = decode_select(instrs, index) {
+        return Some((op, 2));
+    }
+    #[cfg(feature = "simd")]
+    if let Some(decoded) = simd::decode(instrs, index, consts) {
+        return Some(decoded);
+    }
+    let op = decode(instrs[index])?;
+    // Constant-address operations may carry a second word selecting a
+    // non-default memory. Leave that complete instruction to Wasmi.
+    if matches!(op, NativeOp::Load { .. } | NativeOp::Store { .. })
+        && matches!(instrs.get(index + 1), Some(Op::MemoryIndex { .. }))
+    {
+        return None;
+    }
+    Some((op, 1))
+}
+
+/// A validated region: its native operations, with one `Parameter` entry per
+/// operand word, and the distinct globals it accesses.
+struct Decoded {
+    ops: Vec<NativeOp>,
+    globals: Vec<index::Global>,
+}
+
+fn decode_region(
+    instrs: &[Op],
+    consts: &[UntypedVal],
+    start: usize,
+    min_ops: usize,
+    report: &mut Report,
+) -> Option<Decoded> {
     let mut ops = Vec::new();
     let mut i = start;
     while i < instrs.len() && ops.len() < MAX_INSTRUCTIONS {
-        if let Some(op) = decode_select(instrs, i) {
-            if ops.len() + 2 > MAX_INSTRUCTIONS {
-                break;
-            }
-            ops.extend([op, NativeOp::Parameter]);
-            i += 2;
-            continue;
-        }
-        let Some(op) = decode(instrs[i]) else { break };
-        // Constant-address operations may carry a second word selecting a
-        // non-default memory. Leave that complete instruction to Wasmi.
-        if matches!(op, NativeOp::Load { .. } | NativeOp::Store { .. })
-            && matches!(instrs.get(i + 1), Some(Op::MemoryIndex { .. }))
-        {
+        let Some((op, words)) = decode_at(instrs, consts, i) else {
+            break;
+        };
+        if ops.len() + words > MAX_INSTRUCTIONS {
             break;
         }
+        // Operand words keep their own (unreachable) entries so that branch
+        // offsets index the original instruction array exactly.
         ops.push(op);
-        i += 1;
+        ops.extend(core::iter::repeat_n(NativeOp::Parameter, words - 1));
+        i += words;
     }
-    if ops.len() < 4 {
+    report.decoded = ops.len();
+    report.stop = instrs.get(i).copied();
+    if ops.len() < min_ops {
+        report.decline = Some("too few supported instructions");
         return None;
     }
     let mut globals = Vec::new();
@@ -1977,27 +2104,99 @@ fn compile(instrs: &[Op], start: usize) -> Option<NativeRegion> {
         }
     }
     if globals.len() > MAX_GLOBALS {
+        report.decline = Some("too many globals");
         return None;
     }
     for (i, op) in ops.iter().enumerate() {
         if let NativeOp::Branch { offset, .. } = op {
             let target = start as i64 + i as i64 + i64::from(*offset);
             if target < 0 || target >= instrs.len() as i64 {
+                report.decline = Some("branch outside the function");
                 return None;
             }
             if let Some(NativeOp::Parameter) = target
                 .checked_sub(start as i64)
                 .and_then(|index| ops.get(index as usize))
             {
+                report.decline = Some("branch into an operand word");
                 return None;
             }
         }
     }
     // Falling through the final instruction must also remain in the function.
     if start + ops.len() >= instrs.len() {
+        report.decline = Some("falls through the end of the function");
         return None;
     }
+    Some(Decoded { ops, globals })
+}
 
+/// Compiles, without running, the regions starting at the function entry and
+/// at every branch target of `instrs` for the named target ISA and preset,
+/// checking that each lowering exists there.
+#[cfg(all(test, feature = "simd"))]
+fn lower_for(
+    isa: &str,
+    preset: &str,
+    instrs: &[Op],
+    consts: &[UntypedVal],
+) -> Result<usize, String> {
+    use cranelift_codegen::{Context, control::ControlPlane, ir::Signature};
+    let mut flags = settings::builder();
+    flags
+        .set("opt_level", "speed")
+        .map_err(|e| std::format!("{e}"))?;
+    let mut builder =
+        cranelift_codegen::isa::lookup_by_name(isa).map_err(|e| std::format!("{e}"))?;
+    if !preset.is_empty() {
+        builder.enable(preset).map_err(|e| std::format!("{e}"))?;
+    }
+    let isa = builder
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| std::format!("{e}"))?;
+    let mut starts = BTreeSet::from([0]);
+    for (index, op) in instrs.iter().enumerate() {
+        if let Some(NativeOp::Branch { offset, .. }) = decode(*op) {
+            starts.insert(index.wrapping_add_signed(offset as isize));
+        }
+    }
+    let mut compiled = 0;
+    for start in starts {
+        let Some(Decoded { ops, globals }) =
+            decode_region(instrs, consts, start, 1, &mut Report::default())
+        else {
+            continue;
+        };
+        let mut ctx = Context::new();
+        ctx.func.signature = Signature::new(isa.default_call_conv());
+        region_signature(&mut ctx.func.signature);
+        build_region(&mut ctx.func, isa.frontend_config(), &ops, &globals, start);
+        ctx.compile(&*isa, &mut ControlPlane::default())
+            .map_err(|error| std::format!("{} region at {start}: {error:?}", isa.name()))?;
+        compiled += 1;
+    }
+    Ok(compiled)
+}
+
+/// The region signature: frame slots, global addresses and memory context
+/// in, index of the next Wasmi instruction out.
+fn region_signature(signature: &mut cranelift_codegen::ir::Signature) {
+    signature.params.extend([
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+    ]);
+    signature.returns.push(AbiParam::new(types::I64));
+}
+
+fn compile_region(
+    instrs: &[Op],
+    consts: &[UntypedVal],
+    start: usize,
+    min_ops: usize,
+    report: &mut Report,
+) -> Option<NativeRegion> {
+    let Decoded { ops, globals } = decode_region(instrs, consts, start, min_ops, report)?;
     let mut flags = settings::builder();
     flags.set("use_colocated_libcalls", "false").ok()?;
     flags.set("is_pic", "false").ok()?;
@@ -2009,212 +2208,18 @@ fn compile(instrs: &[Op], start: usize) -> Option<NativeRegion> {
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
     let mut ctx = module.make_context();
     let mut signature = module.make_signature();
-    signature.params.extend([
-        AbiParam::new(types::I64),
-        AbiParam::new(types::I64),
-        AbiParam::new(types::I64),
-    ]);
-    signature.returns.push(AbiParam::new(types::I64));
+    region_signature(&mut signature);
     let id = module
         .declare_function("wasmi_region", Linkage::Local, &signature)
         .ok()?;
     ctx.func.signature = signature;
     ctx.func.name = UserFuncName::user(0, id.as_u32());
-    let mut function_ctx = FunctionBuilderContext::new();
-    {
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut function_ctx);
-        let entry = b.create_block();
-        b.append_block_params_for_function_params(entry);
-        b.switch_to_block(entry);
-        let slots_ptr = b.block_params(entry)[0];
-        let slots = Slots::new(&mut b, slots_ptr, &ops);
-        let global_array = b.block_params(entry)[1];
-        let memory = MemoryCode::new(&mut b, entry);
-        let global_ptrs: Vec<_> = (0..globals.len())
-            .map(|i| {
-                b.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    global_array,
-                    (i * 8) as i32,
-                )
-            })
-            .collect();
-        let budget = b.declare_var(types::I32);
-        let limit = b.ins().iconst(types::I32, BACKEDGE_BUDGET);
-        b.def_var(budget, limit);
-        let blocks: Vec<_> = (0..ops.len()).map(|_| b.create_block()).collect();
-        let mut exits = BTreeMap::new();
-        b.ins().jump(blocks[0], &[]);
-        for (i, op) in ops.iter().enumerate() {
-            b.switch_to_block(blocks[i]);
-            match *op {
-                NativeOp::Copy { result, value } => slots.copy(&mut b, result, value),
-                NativeOp::Constant { result, value } => {
-                    let value = b.ins().iconst(types::I64, value);
-                    slots.write(&mut b, result, value);
-                    slots.zero_high(&mut b, result);
-                }
-                NativeOp::GlobalGet { result, global } => {
-                    let ptr = global_ptrs[globals.iter().position(|g| *g == global).unwrap()];
-                    slots.load(&mut b, result, ptr);
-                }
-                NativeOp::GlobalSet { input, global } => {
-                    let ptr = global_ptrs[globals.iter().position(|g| *g == global).unwrap()];
-                    slots.store(&mut b, input, ptr, 0);
-                }
-                NativeOp::GlobalConstant { value, global } => {
-                    let ptr = global_ptrs[globals.iter().position(|g| *g == global).unwrap()];
-                    let value = b.ins().iconst(types::I64, value);
-                    b.ins().store(MemFlags::trusted(), value, ptr, 0);
-                    zero_high(&mut b, ptr, 0);
-                }
-                NativeOp::Binary {
-                    ty,
-                    kind,
-                    result,
-                    lhs,
-                    rhs,
-                } => {
-                    let lhs = slots.read(&mut b, ty, lhs);
-                    let rhs = slots.read(&mut b, ty, rhs);
-                    let value = match kind {
-                        Binary::Add => b.ins().iadd(lhs, rhs),
-                        Binary::Sub => b.ins().isub(lhs, rhs),
-                        Binary::Mul => b.ins().imul(lhs, rhs),
-                        Binary::And => b.ins().band(lhs, rhs),
-                        Binary::Or => b.ins().bor(lhs, rhs),
-                        Binary::Xor => b.ins().bxor(lhs, rhs),
-                        Binary::Shl => b.ins().ishl(lhs, rhs),
-                        Binary::ShrU => b.ins().ushr(lhs, rhs),
-                        Binary::ShrS => b.ins().sshr(lhs, rhs),
-                        Binary::Rotl => b.ins().rotl(lhs, rhs),
-                        Binary::Rotr => b.ins().rotr(lhs, rhs),
-                    };
-                    slots.write(&mut b, result, value);
-                }
-                NativeOp::Compare { result, comparison } => {
-                    let value = compare(&mut b, &slots, comparison);
-                    slots.write(&mut b, result, value);
-                }
-                NativeOp::Convert {
-                    result,
-                    input,
-                    from,
-                    to,
-                    signed,
-                } => {
-                    let value = slots.read(&mut b, from, Operand::Slot(input));
-                    let value = if from == to {
-                        value
-                    } else if signed {
-                        b.ins().sextend(to, value)
-                    } else {
-                        b.ins().uextend(to, value)
-                    };
-                    slots.write(&mut b, result, value);
-                }
-                NativeOp::Select {
-                    result,
-                    comparison,
-                    values,
-                } => {
-                    let condition = compare(&mut b, &slots, comparison);
-                    for word in 0..VALUE_WORDS {
-                        let yes = b.use_var(slots.variables[&i16::from(values[0])][word]);
-                        let no = b.use_var(slots.variables[&i16::from(values[1])][word]);
-                        let value = b.ins().select(condition, yes, no);
-                        b.def_var(slots.variables[&i16::from(result)][word], value);
-                    }
-                    let next =
-                        destination(&mut b, &blocks, &mut exits, start, (start + i + 2) as isize);
-                    b.ins().jump(next, &[]);
-                    continue;
-                }
-                NativeOp::Parameter => {
-                    // No validated control-flow edge targets an operand word.
-                    // Keep an unreachable block so branch offsets still index
-                    // the original Wasmi instruction array exactly.
-                    let value = b.ins().iconst(types::I64, (start + i) as i64);
-                    b.ins().return_(&[value]);
-                    continue;
-                }
-                NativeOp::Load {
-                    result,
-                    ptr,
-                    offset,
-                    width,
-                    ty,
-                    signed,
-                } => {
-                    let (address, _) = memory.checked_address(
-                        &mut b,
-                        &slots,
-                        &mut exits,
-                        start + i,
-                        MemoryAccess { ptr, offset, width },
-                    );
-                    let value = b
-                        .ins()
-                        .load(width, MemFlags::new().with_notrap(), address, 0);
-                    let value = if ty == width {
-                        value
-                    } else if signed {
-                        b.ins().sextend(ty, value)
-                    } else {
-                        b.ins().uextend(ty, value)
-                    };
-                    slots.write(&mut b, result, value);
-                }
-                NativeOp::Store {
-                    value,
-                    ptr,
-                    offset,
-                    width,
-                } => {
-                    let (address, relative) = memory.checked_address(
-                        &mut b,
-                        &slots,
-                        &mut exits,
-                        start + i,
-                        MemoryAccess { ptr, offset, width },
-                    );
-                    let value = slots.read(&mut b, width, value);
-                    b.ins()
-                        .store(MemFlags::new().with_notrap(), value, address, 0);
-                    memory.mark_dirty(&mut b, relative, width);
-                }
-                NativeOp::Branch { comparison, offset } => {
-                    let target = start as isize + i as isize + offset as isize;
-                    let to = edge(&mut b, &blocks, &mut exits, start, i, target, budget);
-                    if let Some(comparison) = comparison {
-                        let condition = compare(&mut b, &slots, comparison);
-                        let next = destination(
-                            &mut b,
-                            &blocks,
-                            &mut exits,
-                            start,
-                            (start + i + 1) as isize,
-                        );
-                        b.ins().brif(condition, to, &[], next, &[]);
-                    } else {
-                        b.ins().jump(to, &[]);
-                    }
-                    continue;
-                }
-            }
-            let next = destination(&mut b, &blocks, &mut exits, start, (start + i + 1) as isize);
-            b.ins().jump(next, &[]);
-        }
-        for (target, block) in exits {
-            b.switch_to_block(block);
-            slots.flush(&mut b);
-            memory.flush(&mut b);
-            let target = b.ins().iconst(types::I64, target as i64);
-            b.ins().return_(&[target]);
-        }
-        b.seal_all_blocks();
-        b.finalize(module.target_config());
+    build_region(&mut ctx.func, module.target_config(), &ops, &globals, start);
+    // `WASMI_JIT_DUMP` prints each region's CLIF and lowered machine code.
+    let dump = std::env::var_os("WASMI_JIT_DUMP").is_some();
+    if dump {
+        std::eprintln!("[wasmi-jit] region at {start}:\n{}", ctx.func.display());
+        ctx.set_disasm(true);
     }
     // Always free allocations on an unsuccessful compilation as well.
     let finalized = match module.define_function(id, &mut ctx) {
@@ -2225,8 +2230,12 @@ fn compile(instrs: &[Op], start: usize) -> Option<NativeRegion> {
         if std::env::var_os("WASMI_JIT_TRACE").is_some() {
             std::eprintln!("[wasmi-jit] compilation fallback: {error}");
         }
+        report.decline = Some("Cranelift compilation failed");
         unsafe { module.free_memory() };
         return None;
+    }
+    if let Some(vcode) = ctx.compiled_code().and_then(|code| code.vcode.as_ref()) {
+        std::eprintln!("[wasmi-jit] machine code:\n{vcode}");
     }
     let code = module.get_finalized_function(id);
     let code_bytes = ctx
@@ -2249,9 +2258,217 @@ fn compile(instrs: &[Op], start: usize) -> Option<NativeRegion> {
         entry,
         globals,
         function_base: instrs.as_ptr() as usize,
+        start,
         instructions: ops.len(),
         code_bytes,
     })
+}
+
+/// Emits the CLIF body of a decoded region into `func`, whose signature is
+/// `(slots, globals, memory) -> index of the next Wasmi instruction`.
+fn build_region(
+    func: &mut Function,
+    frontend: TargetFrontendConfig,
+    ops: &[NativeOp],
+    globals: &[index::Global],
+    start: usize,
+) {
+    let mut function_ctx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(func, &mut function_ctx);
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    let slots_ptr = b.block_params(entry)[0];
+    let slots = Slots::new(&mut b, slots_ptr, ops);
+    let global_array = b.block_params(entry)[1];
+    let memory = MemoryCode::new(&mut b, entry);
+    let global_ptrs: Vec<_> = (0..globals.len())
+        .map(|i| {
+            b.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                global_array,
+                (i * 8) as i32,
+            )
+        })
+        .collect();
+    let budget = b.declare_var(types::I32);
+    let limit = b.ins().iconst(types::I32, BACKEDGE_BUDGET);
+    b.def_var(budget, limit);
+    let blocks: Vec<_> = (0..ops.len()).map(|_| b.create_block()).collect();
+    let mut exits = BTreeMap::new();
+    b.ins().jump(blocks[0], &[]);
+    for (i, op) in ops.iter().enumerate() {
+        b.switch_to_block(blocks[i]);
+        match *op {
+            NativeOp::Copy { result, value } => slots.copy(&mut b, result, value),
+            NativeOp::Constant { result, value } => {
+                let zero = b.ins().iconst(types::I64, 0);
+                let mut words = [zero; VALUE_WORDS];
+                words[0] = b.ins().iconst(types::I64, value);
+                slots.set_words(&mut b, result, words);
+            }
+            NativeOp::GlobalGet { result, global } => {
+                let ptr = global_ptrs[globals.iter().position(|g| *g == global).unwrap()];
+                slots.load(&mut b, result, ptr);
+            }
+            NativeOp::GlobalSet { input, global } => {
+                let ptr = global_ptrs[globals.iter().position(|g| *g == global).unwrap()];
+                slots.store(&mut b, input, ptr, 0);
+            }
+            NativeOp::GlobalConstant { value, global } => {
+                let ptr = global_ptrs[globals.iter().position(|g| *g == global).unwrap()];
+                let value = b.ins().iconst(types::I64, value);
+                b.ins().store(MemFlags::trusted(), value, ptr, 0);
+                zero_high(&mut b, ptr, 0);
+            }
+            NativeOp::Binary {
+                ty,
+                kind,
+                result,
+                lhs,
+                rhs,
+            } => {
+                let lhs = slots.read(&mut b, ty, lhs);
+                let rhs = slots.read(&mut b, ty, rhs);
+                let value = match kind {
+                    Binary::Add => b.ins().iadd(lhs, rhs),
+                    Binary::Sub => b.ins().isub(lhs, rhs),
+                    Binary::Mul => b.ins().imul(lhs, rhs),
+                    Binary::And => b.ins().band(lhs, rhs),
+                    Binary::Or => b.ins().bor(lhs, rhs),
+                    Binary::Xor => b.ins().bxor(lhs, rhs),
+                    Binary::Shl => b.ins().ishl(lhs, rhs),
+                    Binary::ShrU => b.ins().ushr(lhs, rhs),
+                    Binary::ShrS => b.ins().sshr(lhs, rhs),
+                    Binary::Rotl => b.ins().rotl(lhs, rhs),
+                    Binary::Rotr => b.ins().rotr(lhs, rhs),
+                };
+                slots.write(&mut b, result, value);
+            }
+            NativeOp::Compare { result, comparison } => {
+                let value = compare(&mut b, &slots, comparison);
+                slots.write(&mut b, result, value);
+            }
+            NativeOp::Convert {
+                result,
+                input,
+                from,
+                to,
+                signed,
+            } => {
+                let value = slots.read(&mut b, from, Operand::Slot(input));
+                let value = if from == to {
+                    value
+                } else if signed {
+                    b.ins().sextend(to, value)
+                } else {
+                    b.ins().uextend(to, value)
+                };
+                slots.write(&mut b, result, value);
+            }
+            NativeOp::Select {
+                result,
+                comparison,
+                values,
+            } => {
+                let condition = compare(&mut b, &slots, comparison);
+                slots.select(&mut b, condition, result, values);
+            }
+            #[cfg(feature = "simd")]
+            NativeOp::Vector(vector) => {
+                simd::emit(&mut b, &slots, &memory, &mut exits, start + i, vector);
+            }
+            NativeOp::Parameter => {
+                // No validated control-flow edge targets an operand word.
+                // Keep an unreachable block so branch offsets still index
+                // the original Wasmi instruction array exactly.
+                let value = b.ins().iconst(types::I64, (start + i) as i64);
+                b.ins().return_(&[value]);
+                continue;
+            }
+            NativeOp::Load {
+                result,
+                ptr,
+                offset,
+                width,
+                ty,
+                signed,
+            } => {
+                let (address, _) = memory.checked_address(
+                    &mut b,
+                    &slots,
+                    &mut exits,
+                    start + i,
+                    MemoryAccess { ptr, offset, width },
+                );
+                let value = b
+                    .ins()
+                    .load(width, MemFlags::new().with_notrap(), address, 0);
+                let value = if ty == width {
+                    value
+                } else if signed {
+                    b.ins().sextend(ty, value)
+                } else {
+                    b.ins().uextend(ty, value)
+                };
+                slots.write(&mut b, result, value);
+            }
+            NativeOp::Store {
+                value,
+                ptr,
+                offset,
+                width,
+            } => {
+                let (address, relative) = memory.checked_address(
+                    &mut b,
+                    &slots,
+                    &mut exits,
+                    start + i,
+                    MemoryAccess { ptr, offset, width },
+                );
+                let value = slots.read(&mut b, width, value);
+                b.ins()
+                    .store(MemFlags::new().with_notrap(), value, address, 0);
+                memory.mark_dirty(&mut b, relative, width);
+            }
+            NativeOp::Branch { comparison, offset } => {
+                let target = start as isize + i as isize + offset as isize;
+                let to = edge(&mut b, &blocks, &mut exits, start, i, target, budget);
+                if let Some(comparison) = comparison {
+                    let condition = compare(&mut b, &slots, comparison);
+                    let next =
+                        destination(&mut b, &blocks, &mut exits, start, (start + i + 1) as isize);
+                    b.ins().brif(condition, to, &[], next, &[]);
+                } else {
+                    b.ins().jump(to, &[]);
+                }
+                continue;
+            }
+        }
+        // Continue after this instruction's operand words, if any.
+        let mut successor = i + 1;
+        while matches!(ops.get(successor), Some(NativeOp::Parameter)) {
+            successor += 1;
+        }
+        let next = destination(
+            &mut b,
+            &blocks,
+            &mut exits,
+            start,
+            (start + successor) as isize,
+        );
+        b.ins().jump(next, &[]);
+    }
+    for (target, block) in exits {
+        b.switch_to_block(block);
+        slots.flush(&mut b);
+        memory.flush(&mut b);
+        let target = b.ins().iconst(types::I64, target as i64);
+        b.ins().return_(&[target]);
+    }
+    b.seal_all_blocks();
+    b.finalize(frontend);
 }
 
 fn slot_offset(slot: Slot) -> i32 {
@@ -2260,9 +2477,40 @@ fn slot_offset(slot: Slot) -> i32 {
 
 const VALUE_WORDS: usize = core::mem::size_of::<UntypedVal>() / 8;
 
+/// How one frame slot is held in Cranelift variables within a region.
+#[derive(Clone, Copy)]
+enum SlotVar {
+    /// The untyped 64-bit words of the slot, low word first.
+    Words([Variable; VALUE_WORDS]),
+    /// The whole slot as one `i8x16`. Every slot accessed by a v128
+    /// instruction uses this form, so vector values stay in vector registers;
+    /// scalar accesses to such a slot use its low 64-bit lane.
+    #[cfg(feature = "simd")]
+    Vector(Variable),
+}
+
+/// Reinterprets a vector value as another 128-bit type. Lane numbering is
+/// little-endian, matching both the `UntypedVal` slot layout and Wasm.
+#[cfg(feature = "simd")]
+fn cast(b: &mut FunctionBuilder<'_>, ty: Type, value: Value) -> Value {
+    if b.func.dfg.value_type(value) == ty {
+        return value;
+    }
+    let little = MemFlags::new().with_endianness(Endianness::Little);
+    b.ins().bitcast(ty, little, value)
+}
+
+/// Frame slots and globals hold 8-byte aligned `UntypedVal`s. Whole-slot
+/// vector accesses therefore omit Cranelift's `aligned` flag, which would
+/// permit x86-64 to fold them into 16-byte aligned SSE memory operands.
+#[cfg(feature = "simd")]
+fn unaligned() -> MemFlags {
+    MemFlags::new().with_notrap()
+}
+
 struct Slots {
     pointer: Value,
-    variables: BTreeMap<i16, [Variable; VALUE_WORDS]>,
+    variables: BTreeMap<i16, SlotVar>,
     dirty: BTreeSet<i16>,
 }
 
@@ -2270,30 +2518,46 @@ impl Slots {
     fn new(b: &mut FunctionBuilder<'_>, pointer: Value, ops: &[NativeOp]) -> Self {
         let mut all = BTreeSet::new();
         let mut dirty = BTreeSet::new();
+        let mut vectors = BTreeSet::new();
         for op in ops {
-            op.visit_slots(|slot, written| {
-                all.insert(i16::from(slot));
+            op.visit_slots(|slot, written, vector| {
+                let slot = i16::from(slot);
+                all.insert(slot);
                 if written {
-                    dirty.insert(i16::from(slot));
+                    dirty.insert(slot);
+                }
+                if vector {
+                    vectors.insert(slot);
                 }
             });
         }
+        #[cfg(feature = "simd")]
+        unify_moves(ops, &mut vectors);
+        #[cfg(not(feature = "simd"))]
+        let _ = vectors;
         let variables = all
             .into_iter()
             .map(|slot| {
+                let offset = i32::from(slot) * core::mem::size_of::<UntypedVal>() as i32;
+                #[cfg(feature = "simd")]
+                if vectors.contains(&slot) {
+                    let variable = b.declare_var(types::I8X16);
+                    let value = b.ins().load(types::I8X16, unaligned(), pointer, offset);
+                    b.def_var(variable, value);
+                    return (slot, SlotVar::Vector(variable));
+                }
                 let words = core::array::from_fn(|word| {
                     let variable = b.declare_var(types::I64);
                     let value = b.ins().load(
                         types::I64,
                         MemFlags::trusted(),
                         pointer,
-                        i32::from(slot) * core::mem::size_of::<UntypedVal>() as i32
-                            + word as i32 * 8,
+                        offset + word as i32 * 8,
                     );
                     b.def_var(variable, value);
                     variable
                 });
-                (slot, words)
+                (slot, SlotVar::Words(words))
             })
             .collect();
         Self {
@@ -2303,14 +2567,25 @@ impl Slots {
         }
     }
 
+    fn var(&self, slot: Slot) -> SlotVar {
+        self.variables[&i16::from(slot)]
+    }
+
+    /// Reads the low `ty` bits of a slot (or a constant) as a scalar.
     fn read(&self, b: &mut FunctionBuilder<'_>, ty: Type, operand: Operand) -> Value {
-        let Operand::Slot(slot) = operand else {
-            let Operand::Constant(value) = operand else {
-                unreachable!()
-            };
-            return b.ins().iconst(ty, value);
+        let slot = match operand {
+            Operand::Slot(slot) => slot,
+            Operand::Constant(value) => return b.ins().iconst(ty, value),
         };
-        let value = b.use_var(self.variables[&i16::from(slot)][0]);
+        let value = match self.var(slot) {
+            SlotVar::Words(words) => b.use_var(words[0]),
+            #[cfg(feature = "simd")]
+            SlotVar::Vector(variable) => {
+                let value = b.use_var(variable);
+                let value = cast(b, types::I64X2, value);
+                b.ins().extractlane(value, 0)
+            }
+        };
         if ty == types::I64 {
             value
         } else {
@@ -2318,46 +2593,155 @@ impl Slots {
         }
     }
 
+    /// Writes a scalar into the low word, zero-extended to 64 bits. As in
+    /// Wasmi's `WriteAs`, the high word of the slot keeps its contents.
     fn write(&self, b: &mut FunctionBuilder<'_>, result: Slot, value: Value) {
         let value = if b.func.dfg.value_type(value) != types::I64 {
             b.ins().uextend(types::I64, value)
         } else {
             value
         };
-        b.def_var(self.variables[&i16::from(result)][0], value);
+        match self.var(result) {
+            SlotVar::Words(words) => b.def_var(words[0], value),
+            #[cfg(feature = "simd")]
+            SlotVar::Vector(variable) => {
+                let old = b.use_var(variable);
+                let old = cast(b, types::I64X2, old);
+                let new = b.ins().insertlane(old, value, 0);
+                let new = cast(b, types::I8X16, new);
+                b.def_var(variable, new);
+            }
+        }
     }
 
-    fn zero_high(&self, b: &mut FunctionBuilder<'_>, result: Slot) {
-        for word in &self.variables[&i16::from(result)][1..] {
-            let zero = b.ins().iconst(types::I64, 0);
-            b.def_var(*word, zero);
+    /// The complete value of a slot as 64-bit words, low word first.
+    fn words(&self, b: &mut FunctionBuilder<'_>, slot: Slot) -> [Value; VALUE_WORDS] {
+        match self.var(slot) {
+            SlotVar::Words(words) => words.map(|word| b.use_var(word)),
+            #[cfg(feature = "simd")]
+            SlotVar::Vector(variable) => {
+                let value = b.use_var(variable);
+                let value = cast(b, types::I64X2, value);
+                core::array::from_fn(|lane| b.ins().extractlane(value, lane as u8))
+            }
+        }
+    }
+
+    /// Replaces the complete value of a slot.
+    fn set_words(&self, b: &mut FunctionBuilder<'_>, result: Slot, words: [Value; VALUE_WORDS]) {
+        match self.var(result) {
+            SlotVar::Words(variables) => {
+                for (variable, word) in variables.into_iter().zip(words) {
+                    b.def_var(variable, word);
+                }
+            }
+            #[cfg(feature = "simd")]
+            SlotVar::Vector(variable) => {
+                let value = b.ins().scalar_to_vector(types::I64X2, words[0]);
+                let value = b.ins().insertlane(value, words[1], 1);
+                let value = cast(b, types::I8X16, value);
+                b.def_var(variable, value);
+            }
+        }
+    }
+
+    /// The complete value of a slot as a vector of type `ty`.
+    #[cfg(feature = "simd")]
+    fn vector(&self, b: &mut FunctionBuilder<'_>, slot: Slot, ty: Type) -> Value {
+        let value = match self.var(slot) {
+            SlotVar::Vector(variable) => b.use_var(variable),
+            SlotVar::Words(_) => {
+                let words = self.words(b, slot);
+                let value = b.ins().scalar_to_vector(types::I64X2, words[0]);
+                b.ins().insertlane(value, words[1], 1)
+            }
+        };
+        cast(b, ty, value)
+    }
+
+    /// Replaces the complete value of a slot with a 128-bit vector.
+    #[cfg(feature = "simd")]
+    fn set_vector(&self, b: &mut FunctionBuilder<'_>, result: Slot, value: Value) {
+        match self.var(result) {
+            SlotVar::Vector(variable) => {
+                let value = cast(b, types::I8X16, value);
+                b.def_var(variable, value);
+            }
+            SlotVar::Words(_) => {
+                let value = cast(b, types::I64X2, value);
+                let words = core::array::from_fn(|lane| b.ins().extractlane(value, lane as u8));
+                self.set_words(b, result, words);
+            }
         }
     }
 
     fn copy(&self, b: &mut FunctionBuilder<'_>, result: Slot, value: Slot) {
-        for (dst, src) in self.variables[&i16::from(result)]
-            .iter()
-            .zip(&self.variables[&i16::from(value)])
-        {
-            let value = b.use_var(*src);
-            b.def_var(*dst, value);
+        #[cfg(feature = "simd")]
+        if let (SlotVar::Vector(dst), SlotVar::Vector(src)) = (self.var(result), self.var(value)) {
+            let value = b.use_var(src);
+            b.def_var(dst, value);
+            return;
         }
+        let words = self.words(b, value);
+        self.set_words(b, result, words);
     }
 
+    /// Core #exec-select: selects the complete value, including both halves
+    /// of a v128. Both inputs are read before the result is defined.
+    fn select(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        condition: Value,
+        result: Slot,
+        values: [Slot; 2],
+    ) {
+        #[cfg(feature = "simd")]
+        if let SlotVar::Vector(variable) = self.var(result) {
+            let yes = self.vector(b, values[0], types::I8X16);
+            let no = self.vector(b, values[1], types::I8X16);
+            let value = b.ins().select(condition, yes, no);
+            b.def_var(variable, value);
+            return;
+        }
+        let yes = self.words(b, values[0]);
+        let no = self.words(b, values[1]);
+        let words = core::array::from_fn(|word| b.ins().select(condition, yes[word], no[word]));
+        self.set_words(b, result, words);
+    }
+
+    /// Loads the complete value of a global into a slot.
     fn load(&self, b: &mut FunctionBuilder<'_>, result: Slot, ptr: Value) {
-        for (i, variable) in self.variables[&i16::from(result)].iter().enumerate() {
-            let value = b
-                .ins()
-                .load(types::I64, MemFlags::trusted(), ptr, i as i32 * 8);
-            b.def_var(*variable, value);
+        match self.var(result) {
+            SlotVar::Words(variables) => {
+                for (i, variable) in variables.into_iter().enumerate() {
+                    let value = b
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), ptr, i as i32 * 8);
+                    b.def_var(variable, value);
+                }
+            }
+            #[cfg(feature = "simd")]
+            SlotVar::Vector(variable) => {
+                let value = b.ins().load(types::I8X16, unaligned(), ptr, 0);
+                b.def_var(variable, value);
+            }
         }
     }
 
     fn store(&self, b: &mut FunctionBuilder<'_>, input: Slot, ptr: Value, offset: i32) {
-        for (i, variable) in self.variables[&i16::from(input)].iter().enumerate() {
-            let value = b.use_var(*variable);
-            b.ins()
-                .store(MemFlags::trusted(), value, ptr, offset + i as i32 * 8);
+        match self.var(input) {
+            SlotVar::Words(variables) => {
+                for (i, variable) in variables.into_iter().enumerate() {
+                    let value = b.use_var(variable);
+                    b.ins()
+                        .store(MemFlags::trusted(), value, ptr, offset + i as i32 * 8);
+                }
+            }
+            #[cfg(feature = "simd")]
+            SlotVar::Vector(variable) => {
+                let value = b.use_var(variable);
+                b.ins().store(unaligned(), value, ptr, offset);
+            }
         }
     }
 
@@ -2373,8 +2757,33 @@ impl Slots {
     }
 }
 
+/// Copies and selects move complete values. Give their slots one common
+/// representation so loop-carried v128 copies need no lane conversions.
+#[cfg(feature = "simd")]
+fn unify_moves(ops: &[NativeOp], vectors: &mut BTreeSet<i16>) {
+    loop {
+        let mut changed = false;
+        for op in ops {
+            let group: &[Slot] = match op {
+                NativeOp::Copy { result, value } => &[*result, *value],
+                NativeOp::Select { result, values, .. } => &[*result, values[0], values[1]],
+                _ => continue,
+            };
+            if group.iter().any(|slot| vectors.contains(&i16::from(*slot))) {
+                for slot in group {
+                    changed |= vectors.insert(i16::from(*slot));
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
 impl NativeOp {
-    fn visit_slots(&self, mut visit: impl FnMut(Slot, bool)) {
+    /// Visits `(slot, written, holds_v128)` for every frame slot accessed.
+    fn visit_slots(&self, mut visit: impl FnMut(Slot, bool, bool)) {
         use NativeOp as N;
         let (result, lhs, rhs) = match *self {
             N::Copy { result, value } => (Some(result), Some(Operand::Slot(value)), None),
@@ -2403,18 +2812,23 @@ impl NativeOp {
                 values,
             } => {
                 for value in values {
-                    visit(value, false);
+                    visit(value, false, false);
                 }
                 (Some(result), Some(comparison.lhs), Some(comparison.rhs))
+            }
+            #[cfg(feature = "simd")]
+            N::Vector(vector) => {
+                vector.visit_slots(visit);
+                return;
             }
             N::Parameter => (None, None, None),
         };
         if let Some(result) = result {
-            visit(result, true);
+            visit(result, true, false);
         }
         for operand in [lhs, rhs].into_iter().flatten() {
             if let Operand::Slot(slot) = operand {
-                visit(slot, false);
+                visit(slot, false, false);
             }
         }
     }

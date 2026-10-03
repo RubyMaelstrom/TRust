@@ -338,7 +338,9 @@ impl CodeMap {
         Some(self.adjust_cref_lifetime(cref))
     }
 
-    /// Locates a validated instruction and its containing, pinned function.
+    /// Locates a validated instruction and its containing, pinned function,
+    /// returning the function's instructions, its immutable local constants
+    /// (the frame slots with negative indices) and the instruction's index.
     /// This linear lookup is only used when compiling a new hot region.
     #[cfg(all(
         feature = "native-jit",
@@ -346,19 +348,20 @@ impl CodeMap {
         target_endian = "little",
         target_pointer_width = "64"
     ))]
-    pub(super) fn function_at(&self, address: usize) -> Option<(&[Op], usize)> {
+    pub(super) fn function_at(&self, address: usize) -> Option<(&[Op], &[UntypedVal], usize)> {
         let funcs = self.funcs.lock();
         for (_, entity) in funcs.iter() {
             let Some(cref) = entity.get_compiled() else {
                 continue;
             };
-            let instrs = self.adjust_cref_lifetime(cref).instrs();
+            let cref = self.adjust_cref_lifetime(cref);
+            let instrs = cref.instrs();
             let start = instrs.as_ptr() as usize;
             let end = start + core::mem::size_of_val(instrs);
             if (start..end).contains(&address) {
                 let offset = address - start;
                 if offset % core::mem::size_of::<Op>() == 0 {
-                    return Some((instrs, offset / core::mem::size_of::<Op>()));
+                    return Some((instrs, cref.consts(), offset / core::mem::size_of::<Op>()));
                 }
             }
         }
