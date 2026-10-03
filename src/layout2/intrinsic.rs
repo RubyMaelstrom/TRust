@@ -178,6 +178,12 @@ impl Flow<'_> {
                         }
                     })
                     .collect();
+                // css-sizing-3 #cyclic-percentage-contribution: only a
+                // percentage against a size that depends on this one is
+                // cyclic. A definite content height still resolves an inline
+                // replaced element's percentage height, whose width follows
+                // through its ratio (featherfae.neocities.org's 200%-tall
+                // banners), as the block children above already do.
                 let mut ifc = Ifc::new(
                     self.dom,
                     self.base,
@@ -185,7 +191,7 @@ impl Flow<'_> {
                     self.forms,
                     self.vp,
                     cap,
-                    None,
+                    basis,
                     Align2::Left,
                     // text-indent participates in intrinsic widths;
                     // percentages resolve against a zero basis here.
