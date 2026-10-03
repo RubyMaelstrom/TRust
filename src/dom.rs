@@ -15779,11 +15779,8 @@ impl RuleBuckets {
             universal,
         } = self;
         let mut bytes = universal.capacity() * std::mem::size_of::<u32>();
-        bytes += ancestors.capacity() * std::mem::size_of::<(u32, Vec<u16>)>()
-            + ancestors
-                .values()
-                .map(|keys| keys.capacity() * std::mem::size_of::<u16>())
-                .sum::<usize>();
+        bytes += ancestors.starts.capacity() * std::mem::size_of::<u32>()
+            + ancestors.bits.capacity() * std::mem::size_of::<u16>();
         for map in [by_id, by_class, by_tag, by_attribute] {
             bytes = bytes.saturating_add(
                 map.capacity()
@@ -16209,8 +16206,41 @@ struct RuleBuckets {
     by_class: FxHashMap<String, Vec<u32>>,
     by_tag: FxHashMap<String, Vec<u32>>,
     by_attribute: FxHashMap<String, Vec<u32>>,
-    ancestors: FxHashMap<u32, Vec<u16>>,
+    ancestors: AncestorRequirements,
     universal: Vec<u32>,
+}
+
+/// Each rule's necessary ancestor-key bits (`rule_index::ancestor_requirements`),
+/// stored densely by rule index: every candidate of every element consults
+/// it, so a lookup is two array reads rather than a hash probe.
+#[derive(Default)]
+struct AncestorRequirements {
+    /// `starts[ri]..starts[ri + 1]` delimit rule `ri`'s bits.
+    starts: Vec<u32>,
+    bits: Vec<u16>,
+}
+
+impl AncestorRequirements {
+    fn of(&self, rule: u32) -> &[u16] {
+        match (
+            self.starts.get(rule as usize),
+            self.starts.get(rule as usize + 1),
+        ) {
+            (Some(&start), Some(&end)) => &self.bits[start as usize..end as usize],
+            _ => &[],
+        }
+    }
+
+    /// Whether no rule has requirements.
+    fn is_empty(&self) -> bool {
+        self.bits.is_empty()
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.starts.clear();
+        self.bits.clear();
+    }
 }
 
 impl RuleBuckets {
@@ -16220,15 +16250,16 @@ impl RuleBuckets {
 
     fn build_where(rules: &[StyleRule], keep: impl Fn(&StyleRule) -> bool) -> Self {
         let mut b = RuleBuckets::default();
+        b.ancestors.starts.reserve(rules.len() + 1);
         for (i, r) in rules.iter().enumerate() {
+            b.ancestors.starts.push(b.ancestors.bits.len() as u32);
             if !keep(r) {
                 continue;
             }
             let i = i as u32;
-            let ancestors = rule_index::ancestor_requirements(&r.selector);
-            if !ancestors.is_empty() {
-                b.ancestors.insert(i, ancestors);
-            }
+            b.ancestors
+                .bits
+                .extend(rule_index::ancestor_requirements(&r.selector));
             let keys = r
                 .selector
                 .0
@@ -16254,6 +16285,7 @@ impl RuleBuckets {
                 b.universal.push(i);
             }
         }
+        b.ancestors.starts.push(b.ancestors.bits.len() as u32);
         b
     }
 
@@ -16307,16 +16339,16 @@ impl RuleBuckets {
                 }
             }
         }
-        out.sort_unstable();
+        // The buckets are each in rule order: a run-adaptive sort merges them.
+        out.sort();
         out.dedup();
         if !self.ancestors.is_empty() && !out.is_empty() {
             // Only candidates with ancestor requirements need the filter.
             // An unrelated descendant rule must not make universal/subject
             // rules repeatedly walk every ancestor of a deeply nested tree.
-            out.retain(|index| {
-                self.ancestors
-                    .get(index)
-                    .is_none_or(|required| may_match_ancestors(required))
+            out.retain(|&rule| {
+                let required = self.ancestors.of(rule);
+                required.is_empty() || may_match_ancestors(required)
             });
         }
     }
