@@ -19919,6 +19919,7 @@ mod tests {
     /// Every name the platform has ever kept on an author-visible global.
     const FORMER_GLOBAL_INTERNALS: &[&str] = &[
         "$262",
+        "ShadowRealm",
         "__trust",
         "__trust_cfg",
         "__worker_cfg",

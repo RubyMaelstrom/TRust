@@ -704,7 +704,9 @@ pub fn spawn_page(
 /// privately. Every TRust host binding is captured into a lexical binding of one enclosing
 /// function before the bootstrap runs; after it returns, every `__`-prefixed global property
 /// (host bindings, the configuration object and the bootstrap's own rendezvous values) and the
-/// engine's Test262 `$262` host object are deleted. No author script can run before this
+/// engine's Test262 `$262` host object are deleted. `ShadowRealm` (a TC39 proposal no browser
+/// exposes) is removed as well: every Realm it creates carries the engine's `$262` and `print`
+/// hooks, which author script must not reach. No author script can run before this
 /// completes, so page and worker code never observe the host boundary: the global surface is
 /// the standard one, and only the platform's closures and the native host retain capabilities.
 /// Native code reaches each Realm's control object through the host-rooted `controls` slot.
@@ -717,6 +719,7 @@ pub(crate) fn private_bootstrap(source: &str) -> String {
          ;for (const name of Object.getOwnPropertyNames(globalThis))\n\
          \x20   if (name.slice(0, 2) === \"__\") delete globalThis[name];\n\
          delete globalThis.$262;\n\
+         delete globalThis.ShadowRealm;\n\
          }})();\n",
         captures = names.join(", "),
     )
