@@ -352,7 +352,34 @@ impl BoxStyle {
         let u = Units::of(dom, id);
         let tag = dom.tag_name(id).unwrap_or("");
         let (ua_margin, ua_padding) = ua_box(dom, id, tag, u.fs);
-        let context = crate::dom::BoxContext {
+        let context = Self::context(dom, id, vp, u, ua_margin, ua_padding);
+        dom.retained_box_style(id, context, || {
+            Self::of_uncached(dom, id, vp, u, tag, ua_margin, ua_padding)
+        })
+    }
+
+    /// What a retained box record of `id` is valid for: its own metrics,
+    /// the viewport, its UA box defaults and its display.
+    pub(crate) fn record_context<D: StyleSource + ?Sized>(
+        dom: &D,
+        id: NodeId,
+        vp: Vp,
+    ) -> crate::dom::BoxContext {
+        let u = Units::of(dom, id);
+        let tag = dom.tag_name(id).unwrap_or("");
+        let (ua_margin, ua_padding) = ua_box(dom, id, tag, u.fs);
+        Self::context(dom, id, vp, u, ua_margin, ua_padding)
+    }
+
+    fn context<D: StyleSource + ?Sized>(
+        dom: &D,
+        id: NodeId,
+        vp: Vp,
+        u: Units,
+        ua_margin: [f32; 4],
+        ua_padding: [f32; 4],
+    ) -> crate::dom::BoxContext {
+        crate::dom::BoxContext {
             dimensions: [
                 u.fs,
                 u.root,
@@ -371,10 +398,7 @@ impl BoxStyle {
             .map(f32::to_bits),
             document_element: dom.is_document_element(id),
             display: dom.computed_display(id),
-        };
-        dom.retained_box_style(id, context, || {
-            Self::of_uncached(dom, id, vp, u, tag, ua_margin, ua_padding)
-        })
+        }
     }
 
     fn of_uncached<D: StyleSource + ?Sized>(
