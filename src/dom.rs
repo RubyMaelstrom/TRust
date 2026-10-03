@@ -5233,6 +5233,12 @@ impl Dom {
             // remains 30px including its padding and border.
             // HTML Rendering #the-hr-element-2.
             "color" if tag == "hr" => "gray",
+            "color"
+                if self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
+                    && let Some(color) = self.ua_control_color(id, tag) =>
+            {
+                color
+            }
             "border-top-style"
             | "border-right-style"
             | "border-bottom-style"
@@ -5273,6 +5279,23 @@ impl Dom {
             Some("i") => "lower-roman",
             Some("I") => "upper-roman",
             _ => "decimal",
+        }
+    }
+
+    /// The UA foreground of a form control. HTML leaves widget appearance to
+    /// the UA, and layout paints a native ButtonFace or Field surface behind
+    /// buttons, inputs and textareas; CSS Color 4 #system-color-pairs pairs
+    /// those with ButtonText and FieldText, as every engine's UA sheet does.
+    /// Inheriting the page's color instead drew white labels on white faces.
+    pub(super) fn ua_control_color(&self, id: NodeId, tag: &str) -> Option<&'static str> {
+        match tag {
+            "button" => Some("buttontext"),
+            "textarea" => Some("fieldtext"),
+            "input" => Some(match self.input_type(id).as_str() {
+                "button" | "submit" | "reset" | "color" => "buttontext",
+                _ => "fieldtext",
+            }),
+            _ => None,
         }
     }
 
@@ -23623,6 +23646,42 @@ mod tests {
         assert_eq!(css_integer("1.5"), None);
         assert_eq!(css_integer("1e3"), None);
         assert_eq!(css_integer("auto"), None);
+    }
+
+    #[test]
+    fn form_controls_take_button_and_field_text_colors() {
+        // CSS Color 4 #system-color-pairs: controls painted on their native
+        // ButtonFace or Field surface use ButtonText or FieldText, as every
+        // engine's UA sheet sets, instead of inheriting a page's white text
+        // (zooquarium.neocities.org's buttons were blank). Author colors and
+        // select, which has no native surface here, keep the cascade.
+        let dom = Dom::parse_document(
+            r#"<div style="color:white"><button id=b><span id=i>b</span></button>
+            <input id=s type=submit><input id=t><textarea id=x></textarea>
+            <select id=l></select><button id=c style="color:red">c</button><span id=p>p</span></div>"#,
+        );
+        let color = |id: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "color")
+                .unwrap_or_default()
+        };
+        for id in ["b", "i", "s", "t", "x"] {
+            assert_eq!(color(id), "#000000", "{id}");
+        }
+        assert_eq!(color("c"), "red");
+        assert_eq!(color("l"), "white");
+        assert_eq!(color("p"), "white");
+    }
+
+    #[test]
+    fn reduced_motion_preference_answers_both_values_and_boolean_context() {
+        // Media Queries 5 #prefers-reduced-motion: `no-preference` is false
+        // in the boolean context; the desktop answers it, terminals `reduce`.
+        assert!(reduced_motion_feature(Some("reduce"), true));
+        assert!(!reduced_motion_feature(Some("no-preference"), true));
+        assert!(reduced_motion_feature(None, true));
+        assert!(reduced_motion_feature(Some("no-preference"), false));
+        assert!(!reduced_motion_feature(Some("reduce"), false));
+        assert!(!reduced_motion_feature(None, false));
     }
 
     #[test]

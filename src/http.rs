@@ -10001,7 +10001,8 @@ mod tests {
         // graphical path must provide that appearance independently of the
         // terminal-only bracket affordance. Contenteditable is an ordinary
         // CSS box, not a native textarea widget (CSS UI 4 appearance:auto).
-        // The dark page's controls take the dark scheme's ButtonFace.
+        // The dark page's controls take the dark scheme's ButtonFace, and
+        // the button's icon its ButtonText (CSS Color 4 #system-color-pairs).
         let base = Url::parse("https://chatgpt.com/").unwrap();
         let mut dom = crate::dom::Dom::parse_document(
             r##"<html style="color-scheme:dark"><body style="margin:0;background:#000;color:#fff"><form>
@@ -10047,8 +10048,8 @@ mod tests {
         let bytes = crate::img::decode_data_url(source).unwrap();
         let markup = String::from_utf8(bytes.clone()).unwrap();
         assert!(
-            markup.contains("#fff"),
-            "currentColor was not resolved: {markup}"
+            markup.contains("#fbfbfe"),
+            "currentColor was not resolved to ButtonText: {markup}"
         );
         let (image, _) = crate::img::decode(&bytes).expect("Send SVG decodes for desktop");
         assert!(
