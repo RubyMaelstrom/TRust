@@ -56,10 +56,6 @@ impl RowExport {
             .filter(|(_, slot)| **slot != MISSING)
             .map(|(property, slot)| (property, &self.values[usize::from(*slot)]))
     }
-
-    pub(super) fn boxes(&self) -> &[(BoxContext, BoxStyle)] {
-        &self.boxes
-    }
 }
 
 impl NodeExport {

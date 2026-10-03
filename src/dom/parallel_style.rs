@@ -868,6 +868,9 @@ impl Dom {
 
 /// What the memo caches hold for one element, for verification.
 struct Snapshot {
+    /// The box record for the element's own context. A shared row can hold
+    /// records made for other elements, or have evicted this one.
+    own_box: Option<BoxStyle>,
     row: Option<computed_cache::RowExport>,
     node: Option<computed_cache::NodeExport>,
     cascade: Option<CascadedMaps>,
@@ -877,10 +880,14 @@ struct Snapshot {
 }
 
 impl Dom {
-    fn style_snapshot(&self, id: NodeId) -> Snapshot {
+    fn style_snapshot(&self, id: NodeId, vp: Vp) -> Snapshot {
         let style_value_epoch = self.style_value_epoch;
+        // Computing the context may fill missing values; it reads no record.
+        let context = (self.computed_cache.borrow().1.has_row(id) && !self.is_hidden(id))
+            .then(|| BoxStyle::record_context(&ComputeView(self), id, vp));
         let computed = self.computed_cache.borrow();
         Snapshot {
+            own_box: context.and_then(|context| computed.1.box_record(id, &context)),
             row: computed
                 .1
                 .row(id)
@@ -929,12 +936,15 @@ impl Dom {
         viewport: crate::layout2::Viewport,
         base: &url::Url,
     ) -> (usize, usize) {
-        let parallel: Vec<Snapshot> = nodes.iter().map(|&id| self.style_snapshot(id)).collect();
-        self.clear_style_memos();
         let vp = Vp {
             w: viewport.width,
             h: viewport.height,
         };
+        let parallel: Vec<Snapshot> = nodes
+            .iter()
+            .map(|&id| self.style_snapshot(id, vp))
+            .collect();
+        self.clear_style_memos();
         let (mut rendered_memo, mut inline_memo) = (FxHashMap::default(), FxHashMap::default());
         for &id in nodes {
             compute_element(
@@ -957,7 +967,7 @@ impl Dom {
             }
         };
         for (&id, parallel) in nodes.iter().zip(parallel) {
-            let serial = self.style_snapshot(id);
+            let serial = self.style_snapshot(id, vp);
             // Every value the pass stored is what the lazy path computes.
             let values = parallel
                 .row
@@ -978,15 +988,13 @@ impl Dom {
                     );
                 }
             }
-            let serial_boxes = serial.row.as_ref().map_or(&[][..], |row| row.boxes());
-            for (context, value) in parallel.row.as_ref().map_or(&[][..], |row| row.boxes()) {
-                match serial_boxes.iter().find(|(c, _)| c == context) {
-                    Some((_, expected)) if expected == value => {}
-                    Some((_, expected)) => report(
+            if let Some(value) = &parallel.own_box {
+                let expected = BoxStyle::of(&ComputeView(self), id, vp);
+                if *value != expected {
+                    report(
                         id,
                         format!("box record parallel={value:?} serial={expected:?}"),
-                    ),
-                    None => report(id, "box record missing on the lazy path".into()),
+                    );
                 }
             }
             let inline = |snapshot: &Snapshot| {
@@ -1153,6 +1161,25 @@ mod tests {
             let adopted = pass_and_verify(&dom, &pool).expect("pass ran");
             assert!(adopted > 300, "{adopted}");
         }
+    }
+
+    #[test]
+    fn rows_shared_by_elements_with_different_box_contexts_verify() {
+        // Process-wide font revisions from parallel tests expire every style.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        // HTML Rendering #margin-collapsing-quirks: in quirks mode the first
+        // and last p of a cell drop UA margins, so cells' p elements share a
+        // computed row but not a box record context. A row keeps two
+        // records; which survive depends on computation order.
+        let mut html = String::from("<html><body><table>");
+        for i in 0..120 {
+            html.push_str(&format!("<tr><td><p>a{i}</p><p>b</p><p>c</p></td></tr>"));
+        }
+        html.push_str("</table></body></html>");
+        let mut dom = Dom::parse_document(&html);
+        dom.set_viewport_px(VIEWPORT.width, VIEWPORT.height);
+        let pool = style_pool::Pool::new(4);
+        assert!(pass_and_verify(&dom, &pool).expect("pass ran") > 300);
     }
 
     #[test]
