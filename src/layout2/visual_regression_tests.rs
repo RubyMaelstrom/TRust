@@ -597,6 +597,40 @@ fn rounded_overflow_respects_positioned_containing_blocks() {
     }
 }
 
+/// The document path of the link at `point`, if any.
+fn link_at(scene: &crate::render::Scene, point: CssPoint) -> Option<String> {
+    scene.page_hit_at(point).map(|hit| match hit.link {
+        Some(crate::doc::Link::Http(url)) => url.path().to_owned(),
+        other => panic!("not a document link: {other:?}"),
+    })
+}
+
+fn inline_positioning_scene(html: &str) -> crate::render::Scene {
+    headless::scene_for_dom(
+        &Dom::parse_document(html),
+        &Url::parse("https://example.test/").unwrap(),
+        CssSize::new(200., 200.),
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+        ImageStore::default(),
+    )
+}
+
+#[test]
+fn relatively_positioned_links_move_with_their_hit_regions() {
+    // CSS 2 §9.4.3: a relatively positioned inline link moves after line
+    // layout, its hit region with it.
+    let scene = inline_positioning_scene(
+        "<body style='margin:0;font:16px/20px sans-serif'><div><a href='/moved' style='position:relative;left:100px;top:30px'>link</a></div></body>",
+    );
+    assert_eq!(
+        link_at(&scene, CssPoint::new(110., 40.)).as_deref(),
+        Some("/moved")
+    );
+    assert_eq!(link_at(&scene, CssPoint::new(10., 10.)), None);
+}
+
 #[test]
 fn graphical_infinite_and_huge_radii_keep_their_rounded_shape() {
     use crate::render::{DisplayCommand, PaintShape};

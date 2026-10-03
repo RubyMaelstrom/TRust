@@ -51,6 +51,10 @@ pub(crate) struct OofMark<'t> {
     pub b: &'t super::tree::SharedBox,
     pub line: usize,
     pub x_px: f32,
+    /// The static position's vertical offset from its line's top: the
+    /// relative offset of the enclosing inline boxes, which move their
+    /// descendants, the hypothetical box included (CSS 2 §9.4.3).
+    pub dy: f32,
     pub ctx: InlineStyle,
     /// `x_px` includes its line's text-align offset.
     aligned: bool,
@@ -102,6 +106,11 @@ pub(crate) struct Piece {
     pub(crate) control_text: Option<std::sync::Arc<ControlText>>,
     /// The non-replaced inline boxes containing this piece.
     pub(crate) boxes: Option<Box<InlineBoxes>>,
+    /// The relative-positioning offset already applied to `x`/`y` (CSS 2
+    /// §9.4.3): the innermost enclosing inline box's `offset`, plus a
+    /// relatively positioned replaced element's own offset. The line box
+    /// and the pieces after it are laid as if it were zero.
+    pub(crate) shift: [f32; 2],
 }
 
 /// A multiline control's laid-out content.
@@ -167,6 +176,11 @@ pub(crate) struct InlineBoxEntry {
     /// The box's own alignment on the line, which its baseline-aligned
     /// contents share.
     pub vertical_align: VerticalAlign,
+    /// The visual offset of the box: its own relative-positioning offset
+    /// plus those of its enclosing inline boxes. CSS 2 §9.4.3 and CSS
+    /// Positioned Layout 3 #relpos-insets move a relatively positioned box
+    /// and its descendants after line layout without changing the line.
+    pub offset: [f32; 2],
 }
 
 impl InlineBoxEntry {
@@ -176,7 +190,8 @@ impl InlineBoxEntry {
     /// on its own font, whatever the line holds: neither a descendant's
     /// larger font nor an atomic inline stretches it. The box sits on the
     /// line where an inline box of its own font and alignment would, placed
-    /// like a text piece is (CSS 2 #propdef-vertical-align).
+    /// like a text piece is (CSS 2 #propdef-vertical-align), then moves by
+    /// its relative-positioning offset (CSS 2 §9.4.3).
     pub(crate) fn content_area(
         &self,
         line_top: f32,
@@ -184,6 +199,7 @@ impl InlineBoxEntry {
         line_baseline: f32,
     ) -> (f32, f32) {
         let baseline = line_top
+            + self.offset[1]
             + match self.vertical_align {
                 VerticalAlign::Baseline => line_baseline,
                 VerticalAlign::Shift(rise) => line_baseline - rise,
@@ -195,6 +211,66 @@ impl InlineBoxEntry {
             };
         (baseline - self.ascent, baseline + self.descent)
     }
+}
+
+/// One line fragment of an inline box: its border-box horizontal extent from
+/// the line box origin, including its relative offset, and whether the box
+/// begins and ends on this line (CSS Backgrounds 3 #box-decoration-break,
+/// `slice`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoxFragment {
+    pub entry: InlineBoxEntry,
+    pub x0: f32,
+    pub x1: f32,
+    pub starts: bool,
+    pub ends: bool,
+}
+
+/// The line fragments, on one line, of the inline boxes `keep` selects, in
+/// order of appearance. A box spans its pieces on the line, plus its start
+/// and end edges where it begins and ends.
+pub(crate) fn line_box_fragments<'p>(
+    pieces: impl IntoIterator<Item = &'p Piece>,
+    mut keep: impl FnMut(&InlineBoxEntry) -> bool,
+) -> Vec<BoxFragment> {
+    let mut runs: Vec<BoxFragment> = Vec::new();
+    for piece in pieces {
+        let Some(boxes) = &piece.boxes else {
+            continue;
+        };
+        for entry in boxes.chain.iter() {
+            if !keep(entry) {
+                continue;
+            }
+            let (start, end) = piece.extent_in(entry);
+            let mut run = BoxFragment {
+                entry: *entry,
+                x0: start,
+                x1: end,
+                starts: false,
+                ends: false,
+            };
+            if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == entry.key) {
+                run.x0 = start - distance;
+                run.starts = true;
+            }
+            if let Some(&(_, distance)) = boxes.closes.iter().find(|(close, _)| *close == entry.key)
+            {
+                run.x1 = end + distance;
+                run.ends = true;
+            }
+            match runs.iter_mut().find(|other| other.entry.key == entry.key) {
+                Some(other) => {
+                    other.x0 = other.x0.min(run.x0);
+                    other.x1 = other.x1.max(run.x1);
+                    other.starts |= run.starts;
+                    other.ends |= run.ends;
+                }
+                None => runs.push(run),
+            }
+        }
+    }
+    runs
 }
 
 /// What follows an inline item in its formatting context: the rest of its
@@ -271,6 +347,16 @@ impl Piece {
         self.box_height + self.vertical_edges[0] + self.vertical_edges[1]
     }
 
+    /// The piece's horizontal extent from the line box origin as placed in
+    /// its enclosing inline box `entry`. CSS 2 §9.4.3 moves a relatively
+    /// positioned box together with its descendants, so a box's fragment
+    /// spans its pieces at the box's own offset, without a descendant's
+    /// further offset.
+    pub(crate) fn extent_in(&self, entry: &InlineBoxEntry) -> (f32, f32) {
+        let x = self.x - self.shift[0] + entry.offset[0];
+        (x, x + self.box_width)
+    }
+
     pub(super) fn retained_bytes(&self) -> usize {
         self.item.text.capacity()
             + [
@@ -334,6 +420,7 @@ impl Piece {
             paint_control_box: false,
             control_text: None,
             boxes: None,
+            shift: [0.0; 2],
         }
     }
 
@@ -363,6 +450,7 @@ impl Piece {
             paint_control_box: false,
             control_text: None,
             boxes: None,
+            shift: [0.0; 2],
         }
     }
 }
@@ -469,10 +557,16 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// `<a name>`/`<span id>` is a real box and a fragment anchor even
     /// though it paints nothing). Content-bearing elements are covered by
     /// their pieces' nodes too; the mark is just their upper bound.
-    marks: Vec<(NodeId, usize)>,
+    /// Each mark also carries the element's vertical relative offset.
+    marks: Vec<(NodeId, usize, f32)>,
     /// Out-of-flow boxes met (static-position marks for the positioned
     /// post-pass) — they emit no pieces.
     oofs: Vec<OofMark<'t>>,
+    /// Whether a tracked inline box has a relative offset to apply after
+    /// line layout. Sideways text keeps its boxes in place: its pieces are
+    /// in rotated inline/block coordinates.
+    relative_offsets: bool,
+    sideways: bool,
     pen: f32,
     line_start: f32,
     pending_space: bool,
@@ -606,6 +700,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             cur: Vec::new(),
             marks: Vec::new(),
             oofs: Vec::new(),
+            relative_offsets: false,
+            sideways: false,
             pen: 0.0,
             line_start: 0.0,
             pending_space: false,
@@ -653,6 +749,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     pub fn mark_measuring(&mut self, min_content: bool) {
         self.measuring = true;
         self.measuring_min = min_content;
+    }
+
+    /// Lay sideways (vertical) text: inline boxes keep their laid positions,
+    /// because the pieces are in rotated coordinates.
+    pub fn mark_sideways(&mut self) {
+        self.sideways = true;
     }
 
     /// Set the current line box's left/right boundaries from the float band at
@@ -918,6 +1020,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         .dom
                         .effective_display(b.node)
                         .is_some_and(|display| display.starts_with("inline"));
+                // CSS 2 §9.4.3: the hypothetical box moves with the
+                // relatively positioned inline boxes enclosing it.
+                let offset = self.box_stack.last().map_or([0.0; 2], |entry| entry.offset);
                 self.oofs.push(OofMark {
                     b,
                     line: self.lines.len(),
@@ -928,7 +1033,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         self.pen + self.pending_gap_px
                     } else {
                         0.0
-                    },
+                    } + offset[0],
+                    dy: offset[1],
                     ctx: ctx.clone(),
                     aligned: !inline_level,
                 })
@@ -949,14 +1055,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 } else {
                     self.form_context(*node, ctx)
                 };
-                if *node != crate::layout2::NO_NODE {
-                    self.marks.push((*node, self.lines.len()));
-                }
                 let key = if *node == crate::layout2::NO_NODE {
                     style.pseudo.map(|(origin, which)| (origin, Some(which)))
                 } else {
                     Some((*node, None))
                 };
+                // CSS Positioned Layout 3 #position-property: a relative or
+                // sticky inline box is offset after line layout (an
+                // absolute/fixed one was blockified).
+                let positioned = style.position.positioned() && !self.sideways;
                 // Decorated boxes paint their line fragments; CSSOM View
                 // #dom-element-getclientrects also measures every element's
                 // non-replaced inline box. Intrinsic sizing needs neither.
@@ -968,10 +1075,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                                 .resolve(Some(self.cb_w_px))
                                 .unwrap_or(0.0)
                     };
-                    (decorated || key.1.is_none()).then(|| {
+                    (decorated || key.1.is_none() || positioned).then(|| {
                         // The box's own strut, like the block container's
                         // (CSS 2 #inline-non-replaced, #leading).
                         let strut = crate::text::shape(" ", &inner.text_style());
+                        // CSS 2 §9.4.3 / CSS Positioned Layout 3
+                        // #relpos-insets: percentages refer to the containing
+                        // block, this formatting context's content box (CSS 2
+                        // §10.1 item 2). The offsets of enclosing boxes add.
+                        let (dx, dy) = if positioned {
+                            style.paint_offset(self.cb_w_px, self.cb_h_px, 0.0, 0.0)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let outer = self.box_stack.last().map_or([0.0; 2], |entry| entry.offset);
                         InlineBoxEntry {
                             key,
                             decorated,
@@ -981,9 +1098,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                             baseline: strut.baseline,
                             line_height: strut.line_height,
                             vertical_align: inner.vertical_align,
+                            offset: [outer[0] + dx, outer[1] + dy],
                         }
                     })
                 });
+                if *node != crate::layout2::NO_NODE {
+                    let dy = tracked.map_or(0.0, |entry| entry.offset[1]);
+                    self.marks.push((*node, self.lines.len(), dy));
+                }
+                self.relative_offsets |= tracked.is_some_and(|entry| entry.offset != [0.0; 2]);
                 if let Some(entry) = tracked {
                     self.pending_opens
                         .push((entry.key, self.pending_gap_px + self.margin_px(style, LEFT)));
@@ -1699,6 +1822,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             paint_control_box: false,
             control_text: None,
             boxes: None,
+            shift: [0.0; 2],
         });
         self.attach_boxes(gap);
         self.pen = x + w;
@@ -2455,6 +2579,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             paint_control_box,
             control_text: None,
             boxes: None,
+            shift: [0.0; 2],
         });
         self.attach_boxes(gap);
         self.pen = x + geometry.box_width;
@@ -2754,7 +2879,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         mut self,
     ) -> (
         Vec<LineOut>,
-        Vec<(NodeId, usize)>,
+        Vec<(NodeId, usize, f32)>,
         Vec<OofMark<'t>>,
         Vec<FloatPlace>,
         Vec<AtomBoxPlace>,
@@ -2814,8 +2939,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     );
                     piece.x += dx;
                     piece.y += dy;
+                    piece.shift = [dx, dy];
                 }
             }
+        }
+        if self.relative_offsets {
+            self.offset_relative_boxes();
         }
         (
             self.lines,
@@ -2824,6 +2953,42 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.placements,
             self.atom_places,
         )
+    }
+}
+
+impl Ifc<'_, '_, '_> {
+    /// CSS 2 §9.4.3 / CSS Positioned Layout 3 #relpos-insets: once lines are
+    /// broken, aligned and justified, move every piece of a relatively
+    /// positioned inline box and of its descendants (atomic inline boxes
+    /// included) by the box's offset. The line boxes, and everything laid
+    /// after the box, keep the positions they had without it.
+    fn offset_relative_boxes(&mut self) {
+        for (index, line) in self.lines.iter_mut().enumerate() {
+            for piece in line.pieces.iter_mut().chain(line.atom_boxes.iter_mut()) {
+                let Some(offset) = piece
+                    .boxes
+                    .as_ref()
+                    .and_then(|boxes| boxes.chain.last())
+                    .map(|entry| entry.offset)
+                    .filter(|offset| *offset != [0.0; 2])
+                else {
+                    continue;
+                };
+                piece.x += offset[0];
+                piece.y += offset[1];
+                piece.shift[0] += offset[0];
+                piece.shift[1] += offset[1];
+                if piece.atom_box
+                    && let Some(place) = self
+                        .atom_places
+                        .iter_mut()
+                        .find(|place| place.line == index && place.node == piece.item.node)
+                {
+                    place.x += offset[0];
+                    place.y += offset[1];
+                }
+            }
+        }
     }
 }
 

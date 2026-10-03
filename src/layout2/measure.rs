@@ -21,7 +21,6 @@ use crate::dom::{DOCUMENT, Dom, NodeId};
 use crate::layout2::{NO_NODE, PxRect};
 
 use super::flow::{Frag, FragKind, LineFrag, TopFrag};
-use super::inline::InlineBoxEntry;
 use crate::render::{Affine2d, CssRect};
 
 fn border_rect(frag: &Frag, transform: Affine2d) -> PxRect {
@@ -308,55 +307,23 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
 /// its start and end edges where the box begins and ends (CSS Backgrounds 3
 /// #box-decoration-break `slice`). Decorated boxes paint the same geometry.
 fn inline_box_fragments(f: &Frag, line: &LineFrag) -> Vec<(NodeId, Rect)> {
-    struct Run {
-        node: NodeId,
-        x0: f32,
-        x1: f32,
-        entry: InlineBoxEntry,
-    }
-    let mut runs: Vec<Run> = Vec::new();
-    for piece in line.pieces.iter().chain(&line.atom_boxes) {
-        let Some(boxes) = &piece.boxes else {
-            continue;
+    // A relatively positioned box is measured at its offset (CSS 2 §9.4.3).
+    super::inline::line_box_fragments(line.pieces.iter().chain(&line.atom_boxes), |entry| {
+        entry.key.1.is_none()
+    })
+    .into_iter()
+    .map(|run| {
+        let (top, bottom) = run.entry.content_area(f.y, line.height, line.baseline);
+        let [above, below] = run.entry.vertical_edges;
+        let rect = Rect {
+            x0: f.x + run.x0,
+            y0: top - above,
+            x1: f.x + run.x1.max(run.x0),
+            y1: bottom + below,
         };
-        let start = f.x + piece.x;
-        let end = start + piece.box_width;
-        for entry in boxes.chain.iter().filter(|entry| entry.key.1.is_none()) {
-            let (mut x0, mut x1) = (start, end);
-            if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == entry.key) {
-                x0 = start - distance;
-            }
-            if let Some(&(_, distance)) = boxes.closes.iter().find(|(close, _)| *close == entry.key)
-            {
-                x1 = end + distance;
-            }
-            match runs.iter_mut().find(|run| run.node == entry.key.0) {
-                Some(run) => {
-                    run.x0 = run.x0.min(x0);
-                    run.x1 = run.x1.max(x1);
-                }
-                None => runs.push(Run {
-                    node: entry.key.0,
-                    x0,
-                    x1,
-                    entry: *entry,
-                }),
-            }
-        }
-    }
-    runs.into_iter()
-        .map(|run| {
-            let (top, bottom) = run.entry.content_area(f.y, line.height, line.baseline);
-            let [above, below] = run.entry.vertical_edges;
-            let rect = Rect {
-                x0: run.x0,
-                y0: top - above,
-                x1: run.x1.max(run.x0),
-                y1: bottom + below,
-            };
-            (run.node, rect)
-        })
-        .collect()
+        (run.entry.key.0, rect)
+    })
+    .collect()
 }
 
 /// CSS 2 #anonymous-block-level: an in-flow block-level box inside an inline

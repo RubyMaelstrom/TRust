@@ -403,13 +403,14 @@ struct CbRect {
 }
 
 /// An out-of-flow box's placeholder fragment at its static position
-/// (`content_x + the IFC pen offset`, the line's y).
+/// (`content_x + the IFC pen offset`, the line's y plus the relative offset
+/// of the inline boxes around it).
 fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag {
     Frag {
         flow: Default::default(),
         node: NO_NODE,
         x: content_x + m.x_px,
-        y,
+        y: y + m.dy,
         w: 0.0,
         h: 0.0,
         border: [0.0; 4],
@@ -1161,8 +1162,8 @@ impl Flow<'_> {
                                     end_y
                                 }
                             };
-                            for (node, idx) in marks {
-                                cur.anchors.push((node, line_y(idx, &children)));
+                            for (node, idx, dy) in marks {
+                                cur.anchors.push((node, line_y(idx, &children) + dy));
                             }
                             for m in oofs {
                                 let y = line_y(m.line, &children);
@@ -1171,8 +1172,8 @@ impl Flow<'_> {
                         } else {
                             // No line boxes: the elements still sit at this flow
                             // position (where the box self-collapses to).
-                            for (node, _) in marks {
-                                cur.anchors.push((node, cur.preview()));
+                            for (node, _, dy) in marks {
+                                cur.anchors.push((node, cur.preview() + dy));
                             }
                             let y = cur.preview();
                             for m in oofs {
@@ -1849,6 +1850,7 @@ impl Flow<'_> {
                 None,
                 &[],
             );
+            ifc.mark_sideways();
             ifc.run(inls, inl);
             ifc.finish().0
         };
@@ -3666,8 +3668,8 @@ impl Flow<'_> {
                         end_y
                     }
                 };
-                for (node, i2) in marks {
-                    cur.anchors.push((node, line_y(i2, &children)));
+                for (node, i2, dy) in marks {
+                    cur.anchors.push((node, line_y(i2, &children) + dy));
                 }
                 for m in oofs {
                     let y = line_y(m.line, &children);
@@ -5485,7 +5487,7 @@ fn inline_block_baseline(dom: &Dom, fragment: &Frag) -> Option<f32> {
 /// positioned in the content frame).
 struct InlineLaid<'t> {
     lines: Vec<LineOut>,
-    marks: Vec<(NodeId, usize)>,
+    marks: Vec<(NodeId, usize, f32)>,
     oofs: Vec<OofMark<'t>>,
     float_frags: Vec<Frag>,
     float_anchors: Vec<(NodeId, f32)>,
