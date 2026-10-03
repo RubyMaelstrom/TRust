@@ -69,6 +69,7 @@ impl_read_as_for_float!(f32, f64);
 
 #[cfg(feature = "simd")]
 impl ReadAs<V128> for UntypedVal {
+    #[inline]
     fn read_as(&self) -> V128 {
         // Note: we can re-use the `From` impl since both types are of equal size.
         V128::from(*self)
@@ -158,6 +159,7 @@ impl_write_as_for_float!(f32, f64);
 
 #[cfg(feature = "simd")]
 impl WriteAs<V128> for UntypedVal {
+    #[inline]
     fn write_as(&mut self, value: V128) {
         // Note: we can re-use the `From` impl since both types are of equal size.
         *self = UntypedVal::from(value);
@@ -224,6 +226,7 @@ impl_from_untyped_for_float!(f32, f64, F32, F64);
 
 #[cfg(feature = "simd")]
 impl From<UntypedVal> for V128 {
+    #[inline]
     fn from(value: UntypedVal) -> Self {
         let u128 = (u128::from(value.hi64) << 64) | (u128::from(value.lo64));
         Self::from(u128)
@@ -232,6 +235,7 @@ impl From<UntypedVal> for V128 {
 
 #[cfg(feature = "simd")]
 impl From<V128> for UntypedVal {
+    #[inline]
     fn from(value: V128) -> Self {
         let u128 = value.as_u128();
         let lo64 = u128 as u64;

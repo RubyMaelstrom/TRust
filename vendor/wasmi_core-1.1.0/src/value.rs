@@ -501,6 +501,7 @@ macro_rules! impl_wasm_float {
 pub struct V128([u8; 16]);
 
 impl From<u128> for V128 {
+    #[inline]
     fn from(value: u128) -> Self {
         Self(value.to_le_bytes())
     }
@@ -508,6 +509,7 @@ impl From<u128> for V128 {
 
 impl V128 {
     /// Returns the `self` as a 128-bit Rust integer.
+    #[inline]
     pub fn as_u128(&self) -> u128 {
         u128::from_ne_bytes(self.0)
     }
