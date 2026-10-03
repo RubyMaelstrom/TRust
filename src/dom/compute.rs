@@ -336,6 +336,226 @@ impl<B: StyleBackend + ?Sized> crate::layout2::UnitSource for ComputeView<'_, B>
     }
 }
 
+impl crate::layout2::StyleSource for Dom {
+    #[inline]
+    fn tag_name(&self, id: NodeId) -> Option<&str> {
+        Dom::tag_name(self, id)
+    }
+    #[inline]
+    fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
+        Dom::attr(self, id, name)
+    }
+    #[inline]
+    fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.node(id).parent
+    }
+    #[inline]
+    fn children(&self, id: NodeId) -> Vec<NodeId> {
+        Dom::children(self, id)
+    }
+    #[inline]
+    fn text(&self, id: NodeId) -> Option<&str> {
+        style_view::NodesRef::new(&self.nodes).text(id)
+    }
+    #[inline]
+    fn is_element(&self, id: NodeId) -> bool {
+        style_view::NodesRef::new(&self.nodes).is_element(id)
+    }
+    #[inline]
+    fn in_quirks_mode(&self, id: NodeId) -> bool {
+        Dom::in_quirks_mode(self, id)
+    }
+    #[inline]
+    fn device_pixel_ratio(&self) -> f32 {
+        Dom::device_pixel_ratio(self)
+    }
+    #[inline]
+    fn render_clickable(&self, id: NodeId) -> bool {
+        Dom::render_clickable(self, id)
+    }
+    #[inline]
+    fn inherited_lang(&self, id: NodeId) -> Option<&str> {
+        Dom::inherited_lang(self, id)
+    }
+    #[inline]
+    fn is_document_element(&self, id: NodeId) -> bool {
+        Dom::is_document_element(self, id)
+    }
+    #[inline]
+    fn computed_display(&self, id: NodeId) -> Option<String> {
+        Dom::computed_display(self, id)
+    }
+    #[inline]
+    fn css_animation_definitions(&self, id: NodeId) -> Vec<CssAnimationDefinition> {
+        Dom::css_animation_definitions(self, id)
+    }
+    #[inline]
+    fn legacy_line_clamp(&self, id: NodeId) -> Option<usize> {
+        Dom::legacy_line_clamp(self, id)
+    }
+    #[inline]
+    fn size_container_kind(&self, id: NodeId) -> u8 {
+        Dom::size_container_kind(self, id)
+    }
+    #[inline]
+    fn effective_opacity(&self, id: NodeId) -> f32 {
+        Dom::effective_opacity(self, id)
+    }
+    #[inline]
+    fn text_decoration(&self, id: NodeId) -> (bool, bool) {
+        Dom::text_decoration(self, id)
+    }
+    #[inline]
+    fn author_declares(&self, id: NodeId, prop: &str) -> bool {
+        Dom::author_declares(self, id, prop)
+    }
+    #[inline]
+    fn font_size_zero(&self, id: NodeId) -> Option<bool> {
+        Dom::font_size_zero(self, id)
+    }
+    #[inline]
+    fn paint_suppressed(&self, id: NodeId) -> bool {
+        Dom::paint_suppressed(self, id)
+    }
+    #[inline]
+    fn visibility_hidden(&self, id: NodeId) -> bool {
+        Dom::visibility_hidden(self, id)
+    }
+    #[inline]
+    fn document_font_set(&self, id: NodeId) -> Option<std::sync::Arc<crate::text::FontSet>> {
+        Dom::document_font_set(self, id)
+    }
+    #[inline]
+    fn retained_box_style(
+        &self,
+        id: NodeId,
+        context: BoxContext,
+        compute: impl FnOnce() -> BoxStyle,
+    ) -> BoxStyle {
+        Dom::retained_box_style(self, id, context, compute)
+    }
+    #[inline]
+    fn retained_inline_style(
+        &self,
+        id: NodeId,
+        parent: &InlineStyle,
+        base: &url::Url,
+        compute: impl FnOnce() -> InlineStyle,
+    ) -> InlineStyle {
+        Dom::retained_inline_style(self, id, parent, base, compute)
+    }
+}
+
+impl<B: StyleBackend + ?Sized> crate::layout2::StyleSource for ComputeView<'_, B> {
+    #[inline]
+    fn tag_name(&self, id: NodeId) -> Option<&str> {
+        self.0.tag_name(id)
+    }
+    #[inline]
+    fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
+        self.0.attr(id, name)
+    }
+    #[inline]
+    fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.0.style_view().nodes.parent(id)
+    }
+    #[inline]
+    fn children(&self, id: NodeId) -> Vec<NodeId> {
+        self.0.child_iter(id).collect()
+    }
+    #[inline]
+    fn text(&self, id: NodeId) -> Option<&str> {
+        self.0.style_view().nodes.text(id)
+    }
+    #[inline]
+    fn is_element(&self, id: NodeId) -> bool {
+        self.0.style_view().nodes.is_element(id)
+    }
+    #[inline]
+    fn in_quirks_mode(&self, id: NodeId) -> bool {
+        self.0.in_quirks_mode(id)
+    }
+    #[inline]
+    fn device_pixel_ratio(&self) -> f32 {
+        self.0.device_pixel_ratio()
+    }
+    #[inline]
+    fn render_clickable(&self, id: NodeId) -> bool {
+        self.0.render_clickable(id)
+    }
+    #[inline]
+    fn inherited_lang(&self, id: NodeId) -> Option<&str> {
+        self.0.style_view().inherited_lang(id)
+    }
+    #[inline]
+    fn is_document_element(&self, id: NodeId) -> bool {
+        ComputeView::is_document_element(self, id)
+    }
+    #[inline]
+    fn computed_display(&self, id: NodeId) -> Option<String> {
+        ComputeView::computed_display(self, id)
+    }
+    #[inline]
+    fn css_animation_definitions(&self, id: NodeId) -> Vec<CssAnimationDefinition> {
+        ComputeView::css_animation_definitions(self, id)
+    }
+    #[inline]
+    fn legacy_line_clamp(&self, id: NodeId) -> Option<usize> {
+        ComputeView::legacy_line_clamp(self, id)
+    }
+    #[inline]
+    fn size_container_kind(&self, id: NodeId) -> u8 {
+        ComputeView::size_container_kind(self, id)
+    }
+    #[inline]
+    fn effective_opacity(&self, id: NodeId) -> f32 {
+        ComputeView::effective_opacity(self, id)
+    }
+    #[inline]
+    fn text_decoration(&self, id: NodeId) -> (bool, bool) {
+        ComputeView::text_decoration(self, id)
+    }
+    #[inline]
+    fn author_declares(&self, id: NodeId, prop: &str) -> bool {
+        ComputeView::author_declares(self, id, prop)
+    }
+    #[inline]
+    fn font_size_zero(&self, id: NodeId) -> Option<bool> {
+        ComputeView::font_size_zero(self, id)
+    }
+    #[inline]
+    fn paint_suppressed(&self, id: NodeId) -> bool {
+        ComputeView::paint_suppressed(self, id)
+    }
+    #[inline]
+    fn visibility_hidden(&self, id: NodeId) -> bool {
+        ComputeView::visibility_hidden(self, id)
+    }
+    #[inline]
+    fn document_font_set(&self, id: NodeId) -> Option<std::sync::Arc<crate::text::FontSet>> {
+        ComputeView::document_font_set(self, id)
+    }
+    #[inline]
+    fn retained_box_style(
+        &self,
+        id: NodeId,
+        context: BoxContext,
+        compute: impl FnOnce() -> BoxStyle,
+    ) -> BoxStyle {
+        ComputeView::retained_box_style(self, id, context, compute)
+    }
+    #[inline]
+    fn retained_inline_style(
+        &self,
+        id: NodeId,
+        parent: &InlineStyle,
+        base: &url::Url,
+        compute: impl FnOnce() -> InlineStyle,
+    ) -> InlineStyle {
+        ComputeView::retained_inline_style(self, id, parent, base, compute)
+    }
+}
+
 // The DOM's entry points into style computation (`ComputeView`).
 impl Dom {
     #[inline]
