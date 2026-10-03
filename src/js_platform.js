@@ -69,6 +69,34 @@
     const configuredAgentTimeOffset = Number(cfg.agentTimeOffset);
     const agentTimeOffset = Number.isFinite(configuredAgentTimeOffset) &&
         configuredAgentTimeOffset >= 0 ? configuredAgentTimeOffset : 0;
+    // Private slots for platform objects: WeakMaps whose get/set are own,
+    // non-writable data properties holding the pristine intrinsics, so an
+    // author change to WeakMap.prototype can neither observe nor forge them.
+    function privateSlots() {
+        const map = new WeakMap();
+        Object.defineProperty(map, "get", { value: messageWeakGet });
+        Object.defineProperty(map, "set", { value: messageWeakSet });
+        return map;
+    }
+    // A wrapper's native node (DOM #concept-node) and other per-object
+    // platform state, such as a navigable container's child Window, are
+    // internal slots shared by this Agent's Window Realms. Author-visible
+    // properties would let a page read another origin's Window or forge the
+    // node a platform operation acts on (HTML #origin).
+    const nodeIds = __platform_slots("nodes", privateSlots());
+    const internalSlots = __platform_slots("internals", privateSlots());
+    const noInternals = Object.freeze(Object.create(null));
+    function internalsOf(object) {
+        return internalSlots.get(object) || noInternals;
+    }
+    function internalsFor(object) {
+        let record = internalSlots.get(object);
+        if (record === undefined) {
+            record = Object.create(null);
+            internalSlots.set(object, record);
+        }
+        return record;
+    }
     const trust = { errors: [], logs: [], readyState: "loading" };
     // The control object is private to the platform. The native host and the
     // bootstraps of same-Agent Window Realms reach it through one host-rooted
@@ -89,7 +117,7 @@
             childTrust.oneShot = trust.oneShot;
             childWindowTrusts.add(childTrust);
             childActivationWindows.add(childWindow);
-            childRenderingFrames.set(childTrust, frame.__id);
+            childRenderingFrames.set(childTrust, nodeIds.get(frame));
             renderingChildrenEpoch = -1;
             renderingChildrenCache = [];
         }
@@ -117,7 +145,7 @@
             // Only navigable containers can contribute a child Document.
             // Filter natively before crossing into JS: ordinary input edits
             // also advance the DOM epoch, without changing the frame list.
-            for (const id of __dom_rendering_frames(realmRootFrame ? realmRootFrame.__id : 0)) {
+            for (const id of __dom_rendering_frames(realmRootFrame ? nodeIds.get(realmRootFrame) : 0)) {
                 const child = byFrame.get(id);
                 if (child) children.push(child);
             }
@@ -352,10 +380,10 @@
     function snapshotRemovedWrapperSubtrees(target, removedRoots) {
         if ((!nativeWrapperCache && typeof g.WeakRef !== "function") || !removedRoots.length) return [];
         const canWalkInclusiveTarget = target.__trustLN !== "template"
-            && __dom_shadow_root(target.__id) == null;
+            && __dom_shadow_root(nodeIds.get(target)) == null;
         if (canWalkInclusiveTarget) {
-            const ids = __dom_wrapper_subtree(target.__id);
-            if (ids.length && ids[0] === target.__id) ids.shift();
+            const ids = __dom_wrapper_subtree(nodeIds.get(target));
+            if (ids.length && ids[0] === nodeIds.get(target)) ids.shift();
             return ids;
         }
         const ids = [];
@@ -372,7 +400,7 @@
         return element;
     }
     function cacheElementName(element) {
-        const parts = __dom_element_name(element.__id) || ["", null, null];
+        const parts = __dom_element_name(nodeIds.get(element)) || ["", null, null];
         return seedElementName(element, parts[0], parts[1], parts[2]);
     }
     function newElementWrapper(id, localName, namespace, prefix) {
@@ -387,7 +415,7 @@
     }
     function wrapKnown(id, knownConnected) {
         if (id === null || id === undefined) return null;
-        if (realmRootFrame && Number(id) === realmRootFrame.__id) return realmRootFrame;
+        if (realmRootFrame && Number(id) === nodeIds.get(realmRootFrame)) return realmRootFrame;
         let w = cachedWrapper(id, knownConnected);
         if (w) return w;
         // HTML #concept-bcc-content-document / Window.frameElement: a
@@ -397,9 +425,9 @@
         // contentWindow lookup can spuriously reload the enclosing player.
         let ancestor = realmRootFrame;
         while (ancestor) {
-            if (Number(id) === ancestor.__id) return ancestor;
+            if (Number(id) === nodeIds.get(ancestor)) return ancestor;
             const owner = ancestor.ownerDocument;
-            ancestor = owner && owner.__frame || null;
+            ancestor = owner && internalsOf(owner).frame || null;
         }
         const t = __dom_node_type(id);
         // Queued frontend input can outlive its removed target. Public IDs are
@@ -429,16 +457,16 @@
                 w.__serializable = info[3];
                 w.__clonable = info[4];
                 w.__slotAssignment = info[5] ? "manual" : "named";
-                w.__host.__sr = w;
+                internalsFor(w.__host).sr = w;
             }
             return w;
         } else {
             if (t === 9) {
                 const owner = __dom_frame_owner(id);
                 if (owner !== null && owner !== undefined) {
-                    const frame = realmRootFrame && realmRootFrame.__id === owner ? realmRootFrame : wrap(owner);
-                    const current = frame.__contentDoc;
-                    w = current && current.__id === id ? current : new FrameDocument(frame);
+                    const frame = realmRootFrame && nodeIds.get(realmRootFrame) === owner ? realmRootFrame : wrap(owner);
+                    const current = internalsOf(frame).contentDoc;
+                    w = current && nodeIds.get(current) === id ? current : new FrameDocument(frame);
                     return rememberWrapper(id, w, knownConnected);
                 }
             }
@@ -522,7 +550,7 @@
         while (n) { if (n.nodeType === 9) { connected = true; break; } n = n.parentNode; }
         if (!connected) return;
         SCRIPTS_STARTED.add(node);
-        __dom_run_injected_script(node.__id);
+        __dom_run_injected_script(nodeIds.get(node));
     }
     // A `<link rel=stylesheet href>` inserted into the live document is fetched
     // and fires `load`/`error` (HTML "obtain a resource" for a stylesheet link).
@@ -543,7 +571,7 @@
         if (rels.indexOf("stylesheet") >= 0) {
             if (!(node.href || node.getAttribute("href"))) return;
             node.__cssStarted = true;
-            __dom_load_injected_stylesheet(node.__id);
+            __dom_load_injected_stylesheet(nodeIds.get(node));
             return;
         }
         // HTML #link-type-preload fetches the resource into the document's
@@ -553,7 +581,7 @@
         // load/error events BEFORE the view-transition swap.
         if (rels.indexOf("preload") >= 0) {
             node.__cssStarted = true;
-            __dom_preload_link(node.__id);
+            __dom_preload_link(nodeIds.get(node));
             return;
         }
         // Other resource hints (`prefetch`/`modulepreload`/`preconnect`/
@@ -581,10 +609,10 @@
             (before.indexOf(type) < 0 || name === "href" || (name === "as" && type === "preload"));
         if (changed("stylesheet") && node.getAttribute("href")) {
             node.__cssStarted = true;
-            __dom_load_injected_stylesheet(node.__id);
+            __dom_load_injected_stylesheet(nodeIds.get(node));
         } else if (changed("preload")) {
             node.__cssStarted = true;
-            __dom_preload_link(node.__id);
+            __dom_preload_link(nodeIds.get(node));
         }
     }
 
@@ -595,7 +623,7 @@
     // an iframe directly does; no contentDocument getter or later sweep is needed.
     function maybeProcessInsertedFrames(root, parent) {
         if (!parent.isConnected) return;
-        for (const id of __dom_rendering_frames(root.__id)) {
+        for (const id of __dom_rendering_frames(nodeIds.get(root))) {
             const frame = wrap(id);
             if (!frame || !frame.isConnected || frame.ownerDocument !== root.ownerDocument) continue;
             const src = frame.getAttribute("src");
@@ -633,9 +661,9 @@
             return topNavigableName;
         }
         if (frame === realmRootFrame && cfg.parentWindow)
-            return trustOf(cfg.parentWindow).frameTargetName(frame.__id, value, write);
+            return trustOf(cfg.parentWindow).frameTargetName(nodeIds.get(frame), value, write);
         if (!frameNavigableNames.has(frame))
-            frameNavigableNames.set(frame, __dom_get_attr(frame.__id, "name") || "");
+            frameNavigableNames.set(frame, __dom_get_attr(nodeIds.get(frame), "name") || "");
         if (write) { frameNavigableNames.set(frame, value); navigableNamesRevision++; }
         return frameNavigableNames.get(frame);
     }
@@ -656,7 +684,7 @@
         focusedArea = el;
         // CSS :focus / :focus-within observe the same focused area as
         // activeElement, including inside synchronous blur/focus listeners.
-        __dom_focus(g.document.__id, el ? el.__id : -1);
+        __dom_focus(nodeIds.get(g.document), el ? nodeIds.get(el) : -1);
     }
     function viewportFocusAnchor(doc) {
         return (doc && (doc.body || doc.documentElement)) || null;
@@ -666,7 +694,7 @@
             // Focus-fixup: once the focused element leaves its document, the
             // viewport is the surviving focusable area. The activeElement
             // getter must not return a detached stale wrapper.
-            if (!focusedArea.isConnected || __dom_focus(g.document.__id) !== focusedArea.__id)
+            if (!focusedArea.isConnected || __dom_focus(nodeIds.get(g.document)) !== nodeIds.get(focusedArea))
                 setFocusedArea(null);
         }
         if (!focusedArea) return root.nodeType === 9 ? viewportFocusAnchor(root) : null;
@@ -799,13 +827,13 @@
     trust.focusPage = function (id) {
         const childFrame = nativeInputChildFrame(id);
         if (focusedChildFrame && focusedChildFrame !== childFrame) {
-            const childWindow = focusedChildFrame.__contentRealmWindow;
+            const childWindow = internalsOf(focusedChildFrame).contentRealmWindow;
             if (childWindow) trustOf(childWindow).focusPage(null);
         }
         focusedChildFrame = childFrame;
         if (childFrame) {
             focusElement(childFrame, { preventScroll: true });
-            trustOf(childFrame.__contentRealmWindow).focusPage(id);
+            trustOf(internalsOf(childFrame).contentRealmWindow).focusPage(id);
             return;
         }
         let target = id === null || id === undefined ? null : wrap(id);
@@ -823,8 +851,8 @@
         activeElementFor(g.document); // Disconnected-focus fixup.
         // HTML #currently-focused-area-of-a-top-level-browsing-context:
         // the native editor follows the innermost focused navigable.
-        if (focusedArea?.__contentRealmWindow)
-            return trustOf(focusedArea.__contentRealmWindow).focusedNode();
+        if (internalsOf(focusedArea).contentRealmWindow)
+            return trustOf(internalsOf(focusedArea).contentRealmWindow).focusedNode();
         return focusedArea ? elementIdentity(focusedArea) : null;
     };
     function baseHref() {
@@ -903,7 +931,7 @@
             record.nodeId = __dom_node_identity(target);
             record.id = record.nodeId !== null ? record.nodeId
                 : target === topWindowState.listenerTarget
-                    ? (realmRootFrame ? realmRootFrame.__id : 0) : null;
+                    ? (realmRootFrame ? nodeIds.get(realmRootFrame) : 0) : null;
         }
         const connected = record.id !== null
             && (record.nodeId === null || __dom_is_connected(record.nodeId));
@@ -1053,15 +1081,15 @@
         }
         // Replacing the active Document destroys every child navigable owned
         // by that Document before the old subtree is unlinked.
-        if (frame.__contentDoc) destroyFrameNavigablesIn(frame.__contentDoc);
-        if (frame.__contentDoc) detachListenerTarget(frame.__contentDoc);
+        if (internalsOf(frame).contentDoc) destroyFrameNavigablesIn(internalsOf(frame).contentDoc);
+        if (internalsOf(frame).contentDoc) detachListenerTarget(internalsOf(frame).contentDoc);
         const old = frameWindowStates.get(frame);
         retireWindowState(frame, old);
         installFrameWindowState(frame, createWindowState(frame));
-        trust.detachChildWindow(frame.__contentRealmWindow);
-        frame.__contentRealmWindow = undefined;
+        trust.detachChildWindow(internalsOf(frame).contentRealmWindow);
+        internalsFor(frame).contentRealmWindow = undefined;
         frame.__trustInitialAboutBlank = false;
-        frame.__contentDoc = undefined;
+        internalsFor(frame).contentDoc = undefined;
         // requestAnimationFrame is a writable Window property. A replacement
         // Window starts with the platform method rather than an override made
         // by the previous Document.
@@ -1072,7 +1100,7 @@
         frameNavigationURLs.delete(frame);
         frameBlobOrigins.delete(frame);
         let descendants = [];
-        try { descendants = frame.__contentDoc ? frame.__contentDoc.querySelectorAll("iframe, frame") : []; } catch (e) {}
+        try { descendants = internalsOf(frame).contentDoc ? internalsOf(frame).contentDoc.querySelectorAll("iframe, frame") : []; } catch (e) {}
         for (let i = descendants.length - 1; i >= 0; i--)
             destroyFrameNavigable(descendants[i]);
         const pending = frame.__trustPendingNavigationReservations;
@@ -1089,32 +1117,32 @@
         frame.__trustLoadGeneration = (frame.__trustLoadGeneration || 0) + 1;
         frame.__loadedSrc = undefined;
         frame.__loadedSrcdoc = undefined;
-        frame.__frameUrl = undefined;
-        trust.detachChildWindow(frame.__contentRealmWindow);
-        if (frame.__contentDoc) frame.__contentDoc.__destroyed = true;
+        internalsFor(frame).frameUrl = undefined;
+        trust.detachChildWindow(internalsOf(frame).contentRealmWindow);
+        if (internalsOf(frame).contentDoc) internalsOf(frame).contentDoc.__destroyed = true;
         // HTML #destroy-a-child-navigable / #discard-a-document severs the browsing-context
         // association, not the retained Document's own DOM tree. Drop the presentation edge.
-        const documentId = __dom_frame_document(frame.__id);
+        const documentId = __dom_frame_document(nodeIds.get(frame));
         if (documentId !== null) __dom_detach(documentId);
-        frame.__contentDoc = undefined;
-        frame.__contentWin = undefined;
-        frame.__contentRealmWindow = undefined;
+        internalsFor(frame).contentDoc = undefined;
+        internalsFor(frame).contentWin = undefined;
+        internalsFor(frame).contentRealmWindow = undefined;
         frame.__trustInitialAboutBlank = false;
         frame.__trustInitialLoadFired = false;
-        frame.__trustParentWindow = undefined;
-        frame.__trustTopWindow = undefined;
+        internalsFor(frame).trustParentWindow = undefined;
+        internalsFor(frame).trustTopWindow = undefined;
         frame.__trustAnimationFrameMethods = undefined;
     }
     function destroyFrameNavigableDescendantsIn(root) {
-        if (!root || typeof root.__id !== "number") return;
+        if (!root || typeof nodeIds.get(root) !== "number") return;
         // HTML's navigable destruction is an internal tree operation. Do not
         // call author-overridable querySelectorAll/contains during textContent
         // or child replacement (forms may also have named-property collisions).
-        const descendants = __dom_query(root.__id, "iframe, frame", false)[0];
+        const descendants = __dom_query(nodeIds.get(root), "iframe, frame", false)[0];
         for (const id of descendants) {
             const frame = wrap(id);
             const owner = frameOwnerForNode(frame);
-            if (!owner || !__dom_contains(root.__id, owner.__id)) destroyFrameNavigable(frame);
+            if (!owner || !__dom_contains(nodeIds.get(root), nodeIds.get(owner))) destroyFrameNavigable(frame);
         }
     }
     function destroyFrameNavigablesIn(root) {
@@ -1934,7 +1962,7 @@
     // the public Slottable.assignedSlot getter filters those below.
     function assignedSlotInternal(node) {
         if (!(node instanceof Element) && !(node instanceof Text)) return null;
-        return wrap(__dom_assigned_slot(node.__id));
+        return wrap(__dom_assigned_slot(nodeIds.get(node)));
     }
     // "Dispatch" (DOM §2.9): capture down the composed path, at-target, then
     // bubble back up when the event bubbles (or the caller forces it — the
@@ -1978,8 +2006,8 @@
         // child listener), violating DOM's per-EventTarget listener-list rule.
         const targetFrame = target instanceof Node
             ? frameOwnerForNode(target)
-            : target && target.nodeType === 9 && target.__frame
-                ? target.__frame
+            : target && target.nodeType === 9 && internalsOf(target).frame
+                ? internalsOf(target).frame
                 : trust.__activeFrame || null;
         if (target instanceof Node || (target && target.nodeType === 9)) {
             ev.__windowTargetSet = true;
@@ -2210,7 +2238,7 @@
             // Script-prepared requests own their completion independently of
             // the frontend; do not synthesize a second event from paint state.
             if (imageState(im)) continue;
-            const id = im.__id;
+            const id = nodeIds.get(im);
             if (typeof id !== "number") continue;
             let complete = false;
             try { complete = !!im.complete; } catch (e) {}
@@ -2270,12 +2298,12 @@
         if (stripFragment(g.location.href) === target) return true;
         // Walk the presentation arena here, not public DOM parentNode: a
         // nested Document is a tree root, not a child of its embedding iframe.
-        let n = wrap(__dom_parent(frame.__id));
+        let n = wrap(__dom_parent(nodeIds.get(frame)));
         while (n) {
             const ln = n.localName;
-            if ((ln === "iframe" || ln === "frame") && n.__frameUrl &&
-                stripFragment(n.__frameUrl) === target) return true;
-            n = wrap(__dom_parent(n.__id));
+            if ((ln === "iframe" || ln === "frame") && internalsOf(n).frameUrl &&
+                stripFragment(internalsOf(n).frameUrl) === target) return true;
+            n = wrap(__dom_parent(nodeIds.get(n)));
         }
         return false;
     }
@@ -2341,7 +2369,7 @@
         // child load run before the parent's iframe `load` handler begins.
         if (trust.taskQueueState) {
             const frameLoadListeners = lsFor(frame, "load");
-            trust.lastFrameLoadState = frame.__id + "/onload=" + typeof frame.onload +
+            trust.lastFrameLoadState = nodeIds.get(frame) + "/onload=" + typeof frame.onload +
                 "/listeners=" + frameLoadListeners.length + "/generation=" + generation;
         }
         __queue_dom_task(function () {
@@ -2359,7 +2387,7 @@
             // real child Realms route the element task to their owner Realm.
             const ownerTrust = realmRootFrame && cfg.parentWindow && trustOf(cfg.parentWindow);
             if (ownerTrust && ownerTrust !== trust)
-                ownerTrust.queueFrameElementLoad(frame.__id, generation);
+                ownerTrust.queueFrameElementLoad(nodeIds.get(frame), generation);
             else queueFrameElementLoad(frame, generation);
         }, realmRootFrame || frame);
     }
@@ -2384,7 +2412,7 @@
         try {
             childWindow = __dom_create_window_realm(
                 windowState.hostSettingsContext,
-                frame.__id,
+                nodeIds.get(frame),
                 frameUrl,
                 cfg,
                 g,
@@ -2408,36 +2436,36 @@
                 child.originKey = blobOrigin.originKey;
             }
         }
-        frame.__contentRealmWindow = childWindow;
-        frame.__contentDoc = childWindow.document;
+        internalsFor(frame).contentRealmWindow = childWindow;
+        internalsFor(frame).contentDoc = childWindow.document;
         rememberFrameViewport(frame, childWindow.innerWidth, childWindow.innerHeight);
         trust.attachChildWindow(childWindow, frame);
         return childWindow;
     }
     function createInitialFrameWindow(frame, fireElementLoad) {
-        if (!frame || frame.__contentRealmWindow || frame.__trustInitialAboutBlank)
-            return frame && frame.__contentRealmWindow || null;
+        if (!frame || internalsOf(frame).contentRealmWindow || frame.__trustInitialAboutBlank)
+            return frame && internalsOf(frame).contentRealmWindow || null;
 
         // HTML §7.3.2.1 creates and completely loads a populated initial
         // about:blank Document, with its own Window Realm, as part of creating
         // the iframe's child navigable. It exists before attribute navigation.
         navigableName(frame); // Snapshot the name at child-navigable creation, not at every navigation.
-        frame.__frameUrl = "about:blank";
+        internalsFor(frame).frameUrl = "about:blank";
         frameAboutBaseURLs.set(frame, nodeBaseHref(frame));
         // HTML's initial about:blank creation copies the creator Document URL.
         frameReferrers.set(frame, frame.ownerDocument.URL);
         frame.__trustReadyState = "complete";
-        const replacedRoots = frame.__contentDoc ? [frame.__contentDoc] : [];
-        if (frame.__contentDoc) detachListenerTarget(frame.__contentDoc);
-        frame.__contentDoc = undefined;
-        frame.__contentWin = undefined;
-        __dom_load_frame(frame.__id, "", nodeBaseHref(frame));
+        const replacedRoots = internalsOf(frame).contentDoc ? [internalsOf(frame).contentDoc] : [];
+        if (internalsOf(frame).contentDoc) detachListenerTarget(internalsOf(frame).contentDoc);
+        internalsFor(frame).contentDoc = undefined;
+        internalsFor(frame).contentWin = undefined;
+        __dom_load_frame(nodeIds.get(frame), "", nodeBaseHref(frame));
         for (let i = 0; i < replacedRoots.length; i++)
-            syncWrapperSubtreeRetention(replacedRoots[i].__id);
+            syncWrapperSubtreeRetention(nodeIds.get(replacedRoots[i]));
 
         const childWindow = createFrameWindowRealm(frame, "about:blank");
         if (childWindow) frame.__trustInitialAboutBlank = true;
-        else frame.__contentDoc = frameDocument(frame);
+        else internalsFor(frame).contentDoc = frameDocument(frame);
 
         // Processing missing/empty src on initial insertion runs the iframe
         // load-event steps against the already-complete initial Document.
@@ -2453,36 +2481,36 @@
         frameReferrers.set(frame, referrer);
         ftrace("loadFrameMarkup url=" + frameUrl + " markup=" + String(markup == null ? "" : markup).length);
         const initialWindow = frame.__trustInitialAboutBlank
-            ? frame.__contentRealmWindow : null;
+            ? internalsOf(frame).contentRealmWindow : null;
         const reuseInitialWindow = !!(initialWindow && trustOf(initialWindow) &&
             frameSameOrigin(frameUrl, frame));
         if (initialWindow) framesWithNonInitialDocuments.add(frame);
         if (!reuseInitialWindow) resetFrameWindowState(frame);
         frame.__trustInitialAboutBlank = false;
-        frame.__frameUrl = frameUrl;
+        internalsFor(frame).frameUrl = frameUrl;
         if (/^about:(?:blank|srcdoc)(?:[?#]|$)/.test(frameUrl)) frameAboutBaseURLs.set(frame, base);
         else frameAboutBaseURLs.delete(frame);
-        frame.__trustParentWindow = undefined;
-        frame.__trustTopWindow = undefined;
+        internalsFor(frame).trustParentWindow = undefined;
+        internalsFor(frame).trustTopWindow = undefined;
         frame.__trustReadyState = "loading";
-        const replacedRoots = frame.__contentDoc ? [frame.__contentDoc] : [];
+        const replacedRoots = internalsOf(frame).contentDoc ? [internalsOf(frame).contentDoc] : [];
         if (reuseInitialWindow) {
             for (const root of replacedRoots) destroyFrameNavigablesIn(root);
         }
-        __dom_load_frame(frame.__id, String(markup == null ? "" : markup), base,
+        __dom_load_frame(nodeIds.get(frame), String(markup == null ? "" : markup), base,
             isTextDocumentType(contentType));
         for (let i = 0; i < replacedRoots.length; i++)
-            syncWrapperSubtreeRetention(replacedRoots[i].__id);
+            syncWrapperSubtreeRetention(nodeIds.get(replacedRoots[i]));
 
         // HTML §7.5.1 reuses the initial about:blank Window for the first
         // same-origin navigation, but replaces its Document. Other
         // cross-document navigations create a fresh Window and Realm.
         if (reuseInitialWindow) {
             try {
-                if (trustOf(initialWindow).replaceInitialDocument(frame.__id, frameUrl, referrer, contentType, navigationTiming, frameAboutBaseURLs.get(frame) || null)) {
-                    frame.__contentRealmWindow = initialWindow;
-                    frame.__contentDoc = initialWindow.document;
-                    trustOf(initialWindow).finishParsedFrameLoad(frame.__id, generation);
+                if (trustOf(initialWindow).replaceInitialDocument(nodeIds.get(frame), frameUrl, referrer, contentType, navigationTiming, frameAboutBaseURLs.get(frame) || null)) {
+                    internalsFor(frame).contentRealmWindow = initialWindow;
+                    internalsFor(frame).contentDoc = initialWindow.document;
+                    trustOf(initialWindow).finishParsedFrameLoad(nodeIds.get(frame), generation);
                     return;
                 }
             } catch (e) {
@@ -2498,7 +2526,7 @@
         // fallback below.
         const childWindow = createFrameWindowRealm(frame, frameUrl, contentType, navigationTiming);
         if (childWindow) {
-            trustOf(childWindow).finishParsedFrameLoad(frame.__id, generation);
+            trustOf(childWindow).finishParsedFrameLoad(nodeIds.get(frame), generation);
             return;
         }
         finishParsedFrameLoad(frame, generation);
@@ -2524,11 +2552,11 @@
     }
 
     function finishParsedFrameLoad(frame, generation) {
-        ftrace("finishParsedFrameLoad frame=" + frame.__id);
+        ftrace("finishParsedFrameLoad frame=" + nodeIds.get(frame));
         // A cross-document navigation creates a new Document object. All
         // access paths within this navigation must subsequently return that
         // same object (Web IDL interface identity / Window.document).
-        frame.__contentDoc = frameDocument(frame);
+        internalsFor(frame).contentDoc = frameDocument(frame);
         // The native parse is atomic, but its parser-blocking scripts still
         // need to execute with readiness "loading". runFrameScripts marks
         // EOF only after those scripts and before deferred/module execution.
@@ -2568,11 +2596,11 @@
     }
     trust.finishParsedFrameLoad = function (frameId, generation) {
         frameId = Number(frameId);
-        const frame = realmRootFrame && realmRootFrame.__id === frameId
+        const frame = realmRootFrame && nodeIds.get(realmRootFrame) === frameId
             ? realmRootFrame : wrap(frameId);
         if (!frame) return false;
-        frame.__contentRealmWindow = g;
-        frame.__contentDoc = frameDocument(frame);
+        internalsFor(frame).contentRealmWindow = g;
+        internalsFor(frame).contentDoc = frameDocument(frame);
         finishParsedFrameLoad(frame, Number(generation));
         return true;
     };
@@ -2704,7 +2732,7 @@
             const token = {};
             frame.__trustNavigationToken = token;
             let pending;
-            try { pending = navigateDocumentAsync(url, sourceURL, frame.referrerPolicy || "", frame.__id); }
+            try { pending = navigateDocumentAsync(url, sourceURL, frame.referrerPolicy || "", nodeIds.get(frame)); }
             catch (e) { pending = Promise.resolve(null); }
             return pending.then(function (r) {
                 if (frame.__trustNavigationToken !== token || !frame.isConnected) return;
@@ -2713,7 +2741,7 @@
             });
         }
         let r;
-        try { r = navigateDocument(url, sourceURL, frame.referrerPolicy || "", frame.__id); } catch (e) { r = null; }
+        try { r = navigateDocument(url, sourceURL, frame.referrerPolicy || "", nodeIds.get(frame)); } catch (e) { r = null; }
         frame.__trustNavigationToken = null;
         processFrameNavigationResponse(frame, url, r, timingStart);
     }
@@ -3213,7 +3241,7 @@
             const target = document.getElementById(pt);
             if (target && target.popover !== null) {
                 const action = String(invoker.getAttribute("popovertargetaction") || "toggle").toLowerCase();
-                const open = !!POPOVER_OPEN[target.__id];
+                const open = !!POPOVER_OPEN[nodeIds.get(target)];
                 try {
                     if (action === "show") { if (!open) target.showPopover(); }
                     else if (action === "hide") { if (open) target.hidePopover(); }
@@ -3244,9 +3272,9 @@
                     dispatch(form, sev, false);
                 } finally { form.__trustFiringSubmit = false; }
                 const record = (context && context.record) || trust.keyDispatch;
-                if (record) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
+                if (record) trust.lastClickSubmit = { form: nodeIds.get(form), submitter: nodeIds.get(btn), prevented: sev.defaultPrevented };
                 if (!sev.defaultPrevented && form.isConnected && !handleDialogSubmission(form, btn) && !record)
-                    trust.queueFormSubmit(form.__id, btn.__id);
+                    trust.queueFormSubmit(nodeIds.get(form), nodeIds.get(btn));
                 return sev.defaultPrevented;
             }
         }
@@ -3256,20 +3284,20 @@
         const pending = pointerInput.click;
         if (pending) {
             if (pending.owner !== trust) {
-                const result = pending.owner.click(pending.target.__id);
+                const result = pending.owner.click(nodeIds.get(pending.target));
                 trust.lastClickSubmit = pending.owner.lastClickSubmit;
                 pending.owner.lastClickSubmit = null;
                 return result;
             }
             pointerInput.click = null;
-            id = pending.target.__id;
+            id = nodeIds.get(pending.target);
             nativePointerPosition = pending.init;
         }
         // The terminal's semantic activation command represents its user's
         // Enter action. There is no pointer sequence to synthesize in that lane.
         if (!nativePointerPosition) notifyPointerActivation();
         if (pointerLockState.target && pointerLockState.owner !== trust)
-            return pointerLockState.owner.click(pointerLockState.target.__id);
+            return pointerLockState.owner.click(nodeIds.get(pointerLockState.target));
         const target = pointerLockState.target || wrap(id);
         pointerInput.clickDefault = target ? {target,owner:trust} : null;
         if (cfg.frameTrace && target) {
@@ -3279,7 +3307,7 @@
                 path.push(node.localName + "#" + (node.id || "") + ":" +
                     (listeners ? Array.from(listeners.keys()).join(",") : ""));
             }
-            ftrace("native click realm=" + (realmRootFrame ? realmRootFrame.__id : 0) + " " + path.join(" > "));
+            ftrace("native click realm=" + (realmRootFrame ? nodeIds.get(realmRootFrame) : 0) + " " + path.join(" > "));
         }
         const handled = activateClick(target, true, true);
         if (handled) pointerInput.clickDefault = null;
@@ -3328,8 +3356,8 @@
         const t = id === null || id === undefined
             ? focusedArea || viewportFocusAnchor(g.document) : wrap(id);
         if (!t) return false;
-        if ((id === null || id === undefined) && t.__contentRealmWindow) {
-            const childTrust = trustOf(t.__contentRealmWindow);
+        if ((id === null || id === undefined) && internalsOf(t).contentRealmWindow) {
+            const childTrust = trustOf(internalsOf(t).contentRealmWindow);
             const prevented = childTrust.key(null, key, code, repeat, composing,
                 shift, ctrl, alt, meta, released, location);
             trust.lastClickSubmit = childTrust.lastClickSubmit;
@@ -3549,7 +3577,7 @@
         if (state.target && state.raw === record.raw) {
             record.owner.pointerLockResult(record.id, null);
         } else {
-            state.command = [record.id, record.target.__id, record.raw];
+            state.command = [record.id, nodeIds.get(record.target), record.raw];
         }
     }
     trust.pointerLockFailure = pointerLockFailure;
@@ -3724,7 +3752,7 @@
         const childFrame = nativeInputChildFrame(id);
         if (childFrame) {
             const rect = frameContentClientRect(childFrame);
-            const canceled = trustOf(childFrame.__contentRealmWindow).pointerButton(id, pressed,
+            const canceled = trustOf(internalsOf(childFrame).contentRealmWindow).pointerButton(id, pressed,
                 x - rect.left, y - rect.top, screenX, screenY, button, modifiers, true);
             if (pressed && !canceled) trust.focusPage(id);
             if (!pressed && !pointerInput.buttons) trust.hover(hit,x,y,screenX,screenY,modifiers,false,false);
@@ -3840,7 +3868,7 @@
         const t = childFrame || (id === null || id === undefined ? null : wrap(id));
         if (t && !childFrame) { pointerInput.document = t.ownerDocument; pointerInput.lastTarget = t; }
         function childHover(frame, target) {
-            const child = frame.__contentRealmWindow;
+            const child = internalsOf(frame).contentRealmWindow;
             if (!child) return;
             const rect = frameContentClientRect(frame);
             trustOf(child).hover(target, x - rect.left, y - rect.top, screenX, screenY, modifiers, true, motion);
@@ -3877,7 +3905,7 @@
             pageX:x+(g.scrollX||0), pageY:y+(g.scrollY||0)} : null;
         // The CSS half: the cascade's :hover chain follows the same committed
         // target (Phase B syscall; guarded so the JS half stands alone).
-        if (typeof __dom_set_hover === "function") __dom_set_hover(t ? t.__id : -1);
+        if (typeof __dom_set_hover === "function") __dom_set_hover(t ? nodeIds.get(t) : -1);
         if (childFrame) childHover(childFrame, id);
         return true;
     };
@@ -3919,7 +3947,7 @@
         // internal algorithms use the underlying platform object directly.
         const target = formElementTargets.get(form) || form;
         const root = Node.prototype.getRootNode.call(nativeDomTraversal ? form : target);
-        return Array.from(wrapQueryResults(root, __dom_query(root.__id, selector, false)))
+        return Array.from(wrapQueryResults(root, __dom_query(nodeIds.get(root), selector, false)))
             .filter(el => el.namespaceURI === HTML_NS);
     }
     function listedFormControls(form) {
@@ -4158,8 +4186,8 @@
     }
     trust.editableState = function () {
         activeElementFor(g.document);
-        if (focusedArea?.__contentRealmWindow)
-            return trustOf(focusedArea.__contentRealmWindow).editableState();
+        if (internalsOf(focusedArea).contentRealmWindow)
+            return trustOf(internalsOf(focusedArea).contentRealmWindow).editableState();
         const host = editingHostOf(focusedArea);
         if (!host || !host.isConnected) return "null";
         const model = editableModel(host);
@@ -4312,8 +4340,8 @@
     trust.editableKeyDefault = function (id, key, shift, ctrl, alt, meta) {
         if (ctrl || alt || meta) return false;
         const target = id == null ? focusedArea : wrap(id);
-        if (id == null && target?.__contentRealmWindow)
-            return trustOf(target.__contentRealmWindow).editableKeyDefault(null,key,shift,ctrl,alt,meta);
+        if (id == null && internalsOf(target).contentRealmWindow)
+            return trustOf(internalsOf(target).contentRealmWindow).editableKeyDefault(null,key,shift,ctrl,alt,meta);
         const host = editingHostOf(target);
         if (!host || !host.isConnected) return false;
         const movement = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
@@ -4333,7 +4361,7 @@
     // or selection after script changes, cancellation, or a previous input.
     trust.formEditingState = function (id) {
         const frame = nativeInputChildFrame(id);
-        if (frame) return trustOf(frame.__contentRealmWindow).formEditingState(id);
+        if (frame) return trustOf(internalsOf(frame).contentRealmWindow).formEditingState(id);
         const el = wrap(id), tag = el && htmlElementName(el);
         if (tag !== "input" && tag !== "textarea") return "null";
         const selection = controlSelection(el, false);
@@ -4345,7 +4373,7 @@
     };
     trust.formInsertText = function (id, text) {
         const frame = nativeInputChildFrame(id);
-        if (frame) return trustOf(frame.__contentRealmWindow).formInsertText(id,text);
+        if (frame) return trustOf(internalsOf(frame).contentRealmWindow).formInsertText(id,text);
         const el = wrap(id), selection = el && controlSelection(el, false);
         if (!selection || !__dom_is_connected(id)) return null;
         const value = el.localName === "textarea"
@@ -4357,7 +4385,7 @@
     };
     trust.formSet = function (id, value, checked, inputType, data, start, end, direction, composing = false) {
         const frame = nativeInputChildFrame(id);
-        if (frame) return trustOf(frame.__contentRealmWindow).formSet(id,value,checked,inputType,data,start,end,direction,composing);
+        if (frame) return trustOf(internalsOf(frame).contentRealmWindow).formSet(id,value,checked,inputType,data,start,end,direction,composing);
         const el = wrap(id);
         if (!el) return false;
         value = value === null || value === undefined ? "" : String(value);
@@ -4656,21 +4684,21 @@
                 while (c) {
                     const tag = CE.tags.get(c);
                     if (tag) {
-                        this.__id = __dom_create_element(tag, g.document.__id);
+                        nodeIds.set(this, __dom_create_element(tag, nodeIds.get(g.document)));
                         seedElementName(this, tag, HTML_NS, null);
-                        rememberElement(this, this.__id);
+                        rememberElement(this, nodeIds.get(this));
                         this.__ceUpgraded = true;
-                        rememberWrapper(this.__id, this);
+                        rememberWrapper(nodeIds.get(this), this);
                         return;
                     }
                     c = Object.getPrototypeOf(c);
                 }
             }
-            this.__id = id;
+            nodeIds.set(this, id);
         }
-        get nodeType() { return __dom_node_type(this.__id); }
+        get nodeType() { return __dom_node_type(nodeIds.get(this)); }
         get nodeName() {
-            const t = __dom_tag(this.__id);
+            const t = __dom_tag(nodeIds.get(this));
             if (t) return t.toUpperCase();
             const n = this.nodeType;
             return n === 3 ? "#text" : n === 9 ? "#document" : n === 8 ? "#comment" : n === 11 ? "#document-fragment" : "#node";
@@ -4684,23 +4712,23 @@
             if (this.nodeType === 9) return null;
             // Real child Documents now form this boundary natively. Ordinary author-created
             // children of an iframe still have that Element, not its contentDocument, as parent.
-            return wrap(__dom_parent(this.__id));
+            return wrap(__dom_parent(nodeIds.get(this)));
         }
         get parentElement() { if (nativeDomTraversal) return relativeNode(this, 1); const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
         get childNodes() { return childNodeCollection(this); }
         get children() { return childElementCollection(this); }
-        get firstChild() { if (nativeDomTraversal) return relativeNode(this, 2); const c = __dom_children(this.__id); return c.length ? wrap(c[0]) : null; }
-        get lastChild() { if (nativeDomTraversal) return relativeNode(this, 3); const c = __dom_children(this.__id); return c.length ? wrap(c[c.length - 1]) : null; }
+        get firstChild() { if (nativeDomTraversal) return relativeNode(this, 2); const c = __dom_children(nodeIds.get(this)); return c.length ? wrap(c[0]) : null; }
+        get lastChild() { if (nativeDomTraversal) return relativeNode(this, 3); const c = __dom_children(nodeIds.get(this)); return c.length ? wrap(c[c.length - 1]) : null; }
         get firstElementChild() { if (nativeDomTraversal) return relativeNode(this, 4); return this.children[0] || null; }
         get lastElementChild() { if (nativeDomTraversal) return relativeNode(this, 5); const c = this.children; return c[c.length - 1] || null; }
         get childElementCount() { if (nativeDomTraversal) return nativeDomRelative(this, 10); return this.children.length; }
-        get nextSibling() { if (nativeDomTraversal) return relativeNode(this, 6); return this.nodeType === 9 ? null : wrap(__dom_next(this.__id)); }
-        get previousSibling() { if (nativeDomTraversal) return relativeNode(this, 7); return this.nodeType === 9 ? null : wrap(__dom_prev(this.__id)); }
+        get nextSibling() { if (nativeDomTraversal) return relativeNode(this, 6); return this.nodeType === 9 ? null : wrap(__dom_next(nodeIds.get(this))); }
+        get previousSibling() { if (nativeDomTraversal) return relativeNode(this, 7); return this.nodeType === 9 ? null : wrap(__dom_prev(nodeIds.get(this))); }
         get nextElementSibling() { if (nativeDomTraversal) return relativeNode(this, 8); let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
         get previousElementSibling() { if (nativeDomTraversal) return relativeNode(this, 9); let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
         get textContent() {
             const t = this.nodeType;
-            return t === 9 || t === 10 ? null : __dom_text(this.__id);
+            return t === 9 || t === 10 ? null : __dom_text(nodeIds.get(this));
         }
         set textContent(v) {
             v = v === null || v === undefined ? "" : String(v);
@@ -4709,29 +4737,29 @@
             if (t !== 1 && t !== 11) return;
             rangesReplaceChildren(this);
             if (!MO.length) {
-                const removedRoots = __dom_children(this.__id);
+                const removedRoots = __dom_children(nodeIds.get(this));
                 for (let i = 0; i < removedRoots.length; i++)
                     destroyFrameNavigablesIn(wrap(removedRoots[i]));
-                __dom_set_text(this.__id, v);
+                __dom_set_text(nodeIds.get(this), v);
                 if (removedRoots.length || v) moEnqueue();
                 for (let i = 0; i < removedRoots.length; i++)
                     syncWrapperSubtreeRetention(removedRoots[i]);
                 slotQueueCheck(this);
                 return;
             }
-            if (t === 3 || t === 4 || t === 7 || t === 8) { const old = __dom_text(this.__id); __dom_set_text(this.__id, v); moCharData(this, old); return; }
+            if (t === 3 || t === 4 || t === 7 || t === 8) { const old = __dom_text(nodeIds.get(this)); __dom_set_text(nodeIds.get(this), v); moCharData(this, old); return; }
             // DOM string replace all: nonempty strings create a fresh Text node;
             // empty strings remove the children without adding any node.
             const removed = Array.from(this.childNodes);
             for (let i = 0; i < removed.length; i++)
                 destroyFrameNavigablesIn(removed[i]);
-            __dom_set_text(this.__id, v);
+            __dom_set_text(nodeIds.get(this), v);
             for (let i = 0; i < removed.length; i++)
-                syncWrapperSubtreeRetention(removed[i].__id);
+                syncWrapperSubtreeRetention(nodeIds.get(removed[i]));
             moChildBulk(this, removed, Array.from(this.childNodes));
             slotQueueCheck(this);
         }
-        get nodeValue() { const t = this.nodeType; return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(this.__id) : null; }
+        get nodeValue() { const t = this.nodeType; return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(nodeIds.get(this)) : null; }
         set nodeValue(v) {
             if (rangeCharacterData(this)) this.data = v == null ? "" : String(v);
         }
@@ -4754,7 +4782,7 @@
             return document && typeof document === "object" ? document : wrap(document);
         }
         get isConnected() {
-            return !!__dom_is_connected(this.__id);
+            return !!__dom_is_connected(nodeIds.get(this));
         }
         getRootNode(options = {}) {
             let root = rootOfNode(this);
@@ -4769,10 +4797,10 @@
             // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
             // (returns false, unmutated) when `c` is an inclusive ancestor.
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
-            if (!__dom_append(this.__id, c.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            if (!__dom_append(nodeIds.get(this), nodeIds.get(c))) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             rangesRemove(c, oldParent, oldIndex);
             rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
-            syncWrapperSubtreeRetention(c.__id);
+            syncWrapperSubtreeRetention(nodeIds.get(c));
             slotQueueCheck(this);
             moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
@@ -4785,12 +4813,12 @@
         insertBefore(c, ref) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of Array.from(c.childNodes)) this.insertBefore(k, ref); return c; }
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
-            const insertion = __dom_insert_before(this.__id, c.__id, ref ? ref.__id : null);
+            const insertion = __dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null);
             if (insertion === -1) throw new DOMException("The reference node is not a child of this node.", "NotFoundError");
             if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             rangesRemove(c, oldParent, oldIndex);
             rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
-            syncWrapperSubtreeRetention(c.__id);
+            syncWrapperSubtreeRetention(nodeIds.get(c));
             slotQueueCheck(this);
             moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
@@ -4808,9 +4836,9 @@
             if (c.__trustLN === "base") baseHrefCache = null;
             moChildRemove(this, c);
             if (CE.defs.size) ceDisconnect(c);
-            __dom_detach(c.__id);
+            __dom_detach(nodeIds.get(c));
             destroyFrameNavigablesIn(c);
-            syncWrapperSubtreeRetention(c.__id);
+            syncWrapperSubtreeRetention(nodeIds.get(c));
             slotQueueCheck(this);
             return c;
         }
@@ -4819,7 +4847,7 @@
             const oldParent = rangeParent(n), oldIndex = oldParent ? rangeIndex(n) : 0;
             // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
             // syscall refuses (unmutated) when `n` is an inclusive ancestor.
-            const insertion = __dom_insert_before(this.__id, n.__id, old.__id);
+            const insertion = __dom_insert_before(nodeIds.get(this), nodeIds.get(n), nodeIds.get(old));
             if (insertion === -1) throw new DOMException("The node to be replaced is not a child of this node.", "NotFoundError");
             if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             rangesRemove(n, oldParent, oldIndex);
@@ -4833,12 +4861,12 @@
             // Range changes in normative order using the pre-insertion index.
             rangesRemove(old, this, replacementIndex);
             rangesInsert(this, replacementIndex);
-            syncWrapperSubtreeRetention(n.__id);
+            syncWrapperSubtreeRetention(nodeIds.get(n));
             if (CE.defs.size) ceDisconnect(old);
             if (MO.length) moRetainTransient(this, old);
-            __dom_detach(old.__id);
+            __dom_detach(nodeIds.get(old));
             destroyFrameNavigablesIn(old);
-            syncWrapperSubtreeRetention(old.__id);
+            syncWrapperSubtreeRetention(nodeIds.get(old));
             slotQueueCheck(this);
             if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
@@ -4860,7 +4888,7 @@
         replaceWith(...ns) { this.before(...ns); this.remove(); }
         replaceChildren(...ns) { let c; while ((c = this.firstChild)) this.removeChild(c); this.append(...ns); }
         cloneNode(deep) {
-            const clone = wrap(__dom_clone(this.__id, !!deep));
+            const clone = wrap(__dom_clone(nodeIds.get(this), !!deep));
             // Cloning creates a fresh script element rather than a
             // parser-inserted one, so its force-async flag starts true.
             if (clone instanceof HTMLScriptElement) clone.__trustForceAsync = true;
@@ -4898,7 +4926,7 @@
                 if (!ac[i].isEqualNode(bc[i])) return false;
             return true;
         }
-        hasChildNodes() { return __dom_children(this.__id).length > 0; }
+        hasChildNodes() { return __dom_children(nodeIds.get(this)).length > 0; }
         // DOM §4.4: the position of `other` relative to this node, as a
         // bitmask. Was a stub returning 0 — which means "same node", so any
         // caller branching on the bits (ordered insertion, focus traversal)
@@ -4913,7 +4941,7 @@
             const a = chain(this), b = chain(other);
             if (a[a.length - 1] !== b[b.length - 1]) {
                 return 1 /* DISCONNECTED */ + 32 /* IMPLEMENTATION_SPECIFIC */
-                    + (other.__id > this.__id ? 4 /* FOLLOWING */ : 2 /* PRECEDING */);
+                    + (nodeIds.get(other) > nodeIds.get(this) ? 4 /* FOLLOWING */ : 2 /* PRECEDING */);
             }
             if (b.indexOf(this) >= 0) return 16 + 4;  // other is CONTAINED_BY this (and follows)
             if (a.indexOf(other) >= 0) return 8 + 2;  // other CONTAINS this (and precedes)
@@ -5093,8 +5121,8 @@
         return proxy;
     }
     function styleFor(el) {
-        return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(el.__id), JSON.stringify(pairs)); },
-            null, null, () => __dom_document_quirks(el.ownerDocument.__id));
+        return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(nodeIds.get(el)), JSON.stringify(pairs)); },
+            null, null, () => __dom_document_quirks(nodeIds.get(el.ownerDocument)));
     }
     g.CSSStyleDeclaration = CSSStyleDeclaration;
     g.CSSStyleProperties = CSSStyleDeclaration;
@@ -5334,13 +5362,13 @@
     // and event ordering remain the same.
     const PENDING_ELEMENT_SCROLLS = new Map();
     function queueElementScroll(el, resolve) {
-        let pending = PENDING_ELEMENT_SCROLLS.get(el.__id);
+        let pending = PENDING_ELEMENT_SCROLLS.get(nodeIds.get(el));
         if (pending) {
             if (resolve) pending.resolvers.push(resolve);
             return;
         }
         pending = { element: el, frame: trust.__activeFrame || null, resolvers: resolve ? [resolve] : [] };
-        PENDING_ELEMENT_SCROLLS.set(el.__id, pending);
+        PENDING_ELEMENT_SCROLLS.set(nodeIds.get(el), pending);
     }
     trust.runScrollSteps = function () {
         const entries = Array.from(PENDING_ELEMENT_SCROLLS.values());
@@ -5386,12 +5414,12 @@
         return parent && parent.nodeType === 1 ? parent : null;
     }
     function offsetBoxRect(element) {
-        try { return __dom_rect(element.__id, 2); }
+        try { return __dom_rect(nodeIds.get(element), 2); }
         catch (_) { return null; }
     }
     function clientBoxRect(element) {
         let rect;
-        try { rect = __dom_rect(element.__id); } catch (_) { return null; }
+        try { rect = __dom_rect(nodeIds.get(element)); } catch (_) { return null; }
         if (!rect) return null;
         const view = element.ownerDocument && element.ownerDocument.defaultView || g;
         const sx = rect[4] ? 0 : (view.scrollX || 0), sy = rect[4] ? 0 : (view.scrollY || 0);
@@ -5406,12 +5434,12 @@
         const root = document.documentElement, body = document.body;
         if (element === root || element === body) return null;
 
-        const position = offsetStyle(element.__id) & 3;
+        const position = offsetStyle(nodeIds.get(element)) & 3;
         const fixed = position === 1;
         let ancestor = flatTreeParentElement(element);
         while (ancestor && ancestor.ownerDocument === document) {
             if (offsetBoxRect(ancestor)) {
-                const flags = offsetStyle(ancestor.__id);
+                const flags = offsetStyle(nodeIds.get(ancestor));
                 if ((flags & (fixed ? 4 : 7)) ||
                     (!fixed && ancestor === body) ||
                     (!fixed && position === 0 &&
@@ -5433,7 +5461,7 @@
         // offset origin is the root's BORDER edge. Positioned bodies still
         // use their own padding edge. Transforms never enter either result.
         if (parent === document.body && parent.parentNode === document.documentElement &&
-            (offsetStyle(parent.__id) & 3) === 0) {
+            (offsetStyle(nodeIds.get(parent)) & 3) === 0) {
             const rootRect = offsetBoxRect(document.documentElement);
             if (rootRect) return Math.round(axis === "top" ? rect[1] - rootRect[1] : rect[0] - rootRect[0]);
         }
@@ -5442,9 +5470,9 @@
         // The padding edge lies inside the parent's USED border: a collapsed
         // table's is half its outer collapsed border (CSS 2.2 §17.6.2), not
         // its computed border-width. Inline boxes have no client metrics.
-        let border = __dom_scroll_get(parent.__id, axis === "top" ? 8 : 9);
+        let border = __dom_scroll_get(nodeIds.get(parent), axis === "top" ? 8 : 9);
         if (typeof border !== "number") {
-            border = parseFloat(__dom_computed(parent.__id,
+            border = parseFloat(__dom_computed(nodeIds.get(parent),
                 axis === "top" ? "border-top-width" : "border-left-width")) || 0;
         }
         return Math.round((axis === "top" ? rect[1] - parentRect[1] : rect[0] - parentRect[0]) - border);
@@ -5456,8 +5484,8 @@
         // Keeping these off Node is observable (`"querySelectorAll" in text`
         // is false) and prevents code that tests for ParentNode from treating
         // an inserted text node as an element.
-        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
-        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
+        querySelector(s) { return wrapQueryResult(__dom_query(nodeIds.get(this), String(s), true)); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(nodeIds.get(this), String(s), false)); }
         getElementsByTagName(t) {
             if (!arguments.length) throw new TypeError("getElementsByTagName requires a name");
             return tagNameCollection(this, domString(t));
@@ -5558,7 +5586,7 @@
             const c = this.__ac || (this.__ac = Object.create(null));
             const v = c[n];
             if (v !== undefined) return v;
-            return (c[n] = __dom_get_attr(this.__id, n));
+            return (c[n] = __dom_get_attr(nodeIds.get(this), n));
         }
         setAttribute(n, v) {
             n = String(n); v = String(v);
@@ -5570,7 +5598,7 @@
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             const linkOld = (lower === "rel" || lower === "href" || lower === "as") &&
                 this.localName === "link" ? this.getAttribute(n) : undefined;
-            __dom_set_attr(this.__id, n, v);
+            __dom_set_attr(nodeIds.get(this), n, v);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             // DOM §4.9.1: NamedNodeMap is a live collection. Refresh the
             // existing [SameObject] map synchronously so a caller holding
@@ -5596,7 +5624,7 @@
             n = String(n);
             const lower = n.toLowerCase();
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
-            __dom_remove_attr(this.__id, n);
+            __dom_remove_attr(nodeIds.get(this), n);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             // DOM §4.9.1 requires the same live-list behavior for removals.
             // FAST's standards-based template compiler removes marker Attrs
@@ -5613,8 +5641,8 @@
             if (this.localName === "img" && imageRelevantAttribute(lower)) updateImageData(this);
         }
         hasAttribute(n) { return this.getAttribute(n) !== null; }
-        getAttributeNames() { return __dom_attr_names(this.__id); }
-        hasAttributes() { return __dom_attr_names(this.__id).length > 0; }
+        getAttributeNames() { return __dom_attr_names(nodeIds.get(this)); }
+        hasAttributes() { return __dom_attr_names(nodeIds.get(this)).length > 0; }
         // Attr-node accessors (DOM §4.9.2). React DOM's property commit reads
         // getAttributeNode then removeAttributeNode; without them it threw
         // "undefined is not a callable (reading 'removeAttributeNode')". An Attr
@@ -5676,10 +5704,10 @@
                 }
                 list.length = 0;
             }
-            const names = __dom_attr_names(this.__id) || [];
+            const names = __dom_attr_names(nodeIds.get(this)) || [];
             for (let i = 0; i < names.length; i++) {
                 const n = names[i];
-                const v = __dom_get_attr(this.__id, n);
+                const v = __dom_get_attr(nodeIds.get(this), n);
                 const attr = {
                     name: n, localName: n, nodeName: n, namespaceURI: null,
                     prefix: null, specified: true, ownerElement: this,
@@ -5726,16 +5754,16 @@
         set slot(v) { this.setAttribute("slot", String(v)); }
         // `type`/`href`/`src` and the anchor URL components moved to their
         // owning interfaces (HTMLInputElement, HTMLAnchorElement, …) below.
-        get innerHTML() { return __dom_inner_html(this.__id); }
+        get innerHTML() { return __dom_inner_html(nodeIds.get(this)); }
         set innerHTML(v) {
             v = String(v);
             rangesReplaceChildren(this);
-            const removedRoots = __dom_children(this.__id);
+            const removedRoots = __dom_children(nodeIds.get(this));
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
             if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
             if (!MO.length) {
-                __dom_set_inner_html(this.__id, String(v));
-                if (removedRoots.length || __dom_children(this.__id).length) moEnqueue();
+                __dom_set_inner_html(nodeIds.get(this), String(v));
+                if (removedRoots.length || __dom_children(nodeIds.get(this)).length) moEnqueue();
                 syncKnownWrapperRetention(removedWrapperIds, false);
                 baseHrefCache = null;
                 if (CE.defs.size) ceScan(this);
@@ -5747,7 +5775,7 @@
                 return;
             }
             const removed = Array.from(this.childNodes);
-            __dom_set_inner_html(this.__id, String(v));
+            __dom_set_inner_html(nodeIds.get(this), String(v));
             syncKnownWrapperRetention(removedWrapperIds, false);
             baseHrefCache = null;
             moChildBulk(this, removed, Array.from(this.childNodes));
@@ -5770,10 +5798,10 @@
             const slotAssignment = init.slotAssignment === undefined ? "named" : domString(init.slotAssignment);
             if (slotAssignment !== "named" && slotAssignment !== "manual")
                 throw new TypeError("Invalid slot assignment");
-            const previous = wrap(__dom_shadow_root(this.__id));
+            const previous = wrap(__dom_shadow_root(nodeIds.get(this)));
             const removed = previous ? Array.from(previous.childNodes) : [];
-            const removedIds = previous ? snapshotRemovedWrapperSubtrees(previous, removed.map(n => n.__id)) : [];
-            const id = __dom_attach_shadow(this.__id, mode === "closed", delegatesFocus,
+            const removedIds = previous ? snapshotRemovedWrapperSubtrees(previous, removed.map(n => nodeIds.get(n))) : [];
+            const id = __dom_attach_shadow(nodeIds.get(this), mode === "closed", delegatesFocus,
                 serializable, clonable, slotAssignment === "manual");
             if (id === null) throw new DOMException("Cannot attach a shadow root", "NotSupportedError");
             const sr = wrap(id);
@@ -5797,7 +5825,7 @@
             return sr;
         }
         get shadowRoot() {
-            const root = this.__sr || wrap(__dom_shadow_root(this.__id));
+            const root = internalsOf(this).sr || wrap(__dom_shadow_root(nodeIds.get(this)));
             return root && root.__mode === "open" ? root : null;
         }
         // ElementInternals, minimally: form components construct with
@@ -5805,14 +5833,14 @@
         // form-less internals keep them booting.
         attachInternals() {
             return {
-                form: null, shadowRoot: this.__sr || null, willValidate: false,
+                form: null, shadowRoot: internalsOf(this).sr || null, willValidate: false,
                 validity: { valid: true }, validationMessage: "", labels: [],
                 states: new Set(), ariaLabel: null,
                 setFormValue() {}, setValidity() {},
                 checkValidity() { return true; }, reportValidity() { return true; },
             };
         }
-        get outerHTML() { return __dom_outer_html(this.__id); }
+        get outerHTML() { return __dom_outer_html(nodeIds.get(this)); }
         // HTML #dom-element-outerhtml setter steps: fragment-parse in the
         // parent's context and replace this element with the result. As with
         // innerHTML, the fragment parser leaves its script elements inert.
@@ -5823,13 +5851,13 @@
             if (parent.nodeType === 9)
                 throw new DOMException("Failed to set the 'outerHTML' property on 'Element': This element's parent is of type '#document'.", "NoModificationAllowedError");
             const prev = this.previousSibling, next = this.nextSibling;
-            const before = MO.length ? new Set(__dom_children(parent.__id)) : null;
+            const before = MO.length ? new Set(__dom_children(nodeIds.get(parent))) : null;
             const index = rangeIndex(this);
             // A DocumentFragment parent parses in a body context; the native
             // insertion falls back to an equivalent flow-content context.
-            __dom_insert_adjacent(this.__id, "beforebegin", v);
+            __dom_insert_adjacent(nodeIds.get(this), "beforebegin", v);
             baseHrefCache = null;
-            const added = before ? Array.from(parent.childNodes).filter((k) => !before.has(k.__id)) : [];
+            const added = before ? Array.from(parent.childNodes).filter((k) => !before.has(nodeIds.get(k))) : [];
             // DOM #concept-node-replace removes this, then inserts the
             // fragment's nodes before its next sibling, and reports one
             // record with both. The arena inserted first, so apply the Range
@@ -5840,9 +5868,9 @@
             rangesInsert(parent, index, rangeIndex(this) - index);
             if (CE.defs.size) ceDisconnect(this);
             if (MO.length) moRetainTransient(parent, this);
-            __dom_detach(this.__id);
+            __dom_detach(nodeIds.get(this));
             destroyFrameNavigablesIn(this);
-            syncWrapperSubtreeRetention(this.__id);
+            syncWrapperSubtreeRetention(nodeIds.get(this));
             slotQueueCheck(parent);
             if (MO.length && moHasChildList) moNotify({ type: "childList", target: parent, addedNodes: added,
                 removedNodes: [this], previousSibling: prev, nextSibling: next });
@@ -5860,16 +5888,16 @@
                 throw new DOMException("Failed to execute 'insertAdjacentHTML': The value provided ('" + p + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.", "SyntaxError");
             const container = (p === "beforebegin" || p === "afterend") ? this.parentNode : this;
             if (!MO.length || !container) {
-                __dom_insert_adjacent(this.__id, p, String(h));
+                __dom_insert_adjacent(nodeIds.get(this), p, String(h));
                 baseHrefCache = null;
                 if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
                 queueFrameNavigationsIn(container || this);
                 return;
             }
-            const before = new Set(Array.from(container.childNodes).map((k) => k.__id));
-            __dom_insert_adjacent(this.__id, p, String(h));
+            const before = new Set(Array.from(container.childNodes).map((k) => nodeIds.get(k)));
+            __dom_insert_adjacent(nodeIds.get(this), p, String(h));
             baseHrefCache = null;
-            const added = Array.from(container.childNodes).filter((k) => !before.has(k.__id));
+            const added = Array.from(container.childNodes).filter((k) => !before.has(nodeIds.get(k)));
             moChildBulk(container, [], added);
             if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
             queueFrameNavigationsIn(container);
@@ -5970,7 +5998,7 @@
             if (!this.__cl) this.__cl = new DOMTokenList(this);
             return this.__cl;
         }
-        matches(s) { return selectorMatchesResult(__dom_matches(this.__id, String(s))); }
+        matches(s) { return selectorMatchesResult(__dom_matches(nodeIds.get(this), String(s))); }
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }
         // HTML `HTMLElement.click()`: fire a synthetic, non-trusted `click`
@@ -6015,7 +6043,7 @@
             // no-popover attribute or a disconnected element throws). Steam's
             // tooltip re-calls showPopover on every hover tick and a throw
             // here fed its error boundary.
-            if (POPOVER_OPEN[this.__id]) return;
+            if (POPOVER_OPEN[nodeIds.get(this)]) return;
             if (!this.isConnected) throw new DOMException("Popover is not connected", "InvalidStateError");
             const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
             dispatch(this, bev, false);
@@ -6030,24 +6058,24 @@
                     }
                 }
             }
-            POPOVER_OPEN[this.__id] = this;
-            __dom_popover(this.__id, true);
+            POPOVER_OPEN[nodeIds.get(this)] = this;
+            __dom_popover(nodeIds.get(this), true);
             const self = this;
             g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: "closed", newState: "open" }), false); }, 0);
         }
         hidePopover() {
             if (this.popover === null) throw new DOMException("Element has no popover attribute", "NotSupportedError");
             // Already hidden: silent return, same validity rule as show.
-            if (!POPOVER_OPEN[this.__id]) return;
+            if (!POPOVER_OPEN[nodeIds.get(this)]) return;
             // beforetoggle open→closed is NOT cancelable (spec).
             dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
-            delete POPOVER_OPEN[this.__id];
-            __dom_popover(this.__id, false);
+            delete POPOVER_OPEN[nodeIds.get(this)];
+            __dom_popover(nodeIds.get(this), false);
             const self = this;
             g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: "open", newState: "closed" }), false); }, 0);
         }
         togglePopover(force) {
-            const open = !!POPOVER_OPEN[this.__id];
+            const open = !!POPOVER_OPEN[nodeIds.get(this)];
             if (open && (force === undefined || !force)) { this.hidePopover(); return false; }
             if (!open && (force === undefined || !!force)) { this.showPopover(); return true; }
             return open;
@@ -6132,7 +6160,7 @@
             // CSSOM View clamps against the native scrolling area, including
             // negative RTL/vertical ranges and non-scrollable overflow:clip.
             left = this.__snapInlinePosition(left, direction || 0);
-            const changed = __dom_scroll_set(this.__id, top, left);
+            const changed = __dom_scroll_set(nodeIds.get(this), top, left);
             if (!changed) return Promise.resolve();
             const self = this;
             return new Promise(function (resolve) { queueElementScroll(self, resolve); });
@@ -6165,15 +6193,15 @@
             // block, and no scroller of its own document moves a fixed-position
             // box (scrollIntoView-fixed.html). Focusing a fixed cookie banner
             // therefore must not scroll the page.
-            let position = __dom_computed(this.__id, "position");
+            let position = __dom_computed(nodeIds.get(this), "position");
             let a = this.parentNode;
             while (a && a.nodeType === 1) {
-                const flags = offsetStyle(a.__id);
+                const flags = offsetStyle(nodeIds.get(a));
                 const contains = position === "fixed" ? (flags & 4) !== 0
                     : position !== "absolute" || (flags & 7) !== 0 ||
                         a === this.ownerDocument.documentElement;
                 if (!contains) { a = a.parentNode; continue; }
-                position = __dom_computed(a.__id, "position");
+                position = __dom_computed(nodeIds.get(a), "position");
                 // A real scroll container (content taller than its viewport): the
                 // element's offset within it is its rect minus the container's
                 // (both measured at scroll 0 in the inline flow), so that offset
@@ -6193,7 +6221,7 @@
         // including in nested navigables; a missing layout box returns null.
         __rect() {
             let r = null;
-            try { r = __dom_rect(this.__id); } catch (e) { r = null; }
+            try { r = __dom_rect(nodeIds.get(this)); } catch (e) { r = null; }
             if (r) {
                 const left = r[0], top = r[1], width = r[2], height = r[3];
                 return createDOMRect(left, top, width, height);
@@ -6222,18 +6250,18 @@
         // or the owning viewport for the standards root / quirks body. It must
         // not depend on a terminal-cell or desktop-presentation round trip.
         get clientWidth() {
-            return __dom_scroll_get(this.__id, 5);
+            return __dom_scroll_get(nodeIds.get(this), 5);
         }
         get clientHeight() {
-            return __dom_scroll_get(this.__id, 4);
+            return __dom_scroll_get(nodeIds.get(this), 4);
         }
-        get clientTop() { return __dom_scroll_get(this.__id, 6); }
-        get clientLeft() { return __dom_scroll_get(this.__id, 7); }
+        get clientTop() { return __dom_scroll_get(nodeIds.get(this), 6); }
+        get clientLeft() { return __dom_scroll_get(nodeIds.get(this), 7); }
         get scrollWidth() {
-            return __dom_scroll_get(this.__id, 3);
+            return __dom_scroll_get(nodeIds.get(this), 3);
         }
         get scrollHeight() {
-            return __dom_scroll_get(this.__id, 2);
+            return __dom_scroll_get(nodeIds.get(this), 2);
         }
         // The root scroller mirrors the page scroll position (document.scrolling
         // Element === documentElement). Every other element owns a real scroll
@@ -6243,23 +6271,23 @@
         // routes to the window scroll and its frontend presentation request.
         get scrollTop() {
             if (this.localName === "html") return g.scrollY || 0;
-            return __dom_scroll_get(this.__id, 0) || 0;
+            return __dom_scroll_get(nodeIds.get(this), 0) || 0;
         }
         set scrollTop(v) {
             v = normalizedScrollNumber(v);
             if (this.localName === "html") { g.scrollTo(g.scrollX || 0, v); return; }
-            if (__dom_scroll_set(this.__id, v, this.scrollLeft)) queueElementScroll(this);
+            if (__dom_scroll_set(nodeIds.get(this), v, this.scrollLeft)) queueElementScroll(this);
         }
         get scrollLeft() {
             if (this.localName === "html") return g.scrollX || 0;
-            return __dom_scroll_get(this.__id, 1) || 0;
+            return __dom_scroll_get(nodeIds.get(this), 1) || 0;
         }
         set scrollLeft(v) {
             v = normalizedScrollNumber(v);
             if (this.localName === "html") { g.scrollTo(v, g.scrollY || 0); return; }
             const direction = v > this.scrollLeft ? 1 : (v < this.scrollLeft ? -1 : 0);
             v = this.__snapInlinePosition(v, direction);
-            if (__dom_scroll_set(this.__id, this.scrollTop, v)) queueElementScroll(this);
+            if (__dom_scroll_set(nodeIds.get(this), this.scrollTop, v)) queueElementScroll(this);
         }
     }
 
@@ -6330,7 +6358,7 @@
     }
     function loadMediaElement(element) {
         const state = mediaState(element), generation = ++state.generation;
-        rememberMediaFailure(element.__id, false);
+        rememberMediaFailure(nodeIds.get(element), false);
         // HTML media element load algorithm: discard superseded tasks, then
         // abort/empty the old resource before starting resource selection.
         if (state.network === 1 || state.network === 2)
@@ -6356,14 +6384,14 @@
                 queueMediaEvent(element, state, generation, "error", function () {
                     state.error = new MediaError(mediaErrorToken);
                     state.network = 3;
-                    rememberMediaFailure(element.__id, true);
+                    rememberMediaFailure(nodeIds.get(element), true);
                 });
             } else {
                 // Child-source failures target each source, not the media
                 // element. Exhausting candidates leaves error null.
                 for (let i = 0; i < sources.length; i++)
                     queueMediaEvent(sources[i], state, generation, "error", i === 0 ? function () {
-                        rememberMediaFailure(element.__id, true);
+                        rememberMediaFailure(nodeIds.get(element), true);
                     } : null);
                 __queue_dom_task(function () {
                     if (state.generation === generation) state.network = 3;
@@ -6819,7 +6847,7 @@
         return owner;
     }
     function canvasCall(context, op, numbers, payload) {
-        return canvasNative(canvasOwner(context).__id, op, numbers || [], payload);
+        return canvasNative(nodeIds.get(canvasOwner(context)), op, numbers || [], payload);
     }
     function canvasStyleState(context) {
         const generation = canvasCall(context,"generation");
@@ -7085,12 +7113,12 @@
             const n = canvasNumbers(Array.prototype.slice.call(arguments,1),count);
             if (!n.every(Number.isFinite)) return;
             if (image instanceof HTMLCanvasElement) {
-                const size = canvasNative(image.__id,"size",[]);
+                const size = canvasNative(nodeIds.get(image),"size",[]);
                 if (size[0] === 0 || size[1] === 0) throw new DOMException("Empty canvas image", "InvalidStateError");
             }
             if (imageRequest && imageRequest.broken) throw new DOMException("Broken image", "InvalidStateError");
             if (imageRequest && !imageRequest.current) return;
-            n.unshift(bitmap ? 0 : image.__id); canvasCall(this,"draw",n,bitmap ? bitmap.record : imageRequest ? imageRequest.current : undefined);
+            n.unshift(bitmap ? 0 : nodeIds.get(image)); canvasCall(this,"draw",n,bitmap ? bitmap.record : imageRequest ? imageRequest.current : undefined);
         }
         measureText(text) {
             canvasOwner(this);
@@ -7171,9 +7199,9 @@
     Object.defineProperty(Path2D.prototype,Symbol.toStringTag,{value:"Path2D",configurable:true});
     g.Path2D = Path2D;
     class HTMLCanvasElement extends HTMLElement {
-        get width() { return canvasNative(this.__id,"size",[])[0]; }
+        get width() { return canvasNative(nodeIds.get(this),"size",[])[0]; }
         set width(value) { this.setAttribute("width",String(value >>> 0)); }
-        get height() { return canvasNative(this.__id,"size",[])[1]; }
+        get height() { return canvasNative(nodeIds.get(this),"size",[])[1]; }
         set height(value) { this.setAttribute("height",String(value >>> 0)); }
         getContext(kind, options = undefined) {
             if (arguments.length < 1) throw new TypeError("Missing context kind");
@@ -7193,7 +7221,7 @@
             void options.desynchronized; const willReadFrequently = !!options.willReadFrequently;
             // Do not claim a wide-gamut/float backing store when unavailable.
             if (color !== "srgb" || type !== "unorm8") return null;
-            if (!canvasNative(this.__id,"init",[+alpha],canvasRealmOrigin)) return null;
+            if (!canvasNative(nodeIds.get(this),"init",[+alpha],canvasRealmOrigin)) return null;
             const context = Object.create(CanvasRenderingContext2D.prototype);
             canvasContexts.set(this,context); canvasOwners.set(context,this);
             canvasOptions.set(context,{alpha,willReadFrequently});
@@ -7201,8 +7229,8 @@
         }
         toDataURL(type = "image/png", quality = undefined) {
             `${type}`;
-            if (!canvasNative(this.__id,"clean",[])) throw new DOMException("Canvas is not origin-clean","SecurityError");
-            return canvasNative(this.__id,"url",[]);
+            if (!canvasNative(nodeIds.get(this),"clean",[])) throw new DOMException("Canvas is not origin-clean","SecurityError");
+            return canvasNative(nodeIds.get(this),"url",[]);
         }
     }
 
@@ -7496,7 +7524,7 @@
             // only when "submitted from submit() method" is false: a submit
             // handler may cancel the original action and call submit().
             if (!this.isConnected) return;
-            trust.queueFormSubmit(this.__id, null);
+            trust.queueFormSubmit(nodeIds.get(this), null);
         }
         requestSubmit(submitter) {
             const supplied = arguments.length > 0 && submitter !== undefined;
@@ -7529,7 +7557,7 @@
             }
             if (!ev.defaultPrevented) {
                 if (handleDialogSubmission(this, submitter)) return;
-                trust.queueFormSubmit(this.__id, submitter ? submitter.__id : null);
+                trust.queueFormSubmit(nodeIds.get(this), submitter ? nodeIds.get(submitter) : null);
             }
         }
     }
@@ -7638,6 +7666,8 @@
             preventExtensions() { return false; },
         });
         formElementTargets.set(proxy, target);
+        // The proxy is the form's platform object: it carries the node slot.
+        nodeIds.set(proxy, nodeIds.get(target));
         return proxy;
     }
     // HTML "update the image data" / "when to obtain images": creation and
@@ -7666,7 +7696,7 @@
         state.pending = true;
         imageMicrotask(function () {
             if (state.generation !== generation) return;
-            const source = __image_current_src(image.__id);
+            const source = __image_current_src(nodeIds.get(image));
             const hasSource = image.hasAttribute("src") || image.hasAttribute("srcset");
             if (!state.current) state.url = source;
             const finish = function (result) {
@@ -7683,13 +7713,13 @@
                 }, 0);
             };
             if (!source) finish(null);
-            else imageApply(imageThen, imageNative("load", image.__id), [finish, function () { finish(null); }]);
+            else imageApply(imageThen, imageNative("load", nodeIds.get(image)), [finish, function () { finish(null); }]);
         });
     }
     function imageNaturalDimension(image, axis) {
         const state = imageState(image);
         if (state) return state.current ? Math.floor(state.current[axis] / state.current[4]) : 0;
-        return Math.floor(imageNative("size", image.__id)[axis]);
+        return Math.floor(imageNative("size", nodeIds.get(image))[axis]);
     }
     function imageDimension(image, axis) {
         if (image.isConnected && image.getClientRects().length) {
@@ -7713,11 +7743,11 @@
         return imageNaturalDimension(image, axis);
     }
     class HTMLImageElement extends HTMLElement {
-        get currentSrc() { const state = imageState(this); return state ? state.url : __image_current_src(this.__id); }
+        get currentSrc() { const state = imageState(this); return state ? state.url : __image_current_src(nodeIds.get(this)); }
         get complete() {
             if (!this.hasAttribute("srcset") && !this.getAttribute("src")) return true;
             const state = imageState(this);
-            return state ? !state.pending && !!(state.current || state.broken) : __image_complete(this.__id);
+            return state ? !state.pending && !!(state.current || state.broken) : __image_complete(nodeIds.get(this));
         }
         get naturalWidth() { return imageNaturalDimension(this, 0); }
         get naturalHeight() { return imageNaturalDimension(this, 1); }
@@ -7756,7 +7786,7 @@
     class HTMLFrameElement extends HTMLElement {}
     // <template>.content is the inert fragment its markup parses into (read-only).
     class HTMLTemplateElement extends HTMLElement {
-        get content() { return wrap(__dom_template_content(this.__id)); }
+        get content() { return wrap(__dom_template_content(nodeIds.get(this))); }
         // HTML #dom-template-shadowRootMode is also the standard feature
         // detection surface used by declarative-shadow polyfills.
         get shadowRootMode() {
@@ -7785,7 +7815,7 @@
     // HTML #update-a-style-block removes and recreates the associated sheet
     // on child-list/connection changes, even when its source text is equal.
     function elementSheet(owner) {
-        const raw=__css_sheet(owner.__id, "");
+        const raw=__css_sheet(nodeIds.get(owner), "");
         if (raw===null) {
             if (owner.__sheet) owner.__sheet.ownerNode=null;
             owner.__sheet=null; return null;
@@ -7830,7 +7860,7 @@
         set returnValue(v) { this.__dlgReturn = v == null ? "" : String(v); }
         show() {
             if (this.hasAttribute("open")) {
-                if (!__dom_dialog_modal(this.__id)) return; // already open (non-modal): no-op
+                if (!__dom_dialog_modal(nodeIds.get(this))) return; // already open (non-modal): no-op
                 throw new DOMException("The dialog is already open as a modal dialog", "InvalidStateError");
             }
             const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
@@ -7841,7 +7871,7 @@
         }
         showModal() {
             if (this.hasAttribute("open")) {
-                if (__dom_dialog_modal(this.__id)) return;  // already open as a modal: no-op
+                if (__dom_dialog_modal(nodeIds.get(this))) return;  // already open as a modal: no-op
                 throw new DOMException("The dialog is already open", "InvalidStateError");
             }
             if (!this.isConnected) throw new DOMException("The dialog is not connected", "InvalidStateError");
@@ -7849,7 +7879,7 @@
             dispatch(this, bev, false);
             if (bev.defaultPrevented || this.hasAttribute("open")) return;
             this.setAttribute("open", "");
-            __dom_dialog_modal(this.__id, true);
+            __dom_dialog_modal(nodeIds.get(this), true);
             this.__dlgToggle("closed", "open");
         }
         close(returnValue) {
@@ -7868,7 +7898,7 @@
             dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
             if (!this.hasAttribute("open")) return;
             this.removeAttribute("open");
-            __dom_dialog_modal(this.__id, false);
+            __dom_dialog_modal(nodeIds.get(this), false);
             if (result !== null) this.__dlgReturn = result;
             const self = this;
             g.setTimeout(function () {
@@ -8329,7 +8359,7 @@
     // and the 300x150 replaced default; no box means a zero-size viewport.
     function frameViewportDimension(frame, axis) {
         let content = null;
-        try { content = __dom_rect(frame.__id, true); } catch (_) {}
+        try { content = __dom_rect(nodeIds.get(frame), true); } catch (_) {}
         return content ? (axis === "width" ? content[2] : content[3]) : 0;
     }
     function windowViewportDimension(axis) {
@@ -8342,7 +8372,7 @@
         // the used content-box origin. clientLeft/Top only include the border
         // and cannot account for authored (especially percentage) padding.
         let content = null;
-        try { content = __dom_rect(frame.__id, true); } catch (_) {}
+        try { content = __dom_rect(nodeIds.get(frame), true); } catch (_) {}
         if (!content) return new DOMRect();
         const view = frame.ownerDocument && frame.ownerDocument.defaultView || g;
         return new DOMRect(content[0] - (view.scrollX || 0),
@@ -8367,7 +8397,7 @@
         // are sampled only after that parent callback has completed.
         for (let i = 0; i < frames.length; i++) {
             const frame = frames[i];
-            if (!frame.__frameUrl) continue;
+            if (!internalsOf(frame).frameUrl) continue;
             const width = frameViewportDimension(frame, "width");
             const height = frameViewportDimension(frame, "height");
             const old = frameViewportSizes.get(frame);
@@ -8379,7 +8409,7 @@
             // child global, not in this parent Realm's scoped facade. Route
             // the resize steps through that Window when present; the
             // runInFrame path remains for the legacy single-Realm backend.
-            const childWindow = frame.__contentRealmWindow;
+            const childWindow = internalsOf(frame).contentRealmWindow;
             if (childWindow && childWindow !== g && trustOf(childWindow) &&
                 typeof trustOf(childWindow).setViewport === "function") {
                 try { trustOf(childWindow).setViewport(width, height); }
@@ -8418,24 +8448,24 @@
             get() {
                 if (!this.isConnected) return null;
                 ensureFrameProcessed(this); // load src/srcdoc if a script reads us early
-                if (this.__frameUrl && !frameSameOrigin(this.__frameUrl, this)) return null;
-                if (this.__contentRealmWindow) return this.__contentRealmWindow.document;
+                if (internalsOf(this).frameUrl && !frameSameOrigin(internalsOf(this).frameUrl, this)) return null;
+                if (internalsOf(this).contentRealmWindow) return internalsOf(this).contentRealmWindow.document;
                 return frameDocument(this);
             } });
         Object.defineProperty(Cls.prototype, "contentWindow", { configurable: true, enumerable: false,
             get() {
                 if (!this.isConnected) return null;
                 ensureFrameProcessed(this);
-                if (this.__contentRealmWindow &&
-                    (!this.__frameUrl || frameSameOrigin(this.__frameUrl, this))) {
-                    return this.__contentRealmWindow;
+                if (internalsOf(this).contentRealmWindow &&
+                    (!internalsOf(this).frameUrl || frameSameOrigin(internalsOf(this).frameUrl, this))) {
+                    return internalsOf(this).contentRealmWindow;
                 }
-                if (!this.__contentWin) {
+                if (!internalsOf(this).contentWin) {
                     const frame = this;
-                    this.__contentWin = {
+                    internalsFor(this).contentWin = {
                         get document() { return frame.contentDocument; },
                         get location() {
-                            const u = frame.__frameUrl;
+                            const u = internalsOf(frame).frameUrl;
                             const href = u && u !== "about:srcdoc" ? u : "about:blank";
                             const parsed = __url_parse(href, g.location.href);
                             return {
@@ -8453,7 +8483,7 @@
                         postMessage(message, targetOrigin, transfer) {
                             postMessageToFrame(frame, message, g,
                                 transferPorts(targetOrigin, transfer), g.location.origin,
-                                frame.__trustParentWindow || g);
+                                internalsOf(frame).trustParentWindow || g);
                         },
                         matchMedia(query) {
                             return mediaQueryListForViewport(query, function () {
@@ -8473,8 +8503,8 @@
                     // undefined → `new (undefined)()` "not a constructor". Own
                     // getters below (document/location/self/window/parent…) still
                     // shadow the global's.
-                    Object.setPrototypeOf(this.__contentWin, g);
-                    Object.defineProperties(this.__contentWin, {
+                    Object.setPrototypeOf(internalsOf(this).contentWin, g);
+                    Object.defineProperties(internalsOf(this).contentWin, {
                         innerWidth: { configurable: true, enumerable: true,
                             get() { return frameViewportDimension(frame, "width"); } },
                         innerHeight: { configurable: true, enumerable: true,
@@ -8486,9 +8516,9 @@
                     // a child global function obtained through contentWindow
                     // must keep the child's Document, Location, and scoped
                     // scheduling APIs active for the whole call.
-                    const facade = this.__contentWin;
+                    const facade = internalsOf(this).contentWin;
                     messageApply(messageWeakSet, windowMessageSlots, [facade, {
-                        resolve() { return windowMessageState(frame.__contentRealmWindow); }
+                        resolve() { return windowMessageState(internalsOf(frame).contentRealmWindow); }
                     }]);
                     // Keep this as a native operation: a JavaScript forwarding
                     // wrapper would itself become the apparent message sender.
@@ -8525,11 +8555,11 @@
                     proxy.self = proxy;
                     proxy.window = proxy;
                     messageApply(messageWeakSet, windowMessageSlots, [proxy, {
-                        resolve() { return windowMessageState(frame.__contentRealmWindow); }
+                        resolve() { return windowMessageState(internalsOf(frame).contentRealmWindow); }
                     }]);
-                    this.__contentWin = proxy;
+                    internalsFor(this).contentWin = proxy;
                 }
-                return this.__contentWin;
+                return internalsOf(this).contentWin;
             } });
     }
     installFrameSurface(HTMLIFrameElement);
@@ -8539,7 +8569,7 @@
     // `data` is [LegacyNullToEmptyString] — null becomes "" (but undefined
     // stringifies to "undefined"); `length` is the data's UTF-16 length.
     class CharacterData extends Node {
-        get data() { return __dom_text(this.__id) || ""; }
+        get data() { return __dom_text(nodeIds.get(this)) || ""; }
         // The single choke point for text/comment data changes: `data`,
         // `nodeValue`, `appendData`/`insertData`/`deleteData`/`replaceData`, and
         // Node's `textContent` (on a text node) all route here, so the
@@ -8569,7 +8599,7 @@
             if (o > d.length) throw new DOMException("offset out of bounds", "IndexSizeError");
             const c = Math.min(count >>> 0, d.length - o);
             s = String(s);
-            __dom_set_text(this.__id, d.slice(0, o) + s + d.slice(o + c));
+            __dom_set_text(nodeIds.get(this), d.slice(0, o) + s + d.slice(o + c));
             rangesReplaceData(this, o, c, s.length);
             moCharData(this, d);
         }
@@ -8685,12 +8715,12 @@
     // an inline handler that then cancels the anchor's default navigation.
     function documentLocation() {
         if (!(this instanceof Document)) throw new TypeError("Expected a Document");
-        if (this.__frame) {
-            if (this.__destroyed || __dom_frame_document(this.__frame.__id) !== this.__id ||
-                !this.__frame.isConnected || this.__frame.ownerDocument.location === null) return null;
-            return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location;
+        if (internalsOf(this).frame) {
+            if (this.__destroyed || __dom_frame_document(nodeIds.get(internalsOf(this).frame)) !== nodeIds.get(this) ||
+                !internalsOf(this).frame.isConnected || internalsOf(this).frame.ownerDocument.location === null) return null;
+            return trust.__activeFrame === internalsOf(this).frame ? g.location : internalsOf(this).frame.contentWindow.location;
         }
-        return this.__id === 0 ? g.location : null;
+        return nodeIds.get(this) === 0 ? g.location : null;
     }
     function setDocumentLocation(value) {
         if (!(this instanceof Document)) throw new TypeError("Expected a Document");
@@ -8707,7 +8737,7 @@
                 enumerable: true, configurable: false,
             });
             if (id === undefined) {
-                rememberWrapper(this.__id, this);
+                rememberWrapper(nodeIds.get(this), this);
                 documentURLs.set(this, "about:blank");
             }
         }
@@ -8743,7 +8773,7 @@
         // (hot path). A DETACHED document (a `DOMParser` result, `__id !== 0`)
         // scopes to its OWN subtree instead — `__dom_doc_element` only knows the
         // live tree's root.
-        get documentElement() { return this.__id === 0 ? wrap(__dom_doc_element()) : this.firstElementChild; }
+        get documentElement() { return nodeIds.get(this) === 0 ? wrap(__dom_doc_element()) : this.firstElementChild; }
         // The element that scrolls the viewport (CSSOM View). Standards mode ⇒
         // the document element; its scrollTop/scrollHeight/clientHeight mirror
         // the page scroll, so `document.scrollingElement.scrollTop` reads the
@@ -8753,8 +8783,8 @@
         get body() { return this.querySelector("body"); }
         get head() { return this.querySelector("head"); }
         get readyState() { return trust.readyState; }
-        get contentType() { return documentContentTypes.get(this) || __dom_document_content_type(this.__id); }
-        get compatMode() { return __dom_document_quirks(this.__id) ? "BackCompat" : "CSS1Compat"; }
+        get contentType() { return documentContentTypes.get(this) || __dom_document_content_type(nodeIds.get(this)); }
+        get compatMode() { return __dom_document_quirks(nodeIds.get(this)) ? "BackCompat" : "CSS1Compat"; }
         // CSS Font Loading Module Level 3 §4.2: a document's font source is a
         // stable FontFaceSet.  Its setlike collection is independent per
         // Document, including detached documents created by DOMParser.
@@ -8796,7 +8826,7 @@
         // it (GitHub's behaviors bundle: "Unable to get document domain").
         get domain() { return this.__domain !== undefined ? this.__domain : g.location.hostname; }
         set domain(v) { this.__domain = String(v); }
-        get defaultView() { return this.__id === 0 ? g : null; }
+        get defaultView() { return nodeIds.get(this) === 0 ? g : null; }
         // HTML Document creation: snapshot the final request referrer, or the
         // empty default for a Document without navigation request metadata.
         get referrer() { return documentReferrers.get(this) || ""; }
@@ -8834,12 +8864,12 @@
             }
             const previous = __dom_owner_document(node);
             const oldDocument = previous && typeof previous === "object" ? previous : wrap(previous);
-            const oldId = __dom_adopt(this.__id, nodeId);
+            const oldId = __dom_adopt(nodeIds.get(this), nodeId);
             if (oldId === -3) throw new TypeError("Illegal invocation");
             if (oldId === -4) throw new DOMException("The node is a document", "NotSupportedError");
             if (oldId === -5) throw new DOMException("The node is a shadow root", "HierarchyRequestError");
             if (oldId < 0) throw new TypeError("The node is not valid");
-            syncWrapperSubtreeRetention(node.__id);
+            syncWrapperSubtreeRetention(nodeIds.get(node));
             if (oldDocument !== this) ceAdopt(node, oldDocument, this);
             return node;
         }
@@ -8876,7 +8906,7 @@
                 throw new DOMException("The tag name is not a valid element local name.", "InvalidCharacterError");
             }
             const namespace = isHTML || this.contentType === "application/xhtml+xml" ? HTML_NS : null;
-            const el = newElementWrapper(__dom_create_element_ns(namespace || "", "", localName, this.__id), localName, namespace, null);
+            const el = newElementWrapper(__dom_create_element_ns(namespace || "", "", localName, nodeIds.get(this)), localName, namespace, null);
             // HTML's script-element creation steps give dynamically created
             // scripts a true force-async flag. Setting async (as an IDL or
             // content attribute) clears it; parser-created wrappers never get
@@ -8895,7 +8925,7 @@
             const extracted = validateAndExtractElementName(namespace, qualifiedName);
             const localName = extracted[2];
             const el = newElementWrapper(
-                __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName, this.__id),
+                __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName, nodeIds.get(this)),
                 localName, extracted[0], extracted[1]
             );
             if (extracted[0] === HTML_NS && localName === "script") el.__trustForceAsync = true;
@@ -8906,10 +8936,10 @@
             return el;
         }
         createTextNode(s) {
-            return wrap(__dom_create_text(s === undefined ? "" : String(s), this.__id));
+            return wrap(__dom_create_text(s === undefined ? "" : String(s), nodeIds.get(this)));
         }
         createComment(s) {
-            return wrap(__dom_create_comment(s === undefined ? "" : String(s), this.__id));
+            return wrap(__dom_create_comment(s === undefined ? "" : String(s), nodeIds.get(this)));
         }
         // A detached Attr (DOM §4.9.2): a plain object matching what the
         // `attributes` NamedNodeMap yields, so setAttributeNode can consume it.
@@ -8928,7 +8958,7 @@
         // fragment; postponing upgrade until insertion lets those own properties
         // shadow the component's reactive prototype setters forever.
         importNode(n, options) {
-            if (!n || typeof n.__id !== "number")
+            if (!n || typeof nodeIds.get(n) !== "number")
                 throw new TypeError("Failed to execute 'importNode': parameter 1 is not of type 'Node'");
             if (n.nodeType === 9 || n instanceof ShadowRoot)
                 throw new DOMException("Documents and shadow roots cannot be imported", "NotSupportedError");
@@ -8942,7 +8972,7 @@
                     throw new DOMException("Unsupported custom element registry", "NotSupportedError");
             }
             const clone = n.cloneNode(subtree);
-            if (__dom_owner_document(clone.__id) !== this.__id) this.adoptNode(clone);
+            if (__dom_owner_document(nodeIds.get(clone)) !== nodeIds.get(this)) this.adoptNode(clone);
             // `cloneNode` has completed the whole subtree now, matching the
             // clone algorithm's reaction boundary: constructors run in tree
             // order, against the complete clone, but connectedCallback waits
@@ -8953,8 +8983,8 @@
         // DOM Standard ParentNode methods. Document used to inherit these
         // from Node; keep its own implementation now that CharacterData no
         // longer exposes selector methods.
-        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
-        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
+        querySelector(s) { return wrapQueryResult(__dom_query(nodeIds.get(this), String(s), true)); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(nodeIds.get(this), String(s), false)); }
         getElementsByTagName(t) {
             if (!arguments.length) throw new TypeError("getElementsByTagName requires a name");
             return tagNameCollection(this, domString(t));
@@ -8970,13 +9000,13 @@
         createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
         createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
         createDocumentFragment() {
-            return wrap(__dom_create_fragment(this.__id));
+            return wrap(__dom_create_fragment(nodeIds.get(this)));
         }
         createRange() { return new Range(); }
         getElementById(i) {
             // `__dom_get_by_id` scans the LIVE tree; a detached parsed document
             // (`__id !== 0`) must scan its own subtree instead.
-            if (this.__id !== 0) {
+            if (nodeIds.get(this) !== 0) {
                 for (const e of this.querySelectorAll("[id]")) if (e.id === String(i)) return e;
                 return null;
             }
@@ -9015,9 +9045,9 @@
     // the Document boundary, never at the embedding iframe element.
     class FrameDocument extends Document {
         constructor(frameEl) {
-            super(__dom_frame_document(frameEl.__id));
-            cookieDocuments.set(this, [frameEl.__id, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
-            this.__frame = frameEl;
+            super(__dom_frame_document(nodeIds.get(frameEl)));
+            cookieDocuments.set(this, [nodeIds.get(frameEl), Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
+            internalsFor(this).frame = frameEl;
             const url = frameEl === realmRootFrame ? String(cfg.url) : frameURLFor(frameEl);
             documentURLs.set(this, url);
             const inheritedBase = frameEl === realmRootFrame ? cfg.aboutBaseURL : frameAboutBaseURLs.get(frameEl);
@@ -9029,7 +9059,7 @@
                 ? cfg.documentContentType || "text/html" : "text/html");
             // Sharing an arena does not share identity: this native Document is the root for
             // document-scoped operations, while __frame retains the navigable/viewport owner.
-            return rememberWrapper(this.__id, this);
+            return rememberWrapper(nodeIds.get(this), this);
         }
         // The content navigable's document element, found live in the arena.
         // Initial about:blank and navigations both install a populated native Document.
@@ -9039,7 +9069,7 @@
             // `childNodes` getter would therefore manufacture every nested
             // node wrapper with the parent's interface prototypes. Resolve
             // native ids here and wrap them in this Document's Realm instead.
-            const kids = __dom_children(this.__id).map(wrap);
+            const kids = __dom_children(nodeIds.get(this)).map(wrap);
             for (let i = 0; i < kids.length; i++) {
                 const c = kids[i];
                 if (c.nodeType === 1 && c.localName === "html") return c;
@@ -9050,9 +9080,9 @@
         get body() { return this.documentElement?.querySelector("body, frameset") || null; }
         get defaultView() {
             if (this.__destroyed) return null;
-            return trust.__activeFrame === this.__frame ? g : this.__frame.contentWindow;
+            return trust.__activeFrame === internalsOf(this).frame ? g : internalsOf(this).frame.contentWindow;
         }
-        get readyState() { return this.__frame.__trustReadyState || "complete"; }
+        get readyState() { return internalsOf(this).frame.__trustReadyState || "complete"; }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
         get URL() { return documentURLs.get(this); }
@@ -9070,7 +9100,7 @@
         open() { const b = this.body; while (b.firstChild) b.removeChild(b.firstChild); return this; }
         get currentScript() {
             const script = typeof trust.currentScript === "number" ? wrap(trust.currentScript) : null;
-            return script && frameOwnerForNode(script) === this.__frame ? script : null;
+            return script && frameOwnerForNode(script) === internalsOf(this).frame ? script : null;
         }
         write(...text) { documentWrite(this, text, false); }
         writeln(...text) { documentWrite(this, text, true); }
@@ -9116,7 +9146,7 @@
         hasFocus() { return true; }
     }
     function frameDocument(frame) {
-        return frame.__contentDoc || (frame.__contentDoc = new FrameDocument(frame));
+        return internalsOf(frame).contentDoc || (internalsFor(frame).contentDoc = new FrameDocument(frame));
     }
 
     // CSSOM View §5 `elementFromPoint()` / `elementsFromPoint()`. The native
@@ -9129,15 +9159,15 @@
         if (!Number.isFinite(x) || !Number.isFinite(y))
             throw new TypeError("coordinates must be finite doubles");
 
-        const frame = doc && doc.__frame || null;
+        const frame = doc && internalsOf(doc).frame || null;
         // DOMParser-created/detached Documents have no associated viewport.
-        if (!frame && doc.__id !== 0) return [];
+        if (!frame && nodeIds.get(doc) !== 0) return [];
         const width = frame ? frameViewportDimension(frame, "width") : windowViewportDimension("width");
         const height = frame ? frameViewportDimension(frame, "height") : windowViewportDimension("height");
         if (x < 0 || y < 0 || x > width || y > height) return [];
 
         const ids = __dom_elements_from_point(
-            frame ? frame.__id : 0, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
+            frame ? nodeIds.get(frame) : 0, x, y, +(g.scrollX || 0), +(g.scrollY || 0)
         );
         const result = [];
         for (const id of ids || []) {
@@ -9162,15 +9192,15 @@
     // but never the parent's document or arbitrary globals.
     let topFrameState = null;
     function frameOwnerForNode(node) {
-        if (node && node.nodeType === 9) return node.__frame || null;
+        if (node && node.nodeType === 9) return internalsOf(node).frame || null;
         if (!node) return null;
         // DOM #concept-shadow-including-root / HTML child navigables: owning
         // Document lookup is a native tree operation. A wrapper created in a
         // different Realm has no __host metadata for a shadow root; walking
         // those wrappers silently sent native clicks to the wrong Window.
-        const id = __dom_frame_owner(node.__id);
+        const id = __dom_frame_owner(nodeIds.get(node));
         if (id === null || id === undefined) return null;
-        return realmRootFrame && id === realmRootFrame.__id ? realmRootFrame : wrap(id);
+        return realmRootFrame && id === nodeIds.get(realmRootFrame) ? realmRootFrame : wrap(id);
     }
     // DOM dispatch and UI Events' native click/key algorithms use the hit
     // target's own EventTarget and relevant Window. Native frontends supply
@@ -9183,7 +9213,7 @@
         let frame = frameOwnerForNode(wrap(id));
         while (frame && frame !== realmRootFrame) {
             const parent = frameOwnerForNode(frame);
-            if (parent === realmRootFrame) return frame.__contentRealmWindow ? frame : null;
+            if (parent === realmRootFrame) return internalsOf(frame).contentRealmWindow ? frame : null;
             frame = parent;
         }
         return null;
@@ -9210,7 +9240,7 @@
     // async or deferred writer's scripts stay inert as before.
     const writtenScripts = [];
     trust.takeWrittenScripts = function () {
-        return writtenScripts.splice(0).map((node) => node.__id).join(",");
+        return writtenScripts.splice(0).map((node) => nodeIds.get(node)).join(",");
     };
     function prepareWrittenScripts(first, last, writer) {
         // async/defer have no effect on an inline classic writer.
@@ -9239,7 +9269,7 @@
 
         const rawCurrent = trust.currentScript;
         const script = typeof rawCurrent === "number" ? wrap(rawCurrent) : null;
-        const ownerFrame = doc instanceof FrameDocument ? doc.__frame : null;
+        const ownerFrame = doc instanceof FrameDocument ? internalsOf(doc).frame : null;
         if (script && script.localName === "script" && script.__trustForceAsync !== true &&
             frameOwnerForNode(script) === ownerFrame && script.parentNode) {
             const parent = script.parentNode;
@@ -9251,7 +9281,7 @@
             let tail = cursor;
             while (tail.nextSibling && tail.nextSibling !== sourceSuccessor)
                 tail = tail.nextSibling;
-            script.__trustWriteCursor = tail.__id;
+            script.__trustWriteCursor = nodeIds.get(tail);
             if (tail !== cursor) prepareWrittenScripts(cursor.nextSibling, tail, script);
             return;
         }
@@ -9260,7 +9290,7 @@
         if (host) host.insertAdjacentHTML("beforeend", markup);
     }
     function frameURLFor(frame) {
-        return frame && frame.__frameUrl ? String(frame.__frameUrl) : "about:blank";
+        return frame && internalsOf(frame).frameUrl ? String(internalsOf(frame).frameUrl) : "about:blank";
     }
     // HTML §2.4.3 document base URLs and DOM §4.4 Node.baseURI. Nested
     // documents share TRust's presentation arena, so select <base href> by
@@ -9289,7 +9319,7 @@
     }
     function nodeBaseHref(node) {
         const document = node && __dom_owner_document(node);
-        if (document && typeof document === "object" && document.__frame) return document.baseURI;
+        if (document && typeof document === "object" && internalsOf(document).frame) return document.baseURI;
         const owner = frameOwnerForNode(node);
         return (owner || null) === (trust.__activeFrame || null)
             ? baseHref() : documentBaseURL(owner);
@@ -9322,9 +9352,9 @@
     trust.followAnchorDefault = function (nodeId) {
         const clicked = pointerInput.clickDefault;
         if (clicked) {
-            if (clicked.owner !== trust) return clicked.owner.followAnchorDefault(clicked.target.__id);
+            if (clicked.owner !== trust) return clicked.owner.followAnchorDefault(nodeIds.get(clicked.target));
             pointerInput.clickDefault = null;
-            nodeId = clicked.target.__id;
+            nodeId = nodeIds.get(clicked.target);
         }
         let anchor = pendingClickHyperlink;
         pendingClickHyperlink = null;
@@ -9574,7 +9604,7 @@
                 // identity-preserving in this one-realm implementation, but
                 // its callback scope must move with the transfer.
                 for (const port of ports || []) {
-                    if (port && typeof port === "object") port.__frame = frame || null;
+                    if (port && typeof port === "object") internalsFor(port).frame = frame || null;
                 }
                 const ev = new MessageEvent("message", {
                     data: message, origin: origin || "", source: receiverSource || source || g,
@@ -9666,13 +9696,13 @@
             set(v) { frameLocation.assign(v); },
         });
         g.document = frameDocument(frame);
-        const topWindow = frame.__trustTopWindow || makeParentWindow(topLocation, frame,
+        const topWindow = internalsOf(frame).trustTopWindow || makeParentWindow(topLocation, frame,
             frameSameOriginWithParent(frame, topLocation), null, null);
         const parent = parentFrame
-            ? frame.__trustParentWindow || makeParentWindow(parentLocation, frame, sameOrigin, parentFrame, topWindow)
+            ? internalsOf(frame).trustParentWindow || makeParentWindow(parentLocation, frame, sameOrigin, parentFrame, topWindow)
             : topWindow;
-        frame.__trustTopWindow = topWindow;
-        frame.__trustParentWindow = parent;
+        internalsFor(frame).trustTopWindow = topWindow;
+        internalsFor(frame).trustParentWindow = parent;
         g.parent = parent; g.top = topWindow; g.frames = sameOrigin ? g : parent;
         frameElementState = frame;
         cfg.url = url;
@@ -9750,7 +9780,7 @@
         // HTML gives a child navigable its own Window Realm. Re-sweeps from
         // the embedding Document must use that Realm's link wrappers and
         // resource state, not temporarily replace the parent's globals.
-        const childWindow = frame && frame.__contentRealmWindow;
+        const childWindow = frame && internalsOf(frame).contentRealmWindow;
         if (childWindow && childWindow !== g) {
             trustOf(childWindow).loadOwnFrameStyles(done);
             return;
@@ -9814,7 +9844,7 @@
                 SCRIPTS_STARTED.add(script);
                 pendingResources++;
                 waitForFrameResource(script, function () {
-                    __dom_run_injected_script(script.__id);
+                    __dom_run_injected_script(nodeIds.get(script));
                 }, function () {
                     pendingResources--;
                     if (!active()) return;
@@ -9827,7 +9857,7 @@
                 try {
                     // ScriptEvaluation retains the Realm's global lexical
                     // environment across sibling classic script elements.
-                    __dom_run_classic_script(script.__id, script.textContent || "", g.location.href);
+                    __dom_run_classic_script(nodeIds.get(script), script.textContent || "", g.location.href);
                 } catch (e) {
                     trust.errors.push("frame script: " + ((e && e.message) || e));
                 }
@@ -9908,8 +9938,8 @@
         get nodeType() { return 11; }
         get nodeName() { return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "DocumentFragment"; }
-        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
-        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
+        querySelector(s) { return wrapQueryResult(__dom_query(nodeIds.get(this), String(s), true)); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(nodeIds.get(this), String(s), false)); }
 
 
     }
@@ -10166,14 +10196,14 @@
         get clonable() { return !!this.__clonable; }
         get slotAssignment() { return this.__slotAssignment || "named"; }
         get activeElement() { return activeElementFor(this); }
-        get innerHTML() { return __dom_inner_html(this.__id); }
+        get innerHTML() { return __dom_inner_html(nodeIds.get(this)); }
         set innerHTML(v) {
             v = String(v);
             rangesReplaceChildren(this);
-            const removedRoots = __dom_children(this.__id);
+            const removedRoots = __dom_children(nodeIds.get(this));
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
             if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
-            __dom_set_inner_html(this.__id, String(v));
+            __dom_set_inner_html(nodeIds.get(this), String(v));
             syncKnownWrapperRetention(removedWrapperIds, false);
             if (CE.defs.size) ceScan(this);
             slotQueueCheck(this);
@@ -10184,11 +10214,11 @@
             const id = String(i), nodes = this.querySelectorAll("[id]");
             // HTMLFormElement's named getter can shadow .id. ID lookup uses
             // the content attribute, not the element's JavaScript property.
-            for (const node of nodes) if (__dom_get_attr(node.__id, "id") === id) return node;
+            for (const node of nodes) if (__dom_get_attr(nodeIds.get(node), "id") === id) return node;
             return null;
         }
-        querySelector(s) { return wrapQueryResult(__dom_query(this.__id, String(s), true)); }
-        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(this.__id, String(s), false)); }
+        querySelector(s) { return wrapQueryResult(__dom_query(nodeIds.get(this), String(s), true)); }
+        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(nodeIds.get(this), String(s), false)); }
 
 
     }
@@ -10198,7 +10228,7 @@
     // relationship exactly. The optional flattening step recursively substitutes
     // nested slots and uses fallback children only when a slot has no assignment.
     function slotAssignedNodes(slot, flatten) {
-        let nodes = __dom_slot_assigned(slot.__id).map(wrap);
+        let nodes = __dom_slot_assigned(nodeIds.get(slot)).map(wrap);
         if (!flatten) return nodes;
         if (!nodes.length) nodes = Array.from(slot.childNodes);
         const result = [];
@@ -10220,7 +10250,7 @@
         const root = rootOfNode(node);
         if (root instanceof ShadowRoot) return root;
         // A light-tree mutation affects the shadow root attached to its host.
-        return node.__sr || null;
+        return internalsOf(node).sr || null;
     }
     function slotQueueCheck(node) {
         const root = slotAffectedRoot(node);
@@ -10236,7 +10266,7 @@
         const changed = [];
         for (const root of roots) {
             for (const slot of root.querySelectorAll("slot")) {
-                const signature = __dom_slot_assigned(slot.__id).join(",");
+                const signature = __dom_slot_assigned(nodeIds.get(slot)).join(",");
                 const previous = slot.__trustSlotSignature === undefined ? "" : slot.__trustSlotSignature;
                 slot.__trustSlotSignature = signature;
                 if (signature !== previous) changed.push(slot);
@@ -10279,12 +10309,12 @@
         }
     }
     function ceScan(node) {
-        if (!node || typeof node !== "object" || node.__id === undefined) return;
+        if (!node || typeof node !== "object" || nodeIds.get(node) === undefined) return;
         // Rust returns just the custom-element candidates (hyphenated tags) in
         // the inserted subtree, shadow roots included and the root itself — so
         // we wrap/visit only those, never the non-custom bulk of the subtree
         // (the old per-node JS recursion wrapped every node it walked).
-        const ids = __dom_ce_candidates(node.__id);
+        const ids = __dom_ce_candidates(nodeIds.get(node));
         for (let i = 0; i < ids.length; i++) {
             const el = wrap(ids[i]);
             const ctor = CE.defs.get(el.localName);
@@ -10296,7 +10326,7 @@
         // `__dom_ce_candidates` follows the shadow-including tree and returns
         // only custom-element candidates, matching the adoption algorithm's
         // callback walk without wrapping every ordinary descendant.
-        const ids = __dom_ce_candidates(node.__id);
+        const ids = __dom_ce_candidates(nodeIds.get(node));
         for (let i = 0; i < ids.length; i++) {
             const el = wrap(ids[i]);
             if (el.__ceUpgraded && typeof el.adoptedCallback === "function") {
@@ -10317,7 +10347,7 @@
         // JS on every define(). Only the matching elements are wrapped and
         // upgraded; the old walk materialized a wrapper + a childNodes syscall
         // for ALL ~16.8k nodes per define on a big page.
-        const ids = __dom_upgrade_candidates(g.document.__id, name);
+        const ids = __dom_upgrade_candidates(nodeIds.get(g.document), name);
         for (let i = 0; i < ids.length; i++) upgradeElement(wrap(ids[i]), ctor);
     }
     // A definition can arrive while the parser/module task is still attaching
@@ -10326,7 +10356,7 @@
     // microtask checkpoint; retry the already-upgraded candidates there so a
     // transiently-disconnected instance is not left with an empty shadow root.
     function ceConnectName(name) {
-        const ids = __dom_upgrade_candidates(g.document.__id, name);
+        const ids = __dom_upgrade_candidates(nodeIds.get(g.document), name);
         for (let i = 0; i < ids.length; i++) {
             const el = wrap(ids[i]);
             if (el.__ceUpgraded) maybeConnect(el);
@@ -10368,18 +10398,18 @@
             // the internal three-argument path below.
             this.__state = state || createCustomElementState();
             this.__windowState = windowState || null;
-            this.__frame = frame || null;
+            internalsFor(this).frame = frame || null;
         }
         __isCurrentWindowRegistry() {
             if (!this.__windowState) return false;
-            const current = this.__frame
-                ? frameWindowStates.get(this.__frame)
+            const current = internalsOf(this).frame
+                ? frameWindowStates.get(internalsOf(this).frame)
                 : topWindowState;
             return current === this.__windowState;
         }
         __withAssociatedDocument(callback) {
             if (!this.__isCurrentWindowRegistry()) return;
-            runInFrame(this.__frame, callback);
+            runInFrame(internalsOf(this).frame, callback);
         }
         define(name, ctor) {
             name = String(name);
@@ -10467,7 +10497,7 @@
             if (index > array.length) return false;
             const sheet = validType(value);
             const doc = scope.ownerDocument || scope;
-            if (!sheet.__constructed || sheet.__constructorDocument !== doc.__id)
+            if (!sheet.__constructed || sheet.__constructorDocument !== nodeIds.get(doc))
                 throw new DOMException("Stylesheet belongs to another document or is not constructed", "NotAllowedError");
             array[index] = sheet; adoptedSync(scope); return true;
         };
@@ -10511,7 +10541,7 @@
         for (const s of scope.__adopted || []) {
             if (s) sheets.push([s.__appliedText || "", s.__baseURL || scope.baseURI || g.document.baseURI]);
         }
-        cssOp("adopted-sheets", String(scope.__id), JSON.stringify(sheets));
+        cssOp("adopted-sheets", String(nodeIds.get(scope)), JSON.stringify(sheets));
     };
     const sheetSync = (sheet) => {
         for (const reference of adoptedScopes) {
@@ -10533,7 +10563,7 @@
     // constructed sheet's constructor document.
     function sheetQuirks(sheet) {
         const document = sheet?.ownerNode ? sheet.ownerNode.ownerDocument : sheet?.__constructorDocumentObject;
-        return !!document && __dom_document_quirks(document.__id);
+        return !!document && __dom_document_quirks(nodeIds.get(document));
     }
     // Split stylesheet text into its top-level rules (string/comment/brace
     // aware), so a CSSStyleSheet can model insertRule/deleteRule by index and
@@ -10826,7 +10856,7 @@
     class CSSStyleSheet {
         constructor(options = {}) {
             this.__children = []; this.__list = new CSSRuleList(this.__children);
-            this.__constructorDocument = g.document.__id;
+            this.__constructorDocument = nodeIds.get(g.document);
             // CSSOM's constructor document is an associated Document, not merely an arena
             // number. A surviving sheet keeps this Document across Window reuse/navigation.
             this.__constructorDocumentObject = g.document;
@@ -10895,7 +10925,7 @@
             this.__serializedText = undefined;
             if (this.ownerNode) {
                 const owner=this.ownerNode;
-                if (owner.sheet===this) __css_sheet(owner.__id, JSON.stringify([this.__text, this.media.mediaText, this.disabled]));
+                if (owner.sheet===this) __css_sheet(nodeIds.get(owner), JSON.stringify([this.__text, this.media.mediaText, this.disabled]));
             } else sheetSync(this);
         }
         get [Symbol.toStringTag]() { return "CSSStyleSheet"; }
@@ -10955,7 +10985,7 @@
         get [Symbol.toStringTag]() { return "CDATASection"; }
     }
     class ProcessingInstruction extends CharacterData {
-        get target() { return __dom_pi_target(this.__id); }
+        get target() { return __dom_pi_target(nodeIds.get(this)); }
         get nodeType() { return 7; }
         get nodeName() { return this.target; }
         get [Symbol.toStringTag]() { return "ProcessingInstruction"; }
@@ -11162,8 +11192,8 @@
                 CHILD_NODE_COLLECTIONS.set(root, target);
                 return target;
             }
-            list = makeStaticNodeList(__dom_children(root.__id), __dom_epoch(), undefined,
-                () => __dom_children(root.__id));
+            list = makeStaticNodeList(__dom_children(nodeIds.get(root)), __dom_epoch(), undefined,
+                () => __dom_children(nodeIds.get(root)));
             CHILD_NODE_COLLECTIONS.set(root, list);
         }
         return list;
@@ -11199,7 +11229,7 @@
         return makeHTMLCollection(() => {
             const current = __dom_epoch();
             if (epoch !== current) {
-                const result = __dom_elements_by_tag(root.__id, name, namespace);
+                const result = __dom_elements_by_tag(nodeIds.get(root), name, namespace);
                 list = makeStaticNodeList(result[0], result[1], result[2]);
                 epoch = result[1];
             }
@@ -11213,7 +11243,7 @@
         return makeHTMLCollection(() => {
             const current = __dom_epoch();
             if (epoch !== current) {
-                const result = __dom_elements_by_class(root.__id, names, root.nodeType === 9);
+                const result = __dom_elements_by_class(nodeIds.get(root), names, root.nodeType === 9);
                 list = makeStaticNodeList(result[0], result[1], result[2]);
                 epoch = result[1];
             }
@@ -11232,8 +11262,8 @@
         if (name === "") return null;
         for (const element of list) {
             // A form's named getter can shadow .id and .getAttribute.
-            if (__dom_get_attr(element.__id, "id") === name ||
-                (element.__trustNS === HTML_NS && __dom_get_attr(element.__id, "name") === name))
+            if (__dom_get_attr(nodeIds.get(element), "id") === name ||
+                (element.__trustNS === HTML_NS && __dom_get_attr(nodeIds.get(element), "name") === name))
                 return element;
         }
         return null;
@@ -11309,8 +11339,8 @@
                 const list = resolve(), keys = [];
                 for (let i = 0; i < list.length; i++) keys.push(String(i));
                 for (const element of list) {
-                    const names = [__dom_get_attr(element.__id, "id")];
-                    if (element.__trustNS === HTML_NS) names.push(__dom_get_attr(element.__id, "name"));
+                    const names = [__dom_get_attr(nodeIds.get(element), "id")];
+                    if (element.__trustNS === HTML_NS) names.push(__dom_get_attr(nodeIds.get(element), "name"));
                     for (const name of names) {
                         if (name && nodeListArrayIndex(name) < 0 && !Reflect.has(t, name) && !keys.includes(name)) keys.push(name);
                     }
@@ -11981,7 +12011,7 @@
     g.DOMTokenList = DOMTokenList;
     g.DOMStringMap = DOMStringMap;
     g.document = realmRootFrame ? frameDocument(realmRootFrame) : wrap(0);
-    cookieDocuments.set(g.document, [realmRootFrame ? realmRootFrame.__id : 0, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
+    cookieDocuments.set(g.document, [realmRootFrame ? nodeIds.get(realmRootFrame) : 0, Number(cfg.hostSettingsContext) || 0, !!cfg.cookieOpaque, String(cfg.url)]);
     pointerDefine(Element.prototype, "requestPointerLock", {
         value:requestPointerLock, writable:true, enumerable:true, configurable:true,
     });
@@ -12097,16 +12127,16 @@
             __queue_dom_task(() => fireHashChange(old, url));
     };
     trust.replaceInitialDocument = function (frameId, url, referrer = "", contentType = "text/html", navigationTiming = null, aboutBaseURL = null) {
-        if (!realmRootFrame || Number(frameId) !== realmRootFrame.__id)
+        if (!realmRootFrame || Number(frameId) !== nodeIds.get(realmRootFrame))
             return false;
         // HTML §7.5.1's one Window-to-two-Documents exception: a first
         // same-origin navigation reuses the initial about:blank Window and
         // Realm, while installing a distinct active Document and updating the
         // existing Location object's URL state.
-        if (realmRootFrame.__contentDoc)
-            detachListenerTarget(realmRootFrame.__contentDoc);
-        realmRootFrame.__contentDoc = new FrameDocument(realmRootFrame);
-        g.document = realmRootFrame.__contentDoc;
+        if (internalsOf(realmRootFrame).contentDoc)
+            detachListenerTarget(internalsOf(realmRootFrame).contentDoc);
+        internalsFor(realmRootFrame).contentDoc = new FrameDocument(realmRootFrame);
+        g.document = internalsOf(realmRootFrame).contentDoc;
         documentReferrers.set(g.document, referrer);
         documentContentTypes.set(g.document, contentType);
         cfg.url = String(url);
@@ -12226,7 +12256,7 @@
         // no-navigation path. Capture the disposition before consuming it.
         if (!trust.navigation) return null;
         const result = [trust.navigation, trust.navigationReload ? 'reload' :
-            trust.navigationReplace ? 'replace' : 'navigate', realmRootFrame ? realmRootFrame.__id : 0,
+            trust.navigationReplace ? 'replace' : 'navigate', realmRootFrame ? nodeIds.get(realmRootFrame) : 0,
             trust.navigationSourceBase || baseHref(), trust.navigationSourceURL || g.document.URL];
         trust.navigation = null; trust.navigationReplace = false; trust.navigationReload = false;
         return result;
@@ -12303,7 +12333,7 @@
         if (epoch === namedEpoch && namedRevision === navigableNamesRevision && namedDocument === doc) return;
         const treeEpoch = __dom_window_names_epoch();
         const records = treeEpoch === namedTreeEpoch && namedDocument === doc ? namedRecords :
-            doc ? __dom_window_named_items(doc.__id) : [];
+            doc ? __dom_window_named_items(nodeIds.get(doc)) : [];
         let changed = namedDocument !== doc || records.length !== namedRecords.length;
         if (!changed && records !== namedRecords) {
             for (let i = 0; i < records.length; i++) {
@@ -12315,7 +12345,7 @@
         if (changed) {
             namedRecords = records;
             namedElements = new Map(); windowFrames = [];
-            const connected = !!doc && __dom_is_connected(doc.__id);
+            const connected = !!doc && __dom_is_connected(nodeIds.get(doc));
             for (let i = 0; i < records.length; i += 4) {
                 // Supported names are native element identities. HTML's
                 // named getter only needs a wrapper for the name actually
@@ -12350,7 +12380,7 @@
                 // container's name attribute. A child-chosen name alone must
                 // not expose it. See https://github.com/whatwg/html/issues/12663.
                 if (frameSameOrigin(frameURLFor(element), element) ||
-                    __dom_get_attr(element.__id, 'name') === name) namedFrames.set(name, element);
+                    __dom_get_attr(nodeIds.get(element), 'name') === name) namedFrames.set(name, element);
             }
         }
     }
@@ -12878,7 +12908,7 @@
         clone(value) { return messageDeserialize(messageSerialize(value, true)); },
         commit(parsed, replace) {
             setLocParts(parsed);
-            if (realmRootFrame) realmRootFrame.__frameUrl = parsed[0];
+            if (realmRootFrame) internalsFor(realmRootFrame).frameUrl = parsed[0];
             trust.historyUpdates.push({ url: parsed[0], replace: !!replace });
         },
     });
@@ -12999,7 +13029,7 @@
             const name = domString(rawName);
             const rawSyntax = d.syntax;
             const syntax = rawSyntax === undefined ? "*" : domString(rawSyntax);
-            const error = cssOp("register-property", String(g.document.__id),
+            const error = cssOp("register-property", String(nodeIds.get(g.document)),
                 JSON.stringify([name, syntax, inherits, initialValue, g.document.baseURI]));
             if (error) throw new DOMException("Invalid custom property registration: " + name, error);
         },
@@ -13038,7 +13068,7 @@
         trust.setScroll(x, y);
         if (oldX === g.scrollX && oldY === g.scrollY) return Promise.resolve();
         const frame = trust.__activeFrame || realmRootFrame;
-        if (frame) __dom_scroll_set(frame.__id, g.scrollY, g.scrollX);
+        if (frame) __dom_scroll_set(nodeIds.get(frame), g.scrollY, g.scrollX);
         else viewportScrollRequest = [g.scrollX, g.scrollY];
         return new Promise(resolve => queueElementScroll(g.document, resolve));
     }
@@ -13113,14 +13143,14 @@
         return rangeCharacterData(node) ? node.data.length : node.childNodes.length;
     }
     function rangeSame(a,b) {
-        return a === b || !!(a && b && a.__id === b.__id && a.nodeType === b.nodeType);
+        return a === b || !!(a && b && nodeIds.get(a) === nodeIds.get(b) && a.nodeType === b.nodeType);
     }
     function rangeParent(node) {
         if (nativeDomTraversal) return relativeNode(node, 0);
         if (node.nodeType === 9) return null;
-        const parent = wrap(__dom_parent(node.__id));
+        const parent = wrap(__dom_parent(nodeIds.get(node)));
         return parent && (parent.__trustLN === "iframe" || parent.__trustLN === "frame") &&
-            parent.__contentDoc ? parent.__contentDoc : parent;
+            internalsOf(parent).contentDoc ? internalsOf(parent).contentDoc : parent;
     }
     function rangeContains(parent,node) {
         for (; node; node = rangeParent(node)) if (rangeSame(parent,node)) return true;
@@ -13129,7 +13159,7 @@
     function rangeIndex(node) {
         if (nativeDomTraversal) return nativeDomRelative(node, 11);
         const parent = rangeParent(node);
-        return parent ? __dom_children(parent.__id).indexOf(node.__id) : -1;
+        return parent ? __dom_children(nodeIds.get(parent)).indexOf(nodeIds.get(node)) : -1;
     }
     function rangeOrder(a, ao, b, bo) {
         if (a === b) return Math.sign(ao - bo);
@@ -13447,7 +13477,7 @@
     function moIsAncestor(anc, node) {
         // anc strictly contains node? Direct-target matches are handled by the
         // `t === target` test; this is only consulted for subtree observers.
-        return !!(node && __dom_contains(anc.__id, node.__id));
+        return !!(node && __dom_contains(nodeIds.get(anc), nodeIds.get(node)));
     }
 
     // Queue `rec` to every interested observer. `rec.type` is one of
@@ -13457,8 +13487,8 @@
         // DOM #queue-a-mutation-record visits inclusive ancestors, then each
         // node's registrations. Creation order of observers is not delivery
         // order. Snapshot IDs without materializing ancestor wrappers.
-        const ancestors = [rec.target.__id];
-        for (let id = __dom_parent(rec.target.__id); id !== null; id = __dom_parent(id))
+        const ancestors = [nodeIds.get(rec.target)];
+        for (let id = __dom_parent(nodeIds.get(rec.target)); id !== null; id = __dom_parent(id))
             ancestors.push(id);
         const interested = [];
         // Deferred sibling capture: an insert/remove passes `__sib` (the node)
@@ -13504,8 +13534,8 @@
             if (rec.__sib !== undefined && !sibDone) {
                 sibDone = true;
                 const s = rec.__sib;
-                prevSib = s ? wrap(__dom_prev(s.__id)) : null;
-                nextSib = s ? wrap(__dom_next(s.__id)) : null;
+                prevSib = s ? wrap(__dom_prev(nodeIds.get(s))) : null;
+                nextSib = s ? wrap(__dom_next(nodeIds.get(s))) : null;
             }
             o.__records.push({
                 type: rec.type,
@@ -13572,7 +13602,7 @@
             for (let j = 0; j < length; j++) {
                 const source = regs[j], target = source.target.deref();
                 if (!source.subtree || !target || !(target === parent || moIsAncestor(target, parent))) continue;
-                regs.push(Object.assign({}, source, {target: new WeakRef(removed), id: removed.__id,
+                regs.push(Object.assign({}, source, {target: new WeakRef(removed), id: nodeIds.get(removed),
                     source, order: ++moRegistrationSequence}));
                 added = true;
             }
@@ -13593,7 +13623,7 @@
             moFinalizer.register(this, this.__reference);
         }
         observe(target, options) {
-            if (!target || typeof target.__id !== "number")
+            if (!target || typeof nodeIds.get(target) !== "number")
                 throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'");
             options = options || {};
             let attributes = options.attributes;
@@ -13617,7 +13647,7 @@
                 throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
             // Re-observing the same node REPLACES its options (spec). Records
             // already queued for this observer survive (not the registration).
-            const reg = { target: new WeakRef(target), id: target.__id, order: ++moRegistrationSequence,
+            const reg = { target: new WeakRef(target), id: nodeIds.get(target), order: ++moRegistrationSequence,
                 childList, attributes, characterData, subtree,
                 attributeOldValue, characterDataOldValue, attributeFilter };
             let replaced = false;
@@ -13780,7 +13810,7 @@
                 if (!(required[i] in init))
                     throw new TypeError("Failed to construct 'IntersectionObserverEntry': required member '" + required[i] + "' is undefined");
             }
-            if (!init.target || typeof init.target.__id !== "number")
+            if (!init.target || typeof nodeIds.get(init.target) !== "number")
                 throw new TypeError("Failed to construct 'IntersectionObserverEntry': target is not an Element");
             Object.defineProperty(this, "__entry", { value: Object.freeze({
                 time: Number(init.time),
@@ -13856,7 +13886,7 @@
             for (let ti = 0; ti < targets.length; ti++) {
                 const rec = targets[ti];
                 let dr = null;
-                try { dr = __dom_rect(rec.el.__id); } catch (e) { dr = null; }
+                try { dr = __dom_rect(nodeIds.get(rec.el)); } catch (e) { dr = null; }
                 // dr = [left, top, width, height] (document coords), or null only
                 // when the target has NO laid-out box (display:none / detached) ⇒
                 // honestly NOT intersecting. Every real element — including an
@@ -13990,9 +14020,9 @@
     trust.intersectionState = function () {
         return { initial: ioInitialUpdatePending, taskQueued: ioTaskQueued,
             tasks: intersectionTasks.length, notify: ioNotify.length,
-            observers: IO.map(o => ({rootMargin:o.rootMargin, root:o.root && o.root.__id,
+            observers: IO.map(o => ({rootMargin:o.rootMargin, root:o.root && nodeIds.get(o.root),
                 pending:o.__queuedEntries.length, targets:o.__targets.map(t => ({
-                    node:t.el.__id, id:t.el.id, index:t.lastIndex, intersecting:t.lastIx
+                    node:nodeIds.get(t.el), id:t.el.id, index:t.lastIndex, intersecting:t.lastIx
                 }))})) };
     };
     g.ResizeObserver = class {
@@ -14607,7 +14637,7 @@
         },
         apiBaseURL() { return documentBaseURL(realmRootFrame); },
         documentURL() { return g.document.URL; },
-        frameId: realmRootFrame ? realmRootFrame.__id : 0,
+        frameId: realmRootFrame ? nodeIds.get(realmRootFrame) : 0,
         origin: inheritedMessageState ? inheritedMessageState.origin : messageOrigin,
         originKey: inheritedMessageState ? inheritedMessageState.originKey
             : messageOrigin === "null" ? Symbol() : messageOrigin,
@@ -14623,8 +14653,8 @@
             __queue_message_task(function () {
                 if (cfg.frameTrace) ftrace("postMessage deliver from=" + origin + " to=" + messageWindowState.origin +
                     " target=" + String(targetOrigin) + " bytes=" + wire.length +
-                    " frame=" + (frame ? frame.__id : 0) +
-                    " realm=" + (realmRootFrame ? realmRootFrame.__id : 0));
+                    " frame=" + (frame ? nodeIds.get(frame) : 0) +
+                    " realm=" + (realmRootFrame ? nodeIds.get(realmRootFrame) : 0));
                 if (targetOrigin !== "*" && targetOrigin !== messageWindowState.originKey) {
                     if (traceChallengeMessage) traceChallengeMessage("drop-origin", wire, origin,
                         messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
@@ -16804,10 +16834,11 @@
         __cacheSave(id, records);
     }
 
+    const cacheIds = privateSlots();
     class Cache {
         constructor(token, id) {
             if (token !== __cacheToken) throw new TypeError("Illegal constructor");
-            this.__id = id;
+            cacheIds.set(this, id);
         }
         match(request, options) {
             if (arguments.length === 0) return Promise.reject(new TypeError("Cache.match requires a request"));
@@ -16819,7 +16850,7 @@
                 const query = omitted ? null : __cacheRequestRecord(__cacheRequest(request));
                 if (query !== null && query.method !== "GET" && !(options && options.ignoreMethod))
                     return Promise.resolve(Object.freeze([]));
-                const records = __cacheLoad(this.__id);
+                const records = __cacheLoad(cacheIds.get(this));
                 const responses = [];
                 for (let index = 0; index < records.length; index++) {
                     if (query === null || __cacheMatches(query, records[index], options))
@@ -16851,7 +16882,7 @@
                 }
                 return Promise.all(responses.map((response, index) =>
                     __cacheResponseRecord(list[index], response)));
-            }).then((records) => { __cacheCommit(this.__id, records); return undefined; });
+            }).then((records) => { __cacheCommit(cacheIds.get(this), records); return undefined; });
         }
         put(request, response) {
             if (arguments.length < 2) return Promise.reject(new TypeError("Cache.put requires a request and response"));
@@ -16859,7 +16890,7 @@
             try { normalized = __cacheRequest(request); }
             catch (error) { return Promise.reject(error); }
             return __cacheResponseRecord(normalized, response).then((record) => {
-                __cacheCommit(this.__id, [record]);
+                __cacheCommit(cacheIds.get(this), [record]);
                 return undefined;
             });
         }
@@ -16869,10 +16900,10 @@
                 const query = __cacheRequestRecord(__cacheRequest(request));
                 if (query.method !== "GET" && !(options && options.ignoreMethod))
                     return Promise.resolve(false);
-                const records = __cacheLoad(this.__id);
+                const records = __cacheLoad(cacheIds.get(this));
                 const kept = records.filter((record) => !__cacheMatches(query, record, options));
                 if (kept.length === records.length) return Promise.resolve(false);
-                __cacheSave(this.__id, kept);
+                __cacheSave(cacheIds.get(this), kept);
                 return Promise.resolve(true);
             } catch (error) { return Promise.reject(error); }
         }
@@ -16882,7 +16913,7 @@
                 const query = omitted ? null : __cacheRequestRecord(__cacheRequest(request));
                 if (query !== null && query.method !== "GET" && !(options && options.ignoreMethod))
                     return Promise.resolve(Object.freeze([]));
-                const records = __cacheLoad(this.__id);
+                const records = __cacheLoad(cacheIds.get(this));
                 const requests = [];
                 for (let index = 0; index < records.length; index++) {
                     const record = records[index];
@@ -18468,7 +18499,7 @@
             let handler;
             try { handler = Function.prototype.toString.call(entry.fn); }
             catch (_) { handler = entry.fn && entry.fn.name || "<unknown>"; }
-            return (entry.frame && entry.frame.__id || "top") + ":" +
+            return (entry.frame && nodeIds.get(entry.frame) || "top") + ":" +
                 String(handler).replace(/\s+/g, " ").slice(0, 64);
         }).join("|");
         const childSamples = [];
@@ -18535,6 +18566,7 @@
     // what lets a websocket-enabled app (Open WebUI) stream chat tokens back —
     // the page's own socket.io-client runs the protocol over these frames.
     const WS_REGISTRY = {};
+    const socketIds = privateSlots();
     class WebSocket extends EventTarget {
         constructor(url, protocols) {
             super();
@@ -18567,8 +18599,8 @@
             this.extensions = "";
             this.protocol = "";
             this.__binaryType = "blob";
-            this.__id = __ws_open(this.url, protocolList.join(","));
-            if (this.__id < 0) {
+            socketIds.set(this, __ws_open(this.url, protocolList.join(",")));
+            if (socketIds.get(this) < 0) {
                 // Synchronous open failure (bad URL / blocked / no net grant):
                 // a browser still reports it asynchronously as error + close.
                 const self = this;
@@ -18578,7 +18610,7 @@
                     self.__fire("close", { code: 1006, reason: "", wasClean: false });
                 }, 0);
             } else {
-                WS_REGISTRY[this.__id] = this;
+                WS_REGISTRY[socketIds.get(this)] = this;
             }
         }
         get CONNECTING() { return 0; } get OPEN() { return 1; }
@@ -18610,7 +18642,7 @@
                 }
             }
             this.bufferedAmount += byteLength;
-            if (this.readyState === 1) __ws_send(this.__id, wire, binary);
+            if (this.readyState === 1) __ws_send(socketIds.get(this), wire, binary);
         }
         close(code, reason) {
             if (code !== undefined) {
@@ -18626,7 +18658,7 @@
             }
             if (this.readyState >= 2) return;
             this.readyState = 2; // CLOSING
-            __ws_close(this.__id, code === undefined ? 0 : code, reason);
+            __ws_close(socketIds.get(this), code === undefined ? 0 : code, reason);
         }
         __fire(type, init) {
             let ev;
@@ -19210,6 +19242,7 @@
     // wire strings. Worker→page events arrive via `trust.workerMessage/Error`
     // (the actor dispatches them like a click). Mirrors the WebSocket class.
     trust.workers = {};
+    const workerIds = privateSlots();
     class Worker extends EventTarget {
         constructor(url, options) {
             super();
@@ -19234,19 +19267,19 @@
                 const entry = __resolveBlobURL(href);
                 if (entry) blobSource = entry.bytes;
             }
-            this.__id = __worker_spawn(href, type, name, blobSource);
-            if (this.__id > 0) trust.workers[this.__id] = this;
+            workerIds.set(this, __worker_spawn(href, type, name, blobSource));
+            if (workerIds.get(this) > 0) trust.workers[workerIds.get(this)] = this;
         }
         postMessage(message, options) {
             if (arguments.length === 0) throw new TypeError("Worker.postMessage requires a message");
             const packet = serializeMessage(message, portAPI.optionsTransfer(options));
-            if (this.__id > 0) __worker_post(this.__id, JSON.stringify(packet));
+            if (workerIds.get(this) > 0) __worker_post(workerIds.get(this), JSON.stringify(packet));
         }
         terminate() {
-            if (this.__id > 0) {
-                __worker_terminate(this.__id);
-                delete trust.workers[this.__id];
-                this.__id = -1;
+            if (workerIds.get(this) > 0) {
+                __worker_terminate(workerIds.get(this));
+                delete trust.workers[workerIds.get(this)];
+                workerIds.set(this, -1);
             }
         }
         __fire(type, ev) { dispatch(this, ev, false); }
@@ -19271,7 +19304,7 @@
         // HTML #worker-processing-model: once the agent and its queued replies
         // have finished, the host must not retain its wrapper/listener closures.
         const w = trust.workers[id];
-        if (w) w.__id = -1;
+        if (w) workerIds.set(w, -1);
         delete trust.workers[id];
     };
 
@@ -19681,7 +19714,7 @@
         send(body) {
             this.__aborted = false;
             this.__inFlight = true;
-            this.__frame = trust.__activeFrame || null;
+            internalsFor(this).frame = trust.__activeFrame || null;
             // Async requests fire `loadstart` synchronously from send() (XHR
             // §the send() method; a SYNC request deliberately doesn't), and an
             // armed `timeout` runs the timeout request-error steps if the
@@ -19708,7 +19741,7 @@
                 const arr = dp ? [200, dp.ctype || null, dp.text, dp.bytes] : null;
                 const xhr = this;
                 if (this.__sync) this.__finish(arr);
-                else __queue_network_task(function () { xhr.__finish(arr); }, this.__frame);
+                else __queue_network_task(function () { xhr.__finish(arr); }, internalsOf(this).frame);
                 return;
             }
             // A `blob:` URL resolves from the in-realm store, off the wire; a
@@ -19719,7 +19752,7 @@
                 const arr = be ? [200, be.type || null, new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), be.bytes] : null;
                 const xhr = this;
                 if (this.__sync) this.__finish(arr);
-                else __queue_network_task(function () { xhr.__finish(arr); }, this.__frame);
+                else __queue_network_task(function () { xhr.__finish(arr); }, internalsOf(this).frame);
                 return;
             }
             const isFD = body instanceof g.FormData && Array.isArray(body.__entries);
@@ -19747,7 +19780,7 @@
                     "cors", this.withCredentials ? "include" : "same-origin", 'xmlhttprequest'
                 )
                     .then(function (r) {
-                        __queue_network_task(function () { xhr.__finish(r); }, xhr.__frame);
+                        __queue_network_task(function () { xhr.__finish(r); }, internalsOf(xhr).frame);
                     });
             }
         }
@@ -19896,6 +19929,23 @@
     // The per-agent native cache participates in Lumen's collector. It traces
     // Wasm-held references before dropping unreachable wrappers; a JS WeakRef
     // cache alone would lose properties/identity on table-only references.
+    // A Memory, Table or Global keeps its store address in an internal slot
+    // ([[Memory]], [[Table]], [[Global]] in the WebAssembly JS API) shared by
+    // this Agent's Realms, so a forged object cannot name another address.
+    const wasmSlots = __platform_slots("internals", new WeakMap());
+    function wasmAddress(value, kind) {
+        if (!isObject(value)) return undefined;
+        const record = apply(weakGet, wasmSlots, [value]);
+        return record ? record[kind] : undefined;
+    }
+    function setWasmAddress(value, kind, address) {
+        let record = apply(weakGet, wasmSlots, [value]);
+        if (record === undefined) {
+            record = Object.create(null);
+            apply(weakSet, wasmSlots, [value, record]);
+        }
+        record[kind] = address;
+    }
     const functionCache = g.__wasm_function_cache;
     delete g.__wasm_function_cache;
     function exportedFunction(funcId, arity) {
@@ -19978,7 +20028,7 @@
         let g = globalWrappers.get(globalId);
         if (g) return g;
         g = Object.create(Global.prototype);
-        Object.defineProperty(g, "__globalId", { value: globalId });
+        setWasmAddress(g, "wasmGlobal", globalId);
         globalWrappers.set(globalId, g);
         return g;
     }
@@ -19990,17 +20040,17 @@
             const type = String(descriptor.value);
             const value = arguments.length < 2 ? defaultWasmValue(type) : v;
             const id = __wasm_global_new(type, !!descriptor.mutable, value);
-            Object.defineProperty(this, "__globalId", { value: id });
+            setWasmAddress(this, "wasmGlobal", id);
             globalWrappers.set(id, this);
         }
         get value() {
-            return __wasm_global_get(this.__globalId);
+            return __wasm_global_get(wasmAddress(this, "wasmGlobal"));
         }
         set value(v) {
-            __wasm_global_set(this.__globalId, v);
+            __wasm_global_set(wasmAddress(this, "wasmGlobal"), v);
         }
         valueOf() {
-            return __wasm_global_get(this.__globalId);
+            return __wasm_global_get(wasmAddress(this, "wasmGlobal"));
         }
     }
 
@@ -20013,7 +20063,7 @@
         let m = memoryWrappers.get(memId);
         if (m) return m;
         m = Object.create(Memory.prototype);
-        Object.defineProperty(m, "__memId", { value: memId });
+        setWasmAddress(m, "wasmMemory", memId);
         memoryWrappers.set(memId, m);
         return m;
     }
@@ -20035,14 +20085,14 @@
             const maximum =
                 descriptor.maximum === undefined ? -1 : addressU32(descriptor.maximum);
             const id = __wasm_memory_new(initial, maximum);
-            Object.defineProperty(this, "__memId", { value: id });
+            setWasmAddress(this, "wasmMemory", id);
             memoryWrappers.set(id, this);
         }
         get buffer() {
-            return __wasm_memory_buffer(this.__memId);
+            return __wasm_memory_buffer(wasmAddress(this, "wasmMemory"));
         }
         grow(delta) {
-            return __wasm_memory_grow(this.__memId, addressU32(delta));
+            return __wasm_memory_grow(wasmAddress(this, "wasmMemory"), addressU32(delta));
         }
         toFixedLengthBuffer() {
             return this.buffer;
@@ -20061,7 +20111,7 @@
         let t = tableWrappers.get(tableId);
         if (t) return t;
         t = Object.create(Table.prototype);
-        Object.defineProperty(t, "__tableId", { value: tableId });
+        setWasmAddress(t, "wasmTable", tableId);
         Object.defineProperty(t, "__element", { value: element });
         tableWrappers.set(tableId, t);
         return t;
@@ -20083,23 +20133,23 @@
                 descriptor.maximum === undefined ? -1 : addressU32(descriptor.maximum);
             if (arguments.length < 2) value = defaultWasmValue(element);
             const id = __wasm_table_new(element, initial, maximum, value);
-            Object.defineProperty(this, "__tableId", { value: id });
+            setWasmAddress(this, "wasmTable", id);
             Object.defineProperty(this, "__element", { value: element });
             tableWrappers.set(id, this);
         }
         get length() {
-            return __wasm_table_length(this.__tableId);
+            return __wasm_table_length(wasmAddress(this, "wasmTable"));
         }
         get(index) {
-            return __wasm_table_get(this.__tableId, addressU32(index));
+            return __wasm_table_get(wasmAddress(this, "wasmTable"), addressU32(index));
         }
         set(index, value) {
             if (arguments.length < 2) value = defaultWasmValue(this.__element);
-            return __wasm_table_set(this.__tableId, addressU32(index), value);
+            return __wasm_table_set(wasmAddress(this, "wasmTable"), addressU32(index), value);
         }
         grow(delta, value) {
             if (arguments.length < 2) value = defaultWasmValue(this.__element);
-            return __wasm_table_grow(this.__tableId, addressU32(delta), value);
+            return __wasm_table_grow(wasmAddress(this, "wasmTable"), addressU32(delta), value);
         }
     }
 
@@ -20197,8 +20247,8 @@
                     }
                     break;
                 case "global":
-                    if (value instanceof Global) {
-                        descriptor.push(["g", value.__globalId]);
+                    if (wasmAddress(value, "wasmGlobal") !== undefined) {
+                        descriptor.push(["g", wasmAddress(value, "wasmGlobal")]);
                     } else if (typeof value === "number" || typeof value === "bigint") {
                         descriptor.push(["gv", value]);
                     } else {
@@ -20209,8 +20259,8 @@
                     }
                     break;
                 case "memory":
-                    if (value instanceof Memory) {
-                        descriptor.push(["m", value.__memId]);
+                    if (wasmAddress(value, "wasmMemory") !== undefined) {
+                        descriptor.push(["m", wasmAddress(value, "wasmMemory")]);
                     } else {
                         throw new LinkError(
                             "import '" + imp.module + "." + imp.name +
@@ -20219,8 +20269,8 @@
                     }
                     break;
                 case "table":
-                    if (value instanceof Table) {
-                        descriptor.push(["t", value.__tableId]);
+                    if (wasmAddress(value, "wasmTable") !== undefined) {
+                        descriptor.push(["t", wasmAddress(value, "wasmTable")]);
                     } else {
                         throw new LinkError(
                             "import '" + imp.module + "." + imp.name +
@@ -20257,7 +20307,6 @@
             // imported table. Its imports must survive even when no Instance is returned.
             const moduleIndex = moduleId(module);
             const id = unwrap(__wasm_instantiate(moduleIndex, binding.token, binding.descriptor, binding.references));
-            Object.defineProperty(this, "__id", { value: id });
             Object.defineProperty(this, "exports", {
                 value: buildExports(id, moduleIndex),
                 enumerable: true,
@@ -20969,7 +21018,7 @@
         trust[name] = function (...args) {
             const frame = nativeInputChildFrame(args[0]);
             if (!frame) return Reflect.apply(local, trust, args);
-            const child = trustOf(frame.__contentRealmWindow);
+            const child = trustOf(internalsOf(frame).contentRealmWindow);
             const result = Reflect.apply(child[name], child, args);
             if (name === "click" || name === "key") {
                 trust.lastClickSubmit = child.lastClickSubmit;
