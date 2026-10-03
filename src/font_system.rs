@@ -82,6 +82,9 @@ fn font_source_cache() -> SourceCache {
 pub struct FontSet {
     id: u64,
     collection: Collection,
+    /// The same downloadable faces for inline SVG text (`None` when the set
+    /// adds nothing to the installed fonts).
+    svg: Option<Arc<SvgFontEnvironment>>,
 }
 
 impl std::fmt::Debug for FontSet {
@@ -102,43 +105,72 @@ impl FontSet {
         parent: Option<&Arc<Self>>,
         foreground: bool,
     ) -> Arc<Self> {
-        let mut collection = if let Some(parent) = parent {
-            parent.collection.clone()
+        let (mut collection, mut svg_faces) = if let Some(parent) = parent {
+            (
+                parent.collection.clone(),
+                parent
+                    .svg
+                    .as_ref()
+                    .map_or_else(Vec::new, |svg| svg.faces.clone()),
+            )
         } else if foreground {
-            font_context().collection
+            (font_context().collection, page_svg_faces())
         } else {
-            catalog().base_text_collection.clone()
+            (catalog().base_text_collection.clone(), Vec::new())
         };
         let mut declared = HashSet::new();
         for font in fonts {
             // CSS Shadow 1 #shadow-names: a local @font-face family hides
             // the same tree-scoped name in ancestor trees. Clear it once per
             // local family, retaining all of this scope's declared faces.
-            if declared.insert(font.family.case_fold().collect::<String>())
-                && let Some(family_id) = collection.family_id(&font.family)
-                && let Some(family) = collection.family(family_id)
-            {
-                for inherited in family.fonts() {
-                    collection.unregister_font(
-                        family_id,
-                        inherited.width(),
-                        inherited.style(),
-                        inherited.weight(),
-                    );
+            let folded = font.family.trim().case_fold().collect::<String>();
+            if declared.insert(folded.clone()) {
+                svg_faces.retain(|face| fold(&face.family) != folded);
+                if let Some(family_id) = collection.family_id(&font.family)
+                    && let Some(family) = collection.family(family_id)
+                {
+                    for inherited in family.fonts() {
+                        collection.unregister_font(
+                            family_id,
+                            inherited.width(),
+                            inherited.style(),
+                            inherited.weight(),
+                        );
+                    }
                 }
             }
+            let bytes = Arc::new(font.bytes);
             collection.register_fonts(
-                Blob::new(Arc::new(font.bytes)),
+                Blob::new(bytes.clone()),
                 Some(FontInfoOverride {
                     family_name: Some(&font.family),
                     ..FontInfoOverride::default()
                 }),
             );
+            svg_faces.push(SvgPageFace {
+                family: font.family.trim().to_string(),
+                bytes,
+            });
         }
+        // A scope that declares nothing shares its parent's SVG environment.
+        let svg = if declared.is_empty() && parent.is_some() {
+            parent.and_then(|parent| parent.svg.clone())
+        } else if declared.is_empty() && foreground {
+            current_page_svg_environment()
+        } else {
+            SvgFontEnvironment::register(svg_faces)
+        };
         Arc::new(Self {
             id: NEXT_FONT_SET.fetch_add(1, Ordering::Relaxed),
             collection,
+            svg,
         })
+    }
+
+    /// The inline-SVG font environment matching this set's text fonts, as the
+    /// token `svg_document_font_options` accepts (0: installed fonts only).
+    pub(crate) fn svg_font_environment(&self) -> u64 {
+        self.svg.as_ref().map_or(0, |svg| svg.id)
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -411,18 +443,27 @@ pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
             .map(|font| font.family.trim().case_fold().collect())
             .collect(),
     );
+    // One shared byte buffer per face serves both the HTML text collection
+    // and inline SVG text, which is document text as well (CSS Fonts 4
+    // #font-face-rule: the rules define fonts "for use within the documents
+    // that contain these rules").
+    let faces = fonts
+        .into_iter()
+        .filter(|font| !font.family.trim().is_empty() && !font.bytes.is_empty())
+        .map(|font| SvgPageFace {
+            family: font.family.trim().to_string(),
+            bytes: Arc::new(font.bytes),
+        })
+        .collect::<Vec<_>>();
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         let catalog = catalog();
         let mut collection = catalog.base_text_collection.clone();
-        for font in fonts {
-            if font.family.trim().is_empty() || font.bytes.is_empty() {
-                continue;
-            }
+        for face in &faces {
             collection.register_fonts(
-                Blob::new(Arc::new(font.bytes)),
+                Blob::new(face.bytes.clone()),
                 Some(FontInfoOverride {
-                    family_name: Some(font.family.trim()),
+                    family_name: Some(&face.family),
                     ..FontInfoOverride::default()
                 }),
             );
@@ -431,12 +472,185 @@ pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
             .text_collection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = collection;
-        PAGE_FONT_EPOCH.fetch_add(1, Ordering::Release);
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    {
-        let _ = fonts;
+    *PAGE_SVG_FONTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        (faces.clone(), SvgFontEnvironment::register(faces));
+    PAGE_FONT_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// One downloadable face as inline SVG text sees it: the `@font-face`
+/// family name (CSS Fonts 4 §4.1 lets it override the file's own name) and
+/// the decoded SFNT bytes, shared with the HTML text collection.
+#[derive(Clone)]
+pub(crate) struct SvgPageFace {
+    family: String,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl PartialEq for SvgPageFace {
+    fn eq(&self, other: &Self) -> bool {
+        self.family == other.family
+            && (Arc::ptr_eq(&self.bytes, &other.bytes) || self.bytes == other.bytes)
     }
+}
+
+/// The downloadable faces visible to one tree scope's inline SVG text, with
+/// a fontdb index built on first use. Inline SVG is part of its document, so
+/// it uses the same `@font-face` rules as the surrounding HTML text. SVG used
+/// as an image is a separate document and never receives one of these (SVG
+/// Integration #referencing-modes; CSS Fonts 4 #font-face-rule: "Downloaded
+/// fonts are only available to documents that reference them").
+pub(crate) struct SvgFontEnvironment {
+    id: u64,
+    faces: Vec<SvgPageFace>,
+    fonts: OnceLock<SvgDocumentFonts>,
+}
+
+struct SvgDocumentFonts {
+    db: Arc<Database>,
+    /// Case-folded CSS family name to the private family each face was
+    /// registered under.
+    families: Arc<HashMap<String, String>>,
+}
+
+/// The foreground document's own `@font-face` faces and their environment.
+static PAGE_SVG_FONTS: Mutex<(Vec<SvgPageFace>, Option<Arc<SvgFontEnvironment>>)> =
+    Mutex::new((Vec::new(), None));
+static NEXT_SVG_FONT_ENVIRONMENT: AtomicU64 = AtomicU64::new(1);
+/// Environments by token. Weak entries follow their font sets; the recent
+/// strong list keeps a navigated-away page's environment available while its
+/// retained presentation may still re-rasterize inline SVG at a new size.
+static SVG_FONT_ENVIRONMENTS: Mutex<SvgFontEnvironments> = Mutex::new(SvgFontEnvironments {
+    by_id: None,
+    recent: VecDeque::new(),
+});
+const RECENT_SVG_FONT_ENVIRONMENTS: usize = 8;
+const MAX_SVG_FONT_ENVIRONMENT_ENTRIES: usize = 256;
+
+struct SvgFontEnvironments {
+    by_id: Option<HashMap<u64, std::sync::Weak<SvgFontEnvironment>>>,
+    recent: VecDeque<Arc<SvgFontEnvironment>>,
+}
+
+impl SvgFontEnvironment {
+    fn register(faces: Vec<SvgPageFace>) -> Option<Arc<Self>> {
+        if faces.is_empty() {
+            return None;
+        }
+        let mut registry = SVG_FONT_ENVIRONMENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Font sets are rebuilt with every style index. Reusing an identical
+        // environment keeps its token, and so every inline SVG image source,
+        // stable when the faces did not change.
+        if let Some(index) = registry
+            .recent
+            .iter()
+            .position(|environment| environment.faces == faces)
+        {
+            let environment = registry.recent.remove(index)?;
+            registry.recent.push_back(environment.clone());
+            return Some(environment);
+        }
+        let environment = Arc::new(Self {
+            id: NEXT_SVG_FONT_ENVIRONMENT.fetch_add(1, Ordering::Relaxed),
+            faces,
+            fonts: OnceLock::new(),
+        });
+        let by_id = registry.by_id.get_or_insert_with(HashMap::new);
+        if by_id.len() >= MAX_SVG_FONT_ENVIRONMENT_ENTRIES {
+            by_id.retain(|_, environment| environment.strong_count() > 0);
+        }
+        by_id.insert(environment.id, Arc::downgrade(&environment));
+        registry.recent.push_back(environment.clone());
+        while registry.recent.len() > RECENT_SVG_FONT_ENVIRONMENTS {
+            registry.recent.pop_front();
+        }
+        Some(environment)
+    }
+
+    fn lookup(id: u64) -> Option<Arc<Self>> {
+        SVG_FONT_ENVIRONMENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_id
+            .as_ref()?
+            .get(&id)?
+            .upgrade()
+    }
+
+    /// Installed SVG faces plus this environment's downloadable faces. Each
+    /// CSS family receives a private fontdb family name, so a web font
+    /// shadows an installed family of the same name as CSS Fonts 4 §5
+    /// requires, and an installed face can never answer for the web font.
+    fn fonts(&self) -> &SvgDocumentFonts {
+        self.fonts.get_or_init(|| {
+            let mut db = (*svg_fontdb()).clone();
+            let mut families = HashMap::new();
+            for face in &self.faces {
+                let next = families.len();
+                let family = families
+                    .entry(fold(&face.family))
+                    .or_insert_with(|| format!("\u{1}trust-page-font-{}-{next}", self.id))
+                    .clone();
+                for id in db.load_font_source(Source::Binary(face.bytes.clone())) {
+                    let Some(mut info) = db.face(id).cloned() else {
+                        continue;
+                    };
+                    db.remove_face(id);
+                    info.families = vec![(family.clone(), fontdb::Language::English_UnitedStates)];
+                    db.push_face_info(info);
+                }
+            }
+            SvgDocumentFonts {
+                db: Arc::new(db),
+                families: Arc::new(families),
+            }
+        })
+    }
+}
+
+fn page_svg_faces() -> Vec<SvgPageFace> {
+    PAGE_SVG_FONTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .0
+        .clone()
+}
+
+fn current_page_svg_environment() -> Option<Arc<SvgFontEnvironment>> {
+    PAGE_SVG_FONTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .1
+        .clone()
+}
+
+/// The foreground document's inline-SVG font environment token, used where
+/// a tree scope has no font set of its own (0: installed fonts only).
+pub(crate) fn page_svg_font_environment() -> u64 {
+    current_page_svg_environment().map_or(0, |environment| environment.id)
+}
+
+/// The font database and resolver for one inline-SVG decode. An unknown or
+/// expired token falls back to the installed fonts that SVG used as an image
+/// always receives; it never borrows another document's faces.
+pub(crate) fn svg_document_font_options(
+    environment: u64,
+) -> (Arc<Database>, resvg::usvg::FontResolver<'static>) {
+    let Some(environment) = (environment != 0)
+        .then(|| SvgFontEnvironment::lookup(environment))
+        .flatten()
+    else {
+        return (svg_fontdb(), svg_font_resolver());
+    };
+    let fonts = environment.fonts();
+    (
+        fonts.db.clone(),
+        svg_font_resolver_with(Some(fonts.families.clone())),
+    )
 }
 
 /// Whether the foreground page's load installed a face of `family`.
@@ -569,11 +783,17 @@ pub(crate) fn svg_fontdb() -> Arc<Database> {
 /// families. usvg's stock resolver delegates to fontdb's case-sensitive name
 /// comparison and therefore does not satisfy CSS Fonts 4 §5.1 by itself.
 pub(crate) fn svg_font_resolver() -> resvg::usvg::FontResolver<'static> {
+    svg_font_resolver_with(None)
+}
+
+fn svg_font_resolver_with(
+    page_families: Option<Arc<HashMap<String, String>>>,
+) -> resvg::usvg::FontResolver<'static> {
     let materialized = Arc::new(Mutex::new(HashMap::new()));
     let select_materialized = materialized.clone();
     resvg::usvg::FontResolver {
         select_font: Box::new(move |font, db| {
-            select_svg_font(font, db)
+            select_svg_font(font, db, page_families.as_deref())
                 .and_then(|id| materialize_svg_face(db, id, &select_materialized))
         }),
         select_fallback: Box::new(move |c, excluded, db| {
@@ -835,10 +1055,23 @@ fn family_script_coverage(
     result
 }
 
-fn select_svg_font(font: &resvg::usvg::Font, db: &mut Arc<Database>) -> Option<ID> {
+fn select_svg_font(
+    font: &resvg::usvg::Font,
+    db: &mut Arc<Database>,
+    page_families: Option<&HashMap<String, String>>,
+) -> Option<ID> {
     let catalog = catalog();
     let mut names = Vec::<String>::new();
     for family in font.families() {
+        // CSS Fonts 4 #font-face-rule: the document's @font-face fonts "are
+        // considered before other available fonts", and a web font shadows
+        // an installed family of the same name.
+        if let svgtypes::FontFamily::Named(name) = family
+            && let Some(private) = page_families.and_then(|families| families.get(&fold(name)))
+        {
+            names.push(private.clone());
+            continue;
+        }
         match family {
             svgtypes::FontFamily::Serif => {
                 append_generic_names(&mut names, catalog, GenericFamily::Serif)
@@ -1988,6 +2221,30 @@ mod tests {
             .restrict_to(&[]);
         let face = ttf_parser::Face::parse(&all.bytes, 0).unwrap();
         assert!(face.glyph_index('1').is_some());
+    }
+
+    /// Font sets are rebuilt with each style index. Unchanged downloadable
+    /// faces keep their inline-SVG environment token, so inline SVG image
+    /// sources (and their rasters) survive the rebuild; changed faces do not.
+    #[test]
+    fn rebuilt_font_sets_keep_an_unchanged_inline_svg_environment() {
+        let sans = include_bytes!("../assets/fonts/dejavu/DejaVuSans.ttf");
+        let face = |family: &str| PageFont {
+            family: family.into(),
+            bytes: sans.to_vec(),
+        };
+        let first = FontSet::new(vec![face("Stable Inline Face")], None, false);
+        let rebuilt = FontSet::new(vec![face("Stable Inline Face")], None, false);
+        assert_ne!(first.id(), rebuilt.id());
+        assert_ne!(first.svg_font_environment(), 0);
+        assert_eq!(first.svg_font_environment(), rebuilt.svg_font_environment());
+        let changed = FontSet::new(vec![face("Changed Inline Face")], None, false);
+        assert_ne!(first.svg_font_environment(), changed.svg_font_environment());
+        // A child document without faces of its own has none for SVG either.
+        assert_eq!(
+            FontSet::new(Vec::new(), None, false).svg_font_environment(),
+            0
+        );
     }
 
     #[test]

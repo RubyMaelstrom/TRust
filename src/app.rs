@@ -9491,6 +9491,25 @@ async fn load_image_with_cookie_policy(
     blobs: Option<&crate::js::BlobMap>,
     restricted: bool,
 ) -> Option<DecodedImage> {
+    // An inline SVG's `<image>` loads as an ordinary page image of its URL;
+    // the outcome is also recorded for the SVG decoder (`img::inline_svg`).
+    let Some(document_image) = crate::img::document_svg_image_target(url) else {
+        return load_page_image(page, url, blobs, restricted).await;
+    };
+    let decoded = load_page_image(page, document_image, blobs, restricted).await;
+    crate::img::record_document_svg_image(
+        document_image,
+        decoded.as_ref().map(|decoded| &decoded.raw[..]),
+    );
+    decoded
+}
+
+async fn load_page_image(
+    page: &Url,
+    url: &str,
+    blobs: Option<&crate::js::BlobMap>,
+    restricted: bool,
+) -> Option<DecodedImage> {
     // A `data:` image (a rewritten inline SVG, or a page's own data image)
     // carries its bytes — decode locally, no fetch, no SSRF concern.
     if url.starts_with("data:") {
@@ -15643,6 +15662,34 @@ mod tests {
     /// mirrors the bytes via `__blob_mirror`, and the app's image pipeline
     /// decodes from the shared map. A URL missing from the map (revoked before
     /// mirroring existed, or another page's) decodes to nothing, like a 404.
+    /// The terminal image loader records an inline SVG `<image>` load for the
+    /// SVG decoder too, fetching the plain URL (SVG 2
+    /// linking.html#processingURL-fetch).
+    #[tokio::test]
+    async fn inline_svg_document_image_loads_reach_the_svg_decoder() {
+        let page = url::Url::parse("https://example.com/flood").unwrap();
+        let blob_url = "blob:https://example.com/terminal-inline-svg-texture";
+        let blobs = crate::js::BlobMap::default();
+        blobs.lock().unwrap().insert(
+            blob_url.to_string(),
+            (crate::img::red_png(), String::from("image/png")),
+        );
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image href="{blob_url}" width="4" height="4"/></svg>"#
+        );
+        let images = [blob_url.to_string()];
+        let before = crate::img::document_svg_data_url(&svg, 0, &images);
+        let request = crate::img::document_svg_image_requests(&before).remove(0);
+        let decoded = super::load_one_image(&page, &request, Some(&blobs))
+            .await
+            .expect("the document image decodes as a page image");
+        assert_eq!(decoded.raw.as_ref(), crate::img::red_png().as_slice());
+        let after = crate::img::document_svg_data_url(&svg, 0, &images);
+        let bytes = crate::img::decode_data_url(&after).unwrap();
+        let image = crate::img::decode(&bytes).unwrap().0.to_rgba8();
+        assert!(image.pixels().all(|pixel| pixel.0 == [255, 0, 0, 255]));
+    }
+
     #[tokio::test]
     async fn blob_image_urls_decode_from_the_doc_blob_mirror() {
         let page = url::Url::parse("https://example.com/login").unwrap();

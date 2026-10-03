@@ -8405,7 +8405,7 @@ impl Dom {
             // symbol; otherwise the svg's OWN inline geometry. An svg with
             // neither (an unfetched sprite, an empty svg) is left untouched and
             // renders nothing, exactly as before.
-            let Some(svg) = self.svg_render_markup(id, base) else {
+            let Some((svg, images)) = self.svg_render_resource(id, base) else {
                 continue;
             };
             let name = self.svg_accessible_name(id);
@@ -8423,7 +8423,8 @@ impl Dom {
             let h_attr = self.attr(id, "height").map(str::to_string);
             let img = self.create_element("img");
             let svg = self.resolve_svg_current_color(id, svg);
-            self.set_attr(img, "src", &crate::img::svg_data_url(&svg));
+            let source = self.svg_document_source(id, svg, &images);
+            self.set_attr(img, "src", &source);
             if !name.is_empty() {
                 self.set_attr(img, "alt", &name);
             }
@@ -8454,11 +8455,26 @@ impl Dom {
         if self.tag_name(id) != Some("svg") || self.ancestor_is_svg(id) || self.is_hidden(id) {
             return None;
         }
-        let svg = self.svg_render_markup(id, base)?;
+        let (svg, images) = self.svg_render_resource(id, base)?;
         Some((
-            crate::img::svg_data_url(&self.resolve_svg_current_color(id, svg)),
+            self.svg_document_source(id, self.resolve_svg_current_color(id, svg), &images),
             self.svg_accessible_name(id),
         ))
+    }
+
+    /// The image source for an inline SVG resource, marked with its host
+    /// document's context. SVG Integration #referencing-modes: an inline SVG
+    /// fragment uses its host document's referencing mode, so its text uses
+    /// the `@font-face` fonts of its tree scope (CSS Fonts 4 #font-face-rule,
+    /// CSS Scoping #shadow-names, mirroring `layout2` text) and its external
+    /// `<image>` references are document images.
+    fn svg_document_source(&self, id: NodeId, svg: String, images: &[String]) -> String {
+        let fonts = self
+            .scope_font_set(id)
+            .map_or_else(crate::font_system::page_svg_font_environment, |set| {
+                set.svg_font_environment()
+            });
+        crate::img::document_svg_data_url(&svg, fonts, images)
     }
 
     /// SVG's `currentColor` is the computed CSS `color` of the element, not a
@@ -8515,18 +8531,33 @@ impl Dom {
         }
     }
 
+    /// The markup half of `svg_render_resource`.
+    #[cfg(test)]
+    fn svg_render_markup(&self, id: NodeId, base: Option<&url::Url>) -> Option<String> {
+        self.svg_render_resource(id, base).map(|(svg, _)| svg)
+    }
+
     /// Resolve the SVG 2 §5.6 `use` instance tree into self-contained markup
     /// for the image decoder. External references use the fetched sprite table;
     /// a same-tree `#fragment` target outside the outer `<svg>` is injected into
     /// that SVG's `<defs>` so the authored `<use>` resolves without changing
-    /// the canonical DOM.
-    fn svg_render_markup(&self, id: NodeId, base: Option<&url::Url>) -> Option<String> {
+    /// the canonical DOM. Also returns the absolute URLs of the external
+    /// `<image>` resources the markup references, in document order.
+    fn svg_render_resource(
+        &self,
+        id: NodeId,
+        base: Option<&url::Url>,
+    ) -> Option<(String, Vec<String>)> {
         let local_target = self.local_svg_use_target(id);
         let proof = self.svg_input_dependencies(id, local_target, true);
         // Publish negative/unresolved lookups too: a parent box may cache the
         // absence of an image until a later ID insertion makes it renderable.
         self.svg_dependencies.borrow_mut().publish(id, proof);
         let external = self.svg_sprite_ref(id);
+        let mut images = SvgImageRefs {
+            page: base,
+            urls: Vec::new(),
+        };
         let mut svg = if let Some((file, frag)) = &external {
             // Keep the authored outer SVG and <use> boxes/paint/transforms.
             // Replacing them with the naked symbol discarded host inheritance.
@@ -8534,21 +8565,24 @@ impl Dom {
             if !sprite_has_symbol(abs.as_str(), frag) {
                 return None;
             }
-            self.serialize_svg_for_image(id)
+            self.serialize_svg_for_image_with(id, &mut images)
         } else if let Some(target) = local_target {
             // SVG 2 §6.6: author-sheet presentation properties apply to an
             // icon built from local `<use>` references too, so the resource
             // carries them like any other inline SVG (a stylesheet's
             // `.wave > use { fill: url(#water) }` otherwise drew black).
-            let mut outer = self.serialize_svg_for_image(id);
+            let mut outer = self.serialize_svg_for_image_with(id, &mut images);
             if !self.descendants(id).any(|node| node == target) {
                 let open = outer.find('>')? + 1;
-                let definition = format!("<defs>{}</defs>", self.serialize_svg_for_image(target));
+                let definition = format!(
+                    "<defs>{}</defs>",
+                    self.serialize_svg_for_image_with(target, &mut images)
+                );
                 outer.insert_str(open, &definition);
             }
             outer
         } else if self.svg_is_renderable(id) {
-            self.serialize_svg_for_image(id)
+            self.serialize_svg_for_image_with(id, &mut images)
         } else {
             return None;
         };
@@ -8601,27 +8635,44 @@ impl Dom {
                 svg.replace_range(range, &replacement);
             }
         }
-        Some(svg)
+        Some((svg, images.urls))
     }
 
     /// Serialize an inline SVG while resolving `currentColor` per element.
     /// The ordinary HTML serializer intentionally drops `<style>` elements;
     /// this small SVG serializer keeps their text and applies the same
     /// computed-color substitution to each element's authored/baked attrs.
+    #[cfg(test)]
     fn serialize_svg_for_image(&self, root: NodeId) -> String {
+        self.serialize_svg_for_image_with(
+            root,
+            &mut SvgImageRefs {
+                page: None,
+                urls: Vec::new(),
+            },
+        )
+    }
+
+    fn serialize_svg_for_image_with(&self, root: NodeId, images: &mut SvgImageRefs) -> String {
         let mut out = String::new();
-        self.serialize_svg_node_for_image(root, None, &mut out);
+        self.serialize_svg_node_for_image(root, None, &mut out, images);
         out
     }
 
     /// Serialize a standalone SVG resource. Like the presentation serializer,
     /// a shadow host renders its shadow tree in place, with slots projecting
     /// the host's assigned nodes (`host` is the shadow host being expanded).
-    fn serialize_svg_node_for_image(&self, id: NodeId, host: Option<NodeId>, out: &mut String) {
+    fn serialize_svg_node_for_image(
+        &self,
+        id: NodeId,
+        host: Option<NodeId>,
+        out: &mut String,
+        images: &mut SvgImageRefs,
+    ) {
         match &self.nodes[id].data {
             NodeData::Document | NodeData::Fragment => {
                 for child in self.child_iter(id) {
-                    self.serialize_svg_node_for_image(child, host, out);
+                    self.serialize_svg_node_for_image(child, host, out, images);
                 }
             }
             NodeData::Doctype => {}
@@ -8656,7 +8707,7 @@ impl Dom {
                     let assigned = self.slot_assigned(h, self.attr(id, "name"));
                     if assigned.is_empty() {
                         for child in self.child_iter(id) {
-                            self.serialize_svg_node_for_image(child, host, out);
+                            self.serialize_svg_node_for_image(child, host, out, images);
                         }
                     } else {
                         for child in assigned.into_iter().flat_map(|c| {
@@ -8666,7 +8717,7 @@ impl Dom {
                                 vec![c]
                             }
                         }) {
-                            self.serialize_svg_node_for_image(child, None, out);
+                            self.serialize_svg_node_for_image(child, None, out, images);
                         }
                     }
                     return;
@@ -8678,11 +8729,21 @@ impl Dom {
                 // them. The standalone raster resource has no document CSS,
                 // so materialize each direct cascade winner as inline style.
                 let paint = self.svg_resource_style(id);
+                let image =
+                    tag == "image" && self.namespace_uri(id) == Some("http://www.w3.org/2000/svg");
                 let mut serialized_attrs = String::new();
                 self.write_attrs_with_extra_style(
                     id,
                     attrs,
                     &mut |name, value| {
+                        // `href` is the local name of both `href` and the
+                        // legacy `xlink:href` (SVG 2 linking.html#XLinkRefAttrs).
+                        if image
+                            && name == "href"
+                            && let Some(resolved) = images.resolve(self, id, value)
+                        {
+                            return Some(resolved);
+                        }
                         let value = if SVG_PRESENTATION_PROPERTIES.contains(&name) {
                             self.resolve_vars(id, value)
                         } else {
@@ -8700,11 +8761,11 @@ impl Dom {
                 if !VOID_ELEMENTS.contains(&tag) {
                     if let Some(root) = self.shadow_root(id) {
                         for child in self.child_iter(root) {
-                            self.serialize_svg_node_for_image(child, Some(id), out);
+                            self.serialize_svg_node_for_image(child, Some(id), out, images);
                         }
                     } else {
                         for child in self.child_iter(id) {
-                            self.serialize_svg_node_for_image(child, host, out);
+                            self.serialize_svg_node_for_image(child, host, out, images);
                         }
                     }
                     out.push_str("</");
@@ -10808,6 +10869,41 @@ fn append_style(style: &mut String, declarations: &str) {
 /// Keeping one list for attribute var() substitution and stylesheet winner
 /// materialization prevents the two standards-defined cascade inputs from
 /// diverging.
+/// External `<image>` references met while serializing an inline SVG.
+/// `page` is the URL that `Dom::resource_base_url` falls back to; without it
+/// (detached tests) references are left as authored.
+struct SvgImageRefs<'a> {
+    page: Option<&'a url::Url>,
+    urls: Vec<String>,
+}
+
+impl SvgImageRefs<'_> {
+    /// SVG 2 linking.html#processingURL-absolute: an `href` in an HTML
+    /// document resolves as HTML specifies, against the node document's base
+    /// URL (so `<base href>` applies). The serialized resource has no base of
+    /// its own, so it carries the absolute URL, and the fetchable ones are
+    /// recorded to be loaded as document images (#processingURL-fetch). A
+    /// fragment-only reference names the HTML document itself, which is not
+    /// an image (an invalid reference), and `data:` URLs need no fetch; both
+    /// stay as authored. Image references ignore fragments.
+    fn resolve(&mut self, dom: &Dom, id: NodeId, value: &str) -> Option<String> {
+        let page = self.page?;
+        let value = value.trim();
+        if value.is_empty() || value.starts_with('#') {
+            return None;
+        }
+        let mut url = dom.resource_base_url(id, page).join(value).ok()?;
+        if url.scheme() == "data" {
+            return None;
+        }
+        url.set_fragment(None);
+        if crate::img::document_svg_image_url(&url) && !self.urls.contains(&url.to_string()) {
+            self.urls.push(url.to_string());
+        }
+        Some(url.to_string())
+    }
+}
+
 const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
     "fill",
     "fill-opacity",
@@ -20070,6 +20166,149 @@ mod tests {
         );
     }
 
+    /// SVG 2 linking.html#processingURL: an inline SVG `<image href>`
+    /// resolves against its HTML document's base URL and, when fetchable,
+    /// becomes a page-image request of that document (#processingURL-fetch).
+    /// Fragment-only and `data:` references stay as authored; `file:` URLs
+    /// never enter the process-wide document-image store.
+    #[test]
+    fn inline_svg_images_resolve_against_the_document_base_and_are_requested() {
+        let dom = Dom::parse_document(
+            r##"<head><base href="https://cdn.test/assets/"></head><body>
+               <svg id=s width=4 height=4><image href="tex.png#part" width=4 height=4/>
+               <image xlink:href="#self" width=4 height=4/>
+               <image href="data:image/png;base64,AAAA" width=4 height=4/>
+               <image href="file:///etc/local.png" width=4 height=4/></svg></body>"##,
+        );
+        let page = url::Url::parse("https://page.test/dir/index.html").unwrap();
+        let svg = dom.get_by_id("s").unwrap();
+        let (source, _) = dom.svg_image_data(svg, Some(&page)).unwrap();
+        let markup = String::from_utf8(crate::img::decode_data_url(&source).unwrap()).unwrap();
+        assert!(markup.starts_with("<?trust-document-svg "), "{markup}");
+        assert!(
+            markup.contains(r#"href="https://cdn.test/assets/tex.png""#),
+            "{markup}"
+        );
+        assert!(markup.contains(r##"href="#self""##), "{markup}");
+        assert!(markup.contains(r#"href="data:image/png;base64,AAAA""#));
+        assert!(markup.contains(r#"href="file:///etc/local.png""#));
+
+        let requests = crate::img::document_svg_image_requests(&source);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(
+            crate::img::document_svg_image_target(&requests[0]),
+            Some("https://cdn.test/assets/tex.png")
+        );
+        let collected = crate::http::collect_image_urls(
+            &dom,
+            &page,
+            crate::layout2::Viewport::new(800., 600.),
+            1.0,
+        );
+        assert!(
+            collected.eager.contains(&requests[0]),
+            "{:?}",
+            collected.eager
+        );
+        assert!(collected.all.contains(&requests[0]));
+
+        // The presentation-DOM rewrite carries the same document context.
+        let mut rewritten = Dom::parse_document(
+            r#"<svg width=4 height=4><image href="/tex.png" width=4 height=4/></svg>"#,
+        );
+        rewritten.rewrite_inline_svgs(Some(&page));
+        let collected = crate::http::collect_image_urls(
+            &rewritten,
+            &page,
+            crate::layout2::Viewport::new(800., 600.),
+            1.0,
+        );
+        assert!(
+            collected
+                .eager
+                .iter()
+                .any(|request| crate::img::document_svg_image_target(request)
+                    == Some("https://page.test/tex.png")),
+            "{:?}",
+            collected.eager
+        );
+    }
+
+    /// HTML #img-available / SVG 2 linking.html#processingURL-fetch: once an
+    /// inline SVG's document image has loaded, the retained layout serializes
+    /// the SVG again, and the new image source draws the loaded image.
+    #[test]
+    fn inline_svg_redraws_with_its_document_image_after_it_loads() {
+        let base = url::Url::parse("https://example.test/flood/").unwrap();
+        let dom = Dom::parse_document(
+            r#"<svg width=4 height=4><image href="arrival-texture.png" width=4 height=4/></svg>"#,
+        );
+        let paint = |dom: &Dom| {
+            let layout = crate::layout2::lay_out_graphical(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(400., 300.),
+                &[],
+                &crate::layout2::ControlMap::new(),
+                &crate::layout2::ImageSizes::new(),
+            );
+            let source = layout.paint.image_requests[0].source.clone();
+            let bytes = crate::img::decode_data_url(&source).unwrap();
+            let image = crate::img::decode(&bytes).unwrap().0.to_rgba8();
+            let red = image
+                .pixels()
+                .filter(|pixel| pixel.0 == [255, 0, 0, 255])
+                .count();
+            (source, red)
+        };
+        let (before, red) = paint(&dom);
+        assert_eq!(red, 0, "nothing draws before the image loads");
+        crate::img::record_document_svg_image(
+            "https://example.test/flood/arrival-texture.png",
+            Some(&crate::img::red_png()),
+        );
+        let (after, red) = paint(&dom);
+        assert_ne!(before, after);
+        assert_eq!(red, 16);
+    }
+
+    /// CSS Fonts 4 #font-face-rule: the document's `@font-face` faces apply
+    /// to inline SVG text as they do to HTML text, while an `<img>` showing
+    /// the same SVG markup is a separate image document that cannot see them.
+    #[test]
+    fn inline_svg_text_uses_document_font_faces_but_an_svg_img_does_not() {
+        let mono = include_bytes!("../assets/fonts/dejavu/DejaVuSansMono.ttf");
+        let text = r#"<text x="4" y="30" font-family="'Dom Inline Face', serif" font-size="24" fill="black">iiiiiiii</text>"#;
+        let markup = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="40">{text}</svg>"#
+        );
+        let dom = Dom::parse_document(&format!(
+            r#"<style>@font-face {{ font-family: "Dom Inline Face";
+                 src: url(data:font/ttf;base64,{}) }}</style>
+               <svg id=s width=240 height=40>{text}</svg>
+               <img id=i src="{}">"#,
+            crate::img::base64_encode(mono),
+            crate::img::svg_data_url(&markup)
+        ));
+        let ink = |source: &str| {
+            let bytes = crate::img::decode_data_url(source).unwrap();
+            let image = crate::img::decode(&bytes).unwrap().0.to_rgba8();
+            let columns: Vec<u32> = (0..image.width())
+                .filter(|&x| (0..image.height()).any(|y| image.get_pixel(x, y)[3] > 64))
+                .collect();
+            columns.last().unwrap() - columns[0] + 1
+        };
+        let (inline, _) = dom
+            .svg_image_data(dom.get_by_id("s").unwrap(), None)
+            .unwrap();
+        let img = dom.attr(dom.get_by_id("i").unwrap(), "src").unwrap();
+        let (inline, img) = (ink(&inline), ink(img));
+        assert!(
+            inline > img * 3 / 2,
+            "inline SVG ink {inline}px must use the monospaced web font, <img> {img}px"
+        );
+    }
+
     #[test]
     fn external_sprite_use_may_reference_a_nested_svg_or_group() {
         // SVG 2 #UseElement: the referenced element may be any element, not
@@ -22481,6 +22720,62 @@ mod tests {
         .unwrap();
         dom.install_downloaded_font(url, Some(bytes));
         assert!(dom.scope_font_set(p).is_some());
+    }
+
+    /// CSS Fonts 4 #font-fetching-requirements: text in the fallback font is
+    /// redrawn once a downloadable face arrives. Inline SVG text is document
+    /// text, so its raster must refresh too: the face changes the resource's
+    /// document context, giving the next layout a new image source.
+    #[test]
+    fn inline_svg_text_refreshes_when_its_web_font_arrives() {
+        let base = url::Url::parse("https://example.test/page/").unwrap();
+        let mut dom = Dom::parse_document(
+            "<style>@font-face{font-family:'Late Inline Svg';src:url(fonts/late-svg.ttf)}</style>\
+             <svg id=s width=240 height=40><text x=4 y=30 font-size=24 \
+             font-family=\"'Late Inline Svg', serif\">iiiiiiii</text></svg>",
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let source = |dom: &Dom| {
+            let layout = crate::layout2::lay_out_graphical(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(400., 300.),
+                &[],
+                &crate::layout2::ControlMap::new(),
+                &crate::layout2::ImageSizes::new(),
+            );
+            let request = layout
+                .paint
+                .image_requests
+                .iter()
+                .find(|request| request.source.starts_with("data:image/svg+xml"))
+                .expect("inline SVG paints through the image pipeline")
+                .source
+                .clone();
+            let bytes = crate::img::decode_data_url(&request).unwrap();
+            let image = crate::img::decode(&bytes).unwrap().0.to_rgba8();
+            let columns: Vec<u32> = (0..image.width())
+                .filter(|&x| (0..image.height()).any(|y| image.get_pixel(x, y)[3] > 64))
+                .collect();
+            (request, columns.last().unwrap() - columns[0] + 1)
+        };
+        let (fallback, fallback_ink) = source(&dom);
+        let url = "https://example.test/page/fonts/late-svg.ttf";
+        assert_eq!(
+            dom.take_font_requests(),
+            vec![url::Url::parse(url).unwrap()]
+        );
+        let mono = include_bytes!("../assets/fonts/dejavu/DejaVuSansMono.ttf");
+        dom.install_downloaded_font(url, Some(mono.to_vec()));
+        let (loaded, loaded_ink) = source(&dom);
+        assert_ne!(
+            fallback, loaded,
+            "the web font must give a new image source"
+        );
+        assert!(
+            loaded_ink > fallback_ink * 3 / 2,
+            "web font ink {loaded_ink}px, fallback ink {fallback_ink}px"
+        );
     }
 
     #[test]

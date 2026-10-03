@@ -129,6 +129,7 @@ fn shadow_character_data_invalidates_both_formatting_paths() {
                 crate::font_system::page_font_epoch(),
                 crate::img::svg_intrinsic_epoch(),
                 crate::dom::svg_sprite_revision(),
+                crate::img::document_svg_revision(),
             );
             measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
             dom.set_text(changed, data);
@@ -138,6 +139,7 @@ fn shadow_character_data_invalidates_both_formatting_paths() {
                     crate::font_system::page_font_epoch(),
                     crate::img::svg_intrinsic_epoch(),
                     crate::dom::svg_sprite_revision(),
+                    crate::img::document_svg_revision(),
                 )
             {
                 assert!(

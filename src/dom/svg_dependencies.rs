@@ -502,6 +502,7 @@ mod tests {
                 crate::font_system::page_font_epoch(),
                 crate::img::svg_intrinsic_epoch(),
                 super::super::svg_sprite_revision(),
+                crate::img::document_svg_revision(),
             )
         };
         for _ in 0..16 {
