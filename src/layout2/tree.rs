@@ -967,6 +967,37 @@ impl Builder<'_> {
         })
     }
 
+    /// HTML Rendering #dimRendering: an image's width and height attributes
+    /// map to the dimension properties (and as a pair to `aspect-ratio`),
+    /// below author declarations. Inline replaced sizing reads them itself,
+    /// but an image wrapped in an atomic box for its stacking context sizes
+    /// that box from its style, so the box carries them; a percentage then
+    /// resolves against the line's containing block rather than collapsing
+    /// to the natural size.
+    fn with_dimension_attributes(&self, id: NodeId, atom: &Atom, mut style: BoxStyle) -> BoxStyle {
+        let AtomKind::Img {
+            dimension_source, ..
+        } = &atom.kind
+        else {
+            return style;
+        };
+        for (property, slot) in [("width", &mut style.width), ("height", &mut style.height)] {
+            if !self.dom.author_declares(id, property)
+                && let Some(value) =
+                    super::replaced::dimension_attribute(self.dom, *dimension_source, property)
+            {
+                *slot = value;
+            }
+        }
+        if !self.dom.author_declares(id, "aspect-ratio")
+            && let Some(ratio) =
+                super::replaced::dimension_attribute_ratio(self.dom, *dimension_source)
+        {
+            style.aspect_ratio = Some(ratio);
+        }
+        style
+    }
+
     /// A replaced element: inline-level by default, block-level when its
     /// computed display says so (`display:block` images stack on their own
     /// line and can center through auto margins).
@@ -992,7 +1023,7 @@ impl Builder<'_> {
             }
             _ if stacking_context => Built::Inline(Inline::AtomBox(Arc::new(BoxNode {
                 node: id,
-                style,
+                style: self.with_dimension_attributes(id, &atom, style),
                 content: Content::Atomic(atom),
                 marker: None,
                 marker_image: None,

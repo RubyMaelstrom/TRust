@@ -3396,6 +3396,26 @@ mod tests {
     }
 
     #[test]
+    fn percentage_width_attributes_size_styled_images() {
+        // HTML Rendering #dimRendering: `width="50%"` maps to the width
+        // property, whatever else the element's style attribute sets
+        // (item64.neocities.org's `style="filter:drop-shadow(...)"` image
+        // kept its natural 56px width). LibreWolf: 200 x 439.3.
+        let mut images = HashMap::new();
+        images.insert("http://e.com/i.png".to_string(), (56u32, 123u32));
+        let html = r#"<body style="margin:0"><div style="width:400px">
+            <img id=a src="i.png" width="50%"><img id=b src="i.png" width="50%" style="opacity:.9">
+            <img id=c src="i.png" width="50%" style="filter:drop-shadow(0 0 10px red)"></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1024.0, &images);
+        for id in ["a", "b", "c"] {
+            let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
+            assert_eq!(rect.width, 200.0, "{id}");
+            assert!((rect.height - 439.3).abs() < 0.1, "{id} {}", rect.height);
+        }
+    }
+
+    #[test]
     fn decoded_image_reserves_box_and_text_sits_on_baseline() {
         let mut images = HashMap::new();
         images.insert("http://e.com/i.png".to_string(), (80u32, 48u32));
