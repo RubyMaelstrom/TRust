@@ -736,6 +736,7 @@ pub(crate) fn worker_prelude() -> &'static str {
             let ports = platform_block("/*__PORTS_BEGIN__*/", "/*__PORTS_END__*/");
             let headers = wrapped_platform_block("/*__HEADERS_BEGIN__*/", "/*__HEADERS_END__*/");
             let codec = platform_block("/*__SC_CODEC_BEGIN__*/", "/*__SC_CODEC_END__*/");
+            let features = platform_block("/*__FEATURES_BEGIN__*/", "/*__FEATURES_END__*/");
             let bitmap = platform_block("/*__IMAGE_BITMAP_BEGIN__*/", "/*__IMAGE_BITMAP_END__*/");
             let crypto = wrapped_platform_block("/*__CRYPTO_BEGIN__*/", "/*__CRYPTO_END__*/");
             let streams = wrapped_platform_block("/*__STREAMS_BEGIN__*/", "/*__STREAMS_END__*/");
@@ -747,7 +748,7 @@ pub(crate) fn worker_prelude() -> &'static str {
             let performance = platform_block("/*__PERFORMANCE_BEGIN__*/", "/*__PERFORMANCE_END__*/");
             let geometry = wrapped_platform_block("/*__GEOMETRY_BEGIN__*/", "/*__GEOMETRY_END__*/");
             format!(
-                "{WORKER_SCOPE}\n{geometry}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{bitmap}\n{headers}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                "{WORKER_SCOPE}\n{geometry}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{bitmap}\n{headers}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\
                  delete globalThis.__bitmap_api; delete globalThis.__sc_bitmap_codec;\n\

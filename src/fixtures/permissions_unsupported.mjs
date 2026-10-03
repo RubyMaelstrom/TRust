@@ -11,7 +11,8 @@
     const permissions=navigator.permissions;
     // None of these powerful APIs is implemented by the browser. Pretending
     // the browser could prompt for one is not an honest capability report.
-    for (const name of ['not-a-real-permission','geolocation','camera','microphone','notifications','midi','clipboard-read'])
+    // ("notifications" and "persistent-storage" are supported features.)
+    for (const name of ['not-a-real-permission','geolocation','camera','microphone','midi','clipboard-read','clipboard-write','push','speaker-selection'])
         await rejects('TypeError',()=>permissions.query({name}));
     for (const descriptor of [undefined,null,1,'camera',Symbol(),{}, {name:undefined}, {name:Symbol()}])
         await rejects('TypeError',()=>permissions.query(descriptor));

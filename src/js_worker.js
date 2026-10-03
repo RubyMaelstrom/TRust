@@ -2,6 +2,9 @@
     var g = globalThis;
     var portAPI;
     const bitmapTasks = [];
+    // Tasks queued by the shared platform features (permissions, storage,
+    // notifications): one FIFO selected by the worker event loop.
+    const platformTasks = [];
     var cfg = g.__worker_cfg || { id: 0, name: "", type: "classic", url: "about:blank", language: "en-US", languages: ["en-US", "en"], hwc: 8 };
     function errStr(where, e) {
         try { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
@@ -51,6 +54,12 @@
             }));
         },
         installPorts: function (api) { portAPI = api; },
+        hasPlatformTask: function () { return platformTasks.length > 0; },
+        runPlatformTask: function () {
+            if (!platformTasks.length) return false;
+            try { platformTasks.shift()(); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
+            return true;
+        },
         hasBitmapTask: function () { return bitmapTasks.length > 0; },
         runBitmapTask: function () { if (!bitmapTasks.length) return false; bitmapTasks.shift()(); return true; },
         hasPortTask: function () { return portAPI.hasTask(); },
@@ -377,6 +386,20 @@
         configurable: true, enumerable: true,
         get: function () { return navigatorGpc; }
     });
+    // The shared Permissions block and the features built on it run in this
+    // WorkerGlobalScope through this bootstrap-only adapter (see the Window's).
+    g.__feature_adapter = {
+        EventTarget: g.EventTarget, window: false,
+        add(target, type, fn) { addListener.call(target, type, fn); },
+        remove(target, type, fn) { removeListener.call(target, type, fn); },
+        fire(target, type) { dispatchScopeEvent(trustedScopeEvent(Event, type, {}), true, target); },
+        queue(fn) { platformTasks.push(fn); },
+        report(error) { WK.errors.push(errStr("callback", error)); },
+        origin() { return lp[8] || "null"; },
+        baseURL() { return lp[0]; },
+        secure: !!cfg.secureContext,
+        context: 0,
+    };
 
     // --- atob / btoa ---
     var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
