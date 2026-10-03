@@ -2700,6 +2700,45 @@ mod desktop {
         wake
     }
 
+    /// Repaint the current retained fragments for a paint-only animation
+    /// frame, keeping every other product of the previous presentation.
+    /// `None` when the retained geometry no longer describes the document.
+    fn repaint_animation_frame(page: &mut LumenPage) -> Option<crate::http::RenderedPage> {
+        let (cache, images) = {
+            let state = page.engine.ctx().host_mut::<HostState>()?;
+            (state.geom_cache.clone(), state.images.clone())
+        };
+        {
+            let dom = page.dom.borrow();
+            let cached = cache.borrow();
+            if cached.epoch != dom.epoch()
+                || cached.presentation_epoch != dom.layout_presentation_epoch()
+                || cached.svg_sprite_revision != crate::dom::svg_sprite_revision()
+                || cached.fragments.is_none()
+            {
+                return None;
+            }
+        }
+        // Synchronizes the animation sample; the geometry stays current.
+        let cache = ensure_host_geom_cache(page.engine.ctx(), "animation frame");
+        let previous = page.last_render.as_ref()?;
+        let dom = page.dom.borrow();
+        let cached = cache.borrow();
+        let layout = crate::layout2::paint_retained_layout(
+            &dom,
+            &page.base,
+            &previous.controls,
+            &images.borrow(),
+            cached.fragments.clone()?,
+            cached.boxes.clone(),
+            cached.tracks.clone(),
+            page.terminal_presentation,
+        );
+        let mut rendered = previous.clone();
+        rendered.layout = std::sync::Arc::new(layout);
+        Some(rendered)
+    }
+
     fn rendering_input_budget(started: Instant) -> Duration {
         // HTML #event-loop-processing-model allows preferring user input.
         // When a frame already costs more than two display intervals, let a
@@ -4774,12 +4813,46 @@ mod desktop {
                 trace.dirty_finishes += 1;
             }
         }
-        #[cfg(test)]
         let mut render_handled = false;
-        #[cfg(not(test))]
-        let render_handled = false;
+        // CSS Animations 1 #animations: a frame that only changed paint-only
+        // animation-origin values repaints the retained fragments
+        // (`layout2::repaint_graphical`); forms, resources, accessibility and
+        // observer state cannot have changed without a DOM mutation.
+        if render_now
+            && page.render_pending
+            && animation_frame
+            && animation_paint
+            && !animation_layout
+            && let Some(rendered) = repaint_animation_frame(page)
+        {
+            page.render_pending = false;
+            render_handled = true;
+            if page
+                .last_render
+                .as_ref()
+                .is_none_or(|previous| !previous.visually_eq(&rendered))
+            {
+                page.last_render = Some(rendered.clone());
+                page.boundary_render.clear();
+                let mut outcome = std::mem::take(&mut page.outcome);
+                outcome.elapsed = page.started.elapsed();
+                outcome.rendered = Some(Box::new(rendered));
+                outcome.animation_frame = true;
+                if events
+                    .blocking_send(PageEvt::Updated {
+                        html: String::new(),
+                        outcome,
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                sent_primary = true;
+            }
+        }
         #[cfg(test)]
         if render_now
+            && !render_handled
             && page.render_pending
             && dom_dirty
             && !environment_dirty
@@ -5588,14 +5661,20 @@ mod desktop {
             let deadline = tokio::time::Instant::now() + window;
             while let Ok(event) = tokio::time::timeout_at(deadline, events.recv()).await {
                 match event {
-                    Some(PageEvt::Updated { outcome, .. }) => {
+                    Some(PageEvt::Updated {
+                        html: serialized,
+                        outcome,
+                    }) => {
                         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
                         let rendered = outcome.rendered.expect("typed presentation");
                         if outcome.animation_frame {
                             frames += 1;
-                            // Paint-only frames keep the retained geometry.
+                            // Paint-only frames repaint the retained geometry
+                            // without the full presentation rebuild (which
+                            // serializes the document under test).
                             if !html.contains("letter-spacing") {
                                 assert_eq!(rendered.layout.boxes, boxes);
+                                assert!(serialized.is_empty(), "paint-only frame was rebuilt");
                             }
                         }
                         for color in glyph_colors(&rendered.layout.paint) {
