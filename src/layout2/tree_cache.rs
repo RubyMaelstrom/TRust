@@ -168,6 +168,7 @@ pub(super) fn box_bytes(b: &BoxNode) -> usize {
                     + t.col_specs.capacity() * size_of::<Option<super::tree::ColSpec>>()
                     + t.cells.capacity() * size_of::<super::tree::TableCell>()
                     + t.cells.iter().map(|c| box_bytes(&c.b)).sum::<usize>()
+                    + t.collapsed.as_ref().map_or(0, |c| c.retained_bytes())
             }
         }
 }

@@ -11551,6 +11551,128 @@ b</xmp></body>"#;
         }
     }
 
+    /// The graphical layout of a collapsed-border fixture, and a lookup of
+    /// each element's border box relative to the `#t` table's.
+    fn collapsed_fixture(html: &str) -> (Dom, HashMap<NodeId, PxRect>) {
+        let dom = Dom::parse_document(&format!(
+            "<!doctype html><style>body{{margin:0}}</style>{html}"
+        ));
+        let layout = lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            Viewport::new(640., 480.),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        (dom, layout.boxes)
+    }
+
+    #[test]
+    fn collapsed_borders_are_halved_between_cells_and_the_table() {
+        // CSS 2.2 §17.6.2, after §17.6.2.1's own example: borders are
+        // centered on the grid lines, so each cell's border box holds half
+        // of every collapsed border on its edges and cells abut; the table's
+        // border is half its outer collapsed borders. The column's 3px border
+        // beats the cells' 1px ones, the 5px cells beat that, and the table's
+        // 5px border wins its outer edges. A child shows each cell's used
+        // left/top border and, through its width, the left+right sum.
+        let (dom, boxes) = collapsed_fixture(
+            r#"<style>
+            table{border-collapse:collapse;border:5px solid yellow}
+            .c1{border:3px solid black}
+            td{border:1px solid red;padding:0;width:20px;vertical-align:top}
+            td div{height:10px}
+            .five{border:5px dashed blue}.six{border:5px solid green}
+            </style><table id=t><col class=c1><col><col>
+            <tr><td id=a><div id=ai></div><td id=b><div id=bi></div><td id=c><div id=ci></div></tr>
+            <tr><td id=d><div id=di></div><td id=e class=five><div id=ei></div>
+                <td id=f class=six><div id=fi></div></tr></table>"#,
+        );
+        let table = *rect(&dom, &boxes, "t");
+        assert_eq!((table.width, table.height), (80., 35.));
+        let cell = |id: &str| {
+            let cell = rect(&dom, &boxes, id);
+            let inner = rect(&dom, &boxes, &format!("{id}i"));
+            (
+                (cell.left - table.left, cell.top - table.top),
+                (cell.width, cell.height),
+                (inner.left - cell.left, inner.top - cell.top, inner.width),
+            )
+        };
+        assert_eq!(cell("a"), ((2.5, 2.5), (25., 15.), (2.5, 2.5, 21.)));
+        assert_eq!(cell("b"), ((27.5, 2.5), (25., 15.), (1.5, 2.5, 23.)));
+        assert_eq!(cell("c"), ((52.5, 2.5), (25., 15.), (0.5, 2.5, 22.)));
+        assert_eq!(cell("d"), ((2.5, 17.5), (25., 15.), (2.5, 0.5, 20.)));
+        assert_eq!(cell("e"), ((27.5, 17.5), (25., 15.), (2.5, 2.5, 20.)));
+        assert_eq!(cell("f"), ((52.5, 17.5), (25., 15.), (2.5, 2.5, 20.)));
+    }
+
+    #[test]
+    fn collapsed_ridge_rows_stack_like_the_reference_engines() {
+        // The beedge.neocities.org links table: `table, th, tr, td { border:
+        // 2px ridge }`. One shared 2px border separates rows, so 19px rows
+        // with 1px cell padding are 23px apart and the table is 71px tall,
+        // as in Chromium and Gecko — not 2px + 2px between cells.
+        let (dom, boxes) = collapsed_fixture(
+            r#"<style>table,th,tr,td{border:2px ridge;border-collapse:collapse}
+            td{width:40px;height:19px}</style>
+            <table id=t><tr><td id=a></td></tr><tr><td id=b></td></tr><tr><td id=c></td></tr></table>"#,
+        );
+        let table = *rect(&dom, &boxes, "t");
+        assert_eq!(table.height, 71.);
+        for (id, top) in [("a", 1.), ("b", 24.), ("c", 47.)] {
+            let cell = rect(&dom, &boxes, id);
+            assert_eq!((cell.left - table.left, cell.top - table.top), (1., top));
+            assert_eq!((cell.width, cell.height), (44., 23.), "{id}");
+        }
+    }
+
+    #[test]
+    fn collapsed_table_borders_follow_the_first_row_and_hidden_suppresses() {
+        // CSS 2.2 §17.6.2: the table's left and right border widths are half
+        // the first row's collapsed left and right borders; a wider border
+        // further down spills into the margin instead of moving the grid.
+        // §17.6.2.1 rule 1: `hidden` removes the edge for both cells.
+        let (dom, boxes) = collapsed_fixture(
+            r#"<style>table{border-collapse:collapse;border:2px solid}
+            td{padding:0;width:10px;height:10px;border:2px solid}</style>
+            <table id=t><tr><td id=a style="border-right:hidden"></td><td id=b></td></tr>
+            <tr><td id=c style="border-left:8px solid"></td><td id=d></td></tr></table>"#,
+        );
+        let table = *rect(&dom, &boxes, "t");
+        let left = |id: &str| rect(&dom, &boxes, id).left - table.left;
+        // Columns: max(1 + 10 + 0, 4 + 10 + 1) and max(0 + 10 + 1, 1 + 10 + 1).
+        assert_eq!(table.width, 1. + 15. + 12. + 1.);
+        assert_eq!((left("a"), left("c")), (1., 1.));
+        assert_eq!((left("b"), left("d")), (16., 16.));
+        // Rows: 1 + 10 + 1 each, the table's top and bottom borders 1px.
+        assert_eq!(table.height, 1. + 12. + 12. + 1.);
+    }
+
+    #[test]
+    fn collapsed_spanning_cells_take_their_widest_edge() {
+        // CSS 2.2 §17.6.2.1 resolves each grid edge segment separately; a
+        // cell spanning two rows holds half the widest of the collapsed
+        // borders along its side (CSS Tables 3 #border-conflict-resolution-
+        // algorithm: "Divide the used width of all borders by two").
+        let (dom, boxes) = collapsed_fixture(
+            r#"<style>table{border-collapse:collapse}
+            td{padding:0;width:10px;height:10px;border:2px solid;vertical-align:top}
+            td div{height:4px}</style>
+            <table id=t><tr><td id=a></td><td id=s rowspan=2><div id=si></div></td></tr>
+            <tr><td id=b style="border-right:10px solid"></td></tr></table>"#,
+        );
+        let span = rect(&dom, &boxes, "s");
+        let inner = rect(&dom, &boxes, "si");
+        let a = rect(&dom, &boxes, "a");
+        // Left border 5 (the 10px edge beside row 2), right border 1.
+        assert_eq!(inner.left - span.left, 5.);
+        assert_eq!(inner.width, span.width - 5. - 1.);
+        assert_eq!(span.left, a.left + a.width);
+        assert_eq!(span.height, rect(&dom, &boxes, "t").height - 2.);
+    }
+
     #[test]
     fn css_padding_overrides_cellpadding_per_side() {
         // HTML Rendering #tables-2: `cellpadding` is a presentational hint for

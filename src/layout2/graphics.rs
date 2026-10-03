@@ -1571,6 +1571,12 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
     if fragment.flow.hidden {
         return;
     }
+    if let Some(collapsed) = &fragment.paint.collapsed_borders
+        && collapsed.cell.is_none()
+    {
+        paint_collapsed_borders(fragment, collapsed, builder);
+        return;
+    }
     let style = PaintStyle::of(fragment);
     if style.is_some_and(|style| {
         matches!(
@@ -1699,6 +1705,29 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             paint_nested_document_canvas(fragment, builder);
         }
         paint_borders(fragment, radii, builder);
+        if let Some(collapsed) = &fragment.paint.collapsed_borders
+            && collapsed.cell.is_some()
+        {
+            // A positioned cell paints after its table's collapsed borders
+            // (CSS 2.2 Appendix E); repaint them over its background. The
+            // clip covers every device pixel the background touched, so its
+            // antialiased edge cannot show through the snapped bands.
+            let ratio = builder.dom.device_pixel_ratio().max(f32::EPSILON);
+            let (left, top) = ((rect.x * ratio).floor(), (rect.y * ratio).floor());
+            let right = ((rect.x + rect.width) * ratio).ceil();
+            let bottom = ((rect.y + rect.height) * ratio).ceil();
+            let area = CssRect::new(
+                left / ratio,
+                top / ratio,
+                (right - left) / ratio,
+                (bottom - top) / ratio,
+            );
+            builder
+                .commands
+                .push(DisplayCommand::PushClip(PaintShape::Rect(area)));
+            emit_collapsed_borders(fragment, collapsed, builder);
+            builder.commands.push(DisplayCommand::PopClip);
+        }
         paint_number_spin_buttons(fragment, builder);
         // CSS Pseudo 4 §4.1 generates a real box even for content:"". Its hit
         // target is the originating element, including when positioned outside
@@ -4392,6 +4421,12 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
     let Some(style) = PaintStyle::of(fragment) else {
         return;
     };
+    // CSS Tables 3 #drawing-collapsed-borders-1 and -2: a collapsed table
+    // and its cells paint no borders of their own; the table's resolved
+    // grid edges are painted once each by `paint_collapsed_borders`.
+    if fragment.paint.border_collapsed {
+        return;
+    }
     if paint_border_image(fragment, style, builder) {
         return;
     }
@@ -4408,7 +4443,6 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         border_color(builder.dom, style, side)
             .unwrap_or_else(|| text_color_for_style(builder.dom, style))
     });
-    let collapse = style.value(builder.dom, "border-collapse").as_deref() == Some("collapse");
     paint_border_edges(
         builder,
         BorderEdges {
@@ -4418,8 +4452,246 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
             styles: styles.each_ref().map(String::as_str),
             colors,
         },
-        collapse,
+        false,
     );
+}
+
+/// The two edges of a band `width` wide centered on `center`, in device
+/// pixels. CSS 2.2 §17.6.2 centers collapsed borders on the grid lines and
+/// requires "a consistent rule for rounding off in the case of an odd
+/// number of discrete units": the band's start rounds to the nearest device
+/// pixel and it keeps its width, so abutting bands neither gap nor overlap.
+fn snap_band(center: f32, width: f32, ratio: f32) -> (f32, f32) {
+    let device = (width * ratio).round();
+    let start = (center * ratio - device / 2.0).round();
+    (start / ratio, (start + device) / ratio)
+}
+
+/// CSS 2.2 §17.6.2: paint each of a collapsed table's resolved grid edges
+/// once, centered on its grid line, with the width, style and color of the
+/// border that won it (§17.6.2.1). Where edges meet, the one that wins
+/// there by the same rules covers the junction and the others stop at its
+/// band; collinear edges of one appearance join into one run so dashes and
+/// dots continue across cells. CSS Tables 3 #border-style-overrides: inset
+/// draws as ridge and outset as groove.
+fn paint_collapsed_borders(
+    fragment: &Frag,
+    collapsed: &super::table::CollapsedRef,
+    builder: &mut Builder<'_>,
+) {
+    let table = collapsed.paint.borders.table;
+    if matches!(
+        PaintStyle::Element(table)
+            .value(builder.dom, "visibility")
+            .as_deref(),
+        Some("hidden" | "collapse")
+    ) {
+        return;
+    }
+    let scroll_depth = builder.push_scroll_ancestors(table);
+    let clip = builder.ancestor_clip(table, fragment.clip);
+    let clipped = clip.is_some_and(|clip| builder.push_hard_clip(clip));
+    let marquee = builder.marquee_scope(table, false);
+    if let Some(scope) = marquee.clone() {
+        builder.push_marquee_scope(scope);
+    }
+    emit_collapsed_borders(fragment, collapsed, builder);
+    if marquee.is_some() {
+        builder.pop_marquee_scope();
+    }
+    if clipped {
+        builder.pop_hard_clip();
+    }
+    builder.pop_scroll_ancestors(scroll_depth);
+}
+
+/// The display commands of `paint_collapsed_borders`, in the caller's
+/// paint scope.
+fn emit_collapsed_borders(
+    fragment: &Frag,
+    collapsed: &super::table::CollapsedRef,
+    builder: &mut Builder<'_>,
+) {
+    use super::table::{CollapsedEdge, EdgeStyle};
+    let paint = &collapsed.paint;
+    let borders = &paint.borders;
+    let (nrows, ncols) = (borders.nrows, borders.ncols);
+    if paint.xs.len() != ncols + 1 || paint.ys.len() != nrows + 1 {
+        return;
+    }
+    let ratio = builder.dom.device_pixel_ratio();
+    let ratio = if ratio.is_finite() && ratio > 0.0 {
+        ratio
+    } else {
+        1.0
+    };
+    let [origin_x, origin_y] = collapsed.origin;
+    let xs: Vec<f32> = paint.xs.iter().map(|x| fragment.x + origin_x + x).collect();
+    let ys: Vec<f32> = paint.ys.iter().map(|y| fragment.y + origin_y + y).collect();
+    // The grid lines and the steps along them to paint: every edge, or for
+    // a positioned cell (clipped to its border box by the caller) the edges
+    // around it and those whose junction bands reach into it.
+    let (rows, cols) = match collapsed.cell {
+        Some([row, col, row_end, col_end]) => (
+            row.saturating_sub(1)..(row_end + 1).min(nrows),
+            col.saturating_sub(1)..(col_end + 1).min(ncols),
+        ),
+        None => (0..nrows, 0..ncols),
+    };
+    let (row_lines, col_lines) = match collapsed.cell {
+        Some([row, col, row_end, col_end]) => (row..row_end + 1, col..col_end + 1),
+        None => (0..nrows + 1, 0..ncols + 1),
+    };
+    // Junction (r, c) joins the edges to its left, above, right and below:
+    // the arm of the edge that wins there (if any), and the widths of the
+    // widest horizontal and vertical edges meeting at it.
+    const LEFT_ARM: u8 = 0;
+    const UP_ARM: u8 = 1;
+    const RIGHT_ARM: u8 = 2;
+    const DOWN_ARM: u8 = 3;
+    let width = |edge: Option<&CollapsedEdge>| edge.map_or(0.0, |edge| edge.width);
+    let junction = |r: usize, c: usize| {
+        let arms = [
+            c.checked_sub(1).and_then(|c| borders.horizontal(r, c)),
+            r.checked_sub(1).and_then(|r| borders.vertical(r, c)),
+            (c < ncols).then(|| borders.horizontal(r, c)).flatten(),
+            (r < nrows).then(|| borders.vertical(r, c)).flatten(),
+        ];
+        let mut winner: Option<(u8, &CollapsedEdge)> = None;
+        for (arm, edge) in arms.into_iter().enumerate() {
+            if let Some(edge) = edge
+                && winner.is_none_or(|(_, best)| edge.beats(best))
+            {
+                winner = Some((arm as u8, edge));
+            }
+        }
+        (
+            winner.map(|(arm, _)| arm),
+            width(arms[LEFT_ARM as usize]).max(width(arms[RIGHT_ARM as usize])),
+            width(arms[UP_ARM as usize]).max(width(arms[DOWN_ARM as usize])),
+        )
+    };
+    let mut colors = HashMap::<(NodeId, u8), PaintColor>::new();
+    let mut color_of = |edge: &CollapsedEdge| {
+        *colors.entry((edge.source, edge.side)).or_insert_with(|| {
+            let style = PaintStyle::Element(edge.source);
+            let side = ["top", "right", "bottom", "left"][edge.side as usize & 3];
+            border_color(builder.dom, style, side)
+                .unwrap_or_else(|| text_color_for_style(builder.dom, style))
+        })
+    };
+    // (horizontal, line center, start, end, style, width, color)
+    type Run = (bool, f32, f32, f32, EdgeStyle, f32, PaintColor);
+    let mut runs: Vec<Run> = Vec::new();
+    for horizontal in [true, false] {
+        let (lines, steps) = if horizontal {
+            (row_lines.clone(), cols.clone())
+        } else {
+            (col_lines.clone(), rows.clone())
+        };
+        for line in lines {
+            let mut open: Option<Run> = None;
+            for step in steps.clone() {
+                let (edge, before, after, center, from, to) = if horizontal {
+                    (
+                        borders.horizontal(line, step),
+                        junction(line, step),
+                        junction(line, step + 1),
+                        ys[line],
+                        xs[step],
+                        xs[step + 1],
+                    )
+                } else {
+                    (
+                        borders.vertical(step, line),
+                        junction(step, line),
+                        junction(step + 1, line),
+                        xs[line],
+                        ys[step],
+                        ys[step + 1],
+                    )
+                };
+                let Some(edge) = edge else {
+                    runs.extend(open.take());
+                    continue;
+                };
+                // This edge's arm seen from the junctions at its two ends,
+                // and the extent the crossing edges' bands cover there.
+                let (from_arm, to_arm, cross_before, cross_after) = if horizontal {
+                    (RIGHT_ARM, LEFT_ARM, before.2, after.2)
+                } else {
+                    (DOWN_ARM, UP_ARM, before.1, after.1)
+                };
+                let band_before = snap_band(from, cross_before, ratio);
+                let band_after = snap_band(to, cross_after, ratio);
+                let start = if before.0 == Some(from_arm) {
+                    band_before.0
+                } else {
+                    band_before.1
+                };
+                let end = if after.0 == Some(to_arm) {
+                    band_after.1
+                } else {
+                    band_after.0
+                };
+                let color = color_of(edge);
+                let through = before.0 == Some(from_arm) || before.0 == Some(to_arm);
+                match &mut open {
+                    Some(run)
+                        if through
+                            && run.4 == edge.style
+                            && run.5 == edge.width
+                            && run.6 == color =>
+                    {
+                        run.3 = end;
+                    }
+                    _ => {
+                        runs.extend(open.take());
+                        open = Some((
+                            horizontal, center, start, end, edge.style, edge.width, color,
+                        ));
+                    }
+                }
+            }
+            runs.extend(open);
+        }
+    }
+    for (horizontal, center, start, end, style, width, color) in runs {
+        if end <= start {
+            continue;
+        }
+        let (near, far) = snap_band(center, width, ratio);
+        let rect = if horizontal {
+            CssRect::new(start, near, end - start, far - near)
+        } else {
+            CssRect::new(near, start, far - near, end - start)
+        };
+        if style == EdgeStyle::Solid {
+            builder.commands.push(DisplayCommand::Fill {
+                shape: PaintShape::Rect(rect),
+                brush: PaintBrush::Solid(color),
+            });
+            continue;
+        }
+        // A horizontal run paints as a box's top side and a vertical one as
+        // its left side, so the 3D styles keep their top-left relief.
+        let side = if horizontal { 0 } else { 3 };
+        let mut widths = [0.0; 4];
+        widths[side] = far - near;
+        let mut styles = ["none"; 4];
+        styles[side] = style.keyword();
+        paint_border_edges(
+            builder,
+            BorderEdges {
+                rect,
+                radii: CornerRadii::default(),
+                widths,
+                styles,
+                colors: [color; 4],
+            },
+            true,
+        );
+    }
 }
 
 /// Paint the band of each of a box's border edges, or of its outline.
@@ -7614,6 +7886,113 @@ mod tests {
                 [134, 134, 109],
                 "{offset}"
             );
+        }
+    }
+
+    #[test]
+    fn collapsed_borders_paint_each_edge_once() {
+        // CSS 2.2 §17.6.2: `table, td { border: 2px solid }` collapses to one
+        // 2px border per grid edge, centered on the grid line. The table and
+        // cell boxes paint no borders of their own (CSS Tables 3
+        // #drawing-collapsed-borders-1/-2), so the resolved edges cover the
+        // ring exactly once: the table's 1px half border plus the cell's.
+        let (_, layout) = render_fixture(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <table style="position:absolute;left:10px;top:10px;border-collapse:collapse;border:2px solid rgb(1,2,3)">
+            <tr><td style="padding:0;width:20px;height:20px;border:2px solid rgb(1,2,3)"></td></tr></table>"#,
+        );
+        let edges: Vec<CssRect> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::Fill {
+                    shape: PaintShape::Rect(rect),
+                    brush: PaintBrush::Solid(PaintColor::Rgba(1, 2, 3, 255)),
+                } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edges.len(), 4, "{edges:?}");
+        assert!(
+            edges.iter().all(|rect| rect.width.min(rect.height) == 2.),
+            "{edges:?}"
+        );
+        let area: f32 = edges.iter().map(|rect| rect.width * rect.height).sum();
+        assert_eq!(area, 24. * 24. - 20. * 20., "{edges:?}");
+        assert_eq!(
+            layout
+                .paint
+                .primitives
+                .iter()
+                .filter(|command| matches!(command, DisplayCommand::Fill { .. }))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn collapsed_borders_draw_shared_rules_over_cell_backgrounds() {
+        // CSS 2.2 §17.6.2: adjacent cells share one 1px rule, painted after
+        // every cell background (Appendix E: "all table borders"); a
+        // positioned cell, painted later, has the rules repainted over it.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <style>td{border:1px solid black;padding:0;width:20px;height:20px;background:yellow}</style>
+            <table style="position:absolute;left:10px;top:10px;border-collapse:collapse;border:1px solid black">
+            <tr><td></td><td></td></tr>
+            <tr><td style="position:relative"></td><td style="position:relative"></td></tr></table>"#,
+        );
+        let dark = |[r, g, b]: [u8; 3]| r < 100 && g < 100 && b < 100;
+        let rules = vec![(10, 11), (31, 32), (52, 53)];
+        for y in [20, 42] {
+            assert_eq!(
+                ink_runs((0..70).map(|x| (x, dark(pixel(x, y))))),
+                rules,
+                "row {y}"
+            );
+        }
+        for x in [20, 42] {
+            assert_eq!(
+                ink_runs((0..70).map(|y| (y, dark(pixel(x, y))))),
+                rules,
+                "column {x}"
+            );
+        }
+        assert_eq!(pixel(20, 20), [255, 255, 0]);
+        assert_eq!(pixel(42, 42), [255, 255, 0]);
+    }
+
+    #[test]
+    fn collapsed_border_conflicts_pick_the_most_eye_catching_border() {
+        // CSS 2.2 §17.6.2.1: `hidden` suppresses an edge (rule 1), wider
+        // beats narrower and double beats solid (rule 3), and at equal
+        // width and style a cell beats its row, which beats the table
+        // (rule 4). The table's blue border loses everywhere.
+        let pixel = render_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <style>td{padding:0;width:20px;height:20px}</style>
+            <table style="position:absolute;left:100px;top:10px;border-collapse:collapse;border:4px solid blue">
+            <tr style="border:4px solid lime"><td style="border:4px solid red"></td>
+            <td style="border-top:hidden;border-right:6px double red"></td></tr></table>"#,
+        );
+        let (red, lime, white) = ([255, 0, 0], [0, 255, 0], [255, 255, 255]);
+        // The first cell's red border wins its four edges over row and table.
+        for (x, y) in [(101, 24), (112, 11), (126, 24), (112, 37)] {
+            assert_eq!(pixel(x, y), red, "({x}, {y})");
+        }
+        // Above the second cell, `hidden` leaves the table's border space bare.
+        assert_eq!(pixel(138, 11), white);
+        // Below it the row's border beats the table's.
+        assert_eq!(pixel(138, 37), lime);
+        // At the table's right edge the 6px double beats the 4px solids.
+        assert_eq!(pixel(148, 24), red);
+        assert_eq!(pixel(150, 24), white);
+        assert_eq!(pixel(153, 24), red);
+        for y in 0..50 {
+            for x in 90..170 {
+                assert_ne!(pixel(x, y), [0, 0, 255], "({x}, {y})");
+            }
         }
     }
 

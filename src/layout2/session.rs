@@ -202,6 +202,9 @@ impl LayoutFragments {
                 }
                 _ => {}
             }
+            if let Some(collapsed) = &frag.paint.collapsed_borders {
+                bytes += collapsed.retained_bytes();
+            }
             bytes + frag.children.iter().map(fragment).sum::<usize>()
         }
         std::mem::size_of::<Self>()

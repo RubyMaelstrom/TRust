@@ -751,6 +751,15 @@ fn border_side(dom: &Dom, id: NodeId, side: &str, u: Units) -> f32 {
     )
 }
 
+/// One side's computed `border-*-style` keyword and used width (px, 0 for
+/// `none`/`hidden`) — what CSS 2.2 §17.6.2.1 border conflict resolution
+/// compares for every table box meeting at a collapsed edge.
+pub(super) fn border_edge(dom: &Dom, id: NodeId, side: usize) -> (Option<String>, f32) {
+    let name = ["top", "right", "bottom", "left"][side];
+    let style = dom.computed_value_resolved(id, &format!("border-{name}-style"));
+    (style, border_side(dom, id, name, Units::of(dom, id)))
+}
+
 /// A computed `<line-width>` in CSS px, snapped as a line width (CSS
 /// Backgrounds 3 #border-width, CSS UI 4 #outline-width).
 fn line_width(dom: &Dom, value: Option<&str>, u: Units) -> f32 {
