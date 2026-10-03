@@ -16471,6 +16471,16 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
             (v, false)
         };
     let v = v.trim();
+    // CSS Syntax 3 #parse-a-declaration: a value that does not match its
+    // property's grammar invalidates the declaration, and no property's
+    // grammar has a top-level `:` token. A missing semicolon
+    // (vickkuma.neocities.org's `background-clip:` swallowing the next
+    // `text-shadow: …` line) must leave the earlier declaration in force.
+    // Author CSS never holds U+0000 (CSS Syntax 3 #input-preprocessing), so
+    // it marks TRust's own pending-shorthand values.
+    if !custom && !v.starts_with('\0') && has_top_level_colon(v) {
+        return None;
+    }
     let value = if k == "anchor-name" && find_var_function(v).is_none() && wide_keyword(v).is_none()
     {
         // CSS Anchor Positioning 1 §2: the dashed-ident list is parsed once
@@ -16593,6 +16603,19 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
         return None;
     }
     Some((k, value, important))
+}
+
+/// Whether a component value list has a `:` token outside any block or
+/// function (strings and URLs are single tokens).
+fn has_top_level_colon(value: &str) -> bool {
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    while let Ok(token) = parser.next() {
+        if matches!(token, cssparser::Token::Colon) {
+            return true;
+        }
+    }
+    false
 }
 
 fn valid_font_size(value: &str) -> bool {
@@ -19639,6 +19662,29 @@ mod tests {
             html.contains("width:0") && html.contains("height:0"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn a_declaration_swallowing_the_next_one_is_invalid() {
+        // CSS Syntax 3 #parse-a-declaration: no property's grammar has a
+        // top-level colon, so a missing semicolon drops the whole
+        // declaration. vickkuma.neocities.org's gradient title lost its
+        // `-webkit-background-clip:text` to `background-clip: text-shadow:
+        // …` and painted a band over its header (Chromium keeps `text`).
+        let dom = Dom::parse_document(
+            "<style>#a{-webkit-background-clip:text;background-clip:\n text-shadow: 1px 1px red;\
+             color:red;color:blue width:10px}#b{background:url(http://e.com/i.png);--x:a:b}</style>\
+             <p id=a>a</p><p id=b style='font-family:serif;font-family:x y:z'>b</p>",
+        );
+        let value = |id: &str, name: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            dom.computed_value(node, name)
+        };
+        assert_eq!(value("a", "background-clip").as_deref(), Some("text"));
+        assert_eq!(value("a", "color").as_deref(), Some("red"));
+        assert!(value("b", "background-image").is_some_and(|image| image.contains("i.png")));
+        assert_eq!(value("b", "--x").as_deref(), Some("a:b"));
+        assert_eq!(value("b", "font-family").as_deref(), Some("serif"));
     }
 
     #[test]
