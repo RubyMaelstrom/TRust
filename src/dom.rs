@@ -133,7 +133,7 @@ thread_local! {
     static CASC_DIAG: std::cell::Cell<CascDiag> = const { std::cell::Cell::new(CascDiag::ZERO) };
 }
 
-/// Diagnostic (`TRUST_DIAG_FRAME`): times the outermost style computation
+/// Diagnostic (`TRUST_DIAG_FRAME` with `TRUST_DIAG_STYLE`): times the outermost style computation
 /// on this thread (the cascade, computed values, typed records and parallel
 /// style passes) into `CascDiag::style_us`. Nested entries add nothing;
 /// disabled, it is a flag test.
@@ -146,10 +146,18 @@ thread_local! {
     static STYLE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Cached once: is the style computation timer on (`TRUST_DIAG_STYLE`)?
+/// Separate from `TRUST_DIAG_FRAME`, so the frame diagnostics' timings do
+/// not include its clock reads.
+fn style_timer_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| casc_diag_on() && std::env::var_os("TRUST_DIAG_STYLE").is_some())
+}
+
 impl StyleTimer {
     #[inline]
     pub(super) fn start() -> Self {
-        if !casc_diag_on() {
+        if !style_timer_on() {
             return StyleTimer {
                 active: false,
                 started: None,
