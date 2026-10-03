@@ -48,6 +48,7 @@ dependencies = [
  "roxmltree",
  "rustc-hash 2.1.3",
  "rustix 1.1.4",
+ "rustls",
  "ruzstd",
  "serde",
  "serde_json",
@@ -829,6 +830,17 @@ checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
 dependencies = [
  "bytes",
  "cfg_aliases",
+]
+
+[[package]]
+name = "brotli"
+version = "8.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor",
 ]
 
 [[package]]
@@ -4894,6 +4906,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "aws-lc-rs",
+ "brotli",
+ "brotli-decompressor",
  "log",
  "once_cell",
  "rustls-pki-types",
