@@ -251,6 +251,16 @@ pub(crate) struct PaintFlags {
     /// context rides the normal positioned/SC path instead, so this stays false
     /// for it (`build_floats` re-checks `sc`/`positioned`).
     pub float: bool,
+    /// CSS 2.2 §17.6.2: in the collapsing border model the table resolves
+    /// and paints this box's borders (CSS Tables 3
+    /// #drawing-collapsed-borders-1 and #drawing-collapsed-borders-2), so
+    /// paint draws none of its own. Set on the table and its cells.
+    pub border_collapsed: bool,
+    /// The zero-size fragment, last among a collapsed table's grid
+    /// fragments, that paints the table's resolved borders over every cell
+    /// background (CSS 2.2 Appendix E: "all table borders"); or a positioned
+    /// cell, which repaints them over its own background.
+    pub collapsed_borders: Option<std::sync::Arc<super::table::CollapsedRef>>,
 }
 
 impl Default for PaintFlags {
@@ -272,8 +282,16 @@ impl Default for PaintFlags {
             cb_abs: false,
             cb_fixed: false,
             float: false,
+            border_collapsed: false,
+            collapsed_borders: None,
         }
     }
+}
+
+/// A table in the collapsing border model, whose borders its grid paints
+/// (CSS Tables 3 #drawing-collapsed-borders-1).
+fn collapsed_table(b: &BoxNode) -> bool {
+    matches!(&b.content, Content::Table(table) if table.collapsed.is_some())
 }
 
 /// Derive the paint flags from a box style. `item` = the box is a flex/grid
@@ -301,6 +319,9 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         // Set on the laid float fragment by `lay_inlines`, not from style
         // (positioning wins over `float`, so the style bit alone is ambiguous).
         float: false,
+        // Set on collapsed tables and their cells by table layout.
+        border_collapsed: false,
+        collapsed_borders: None,
     }
 }
 
@@ -1700,7 +1721,10 @@ impl Flow<'_> {
             }),
             content_size: Some([h.content_w, (frag_h - vertical_edges).max(0.0)]),
             content_offset: [h.bp_l, b.style.border[TOP] + self.pad(&b.style, TOP, cb.0)],
-            paint: paint_flags(&b.style, false),
+            paint: PaintFlags {
+                border_collapsed: collapsed_table(b),
+                ..paint_flags(&b.style, false)
+            },
             clip: None,
             kind: FragKind::Block,
             children,
@@ -3925,7 +3949,10 @@ impl Flow<'_> {
                 // `item = true`: only flex/grid items and out-of-flow boxes
                 // lay through here, and for the (always-positioned)
                 // out-of-flow ones the item bit can't change the result.
-                paint: paint_flags(s, true),
+                paint: PaintFlags {
+                    border_collapsed: collapsed_table(b),
+                    ..paint_flags(s, true)
+                },
                 clip: None,
                 kind: FragKind::Block,
                 children,

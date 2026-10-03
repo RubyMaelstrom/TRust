@@ -687,7 +687,11 @@ fn fragment_bytes(fragment: &Frag) -> usize {
                 + inl.link.as_ref().map_or(0, |link| link.retained_memory().0)
         }
         _ => 0,
-    };
+    } + fragment
+        .paint
+        .collapsed_borders
+        .as_ref()
+        .map_or(0, |collapsed| collapsed.retained_bytes());
     own + fragment.children.capacity() * size_of::<Frag>()
         + fragment.children.iter().map(fragment_bytes).sum::<usize>()
 }

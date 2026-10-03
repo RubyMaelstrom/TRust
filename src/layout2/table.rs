@@ -343,11 +343,52 @@ impl Flow<'_> {
             if !layers.is_empty() {
                 l.frag.kind = FragKind::TableCell(layers.into_boxed_slice());
             }
+            l.frag.paint.border_collapsed = tb.collapsed.is_some();
             Flow::offset_frag(&mut l.frag, x, y);
             for (n, ay) in l.anchors {
                 anchors.push((n, ay + y + dy_valign));
             }
             frags.push(l.frag);
+        }
+        // CSS 2.2 §17.6.2: collapsed borders are centered on the grid lines
+        // and painted once each, by the table, after every cell background
+        // (Appendix E). A zero-size fragment at the grid origin carries the
+        // lines, so later fragment offsets move them with the cells. A
+        // positioned cell paints later still, so it keeps a reference to
+        // repaint them over its own background.
+        if let Some(borders) = &tb.collapsed {
+            let mut xs = col_x.clone();
+            xs.push(col_x[ncols - 1] + cols.widths.get(ncols - 1).copied().unwrap_or(1.0));
+            let mut ys = row_y.clone();
+            ys.push(row_y[nrows - 1] + row_h[nrows - 1]);
+            let paint = std::sync::Arc::new(CollapsedPaint {
+                borders: borders.clone(),
+                xs: xs.into_boxed_slice(),
+                ys: ys.into_boxed_slice(),
+            });
+            for (cell, frag) in tb.cells.iter().zip(&mut frags) {
+                if frag.paint.positioned || frag.paint.sc {
+                    frag.paint.collapsed_borders = Some(std::sync::Arc::new(CollapsedRef {
+                        paint: paint.clone(),
+                        origin: [content_x - frag.x, content_top - frag.y],
+                        cell: Some([
+                            cell.row,
+                            cell.col,
+                            (cell.row + cell.rowspan).min(nrows),
+                            (cell.col + cell.colspan).min(ncols),
+                        ]),
+                    }));
+                }
+            }
+            let mut painter = Frag::empty();
+            painter.x = content_x;
+            painter.y = content_top;
+            painter.paint.collapsed_borders = Some(std::sync::Arc::new(CollapsedRef {
+                paint,
+                origin: [0.0; 2],
+                cell: None,
+            }));
+            frags.push(painter);
         }
         (frags, table_h)
     }
@@ -640,6 +681,400 @@ impl Flow<'_> {
                 }
             }
         }
+    }
+}
+
+/// A `<line-style>` as CSS 2.2 §17.6.2.1 border conflict resolution ranks
+/// it: at equal width rule 3 prefers double, then solid, dashed, dotted,
+/// ridge, outset, groove and lastly inset, and rule 2 gives `none` the lowest
+/// priority. `hidden` (rule 1) never ranks: it suppresses its edge outright.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EdgeStyle {
+    None,
+    Inset,
+    Groove,
+    Outset,
+    Ridge,
+    Dotted,
+    Dashed,
+    Solid,
+    Double,
+    Hidden,
+}
+
+impl EdgeStyle {
+    fn parse(value: Option<&str>) -> EdgeStyle {
+        let value = value.map(str::trim).unwrap_or("none");
+        [
+            ("hidden", EdgeStyle::Hidden),
+            ("double", EdgeStyle::Double),
+            ("solid", EdgeStyle::Solid),
+            ("dashed", EdgeStyle::Dashed),
+            ("dotted", EdgeStyle::Dotted),
+            ("ridge", EdgeStyle::Ridge),
+            ("outset", EdgeStyle::Outset),
+            ("groove", EdgeStyle::Groove),
+            ("inset", EdgeStyle::Inset),
+        ]
+        .into_iter()
+        .find_map(|(keyword, style)| value.eq_ignore_ascii_case(keyword).then_some(style))
+        .unwrap_or(EdgeStyle::None)
+    }
+
+    /// The `border-style` keyword the edge paints with.
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            EdgeStyle::None => "none",
+            EdgeStyle::Inset => "inset",
+            EdgeStyle::Groove => "groove",
+            EdgeStyle::Outset => "outset",
+            EdgeStyle::Ridge => "ridge",
+            EdgeStyle::Dotted => "dotted",
+            EdgeStyle::Dashed => "dashed",
+            EdgeStyle::Solid => "solid",
+            EdgeStyle::Double => "double",
+            EdgeStyle::Hidden => "hidden",
+        }
+    }
+}
+
+/// The kind of table box a collapsed border comes from. CSS 2.2 §17.6.2.1
+/// rule 4: when borders differ only in color, a cell's wins over a row's,
+/// a row group's, a column's, a column group's and lastly the table's.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EdgeOrigin {
+    Table,
+    ColumnGroup,
+    Column,
+    RowGroup,
+    Row,
+    Cell,
+}
+
+/// The border that won one grid edge segment of a table in the collapsing
+/// border model.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct CollapsedEdge {
+    /// Used width (px), always positive.
+    pub width: f32,
+    pub style: EdgeStyle,
+    pub origin: EdgeOrigin,
+    /// The element whose border won, and which of its sides (`TOP`…`LEFT`):
+    /// the painter resolves the edge's `border-*-color` from them.
+    pub source: NodeId,
+    pub side: u8,
+}
+
+impl CollapsedEdge {
+    /// CSS 2.2 §17.6.2.1 rule 3: wider borders win, then the style order.
+    fn outranks(&self, other: &CollapsedEdge) -> bool {
+        self.width > other.width || (self.width == other.width && self.style > other.style)
+    }
+
+    /// Whether this edge wins a grid-line junction over `other` meeting it
+    /// there: rules 3 and 4, with the edge considered first keeping a tie.
+    pub(crate) fn beats(&self, other: &CollapsedEdge) -> bool {
+        self.outranks(other)
+            || (self.width == other.width
+                && self.style == other.style
+                && self.origin > other.origin)
+    }
+}
+
+/// A table's resolved collapsed borders (CSS 2.2 §17.6.2): one entry per
+/// grid edge segment, `None` where no border shows — inside a spanning
+/// cell, where `hidden` suppresses it, or where every box has `none`.
+#[derive(Debug)]
+pub(crate) struct CollapsedBorders {
+    pub table: NodeId,
+    pub nrows: usize,
+    pub ncols: usize,
+    /// Grid line `r` (0..=nrows) above column `c`, at `r * ncols + c`.
+    horizontal: Box<[Option<CollapsedEdge>]>,
+    /// Grid line `c` (0..=ncols) beside row `r`, at `r * (ncols + 1) + c`.
+    vertical: Box<[Option<CollapsedEdge>]>,
+}
+
+/// A grid holding more slots than this keeps the separated rendering rather
+/// than allocate per-slot edges for a pathological span/column structure.
+const MAX_COLLAPSED_SLOTS: usize = 1 << 20;
+
+impl CollapsedBorders {
+    /// The horizontal edge on grid line `row` (0..=nrows) above `col`.
+    pub(crate) fn horizontal(&self, row: usize, col: usize) -> Option<&CollapsedEdge> {
+        self.horizontal.get(row * self.ncols + col)?.as_ref()
+    }
+
+    /// The vertical edge on grid line `col` (0..=ncols) beside `row`.
+    pub(crate) fn vertical(&self, row: usize, col: usize) -> Option<&CollapsedEdge> {
+        self.vertical.get(row * (self.ncols + 1) + col)?.as_ref()
+    }
+
+    /// A cell's used border widths: half of the collapsed border on each
+    /// side (CSS 2.2 §17.6.2: "borders are centered on the grid lines between
+    /// the cells"; CSS Tables 3 #border-conflict-resolution-algorithm:
+    /// "Divide the used width of all borders by two"), the widest one where
+    /// a spanning side meets several edges.
+    pub(super) fn cell_border(&self, cell: &super::tree::TableCell) -> [f32; 4] {
+        let rows = cell.row..(cell.row + cell.rowspan).min(self.nrows);
+        let cols = cell.col..(cell.col + cell.colspan).min(self.ncols);
+        let widest = |edges: &mut dyn Iterator<Item = Option<&CollapsedEdge>>| {
+            edges.fold(0.0f32, |widest, edge| {
+                widest.max(edge.map_or(0.0, |e| e.width))
+            }) / 2.0
+        };
+        let mut border = [0.0; 4];
+        border[TOP] = widest(&mut cols.clone().map(|c| self.horizontal(rows.start, c)));
+        border[BOTTOM] = widest(&mut cols.clone().map(|c| self.horizontal(rows.end, c)));
+        border[LEFT] = widest(&mut rows.clone().map(|r| self.vertical(r, cols.start)));
+        border[RIGHT] = widest(&mut rows.map(|r| self.vertical(r, cols.end)));
+        border
+    }
+
+    /// The table's used border widths, CSS 2.2 §17.6.2: the left and right
+    /// are half the first row's collapsed left and right borders (wider
+    /// borders of later rows spill into the table's margin); the top and
+    /// bottom are half the widest collapsed border along each.
+    pub(super) fn table_border(&self) -> [f32; 4] {
+        let width = |edge: Option<&CollapsedEdge>| edge.map_or(0.0, |e| e.width) / 2.0;
+        let widest = |row: usize| {
+            (0..self.ncols)
+                .map(|c| width(self.horizontal(row, c)))
+                .fold(0.0f32, f32::max)
+        };
+        let mut border = [0.0; 4];
+        border[TOP] = widest(0);
+        border[BOTTOM] = widest(self.nrows);
+        border[LEFT] = width(self.vertical(0, 0));
+        border[RIGHT] = width(self.vertical(0, self.ncols));
+        border
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of_val(self.horizontal.as_ref())
+            + std::mem::size_of_val(self.vertical.as_ref())
+    }
+}
+
+/// CSS 2.2 §17.6.2.1 border conflict resolution over a table's grid. Each
+/// grid edge segment collects the borders of every box meeting there — the
+/// cells on either side, the rows, row groups, columns and column groups
+/// whose edges coincide with it (§17.5: in this model they lie on the grid
+/// lines), and the table at its outer edges — then rule 1 lets `hidden`
+/// suppress the segment, and rules 2–4 pick the most eye-catching border.
+/// `rows`/`cols` give each grid track's (track, track group) elements.
+pub(super) fn resolve_collapsed_borders(
+    dom: &crate::dom::Dom,
+    table: NodeId,
+    cells: &[super::tree::TableCell],
+    (nrows, ncols): (usize, usize),
+    rows: &[(Option<NodeId>, Option<NodeId>)],
+    cols: &[(Option<NodeId>, Option<NodeId>)],
+) -> Option<CollapsedBorders> {
+    if nrows == 0 || ncols == 0 || nrows.saturating_mul(ncols) > MAX_COLLAPSED_SLOTS {
+        return None;
+    }
+    // Which cell occupies each slot. Overlapping cells (a table model
+    // error) leave the slot with the first.
+    let mut owner = vec![u32::MAX; nrows * ncols];
+    let mut work = 0usize;
+    for (index, cell) in cells.iter().enumerate() {
+        for row in cell.row..(cell.row + cell.rowspan).min(nrows) {
+            let cols = cell.col.min(ncols)..(cell.col + cell.colspan).min(ncols);
+            work += cols.len();
+            if work > 4 * MAX_COLLAPSED_SLOTS {
+                return None;
+            }
+            for slot in &mut owner[row * ncols + cols.start..row * ncols + cols.end] {
+                if *slot == u32::MAX {
+                    *slot = index as u32;
+                }
+            }
+        }
+    }
+    let at = |row: usize, col: usize| {
+        let index = owner[row * ncols + col];
+        (index != u32::MAX).then(|| (index as usize, &cells[index as usize]))
+    };
+    let track = |tracks: &[(Option<NodeId>, Option<NodeId>)], index: usize| {
+        tracks.get(index).copied().unwrap_or((None, None))
+    };
+    let mut sides = rustc_hash::FxHashMap::<(NodeId, usize), (EdgeStyle, f32)>::default();
+    let mut candidates: Vec<(NodeId, usize, EdgeOrigin)> = Vec::with_capacity(12);
+    // Candidates arrive in rule 4's order — cell, row, row group, column,
+    // column group, table — and, within one kind, the box further up or
+    // left first, so only a strictly more eye-catching border replaces the
+    // current winner.
+    let mut resolve = |candidates: &[(NodeId, usize, EdgeOrigin)]| {
+        let mut best: Option<CollapsedEdge> = None;
+        for &(source, side, origin) in candidates {
+            let (style, width) = *sides.entry((source, side)).or_insert_with(|| {
+                let (style, width) = super::style::border_edge(dom, source, side);
+                (EdgeStyle::parse(style.as_deref()), width)
+            });
+            // Rule 1: any `hidden` border suppresses all borders here.
+            if style == EdgeStyle::Hidden {
+                return None;
+            }
+            let edge = CollapsedEdge {
+                width,
+                style,
+                origin,
+                source,
+                side: side as u8,
+            };
+            if best.is_none_or(|best| edge.outranks(&best)) {
+                best = Some(edge);
+            }
+        }
+        // Rule 2: only if every box has `none` is the border omitted.
+        best.filter(|edge| edge.width > 0.0 && edge.style != EdgeStyle::None)
+    };
+
+    let mut horizontal = Vec::with_capacity((nrows + 1) * ncols);
+    for row in 0..=nrows {
+        let (row_above, group_above) = row.checked_sub(1).map_or((None, None), |r| track(rows, r));
+        let (row_below, group_below) = if row < nrows {
+            track(rows, row)
+        } else {
+            (None, None)
+        };
+        for col in 0..ncols {
+            let above = row.checked_sub(1).and_then(|r| at(r, col));
+            let below = (row < nrows).then(|| at(row, col)).flatten();
+            if above.is_some() && above.map(|a| a.0) == below.map(|b| b.0) {
+                // Inside a row-spanning cell: no edge.
+                horizontal.push(None);
+                continue;
+            }
+            candidates.clear();
+            if let Some((_, cell)) = above
+                && cell.row + cell.rowspan == row
+                && cell.b.node != super::NO_NODE
+            {
+                candidates.push((cell.b.node, BOTTOM, EdgeOrigin::Cell));
+            }
+            if let Some((_, cell)) = below
+                && cell.row == row
+                && cell.b.node != super::NO_NODE
+            {
+                candidates.push((cell.b.node, TOP, EdgeOrigin::Cell));
+            }
+            candidates.extend(row_above.map(|r| (r, BOTTOM, EdgeOrigin::Row)));
+            candidates.extend(row_below.map(|r| (r, TOP, EdgeOrigin::Row)));
+            if group_above != group_below {
+                candidates.extend(group_above.map(|g| (g, BOTTOM, EdgeOrigin::RowGroup)));
+                candidates.extend(group_below.map(|g| (g, TOP, EdgeOrigin::RowGroup)));
+            }
+            if row == 0 || row == nrows {
+                let side = if row == 0 { TOP } else { BOTTOM };
+                let (column, group) = track(cols, col);
+                candidates.extend(column.map(|c| (c, side, EdgeOrigin::Column)));
+                candidates.extend(group.map(|g| (g, side, EdgeOrigin::ColumnGroup)));
+                candidates.push((table, side, EdgeOrigin::Table));
+            }
+            horizontal.push(resolve(&candidates));
+        }
+    }
+
+    let mut vertical = Vec::with_capacity(nrows * (ncols + 1));
+    for row in 0..nrows {
+        let (track_row, group) = track(rows, row);
+        for col in 0..=ncols {
+            let left = col.checked_sub(1).and_then(|c| at(row, c));
+            let right = (col < ncols).then(|| at(row, col)).flatten();
+            if left.is_some() && left.map(|l| l.0) == right.map(|r| r.0) {
+                // Inside a column-spanning cell: no edge.
+                vertical.push(None);
+                continue;
+            }
+            candidates.clear();
+            if let Some((_, cell)) = left
+                && cell.col + cell.colspan == col
+                && cell.b.node != super::NO_NODE
+            {
+                candidates.push((cell.b.node, RIGHT, EdgeOrigin::Cell));
+            }
+            if let Some((_, cell)) = right
+                && cell.col == col
+                && cell.b.node != super::NO_NODE
+            {
+                candidates.push((cell.b.node, LEFT, EdgeOrigin::Cell));
+            }
+            let outer = (col == 0 || col == ncols).then_some(if col == 0 { LEFT } else { RIGHT });
+            if let Some(side) = outer {
+                candidates.extend(track_row.map(|r| (r, side, EdgeOrigin::Row)));
+                candidates.extend(group.map(|g| (g, side, EdgeOrigin::RowGroup)));
+            }
+            let (column_left, group_left) =
+                col.checked_sub(1).map_or((None, None), |c| track(cols, c));
+            let (column_right, group_right) = if col < ncols {
+                track(cols, col)
+            } else {
+                (None, None)
+            };
+            candidates.extend(column_left.map(|c| (c, RIGHT, EdgeOrigin::Column)));
+            candidates.extend(column_right.map(|c| (c, LEFT, EdgeOrigin::Column)));
+            if group_left != group_right {
+                candidates.extend(group_left.map(|g| (g, RIGHT, EdgeOrigin::ColumnGroup)));
+                candidates.extend(group_right.map(|g| (g, LEFT, EdgeOrigin::ColumnGroup)));
+            }
+            if let Some(side) = outer {
+                candidates.push((table, side, EdgeOrigin::Table));
+            }
+            vertical.push(resolve(&candidates));
+        }
+    }
+    Some(CollapsedBorders {
+        table,
+        nrows,
+        ncols,
+        horizontal: horizontal.into_boxed_slice(),
+        vertical: vertical.into_boxed_slice(),
+    })
+}
+
+/// A table's collapsed borders positioned for painting: its grid lines,
+/// relative to the grid origin (CSS 2.2 §17.6.2: "borders are centered on
+/// the grid lines between the cells").
+#[derive(Debug)]
+pub(crate) struct CollapsedPaint {
+    pub borders: std::sync::Arc<CollapsedBorders>,
+    /// Vertical grid line x offsets, `ncols + 1` of them.
+    pub xs: Box<[f32]>,
+    /// Horizontal grid line y offsets, `nrows + 1` of them.
+    pub ys: Box<[f32]>,
+}
+
+/// A fragment's reference to its table's collapsed borders. The zero-size
+/// fragment closing a collapsed grid paints them all. A positioned cell
+/// paints after them (CSS 2.2 Appendix E), so it repaints them over its own
+/// background, within its border box.
+#[derive(Debug)]
+pub(crate) struct CollapsedRef {
+    pub paint: std::sync::Arc<CollapsedPaint>,
+    /// The grid origin relative to the fragment.
+    pub origin: [f32; 2],
+    /// A positioned cell's grid area: its first row and column and the
+    /// rows and columns past its last.
+    pub cell: Option<[usize; 4]>,
+}
+
+impl CollapsedRef {
+    /// The border fragment counts the shared grid too, conservatively, as
+    /// the layout caches count other shared box-tree data.
+    pub(super) fn retained_bytes(&self) -> usize {
+        let paint = &self.paint;
+        std::mem::size_of::<Self>()
+            + if self.cell.is_some() {
+                0
+            } else {
+                std::mem::size_of::<CollapsedPaint>()
+                    + std::mem::size_of_val(paint.xs.as_ref())
+                    + std::mem::size_of_val(paint.ys.as_ref())
+                    + paint.borders.retained_bytes()
+            }
     }
 }
 
