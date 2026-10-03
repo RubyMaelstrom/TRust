@@ -171,7 +171,10 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         if let Some(value) = self.computed_cache().borrow().1.box_record(id, &context) {
             return value;
         }
-        let value = compute();
+        let value = {
+            let _timer = StyleTimer::start();
+            compute()
+        };
         if computation.can_publish(id) {
             self.computed_cache()
                 .borrow_mut()
@@ -206,7 +209,10 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         ) {
             return value;
         }
-        let value = compute();
+        let value = {
+            let _timer = StyleTimer::start();
+            compute()
+        };
         if computation.can_publish(id) {
             self.computed_cache().borrow_mut().1.put_inline_record(
                 id,
@@ -233,7 +239,10 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         if let Some(value) = self.computed_cache().borrow().1.display_record(id) {
             return value;
         }
-        let value = compute();
+        let value = {
+            let _timer = StyleTimer::start();
+            compute()
+        };
         if computation.can_publish(id) {
             self.computed_cache()
                 .borrow_mut()
