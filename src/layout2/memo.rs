@@ -676,11 +676,12 @@ fn fragment_bytes(fragment: &Frag) -> usize {
                     .sum::<usize>()
         }
         FragKind::TableCell(layers) => std::mem::size_of_val(layers.as_ref()),
-        FragKind::Oof(b, inl, _) => {
+        FragKind::Oof(b, placeholder) => {
             // Count every shared dependency conservatively, even when also
             // reachable from another cache entry or the box-tree cache.
+            let inl = &placeholder.ctx;
             super::tree_cache::box_bytes(b)
-                + size_of::<InlineStyle>()
+                + size_of::<super::flow::OofStatic>()
                 + inl.font_family.capacity()
                 + inl.language.as_ref().map_or(0, String::capacity)
                 + inl.link.as_ref().map_or(0, |link| link.retained_memory().0)

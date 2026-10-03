@@ -325,6 +325,9 @@ impl ScrollAreas {
         }
         if !root && f.node != NO_NODE {
             match dom.computed_value_resolved(f.node, "position").as_deref() {
+                // Its containing block is an inline box of the parent's
+                // formatting context, so it joins the parent's area.
+                Some("absolute") if f.flow.inline_cb => {}
                 Some("absolute") => {
                     escaping.push((false, area));
                     return Edge::point(0., 0.);

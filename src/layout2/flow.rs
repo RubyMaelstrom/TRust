@@ -126,6 +126,23 @@ impl Clip {
     }
 }
 
+/// What an out-of-flow placeholder hands the positioned post-pass besides
+/// its box.
+#[derive(Clone, Debug)]
+pub(crate) struct OofStatic {
+    /// The inline context the box inherits (by DOM tree, not by containing
+    /// block).
+    pub ctx: InlineStyle,
+    /// For a flex container's child, its alignment in the static-position
+    /// rectangle.
+    pub flex: Option<FlexStatic>,
+    /// The containing block that a positioned inline ancestor forms (CSS 2
+    /// §10.1 item 4), as (x, y, width, height) with x/y relative to this
+    /// placeholder, so it moves with every later translation of the line
+    /// boxes. `None` when a fragment ancestor's box contains it.
+    pub inline_cb: Option<[f32; 4]>,
+}
+
 /// CSS Flexbox 1 #abspos-items: the static-position rectangle of an
 /// absolutely positioned child of a flex container is the container's
 /// content box, and the child aligns in it as if it were the sole flex item
@@ -149,10 +166,8 @@ pub(crate) enum FragKind {
     /// An out-of-flow box's placeholder, sitting at its STATIC POSITION
     /// (§10.3.7/§10.6.4) in the fragment tree so every later translation
     /// moves it consistently; the positioned post-pass (`resolve_oof`)
-    /// replaces it with the laid box. Carries the inline context the box
-    /// inherits (by DOM tree, not by containing block), and for a flex
-    /// container's child its alignment in the static-position rectangle.
-    Oof(SharedBox, Box<InlineStyle>, Option<FlexStatic>),
+    /// replaces it with the laid box.
+    Oof(SharedBox, Box<OofStatic>),
     /// Marker retained at the original tree position of a viewport-fixed box.
     /// The laid fragment lives in the flow's fixed list; graphical paint
     /// resolves this marker there so fixed positioning remains viewport-pinned
@@ -421,7 +436,14 @@ fn oof_placeholder(m: OofMark<'_>, content_x: f32, y: f32) -> Frag {
         content_offset: [0.0; 2],
         paint: PaintFlags::default(),
         clip: None,
-        kind: FragKind::Oof(m.b.clone(), Box::new(m.ctx), None),
+        kind: FragKind::Oof(
+            m.b.clone(),
+            Box::new(OofStatic {
+                ctx: m.ctx,
+                flex: None,
+                inline_cb: m.inline_cb,
+            }),
+        ),
         children: Vec::new(),
     }
 }
@@ -1785,7 +1807,14 @@ impl Flow<'_> {
                     content_offset: [0.0; 2],
                     paint: PaintFlags::default(),
                     clip: None,
-                    kind: FragKind::Oof(ob.clone(), Box::new(inl.clone()), align),
+                    kind: FragKind::Oof(
+                        ob.clone(),
+                        Box::new(OofStatic {
+                            ctx: inl.clone(),
+                            flex: align,
+                            inline_cb: None,
+                        }),
+                    ),
                     children: Vec::new(),
                 },
             ));
@@ -4295,9 +4324,14 @@ impl Flow<'_> {
             let child_own_clip = if matches!(f.children[i].kind, FragKind::Oof(..)) {
                 let ph = f.children.remove(i);
                 let (x0, y0) = (ph.x, ph.y);
-                let FragKind::Oof(b, ctx, flex) = ph.kind else {
+                let FragKind::Oof(b, placeholder) = ph.kind else {
                     unreachable!()
                 };
+                let OofStatic {
+                    ctx,
+                    flex,
+                    inline_cb,
+                } = *placeholder;
                 let content = f.content_box();
                 let flex = flex.map(|align| (align, content.width, content.height));
                 // CSS Color 4 #transparency applies opacity after layout.
@@ -4309,6 +4343,10 @@ impl Flow<'_> {
                 let fixed = b.style.position == Pos::Fixed;
                 let top_layer = b.node != NO_NODE && self.dom.is_popover_showing(b.node);
                 let pinned = fixed && child_fixed.is_none() && !top_layer;
+                // CSS 2 §10.1 item 4: a positioned inline ancestor, nearer
+                // than any fragment that establishes one, forms an absolute
+                // box's containing block from its line fragments.
+                let inline_cb = inline_cb.filter(|_| !fixed && !top_layer);
                 // CSS Positioned Layout 4 §3: top-layer boxes generate as root
                 // siblings and use the initial containing block, regardless of
                 // positioned/transformed DOM ancestors.
@@ -4316,10 +4354,18 @@ impl Flow<'_> {
                     icb
                 } else if fixed {
                     child_fixed.unwrap_or(icb)
+                } else if let Some([dx, dy, w, h]) = inline_cb {
+                    CbRect {
+                        x: x0 + dx,
+                        y: y0 + dy,
+                        w,
+                        h,
+                    }
                 } else {
                     child_abs
                 };
-                let (laid, anc) = self.lay_oof(&b, cb, (x0 - cb.x, y0 - cb.y), flex, &ctx);
+                let (mut laid, anc) = self.lay_oof(&b, cb, (x0 - cb.x, y0 - cb.y), flex, &ctx);
+                laid.flow.inline_cb = inline_cb.is_some();
                 if top_layer {
                     top_layer_out.push(TopFrag {
                         fragment: laid,
@@ -4371,9 +4417,12 @@ impl Flow<'_> {
                 anchors.extend(anc);
                 f.children.insert(i, laid);
                 // A positioned box is clipped by its containing block's clip
-                // chain (§3) — threaded down as the abspos/fixed clip.
+                // chain (§3) — threaded down as the abspos/fixed clip. An
+                // inline containing block is in-flow content of this box.
                 if fixed {
                     child_fixed_clip
+                } else if inline_cb.is_some() {
+                    content_clip
                 } else {
                     child_abs_clip
                 }
@@ -5088,6 +5137,12 @@ impl Flow<'_> {
             let bx = content_x + pl.x + pa.ml;
             let by = line_tops.get(pl.line).copied().unwrap_or(content_top_y) + pl.y + pa.mt;
             Self::offset_frag(&mut pa.frag, bx, by);
+            // CSS 2 §10.1 item 4: the positioned inline box around this
+            // atomic inline contains the absolutely positioned boxes inside
+            // it that none of its own boxes contains.
+            if let Some([x, y, w, h]) = pl.inline_cb {
+                adopt_inline_cb(&mut pa.frag, [content_x + x, content_top_y + y, w, h]);
+            }
             for a in &mut pa.anchors {
                 a.1 += by;
             }
@@ -5485,6 +5540,24 @@ fn inline_block_baseline(dom: &Dom, fragment: &Frag) -> Option<f32> {
     fragment.children.iter().rev().find_map(|child| {
         inline_block_baseline(dom, child).map(|baseline| flow_y(child) + baseline)
     })
+}
+
+/// Give each out-of-flow placeholder in `fragment`'s subtree that no fragment
+/// there contains the containing block `cb` (absolute x, y, width, height)
+/// that a positioned inline box around `fragment` forms (CSS 2 §10.1 item 4).
+fn adopt_inline_cb(fragment: &mut Frag, cb: [f32; 4]) {
+    if fragment.paint.cb_abs {
+        return;
+    }
+    for child in &mut fragment.children {
+        if let FragKind::Oof(_, placeholder) = &mut child.kind {
+            if placeholder.inline_cb.is_none() {
+                placeholder.inline_cb = Some([cb[0] - child.x, cb[1] - child.y, cb[2], cb[3]]);
+            }
+        } else {
+            adopt_inline_cb(child, cb);
+        }
+    }
 }
 
 /// The result of laying one inline formatting context: its line boxes, the

@@ -9594,6 +9594,64 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn positioned_inline_boxes_contain_absolutely_positioned_descendants() {
+        // CSS 2 §10.1 item 4 / CSS Positioned Layout 3 #absolute-cb: the
+        // containing block runs from the padding edges that start the inline
+        // box's first fragment to those that end its last (CSS 2 names the
+        // padding boxes; Gecko and Blink use them), clamped to an empty
+        // extent when the last fragment ends before the first starts. An
+        // empty box still has its fragment (CSS 2 §10.8). The static position
+        // moves with the box (as in Blink; Gecko leaves its vertical part).
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <style>.ab{position:absolute;width:10px;height:10px}</style>
+            <div style="height:40px">aa <span id=p1 style="position:relative;padding:5px 7px;border:3px solid">ab<i id=pa class=ab style="left:0;top:0"></i><i id=pb class=ab style="right:0;bottom:0"></i></span></div>
+            <div id=stb style="height:20px">aa <span id=st style="position:relative;left:30px;top:4px">x<i id=sti class=ab></i>y</span></div>
+            <div style="height:20px">aa <span>x<span id=stm></span>y</span></div>
+            <div style="width:80px"><span id=s1 style="position:relative;padding:0 4px;border:2px solid">one two three four five<span id=end></span><i id=sa class=ab style="left:0;top:0"></i><i id=sb class=ab style="right:0;bottom:0"></i></span></div>
+            <div id=sd style="width:100px"><span style="display:inline-block;width:60px;height:10px"></span><span id=sp style="position:relative"><span style="display:inline-block;width:30px;height:10px"></span><span style="display:inline-block;width:20px;height:10px"></span><i id=a7 class=ab style="left:0;top:0;right:0;bottom:0;width:auto;height:auto"></i></span></div>
+            <div style="height:20px">text <span id=e style="position:relative"><i id=ei class=ab style="left:10px;top:5px"></i></span> <span id=eref>after</span></div>
+            <div style="width:400px;height:100px;text-align:center" id=zone> <span id=h style="position:relative"><i id=hi class=ab style="left:-30px;top:5px"></i></span> </div>
+            <div style="margin-top:30px;height:20px">see <span id=tt style="position:relative">hover me<span id=tip style="position:absolute;bottom:100%;left:50%;width:120px;height:16px"></span></span> now</div>
+            </body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        let (p1, pa, pb) = (rect("p1"), rect("pa"), rect("pb"));
+        assert_near(pa.left, p1.left + 3.0, "pa left");
+        assert_near(pa.top, p1.top + 3.0, "pa top");
+        assert_near(pb.left + 10.0, p1.left + p1.width - 3.0, "pb right");
+        assert_near(pb.top + 10.0, p1.top + p1.height - 3.0, "pb bottom");
+        assert_near(rect("sti").left, rect("stm").left + 30.0, "static left");
+        assert_near(rect("sti").top, rect("stb").top + 4.0, "static top");
+        // Split across lines: the first fragment's start, the last's end.
+        let (s1, sa, sb, end) = (rect("s1"), rect("sa"), rect("sb"), rect("end"));
+        assert!(s1.height > 40.0, "the box must wrap: {s1:?}");
+        assert_near(sa.left, 2.0, "split left");
+        assert_near(sa.top, s1.top + 2.0, "split top");
+        assert_near(sb.left + 10.0, end.left + 4.0, "split right");
+        assert_near(sb.top + 10.0, s1.top + s1.height - 2.0, "split bottom");
+        let (sp, a7) = (rect("sp"), rect("a7"));
+        assert!(sp.height > 30.0, "the box must wrap: {sp:?}");
+        assert_eq!((a7.left, a7.width), (60.0, 0.0));
+        assert_near(a7.top, sp.top, "clamped top");
+        assert_near(a7.height, sp.height, "clamped height");
+        // An empty box among text, and alone on a centered line.
+        let (e, eref, ei) = (rect("e"), rect("eref"), rect("ei"));
+        assert_eq!(e.width, 0.0);
+        assert_near(e.left, eref.left, "empty box left");
+        assert_near(e.height, eref.height, "empty box content area");
+        assert_near(ei.left, e.left + 10.0, "empty cb left");
+        assert_near(ei.top, e.top + 5.0, "empty cb top");
+        let hi = rect("hi");
+        assert_near(hi.left, 170.0, "centered empty cb left");
+        assert_near(hi.top, rect("zone").top + 5.0, "centered empty cb top");
+        // A tooltip above its relatively positioned anchor text.
+        let (tt, tip) = (rect("tt"), rect("tip"));
+        assert_near(tip.top + 16.0, tt.top, "tooltip bottom");
+        assert_near(tip.left, tt.left + tt.width / 2.0, "tooltip left");
+    }
+
+    #[test]
     fn normalize_css_superscripts_rise_without_growing_their_line() {
         // normalize.css sets `sub, sup { position: relative; vertical-align:
         // baseline; line-height: 0 }` with `sup { top: -0.5em }` and
