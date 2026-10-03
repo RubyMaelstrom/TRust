@@ -8532,10 +8532,14 @@ impl Dom {
             }
             self.serialize_svg_for_image(id)
         } else if let Some(target) = local_target {
-            let mut outer = self.serialize(id);
+            // SVG 2 §6.6: author-sheet presentation properties apply to an
+            // icon built from local `<use>` references too, so the resource
+            // carries them like any other inline SVG (a stylesheet's
+            // `.wave > use { fill: url(#water) }` otherwise drew black).
+            let mut outer = self.serialize_svg_for_image(id);
             if !self.descendants(id).any(|node| node == target) {
                 let open = outer.find('>')? + 1;
-                let definition = format!("<defs>{}</defs>", self.serialize(target));
+                let definition = format!("<defs>{}</defs>", self.serialize_svg_for_image(target));
                 outer.insert_str(open, &definition);
             }
             outer
@@ -8602,15 +8606,18 @@ impl Dom {
     /// computed-color substitution to each element's authored/baked attrs.
     fn serialize_svg_for_image(&self, root: NodeId) -> String {
         let mut out = String::new();
-        self.serialize_svg_node_for_image(root, &mut out);
+        self.serialize_svg_node_for_image(root, None, &mut out);
         out
     }
 
-    fn serialize_svg_node_for_image(&self, id: NodeId, out: &mut String) {
+    /// Serialize a standalone SVG resource. Like the presentation serializer,
+    /// a shadow host renders its shadow tree in place, with slots projecting
+    /// the host's assigned nodes (`host` is the shadow host being expanded).
+    fn serialize_svg_node_for_image(&self, id: NodeId, host: Option<NodeId>, out: &mut String) {
         match &self.nodes[id].data {
             NodeData::Document | NodeData::Fragment => {
                 for child in self.child_iter(id) {
-                    self.serialize_svg_node_for_image(child, out);
+                    self.serialize_svg_node_for_image(child, host, out);
                 }
             }
             NodeData::Doctype => {}
@@ -8637,6 +8644,27 @@ impl Dom {
                 if matches!(tag, "script" | "noscript" | "template")
                     || (tag != "style" && self.is_hidden(id))
                 {
+                    return;
+                }
+                if tag == "slot"
+                    && let Some(h) = host
+                {
+                    let assigned = self.slot_assigned(h, self.attr(id, "name"));
+                    if assigned.is_empty() {
+                        for child in self.child_iter(id) {
+                            self.serialize_svg_node_for_image(child, host, out);
+                        }
+                    } else {
+                        for child in assigned.into_iter().flat_map(|c| {
+                            if self.tag_name(c) == Some("slot") {
+                                self.flat_slot_nodes(c)
+                            } else {
+                                vec![c]
+                            }
+                        }) {
+                            self.serialize_svg_node_for_image(child, None, out);
+                        }
+                    }
                     return;
                 }
                 let color = self.svg_used_color(id);
@@ -8666,8 +8694,14 @@ impl Dom {
                 out.push_str(&replace_css_current_color(&serialized_attrs, &color));
                 out.push('>');
                 if !VOID_ELEMENTS.contains(&tag) {
-                    for child in self.child_iter(id) {
-                        self.serialize_svg_node_for_image(child, out);
+                    if let Some(root) = self.shadow_root(id) {
+                        for child in self.child_iter(root) {
+                            self.serialize_svg_node_for_image(child, Some(id), out);
+                        }
+                    } else {
+                        for child in self.child_iter(id) {
+                            self.serialize_svg_node_for_image(child, host, out);
+                        }
                     }
                     out.push_str("</");
                     out.push_str(tag);
@@ -19558,6 +19592,38 @@ mod tests {
             html.contains("width:0") && html.contains("height:0"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn local_use_icons_keep_author_sheet_paint() {
+        // SVG 2 §6.6: a stylesheet's presentation properties apply to an
+        // inline SVG built from local `<use>` references, including a
+        // pattern paint server (renyoi.neocities.org's flood.js water drew
+        // black). Quoted and unquoted url() both resolve.
+        for fill in ["url(#p1)", "url(\"#p1\")"] {
+            let html = format!(
+                r##"<!doctype html><style>.q > use {{ fill: {fill} }}</style>
+                <svg id=s width="60" height="60" viewBox="0 0 60 60"><defs>
+                <path id="w" d="M0 0h60v60H0z"/>
+                <pattern id="p1" patternUnits="userSpaceOnUse" width="30" height="30">
+                <rect width="15" height="15" fill="blue"/></pattern></defs>
+                <g class="q"><use href="#w"/></g></svg>"##
+            );
+            let dom = Dom::parse_document(&html);
+            let (source, _) = dom
+                .svg_image_data(dom.get_by_id("s").unwrap(), None)
+                .expect("paintable SVG");
+            let bytes = crate::img::decode_data_url(&source).unwrap();
+            let (image, _) = crate::img::decode(&bytes).expect("SVG decodes");
+            let image = image.to_rgba8();
+            let at = |x: u32, y: u32| {
+                image
+                    .get_pixel(x * image.width() / 60, y * image.height() / 60)
+                    .0
+            };
+            assert_eq!(at(5, 5), [0, 0, 255, 255], "{fill}: pattern tile");
+            assert_eq!(at(20, 20)[3], 0, "{fill}: pattern gap stays transparent");
+        }
     }
 
     #[test]
