@@ -20,6 +20,12 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FilterType, Resize};
 
+mod inline_svg;
+pub(crate) use inline_svg::{
+    document_svg_data_url, document_svg_image_requests, document_svg_image_target,
+    document_svg_image_url, document_svg_revision, record_document_svg_image,
+};
+
 /// Hard ceiling on decoded raster dimensions: a small download can still claim
 /// to be a gigapixel image.
 const MAX_DIMENSION: u32 = 12_000;
@@ -194,10 +200,11 @@ fn apply_silhouette(image: DynamicImage, tint: SvgTint) -> DynamicImage {
 }
 
 /// Wrap serialized SVG markup as a self-contained `data:` URL. Inline `<svg>`
-/// elements are rewritten to `<img src=…>` carrying this so they reuse the
-/// whole `<img>` decode/cache/reflow/tint pipeline (an inline vector has no URL
-/// of its own). base64 keeps the payload safe inside an HTML `src` attribute
-/// (the markup is full of `"`/`<`/`>`).
+/// elements are rewritten to `<img src=…>` carrying this (through
+/// `document_svg_data_url`, which adds their document context) so they reuse
+/// the whole `<img>` decode/cache/reflow/tint pipeline (an inline vector has
+/// no URL of its own). base64 keeps the payload safe inside an HTML `src`
+/// attribute (the markup is full of `"`/`<`/`>`).
 pub(crate) fn svg_data_url(svg: &str) -> String {
     format!(
         "data:image/svg+xml;base64,{}",
@@ -743,6 +750,8 @@ fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
 /// image resources: scripting/animation are absent in usvg, and our resolver
 /// permits embedded data URLs but rejects every external string reference.
 /// This is also used for the deliberately static standalone image viewer.
+/// Inline SVG serialized by the DOM carries a marker for its host document's
+/// context instead: document fonts and the document images it references.
 struct SvgImage {
     tree: resvg::usvg::Tree,
     info: ImageInfo,
@@ -826,8 +835,13 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
     let wrapped = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"{viewport_style} viewBox="0 0 {width} {height}">{original_root}</svg>"#
     );
-    let tree = resvg::usvg::Tree::from_str(&wrapped, &secure_svg_options())
-        .map_err(|e| format!("svg parse: {e}"))?;
+    // SVG Integration #referencing-modes: inline SVG shares its host
+    // document's mode; every other SVG image is a separate static image
+    // document in secure static mode (see `inline_svg`).
+    let options = inline_svg::DocumentSvgContext::of(text.as_ref())
+        .map_or_else(secure_svg_options, inline_svg::DocumentSvgContext::options);
+    let tree =
+        resvg::usvg::Tree::from_str(&wrapped, &options).map_err(|e| format!("svg parse: {e}"))?;
     Ok(SvgImage {
         tree,
         info: ImageInfo {

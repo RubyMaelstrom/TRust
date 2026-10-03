@@ -816,15 +816,43 @@ pub async fn fetch_graphical_image_with_cookie_policy(
     blobs: Option<&crate::js::BlobMap>,
     restricted: bool,
 ) -> Result<Vec<u8>, String> {
+    // An inline SVG's `<image>` loads as an ordinary page image of its URL;
+    // the outcome is also recorded for the SVG decoder (`img::inline_svg`).
+    let Some(document_image) = crate::img::document_svg_image_target(source) else {
+        return fetch_page_image(page, source, blobs, restricted)
+            .await
+            .map(|(_, bytes)| bytes);
+    };
+    let result = fetch_page_image(page, document_image, blobs, restricted).await;
+    crate::img::record_document_svg_image(
+        document_image,
+        result
+            .as_ref()
+            .ok()
+            .filter(|(ok, _)| *ok)
+            .map(|(_, bytes)| bytes.as_slice()),
+    );
+    result.map(|(_, bytes)| bytes)
+}
+
+/// Load one page image's bytes. The flag says whether the response was a
+/// success, not an HTTP error document.
+async fn fetch_page_image(
+    page: &Url,
+    source: &str,
+    blobs: Option<&crate::js::BlobMap>,
+    restricted: bool,
+) -> Result<(bool, Vec<u8>), String> {
     if source.starts_with("data:") {
         return crate::img::decode_data_url(source)
+            .map(|bytes| (true, bytes))
             .ok_or_else(|| String::from("invalid data image URL"));
     }
     if source.starts_with("blob:") {
         let key = source.split('#').next().unwrap_or(source);
         return blobs
             .and_then(|mirror| mirror.lock().ok())
-            .and_then(|mirror| mirror.get(key).map(|(bytes, _)| bytes.clone()))
+            .and_then(|mirror| mirror.get(key).map(|(bytes, _)| (true, bytes.clone())))
             .ok_or_else(|| String::from("blob image is not present in the page mirror"));
     }
     let url = Url::parse(source).map_err(|error| format!("invalid image URL: {error}"))?;
@@ -837,7 +865,9 @@ pub async fn fetch_graphical_image_with_cookie_policy(
     request.cookie_context.as_mut().unwrap().cross_site_ancestor = restricted;
     set_image_accept(&mut request);
     set_referrer(&mut request, page);
-    fetch(&request).await.map(|response| response.body)
+    fetch(&request)
+        .await
+        .map(|response| ((200..300).contains(&response.status), response.body))
 }
 
 /// A page kept alive for interaction: commands in, renders out.
@@ -7667,8 +7697,23 @@ fn collect_image_urls_for_boxes(
                 .attr(id, "loading")
                 .is_some_and(|value| value.eq_ignore_ascii_case("lazy"));
         let handle = crate::render::ImageHandle::for_source(&u);
-        if dom.resource_cookies_restricted(id) {
+        let restricted = dom.resource_cookies_restricted(id);
+        if restricted {
             cookie_restricted.insert(u.clone());
+        }
+        // SVG 2 linking.html#processingURL-fetch: an inline SVG's external
+        // `<image>` references load as images of its document, through the
+        // same page-image fetch path and policies, as soon as it is rendered.
+        for request in crate::img::document_svg_image_requests(&u) {
+            if restricted {
+                cookie_restricted.insert(request.clone());
+            }
+            if !urls.contains(&request) {
+                urls.push(request.clone());
+            }
+            if !eager.contains(&request) {
+                eager.push(request);
+            }
         }
         if !urls.contains(&u) {
             urls.push(u.clone());
@@ -9133,6 +9178,53 @@ mod tests {
             vec![0, 1, 2, 255]
         );
         assert!(fetch_graphical_image(&page, blob_url, None).await.is_err());
+    }
+
+    /// SVG 2 linking.html#processingURL-fetch: an inline SVG's `<image>` is
+    /// fetched as an ordinary page image of its URL (the request's marker
+    /// fragment never reaches the fetch), and the outcome reaches the SVG
+    /// decoder so the next serialization draws it.
+    #[tokio::test]
+    async fn graphical_image_fetch_records_inline_svg_document_images() {
+        let page = Url::parse("https://example.test/flood").unwrap();
+        let blob_url = "blob:https://example.test/inline-svg-texture";
+        let blobs = crate::js::BlobMap::default();
+        blobs.lock().unwrap().insert(
+            blob_url.to_owned(),
+            (crate::img::red_png(), "image/png".to_owned()),
+        );
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image href="{blob_url}" width="4" height="4"/></svg>"#
+        );
+        let images = [blob_url.to_string()];
+        let red = |source: &str| {
+            let bytes = crate::img::decode_data_url(source).unwrap();
+            let image = crate::img::decode(&bytes).unwrap().0.to_rgba8();
+            image
+                .pixels()
+                .filter(|pixel| pixel.0 == [255, 0, 0, 255])
+                .count()
+        };
+        let before = crate::img::document_svg_data_url(&svg, 0, &images);
+        assert_eq!(red(&before), 0);
+        let requests = crate::img::document_svg_image_requests(&before);
+        assert_eq!(
+            fetch_graphical_image(&page, &requests[0], Some(&blobs))
+                .await
+                .unwrap(),
+            crate::img::red_png()
+        );
+        let after = crate::img::document_svg_data_url(&svg, 0, &images);
+        assert_ne!(before, after);
+        assert_eq!(red(&after), 16);
+
+        // A refused or missing load withdraws the image again.
+        assert!(
+            fetch_graphical_image(&page, &requests[0], None)
+                .await
+                .is_err()
+        );
+        assert_eq!(red(&crate::img::document_svg_data_url(&svg, 0, &images)), 0);
     }
 
     #[test]

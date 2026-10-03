@@ -206,6 +206,8 @@ struct Environment {
     font_epoch: u64,
     image_metadata_epoch: u64,
     svg_sprite_revision: u64,
+    /// Inline SVG serializations list their document images' availability.
+    document_svg_revision: u64,
 }
 
 impl Environment {
@@ -333,12 +335,14 @@ impl LayoutCache {
         // resource inserted concurrently with this layout must force a miss on
         // the next transaction, not bless older output with the newer revision.
         let svg_sprite_revision = crate::dom::svg_sprite_revision();
+        let document_svg_revision = crate::img::document_svg_revision();
         let same_global = self.environment.as_ref().is_some_and(|e| {
             e.base == *base
                 && e.vp == vp
                 && e.font_epoch == font_epoch
                 && e.image_metadata_epoch == image_metadata_epoch
                 && e.svg_sprite_revision == svg_sprite_revision
+                && e.document_svg_revision == document_svg_revision
         });
         let same_images = self
             .environment
@@ -423,6 +427,7 @@ impl LayoutCache {
                 font_epoch,
                 image_metadata_epoch,
                 svg_sprite_revision,
+                document_svg_revision,
             });
         } else if !same_images {
             // Natural dimensions affect only the computations which observed
@@ -1341,6 +1346,7 @@ pub(super) mod tests {
                 crate::font_system::page_font_epoch(),
                 crate::img::svg_intrinsic_epoch(),
                 crate::dom::svg_sprite_revision(),
+                crate::img::document_svg_revision(),
             );
             let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
             measure_retained_layout(&dom, &base, vp, &forms, &controls, &images);
@@ -1354,6 +1360,7 @@ pub(super) mod tests {
                     crate::font_system::page_font_epoch(),
                     crate::img::svg_intrinsic_epoch(),
                     crate::dom::svg_sprite_revision(),
+                    crate::img::document_svg_revision(),
                 );
             assert_cold(&mut dom, &base, vp, &forms, &controls, &images);
             if stable {
@@ -1390,6 +1397,7 @@ pub(super) mod tests {
                 crate::font_system::page_font_epoch(),
                 crate::img::svg_intrinsic_epoch(),
                 crate::dom::svg_sprite_revision(),
+                crate::img::document_svg_revision(),
             );
             measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
             // The image map can change without any DOM mutation. Keep the
@@ -1409,6 +1417,7 @@ pub(super) mod tests {
                     crate::font_system::page_font_epoch(),
                     crate::img::svg_intrinsic_epoch(),
                     crate::dom::svg_sprite_revision(),
+                    crate::img::document_svg_revision(),
                 );
             assert_cold(&mut dom, &base, vp, &[], &controls, &images);
             if stable {
