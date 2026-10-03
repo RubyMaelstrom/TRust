@@ -12,7 +12,9 @@ use url::Url;
 
 use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::layout2::{Emphasis, NO_NODE};
-use crate::layout2::{ItemKind, TextTransform, Units, WhiteSpace, css_is_italic, css_length_px};
+use crate::layout2::{
+    ItemKind, TextTransform, UnitSource, Units, WhiteSpace, css_is_italic, css_length_px,
+};
 
 use super::value::{Len, Vp};
 
@@ -59,6 +61,49 @@ impl Outline {
     }
 }
 
+/// What the typed style snapshots (`BoxStyle::of`, `InlineStyle::derive`)
+/// read about an element: the DOM on the page thread, or a style
+/// computation's view of it during a parallel style pass.
+pub(crate) trait StyleSource: UnitSource {
+    fn tag_name(&self, id: NodeId) -> Option<&str>;
+    fn attr(&self, id: NodeId, name: &str) -> Option<&str>;
+    /// Tree parent. Panics for an unknown id.
+    fn parent(&self, id: NodeId) -> Option<NodeId>;
+    fn children(&self, id: NodeId) -> Vec<NodeId>;
+    /// The character data of a Text node. Panics for an unknown id.
+    fn text(&self, id: NodeId) -> Option<&str>;
+    fn is_element(&self, id: NodeId) -> bool;
+    fn in_quirks_mode(&self, id: NodeId) -> bool;
+    fn device_pixel_ratio(&self) -> f32;
+    fn render_clickable(&self, id: NodeId) -> bool;
+    fn inherited_lang(&self, id: NodeId) -> Option<&str>;
+    fn is_document_element(&self, id: NodeId) -> bool;
+    fn computed_display(&self, id: NodeId) -> Option<String>;
+    fn css_animation_definitions(&self, id: NodeId) -> Vec<crate::dom::CssAnimationDefinition>;
+    fn legacy_line_clamp(&self, id: NodeId) -> Option<usize>;
+    fn size_container_kind(&self, id: NodeId) -> u8;
+    fn effective_opacity(&self, id: NodeId) -> f32;
+    fn text_decoration(&self, id: NodeId) -> (bool, bool);
+    fn author_declares(&self, id: NodeId, prop: &str) -> bool;
+    fn font_size_zero(&self, id: NodeId) -> Option<bool>;
+    fn paint_suppressed(&self, id: NodeId) -> bool;
+    fn visibility_hidden(&self, id: NodeId) -> bool;
+    fn document_font_set(&self, id: NodeId) -> Option<std::sync::Arc<crate::text::FontSet>>;
+    fn retained_box_style(
+        &self,
+        id: NodeId,
+        context: crate::dom::BoxContext,
+        compute: impl FnOnce() -> BoxStyle,
+    ) -> BoxStyle;
+    fn retained_inline_style(
+        &self,
+        id: NodeId,
+        parent: &InlineStyle,
+        base: &Url,
+        compute: impl FnOnce() -> InlineStyle,
+    ) -> InlineStyle;
+}
+
 /// The positioning scheme (CSS 2.1 §9.3.1; css-position-3 adds `sticky`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Pos {
@@ -76,7 +121,7 @@ pub(crate) enum Pos {
 }
 
 impl Pos {
-    pub fn of(dom: &Dom, id: NodeId) -> Pos {
+    pub fn of<D: StyleSource + ?Sized>(dom: &D, id: NodeId) -> Pos {
         match dom
             .computed_value_resolved(id, "position")
             .as_deref()
@@ -303,7 +348,7 @@ impl BoxStyle {
     }
 
     /// Snapshot `id`'s box style: author cascade first, else the UA default.
-    pub fn of(dom: &Dom, id: NodeId, vp: Vp) -> BoxStyle {
+    pub fn of<D: StyleSource + ?Sized>(dom: &D, id: NodeId, vp: Vp) -> BoxStyle {
         let u = Units::of(dom, id);
         let tag = dom.tag_name(id).unwrap_or("");
         let (ua_margin, ua_padding) = ua_box(dom, id, tag, u.fs);
@@ -332,8 +377,8 @@ impl BoxStyle {
         })
     }
 
-    fn of_uncached(
-        dom: &Dom,
+    fn of_uncached<D: StyleSource + ?Sized>(
+        dom: &D,
         id: NodeId,
         vp: Vp,
         u: Units,
@@ -663,7 +708,7 @@ fn compositing_group(blend: Option<String>, isolation: Option<String>) -> bool {
 /// Whether the element declares a rendered background: a background-color
 /// that isn't fully transparent, or any background-image. (The `background`
 /// shorthand was expanded into these longhands by the cascade.)
-fn declares_background(dom: &Dom, id: NodeId) -> bool {
+fn declares_background<D: StyleSource + ?Sized>(dom: &D, id: NodeId) -> bool {
     if let Some(c) = dom.computed_value_resolved(id, "background-color") {
         let t = c.trim().to_ascii_lowercase();
         if !t.is_empty()
@@ -735,7 +780,7 @@ fn zero_alpha_color(t: &str) -> bool {
 /// absent/`none`/`hidden` (CSS 2.1 §8.5.3), else the declared width
 /// (`thin`/`medium`/`thick` = 1/3/5px per the usual UA mapping; `medium` is
 /// the initial width).
-fn border_side(dom: &Dom, id: NodeId, side: &str, u: Units) -> f32 {
+fn border_side<D: StyleSource + ?Sized>(dom: &D, id: NodeId, side: &str, u: Units) -> f32 {
     match dom
         .computed_value_resolved(id, &format!("border-{side}-style"))
         .as_deref()
@@ -762,7 +807,7 @@ pub(super) fn border_edge(dom: &Dom, id: NodeId, side: usize) -> (Option<String>
 
 /// A computed `<line-width>` in CSS px, snapped as a line width (CSS
 /// Backgrounds 3 #border-width, CSS UI 4 #outline-width).
-fn line_width(dom: &Dom, value: Option<&str>, u: Units) -> f32 {
+fn line_width<D: StyleSource + ?Sized>(dom: &D, value: Option<&str>, u: Units) -> f32 {
     let px = match value.map(str::trim) {
         None | Some("medium") => 3.0,
         Some("thin") => 1.0,
@@ -772,7 +817,7 @@ fn line_width(dom: &Dom, value: Option<&str>, u: Units) -> f32 {
     super::snap_line_width(px, dom.device_pixel_ratio())
 }
 
-pub(crate) fn outline_of(dom: &Dom, id: NodeId, u: Units) -> Outline {
+pub(crate) fn outline_of<D: StyleSource + ?Sized>(dom: &D, id: NodeId, u: Units) -> Outline {
     let style = match dom
         .computed_value_resolved(id, "outline-style")
         .as_deref()
@@ -813,7 +858,12 @@ pub(crate) fn outline_of(dom: &Dom, id: NodeId, u: Units) -> Outline {
 /// (`fs` = the element's own computed font size, so the `em` values scale
 /// with the heading factors `Dom::font_px` already applies). Returns
 /// `(margin, padding)` in TRBL order.
-fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
+fn ua_box<D: StyleSource + ?Sized>(
+    dom: &D,
+    id: NodeId,
+    tag: &str,
+    fs: f32,
+) -> ([f32; 4], [f32; 4]) {
     let m0 = [0.0f32; 4];
     let p0 = [0.0f32; 4];
     let em = fs;
@@ -826,8 +876,7 @@ fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
         "body" => ([8.0; 4], p0),
         _ if dom.attr(id, "data-trust-frame-body").is_some()
             && dom
-                .node(id)
-                .parent
+                .parent(id)
                 .is_some_and(|parent| dom.attr(parent, "data-trust-frame").is_some()) =>
         {
             ([8.0; 4], p0)
@@ -837,7 +886,7 @@ fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
         "ul" | "ol" | "menu" | "dir" => {
             // Nested lists lose their block margins (the classic UA
             // `ul ul { margin-block: 0 }` family of rules).
-            let nested = std::iter::successors(dom.node(id).parent, |&p| dom.node(p).parent)
+            let nested = std::iter::successors(dom.parent(id), |&p| dom.parent(p))
                 .any(|a| matches!(dom.tag_name(a), Some("ul" | "ol" | "menu" | "dir")));
             let m = if nested { m0 } else { block(em) };
             (m, [0.0, 0.0, 0.0, 40.0])
@@ -875,7 +924,7 @@ fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
 /// UA block-start/-end margins an element with default margins drops as the
 /// first or last substantial child of a body, td or th (blank elements and
 /// p elements only in some positions). Returns (block-start, block-end).
-fn quirks_margin_trims(dom: &Dom, id: NodeId, tag: &str) -> (bool, bool) {
+fn quirks_margin_trims<D: StyleSource + ?Sized>(dom: &D, id: NodeId, tag: &str) -> (bool, bool) {
     let with_default_margins = matches!(
         tag,
         "blockquote"
@@ -899,19 +948,18 @@ fn quirks_margin_trims(dom: &Dom, id: NodeId, tag: &str) -> (bool, bool) {
     if !with_default_margins || !dom.in_quirks_mode(id) {
         return (false, false);
     }
-    let Some(parent) = dom.node(id).parent else {
+    let Some(parent) = dom.parent(id) else {
         return (false, false);
     };
     let cell = matches!(dom.tag_name(parent), Some("td" | "th"));
     if !cell && dom.tag_name(parent) != Some("body") {
         return (false, false);
     }
-    let substantial = |node: NodeId| match &dom.node(node).data {
-        crate::dom::NodeData::Text(text) => !text
+    let substantial = |node: NodeId| match dom.text(node) {
+        Some(text) => !text
             .chars()
             .all(|c| matches!(c, ' ' | '\t' | '\n' | '\u{c}' | '\r')),
-        crate::dom::NodeData::Element { .. } => true,
-        _ => false,
+        None => dom.is_element(node),
     };
     let siblings = dom.children(parent);
     let index = siblings.iter().position(|&node| node == id).unwrap_or(0);
@@ -1142,7 +1190,12 @@ impl InlineStyle {
     }
 
     /// The context inside element `id`, derived from the parent's.
-    pub fn derive(dom: &Dom, id: NodeId, parent: &InlineStyle, base: &Url) -> InlineStyle {
+    pub fn derive<D: StyleSource + ?Sized>(
+        dom: &D,
+        id: NodeId,
+        parent: &InlineStyle,
+        base: &Url,
+    ) -> InlineStyle {
         dom.retained_inline_style(id, parent, base, || {
             Self::derive_uncached(dom, id, parent, base)
         })
@@ -1157,7 +1210,12 @@ impl InlineStyle {
                 .map_or(0, |link| link.retained_memory().0)
     }
 
-    fn derive_uncached(dom: &Dom, id: NodeId, parent: &InlineStyle, base: &Url) -> InlineStyle {
+    fn derive_uncached<D: StyleSource + ?Sized>(
+        dom: &D,
+        id: NodeId,
+        parent: &InlineStyle,
+        base: &Url,
+    ) -> InlineStyle {
         let u = Units::of(dom, id);
         let mut s = parent.clone();
         s.node = id;
@@ -1542,7 +1600,7 @@ impl InlineStyle {
 
 /// The CSS Text 4 wrap longhand as a nowrap override for
 /// `WhiteSpace::with_longhands`. The cascade expands `text-wrap` first.
-fn nowrap_longhand(dom: &Dom, id: NodeId) -> Option<bool> {
+fn nowrap_longhand<D: StyleSource + ?Sized>(dom: &D, id: NodeId) -> Option<bool> {
     match dom
         .computed_value_resolved(id, "text-wrap-mode")
         .as_deref()

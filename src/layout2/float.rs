@@ -13,7 +13,8 @@
 //! line-box intersections remain fractional CSS pixels; only the terminal
 //! adapter later quantizes their painted result.
 
-use crate::dom::{Dom, NodeId};
+use super::StyleSource;
+use crate::dom::NodeId;
 
 /// Which edge a float is shifted to (CSS 2.1 §9.5.1). `float:none` produces no
 /// [`Side`] at all (the element stays in flow).
@@ -43,7 +44,7 @@ impl Clear {
 /// maps logical property NAMES under the same rule). An out-of-flow
 /// (`position:absolute`/`fixed`) box computes `float:none` (§9.7) — the caller
 /// checks positioning first, so this need not.
-pub(crate) fn float_side(dom: &Dom, id: NodeId) -> Option<Side> {
+pub(crate) fn float_side<D: StyleSource + ?Sized>(dom: &D, id: NodeId) -> Option<Side> {
     match dom
         .computed_value_resolved(id, "float")
         .as_deref()
@@ -59,7 +60,7 @@ pub(crate) fn float_side(dom: &Dom, id: NodeId) -> Option<Side> {
 
 /// The `clear` sides of an element (§9.5.2). Logical values map by direction
 /// (LTR), same as `float_side`.
-pub(crate) fn clear_of(dom: &Dom, id: NodeId) -> Clear {
+pub(crate) fn clear_of<D: StyleSource + ?Sized>(dom: &D, id: NodeId) -> Clear {
     match dom
         .computed_value_resolved(id, "clear")
         .as_deref()

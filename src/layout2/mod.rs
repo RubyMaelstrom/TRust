@@ -99,7 +99,7 @@ pub(crate) fn stable_global_layout_inputs() -> std::sync::RwLockReadGuard<'stati
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 pub(crate) use memo::box_style_bytes;
-pub(crate) use style::{BoxStyle, InlineStyle};
+pub(crate) use style::{BoxStyle, InlineStyle, StyleSource};
 pub(crate) use tree_cache::BoxTreeCache;
 
 pub(crate) fn container_query_length(dom: &Dom, node: NodeId, text: &str) -> Option<f32> {
