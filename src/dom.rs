@@ -16576,7 +16576,50 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     {
         return None;
     }
+    // CSS Fonts 4 #font-size-prop: anything but an <absolute-size>,
+    // <relative-size>, non-negative <length-percentage> or `math` is invalid,
+    // so an earlier declaration stays in force. A missing semicolon made
+    // `font-size:19px max-width:600px` override a sheet's 19px and fall
+    // back to the 16px initial size.
+    if k == "font-size"
+        && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+        && !valid_font_size(&value)
+    {
+        return None;
+    }
     Some((k, value, important))
+}
+
+fn valid_font_size(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(
+        value.as_str(),
+        "xx-small"
+            | "x-small"
+            | "small"
+            | "medium"
+            | "large"
+            | "x-large"
+            | "xx-large"
+            | "xxx-large"
+            | "larger"
+            | "smaller"
+            | "math"
+    ) {
+        return true;
+    }
+    !value.starts_with('-')
+        && crate::layout2::value::Len::parse(
+            &value,
+            crate::layout2::Units {
+                fs: 16.,
+                root: 16.,
+                ch: 8.,
+            },
+            crate::layout2::value::Vp { w: 100., h: 100. },
+        )
+        .is_some()
 }
 
 /// Properties whose bare numeric components are lengths, never numbers.
@@ -19592,6 +19635,30 @@ mod tests {
             html.contains("width:0") && html.contains("height:0"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn invalid_font_size_declarations_leave_earlier_ones_in_force() {
+        // CSS Syntax 3 / CSS Fonts 4 #font-size-prop: an invalid value drops
+        // the declaration (anypup.neocities.org's missing semicolon), while
+        // keywords, lengths, percentages and calc() remain valid (relative
+        // sizes resolve against the parent's 16px).
+        for (value, expected) in [
+            ("19px\n max-width:600px", 19.0),
+            ("-4px", 19.0),
+            ("bold", 19.0),
+            ("larger", 19.2),
+            ("150%", 24.0),
+            ("calc(10px + 2px)", 12.0),
+            ("x-large", 24.0),
+        ] {
+            let html = format!(
+                "<style>body{{font-size:19px}}</style><style>body{{font-size:{value}}}</style><body id=b>x"
+            );
+            let dom = Dom::parse_document(&html);
+            let px = dom.font_px(dom.get_by_id("b").unwrap());
+            assert!((px - expected).abs() < 0.05, "{value}: {px}");
+        }
     }
 
     #[test]
