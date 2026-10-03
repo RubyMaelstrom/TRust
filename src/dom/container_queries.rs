@@ -499,6 +499,7 @@ impl Dom {
             let mut decorations = self.decoration_cache.borrow_mut();
             for &node in &affected {
                 self.transitions.invalidate(node);
+                self.animations.invalidate(node);
                 computed.1.remove_node(node);
                 custom.1.remove(&node);
                 matched.invalidate(node);
@@ -549,6 +550,7 @@ impl Dom {
         // A style/layout interleave is not a DOM mutation. Preserve the parsed
         // rule index and invalidate only values which depend on query results.
         self.transitions.invalidate_all();
+        self.animations.invalidate_all();
         *self.matched_cache.borrow_mut() = NodeCache::default();
         *self.cascaded_cache.borrow_mut() = NodeCache::default();
         self.computed_cache.borrow_mut().1.clear();

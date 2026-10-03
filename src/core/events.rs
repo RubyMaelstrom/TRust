@@ -90,6 +90,21 @@ impl Sender {
             if let Some(previous) = state.events.back_mut()
                 && supersedes(previous, event.as_ref().expect("pending event"))
             {
+                // A superseded content update is still a content update for
+                // consumers that ignore CSS animation frames.
+                if let (
+                    CoreEvent::Page {
+                        event: PageEvt::Updated { outcome: old, .. },
+                        ..
+                    },
+                    Some(CoreEvent::Page {
+                        event: PageEvt::Updated { outcome: new, .. },
+                        ..
+                    }),
+                ) = (&*previous, event.as_mut())
+                {
+                    new.animation_frame &= old.animation_frame;
+                }
                 (
                     false,
                     Some(std::mem::replace(
@@ -435,6 +450,46 @@ mod tests {
             })
         ));
         assert!(rx.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn coalesced_content_updates_are_not_mistaken_for_animation_frames() {
+        let (tx, mut rx, _) = counted_channel(4);
+        let frame = rendered();
+        let animation = |html: &str| {
+            let mut event = paint(1, html, frame.clone());
+            let CoreEvent::Page {
+                event: PageEvt::Updated { outcome, .. },
+                ..
+            } = &mut event
+            else {
+                unreachable!()
+            };
+            outcome.animation_frame = true;
+            event
+        };
+        // A CSS animation frame supersedes a pending content update: the
+        // surviving snapshot still carries that content change.
+        tx.send(paint(1, "content", frame.clone())).await.unwrap();
+        tx.send(animation("frame")).await.unwrap();
+        // Frames that supersede only frames remain animation frames.
+        tx.send(semantic(1)).await.unwrap();
+        tx.send(animation("frame 2")).await.unwrap();
+        tx.send(animation("frame 3")).await.unwrap();
+        let mut flags = Vec::new();
+        while let Some(event) = rx.pop() {
+            if let CoreEvent::Page {
+                event: PageEvt::Updated { html, outcome },
+                ..
+            } = event
+            {
+                flags.push((html, outcome.animation_frame));
+            }
+        }
+        assert_eq!(
+            flags,
+            [("frame".to_string(), false), ("frame 3".to_string(), true)]
+        );
     }
 
     #[tokio::test]

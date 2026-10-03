@@ -583,6 +583,9 @@ pub struct BrowserController {
     tx: events::Sender,
     rx: events::Receiver,
     current: Option<BrowserPage>,
+    /// The last `process_async_events` round delivered only CSS animation
+    /// frames (see `crate::js::Outcome::animation_frame`).
+    animation_frames_only: bool,
     back: Vec<HistoryEntry>,
     forward: Vec<HistoryEntry>,
     pending: Option<PendingNavigation>,
@@ -660,6 +663,7 @@ impl BrowserController {
             tx,
             rx,
             current: None,
+            animation_frames_only: false,
             back: Vec::new(),
             forward: Vec::new(),
             pending: None,
@@ -1312,8 +1316,17 @@ impl BrowserController {
         let generation_before = self.generation;
         let mut changed = false;
         let started = std::time::Instant::now();
+        let mut animation_frames = None;
         for _ in 0..16 {
             let Some(event) = self.rx.pop() else { break };
+            let animation_frame = matches!(
+                &event,
+                CoreEvent::Page {
+                    event: crate::js::PageEvt::Updated { outcome, .. },
+                    ..
+                } if outcome.animation_frame
+            );
+            animation_frames = Some(animation_frames.unwrap_or(true) && animation_frame);
             match event {
                 CoreEvent::UserInputReady { generation, permit } => {
                     if generation == self.generation {
@@ -1400,10 +1413,19 @@ impl BrowserController {
             }
         }
         self.rx.wake_if_pending();
+        self.animation_frames_only =
+            animation_frames == Some(true) && self.generation == generation_before;
         ActionOutcome {
             invalidated: changed || self.generation != generation_before,
             loading_retired: self.generation != generation_before,
         }
+    }
+
+    /// Whether the last [`Self::process_async_events`] round only advanced
+    /// CSS animations on the live page. Consumers waiting for a document to
+    /// stop changing (headless capture) disregard such rounds.
+    pub fn animation_frames_only(&self) -> bool {
+        self.animation_frames_only
     }
 
     fn begin_address(&mut self, address: &str, intent: NavigationIntent) -> bool {
@@ -4550,6 +4572,37 @@ mod tests {
             browser.page_render_is_final(),
             "a document that never committed cannot render again"
         );
+    }
+
+    #[test]
+    fn animation_frame_rounds_are_distinguished_from_content_changes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let generation = browser.generation;
+        let update = |animation_frame| CoreEvent::Page {
+            generation,
+            event: crate::js::PageEvt::Updated {
+                html: String::new(),
+                outcome: crate::js::Outcome {
+                    animation_frame,
+                    ..Default::default()
+                },
+            },
+        };
+        // Headless capture waits for a document to stop changing; CSS
+        // animation frames alone never let it settle otherwise.
+        runtime.block_on(browser.tx.send(update(true))).unwrap();
+        assert!(browser.process_async_events().invalidated);
+        assert!(browser.animation_frames_only());
+        runtime.block_on(browser.tx.send(update(false))).unwrap();
+        browser.process_async_events();
+        assert!(!browser.animation_frames_only());
+        browser.process_async_events();
+        assert!(!browser.animation_frames_only(), "an empty round");
     }
 
     #[test]

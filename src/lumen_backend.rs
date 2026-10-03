@@ -2170,6 +2170,7 @@ mod desktop {
         let mut interaction_burst_started: Option<Instant> = None;
         let mut background_service: Option<(Instant, usize)> = None;
         let mut task_gc_defer_until: Option<Instant> = None;
+        let mut animation_schedule = AnimationSchedule::default();
 
         'event_loop: loop {
             if matches!(
@@ -2202,11 +2203,21 @@ mod desktop {
             let deadline = trust_number(&mut page, "nextDeadline");
             let timer_due = deadline.is_some_and(|deadline| deadline <= now);
             if page.dom.borrow().css_transition_work_pending()
+                || page.dom.borrow().css_animation_events_pending()
                 || trust_bool(&mut page, "hasRenderingUpdate")
             {
                 page.render_pending = true;
             }
-            if page.render_pending
+            // CSS Animations 1 #animations: running style-origin animations
+            // need rendering opportunities.
+            let animation_wake = css_animation_wake(&mut page, &mut animation_schedule);
+            let animation_due = animation_wake.is_some_and(|at| at <= Instant::now());
+            if !page.render_pending && !animation_due {
+                // An animation frame queued before its animations stopped
+                // needing frames is no longer needed.
+                render_deadline = None;
+            }
+            if (page.render_pending || animation_due)
                 && (render_deadline.is_none() || interaction_burst_started.is_some())
             {
                 // Input need not wait an extra frame after its task finishes.
@@ -2296,8 +2307,14 @@ mod desktop {
 
             let timer_wait = deadline
                 .map(|deadline| Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0));
-            let render_wait =
-                render_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let render_wait = match (
+                render_deadline,
+                animation_wake.filter(|at| *at > Instant::now()),
+            ) {
+                (Some(deadline), Some(wake)) => Some(deadline.min(wake)),
+                (deadline, wake) => deadline.or(wake),
+            }
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
             let (mut wait, mut timeout_wake) = match (timer_wait, render_wait) {
                 (Some(timer), Some(render)) if render < timer => (Some(render), Wake::Render),
                 (Some(timer), _) => (Some(timer), Wake::Timer),
@@ -2589,6 +2606,14 @@ mod desktop {
                         break;
                     }
                     last_render_opportunity = Instant::now();
+                    animation_schedule.last_frame = Some(last_render_opportunity);
+                    if diag_frame_enabled() {
+                        eprintln!(
+                            "DIAGFRAMEACTOR total={:.2}ms animated={}",
+                            render_started.elapsed().as_secs_f64() * 1000.,
+                            page.dom.borrow().css_animation_frame_targets().len(),
+                        );
+                    }
                     input_burst_budget = rendering_input_budget(render_started);
                     render_not_before = defer_expensive_rendering(&mut page, render_started);
                     // Rendering must leave time for the other task sources,
@@ -2600,7 +2625,7 @@ mod desktop {
                     prefer_command = true;
                 }
             }
-            if !page.render_pending {
+            if !page.render_pending && !animation_due {
                 render_deadline = None;
             }
             report_task_trace(&mut page);
@@ -2616,6 +2641,63 @@ mod desktop {
             Some(wait) => tokio::time::sleep(wait).await,
             None => std::future::pending::<()>().await,
         }
+    }
+
+    fn diag_frame_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TRUST_DIAG_FRAME").is_some())
+    }
+
+    /// Layout-affecting style-origin CSS animations on a terminal sample at a
+    /// low rate: every terminal update re-adapts the page to cells and
+    /// rewrites them over the TTY.
+    const TERMINAL_ANIMATION_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// Frame scheduling state for style-origin CSS animations.
+    #[derive(Default)]
+    struct AnimationSchedule {
+        last_frame: Option<Instant>,
+    }
+
+    /// When the actor next needs a rendering opportunity for CSS animations:
+    /// now (at the frame cadence) while one runs, or when a running
+    /// animation next starts or ends.
+    fn css_animation_wake(
+        page: &mut LumenPage,
+        schedule: &mut AnimationSchedule,
+    ) -> Option<Instant> {
+        let targets = page.dom.borrow().css_animation_frame_targets();
+        let mut wake = None;
+        // The terminal's cell compositor paints no CSS colors, shadows or
+        // backgrounds: a paint-only animation can never change a cell there,
+        // so it is sampled only with other rendering updates.
+        if targets
+            .iter()
+            .any(|target| !target.paint_only || !page.terminal_presentation)
+        {
+            wake = Some(if page.terminal_presentation {
+                schedule
+                    .last_frame
+                    .map_or_else(Instant::now, |last| last + TERMINAL_ANIMATION_INTERVAL)
+            } else {
+                Instant::now()
+            });
+        }
+        let next = page.dom.borrow().css_animation_next_change();
+        if let Some(next) = next {
+            let clock = page
+                .engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| state.clock.clone());
+            if let Some(clock) = clock {
+                let timeline = (clock.now_ms() - clock.origin_ms) / 1000.;
+                let at =
+                    Instant::now() + Duration::from_secs_f64((next - timeline).clamp(0., 3600.));
+                wake = Some(wake.map_or(at, |wake: Instant| wake.min(at)));
+            }
+        }
+        wake
     }
 
     fn rendering_input_budget(started: Instant) -> Duration {
@@ -3225,6 +3307,7 @@ mod desktop {
     fn has_resident_work(page: &mut LumenPage, has_interaction: bool) -> bool {
         if has_interaction
             || page.dom.borrow().css_transition_work_pending()
+            || page.dom.borrow().css_animations_keep_alive()
             || page.dom.borrow().hover_css_affects_rendering()
             || page.dom.borrow().focus_css_affects_rendering()
             || !page.dom.borrow().hover_hosts_is_empty()
@@ -3625,6 +3708,8 @@ mod desktop {
             let mut dom = page.dom.borrow_mut();
             let _ = dom.take_dirty();
             let _ = dom.take_dirty_targets();
+            // The presentation includes the current animation sample.
+            let _ = dom.take_css_animation_updates();
         }
         (html, rendered, has_interaction)
     }
@@ -4675,7 +4760,14 @@ mod desktop {
         let mut sent_primary = false;
         let dom_dirty = page.dom.borrow_mut().take_dirty();
         let environment_dirty = std::mem::take(&mut page.render_environment_dirty);
-        page.render_pending |= dom_dirty || environment_dirty;
+        let (animation_paint, animation_layout) =
+            page.dom.borrow_mut().take_css_animation_updates();
+        page.render_pending |=
+            dom_dirty || environment_dirty || animation_paint || animation_layout;
+        // A frame whose only cause is the CSS animation origin (headless
+        // capture waits for everything else to settle).
+        let animation_frame =
+            !dom_dirty && !environment_dirty && (animation_paint || animation_layout);
         if let Some(trace) = page.task_trace.as_mut() {
             trace.finishes += 1;
             if dom_dirty || environment_dirty {
@@ -4752,6 +4844,7 @@ mod desktop {
                 let mut outcome = std::mem::take(&mut page.outcome);
                 outcome.elapsed = page.started.elapsed();
                 outcome.rendered = Some(Box::new(rendered));
+                outcome.animation_frame = animation_frame;
                 if events
                     .blocking_send(PageEvt::Updated { html, outcome })
                     .is_err()
@@ -5441,6 +5534,111 @@ mod desktop {
                     Some(_)=>{},None=>panic!("transition page ended"),
                 }}
             }).await.expect("CSS transition never completed");
+        }
+
+        fn glyph_colors(page: &crate::render::PagePaint) -> Vec<crate::render::PaintColor> {
+            page.primitives
+                .iter()
+                .filter_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Count the CSS animation frames a script-free page sends within
+        /// `window`, after its first presentation, and the distinct text
+        /// colors they paint.
+        async fn css_animation_frames(
+            html: &str,
+            terminal_presentation: bool,
+            window: Duration,
+            commands: Vec<PageCmd>,
+        ) -> (usize, usize) {
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.terminal_presentation = terminal_presentation;
+            let (handle, mut events) = spawn_page(html.into(), env);
+            let mut first = None;
+            while first.is_none() {
+                match tokio::time::timeout(Duration::from_secs(30), events.recv()).await {
+                    Ok(Some(PageEvt::Updated { outcome, .. })) => first = outcome.rendered,
+                    Ok(Some(PageEvt::Static { .. })) => panic!("animated page went static"),
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => panic!("no presentation"),
+                }
+            }
+            let boxes = first.unwrap().layout.boxes.clone();
+            // Let the load-time rendering updates (which sample every
+            // animation once) finish before counting.
+            let settle = tokio::time::Instant::now() + Duration::from_millis(400);
+            while let Ok(event) = tokio::time::timeout_at(settle, events.recv()).await {
+                assert!(
+                    !matches!(event, Some(PageEvt::Static { .. }) | None),
+                    "animated page retired"
+                );
+            }
+            for command in commands {
+                if command.is_user_interaction() {
+                    handle.try_send_user(command).unwrap();
+                } else {
+                    handle.cmds.try_send(command).unwrap();
+                }
+            }
+            let (mut frames, mut colors) = (0, Vec::new());
+            let deadline = tokio::time::Instant::now() + window;
+            while let Ok(event) = tokio::time::timeout_at(deadline, events.recv()).await {
+                match event {
+                    Some(PageEvt::Updated { outcome, .. }) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        let rendered = outcome.rendered.expect("typed presentation");
+                        if outcome.animation_frame {
+                            frames += 1;
+                            // Paint-only frames keep the retained geometry.
+                            if !html.contains("letter-spacing") {
+                                assert_eq!(rendered.layout.boxes, boxes);
+                            }
+                        }
+                        for color in glyph_colors(&rendered.layout.paint) {
+                            if !colors.contains(&color) {
+                                colors.push(color);
+                            }
+                        }
+                    }
+                    Some(PageEvt::Static { .. }) | None => panic!("animated page retired"),
+                    Some(_) => {}
+                }
+            }
+            (frames, colors.len())
+        }
+
+        #[tokio::test]
+        async fn css_animations_paint_frames_and_slow_terminals() {
+            // CSS Animations 1 #animations: a script-free page keeps its
+            // actor for a running color animation and repaints it without
+            // relayout on every rendering opportunity.
+            let near = r#"<!doctype html><style>body{margin:0}
+                p{margin:0;height:20px;animation:c 1s linear infinite}
+                @keyframes c{from{color:rgb(255, 0, 0)}to{color:rgb(0, 0, 255)}}</style>
+                <p>glowing</p>"#;
+            let (frames, colors) =
+                css_animation_frames(near, false, Duration::from_millis(1500), vec![]).await;
+            assert!(
+                frames >= 8 && colors >= 8,
+                "frames={frames} colors={colors}"
+            );
+            // The terminal paints no CSS colors: a color cycle never wakes it.
+            let (frames, _) =
+                css_animation_frames(near, true, Duration::from_millis(1000), vec![]).await;
+            assert_eq!(frames, 0, "a terminal repainted an invisible color change");
+            // Layout-affecting animations reach a terminal at a low rate
+            // instead of 60 Hz.
+            let spacing = r#"<!doctype html><style>body{margin:0}
+                p{margin:0;animation:s 1s linear infinite alternate}
+                @keyframes s{from{letter-spacing:0px}to{letter-spacing:40px}}</style>
+                <p>spreading out</p>"#;
+            let (frames, _) =
+                css_animation_frames(spacing, true, Duration::from_millis(1500), vec![]).await;
+            assert!((2..=8).contains(&frames), "frames={frames}");
         }
 
         #[tokio::test]
@@ -7900,6 +8098,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__worker_self_close", 0, host_worker_self_close),
     ("__dom_computed", 2, host_computed_style),
     ("__dom_transition_events", 0, host_transition_events),
+    ("__dom_animation_events", 0, host_animation_events),
     ("__dom_offset_style", 1, host_offset_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
@@ -13789,12 +13988,23 @@ fn sync_css_transitions(ctx: &mut Ctx) {
                 .unwrap_or_else(|| (state.clock.now_ms() - state.clock.origin_ms) / 1000.),
         )
     };
-    dom.borrow_mut().update_css_transitions(seconds);
+    let mut dom = dom.borrow_mut();
+    dom.update_css_transitions(seconds);
+    // CSS Animations 1 #animations shares the document timeline sample, so
+    // CSSOM, observers and paint see one animation-origin value per frame.
+    dom.update_css_animations(seconds);
 }
 
 fn host_transition_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     sync_css_transitions(ctx);
     let events = host_dom(ctx).borrow_mut().take_css_transition_events();
+    Ok(Value::from_string(serde_json::to_string(&events).unwrap()))
+}
+
+/// CSS Animations 2 #event-dispatch for this rendering update's sample.
+fn host_animation_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    sync_css_transitions(ctx);
+    let events = host_dom(ctx).borrow_mut().take_css_animation_events();
     Ok(Value::from_string(serde_json::to_string(&events).unwrap()))
 }
 
@@ -16155,6 +16365,68 @@ mod tests {
         })()"#
             ),
             "transitionrun,transitionstart,raf"
+        );
+    }
+
+    #[test]
+    fn css_animation_origin_follows_the_realm_clock_through_cssom_paint_and_events() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><style>#box{height:10px;animation:c 1s linear infinite}
+             @keyframes c{from{color:rgb(0, 0, 0)}to{color:rgb(200, 0, 0)}}</style>
+             <div id=box>text</div>",
+        )));
+        let clock = Rc::new(RealmClock::new());
+        let mut engine = configured_engine(HostState::new(dom.clone(), clock.clone()), DEFAULT_URL);
+        let color = |engine: &mut lumen::Engine| {
+            string_value(
+                engine,
+                "getComputedStyle(document.getElementById('box')).color",
+            )
+        };
+        let first = color(&mut engine);
+        let cache = ensure_host_geom_cache(engine.ctx(), "before frame");
+        let fragments = cache.borrow().fragments.clone().unwrap();
+        let _ = dom.borrow_mut().take_dirty();
+        let _ = dom.borrow_mut().take_css_animation_updates();
+        clock.set_epoch_ms(clock.now_ms() + 400.);
+        let second = color(&mut engine);
+        assert_ne!(first, second, "the animation origin did not advance");
+        // CSS Animations 1 #events, HTML #update-the-rendering: animation
+        // events dispatch before animation frame callbacks.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const box=document.getElementById('box'), seen=[];
+            for(const type of ['animationstart','animationiteration'])
+                box.addEventListener(type,e=>seen.push(type+':'+e.animationName+':'+e.elapsedTime+':'+(e instanceof AnimationEvent)));
+            requestAnimationFrame(()=>seen.push('raf'));
+            __trust.runRenderingFrame(performance.now());
+            return seen.join(',');
+        })()"#
+            ),
+            "animationstart:c:0:true,raf"
+        );
+        // A color frame repaints: neither the DOM nor geometry changed.
+        assert_eq!(dom.borrow_mut().take_css_animation_updates(), (true, false));
+        assert!(!dom.borrow_mut().take_dirty());
+        ensure_host_geom_cache(engine.ctx(), "after frame");
+        assert!(std::sync::Arc::ptr_eq(
+            &fragments,
+            cache.borrow().fragments.as_ref().unwrap()
+        ));
+        clock.set_epoch_ms(clock.now_ms() + 700.);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const seen=[];
+            document.getElementById('box').onanimationiteration=e=>seen.push(e.type+':'+e.elapsedTime);
+            __trust.runRenderingFrame(performance.now());
+            return seen.join(',');
+        })()"#
+            ),
+            "animationiteration:1"
         );
     }
 
@@ -18562,7 +18834,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 188, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 189, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -18573,7 +18845,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 188);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 189);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

@@ -1288,6 +1288,7 @@ impl Dom {
         }
         for id in affected {
             self.transitions.invalidate(id);
+            self.animations.invalidate(id);
             if seen[&id] {
                 self.selector_cache.borrow_mut().invalidate(id);
             }

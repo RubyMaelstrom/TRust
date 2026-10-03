@@ -72,6 +72,49 @@ impl Row {
         }
     }
 
+    /// Drop one cached value while keeping the row's identity and its slot
+    /// directory dense: the last value moves into the vacated slot, so a
+    /// property evicted every animation frame never grows the row.
+    fn forget(&mut self, property: usize) {
+        let Some(&slot) = self.slots.get(property) else {
+            return;
+        };
+        if slot == MISSING {
+            return;
+        }
+        self.slots[property] = MISSING;
+        let removed = self
+            .values
+            .swap_remove(usize::from(slot))
+            .map_or(0, |value| value.capacity());
+        let moved = self.values.len() as u16;
+        if moved != slot
+            && let Some(entry) = self.slots.iter_mut().find(|entry| **entry == moved)
+        {
+            *entry = slot;
+        }
+        if let Some(charge) = self.retention.as_mut() {
+            charge.resize(0, removed);
+        }
+    }
+
+    /// Drop every cached value and typed record, keeping the row's identity
+    /// (and therefore the style-sharing keys of the rows below it).
+    fn clear(&mut self) {
+        let removed = self
+            .values
+            .iter()
+            .flatten()
+            .map(String::capacity)
+            .sum::<usize>();
+        self.slots.clear();
+        self.values.clear();
+        self.boxes = [None, None];
+        if let Some(charge) = self.retention.as_mut() {
+            charge.resize(0, removed);
+        }
+    }
+
     pub(super) fn retain_in_graph(&mut self, budget: &super::style_sharing::RowBudget) -> bool {
         // A row can outlive an evicted graph through a node cache. Transfer
         // its charge when a later graph acquires ownership of that same row.
@@ -283,6 +326,29 @@ impl Values {
         self.rows.remove(node);
     }
 
+    /// CSS Animations 1 #animations: an animation-origin value changed. Only
+    /// rows below a privately computed animated element reach here, so the
+    /// shared row can be updated in place for every node that uses it.
+    pub(super) fn forget(&mut self, node: NodeId, property: usize) {
+        let Some(row) = self.rows.get_mut(node) else {
+            return;
+        };
+        if contextual(property) {
+            row.contextual.forget(property);
+        } else if let Some(common) = &row.common {
+            common.borrow_mut().forget(property);
+        }
+    }
+
+    /// Retire a node's values and records, clearing its (possibly shared)
+    /// row in place so a retained style-sharing key cannot return them.
+    pub(super) fn clear_node(&mut self, node: NodeId) {
+        if let Some(common) = self.rows.get(node).and_then(|row| row.common.as_ref()) {
+            common.borrow_mut().clear();
+        }
+        self.rows.remove(node);
+    }
+
     pub(super) fn clear(&mut self) {
         self.rows.clear();
     }
@@ -360,5 +426,29 @@ mod tests {
         );
         values.retain_nodes(|_| false);
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn animated_evictions_keep_shared_rows_dense_and_their_identity() {
+        let mut values = Values::default();
+        for property in 0..4 {
+            values.insert((1, property), Some(format!("v{property}")));
+        }
+        let row = values.row(1).unwrap();
+        values.forget(1, 1);
+        assert_eq!(values.get(&(1, 1)), None);
+        assert_eq!(values.get(&(1, 3)), Some(Some("v3".into())));
+        // An animated property evicted every frame never grows the row.
+        for frame in 0..100 {
+            values.insert((1, 1), Some(format!("frame {frame}")));
+            values.forget(1, 1);
+        }
+        assert_eq!(row.borrow().values.len(), 3);
+        assert_eq!(values.get(&(1, 0)), Some(Some("v0".into())));
+        assert_eq!(values.get(&(1, 2)), Some(Some("v2".into())));
+        // Clearing in place retires values for every user of the shared row.
+        values.clear_node(1);
+        assert!(row.borrow().values.is_empty());
+        assert_eq!(values.get(&(1, 0)), None);
     }
 }

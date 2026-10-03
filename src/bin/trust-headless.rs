@@ -275,10 +275,14 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
         let outcome = controller.process_async_events();
         let snapshot = controller.snapshot();
         let now = Instant::now();
-        if outcome.invalidated || snapshot.page_revision != revision {
-            revision = snapshot.page_revision;
+        // CSS animation frames keep a live page changing forever; the
+        // document is settled once anything else stops changing.
+        if (outcome.invalidated || snapshot.page_revision != revision)
+            && !controller.animation_frames_only()
+        {
             last_change = now;
         }
+        revision = snapshot.page_revision;
         if timeline_origin.is_none() && controller.current_page().is_some() {
             timeline_origin = Some(now);
         }
