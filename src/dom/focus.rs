@@ -76,38 +76,14 @@ impl Dom {
         }
     }
 
-    /// HTML #selector-focus additionally matches shadow hosts, but excludes
-    /// navigable containers. Ordinary parents do not inherit :focus.
-    pub(super) fn matches_focus(&self, id: NodeId) -> bool {
-        let focused = self.focused_area(self.nodes[id].owner_document);
-        if focused.is_some_and(|node| matches!(self.tag_name(node), Some("iframe" | "frame"))) {
-            return false;
-        }
-        let mut current = focused;
-        while let Some(node) = current {
-            if node == id {
-                return true;
-            }
-            current = self.shadow_hosts.get(&self.tree_scope(node)).copied();
-        }
-        false
+    #[cfg(test)]
+    fn matches_focus(&self, id: NodeId) -> bool {
+        self.style_view().matches_focus(id)
     }
 
-    pub(super) fn matches_focus_within(&self, id: NodeId) -> bool {
-        let Some(focused) = self.focused_area(self.nodes[id].owner_document) else {
-            return false;
-        };
-        if !self.matches_focus(focused) {
-            return false;
-        }
-        let mut current = Some(focused);
-        while let Some(node) = current {
-            if node == id {
-                return true;
-            }
-            current = self.parent_flat(node);
-        }
-        false
+    #[cfg(test)]
+    fn matches_focus_within(&self, id: NodeId) -> bool {
+        self.style_view().matches_focus_within(id)
     }
 
     #[cfg(test)]
@@ -229,6 +205,51 @@ fn compound_uses_focus(c: &Compound) -> bool {
         })
         || c.host_inner.as_deref().is_some_and(compound_uses_focus)
         || c.slotted.as_deref().is_some_and(compound_uses_focus)
+}
+
+impl StyleView<'_> {
+    /// HTML #selector-focus additionally matches shadow hosts, but excludes
+    /// navigable containers. Ordinary parents do not inherit :focus.
+    pub(super) fn matches_focus(&self, id: NodeId) -> bool {
+        let focused = self
+            .state
+            .focused_areas
+            .get(&self.nodes.owner_document(id))
+            .copied();
+        if focused.is_some_and(|node| matches!(self.tag_name(node), Some("iframe" | "frame"))) {
+            return false;
+        }
+        let mut current = focused;
+        while let Some(node) = current {
+            if node == id {
+                return true;
+            }
+            current = self.state.shadow_hosts.get(&self.tree_scope(node)).copied();
+        }
+        false
+    }
+
+    pub(super) fn matches_focus_within(&self, id: NodeId) -> bool {
+        let Some(focused) = self
+            .state
+            .focused_areas
+            .get(&self.nodes.owner_document(id))
+            .copied()
+        else {
+            return false;
+        };
+        if !self.matches_focus(focused) {
+            return false;
+        }
+        let mut current = Some(focused);
+        while let Some(node) = current {
+            if node == id {
+                return true;
+            }
+            current = self.parent_flat(node);
+        }
+        false
+    }
 }
 
 #[cfg(test)]

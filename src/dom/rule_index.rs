@@ -143,7 +143,7 @@ impl AncestorMatches {
 
     pub(super) fn candidate(
         &mut self,
-        dom: &Dom,
+        dom: &StyleView<'_>,
         subject: NodeId,
         compound: &Compound,
         context: SelectorContext<'_>,
@@ -195,7 +195,7 @@ impl AncestorMatches {
             };
             entry.next = dom.selector_parent_in(node, context);
             let matches = match kind {
-                0 => dom.matches_classes(node, std::slice::from_ref(&entry.name)),
+                0 => dom.matches_classes(node, std::slice::from_ref(&entry.name), context.classes),
                 1 => dom.attr(node, "id") == Some(value),
                 _ => dom.tag_name(node) == Some(value),
             };
@@ -320,7 +320,7 @@ pub(super) fn ancestor_requirements(selector: &Complex) -> Vec<u16> {
 }
 
 impl Ancestors {
-    pub(super) fn of(dom: &Dom, id: NodeId) -> Self {
+    pub(super) fn of(dom: &StyleView<'_>, id: NodeId) -> Self {
         Self {
             bits: [0; 32],
             next: dom.parent_composed(id),
@@ -330,7 +330,7 @@ impl Ancestors {
         }
     }
 
-    pub(super) fn may_match(&mut self, dom: &Dom, required: &[u16]) -> bool {
+    pub(super) fn may_match(&mut self, dom: &StyleView<'_>, required: &[u16]) -> bool {
         loop {
             if self.exhausted
                 || required
@@ -444,7 +444,7 @@ mod tests {
                         context.ancestors = ancestors.as_ref();
                     }
                     candidates.clear();
-                    buckets.candidates(&dom, node, &mut candidates);
+                    buckets.candidates(&dom.style_view(), node, &mut candidates);
                     count += candidates.len();
                     matches.extend(
                         candidates
@@ -533,7 +533,7 @@ mod tests {
                 continue;
             };
             let mut candidates = Vec::new();
-            index.buckets[&scope].candidates(dom, node, &mut candidates);
+            index.buckets[&scope].candidates(&dom.style_view(), node, &mut candidates);
             assert!(
                 candidates.windows(2).all(|pair| pair[0] < pair[1]),
                 "candidate union must be unique"
@@ -665,14 +665,22 @@ mod tests {
             "functional class subjects must not enter the universal bucket"
         );
         let mut candidates = Vec::new();
-        buckets.candidates(&dom, dom.get_by_id("target").unwrap(), &mut candidates);
+        buckets.candidates(
+            &dom.style_view(),
+            dom.get_by_id("target").unwrap(),
+            &mut candidates,
+        );
         assert_eq!(
             candidates.len(),
             1,
             "499 impossible rules must not reach the full matcher"
         );
         candidates.clear();
-        buckets.candidates(&dom, dom.get_by_id("unrelated").unwrap(), &mut candidates);
+        buckets.candidates(
+            &dom.style_view(),
+            dom.get_by_id("unrelated").unwrap(),
+            &mut candidates,
+        );
         assert!(candidates.is_empty());
     }
 
@@ -780,7 +788,7 @@ mod tests {
         let index = dom.style_index();
         let mut candidates = Vec::new();
         index.buckets[&DOCUMENT].candidates(
-            &dom,
+            &dom.style_view(),
             dom.get_by_id("target").unwrap(),
             &mut candidates,
         );
@@ -884,10 +892,13 @@ mod tests {
         let ancestors = RefCell::new(AncestorMatches::new(node, base.shadow_host));
         for key in 0..=AncestorMatches::MAX_EDGES {
             let selector = SelectorList::parse(&format!(".k{key}")).unwrap();
-            let result =
-                ancestors
-                    .borrow_mut()
-                    .candidate(&dom, node, &selector.0[0].0[0].1, base, 0);
+            let result = ancestors.borrow_mut().candidate(
+                &dom.style_view(),
+                node,
+                &selector.0[0].0[0].1,
+                base,
+                0,
+            );
             if matches!(result, AncestorCandidate::Unavailable) {
                 break;
             }

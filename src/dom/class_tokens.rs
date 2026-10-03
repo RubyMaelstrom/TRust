@@ -14,22 +14,45 @@ const MEMOIZE_BYTES: usize = 64;
 
 impl Dom {
     pub(super) fn matches_classes(&self, id: NodeId, required: &[String]) -> bool {
+        self.style_view()
+            .matches_classes(id, required, ClassMemo::Document(&self.class_cache))
+    }
+}
+
+impl StyleView<'_> {
+    pub(super) fn matches_classes(
+        &self,
+        id: NodeId,
+        required: &[String],
+        memo: ClassMemo<'_>,
+    ) -> bool {
         if required.is_empty() {
             return true;
         }
         let classes = self.attr(id, "class").unwrap_or("");
-        if classes.len() < MEMOIZE_BYTES {
-            return required
+        let scan = || {
+            required
                 .iter()
-                .all(|want| classes.split_ascii_whitespace().any(|token| token == want));
+                .all(|want| classes.split_ascii_whitespace().any(|token| token == want))
+        };
+        if classes.len() < MEMOIZE_BYTES {
+            return scan();
         }
-        if let Some(tokens) = self.class_cache.borrow().get(id, 0) {
-            return required.iter().all(|want| tokens.contains(want.as_str()));
+        let all = |tokens: &ClassTokens| required.iter().all(|want| tokens.contains(want.as_str()));
+        let tokenize =
+            || -> ClassTokens { classes.split_ascii_whitespace().map(Box::from).collect() };
+        match memo {
+            ClassMemo::None => scan(),
+            ClassMemo::Document(cache) => {
+                if let Some(tokens) = cache.borrow().get(id, 0) {
+                    return all(tokens);
+                }
+                let tokens = tokenize();
+                let matches = all(&tokens);
+                cache.borrow_mut().put(id, 0, tokens);
+                matches
+            }
         }
-        let tokens: ClassTokens = classes.split_ascii_whitespace().map(Box::from).collect();
-        let matches = required.iter().all(|want| tokens.contains(want.as_str()));
-        self.class_cache.borrow_mut().put(id, 0, tokens);
-        matches
     }
 }
 
