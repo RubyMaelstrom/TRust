@@ -12663,15 +12663,95 @@
         }
     })();
     /*__NAVIGATOR_END__*/
+    // Permissions and the features built on it (Notifications, Storage,
+    // Service Workers) share one Window and Worker implementation. This
+    // bootstrap-only adapter supplies the environment's EventTarget, task
+    // queue and settings object; the shared feature block deletes it.
+    g.__feature_adapter = {
+        EventTarget, window: true,
+        add(target, type, fn) { addL(target, type, fn, false); },
+        remove(target, type, fn) { removeL(target, type, fn, false); },
+        fire(target, type) { dispatch(target, createTrustedEvent(Event, type, {}), false); },
+        queue(fn) { __queue_dom_task(fn); },
+        report(error) { trust.errors.push("callback: " + ((error && error.message) || error)); },
+        origin() { return messageWindowState.origin; },
+        baseURL() { return messageWindowState.apiBaseURL(); },
+        secure: secureContext,
+        context: storageContextId,
+    };
     /*__PERMISSIONS_BEGIN__*/
     (function () {
         "use strict";
-        const g = globalThis, binding = g.__permissions_binding;
+        const g = globalThis, binding = g.__permissions_binding, adapter = g.__feature_adapter;
         delete g.__permissions_binding;
         const slots = binding("slots",new WeakMap());
-        const apply = Reflect.apply, get = WeakMap.prototype.get, set = WeakMap.prototype.set;
+        const apply = Reflect.apply, construct = Reflect.construct;
+        const get = WeakMap.prototype.get, set = WeakMap.prototype.set;
+        const define = Object.defineProperty, freeze = Object.freeze;
         const PromiseCtor = Promise, reject = Promise.reject, TypeErrorCtor = TypeError;
-        const context = Number((g.__trust_cfg || {}).hostSettingsContext) || 0;
+        const EventTargetCtor = adapter.EventTarget, context = adapter.context;
+        const read = object => apply(get,slots,[object]);
+        function named(fn, name) { define(fn,"name",{value:name,configurable:true}); return fn; }
+        // Permissions #powerful-feature: the features TRust implements, each
+        // with the default PermissionDescriptor type and permission query
+        // algorithm. "notifications" is Notifications API §Permissions
+        // integration; "persistent-storage" is Storage §Persistence permission.
+        // TRust has no permission prompt UI. Pretending a device or capability
+        // exists by reporting other names would not be an honest answer.
+        const FEATURES = freeze(["notifications", "persistent-storage"]);
+        // Permissions #dfn-permission-store, keyed by the settings object's
+        // origin. The native store is shared by this page's Window Realms and
+        // dedicated workers. An opaque origin has no stable key across
+        // settings objects, so its decisions stay with this Realm.
+        const opaqueEntries = Object.create(null);
+        function entryKey(name) {
+            const origin = adapter.origin();
+            return origin === "null" ? null : origin + "\u0000" + name;
+        }
+        function storedState(name) {
+            const key = entryKey(name);
+            return key === null ? opaqueEntries[name] : binding("state", key);
+        }
+        // Permissions #dfn-permission-state with this Realm's settings object.
+        function permissionState(name) {
+            if (!adapter.secure) return "denied";
+            const stored = storedState(name);
+            return typeof stored === "string" ? stored : "prompt";
+        }
+        // Live PermissionStatus objects for each name in this Realm. The store
+        // can only move from "prompt" to "denied" (there is no grant path), so
+        // a feature's list is released once that terminal change is delivered.
+        const statuses = Object.create(null);
+        function setEntry(name, state) {
+            const key = entryKey(name);
+            if (key === null) opaqueEntries[name] = state;
+            else binding("set", key + "\u0000" + state);
+            // Permissions #PermissionStatus-update: rerun the query algorithm
+            // and queue a change event for each status whose state changed.
+            const list = statuses[name];
+            if (!list) return;
+            const current = permissionState(name);
+            if (current !== "prompt") delete statuses[name];
+            // A status whose Document is no longer fully active is not updated.
+            if (!binding("active", context)) return;
+            for (const status of list) {
+                const record = read(status);
+                if (record.state === current) continue;
+                record.state = current;
+                adapter.queue(() => adapter.fire(status, "change"));
+            }
+        }
+        // Permissions #request-permission-to-use. Without a permission UI the
+        // user cannot give express permission, so a "prompt" state resolves to
+        // "denied". The permission store entry is set by a queued task.
+        function requestPermission(name) {
+            const current = permissionState(name);
+            if (current !== "prompt") return current;
+            adapter.queue(() => {
+                if (permissionState(name) === "prompt") setEntry(name, "denied");
+            });
+            return "denied";
+        }
         class Permissions {
             constructor() { throw new TypeErrorCtor("Illegal constructor"); }
             query(permissionDesc) {
@@ -12679,38 +12759,88 @@
                 // #js-dictionary and #dfn-create-operation-function.
                 // Promise-returning operations reject ALL conversion errors.
                 try {
-                    const state = apply(get,slots,[this]);
+                    const state = read(this);
                     if (!state || !state.permissions) throw new TypeErrorCtor("Illegal Permissions invocation");
                     if (permissionDesc === null || (typeof permissionDesc !== "object" && typeof permissionDesc !== "function"))
                         throw new TypeErrorCtor("Expected a permission descriptor object");
                     if (!binding("active",context))
                         throw new DOMException("Document is not fully active","InvalidStateError");
-                    const name = permissionDesc.name;
-                    if (name === undefined) throw new TypeErrorCtor("Permission name is required");
+                    const rootName = permissionDesc.name;
+                    if (rootName === undefined) throw new TypeErrorCtor("Permission name is required");
                     // DOMString conversion is observable even for unsupported
                     // features (including Symbol and throwing toString).
-                    `${name}`;
-                    // TRust currently implements no permission-controlled
-                    // powerful web API. A future feature must supply a real
-                    // query algorithm, PermissionStatus/EventTarget and user
-                    // permission lifecycle here, not a manufactured "prompt".
-                    throw new TypeErrorCtor("Unsupported permission name");
+                    if (!FEATURES.includes(`${rootName}`)) throw new TypeErrorCtor("Unsupported permission name");
+                    // The supported features use PermissionDescriptor as their
+                    // permission descriptor type: convert the object again.
+                    const typedName = permissionDesc.name;
+                    if (typedName === undefined) throw new TypeErrorCtor("Permission name is required");
+                    const name = `${typedName}`;
+                    if (!FEATURES.includes(name)) throw new TypeErrorCtor("Unsupported permission name");
+                    return new PromiseCtor(resolve => {
+                        // #create-a-permissionstatus, then the default
+                        // permission query algorithm, on a queued task.
+                        const status = construct(EventTargetCtor, [], PermissionStatus);
+                        const record = {status:true, name, state:permissionState(name), handler:null,
+                            add:(type, fn) => adapter.add(status, type, fn),
+                            remove:(type, fn) => adapter.remove(status, type, fn)};
+                        apply(set,slots,[status,record]);
+                        (statuses[name] || (statuses[name] = [])).push(status);
+                        adapter.queue(() => resolve(status));
+                    });
                 } catch (error) {
                     return apply(reject,PromiseCtor,[error]);
                 }
             }
         }
+        class PermissionStatus extends EventTargetCtor {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+        }
+        function statusRecord(object) {
+            const record = read(object);
+            if (!record || !record.status) throw new TypeErrorCtor("Illegal PermissionStatus invocation");
+            return record;
+        }
+        for (const name of ["state", "name"]) {
+            define(PermissionStatus.prototype,name,{configurable:true,enumerable:true,
+                get:named({get() { return statusRecord(this)[name]; }}.get,"get "+name)});
+        }
+        // HTML #event-handler-attributes: the handler's listener keeps its
+        // position when a non-null handler is replaced.
+        define(PermissionStatus.prototype,"onchange",{configurable:true,enumerable:true,
+            get:named({get() { const handler = statusRecord(this).handler; return handler ? handler.value : null; }}.get,"get onchange"),
+            set:named({set(value) {
+                const record = statusRecord(this);
+                value = typeof value === "function" || (value !== null && typeof value === "object") ? value : null;
+                let handler = record.handler;
+                if (value === null) {
+                    if (handler) record.remove("change", handler.listener);
+                    record.handler = null;
+                } else if (handler) handler.value = value;
+                else {
+                    const target = this;
+                    handler = record.handler = {value, listener(event) {
+                        const callback = handler.value;
+                        if (typeof callback === "function" && apply(callback,target,[event]) === false) event.preventDefault();
+                    }};
+                    record.add("change", handler.listener);
+                }
+            }}.set,"set onchange")});
+        define(PermissionStatus.prototype,Symbol.toStringTag,{value:"PermissionStatus",configurable:true});
         Object.defineProperty(Permissions.prototype,Symbol.toStringTag,{value:"Permissions",configurable:true});
         Object.defineProperty(Permissions.prototype,"query",{enumerable:true});
         const permissions = Object.create(Permissions.prototype);
         apply(set,slots,[permissions,{permissions:true}]);
         apply(set,slots,[g.navigator,{navigatorPermissions:permissions}]);
-        Object.defineProperty(Object.getPrototypeOf(g.navigator),"permissions",{configurable:true,enumerable:true,get() {
-            const state = apply(get,slots,[this]);
+        Object.defineProperty(Object.getPrototypeOf(g.navigator),"permissions",{configurable:true,enumerable:true,get:named({get() {
+            const state = read(this);
             if (!state || !state.navigatorPermissions) throw new TypeErrorCtor("Illegal Navigator invocation");
             return state.navigatorPermissions;
-        }});
-        g.Permissions = Permissions;
+        }}.get,"get permissions")});
+        define(g,"Permissions",{value:Permissions,writable:true,configurable:true});
+        define(g,"PermissionStatus",{value:PermissionStatus,writable:true,configurable:true});
+        // Bootstrap-only rendezvous for the features above; the shared
+        // feature blocks consume it and the bootstrap deletes leftovers.
+        g.__permission_api = {state:permissionState, request:requestPermission};
     })();
     /*__PERMISSIONS_END__*/
     windowViewportWidth = windowViewportDimension("width");
@@ -19426,6 +19556,466 @@
     portAPI.setCodec(messageSerialize, messageDeserialize);
     // The structured-clone wire codec, for native diagnostics and tests only.
     trust.messageCodec = { serialize: messageSerialize, deserialize: messageDeserialize };
+    // Notifications, Storage and Service Workers expose the same interfaces
+    // to Window and Worker globals. One shared block implements them; the
+    // Rust `worker_prelude()` extracts it between these markers.
+    /*__FEATURES_BEGIN__*/
+    (function () {
+        "use strict";
+        const g = globalThis, adapter = g.__feature_adapter, permission = g.__permission_api;
+        delete g.__feature_adapter;
+        delete g.__permission_api;
+        // StructuredSerializeForStorage / StructuredDeserialize, captured from
+        // the shared wire codec before the bootstrap removes it.
+        const serialize = g.__sc_serialize, deserialize = g.__sc_deserialize;
+        const slots = __platform_slots("internals", new WeakMap());
+        const apply = Reflect.apply, weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+        const define = Object.defineProperty, freeze = Object.freeze, create = Object.create;
+        const PromiseCtor = Promise, promiseReject = Promise.reject, promiseResolve = Promise.resolve;
+        const TypeErrorCtor = TypeError, NumberCtor = Number, isFinite = Number.isFinite;
+        const trunc = Math.trunc, floor = Math.floor, round = Math.round, dateNow = Date.now;
+        const iteratorSymbol = Symbol.iterator, arrayPush = Array.prototype.push;
+        const stringReplace = String.prototype.replace, stringIncludes = Array.prototype.includes;
+        const EventTargetCtor = adapter.EventTarget, isWindow = adapter.window;
+        const secure = adapter.secure;
+        const navigator = g.navigator, NavigatorPrototype = Object.getPrototypeOf(navigator);
+        const navigatorSlots = __navigator_binding(new WeakMap());
+        function record(object) { return apply(weakGet, slots, [object]); }
+        function remember(object, value) { apply(weakSet, slots, [object, value]); }
+        function named(fn, name) { define(fn, "name", {value: name, configurable: true}); return fn; }
+        function exception(message, name) { return new g.DOMException(message, name); }
+        function rejected(error) { return apply(promiseReject, PromiseCtor, [error]); }
+        function brand(object, kind, interfaceName) {
+            const state = record(object);
+            if (!state || state.kind !== kind) throw new TypeErrorCtor("Illegal " + interfaceName + " invocation");
+            return state;
+        }
+        // Web IDL #js-DOMString, #js-USVString and #js-unsigned-long(-long).
+        function domString(value) { return `${value}`; }
+        function usvString(value) {
+            return apply(stringReplace, `${value}`,
+                [/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/g,
+                    match => match.length === 1 ? "�" : match[0] + "�"]);
+        }
+        function unsignedInteger(value, bits) {
+            let number = NumberCtor(value);
+            if (!isFinite(number) || number === 0) return 0;
+            number = trunc(number);
+            const modulus = bits === 64 ? 18446744073709551616 : 4294967296;
+            number %= modulus;
+            return number < 0 ? number + modulus : number;
+        }
+        function dictionary(value, name) {
+            if (value !== undefined && value !== null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeErrorCtor(name + " must be a dictionary");
+            return value === undefined || value === null ? null : value;
+        }
+        function enumeration(value, values, name) {
+            const text = domString(value);
+            if (!apply(stringIncludes, values, [text])) throw new TypeErrorCtor("Invalid " + name + " value");
+            return text;
+        }
+        // Web IDL #js-sequence: create a sequence from an iterable.
+        function sequence(value, convert, method) {
+            if (value === null || (typeof value !== "object" && typeof value !== "function"))
+                throw new TypeErrorCtor("Expected a sequence");
+            if (method === undefined) method = value[iteratorSymbol];
+            if (typeof method !== "function") throw new TypeErrorCtor("Expected an iterable sequence");
+            const iterator = apply(method, value, []), next = iterator.next, result = [];
+            for (;;) {
+                const step = apply(next, iterator, []);
+                if (step === null || (typeof step !== "object" && typeof step !== "function"))
+                    throw new TypeErrorCtor("Iterator result is not an object");
+                if (step.done) return result;
+                apply(arrayPush, result, [convert(step.value)]);
+            }
+        }
+        function parseURL(value) {
+            const parsed = __url_parse(value, adapter.baseURL());
+            return parsed ? parsed[0] : null;
+        }
+        // HTML #event-handler-attributes for a platform object's handler map:
+        // a replaced non-null handler keeps its listener's position.
+        function eventHandlers(prototype, kind, interfaceName, types) {
+            for (const type of types) {
+                define(prototype, "on" + type, {configurable: true, enumerable: true,
+                    get: named({get() {
+                        const handler = brand(this, kind, interfaceName).handlers[type];
+                        return handler ? handler.value : null;
+                    }}.get, "get on" + type),
+                    set: named({set(value) {
+                        const state = brand(this, kind, interfaceName), handlers = state.handlers;
+                        value = typeof value === "function" || (value !== null && typeof value === "object") ? value : null;
+                        let handler = handlers[type];
+                        if (value === null) {
+                            if (handler) adapter.remove(this, type, handler.listener);
+                            delete handlers[type];
+                        } else if (handler) handler.value = value;
+                        else {
+                            const target = this;
+                            handler = handlers[type] = {value, listener(event) {
+                                const callback = handler.value;
+                                if (typeof callback === "function" && apply(callback, target, [event]) === false)
+                                    event.preventDefault();
+                            }};
+                            adapter.add(this, type, handler.listener);
+                        }
+                    }}.set, "set on" + type)});
+            }
+        }
+        // Web IDL #js-interfaces: operations and attributes are enumerable;
+        // interface objects are non-enumerable global properties.
+        function finishInterface(constructor, name, exposed) {
+            for (const target of [constructor, constructor.prototype]) {
+                for (const key of Reflect.ownKeys(target)) {
+                    if (key === "constructor" || key === "prototype" || key === "length" || key === "name") continue;
+                    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+                    if (typeof key === "symbol" || !descriptor.configurable) continue;
+                    descriptor.enumerable = true;
+                    define(target, key, descriptor);
+                }
+            }
+            define(constructor.prototype, Symbol.toStringTag, {value: name, configurable: true});
+            if (exposed) define(g, name, {value: constructor, writable: true, configurable: true});
+        }
+        // [SecureContext, SameObject] attributes of Navigator / WorkerNavigator.
+        function navigatorAttribute(name, value) {
+            const state = record(navigator) || create(null);
+            state[name] = value;
+            remember(navigator, state);
+            define(NavigatorPrototype, name, {configurable: true, enumerable: true,
+                get: named({get() {
+                    const nav = apply(weakGet, navigatorSlots, [this]);
+                    const own = nav && record(this);
+                    if (!own || !own[name]) throw new TypeErrorCtor("Illegal Navigator invocation");
+                    return own[name];
+                }}.get, "get " + name)});
+        }
+
+        // --- Notifications API (WHATWG, local whatwg/notifications@3f8cee6) ---
+        // TRust has no notification platform. The permission is therefore never
+        // granted, a constructed notification is never shown and fires `error`,
+        // and the maximum number of actions is zero (#maximum-number-of-actions).
+        const NOTIFICATION_DIRECTIONS = freeze(["auto", "ltr", "rtl"]);
+        // #get-the-notifications-permission-state
+        function notificationPermission() {
+            const state = permission.state("notifications");
+            return state === "prompt" ? "default" : state;
+        }
+        function notificationAction(value) {
+            // NotificationAction members in lexicographic order; action and
+            // title are required.
+            if (value === undefined || value === null || (typeof value !== "object" && typeof value !== "function"))
+                throw new TypeErrorCtor("NotificationAction must be a dictionary");
+            const action = value.action;
+            if (action === undefined) throw new TypeErrorCtor("NotificationAction.action is required");
+            const result = {action: domString(action)};
+            const icon = value.icon;
+            if (icon !== undefined) result.icon = usvString(icon);
+            const navigate = value.navigate;
+            if (navigate !== undefined) result.navigate = usvString(navigate);
+            const title = value.title;
+            if (title === undefined) throw new TypeErrorCtor("NotificationAction.title is required");
+            result.title = domString(title);
+            return result;
+        }
+        // Vibration API #dfn-validate-and-normalize for a converted
+        // VibratePattern ((unsigned long or sequence<unsigned long>)).
+        function vibrationPattern(value) {
+            let pattern;
+            if (value !== null && (typeof value === "object" || typeof value === "function")) {
+                const method = value[iteratorSymbol];
+                pattern = method === undefined || method === null
+                    ? [unsignedInteger(value, 32)]
+                    : sequence(value, entry => unsignedInteger(entry, 32), method);
+            } else pattern = [unsignedInteger(value, 32)];
+            if (pattern.length > 10) pattern.length = 10;
+            for (let i = 0; i < pattern.length; i++) if (pattern[i] > 10000) pattern[i] = 10000;
+            return pattern;
+        }
+        function notificationOptions(value) {
+            const options = dictionary(value, "NotificationOptions");
+            const member = name => options === null ? undefined : options[name];
+            const result = {};
+            const actions = member("actions");
+            result.actions = actions === undefined ? [] : sequence(actions, notificationAction);
+            const badge = member("badge");
+            if (badge !== undefined) result.badge = usvString(badge);
+            const body = member("body");
+            result.body = body === undefined ? "" : domString(body);
+            const data = member("data");
+            result.data = data === undefined ? null : data;
+            const dir = member("dir");
+            result.dir = dir === undefined ? "auto" : enumeration(dir, NOTIFICATION_DIRECTIONS, "NotificationDirection");
+            const icon = member("icon");
+            if (icon !== undefined) result.icon = usvString(icon);
+            const image = member("image");
+            if (image !== undefined) result.image = usvString(image);
+            const lang = member("lang");
+            result.lang = lang === undefined ? "" : domString(lang);
+            const navigate = member("navigate");
+            if (navigate !== undefined) result.navigate = usvString(navigate);
+            result.renotify = !!member("renotify");
+            result.requireInteraction = !!member("requireInteraction");
+            const silent = member("silent");
+            result.silent = silent === undefined || silent === null ? null : !!silent;
+            const tag = member("tag");
+            result.tag = tag === undefined ? "" : domString(tag);
+            const timestamp = member("timestamp");
+            if (timestamp !== undefined) result.timestamp = unsignedInteger(timestamp, 64);
+            const vibrate = member("vibrate");
+            if (vibrate !== undefined) result.vibrate = vibrationPattern(vibrate);
+            return result;
+        }
+        // #create-a-notification-with-a-settings-object / #create-a-notification
+        function createNotification(title, options) {
+            if (options.silent === true && options.vibrate !== undefined)
+                throw new TypeErrorCtor("A silent notification cannot vibrate");
+            if (options.renotify && options.tag === "")
+                throw new TypeErrorCtor("Renotify requires a tag");
+            const notification = {
+                data: serialize(options.data, true),
+                title, dir: options.dir, lang: options.lang, body: options.body,
+                navigate: options.navigate === undefined ? null : parseURL(options.navigate),
+                tag: options.tag,
+                image: options.image === undefined ? null : parseURL(options.image),
+                icon: options.icon === undefined ? null : parseURL(options.icon),
+                badge: options.badge === undefined ? null : parseURL(options.badge),
+                vibrate: freeze(options.vibrate === undefined ? [] : options.vibrate),
+                timestamp: options.timestamp === undefined ? round(dateNow()) : options.timestamp,
+                renotify: options.renotify, silent: options.silent,
+                requireInteraction: options.requireInteraction,
+                // Actions beyond the maximum number of actions (zero) are skipped.
+                actions: freeze([]),
+            };
+            return notification;
+        }
+        class Notification extends EventTargetCtor {
+            constructor(title, options = undefined) {
+                if (arguments.length < 1) throw new TypeErrorCtor("Notification requires a title");
+                title = domString(title);
+                const converted = notificationOptions(options);
+                // #dom-notification-notification step 2: actions are only
+                // supported for persistent notifications.
+                if (converted.actions.length) throw new TypeErrorCtor("Notification actions require a service worker");
+                const notification = createNotification(title, converted);
+                super();
+                remember(this, {kind: "notification", notification, handlers: create(null)});
+                // In parallel: the permission is never "granted", so the
+                // notification is not shown and an error event is queued.
+                if (notificationPermission() !== "granted") {
+                    const target = this;
+                    adapter.queue(() => adapter.fire(target, "error"));
+                }
+            }
+            static get permission() { return notificationPermission(); }
+            static get maxActions() { return 0; }
+            // #close-steps: a notification that was never shown is not in the
+            // list of notifications, so closing it has no effect.
+            close() { brand(this, "notification", "Notification"); }
+        }
+        define(Notification, "permission", {enumerable: true});
+        const notificationField = name => named({get() {
+            return brand(this, "notification", "Notification").notification[name];
+        }}.get, "get " + name);
+        for (const name of ["title", "dir", "lang", "body", "tag", "vibrate", "timestamp",
+            "renotify", "silent", "requireInteraction", "actions"])
+            define(Notification.prototype, name, {configurable: true, enumerable: true, get: notificationField(name)});
+        for (const name of ["navigate", "image", "icon", "badge"]) {
+            define(Notification.prototype, name, {configurable: true, enumerable: true, get: named({get() {
+                const url = brand(this, "notification", "Notification").notification[name];
+                return url === null ? "" : url;
+            }}.get, "get " + name)});
+        }
+        // #dom-notification-data, cached as [SameObject] requires.
+        define(Notification.prototype, "data", {configurable: true, enumerable: true, get: named({get() {
+            const state = brand(this, "notification", "Notification");
+            if (!("dataValue" in state)) {
+                try { state.dataValue = deserialize(state.notification.data); }
+                catch (_) { state.dataValue = null; }
+            }
+            return state.dataValue;
+        }}.get, "get data")});
+        if (isWindow) {
+            // #dom-notification-requestpermission is [Exposed=Window].
+            define(Notification, "requestPermission", {configurable: true, enumerable: true, writable: true,
+                value: named({requestPermission(deprecatedCallback = undefined) {
+                    if (deprecatedCallback !== undefined && typeof deprecatedCallback !== "function")
+                        return rejected(new TypeErrorCtor("NotificationPermissionCallback must be callable"));
+                    return new PromiseCtor(resolve => {
+                        const result = permission.request("notifications");
+                        const state = result === "prompt" ? "default" : result;
+                        adapter.queue(() => {
+                            if (deprecatedCallback !== undefined) {
+                                // Web IDL #invoke-a-callback-function with "report".
+                                try { apply(deprecatedCallback, undefined, [state]); }
+                                catch (error) { adapter.report(error); }
+                            }
+                            resolve(state);
+                        });
+                    });
+                }}.requestPermission, "requestPermission")});
+        }
+        eventHandlers(Notification.prototype, "notification", "Notification", ["click", "show", "error", "close"]);
+        finishInterface(Notification, "Notification", true);
+
+        // --- Storage (WHATWG Storage, local whatwg/storage@1933f42) ---------
+        // #storagemanager. The local storage shelf combines this origin's
+        // localStorage, Indexed Database and Cache Storage bottles in TRust's
+        // shared storage shed. Buckets are best-effort: TRust keeps Indexed
+        // Database and Cache Storage only for the browsing session.
+        function storageShelf() {
+            // #obtain-a-local-storage-shelf -> #obtain-a-storage-key: an
+            // opaque origin has no storage key.
+            const origin = adapter.origin();
+            if (origin === "null") throw new TypeErrorCtor("Storage is unavailable for an opaque origin");
+            return origin;
+        }
+        class StorageManager {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            persisted() {
+                try {
+                    brand(this, "storage-manager", "StorageManager");
+                    storageShelf();
+                } catch (error) { return rejected(error); }
+                // #dom-storagemanager-persisted: the default bucket's mode is
+                // never "persistent".
+                return new PromiseCtor(resolve => adapter.queue(() => resolve(false)));
+            }
+            estimate() {
+                let origin;
+                try {
+                    brand(this, "storage-manager", "StorageManager");
+                    origin = storageShelf();
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => {
+                    // #dom-storagemanager-estimate: storage usage and quota of
+                    // the shelf, measured as each endpoint enforces its quota.
+                    const measured = __storage_manager("estimate", origin);
+                    adapter.queue(() => {
+                        if (!measured) reject(new TypeErrorCtor("Storage estimate is unavailable"));
+                        else resolve({usage: measured[0], quota: measured[1]});
+                    });
+                });
+            }
+            getDirectory() {
+                try { brand(this, "storage-manager", "StorageManager"); }
+                catch (error) { return rejected(error); }
+                // File System #dom-storagemanager-getdirectory: TRust has no
+                // "fileSystem" storage bottle, so its bottle map cannot be
+                // obtained and the promise rejects with a SecurityError.
+                return rejected(exception("The origin private file system is unavailable", "SecurityError"));
+            }
+        }
+        if (isWindow) {
+            define(StorageManager.prototype, "persist", {configurable: true, enumerable: true, writable: true,
+                value: named({persist() {
+                    try {
+                        brand(this, "storage-manager", "StorageManager");
+                        storageShelf();
+                    } catch (error) { return rejected(error); }
+                    // #dom-storagemanager-persist: request "persistent-storage";
+                    // TRust has no permission UI, so the bucket stays best-effort.
+                    // Even a granted permission could not make TRust's session-only
+                    // Indexed Database and Cache Storage bottles persistent.
+                    return new PromiseCtor(resolve => {
+                        permission.request("persistent-storage");
+                        adapter.queue(() => resolve(false));
+                    });
+                }}.persist, "persist")});
+        }
+        finishInterface(StorageManager, "StorageManager", secure);
+
+        // --- Service Workers (W3C, local w3c/ServiceWorker@92aba3b) ----------
+        // #serviceworkercontainer-interface. TRust runs no service workers:
+        // there is no registration, no controller and no ready registration.
+        // Registration behaves as for a user agent whose policy disables
+        // service-worker storage, after the Start Register checks.
+        const WORKER_TYPES = freeze(["classic", "module"]);
+        const UPDATE_VIA_CACHE = freeze(["imports", "all", "none"]);
+        function stripFragment(url) {
+            const hash = url.indexOf("#");
+            return hash < 0 ? url : url.slice(0, hash);
+        }
+        function hasEncodedSeparator(url) {
+            const path = (__url_parse(url, null) || [])[5] || "";
+            return /%2f|%5c/i.test(path);
+        }
+        class ServiceWorkerContainer extends EventTargetCtor {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get controller() { brand(this, "service-worker-container", "ServiceWorkerContainer"); return null; }
+            get ready() {
+                const state = brand(this, "service-worker-container", "ServiceWorkerContainer");
+                // #navigator-service-worker-ready: no registration can ever
+                // match, so the promise stays pending (and never rejects).
+                if (!state.ready) state.ready = new PromiseCtor(() => {});
+                return state.ready;
+            }
+            register(scriptURL, options = undefined) {
+                try {
+                    brand(this, "service-worker-container", "ServiceWorkerContainer");
+                    if (arguments.length < 1) throw new TypeErrorCtor("register requires a script URL");
+                    scriptURL = usvString(scriptURL);
+                    const dict = dictionary(options, "RegistrationOptions");
+                    const scopeValue = dict === null ? undefined : dict.scope;
+                    const scope = scopeValue === undefined ? null : usvString(scopeValue);
+                    const typeValue = dict === null ? undefined : dict.type;
+                    if (typeValue !== undefined) enumeration(typeValue, WORKER_TYPES, "WorkerType");
+                    const cacheValue = dict === null ? undefined : dict.updateViaCache;
+                    if (cacheValue !== undefined) enumeration(cacheValue, UPDATE_VIA_CACHE, "ServiceWorkerUpdateViaCache");
+                    // #start-register-algorithm.
+                    let script = parseURL(scriptURL);
+                    if (script === null) throw new TypeErrorCtor("Invalid service worker script URL");
+                    script = stripFragment(script);
+                    if (!/^https?:/i.test(script) || hasEncodedSeparator(script))
+                        throw new TypeErrorCtor("Unsupported service worker script URL");
+                    let scopeURL = scope === null ? (__url_parse("./", script) || [null])[0] : parseURL(scope);
+                    if (scopeURL === null) throw new TypeErrorCtor("Invalid service worker scope URL");
+                    scopeURL = stripFragment(scopeURL);
+                    if (!/^https?:/i.test(scopeURL) || hasEncodedSeparator(scopeURL))
+                        throw new TypeErrorCtor("Unsupported service worker scope URL");
+                } catch (error) { return rejected(error); }
+                // #register-algorithm rejects through #reject-job-promise on a
+                // DOM manipulation task. Without service-worker support no job
+                // can create a registration: "SecurityError".
+                return new PromiseCtor((resolve, reject) => adapter.queue(() => reject(
+                    exception("Service worker registration is disabled", "SecurityError"))));
+            }
+            getRegistration(clientURL = "") {
+                try {
+                    brand(this, "service-worker-container", "ServiceWorkerContainer");
+                    clientURL = usvString(clientURL);
+                    // #navigator-service-worker-getRegistration.
+                    const parsed = __url_parse(clientURL, adapter.baseURL());
+                    if (!parsed) throw new TypeErrorCtor("Invalid client URL");
+                    if (parsed[8] !== adapter.origin() || parsed[8] === "null")
+                        throw exception("Client URL is not same origin", "SecurityError");
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor(resolve => adapter.queue(() => resolve(undefined)));
+            }
+            getRegistrations() {
+                try { brand(this, "service-worker-container", "ServiceWorkerContainer"); }
+                catch (error) { return rejected(error); }
+                return new PromiseCtor(resolve => adapter.queue(() => resolve(freeze([]))));
+            }
+            // #navigator-service-worker-startMessages: enabling the client
+            // message queue delivers nothing because no service worker exists.
+            startMessages() { brand(this, "service-worker-container", "ServiceWorkerContainer"); }
+        }
+        eventHandlers(ServiceWorkerContainer.prototype, "service-worker-container", "ServiceWorkerContainer",
+            ["controllerchange", "message", "messageerror"]);
+        finishInterface(ServiceWorkerContainer, "ServiceWorkerContainer", secure);
+
+        if (secure) {
+            const manager = create(StorageManager.prototype);
+            remember(manager, {kind: "storage-manager"});
+            navigatorAttribute("storage", manager);
+            const container = Reflect.construct(EventTargetCtor, [], ServiceWorkerContainer);
+            remember(container, {kind: "service-worker-container", handlers: create(null), ready: null});
+            navigatorAttribute("serviceWorker", container);
+        }
+    })();
+    /*__FEATURES_END__*/
     canvasImageConstructor = g.ImageData;
     canvasImageGetters = {};
     for (const key of ["width","height","data","colorSpace","pixelFormat"])

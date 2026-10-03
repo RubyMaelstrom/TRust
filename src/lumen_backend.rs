@@ -342,6 +342,9 @@ enum LumenWorkerKind {
     Module,
 }
 
+/// Permissions #dfn-permission-store entries keyed by "origin\0feature".
+type PermissionStore = Arc<std::sync::Mutex<HashMap<String, &'static str>>>;
+
 struct LumenWorkerLaunch {
     id: usize,
     owner_page: url::Url,
@@ -355,6 +358,10 @@ struct LumenWorkerLaunch {
     port_registry: Arc<std::sync::Mutex<message_port_host::Registry>>,
     port_wake: message_port_host::Wake,
     task_sender: LumenTaskSender,
+    /// The owner's storage shed and permission store: a dedicated worker shares its
+    /// settings object's origin (Storage #obtain-a-storage-key, Permissions #dfn-permission-store).
+    storage: crate::js::WebStorage,
+    permission_store: PermissionStore,
 }
 
 #[derive(Clone, Copy)]
@@ -514,6 +521,10 @@ struct HostState {
     webgl: HashMap<usize, crate::webgl::Context>,
     import_maps: HashMap<u64, crate::import_maps::Handle>,
     permission_slots: Option<Value>,
+    /// Permissions #dfn-permission-store for this page: origin + feature name to state. Window
+    /// Realms and the page's dedicated workers share it; TRust has no permission UI, so entries
+    /// only record decisions made during this page's lifetime.
+    permission_store: PermissionStore,
     audio_context_slots: Option<Value>,
     history_slots: Option<Value>,
     history_traversals: Vec<(u64, i32)>,
@@ -612,6 +623,7 @@ impl HostState {
             webgl: HashMap::new(),
             import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
+            permission_store: Default::default(),
             audio_context_slots: None,
             history_slots: None,
             history_traversals: Vec::new(),
@@ -818,6 +830,7 @@ impl RetainedMemory for HostState {
             webgl,
             import_maps,
             permission_slots,
+            permission_store,
             audio_context_slots,
             history_slots,
             history_traversals,
@@ -1179,6 +1192,16 @@ impl RetainedMemory for HostState {
         }
         if let Some(value) = permission_slots {
             visitor.value(value);
+        }
+        let permission_entries = permission_store
+            .lock()
+            .map_or(0, |store| store.keys().map(|key| key.capacity()).sum());
+        if permission_entries != 0 {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.permission-store",
+                Arc::as_ptr(permission_store) as usize,
+                permission_entries,
+            ));
         }
         if let Some(value) = audio_context_slots {
             visitor.value(value);
@@ -8530,6 +8553,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__storage_clear", 1, host_storage_clear),
     ("__storage_key", 2, host_storage_key),
     ("__storage_len", 1, host_storage_len),
+    ("__storage_manager", 2, host_storage_manager),
     ("__blob_mirror", 3, host_blob_mirror),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
     ("__crypto_digest", 2, host_crypto_digest),
@@ -8778,6 +8802,31 @@ fn host_performance_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
 /// grant or capability is inferred from a descriptor supplied by page script.
 fn host_permissions_binding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let op = host_arg_string(ctx, args, 0);
+    if op == "state" || op == "set" {
+        // Permissions #get-a-permission-store-entry / #set-a-permission-store-entry. Only the
+        // states a TRust request can produce are recorded; anything else is ignored.
+        let entry = host_arg_string(ctx, args, 1);
+        let store = ctx
+            .host_mut::<HostState>()
+            .expect("Permissions require HostState")
+            .permission_store
+            .clone();
+        let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
+        if op == "state" {
+            return Ok(store.get(&entry).map_or(Value::Undefined, |state| {
+                Value::from_string(state.to_string())
+            }));
+        }
+        if let Some((key, decision)) = entry.rsplit_once('\0') {
+            let decision = match decision {
+                "denied" => "denied",
+                "granted" => "granted",
+                _ => return Ok(Value::Undefined),
+            };
+            store.insert(key.to_string(), decision);
+        }
+        return Ok(Value::Undefined);
+    }
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let state = ctx
         .host_mut::<HostState>()
@@ -11832,6 +11881,8 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         port_registry: state.message_ports.registry.clone(),
         port_wake: message_port_host::Wake::Worker(Arc::downgrade(&ctl)),
         task_sender: LumenTaskSender::Worker(Arc::downgrade(&ctl)),
+        storage: state.storage.clone(),
+        permission_store: state.permission_store.clone(),
     };
     let handle = workers.handle.clone();
     let tasks = workers.tasks.child();
@@ -11992,6 +12043,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__http_fetch_async", 5, host_http_fetch_async as NativeFn),
         ("__worker_self_post", 1, host_worker_self_post as NativeFn),
         ("__worker_self_close", 0, host_worker_self_close as NativeFn),
+        ("__storage_manager", 2, host_storage_manager as NativeFn),
         ("__blob_mirror", 3, host_blob_mirror as NativeFn),
         (
             "__crypto_sha256_digest",
@@ -12414,6 +12466,8 @@ fn run_lumen_worker(
         ),
     );
     state.agent_cluster = launch.agent_cluster;
+    state.storage = launch.storage.clone();
+    state.permission_store = launch.permission_store.clone();
     state.message_ports.registry = launch.port_registry.clone();
     state.message_ports.wake = launch.port_wake.clone();
     state.network = Some(LumenNetwork {
@@ -12533,6 +12587,7 @@ fn run_lumen_worker(
         Port,
         Bitmap,
         Performance,
+        Platform,
     }
     let wall_origin = Instant::now();
     let virtual_origin = lumen_worker_now(&mut engine);
@@ -12560,21 +12615,26 @@ fn run_lumen_worker(
             lumen_worker_internal_call(&mut engine, "hasPerformanceTask", &[]),
             Ok(Value::Bool(true))
         );
+        let platform_ready = matches!(
+            lumen_worker_internal_call(&mut engine, "hasPlatformTask", &[]),
+            Ok(Value::Bool(true))
+        );
         // Distinct task sources all make progress. A busy implicit worker port
         // must not starve transferred channels or an already-due timer.
         let mut task = None;
-        for offset in 0..5 {
-            let source = (source_cursor + offset) % 5;
+        for offset in 0..6 {
+            let source = (source_cursor + offset) % 6;
             task = match source {
                 0 => queued_command.take().map(WorkerTask::Command),
                 1 if deadline.is_some_and(|deadline| deadline <= now) => Some(WorkerTask::Timer),
                 2 if port_ready => Some(WorkerTask::Port),
                 3 if bitmap_ready => Some(WorkerTask::Bitmap),
                 4 if performance_ready => Some(WorkerTask::Performance),
+                5 if platform_ready => Some(WorkerTask::Platform),
                 _ => None,
             };
             if task.is_some() {
-                source_cursor = (source + 1) % 5;
+                source_cursor = (source + 1) % 6;
                 break;
             }
         }
@@ -12621,6 +12681,7 @@ fn run_lumen_worker(
             WorkerTask::Performance => {
                 lumen_worker_internal_call(&mut engine, "runPerformanceTask", &[])
             }
+            WorkerTask::Platform => lumen_worker_internal_call(&mut engine, "runPlatformTask", &[]),
             WorkerTask::Timer => {
                 lumen_worker_internal_call(&mut engine, "tick", &[Value::Num(now)])
             }
@@ -15874,6 +15935,58 @@ fn host_storage_len(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         .get(&bucket)
         .map_or(0, std::collections::HashMap::len);
     Ok(Value::Num(len as f64))
+}
+
+/// Indexed Database and Cache Storage quotas enforced by the platform prelude (`__idbQuota`,
+/// `__cacheQuota`), measured in UTF-16 code units of their serialized records.
+const INDEXED_DATABASE_QUOTA: usize = 64 * 1024 * 1024;
+const CACHE_STORAGE_QUOTA: usize = 64 * 1024 * 1024;
+
+/// Storage #storage-usage and #storage-quota of an origin's local storage shelf (Storage
+/// #dom-storagemanager-estimate). The shelf's bottles are this origin's localStorage, Indexed
+/// Database and Cache Storage buckets in the shared storage shed; sessionStorage belongs to a
+/// session shelf. Each bottle is measured as its endpoint enforces its quota, and the quota is
+/// the sum of those endpoint quotas, independent of the device's free space.
+fn host_storage_manager(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    if host_arg_string(ctx, args, 0) != "estimate" {
+        return Ok(Value::Undefined);
+    }
+    let origin = host_arg_string(ctx, args, 1);
+    if origin == "null" {
+        return Ok(Value::Undefined);
+    }
+    let Some(storage) = ctx
+        .host_mut::<HostState>()
+        .map(|state| state.storage.clone())
+    else {
+        return Ok(Value::Undefined);
+    };
+    let usage = {
+        let storage = storage.lock().unwrap_or_else(|e| e.into_inner());
+        let units = |text: &str| text.encode_utf16().count();
+        storage
+            .iter()
+            .filter_map(|(bucket, entries)| {
+                let (kind, owner) = bucket.split_once(':')?;
+                if owner != origin {
+                    return None;
+                }
+                Some(match kind {
+                    // Two bytes per UTF-16 code unit of each key and value, as setItem() counts.
+                    "local" => entries
+                        .iter()
+                        .map(|(key, value)| 2 * (units(key) + units(value)))
+                        .sum::<usize>(),
+                    "indexed-database" | "cache-storage-names" | "cache-storage-data" => {
+                        entries.values().map(|value| units(value)).sum()
+                    }
+                    _ => 0,
+                })
+            })
+            .sum::<usize>()
+    };
+    let quota = crate::site_storage::ORIGIN_QUOTA + INDEXED_DATABASE_QUOTA + CACHE_STORAGE_QUOTA;
+    Ok(ctx.make_array(vec![Value::Num(usage as f64), Value::Num(quota as f64)]))
 }
 
 fn host_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
@@ -19889,7 +20002,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 191, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 192, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -19900,7 +20013,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 191);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 192);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -28557,6 +28670,171 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Run queued platform tasks and microtasks until `result` is set or no work remains.
+    fn settle_platform_result(engine: &mut lumen::Engine, control: &str, result: &str) -> String {
+        for _ in 0..500 {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, &format!("typeof globalThis.{result}")) != "undefined"
+                || string_value(engine, &format!("{control}.hasPlatformTask()")) != "true"
+            {
+                break;
+            }
+            eval(
+                engine,
+                &format!("{control}.runPlatformTask()"),
+                "platform task",
+            )
+            .unwrap();
+        }
+        run_microtask_checkpoint(engine);
+        string_value(engine, &format!("String(globalThis.{result})"))
+    }
+
+    /// A dedicated-worker global with an explicit secure-context configuration.
+    fn worker_engine_with_secure_context(secure: bool) -> lumen::Engine {
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+        state.test_hooks.internals = true;
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        state.worker_self = Some(LumenWorkerSelf {
+            id: 1,
+            events,
+            closed: false,
+            origin: url::Url::parse(DEFAULT_URL).unwrap(),
+        });
+        let origin = clock.origin_ms;
+        let mut engine = lumen::Engine::new();
+        engine.set_wall_clock(move || clock.now_ms());
+        engine
+            .ctx()
+            .op_state()
+            .put_retained_memory_with_external_memory(state);
+        install_lumen_worker_boundary(&mut engine);
+        eval(
+            &mut engine,
+            &format!(
+                "globalThis.__worker_cfg={{url:'https://example.com/worker.js',timeOrigin:{origin},secureContext:{secure}}}"
+            ),
+            "worker config",
+        )
+        .unwrap();
+        assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+        engine
+    }
+
+    #[test]
+    fn notifications_report_default_permission_and_never_show() {
+        // Notifications API §§2–4 (local whatwg/notifications@3f8cee6) and
+        // Permissions #query-method / #request-permission-to-use: no
+        // notification platform or permission prompt exists, so the state is
+        // "default" until a request records "denied", and every constructed
+        // notification fires error instead of show.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/notifications.mjs"),
+                "notifications",
+            )
+            .unwrap();
+            assert_eq!(
+                settle_platform_result(&mut engine, "__trust", "notificationResult"),
+                "notifications-ok",
+                "{tier:?}"
+            );
+            assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        }
+        let mut worker = worker_engine_with_secure_context(true);
+        eval(
+            &mut worker,
+            include_str!("fixtures/notifications.mjs"),
+            "worker notifications",
+        )
+        .unwrap();
+        assert_eq!(
+            settle_platform_result(&mut worker, "__wkr", "notificationResult"),
+            "notifications-ok"
+        );
+        assert_eq!(string_value(&mut worker, "__wkr.takeErrors()"), "");
+    }
+
+    #[test]
+    fn storage_manager_and_service_worker_container_in_secure_contexts() {
+        // Storage #storagemanager (local whatwg/storage@1933f42), File System
+        // #dom-storagemanager-getdirectory and Service Workers
+        // #serviceworkercontainer-interface (local w3c/ServiceWorker@92aba3b).
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/storage_manager.mjs"),
+                "storage manager",
+            )
+            .unwrap();
+            assert_eq!(
+                settle_platform_result(&mut engine, "__trust", "storageResult"),
+                "storage-manager-ok",
+                "{tier:?}"
+            );
+        }
+        let mut worker = worker_engine_with_secure_context(true);
+        eval(
+            &mut worker,
+            include_str!("fixtures/storage_manager.mjs"),
+            "worker storage manager",
+        )
+        .unwrap();
+        assert_eq!(
+            settle_platform_result(&mut worker, "__wkr", "storageResult"),
+            "storage-manager-ok"
+        );
+    }
+
+    #[test]
+    fn secure_context_gates_storage_service_workers_and_notification_permission() {
+        // [SecureContext] members are absent from non-secure globals, and the
+        // Permissions #dfn-permission-state of a non-secure context is "denied".
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            "http://example.com/",
+        );
+        let probe = r#"
+            (async () => {
+                const errors = [];
+                const note = new Notification('x');
+                note.onerror = () => errors.push('error');
+                const failed = new Promise(resolve => note.addEventListener('error', resolve));
+                const status = await navigator.permissions.query({name: 'notifications'});
+                await failed;
+                const result = [isSecureContext, Notification.permission, status.state, errors.join(),
+                    'storage' in navigator, 'serviceWorker' in navigator, typeof StorageManager,
+                    typeof ServiceWorkerContainer];
+                if (typeof Notification.requestPermission === 'function')
+                    result.push(await Notification.requestPermission());
+                return result.join('|');
+            })().then(value => globalThis.insecureResult = value,
+                error => globalThis.insecureResult = 'ERROR:' + error.message);
+        "#;
+        eval(&mut engine, probe, "insecure window").unwrap();
+        assert_eq!(
+            settle_platform_result(&mut engine, "__trust", "insecureResult"),
+            "false|denied|denied|error|false|false|undefined|undefined|denied"
+        );
+        let mut worker = worker_engine_with_secure_context(false);
+        eval(&mut worker, probe, "insecure worker").unwrap();
+        assert_eq!(
+            settle_platform_result(&mut worker, "__wkr", "insecureResult"),
+            "false|denied|denied|error|false|false|undefined|undefined"
+        );
     }
 
     #[test]
