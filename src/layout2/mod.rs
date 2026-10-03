@@ -12334,6 +12334,62 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn inline_replaced_images_paint_their_background_and_border() {
+        // CSS 2 Appendix E step 7.2.1: each box in a line box paints its
+        // background and border, then an inline-level replaced element its
+        // content. shadok.neocities.org's `img.border` profile picture lost
+        // its 5px black frame; display:block and opacity images kept theirs.
+        let mut images = HashMap::new();
+        images.insert("http://e.com/i.png".to_string(), (50u32, 50u32));
+        let fills = |style: &str, color: (u8, u8, u8)| {
+            let html = format!(
+                r#"<body style="margin:0"><img src="i.png" style="width:100px;{style}"></body>"#
+            );
+            let layout = lay_graphical(&html, 400.0, &images);
+            let image = layout
+                .paint
+                .primitives
+                .iter()
+                .position(|command| matches!(command, crate::render::DisplayCommand::Image { .. }))
+                .expect("image");
+            let fills: Vec<usize> = layout
+                .paint
+                .primitives
+                .iter()
+                .enumerate()
+                .filter(|(_, command)| {
+                    matches!(
+                        command,
+                        crate::render::DisplayCommand::Fill {
+                            brush: crate::render::PaintBrush::Solid(
+                                crate::render::PaintColor::Rgba(r, g, b, 255)
+                            ),
+                            ..
+                        } if (*r, *g, *b) == color
+                    )
+                })
+                .map(|(index, _)| index)
+                .collect();
+            assert!(
+                fills.iter().all(|&index| index < image),
+                "{style}: decorations paint under the content"
+            );
+            fills.len()
+        };
+        let inline = fills("border:5px solid red;border-radius:10px", (255, 0, 0));
+        assert!(inline > 0, "the inline image's border must paint");
+        assert_eq!(
+            inline,
+            fills(
+                "display:block;border:5px solid red;border-radius:10px",
+                (255, 0, 0)
+            ),
+            "inline and block images paint the same border once"
+        );
+        assert_eq!(fills("background:blue;padding:3px", (0, 0, 255)), 1);
+    }
+
+    #[test]
     fn graphical_empty_positioned_pseudo_paints_border_and_transform() {
         // CSS Pseudo 4 §4.1: content:"" still generates a fully styleable
         // box. Steam draws its discounted-price slash as an absolutely

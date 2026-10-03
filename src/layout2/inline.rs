@@ -107,6 +107,12 @@ pub(crate) struct Piece {
     /// Blockified controls already have an outer fragment and use their child
     /// form piece only for the label.
     pub(crate) paint_control_box: bool,
+    /// An inline-level replaced element's border and padding outside its
+    /// content box (top, right, bottom, left), when this piece paints that
+    /// box's background and border (CSS 2 Appendix E step 7.2.1). Layout
+    /// carries those edges as inline space; block-level and stacking-context
+    /// replaced boxes paint them on their own fragment instead.
+    pub(crate) replaced_edges: Option<[f32; 4]>,
     /// A multiline text control's (`<textarea>`) laid-out value. When
     /// present, graphical paint draws its line runs instead of `shaped`,
     /// which remains the single-run label for the other consumers.
@@ -450,6 +456,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
+            replaced_edges: None,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
@@ -480,6 +487,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
+            replaced_edges: None,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
@@ -1914,6 +1922,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box: false,
             paint_control_box: false,
+            replaced_edges: None,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
@@ -2626,16 +2635,30 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // (#margin-properties / #inline-replaced-height). Pre-laid atomic
         // placeholders already contain their margins; block-level atoms
         // receive these edges from their enclosing flow fragment.
-        let vertical_edges = if self.position_inline_atoms && !atom_box && item.node != NO_NODE {
-            let style = BoxStyle::of(self.dom, item.node, self.vp);
-            if paint_control_box {
-                [self.margin_px(&style, TOP), self.margin_px(&style, BOTTOM)]
+        let (vertical_edges, replaced_edges) =
+            if self.position_inline_atoms && !atom_box && item.node != NO_NODE {
+                let style = BoxStyle::of(self.dom, item.node, self.vp);
+                if paint_control_box {
+                    (
+                        [self.margin_px(&style, TOP), self.margin_px(&style, BOTTOM)],
+                        None,
+                    )
+                } else {
+                    let inner = |side: usize| {
+                        style.border[side]
+                            + style.padding[side]
+                                .resolve(Some(self.cb_w_px))
+                                .unwrap_or(0.0)
+                    };
+                    (
+                        [self.edge_px(&style, TOP), self.edge_px(&style, BOTTOM)],
+                        (item.kind == ItemKind::Image && item.style_node == item.node)
+                            .then(|| [inner(TOP), inner(RIGHT), inner(BOTTOM), inner(LEFT)]),
+                    )
+                }
             } else {
-                [self.edge_px(&style, TOP), self.edge_px(&style, BOTTOM)]
-            }
-        } else {
-            [0.0; 2]
-        };
+                ([0.0; 2], None)
+            };
         let height = geometry.box_height + vertical_edges[0] + vertical_edges[1];
         // HTML #the-input-element-as-a-button / CSS 2 #line-height: text
         // controls export their internal text baseline, including when the
@@ -2671,6 +2694,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box,
             paint_control_box,
+            replaced_edges,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
