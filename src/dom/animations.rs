@@ -1219,7 +1219,9 @@ impl Dom {
                     .collect::<Vec<_>>();
                 // CSS Animations 1 #animations: `display: none` on the
                 // element or an ancestor terminates its animations.
-                if !specs.is_empty() && !transitions::participates(self, id, &mut participation) {
+                if !specs.is_empty()
+                    && !transitions::participates(ComputeView(&*self), id, &mut participation)
+                {
                     specs.clear();
                 }
             }

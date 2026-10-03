@@ -3877,13 +3877,13 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     }
 }
 
-impl Dom {
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether an authored CSS/HTML state omits this element and all descendants
     /// from the box tree. Keep this narrower than [`Self::is_hidden`]: UA-hidden
     /// metadata/resource elements can affect the document outside their own
     /// boxes, while clipped screen-reader text and other visual suppression
     /// heuristics are not `display:none` at all.
-    fn subtree_omitted_from_box_tree(&self, id: NodeId) -> bool {
+    pub(super) fn subtree_omitted_from_box_tree(&self, id: NodeId) -> bool {
         let Some(tag) = self.tag_name(id) else {
             return false;
         };
