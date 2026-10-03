@@ -2,6 +2,18 @@
     var g = globalThis;
     var portAPI;
     const bitmapTasks = [];
+    // Internal slots of worker platform objects (shared with the platform
+    // blocks): never author-visible properties of the objects themselves.
+    const internalSlotMap = __platform_slots("internals", new WeakMap());
+    function internalsFor(object) {
+        let record = Reflect.apply(WeakMap.prototype.get, internalSlotMap, [object]);
+        if (record === undefined) {
+            record = Object.create(null);
+            if ((typeof object === "object" && object !== null) || typeof object === "function")
+                Reflect.apply(WeakMap.prototype.set, internalSlotMap, [object, record]);
+        }
+        return record;
+    }
     // Tasks queued by the shared platform features (permissions, storage,
     // notifications): one FIFO selected by the worker event loop.
     const platformTasks = [];
@@ -525,9 +537,9 @@
 
     // --- Blob / File (string-backed, like the page engine's) ---
     function Blob(parts, opts) {
-        this.__parts = Array.isArray(parts) ? parts.slice() : (parts != null ? [parts] : []);
+        internalsFor(this).parts = Array.isArray(parts) ? parts.slice() : (parts != null ? [parts] : []);
         opts = opts || {}; this.type = opts.type || "";
-        var size = 0; for (var i = 0; i < this.__parts.length; i++) { var p = this.__parts[i]; size += (typeof p === "string") ? p.length : ((p && p.byteLength) || 0); }
+        var size = 0; for (var i = 0; i < internalsFor(this).parts.length; i++) { var p = internalsFor(this).parts[i]; size += (typeof p === "string") ? p.length : ((p && p.byteLength) || 0); }
         this.size = size;
     }
     // Byte-faithful reads via __blobBytes/__blobText (hoisted, defined with the
@@ -556,32 +568,32 @@
 
     // --- URLSearchParams / URL (over the __url_parse syscall) ---
     function URLSearchParams(init) {
-        this.__l = [];
-        if (typeof init === "string") { var s = init.charAt(0) === "?" ? init.slice(1) : init; if (s) s.split("&").forEach(function (pair) { var eq = pair.indexOf("="); var k = eq < 0 ? pair : pair.slice(0, eq); var v = eq < 0 ? "" : pair.slice(eq + 1); this.__l.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }, this); }
-        else if (init && typeof init.forEach === "function") { init.forEach(function (v, k) { this.__l.push([String(k), String(v)]); }, this); }
-        else if (init && typeof init === "object") { for (var key in init) if (Object.prototype.hasOwnProperty.call(init, key)) this.__l.push([key, String(init[key])]); }
+        internalsFor(this).l = [];
+        if (typeof init === "string") { var s = init.charAt(0) === "?" ? init.slice(1) : init; if (s) s.split("&").forEach(function (pair) { var eq = pair.indexOf("="); var k = eq < 0 ? pair : pair.slice(0, eq); var v = eq < 0 ? "" : pair.slice(eq + 1); internalsFor(this).l.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }, this); }
+        else if (init && typeof init.forEach === "function") { init.forEach(function (v, k) { internalsFor(this).l.push([String(k), String(v)]); }, this); }
+        else if (init && typeof init === "object") { for (var key in init) if (Object.prototype.hasOwnProperty.call(init, key)) internalsFor(this).l.push([key, String(init[key])]); }
     }
-    URLSearchParams.prototype.get = function (k) { for (var i = 0; i < this.__l.length; i++) if (this.__l[i][0] === k) return this.__l[i][1]; return null; };
-    URLSearchParams.prototype.getAll = function (k) { var r = []; for (var i = 0; i < this.__l.length; i++) if (this.__l[i][0] === k) r.push(this.__l[i][1]); return r; };
+    URLSearchParams.prototype.get = function (k) { for (var i = 0; i < internalsFor(this).l.length; i++) if (internalsFor(this).l[i][0] === k) return internalsFor(this).l[i][1]; return null; };
+    URLSearchParams.prototype.getAll = function (k) { var r = []; for (var i = 0; i < internalsFor(this).l.length; i++) if (internalsFor(this).l[i][0] === k) r.push(internalsFor(this).l[i][1]); return r; };
     URLSearchParams.prototype.has = function (k) { return this.get(k) !== null; };
-    URLSearchParams.prototype.set = function (k, v) { var done = false; for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) { if (done) this.__l.splice(i, 1); else { this.__l[i][1] = String(v); done = true; } } if (!done) this.__l.push([k, String(v)]); this.__notify(); };
-    URLSearchParams.prototype.append = function (k, v) { this.__l.push([String(k), String(v)]); this.__notify(); };
-    URLSearchParams.prototype["delete"] = function (k) { for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) this.__l.splice(i, 1); this.__notify(); };
-    URLSearchParams.prototype.forEach = function (cb, t) { for (var i = 0; i < this.__l.length; i++) cb.call(t, this.__l[i][1], this.__l[i][0], this); };
+    URLSearchParams.prototype.set = function (k, v) { var done = false; for (var i = internalsFor(this).l.length - 1; i >= 0; i--) if (internalsFor(this).l[i][0] === k) { if (done) internalsFor(this).l.splice(i, 1); else { internalsFor(this).l[i][1] = String(v); done = true; } } if (!done) internalsFor(this).l.push([k, String(v)]); searchParamsNotify(this); };
+    URLSearchParams.prototype.append = function (k, v) { internalsFor(this).l.push([String(k), String(v)]); searchParamsNotify(this); };
+    URLSearchParams.prototype["delete"] = function (k) { for (var i = internalsFor(this).l.length - 1; i >= 0; i--) if (internalsFor(this).l[i][0] === k) internalsFor(this).l.splice(i, 1); searchParamsNotify(this); };
+    URLSearchParams.prototype.forEach = function (cb, t) { for (var i = 0; i < internalsFor(this).l.length; i++) cb.call(t, internalsFor(this).l[i][1], internalsFor(this).l[i][0], this); };
     // application/x-www-form-urlencoded byte serializer (URL Standard): space→"+",
     // percent-encode `! ' ( ) ~` that encodeURIComponent leaves bare. Mirrors the
     // page realm's `fenc`.
     function __fenc(s) { return encodeURIComponent(String(s)).replace(/[!'()~]/g, function (c) { return "%" + c.charCodeAt(0).toString(16).toUpperCase(); }).replace(/%20/g, "+"); }
-    URLSearchParams.prototype.toString = function () { return this.__l.map(function (p) { return __fenc(p[0]) + "=" + __fenc(p[1]); }).join("&"); };
+    URLSearchParams.prototype.toString = function () { return internalsFor(this).l.map(function (p) { return __fenc(p[0]) + "=" + __fenc(p[1]); }).join("&"); };
     // Live binding to an owning URL, mirroring the page realm (see its URL/USP).
-    URLSearchParams.prototype.__notify = function () { if (this.__url) this.__url.__setSearchFromParams(this.toString()); };
-    URLSearchParams.prototype.__setList = function (query) { this.__l = []; var s = String(query).charAt(0) === "?" ? String(query).slice(1) : String(query); if (s) s.split("&").forEach(function (pair) { var eq = pair.indexOf("="); var k = eq < 0 ? pair : pair.slice(0, eq); var v = eq < 0 ? "" : pair.slice(eq + 1); this.__l.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }, this); };
+    function searchParamsNotify(params) { if (internalsFor(params).url) urlSetSearchFromParams(internalsFor(params).url, params.toString()); }
+    function searchParamsSetList(params, query) { internalsFor(params).l = []; var s = String(query).charAt(0) === "?" ? String(query).slice(1) : String(query); if (s) s.split("&").forEach(function (pair) { var eq = pair.indexOf("="); var k = eq < 0 ? pair : pair.slice(0, eq); var v = eq < 0 ? "" : pair.slice(eq + 1); internalsFor(this).l.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }, params); }
     // A live URL: assigning a component re-serializes href via __url_set (the
     // url crate's WHATWG setters), exactly like the page realm's class version.
     function URL(url, base) {
         var p = __url_parse(String(url), base != null ? String(base) : null);
         if (!p) throw new TypeError("Invalid URL: " + url);
-        this.__p = p; this.__sp = null;
+        internalsFor(this).p = p; internalsFor(this).sp = null;
     }
     // URL Standard #dom-url-parse / #dom-url-canparse, exposed in workers too.
     const urlWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
@@ -590,7 +602,7 @@
         var parts = __url_parse(urlWellFormed(`${url}`), base === undefined ? null : urlWellFormed(`${base}`));
         if (!parts) return null;
         var result = Object.create(URL.prototype);
-        result.__p = parts; result.__sp = null;
+        internalsFor(result).p = parts; internalsFor(result).sp = null;
         return result;
     };
     URL.canParse = function canParse(url, base = undefined) {
@@ -599,39 +611,39 @@
     };
     function urlAccessor(i, which) {
         return which
-            ? { get: function () { return this.__p[i]; }, set: function (v) { var r = __url_set(this.__p[0], which, String(v)); if (r) this.__p = r; } }
-            : { get: function () { return this.__p[i]; } };
+            ? { get: function () { return internalsFor(this).p[i]; }, set: function (v) { var r = __url_set(internalsFor(this).p[0], which, String(v)); if (r) internalsFor(this).p = r; } }
+            : { get: function () { return internalsFor(this).p[i]; } };
     }
     Object.defineProperties(URL.prototype, {
-        href: { get: function () { return this.__p[0]; }, set: function (v) { var r = __url_parse(String(v), null); if (!r) throw new TypeError("Invalid URL: " + v); this.__p = r; if (this.__sp) this.__sp.__setList(this.__p[6]); } },
+        href: { get: function () { return internalsFor(this).p[0]; }, set: function (v) { var r = __url_parse(String(v), null); if (!r) throw new TypeError("Invalid URL: " + v); internalsFor(this).p = r; if (internalsFor(this).sp) searchParamsSetList(internalsFor(this).sp, internalsFor(this).p[6]); } },
         protocol: urlAccessor(1, "protocol"),
         host: urlAccessor(2, "host"),
         hostname: urlAccessor(3, "hostname"),
         port: urlAccessor(4, "port"),
         pathname: urlAccessor(5, "pathname"),
-        search: { get: function () { return this.__p[6]; }, set: function (v) { var r = __url_set(this.__p[0], "search", String(v)); if (r) this.__p = r; if (this.__sp) this.__sp.__setList(this.__p[6]); } },
+        search: { get: function () { return internalsFor(this).p[6]; }, set: function (v) { var r = __url_set(internalsFor(this).p[0], "search", String(v)); if (r) internalsFor(this).p = r; if (internalsFor(this).sp) searchParamsSetList(internalsFor(this).sp, internalsFor(this).p[6]); } },
         hash: urlAccessor(7, "hash"),
         origin: urlAccessor(8),
         username: urlAccessor(9, "username"),
         password: urlAccessor(10, "password"),
-        searchParams: { get: function () { if (!this.__sp) { this.__sp = new URLSearchParams(this.__p[6]); this.__sp.__url = this; } return this.__sp; } },
+        searchParams: { get: function () { if (!internalsFor(this).sp) { internalsFor(this).sp = new URLSearchParams(internalsFor(this).p[6]); internalsFor(internalsFor(this).sp).url = this; } return internalsFor(this).sp; } },
     });
-    URL.prototype.__setSearchFromParams = function (qs) { var r = __url_set(this.__p[0], "search", qs); if (r) this.__p = r; };
-    URL.prototype.toString = function () { return this.__p[0]; };
-    URL.prototype.toJSON = function () { return this.__p[0]; };
+    function urlSetSearchFromParams(url, qs) { var r = __url_set(internalsFor(url).p[0], "search", qs); if (r) internalsFor(url).p = r; }
+    URL.prototype.toString = function () { return internalsFor(this).p[0]; };
+    URL.prototype.toJSON = function () { return internalsFor(this).p[0]; };
     g.URL = URL; g.URLSearchParams = URLSearchParams;
 
     // --- Blob URL store (worker realm) — RAM-only, mirrors the page realm ---
     var __blobURLStore = Object.create(null);
     function __blobBytes(b) {
-        if (!b || !Array.isArray(b.__parts)) return "";
+        if (!b || !Array.isArray(internalsFor(b).parts)) return "";
         var enc = new g.TextEncoder(), out = "";
-        for (var i = 0; i < b.__parts.length; i++) {
-            var p = b.__parts[i], v, j;
+        for (var i = 0; i < internalsFor(b).parts.length; i++) {
+            var p = internalsFor(b).parts[i], v, j;
             if (typeof p === "string") { v = enc.encode(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
             else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
             else if (p && typeof p.byteLength === "number" && p.buffer) { v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-            else if (p && Array.isArray(p.__parts)) out += __blobBytes(p);
+            else if (p && Array.isArray(internalsFor(p).parts)) out += __blobBytes(p);
             else if (p != null) { v = enc.encode(String(p)); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
         }
         return out;
@@ -640,7 +652,7 @@
     function __resolveBlobURL(u) {
         var h = u.indexOf("#"), key = h >= 0 ? u.slice(0, h) : u, obj = __blobURLStore[key];
         if (!obj) return null;
-        if (Array.isArray(obj.__parts)) return { bytes: __blobBytes(obj), type: obj.type || "" };
+        if (Array.isArray(internalsFor(obj).parts)) return { bytes: __blobBytes(obj), type: obj.type || "" };
         return { bytes: "", type: "" };
     }
     URL.createObjectURL = function (obj) {

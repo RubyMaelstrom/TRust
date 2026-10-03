@@ -21363,6 +21363,99 @@ mod tests {
     }
 
     #[test]
+    fn page_visible_platform_objects_expose_no_internal_properties() {
+        // Web IDL #js-platform-objects keeps implementation state in internal
+        // slots. Exercise wrappers, collections, events, observers, CSSOM,
+        // fetch/XHR, Indexed Database and the newer device APIs, in an engine
+        // without the test-only control-object exposure, and list every own
+        // "__…" or "…trust…" property reachable on those objects or their
+        // prototype chains. The engine's legacy RegExp statics are excluded.
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state
+            .window_request_urls
+            .insert(0, url::Url::parse(DEFAULT_URL).unwrap());
+        let mut engine = lumen::Engine::new();
+        engine.set_tier(Tier::Interp);
+        let clock = state.clock.clone();
+        engine.set_wall_clock(move || clock.now_ms());
+        state.configure_module_loading(&mut engine);
+        engine
+            .ctx()
+            .op_state()
+            .put_retained_memory_with_external_memory(state);
+        install_host_boundary(&mut engine);
+        eval(
+            &mut engine,
+            &format!(
+                "globalThis.__trust_cfg = {{ url: {DEFAULT_URL:?}, width: 640, height: 384 }};"
+            ),
+            "configuration",
+        )
+        .unwrap();
+        eval_platform_prelude(&mut engine).unwrap();
+        assert_eq!(
+            string_value(&mut engine, "typeof globalThis.__trust"),
+            "undefined"
+        );
+        eval(
+            &mut engine,
+            include_str!("fixtures/internal_names.mjs"),
+            "internal names",
+        )
+        .unwrap();
+        call_trust_method(&mut engine, "hydrateFrames", &[]);
+        let mut result = String::from("undefined");
+        for _ in 0..2000 {
+            run_microtask_checkpoint(&mut engine);
+            result = string_value(&mut engine, "String(globalThis.internalNamesResult)");
+            if result != "undefined" {
+                break;
+            }
+            if matches!(
+                call_trust_method(&mut engine, "hasPlatformTask", &[]),
+                Value::Bool(true)
+            ) {
+                call_trust_method(&mut engine, "runPlatformTask", &[]);
+            } else {
+                call_trust_method(&mut engine, "tick", &[]);
+            }
+        }
+        assert_eq!(result, "none");
+
+        let mut worker = worker_platform_engine_with(false);
+        let probe = r#"
+            (() => {
+                const bad = key => typeof key === 'string' && !['__proto__', '__defineGetter__',
+                    '__defineSetter__', '__lookupGetter__', '__lookupSetter__', 'isTrusted'].includes(key)
+                    && (key.startsWith('__') || /trust/i.test(key));
+                const found = new Set();
+                const scan = object => {
+                    if (object === null || (typeof object !== 'object' && typeof object !== 'function') || object === RegExp) return;
+                    for (let o = object, depth = 0; o && depth < 8; o = Object.getPrototypeOf(o), depth++)
+                        for (const key of Reflect.ownKeys(o)) if (bad(key)) found.add(key);
+                };
+                scan(globalThis);
+                for (const name of Object.getOwnPropertyNames(globalThis)) {
+                    const value = globalThis[name];
+                    if (typeof value === 'function' && value !== RegExp) { scan(value); scan(value.prototype); }
+                }
+                const url = new URL('https://example.com/?a=1');
+                url.searchParams.append('b', '2');
+                for (const object of [new Blob(['x']), new File(['y'], 'f'), url, url.searchParams,
+                    new URLSearchParams('c=3'), new Headers({a: 'b'}),
+                    new TextDecoder(), new TextEncoder(), new MessageChannel().port1, new Notification('x'),
+                    navigator, navigator.permissions, performance, location])
+                    scan(object);
+                return [...found].sort().join() || 'none';
+            })()
+        "#;
+        assert_eq!(string_value(&mut worker, probe), "none");
+    }
+
+    #[test]
     fn offline_audio_context_renders_the_graph_deterministically() {
         // Web Audio 1.1 (local WebAudio/web-audio-api@2047f16) #OfflineAudioContext,
         // #rendering-loop, #computation-of-value, #waveform-generation,

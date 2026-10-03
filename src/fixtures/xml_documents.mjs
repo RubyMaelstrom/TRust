@@ -55,8 +55,7 @@
         const xhr = new XMLHttpRequest();
         xhr.open('GET', 'https://example.com/game.xml');
         xhr.responseType = responseType;
-        xhr.__inFlight = true;
-        xhr.__finish([200, type, body, null]);
+        __trust.finishXhrResponse(xhr, [200, type, body, null]);
         return xhr;
     }
     const xhr = response('text/xml; charset=utf-8', '<metadata><emulator>dosbox</emulator></metadata>', 'document');

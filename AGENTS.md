@@ -145,7 +145,11 @@ The project favors:
   run time. Rust reaches a Realm's prelude only through `platform_control()`,
   never by evaluating `__trust` snippets. Wrapper state that carries host
   identity (node ids, child Windows, store handles) lives in internal slots,
-  and DOM host operations refuse nodes of cross-origin Documents.
+  and DOM host operations refuse nodes of cross-origin Documents. All other
+  platform state of author-reachable objects (wrappers, collections, events,
+  observers, CSSOM, fetch/XHR, IndexedDB, …) also lives in internal slots
+  (`internalsFor`), and internal operations are closures rather than
+  prototype methods: no own or inherited `__…`/`…trust…` property is visible.
 - Keep session caches bounded. Avoid copying large scripts, DOMs, images, or
   bytecode unnecessarily.
 
