@@ -20196,7 +20196,7 @@ mod tests {
         let requests = crate::img::document_svg_image_requests(&source);
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert_eq!(
-            crate::img::document_svg_image_target(&requests[0]),
+            crate::img::document_svg_image_target(&requests[0]).map(|image| image.url()),
             Some("https://cdn.test/assets/tex.png")
         );
         let collected = crate::http::collect_image_urls(
@@ -20228,7 +20228,7 @@ mod tests {
                 .eager
                 .iter()
                 .any(|request| crate::img::document_svg_image_target(request)
-                    == Some("https://page.test/tex.png")),
+                    .is_some_and(|image| image.url() == "https://page.test/tex.png")),
             "{:?}",
             collected.eager
         );
@@ -20240,9 +20240,6 @@ mod tests {
     #[test]
     fn inline_svg_redraws_with_its_document_image_after_it_loads() {
         let base = url::Url::parse("https://example.test/flood/").unwrap();
-        let dom = Dom::parse_document(
-            r#"<svg width=4 height=4><image href="arrival-texture.png" width=4 height=4/></svg>"#,
-        );
         let paint = |dom: &Dom| {
             let layout = crate::layout2::lay_out_graphical(
                 dom,
@@ -20261,15 +20258,32 @@ mod tests {
                 .count();
             (source, red)
         };
-        let (before, red) = paint(&dom);
-        assert_eq!(red, 0, "nothing draws before the image loads");
-        crate::img::record_document_svg_image(
-            "https://example.test/flood/arrival-texture.png",
-            Some(&crate::img::red_png()),
-        );
-        let (after, red) = paint(&dom);
-        assert_ne!(before, after);
-        assert_eq!(red, 16);
+        // Page loads running concurrently begin navigations; a source made
+        // in one navigation never draws an image recorded for another.
+        for _ in 0..64 {
+            let navigation = crate::img::document_svg_navigation();
+            let dom = Dom::parse_document(
+                r#"<svg width=4 height=4><image href="arrival-texture.png" width=4 height=4/></svg>"#,
+            );
+            let (before, red) = paint(&dom);
+            assert_eq!(red, 0, "nothing draws before the image loads");
+            // The frontend's page-image load for the SVG's request records it.
+            let request = crate::img::document_svg_image_requests(&before).remove(0);
+            let image = crate::img::document_svg_image_target(&request).unwrap();
+            assert_eq!(
+                image.url(),
+                "https://example.test/flood/arrival-texture.png"
+            );
+            crate::img::record_document_svg_image(&image, Some(&crate::img::red_png()));
+            let (after, red) = paint(&dom);
+            if crate::img::document_svg_navigation() != navigation {
+                continue;
+            }
+            assert_ne!(before, after);
+            assert_eq!(red, 16);
+            return;
+        }
+        panic!("navigations never settled for the test");
     }
 
     /// CSS Fonts 4 #font-face-rule: the document's `@font-face` faces apply
