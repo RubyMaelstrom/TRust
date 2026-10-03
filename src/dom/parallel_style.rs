@@ -29,7 +29,7 @@
 //! reports differences.
 
 use super::parallel_match::{
-    Chunk, Participant, Published, ScopeRules, Stream, Walk, participants_for, verify_enabled, work,
+    Chunk, Participant, ScopeRules, Stream, Walk, participants_for, verify_enabled, work,
 };
 use super::*;
 use crate::layout2::value::Vp;
@@ -43,9 +43,25 @@ const MIN_ELEMENTS: usize = 128;
 const MIN_WORK: Duration = Duration::from_micros(300);
 /// The per-element cost assumed before a document's first pass is measured.
 const FIRST_ELEMENT_COST: Duration = Duration::from_micros(4);
-/// Elements per claimed run: long enough that a run's ancestor chain is a
-/// small part of its work, short enough to balance participants.
-const RUN: usize = 64;
+/// Run lengths. Participants claim a share of the remaining elements:
+/// elements of one run share computed styles (CSS Cascade 5 #inheriting
+/// makes siblings' rows equal more often than not), and a run's first
+/// element computes the ancestor chain, so long runs do less work; the last
+/// runs are short to balance participants.
+const MIN_RUN: usize = 32;
+const MAX_RUN: usize = 1024;
+
+/// Which elements a pass computes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Scope {
+    /// Every connected element outside animated subtrees, so the frame's
+    /// consumers find all of their results, also where a lazy read since
+    /// the invalidation computed some values but not all they read.
+    All,
+    /// Only elements without a computed row for this revision.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Stale,
+}
 
 /// When to attempt a pass, per arena.
 #[derive(Default)]
@@ -712,10 +728,8 @@ impl Dom {
 
     /// Before a frame's style consumers run, once per broad invalidation
     /// (a new style value or page font revision): compute the style of every
-    /// rendered element that has none yet, in parallel. A lazy read since the
-    /// invalidation may already have computed a few. `viewport` and `base`
-    /// are the layout's, so the typed records match what box-tree
-    /// construction asks for.
+    /// element in parallel. `viewport` and `base` are the layout's, so the
+    /// typed records match what box-tree construction asks for.
     pub(crate) fn prepare_styles(&self, viewport: crate::layout2::Viewport, base: &url::Url) {
         self.flush_style_invalidations();
         let stamp = (
@@ -735,7 +749,7 @@ impl Dom {
             .get()
             .unwrap_or(FIRST_ELEMENT_COST);
         let ran = self
-            .compute_stale_with(pool, viewport, base, MIN_ELEMENTS, cost)
+            .compute_styles_with(pool, Scope::All, viewport, base, MIN_ELEMENTS, cost)
             .is_some();
         #[cfg(test)]
         self.parallel_style
@@ -744,13 +758,14 @@ impl Dom {
         let _ = ran;
     }
 
-    /// Compute every connected element without a computed row for this
-    /// revision, in parallel, if there are at least `min_elements` of them
-    /// and their estimated work at `element_cost` each reaches `MIN_WORK`.
-    /// Returns the elements whose results were adopted.
-    pub(super) fn compute_stale_with(
+    /// Compute the connected elements in `scope`, in parallel, if there are
+    /// at least `min_elements` of them and their estimated work at
+    /// `element_cost` each reaches `MIN_WORK`. Returns the elements whose
+    /// results were adopted.
+    pub(super) fn compute_styles_with(
         &self,
         pool: &style_pool::Pool,
+        scope: Scope,
         viewport: crate::layout2::Viewport,
         base: &url::Url,
         min_elements: usize,
@@ -768,19 +783,26 @@ impl Dom {
             crate::font_system::page_font_epoch(),
         );
         let fresh = self.computed_cache.borrow().0 == stamp;
-        let stale = |node| !fresh || !self.computed_cache.borrow().1.has_row(node);
+        let stale =
+            |node| scope == Scope::All || !fresh || !self.computed_cache.borrow().1.has_row(node);
         let animated = self.animations.origin_elements();
         let pruned = |node| animated.contains(&node);
-        let stream = Stream::new(self.nodes.len(), RUN);
+        let stream = Stream::new(self.nodes.len(), MIN_RUN);
         let mut walk = Walk::new(&slots);
         let min_elements = min_elements
             .max(1)
             .max((MIN_WORK.as_nanos() / element_cost.as_nanos().max(1)) as usize);
-        if !walk.advance(self, &slots, &stream, min_elements, stale, pruned)
+        // The whole list first (a fraction of a millisecond), so runs can
+        // be sized by what remains.
+        let walk_started = Instant::now();
+        if !walk.advance(self, &slots, &stream, usize::MAX, stale, pruned)
             || walk.count < min_elements
         {
             return None;
         }
+        stream.publish_all(walk.count);
+        let walked = walk_started.elapsed();
+        let divisor = 2 * pool.participants();
         let document_base = self.document_base(DOCUMENT);
         // SAFETY: as in `match_stale_with`: the view is shared only with this
         // pass's job, and `Pool::run` keeps this thread inside the pass until
@@ -812,7 +834,7 @@ impl Dom {
         let stream = &stream;
         let job = |participant: usize| {
             let mut part = Part::new(participant, inputs, inputs.view.view());
-            while let Some(range) = stream.claim() {
+            while let Some(range) = stream.claim_guided(divisor, MIN_RUN, MAX_RUN) {
                 let run = part.run(stream, range);
                 stream
                     .done
@@ -821,29 +843,9 @@ impl Dom {
                     .push(run);
             }
         };
-        let (mut walked, mut joined) = (Duration::ZERO, 1);
+        let mut joined = 1;
         let result = pool.run(pool.participants(), &job, |lead| {
-            let walk_started = Instant::now();
-            let ok = {
-                let _published = Published(stream);
-                loop {
-                    stream
-                        .published
-                        .store(walk.count, std::sync::atomic::Ordering::Release);
-                    lead.wake(participants_for(work(walk.count, element_cost)));
-                    if walk.is_done() {
-                        break true;
-                    }
-                    if !walk.advance(self, &slots, stream, walk.count + RUN, stale, pruned) {
-                        break false;
-                    }
-                }
-            };
-            walked = walk_started.elapsed();
-            joined = lead.participants();
-            if !ok {
-                return None;
-            }
+            lead.wake(participants_for(work(walk.count, element_cost)));
             let mut adopt = Adopt::new(self, stamp, pool.participants());
             let mut own = Part::new(0, inputs, inputs.view.view());
             while adopt.stored < walk.count && !lead.worker_panicked() {
@@ -854,16 +856,17 @@ impl Dom {
                         adopt.add(stream, run);
                     }
                     let cost = adopt.busy / adopt.stored.max(1) as u32;
-                    if adopt.stored >= 2 * RUN && cost > element_cost * 2 {
+                    if adopt.stored >= 2 * MIN_RUN && cost > element_cost * 2 {
                         lead.wake(participants_for(work(walk.count - adopt.stored, cost)));
                     }
-                } else if let Some(range) = stream.claim() {
+                } else if let Some(range) = stream.claim_guided(divisor, MIN_RUN, MAX_RUN) {
                     let run = own.run(stream, range);
                     adopt.add(stream, run);
                 } else {
                     std::hint::spin_loop();
                 }
             }
+            joined = lead.participants();
             self.transitions.prepare(transitions::Prepared {
                 stamp: (stamp.0, stamp.1, self.epoch),
                 endpoints: std::mem::take(&mut adopt.transitions),
@@ -1159,8 +1162,14 @@ mod tests {
     /// Run a pass on `pool` and require every adopted result to equal the
     /// lazy path. Returns how many elements were adopted.
     fn pass_and_verify(dom: &Dom, pool: &style_pool::Pool) -> Option<usize> {
-        let adopted =
-            dom.compute_stale_with(pool, VIEWPORT, &base(), 1, Duration::from_millis(1))?;
+        let adopted = dom.compute_styles_with(
+            pool,
+            Scope::Stale,
+            VIEWPORT,
+            &base(),
+            1,
+            Duration::from_millis(1),
+        )?;
         let (checked, mismatches) = dom.pending_endpoint_mismatches().expect("endpoints");
         assert_eq!(mismatches, 0);
         assert!(checked > 0);
@@ -1209,8 +1218,15 @@ mod tests {
         let dom = document();
         let pool = style_pool::Pool::new(4);
         assert!(
-            dom.compute_stale_with(&pool, VIEWPORT, &base(), 1, Duration::from_millis(1))
-                .is_some()
+            dom.compute_styles_with(
+                &pool,
+                Scope::All,
+                VIEWPORT,
+                &base(),
+                1,
+                Duration::from_millis(1)
+            )
+            .is_some()
         );
         let vp = Vp {
             w: VIEWPORT.width,
@@ -1288,7 +1304,14 @@ mod tests {
         dom.set_viewport_px(VIEWPORT.width + 1., VIEWPORT.height);
         let pool = style_pool::Pool::new(4);
         let adopted = dom
-            .compute_stale_with(&pool, VIEWPORT, &base(), 1, Duration::from_millis(1))
+            .compute_styles_with(
+                &pool,
+                Scope::All,
+                VIEWPORT,
+                &base(),
+                1,
+                Duration::from_millis(1),
+            )
             .expect("pass ran");
         let (a, b, u) = (id(&dom, "a"), id(&dom, "b"), id(&dom, "u7"));
         assert!(!adopted.contains(&a) && !adopted.contains(&b));
@@ -1341,8 +1364,15 @@ mod tests {
         let t = dom.get_by_id("t").unwrap();
         let pool = style_pool::Pool::new(4);
         assert!(
-            dom.compute_stale_with(&pool, VIEWPORT, &base(), 1, Duration::from_millis(1))
-                .is_some()
+            dom.compute_styles_with(
+                &pool,
+                Scope::All,
+                VIEWPORT,
+                &base(),
+                1,
+                Duration::from_millis(1)
+            )
+            .is_some()
         );
         dom.update_css_transitions(0.);
         // One change both gains the transition and changes the width, and
@@ -1350,7 +1380,14 @@ mod tests {
         dom.set_attr(t, "class", "open");
         dom.set_viewport_px(VIEWPORT.width + 1., VIEWPORT.height);
         let adopted = dom
-            .compute_stale_with(&pool, VIEWPORT, &base(), 1, Duration::from_millis(1))
+            .compute_styles_with(
+                &pool,
+                Scope::All,
+                VIEWPORT,
+                &base(),
+                1,
+                Duration::from_millis(1),
+            )
             .expect("pass ran");
         assert!(adopted.contains(&t));
         dom.update_css_transitions(0.);
