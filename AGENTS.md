@@ -310,6 +310,20 @@ current behavior and limits; consult the governing standards before changing it.
   `getContext("webgl")` return `null`. WebGL 2 and multisample antialiasing are
   unimplemented. Estimated buffer/image storage has a shared 256 MiB page budget
   and at most 16 contexts; driver overhead and CPU copies are additional.
+- Capability APIs report only what TRust provides. There is no permission
+  prompt: "notifications" and "persistent-storage" start as "prompt"
+  (`Notification.permission` "default"), a request records "denied" in the
+  page-scoped permission store shared with dedicated workers, and non-secure
+  contexts report "denied". Notifications never show (they fire `error`;
+  `maxActions` is 0). `navigator.storage` estimates the origin's localStorage,
+  IndexedDB and Cache Storage usage against their summed quotas; buckets are
+  best-effort and OPFS `getDirectory()` rejects. No credential type, capture
+  device, display source or speech voice exists. Clipboard reads are never
+  permitted; writes with transient activation go through
+  `PageEvt::ClipboardWrite` to trust-desktop (arboard) or the terminal
+  (OSC 52), and trust-headless refuses them. `navigator.serviceWorker` has no
+  registrations and `register()` rejects with `SecurityError`. `SharedWorker`
+  shares one agent per origin, URL and name within the page.
 - Web Audio `AudioContext`s stay suspended with a stationary clock: there is no
   output device, renderer acquisition errors asynchronously and `resume()`
   rejects with `NotSupportedError`. `OfflineAudioContext` renders on the page's
