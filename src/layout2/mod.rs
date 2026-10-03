@@ -3424,6 +3424,26 @@ mod tests {
     }
 
     #[test]
+    fn stacking_context_images_keep_their_inline_replaced_size() {
+        // CSS 2 §10.3.2: an inline ratio-only SVG with auto width and height
+        // takes the containing block's width. A filter makes it a stacking
+        // context, not an inline-block, so it must not shrink-to-fit to the
+        // default object size (archive.org's media icons; Chromium: 41x41).
+        let svg = "data:image/svg+xml,%3Csvg%20viewBox='0%200%20300%20300'%20xmlns='http://www.w3.org/2000/svg'%3E%3Crect%20width='300'%20height='300'/%3E%3C/svg%3E";
+        let mut images = HashMap::new();
+        images.insert(svg.to_string(), (150u32, 150u32));
+        for style in ["", "filter:invert(90%)", "opacity:.5"] {
+            let html = format!(
+                r#"<body style="margin:0"><div style="width:41px"><img id=i src="{svg}" style="{style}"></div></body>"#
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 400.0, &images);
+            let rect = layout.boxes[&dom.get_by_id("i").unwrap()];
+            assert_eq!((rect.width, rect.height), (41.0, 41.0), "{style}");
+        }
+    }
+
+    #[test]
     fn percentage_width_attributes_size_styled_images() {
         // HTML Rendering #dimRendering: `width="50%"` maps to the width
         // property, whatever else the element's style attribute sets
