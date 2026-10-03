@@ -519,8 +519,12 @@ struct HostState {
     element_slots: Option<Value>,
     /// Platform-private, same-Agent WeakMaps created by the first bootstrap and shared by every
     /// later Realm (see `host_platform_slots`). `controls` maps each Window or worker global to its
-    /// private control object; Rust reaches the platform only through it.
+    /// private control object; Rust reaches the platform only through it. `nodes` holds each DOM
+    /// wrapper's arena id and `internals` other per-object platform state, as internal slots
+    /// instead of author-visible (and forgeable) properties.
     platform_controls: Option<Value>,
+    platform_nodes: Option<Value>,
+    platform_internals: Option<Value>,
     live_ranges: live_range_host::Registry,
     geometry: geometry_host::Registry,
     pointer_event_slots: Option<Value>,
@@ -610,6 +614,8 @@ impl HostState {
             performance_slots: None,
             element_slots: None,
             platform_controls: None,
+            platform_nodes: None,
+            platform_internals: None,
             live_ranges: live_range_host::Registry::default(),
             geometry: geometry_host::Registry::default(),
             pointer_event_slots: None,
@@ -807,6 +813,8 @@ impl RetainedMemory for HostState {
             performance_slots,
             element_slots,
             platform_controls,
+            platform_nodes,
+            platform_internals,
             live_ranges,
             geometry,
             pointer_event_slots,
@@ -1188,7 +1196,10 @@ impl RetainedMemory for HostState {
         if let Some(value) = element_slots {
             visitor.value(value);
         }
-        if let Some(value) = platform_controls {
+        for value in [platform_controls, platform_nodes, platform_internals]
+            .into_iter()
+            .flatten()
+        {
             visitor.value(value);
         }
         if let Some(value) = pointer_event_slots {
@@ -8680,6 +8691,8 @@ fn host_platform_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     };
     let slot = match kind.as_str() {
         "controls" => &mut state.platform_controls,
+        "nodes" => &mut state.platform_nodes,
+        "internals" => &mut state.platform_internals,
         _ => return Err(ctx.make_error("TypeError", "unknown platform slot")),
     };
     Ok(slot.get_or_insert(candidate).clone())
@@ -10198,6 +10211,23 @@ fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Valu
             ctx.define_embed_global(name, len, host_fn);
         }
     }
+    // Fixtures address nodes by arena id and inspect navigable state through the former
+    // property names. The platform itself only reads its internal slots.
+    static ACCESSORS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let accessors = ACCESSORS.get_or_init(|| {
+        lumen::compile_host_snapshot(TEST_INTERNAL_ACCESSORS).expect("test accessors parse")
+    });
+    let maps = ctx.host_mut::<HostState>().map(|state| {
+        [
+            state.platform_nodes.clone().unwrap_or(Value::Undefined),
+            state.platform_internals.clone().unwrap_or(Value::Undefined),
+        ]
+    });
+    if let (Some(maps), Ok(Ok(installer))) =
+        (maps, ctx.eval_classic_snapshot_interruptible(accessors))
+    {
+        let _ = ctx.invoke(installer, Value::Undefined, &maps);
+    }
     ctx.define_embed_global("__window_named_exports", 0, |ctx, _, _| {
         Ok(Value::Num(
             ctx.host_mut::<HostState>()
@@ -10205,6 +10235,41 @@ fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Valu
         ))
     });
 }
+
+/// Test-only accessors for the former wrapper properties. Writing `__id` creates an own data
+/// property, as on the old platform, so fixtures can still check that forged ids are ignored;
+/// the navigable fields write the platform's internal record, as fixtures set up frame state.
+#[cfg(test)]
+const TEST_INTERNAL_ACCESSORS: &str = r#"(function (nodeIds, internals) {
+    "use strict";
+    const get = WeakMap.prototype.get, apply = Reflect.apply, define = Object.defineProperty;
+    function shadow(object, name, value) {
+        define(object, name, {value, writable: true, enumerable: true, configurable: true});
+    }
+    if (typeof Node === "function") define(Node.prototype, "__id", {
+        configurable: true,
+        get() { return apply(get, nodeIds, [this]); },
+        set(value) { shadow(this, "__id", value); },
+    });
+    for (const name of ["contentRealmWindow", "contentDoc", "contentWin", "frame",
+        "trustParentWindow", "trustTopWindow", "sr", "frameUrl"]) {
+        define(Object.prototype, "__" + name, {
+            configurable: true,
+            get() {
+                const record = apply(get, internals, [this]);
+                return record ? record[name] : undefined;
+            },
+            set(value) {
+                let record = apply(get, internals, [this]);
+                if (!record) {
+                    record = Object.create(null);
+                    apply(WeakMap.prototype.set, internals, [this, record]);
+                }
+                record[name] = value;
+            },
+        });
+    }
+})"#;
 
 /// Evaluate a platform prelude source as the private bootstrap does, for tests that assemble
 /// their own Realm instead of using `eval_platform_prelude`.
@@ -19639,6 +19704,168 @@ mod tests {
         // WorkerGlobalScope has no print(); the engine's Test262 hook is removed too.
         assert_eq!(string_value(&mut worker, "typeof print"), "undefined");
         assert!(matches!(platform_control(worker.ctx()), Ok(Value::Obj(_))));
+    }
+
+    /// A production-configured top-level Window: no test internals are republished.
+    fn sealed_platform_engine(url: &str) -> lumen::Engine {
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            url,
+        );
+        engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .test_hooks
+            .internals = false;
+        eval_platform_prelude(&mut engine).unwrap();
+        engine
+    }
+
+    #[test]
+    fn cross_origin_frame_realm_is_unreachable_through_wrapper_internals() {
+        // HTML #origin / #cross-origin-objects: an embedding page must not obtain a
+        // cross-origin child's Window, Document or nodes. TRust shares one DOM arena and one
+        // Agent between the Realms, so wrapper internals (node ids, the container's child
+        // Window/Document, its URL) must be internal slots, not author-visible properties.
+        let mut engine = sealed_platform_engine("https://top.example/");
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            globalThis.frame = document.createElement('iframe');
+            frame.src = 'data:text/html,<p id=secret>CROSS-ORIGIN-SECRET</p>';
+            body.appendChild(frame);
+            "#,
+            "cross-origin frame setup",
+        )
+        .unwrap();
+        call_trust_method(&mut engine, "hydrateFrames", &[]);
+        let child = {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let newest = *state
+                .window_realms
+                .keys()
+                .max()
+                .expect("child Window Realm");
+            state.window_realms[&newest].clone()
+        };
+        let mut read = |object: &Value, name: &str| {
+            engine
+                .ctx()
+                .member_get(object, name)
+                .unwrap_or_else(|_| panic!("read {name}"))
+        };
+        let child_document = read(&child, "document");
+        let child_secret = read(&child_document, "documentElement");
+        let outer = read(&child_secret, "outerHTML");
+        assert!(
+            value_string(&mut engine, &outer).contains("CROSS-ORIGIN-SECRET"),
+            "the child Realm loaded its own document"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const leaks = [];
+                    if (frame.contentDocument !== null) leaks.push('contentDocument');
+                    if (frame.contentWindow.document !== null) leaks.push('contentWindow.document');
+                    const internal = ['__id', '__contentRealmWindow', '__contentDoc', '__contentWin',
+                        '__frameUrl', '__frame', '__trustParentWindow', '__trustTopWindow', '__sr'];
+                    for (const object of [globalThis, document, document.documentElement, frame,
+                        frame.contentWindow])
+                        for (const key of internal)
+                            if (key in object) leaks.push(key);
+                    return leaks.join() || 'sealed';
+                })()"#
+            ),
+            "sealed"
+        );
+        // Identity check: the child global, Document and root element are not reachable
+        // through any own data property of the page-visible objects, transitively.
+        eval(
+            &mut engine,
+            r#"globalThis.reaches = function (...secrets) {
+                const seen = new Set(), queue = [[globalThis, 0], [document, 0], [frame, 0],
+                    [frame.contentWindow, 0]];
+                while (queue.length) {
+                    const [value, depth] = queue.shift();
+                    if (value === null || (typeof value !== 'object' && typeof value !== 'function')
+                        || seen.has(value)) continue;
+                    seen.add(value);
+                    if (secrets.includes(value)) return true;
+                    if (depth === 4) continue;
+                    for (const key of Reflect.ownKeys(value)) {
+                        const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+                        if (descriptor && 'value' in descriptor) queue.push([descriptor.value, depth + 1]);
+                    }
+                }
+                return false;
+            };"#,
+            "reachability probe",
+        )
+        .unwrap();
+        let global = engine.global_this();
+        let reaches = engine
+            .ctx()
+            .member_get(&global, "reaches")
+            .unwrap_or_else(|_| panic!("read reaches"));
+        let reached = engine
+            .call_function(
+                &reaches,
+                Value::Undefined,
+                &[child, child_document, child_secret],
+            )
+            .unwrap_or_else(|_| panic!("reachability probe threw"));
+        assert!(
+            matches!(reached, Value::Bool(false)),
+            "child Realm reachable"
+        );
+    }
+
+    #[test]
+    fn cross_origin_frame_content_is_unreachable_from_the_embedding_page() {
+        // End-to-end through the production bootstrap: the page tries every former host
+        // binding and wrapper-internal route to a cross-origin frame's document.
+        let html = r#"<!doctype html><body><iframe id=f
+            src="data:text/html,<p id=s>CROSS-ORIGIN-SECRET-42</p>"></iframe><pre id=o></pre><script>
+            addEventListener('load', () => {
+                const f = document.getElementById('f'), routes = [];
+                function attempt(label, read) {
+                    try { if (String(read()).includes('CROSS-ORIGIN-SECRET')) routes.push(label); }
+                    catch (error) {}
+                }
+                attempt('contentDocument', () => f.contentDocument.documentElement.outerHTML);
+                attempt('contentWindow', () => f.contentWindow.document.documentElement.outerHTML);
+                attempt('realm window', () => f.__contentRealmWindow.document.documentElement.outerHTML);
+                attempt('content doc', () => f.__contentDoc.documentElement.outerHTML);
+                attempt('arena root', () => __dom_outer_html(0));
+                attempt('frame document', () => __dom_outer_html(__dom_frame_document(f.__id)));
+                attempt('control object', () => __trust.frameDocumentHTML);
+                for (let id = 0; id < 64; id++) {
+                    const forged = document.createElement('p');
+                    forged.__id = id;
+                    attempt('forged id ' + id, () => forged.outerHTML + forged.textContent);
+                }
+                document.getElementById('o').textContent = routes.join() || 'sealed';
+            });
+            </script>"#;
+        let (output, outcome) = crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let result = output
+            .split("<pre id=\"o\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</pre>").next())
+            .unwrap_or_default();
+        assert_eq!(result, "sealed", "{output}");
+        assert!(
+            output.contains(r#"<p id="s">CROSS-ORIGIN-SECRET-42</p>"#),
+            "the cross-origin frame document was realized: {output}"
+        );
     }
 
     #[test]
