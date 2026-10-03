@@ -194,13 +194,23 @@ impl Default for Units {
     }
 }
 
+/// What resolving relative lengths reads (CSS Values 4 #relative-lengths):
+/// the DOM, or a style computation's view of it.
+pub(crate) trait UnitSource {
+    fn font_px(&self, id: NodeId) -> f32;
+    fn root_font_px(&self) -> f32;
+    fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String>;
+    fn viewport_px(&self) -> (f32, f32);
+    fn cached_font_units(&self, id: NodeId, compute: impl FnOnce() -> Units) -> Units;
+}
+
 impl Units {
     /// The resolution context for `id` in `dom`.
-    pub(crate) fn of(dom: &Dom, id: NodeId) -> Units {
+    pub(crate) fn of<D: UnitSource + ?Sized>(dom: &D, id: NodeId) -> Units {
         dom.cached_font_units(id, || Self::uncached(dom, id))
     }
 
-    fn uncached(dom: &Dom, id: NodeId) -> Units {
+    fn uncached<D: UnitSource + ?Sized>(dom: &D, id: NodeId) -> Units {
         let fs = dom.font_px(id);
         let family = dom
             .computed_value_resolved(id, "font-family")

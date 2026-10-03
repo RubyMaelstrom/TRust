@@ -78,19 +78,19 @@ impl DisplayRecord {
     }
 }
 
-struct Computation<'a> {
-    dom: &'a Dom,
+struct Computation<'a, B: StyleBackend + ?Sized> {
+    dom: &'a B,
     stamp: (u64, u64),
     row: Option<computed_cache::SharedRow>,
 }
 
-impl Computation<'_> {
+impl<B: StyleBackend + ?Sized> Computation<'_, B> {
     fn can_publish(&self, id: NodeId) -> bool {
-        let cache = self.dom.computed_cache.borrow();
+        let cache = self.dom.computed_cache().borrow();
         cache.0 == self.stamp
             && self.stamp
                 == (
-                    self.dom.style_value_epoch,
+                    self.dom.style_value_epoch(),
                     crate::font_system::page_font_epoch(),
                 )
             && self.row.as_ref().is_some_and(|original| {
@@ -102,9 +102,9 @@ impl Computation<'_> {
     }
 }
 
-impl Drop for Computation<'_> {
+impl<B: StyleBackend + ?Sized> Drop for Computation<'_, B> {
     fn drop(&mut self) {
-        self.dom.computed_cache.borrow_mut().1.record_computing = false;
+        self.dom.computed_cache().borrow_mut().1.record_computing = false;
     }
 }
 
@@ -120,8 +120,8 @@ impl InlineRecord {
     }
 }
 
-impl Dom {
-    fn prepare_style_record(&self, id: NodeId) -> Option<Computation<'_>> {
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
+    fn prepare_style_record(&self, id: NodeId) -> Option<Computation<'_, B>> {
         if !enabled() || self.css_transitions_active() {
             return None;
         }
@@ -139,24 +139,26 @@ impl Dom {
             return None;
         }
         {
-            let mut cache = self.computed_cache.borrow_mut();
+            let mut cache = self.computed_cache().borrow_mut();
             if cache.1.record_computing {
                 return None;
             }
             cache.1.record_computing = true;
         }
         let mut computation = Computation {
-            dom: self,
+            dom: self.0,
             stamp: (0, 0),
             row: None,
         };
         // This also synchronizes the page-font epoch. The shared row identity
         // proves common values; node context is separately represented below.
         computation.row = Some(self.prepare_computed_row(id, 0));
-        computation.stamp = self.computed_cache.borrow().0;
+        computation.stamp = self.computed_cache().borrow().0;
         Some(computation)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(crate) fn retained_box_style(
         &self,
         id: NodeId,
@@ -166,19 +168,21 @@ impl Dom {
         let Some(computation) = self.prepare_style_record(id) else {
             return compute();
         };
-        if let Some(value) = self.computed_cache.borrow().1.box_record(id, &context) {
+        if let Some(value) = self.computed_cache().borrow().1.box_record(id, &context) {
             return value;
         }
         let value = compute();
         if computation.can_publish(id) {
-            self.computed_cache
+            self.computed_cache()
                 .borrow_mut()
                 .1
                 .put_box_record(id, context, value.clone());
         }
         value
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(crate) fn retained_inline_style(
         &self,
         id: NodeId,
@@ -193,19 +197,20 @@ impl Dom {
         // Keep the node's own activation and the inherited formatting context
         // in this node-private record, never in the shared property row.
         let clickable = self.render_clickable(id);
-        if let Some(value) = self
-            .computed_cache
-            .borrow()
-            .1
-            .inline_record(id, self.epoch, clickable, parent, base)
-        {
+        if let Some(value) = self.computed_cache().borrow().1.inline_record(
+            id,
+            self.epoch(),
+            clickable,
+            parent,
+            base,
+        ) {
             return value;
         }
         let value = compute();
         if computation.can_publish(id) {
-            self.computed_cache.borrow_mut().1.put_inline_record(
+            self.computed_cache().borrow_mut().1.put_inline_record(
                 id,
-                self.epoch,
+                self.epoch(),
                 clickable,
                 parent.clone(),
                 base.clone(),
@@ -214,7 +219,9 @@ impl Dom {
         }
         value
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(super) fn retained_display(
         &self,
         id: NodeId,
@@ -223,12 +230,12 @@ impl Dom {
         let Some(computation) = self.prepare_style_record(id) else {
             return compute();
         };
-        if let Some(value) = self.computed_cache.borrow().1.display_record(id) {
+        if let Some(value) = self.computed_cache().borrow().1.display_record(id) {
             return value;
         }
         let value = compute();
         if computation.can_publish(id) {
-            self.computed_cache
+            self.computed_cache()
                 .borrow_mut()
                 .1
                 .put_display_record(id, value.clone());
@@ -484,9 +491,11 @@ mod tests {
         assert!(budget.reserve(MAX_BYTES + 1).is_none());
         let dom = Dom::parse_document("<p id=x>x</p>");
         let x = dom.get_by_id("x").unwrap();
-        let result = dom.retained_display(x, || {
+        let result = ComputeView(&dom).retained_display(x, || {
             assert_eq!(
-                dom.retained_display(x, || Some("nested".into())).as_deref(),
+                ComputeView(&dom)
+                    .retained_display(x, || Some("nested".into()))
+                    .as_deref(),
                 Some("nested")
             );
             Some("outer".into())
@@ -494,7 +503,8 @@ mod tests {
         assert_eq!(result.as_deref(), Some("outer"));
         if enabled() {
             assert_eq!(
-                dom.retained_display(x, || panic!("cached complete record"))
+                ComputeView(&dom)
+                    .retained_display(x, || panic!("cached complete record"))
                     .as_deref(),
                 Some("outer")
             );

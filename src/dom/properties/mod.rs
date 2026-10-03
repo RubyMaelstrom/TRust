@@ -99,7 +99,11 @@ pub(super) fn is_color(text: &str) -> bool {
 /// nearest eligible query container (recorded as a dependency, so layout
 /// settles again when that container resizes) or the small viewport size.
 /// `None` when `value` has no such unit. Strings and URLs are untouched.
-pub(crate) fn resolve_container_units(dom: &Dom, id: NodeId, value: &str) -> Option<String> {
+pub(in crate::dom) fn resolve_container_units<B: StyleBackend + ?Sized>(
+    dom: &ComputeView<'_, B>,
+    id: NodeId,
+    value: &str,
+) -> Option<String> {
     if !value
         .as_bytes()
         .windows(2)
@@ -316,8 +320,59 @@ impl Syntax {
     }
 }
 
+/// What computing a registered property's value reads from its element:
+/// font, line and viewport metrics for relative lengths (CSS Values 4
+/// #relative-lengths) and query containers for container lengths (CSS
+/// Conditional 5 #container-lengths).
+pub(in crate::dom) trait Host {
+    fn style_scope_root_element(&self, id: NodeId) -> Option<NodeId>;
+    fn font_px(&self, id: NodeId) -> f32;
+    fn root_font_px(&self) -> f32;
+    fn pseudo_layout_value(&self, id: NodeId, which: PseudoEl, name: &str) -> Option<String>;
+    fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String>;
+    fn style_parent(&self, id: NodeId) -> Option<NodeId>;
+    fn viewport_px(&self) -> (f32, f32);
+    fn device_pixel_ratio(&self) -> f32;
+    fn record_container_read(&self, subject: NodeId, container: NodeId, axes: u8, units: bool);
+    fn container_size(&self, container: NodeId) -> Option<[f32; 2]>;
+}
+
+impl<B: StyleBackend + ?Sized> Host for ComputeView<'_, B> {
+    fn style_scope_root_element(&self, id: NodeId) -> Option<NodeId> {
+        ComputeView::style_scope_root_element(self, id)
+    }
+    fn font_px(&self, id: NodeId) -> f32 {
+        ComputeView::font_px(self, id)
+    }
+    fn root_font_px(&self) -> f32 {
+        ComputeView::root_font_px(self)
+    }
+    fn pseudo_layout_value(&self, id: NodeId, which: PseudoEl, name: &str) -> Option<String> {
+        ComputeView::pseudo_layout_value(self, id, which, name)
+    }
+    fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String> {
+        ComputeView::computed_value_resolved(self, id, name)
+    }
+    fn style_parent(&self, id: NodeId) -> Option<NodeId> {
+        self.0.style_parent(id)
+    }
+    fn viewport_px(&self) -> (f32, f32) {
+        self.0.viewport_px()
+    }
+    fn device_pixel_ratio(&self) -> f32 {
+        self.0.device_pixel_ratio()
+    }
+    fn record_container_read(&self, subject: NodeId, container: NodeId, axes: u8, units: bool) {
+        self.0
+            .record_container_read(subject, container, axes, units)
+    }
+    fn container_size(&self, container: NodeId) -> Option<[f32; 2]> {
+        self.0.container_size(container)
+    }
+}
+
 pub(super) struct Context<'a> {
-    pub dom: Option<&'a Dom>,
+    pub dom: Option<&'a dyn Host>,
     pub id: NodeId,
     pub pseudo: Option<PseudoEl>,
     pub base: Option<&'a url::Url>,

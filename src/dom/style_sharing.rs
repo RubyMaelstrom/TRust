@@ -142,16 +142,16 @@ enum UaContext {
 }
 
 impl UaContext {
-    fn of(dom: &Dom, id: NodeId, tag: &str) -> Self {
+    fn of<B: StyleBackend + ?Sized>(dom: &ComputeView<'_, B>, id: NodeId, tag: &str) -> Self {
         match tag {
             "a" | "area" => Self::Link(dom.attr(id, "href").is_some()),
             "ul" | "menu" | "dir" => Self::List(dom.ul_marker_default(id)),
             "ol" => Self::List(dom.ol_marker_default(id)),
             "input" => Self::Input(dom.ua_input_border_box(id), dom.ua_control_color(id, tag)),
-            "summary" => Self::Summary(
-                dom.is_details_summary(id)
-                    .then(|| dom.attr(dom.nodes[id].parent.unwrap(), "open").is_some()),
-            ),
+            "summary" => Self::Summary(dom.is_details_summary(id).then(|| {
+                dom.attr(dom.style_view().nodes.parent(id).unwrap(), "open")
+                    .is_some()
+            })),
             "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 Self::Align(dom.ua_paragraph_align(id, tag))
             }
@@ -286,20 +286,22 @@ fn cascade_bytes(value: &CascadedMaps) -> usize {
             .sum::<usize>()
 }
 
-impl Dom {
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn sharing_stamp(&self) -> (u64, u64, u64) {
         (
-            self.style_epoch,
-            self.style_value_epoch,
+            self.style_epoch(),
+            self.style_value_epoch(),
             crate::font_system::page_font_epoch(),
         )
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn shareable_cascade_context(&self, id: NodeId) -> bool {
         if !enabled()
             || self.css_transitions_active()
             || self.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml")
-            || self.shadow_roots.contains_key(&id)
+            || self.shadow_root(id).is_some()
         {
             return false;
         }
@@ -316,19 +318,26 @@ impl Dom {
             && !self
                 .attr(id, "style")
                 .is_some_and(|text| text.to_ascii_lowercase().contains("revert-layer"))
-            && !self.cssom_inline.get(&id).is_some_and(|ds| {
-                ds.iter()
-                    .any(|(_, value, _)| value.to_ascii_lowercase().contains("revert-layer"))
-            })
+            && !self
+                .style_view()
+                .state
+                .cssom_inline
+                .get(&id)
+                .is_some_and(|ds| {
+                    ds.iter()
+                        .any(|(_, value, _)| value.to_ascii_lowercase().contains("revert-layer"))
+                })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(super) fn shared_cascade_input(&self, id: NodeId) -> Option<CascadeInput> {
         if !self.shareable_cascade_context(id) {
             return None;
         }
         // Parent preparation can itself ask for a cascade before its caller
         // reaches the ordinary depth check. Bound that dependency walk too.
-        let depth = self.style_sharing.borrow().preparing_depth.clone();
+        let depth = self.style_sharing().borrow().preparing_depth.clone();
         if depth.get() >= 128 {
             return None;
         }
@@ -337,17 +346,26 @@ impl Dom {
         if self
             .attr(id, "style")
             .is_some_and(|text| text.len() > MAX_KEY_BYTES)
-            || self.cssom_inline.get(&id).is_some_and(|ds| {
-                ds.iter()
-                    .map(|(name, value, _)| name.len() + value.len() + 64)
-                    .sum::<usize>()
-                    > MAX_KEY_BYTES
-            })
+            || self
+                .style_view()
+                .state
+                .cssom_inline
+                .get(&id)
+                .is_some_and(|ds| {
+                    ds.iter()
+                        .map(|(name, value, _)| name.len() + value.len() + 64)
+                        .sum::<usize>()
+                        > MAX_KEY_BYTES
+                })
         {
             return None;
         }
         let mut hints = Vec::new();
-        self.html_presentational_hints(id, |name, value| hints.push((name, value)));
+        self.style_view().html_presentational_hints(
+            id,
+            &|node| self.document_base(node),
+            |name, value| hints.push((name, value)),
+        );
         Some(CascadeInput {
             scope: self.tree_scope(id),
             // The cascade physicalizes logical declarations before publication.
@@ -357,23 +375,27 @@ impl Dom {
                 .map(|parent| Identity(Rc::downgrade(&self.prepare_computed_row(parent, 0)))),
             rules: self.matched_rules(id),
             inline_text: self.attr(id, "style").map(str::to_owned),
-            inline_declarations: self.cssom_inline.get(&id).cloned(),
+            inline_declarations: self.style_view().state.cssom_inline.get(&id).cloned(),
             hints,
         })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(super) fn shared_cascade_get(&self, key: &CascadeInput) -> Option<Rc<CascadedMaps>> {
-        let mut state = self.style_sharing.borrow_mut();
+        let mut state = self.style_sharing().borrow_mut();
         state.synchronize(self.sharing_stamp());
         state.cascades.get(key).and_then(Weak::upgrade)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(super) fn shared_cascade_put(&self, key: CascadeInput, maps: &Rc<CascadedMaps>) {
         let bytes = key.bytes();
         if bytes > MAX_KEY_BYTES {
             return;
         }
-        let mut state = self.style_sharing.borrow_mut();
+        let mut state = self.style_sharing().borrow_mut();
         state.synchronize(self.sharing_stamp());
         if state.cascades.len() >= MAX_ENTRIES
             || state.key_bytes.saturating_add(bytes) > MAX_KEY_BYTES
@@ -400,18 +422,20 @@ impl Dom {
             }
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(super) fn prepare_computed_row(
         &self,
         id: NodeId,
         depth: usize,
     ) -> computed_cache::SharedRow {
         let stamp = (
-            self.style_value_epoch,
+            self.style_value_epoch(),
             crate::font_system::page_font_epoch(),
         );
         let original = {
-            let mut cache = self.computed_cache.borrow_mut();
+            let mut cache = self.computed_cache().borrow_mut();
             if cache.0 != stamp {
                 cache.0 = stamp;
                 cache.1.clear();
@@ -426,7 +450,7 @@ impl Dom {
         // CSS Animations 1 #animations: animated values change on their own
         // timeline, so an animated element (and thereby its subtree) never
         // shares a computed row with an equal cascade.
-        if depth >= 128 || !self.shareable_cascade_context(id) || self.animations.private_row(id) {
+        if depth >= 128 || !self.shareable_cascade_context(id) || self.animation_private_row(id) {
             return original;
         }
         let Some(tag) = self.tag_name(id) else {
@@ -444,7 +468,7 @@ impl Dom {
         // per-element exclusion. Registered values introduce extra computed
         // unit dependencies; do not conflate them with plain token streams.
         if self
-            .properties
+            .properties()
             .javascript
             .get(&document)
             .is_some_and(|registry| !registry.is_empty())
@@ -476,10 +500,10 @@ impl Dom {
         // publish into the exact row/generation that this preparation began
         // with; restarting as a private row needs no unbounded retry loop.
         let current_stamp = (
-            self.style_value_epoch,
+            self.style_value_epoch(),
             crate::font_system::page_font_epoch(),
         );
-        let mut cache = self.computed_cache.borrow_mut();
+        let mut cache = self.computed_cache().borrow_mut();
         if cache.0 != current_stamp {
             cache.0 = current_stamp;
             cache.1.clear();
@@ -493,8 +517,8 @@ impl Dom {
             return cache.1.ensure_row(id);
         }
         let shared = {
-            let mut state = self.style_sharing.borrow_mut();
-            state.synchronize((self.style_epoch, stamp.0, stamp.1));
+            let mut state = self.style_sharing().borrow_mut();
+            state.synchronize((self.style_epoch(), stamp.0, stamp.1));
             if let Some(row) = state.computations.get(&key).and_then(Weak::upgrade) {
                 row
             } else {
@@ -932,16 +956,20 @@ mod tests {
         let index = prop_index("color").unwrap();
         assert!(!dom.style_sharing.borrow().rows_owned.is_empty());
         for length in [0, 17, 8192, 2, 10000, 0] {
-            dom.computed_cache_put(x, index, Some("x".repeat(length)));
+            ComputeView(&dom).computed_cache_put(x, index, Some("x".repeat(length)));
             assert!(!dom.style_sharing.borrow().rows_owned.is_empty());
             assert!(dom.style_sharing.borrow().row_budget.0.get() <= MAX_ROW_BYTES);
         }
-        dom.computed_cache_put(x, index, Some("x".repeat(MAX_ROW_BYTES + 1)));
+        ComputeView(&dom).computed_cache_put(x, index, Some("x".repeat(MAX_ROW_BYTES + 1)));
         assert!(dom.style_sharing.borrow().rows_owned.is_empty());
         assert!(dom.style_sharing.borrow().cascades_owned.is_empty());
         // The active semantic value survives eviction.
         assert_eq!(
-            dom.computed_cache_get(x, index).unwrap().unwrap().len(),
+            ComputeView(&dom)
+                .computed_cache_get(x, index)
+                .unwrap()
+                .unwrap()
+                .len(),
             MAX_ROW_BYTES + 1
         );
         dom.computed_cache.borrow_mut().1.clear();

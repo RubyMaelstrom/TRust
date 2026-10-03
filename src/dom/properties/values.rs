@@ -110,7 +110,7 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
         };
         return Some(f64::from(n));
     }
-    let (w, h) = ctx.dom.map_or((1000., 800.), |d| d.viewport_px);
+    let (w, h) = ctx.dom.map_or((1000., 800.), |d| d.viewport_px());
     let vertical_at = |id| {
         ctx.dom.is_some_and(|dom| {
             dom.computed_value_resolved(id, "writing-mode")
@@ -161,7 +161,7 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
                 if eligible {
                     dom.record_container_read(ctx.id, node, 1 << physical, true);
                 }
-                if eligible && let Some(size) = dom.container_sizes.borrow().get(&node) {
+                if eligible && let Some(size) = dom.container_size(node) {
                     return size[physical];
                 }
                 current = dom.style_parent(node);
@@ -198,7 +198,7 @@ pub(super) fn length_scale(unit: &str, ctx: &Context<'_>) -> Option<f64> {
     )
 }
 
-fn property_font_size(dom: &Dom, id: NodeId, pseudo: Option<PseudoEl>) -> f32 {
+fn property_font_size(dom: &dyn Host, id: NodeId, pseudo: Option<PseudoEl>) -> f32 {
     let size = dom.font_px(id);
     match pseudo {
         Some(which) => dom
@@ -211,7 +211,7 @@ fn property_font_size(dom: &Dom, id: NodeId, pseudo: Option<PseudoEl>) -> f32 {
 }
 
 fn text_style(
-    dom: &Dom,
+    dom: &dyn Host,
     id: NodeId,
     pseudo: Option<PseudoEl>,
     size: f32,

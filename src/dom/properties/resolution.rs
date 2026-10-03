@@ -232,24 +232,27 @@ pub(in crate::dom) fn registry_bytes(registry: &Registry) -> usize {
             .sum::<usize>()
 }
 
-impl Dom {
+impl<'a, B: StyleBackend + ?Sized> ComputeView<'a, B> {
     pub(in crate::dom) fn property_guard(
         &self,
         id: NodeId,
         pseudo: Option<PseudoEl>,
         name: &str,
-    ) -> Option<Guard<'_>> {
+    ) -> Option<Guard<'a>> {
         self.flush_style_invalidations();
-        self.properties.enter(
+        self.0.properties().enter(
             id,
             pseudo,
             name,
             (
-                self.style_value_epoch,
+                self.style_value_epoch(),
                 crate::font_system::page_font_epoch(),
             ),
         )
     }
+}
+
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Shadow roots share their document's registry. Embedded documents have
     /// independent registries even though their arenas share one allocation.
     pub(in crate::dom) fn registration_document(&self, id: NodeId) -> NodeId {
@@ -259,25 +262,31 @@ impl Dom {
         // detached and shadow descendants. Presentation ancestry is neither
         // necessary nor authoritative: light children of an iframe belong to
         // its outer document, while its content Document owns its own tree.
-        self.nodes
-            .get(id)
-            .map_or(DOCUMENT, |node| node.owner_document)
+        self.style_view()
+            .nodes
+            .owner_document_of(id)
+            .unwrap_or(DOCUMENT)
     }
+}
 
-    pub(in crate::dom) fn property_base(&self, id: NodeId) -> Option<&url::Url> {
-        self.properties
+impl<'a, B: StyleBackend + ?Sized> ComputeView<'a, B> {
+    pub(in crate::dom) fn property_base(&self, id: NodeId) -> Option<&'a url::Url> {
+        self.0
+            .properties()
             .document_bases
             .get(&self.registration_document(id))
-            .or(self.doc_url.as_ref())
+            .or(self.0.doc_url())
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(in crate::dom) fn property_registration(
         &self,
         id: NodeId,
         name: &str,
     ) -> Option<Arc<Registration>> {
         let document = self.registration_document(id);
-        self.properties
+        self.properties()
             .javascript
             .get(&document)
             .and_then(|r| r.get(name))
@@ -290,7 +299,9 @@ impl Dom {
                     .cloned()
             })
     }
+}
 
+impl Dom {
     /// CSSOM #dom-window-getcomputedstyle appends every custom property with
     /// a non-guaranteed-invalid computed value, including registered initials.
     pub(crate) fn cssom_computed_names(&self, id: NodeId, pseudo: Option<PseudoEl>) -> Vec<String> {
@@ -387,7 +398,9 @@ impl Dom {
         self.touch_style();
         Ok(())
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(in crate::dom) fn registered_custom_value(
         &self,
         id: NodeId,
@@ -397,7 +410,7 @@ impl Dom {
         self.flush_style_invalidations();
         let key = (id, pseudo, name.to_owned());
         if let Some(value) = {
-            let state = self.properties.resolving.borrow();
+            let state = self.properties().resolving.borrow();
             (!state.active.is_empty() && !state.is_cyclic(&key))
                 .then(|| state.memo.get(&key).cloned())
                 .flatten()
@@ -415,7 +428,7 @@ impl Dom {
                     r.syntax.compute(
                         initial,
                         &Context {
-                            dom: Some(self),
+                            dom: Some(self as &dyn Host),
                             id,
                             pseudo,
                             base: r.base.as_ref().or_else(|| self.property_base(id)),
@@ -480,7 +493,7 @@ impl Dom {
                                 .compute(
                                     &value,
                                     &Context {
-                                        dom: Some(self),
+                                        dom: Some(self as &dyn Host),
                                         id,
                                         pseudo,
                                         base: base
@@ -504,14 +517,16 @@ impl Dom {
                 }
             }
         };
-        self.properties
+        self.properties()
             .resolving
             .borrow_mut()
             .memo
             .insert(key, computed.clone());
         computed.map_or(VarResult::Undefined, VarResult::Resolved)
     }
+}
 
+impl Dom {
     pub(crate) fn set_adopted_sheets(
         &mut self,
         scope: NodeId,
@@ -585,16 +600,16 @@ fn variable_references(text: &str) -> Option<Vec<String>> {
     Some(refs)
 }
 
-pub(in crate::dom) fn substitute(
-    dom: &Dom,
+pub(in crate::dom) fn substitute<B: StyleBackend + ?Sized>(
+    dom: &ComputeView<'_, B>,
     id: NodeId,
     pseudo: Option<PseudoEl>,
     text: &str,
 ) -> Option<String> {
     use cssparser::TokenSerializationType;
-    fn scan<'i>(
+    fn scan<'i, B: StyleBackend + ?Sized>(
         p: &mut Parser<'i, '_>,
-        dom: &Dom,
+        dom: &ComputeView<'_, B>,
         id: NodeId,
         pseudo: Option<PseudoEl>,
         depth: usize,

@@ -801,7 +801,7 @@ mod tests {
         for _ in 0..1000 {
             let node = dom.create_element("span");
             dom.font_cache.borrow_mut().put(node, 0, 17.0);
-            dom.computed_cache_put(node, 0, Some("payload".repeat(64)));
+            ComputeView(&dom).computed_cache_put(node, 0, Some("payload".repeat(64)));
             dom.clear_gc_allocation_leases();
             assert_eq!(minor(&mut dom, &[]).0, [node]);
             assert_eq!(dom.node_count(), 1);

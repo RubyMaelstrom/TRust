@@ -7,7 +7,7 @@ use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
-use super::{Dom, NodeData, NodeId};
+use super::{ComputeView, NodeId, StyleBackend};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ColorScheme {
@@ -108,15 +108,13 @@ impl PageSupport {
     }
 }
 
-impl Dom {
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The element color scheme of `id`.
     pub(crate) fn color_scheme(&self, id: NodeId) -> ColorScheme {
-        let document = self
-            .nodes
-            .get(id)
-            .map_or(super::DOCUMENT, |node| node.owner_document);
+        let nodes = self.style_view().nodes;
+        let document = nodes.owner_document_of(id).unwrap_or(super::DOCUMENT);
         // An embedded document's preference is its embedding element's scheme.
-        let preference = match self.nodes.get(document).and_then(|node| node.parent) {
+        let preference = match nodes.try_parent(document).flatten() {
             Some(frame) if matches!(self.tag_name(frame), Some("iframe" | "frame")) => {
                 self.color_scheme(frame)
             }
@@ -136,20 +134,19 @@ impl Dom {
     /// HTML #meta-color-scheme: the first valid `<meta name=color-scheme>`
     /// content in the document's tree order.
     fn page_color_schemes(&self, document: NodeId) -> Option<Support> {
-        let epoch = self.style_epoch;
-        if let Some((at, support)) = self.page_color_schemes.0.borrow().get(&document)
+        let epoch = self.style_epoch();
+        if let Some((at, support)) = self.page_support().0.borrow().get(&document)
             && *at == epoch
         {
             return support.clone();
         }
+        let nodes = self.style_view().nodes;
         let support = self
             .descendants(document)
-            .filter(|&id| {
-                self.nodes[id].owner_document == document && self.is_color_scheme_meta(id)
-            })
+            .filter(|&id| nodes.owner_document(id) == document && self.is_color_scheme_meta(id))
             .find_map(|id| self.attr(id, "content").and_then(parse_support))
             .flatten();
-        self.page_color_schemes
+        self.page_support()
             .0
             .borrow_mut()
             .insert(document, (epoch, support.clone()));
@@ -157,7 +154,7 @@ impl Dom {
     }
 
     pub(super) fn is_color_scheme_meta(&self, id: NodeId) -> bool {
-        matches!(&self.nodes[id].data, NodeData::Element { .. })
+        self.style_view().nodes.is_element(id)
             && self.tag_name(id) == Some("meta")
             && self
                 .attr(id, "name")
@@ -416,6 +413,7 @@ fn top_level_commas(inner: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dom::Dom;
 
     #[test]
     fn elements_take_the_page_or_their_own_color_scheme() {
