@@ -22,7 +22,7 @@
     catch (error) { forged = error instanceof TypeError; }
     assert(forged, 'forged prototype is not Module');
     let storage = false;
-    try { __sc_serialize({nested:new Set([module])}, true); }
+    try { (globalThis.__trust || globalThis.__wkr).messageCodec.serialize({nested:new Set([module])}, true); }
     catch (error) { storage = error.name === 'DataCloneError'; }
     assert(storage, 'nested storage serialization rejected');
     assert(typeof __wasm_register_clone === 'undefined' && typeof __wasm_module_binding === 'undefined', 'bootstrap hooks private');

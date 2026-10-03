@@ -20,6 +20,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_set_viewport", 2),
     ("__performance_binding", 1),
     ("__element_slots", 1),
+    ("__platform_slots", 2),
     ("__dom_register_wrapper", 2),
     ("__dom_cached_wrapper", 1),
     ("__dom_wrapper_cache_enabled", 0),
