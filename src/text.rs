@@ -735,6 +735,8 @@ struct TextSystem {
     shape_order: VecDeque<ShapeKey>,
     shape_cache_bytes: usize,
     layout_cache: layout_cache::Cache,
+    /// Emoji-presentation family lists by (font set, CSS family list).
+    emoji_families: HashMap<(u64, String), Arc<str>>,
     #[cfg(test)]
     shaped_input_bytes: usize,
 }
@@ -818,6 +820,7 @@ impl TextSystem {
             shape_order: VecDeque::new(),
             shape_cache_bytes: 0,
             layout_cache: Default::default(),
+            emoji_families: HashMap::new(),
             #[cfg(test)]
             shaped_input_bytes: 0,
         }
@@ -908,11 +911,40 @@ impl TextSystem {
         {
             self.shaped_input_bytes += text.len();
         }
+        let emoji = self.emoji_presentation(text, style);
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, quantize);
         configure_layout(&mut builder, style, breaks);
+        push_emoji_presentation(&mut builder, emoji);
         builder.build(text)
+    }
+
+    /// The emoji-presentation clusters of `text` and the family list they
+    /// select fonts from.
+    fn emoji_presentation(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+    ) -> Option<(Vec<Range<usize>>, Arc<str>)> {
+        let runs = emoji_presentation_runs(text);
+        if runs.is_empty() {
+            return None;
+        }
+        let key = (self.active_font_set, style.family.clone());
+        let family = match self.emoji_families.get(&key) {
+            Some(family) => family.clone(),
+            None => {
+                let family: Arc<str> =
+                    crate::font_system::emoji_family_source(&style.family, &mut self.fonts).into();
+                if self.emoji_families.len() >= 256 {
+                    self.emoji_families.clear();
+                }
+                self.emoji_families.insert(key, family.clone());
+                family
+            }
+        };
+        Some((runs, family))
     }
 
     fn first_line_end_uncached(
@@ -1048,6 +1080,7 @@ impl TextSystem {
         if text.is_empty() || style.size <= 0.0 {
             return (0.0, 0.0);
         }
+        let emoji = self.emoji_presentation(text, style);
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
@@ -1075,6 +1108,7 @@ impl TextSystem {
             TextOverflowWrap::Anywhere => OverflowWrap::Anywhere,
             TextOverflowWrap::BreakWord => OverflowWrap::BreakWord,
         }));
+        push_emoji_presentation(&mut builder, emoji);
         let layout: Layout<()> = builder.build(text);
         let widths = layout.calculate_content_widths();
         (widths.min, widths.max)
@@ -1092,6 +1126,7 @@ impl TextSystem {
         self.shape_order.clear();
         self.shape_cache_bytes = 0;
         self.layout_cache = Default::default();
+        self.emoji_families.clear();
         self.page_font_epoch = epoch;
         self.active_font_set = 0;
     }
@@ -1151,6 +1186,75 @@ fn configure_layout<B: parley::Brush>(
     }
 }
 
+fn push_emoji_presentation<B: parley::Brush>(
+    builder: &mut parley::RangedBuilder<'_, B>,
+    emoji: Option<(Vec<Range<usize>>, Arc<str>)>,
+) {
+    let Some((runs, family)) = emoji else {
+        return;
+    };
+    for range in runs {
+        builder.push(
+            StyleProperty::FontFamily(FontFamily::Source(Cow::Owned(family.to_string()))),
+            range,
+        );
+    }
+}
+
+/// The byte ranges of clusters that request emoji presentation. UTS #51
+/// #Emoji_Variation_Sequences: U+FE0F after an emoji character requests
+/// emoji presentation and U+FE0E text presentation; without either, the
+/// Emoji_Presentation property gives the default, which is how
+/// `font-variant-emoji: normal` platforms choose (CSS Fonts 4
+/// #font-variant-emoji-prop). A selector, keycap, skin-tone modifier, tag
+/// or zero-width-joined sequence stays in its base's cluster.
+fn emoji_presentation_runs(text: &str) -> Vec<Range<usize>> {
+    use icu_properties::CodePointSetData;
+    use icu_properties::props::{Emoji, EmojiPresentation};
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    if text.is_ascii() {
+        return runs;
+    }
+    let emoji = CodePointSetData::new::<Emoji>();
+    let presentation = CodePointSetData::new::<EmojiPresentation>();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if !emoji.contains(ch) {
+            continue;
+        }
+        let selector = chars.peek().map(|&(_, next)| next);
+        let wanted = match selector {
+            Some('\u{FE0F}') => true,
+            Some('\u{FE0E}') => false,
+            _ => presentation.contains(ch),
+        };
+        let mut end = start + ch.len_utf8();
+        let mut joined = false;
+        while let Some(&(index, next)) = chars.peek() {
+            let extends = matches!(
+                next,
+                '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}' | '\u{200D}'
+                    | '\u{1F3FB}'..='\u{1F3FF}'
+                    | '\u{E0020}'..='\u{E007F}'
+            );
+            if !extends && !joined {
+                break;
+            }
+            joined = next == '\u{200D}';
+            end = index + next.len_utf8();
+            chars.next();
+        }
+        if !wanted {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.end == start => last.end = end,
+            _ => runs.push(start..end),
+        }
+    }
+    runs
+}
+
 fn shape_cost(key: &ShapeKey, shaped: &ShapedText) -> usize {
     key.text
         .len()
@@ -1200,6 +1304,7 @@ pub(crate) fn colored_lines(
 ) -> Vec<ShapedText> {
     TEXT.with_borrow_mut(|system| {
         system.select_fonts(style.font_set.as_ref());
+        let emoji = system.emoji_presentation(text, style);
         let mut builder = system
             .color_layouts
             .ranged_builder(&mut system.fonts, text, 1.0, true);
@@ -1212,6 +1317,7 @@ pub(crate) fn colored_lines(
                 ..TextBreakStyle::default()
             }),
         );
+        push_emoji_presentation(&mut builder, emoji);
         for (range, color) in colors {
             builder.push(StyleProperty::Brush(Some(color)), range);
         }
@@ -1818,6 +1924,54 @@ mod tests {
                 .all(|cluster| !cluster.text_range.is_empty())
         );
         assert!(shaped.advance > 0.0);
+    }
+
+    #[test]
+    fn emoji_presentation_clusters_follow_selectors_and_defaults() {
+        // UTS #51: U+FE0F requests emoji presentation, U+FE0E text, and the
+        // Emoji_Presentation property supplies the default. Modifiers,
+        // keycaps and joined sequences stay with their base.
+        let text = "a\u{26A0}\u{FE0F} \u{26A0} \u{2728} \u{2728}\u{FE0E} \u{2764}\u{FE0F}\u{200D}\u{1F525} 1\u{FE0F}\u{20E3} \u{1F44B}\u{1F3FD}\u{A9}";
+        let runs: Vec<&str> = emoji_presentation_runs(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                "\u{26A0}\u{FE0F}",
+                "\u{2728}",
+                "\u{2764}\u{FE0F}\u{200D}\u{1F525}",
+                "1\u{FE0F}\u{20E3}",
+                "\u{1F44B}\u{1F3FD}",
+            ]
+        );
+        assert!(emoji_presentation_runs("plain ascii 123 #*").is_empty());
+    }
+
+    #[test]
+    fn emoji_presentation_sequences_prefer_color_faces() {
+        // CSS Fonts 4 #font-variant-emoji-prop: an explicit U+FE0F selects a
+        // color face even where the first text family maps the base and the
+        // selector (DejaVu Sans maps both U+26A0 and U+FE0F).
+        let color = |shaped: &ShapedText| {
+            shaped.runs.iter().any(|run| {
+                let data = run.font.data();
+                skrifa::FontRef::from_index(data.data.as_ref(), data.index).is_ok_and(|face| {
+                    [b"COLR", b"CBDT", b"SVG ", b"sbix"]
+                        .iter()
+                        .any(|tag| face.table_data(skrifa::Tag::new(tag)).is_some())
+                })
+            })
+        };
+        if !color(&shape("\u{1F600}", &TextStyle::default())) {
+            return; // No color emoji face is installed.
+        }
+        assert!(color(&shape("\u{26A0}\u{FE0F}", &TextStyle::default())));
+        assert!(color(&shape("x\u{2728}x", &TextStyle::default())));
+        if !color(&shape("\u{26A0}", &TextStyle::default())) {
+            assert!(!color(&shape("\u{26A0}\u{FE0E}", &TextStyle::default())));
+        }
     }
 
     #[test]
