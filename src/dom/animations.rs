@@ -513,6 +513,7 @@ impl State {
     pub(super) fn retained_bytes(&self) -> usize {
         let value_bytes = |value: &Value| match value {
             Value::Shadows(shadows) => shadows.capacity() * std::mem::size_of::<values::Shadow>(),
+            Value::Filters(filters) => filters.capacity() * std::mem::size_of::<values::Filter>(),
             Value::Positions(positions) => positions.capacity() * 8,
             Value::Other(text) => text.capacity(),
             _ => 0,
