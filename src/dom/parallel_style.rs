@@ -92,6 +92,9 @@ struct Computed {
     generation: Option<BoxGeneration>,
     decoration: Option<(bool, bool)>,
     custom: Option<FxHashMap<String, Option<String>>>,
+    /// Transition endpoints for the next transition update; `Some(None)`:
+    /// the element does not participate.
+    transition: Option<Option<transitions::Endpoints>>,
 }
 
 /// One claimed run's results.
@@ -347,6 +350,10 @@ struct Part<'p, 'i, 'a> {
     inline: FxHashMap<NodeId, InlineStyle>,
     /// Whether an element and all its ancestors generate boxes.
     rendered: FxHashMap<NodeId, bool>,
+    /// Transition participation along the composed ancestry.
+    participation: FxHashMap<NodeId, bool>,
+    /// This run's transition endpoints, until exported.
+    transitions: FxHashMap<NodeId, Option<transitions::Endpoints>>,
 }
 
 impl<'p, 'i, 'a> Part<'p, 'i, 'a> {
@@ -361,6 +368,8 @@ impl<'p, 'i, 'a> Part<'p, 'i, 'a> {
             pinned_rows: Vec::new(),
             inline: FxHashMap::default(),
             rendered: FxHashMap::default(),
+            participation: FxHashMap::default(),
+            transitions: FxHashMap::default(),
         }
     }
 
@@ -401,14 +410,26 @@ impl<'p, 'i, 'a> Part<'p, 'i, 'a> {
 
     fn compute(&mut self, id: NodeId) {
         let inputs = self.worker.inputs;
+        let view = ComputeView(&self.worker);
         compute_element(
-            ComputeView(&self.worker),
+            view,
             id,
             inputs.vp,
             inputs.base,
             &mut self.rendered,
             &mut self.inline,
         );
+        // What the transition update (CSS Transitions 1 #starting) derives
+        // from those values, with its own viewport.
+        if view.tag_name(id).is_some() {
+            let vp = Vp {
+                w: inputs.viewport_px.0,
+                h: inputs.viewport_px.1,
+            };
+            let endpoints = transitions::participates(view, id, &mut self.participation)
+                .then(|| transitions::endpoints_ahead(&view, id, vp));
+            self.transitions.insert(id, endpoints);
+        }
     }
 
     /// `id`'s memoized state as owned data, interning its cascade and row.
@@ -443,6 +464,7 @@ impl<'p, 'i, 'a> Part<'p, 'i, 'a> {
             let cache = worker.custom_prop_cache.borrow();
             cache.1.get(&id).cloned()
         };
+        let transition = self.transitions.remove(&id);
         Computed {
             cascade,
             row,
@@ -464,6 +486,7 @@ impl<'p, 'i, 'a> Part<'p, 'i, 'a> {
                 .get(id, style_value_epoch)
                 .copied(),
             custom,
+            transition,
         }
     }
 }
@@ -555,6 +578,7 @@ struct Adopt<'d> {
     rows: Vec<Vec<computed_cache::SharedRow>>,
     stored: usize,
     adopted: Vec<NodeId>,
+    transitions: FxHashMap<NodeId, Option<transitions::Endpoints>>,
     busy: Duration,
     time: Duration,
 }
@@ -583,6 +607,7 @@ impl<'d> Adopt<'d> {
             rows: vec![Vec::new(); participants],
             stored: 0,
             adopted: Vec::new(),
+            transitions: FxHashMap::default(),
             busy: Duration::ZERO,
             time: Duration::ZERO,
         }
@@ -653,6 +678,9 @@ impl<'d> Adopt<'d> {
             }
             if let Some(value) = element.decoration {
                 decorations.put(id, style_value_epoch, value);
+            }
+            if let Some(endpoints) = element.transition {
+                self.transitions.insert(id, endpoints);
             }
             self.adopted.push(id);
         }
@@ -836,6 +864,10 @@ impl Dom {
                     std::hint::spin_loop();
                 }
             }
+            self.transitions.prepare(transitions::Prepared {
+                stamp: (stamp.0, stamp.1, self.epoch),
+                endpoints: std::mem::take(&mut adopt.transitions),
+            });
             Some((adopt.adopted, adopt.busy, adopt.time))
         });
         let (adopted, busy, adopting) = result?;
@@ -997,40 +1029,25 @@ impl Dom {
                     );
                 }
             }
-            let inline = |snapshot: &Snapshot| {
-                snapshot
-                    .node
-                    .as_ref()
-                    .and_then(|node| node.inline())
-                    .map(|(parent, value)| (parent.clone(), value.clone()))
-            };
-            if let Some(record) = inline(&parallel)
-                && inline(&serial) != Some(record.clone())
-            {
-                report(
-                    id,
-                    format!(
-                        "inline record parallel={:?} serial={:?}",
-                        record.1,
-                        inline(&serial).map(|(_, value)| value)
-                    ),
-                );
+            // Records are compared by value: which elements a path creates
+            // records for as a side effect depends on computation order.
+            if let Some((parent, value)) = parallel.node.as_ref().and_then(|node| node.inline()) {
+                let expected = InlineStyle::derive(&ComputeView(self), id, parent, base);
+                if *value != expected {
+                    report(
+                        id,
+                        format!("inline record parallel={value:?} serial={expected:?}"),
+                    );
+                }
             }
-            let display = |snapshot: &Snapshot| {
-                snapshot
-                    .node
-                    .as_ref()
-                    .and_then(|node| node.display().cloned())
-            };
-            if display(&parallel).is_some() && display(&parallel) != display(&serial) {
-                report(
-                    id,
-                    format!(
-                        "display record parallel={:?} serial={:?}",
-                        display(&parallel),
-                        display(&serial)
-                    ),
-                );
+            if let Some(value) = parallel.node.as_ref().and_then(|node| node.display()) {
+                let expected = ComputeView(self).computed_display_uncached(id);
+                if *value != expected {
+                    report(
+                        id,
+                        format!("display record parallel={value:?} serial={expected:?}"),
+                    );
+                }
             }
             if let (Some(a), Some(b)) = (&parallel.cascade, &serial.cascade)
                 && !a.same_declarations(b)
@@ -1144,6 +1161,9 @@ mod tests {
     fn pass_and_verify(dom: &Dom, pool: &style_pool::Pool) -> Option<usize> {
         let adopted =
             dom.compute_stale_with(pool, VIEWPORT, &base(), 1, Duration::from_millis(1))?;
+        let (checked, mismatches) = dom.pending_endpoint_mismatches().expect("endpoints");
+        assert_eq!(mismatches, 0);
+        assert!(checked > 0);
         let (rows, mismatches) = dom.parallel_style_mismatches(&adopted, VIEWPORT, &base());
         assert_eq!(mismatches, 0);
         assert!(rows > 0);
@@ -1334,6 +1354,8 @@ mod tests {
             .expect("pass ran");
         assert!(adopted.contains(&t));
         dom.update_css_transitions(0.);
+        // The update read the endpoints the pass computed.
+        assert!(dom.transitions.last_prepared > 200);
         assert_eq!(
             dom.computed_value_resolved(t, "width").as_deref(),
             Some("100px")

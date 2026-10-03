@@ -387,10 +387,40 @@ pub(super) struct State {
     values: FxHashMap<Key, String>,
     events: Vec<PendingEvent>,
     generation: u64,
+    /// Endpoints computed by a parallel style pass for the next update.
+    prepared: RefCell<Option<Prepared>>,
     #[cfg(test)]
     last_recomputed: usize,
+    #[cfg(test)]
+    pub(super) last_prepared: usize,
 }
+
+/// Per element, its endpoints (`None`: it does not participate), as a
+/// parallel style pass computed them for one revision of the document
+/// (style value, page font and DOM epochs).
+pub(super) struct Prepared {
+    pub(super) stamp: (u64, u64, u64),
+    pub(super) endpoints: FxHashMap<NodeId, Option<Endpoints>>,
+}
+
+/// One element's endpoints, computed ahead of the update that reads them.
+pub(super) struct Endpoints(Values);
+
+/// `id`'s endpoints as the next update computes them (see `endpoints`).
+pub(super) fn endpoints_ahead<D: crate::layout2::UnitSource + ?Sized>(
+    dom: &D,
+    id: NodeId,
+    vp: Vp,
+) -> Endpoints {
+    Endpoints(endpoints(dom, id, vp))
+}
+
 impl State {
+    /// Offer the next update endpoints computed elsewhere for `stamp`.
+    pub(super) fn prepare(&self, prepared: Prepared) {
+        *self.prepared.borrow_mut() = Some(prepared);
+    }
+
     pub(super) fn remove_node(&mut self, node: NodeId) {
         self.invalid.get_mut().remove(&node);
         self.before.remove(&node);
@@ -626,6 +656,40 @@ pub(super) fn participates<B: StyleBackend + ?Sized>(
 }
 
 impl Dom {
+    /// Compare prepared endpoints with the serial computation; returns the
+    /// elements checked and the mismatches.
+    pub(super) fn prepared_mismatches(&self, prepared: &Prepared) -> (usize, usize) {
+        let vp = Vp {
+            w: self.viewport_px.0,
+            h: self.viewport_px.1,
+        };
+        let mut participation = FxHashMap::default();
+        let mut mismatches = 0;
+        for (&id, known) in &prepared.endpoints {
+            let known = known.as_ref().map(|known| &known.0);
+            let expected = participates(ComputeView(self), id, &mut participation)
+                .then(|| endpoints(self, id, vp));
+            if known != expected.as_ref() {
+                mismatches += 1;
+                if mismatches <= 8 {
+                    eprintln!(
+                        "STYLEVERIFY transition mismatch node={id} tag={:?} parallel={known:?} serial={expected:?}",
+                        self.tag_name(id)
+                    );
+                }
+            }
+        }
+        (prepared.endpoints.len(), mismatches)
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_endpoint_mismatches(&self) -> Option<(usize, usize)> {
+        let prepared = self.transitions.prepared.borrow();
+        prepared
+            .as_ref()
+            .map(|prepared| self.prepared_mismatches(prepared))
+    }
+
     pub(crate) fn css_transitions_active(&self) -> bool {
         !self.transitions.running.is_empty()
     }
@@ -679,6 +743,19 @@ impl Dom {
         #[cfg(test)]
         {
             state.last_recomputed = 0;
+            state.last_prepared = 0;
+        }
+        // Endpoints from a parallel style pass over this very revision.
+        let prepared = state
+            .prepared
+            .get_mut()
+            .take()
+            .filter(|prepared| prepared.stamp == (stamp.0, stamp.1, self.epoch));
+        if let Some(prepared) = &prepared
+            && super::parallel_match::verify_enabled()
+        {
+            let (checked, mismatches) = self.prepared_mismatches(prepared);
+            eprintln!("STYLEVERIFY transitions checked={checked} mismatches={mismatches}");
         }
         if full || !invalid.is_empty() || state.epoch != Some(self.epoch) {
             state.generation = state.generation.wrapping_add(1);
@@ -714,7 +791,14 @@ impl Dom {
                 if self.tag_name(id).is_none() {
                     continue;
                 }
-                if !participates(ComputeView(&*self), id, &mut participation) {
+                let known = prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.endpoints.get(&id));
+                let participating = match known {
+                    Some(values) => values.is_some(),
+                    None => participates(ComputeView(&*self), id, &mut participation),
+                };
+                if !participating {
                     state.before.remove(&id);
                     for property in 0..PROPERTIES.len() {
                         state.cancel((id, property), now);
@@ -726,7 +810,16 @@ impl Dom {
                 {
                     state.last_recomputed += 1;
                 }
-                let values = endpoints(&*self, id, vp);
+                let values = match known {
+                    Some(Some(values)) => {
+                        #[cfg(test)]
+                        {
+                            state.last_prepared += 1;
+                        }
+                        values.0.clone()
+                    }
+                    _ => endpoints(&*self, id, vp),
+                };
                 if let Some(before) = state.before.get(&id).cloned() {
                     if before == values
                         && !active_nodes.contains(&id)
