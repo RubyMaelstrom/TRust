@@ -88,6 +88,7 @@ impl Dom {
     pub(crate) fn visit_gc_roots(&self, mut visit: impl FnMut(NodeId)) {
         visit(DOCUMENT);
         self.transitions.visit_gc_roots(&mut visit);
+        self.animations.visit_gc_roots(&mut visit);
         for &(node, _, _) in &self.scroll_changes {
             visit(node);
         }
@@ -164,6 +165,7 @@ impl Dom {
             self.container_dependencies.get_mut().remove_node(id);
             self.properties.remove_node(id);
             self.transitions.remove_node(id);
+            self.animations.remove_node(id);
             macro_rules! cache_remove {
                 ($($field:ident),+ $(,)?) => {$(self.$field.get_mut().slots.remove(id);)+};
             }
@@ -383,6 +385,7 @@ impl Dom {
         self.container_dependencies.get_mut().retain_nodes(&valid);
         self.properties.retain_nodes(&valid);
         self.transitions.retain_nodes(&valid);
+        self.animations.retain_nodes(&valid);
         macro_rules! cache {
             ($($field:ident),+ $(,)?) => {$(
                 self.$field.get_mut().slots.retain(|id, _| valid(id));

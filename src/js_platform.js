@@ -2157,8 +2157,18 @@
                 { bubbles: true, propertyName, elapsedTime, pseudoElement: "" }), false);
         }
     };
+    // CSS Animations 1 #events / CSS Animations 2 #event-dispatch: one
+    // AnimationEvent per animation-name item, at its owning element.
+    trust.dispatchCssAnimationEvents = function (json) {
+        for (const [id, animationName, type, elapsedTime] of JSON.parse(json)) {
+            const target = wrap(id);
+            if (target) dispatch(target, createTrustedEvent(AnimationEvent, type,
+                { bubbles: true, animationName, elapsedTime, pseudoElement: "" }), false);
+        }
+    };
     trust.updateCssTransitions = function () {
         trust.dispatchCssTransitionEvents(__dom_transition_events());
+        trust.dispatchCssAnimationEvents(__dom_animation_events());
     };
     trust.setDocumentReadiness = function (value) {
         const previous = realmRootFrame ? realmRootFrame.__trustReadyState : trust.readyState;
@@ -14501,7 +14511,8 @@
         "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
         "pointerenter", "pointerleave", "pointercancel", "gotpointercapture",
         "lostpointercapture", "touchstart", "touchend", "touchmove", "touchcancel",
-        "animationstart", "animationend", "animationiteration", "transitionstart",
+        "animationstart", "animationend", "animationiteration", "animationcancel",
+        "transitionstart",
         "transitionend", "transitioncancel", "copy", "cut", "paste",
         "compositionstart", "compositionupdate", "compositionend",
     ];

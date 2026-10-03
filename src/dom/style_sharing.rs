@@ -423,7 +423,10 @@ impl Dom {
             // this node sees canonical partial computation, never a borrow panic.
             cache.1.ensure_row(id)
         };
-        if depth >= 128 || !self.shareable_cascade_context(id) {
+        // CSS Animations 1 #animations: animated values change on their own
+        // timeline, so an animated element (and thereby its subtree) never
+        // shares a computed row with an equal cascade.
+        if depth >= 128 || !self.shareable_cascade_context(id) || self.animations.private_row(id) {
             return original;
         }
         let Some(tag) = self.tag_name(id) else {

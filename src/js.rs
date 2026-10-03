@@ -16,6 +16,9 @@ pub struct Outcome {
     pub fetches: usize,
     pub console: Vec<String>,
     pub(crate) rendered: Option<Box<crate::http::RenderedPage>>,
+    /// This presentation only advanced style-origin CSS animations; no DOM,
+    /// resource or environment change contributed to it.
+    pub(crate) animation_frame: bool,
 }
 
 impl std::fmt::Debug for Outcome {
@@ -28,6 +31,7 @@ impl std::fmt::Debug for Outcome {
             .field("fetches", &self.fetches)
             .field("console", &self.console)
             .field("rendered", &self.rendered.is_some())
+            .field("animation_frame", &self.animation_frame)
             .finish()
     }
 }
@@ -775,6 +779,9 @@ fn phase(label: &str) {
 pub(crate) fn needs_live_dom(dom: &Dom) -> bool {
     dom.hover_css_affects_rendering()
         || dom.focus_css_affects_rendering()
+        // CSS Animations 1 #animations: the page actor samples the animation
+        // origin on the document timeline.
+        || dom.css_animations_declared()
         || clickable_set_for_dom(dom, &std::collections::HashSet::new()).1
 }
 

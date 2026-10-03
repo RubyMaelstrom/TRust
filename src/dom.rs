@@ -41,6 +41,7 @@ pub(crate) use style_records::BoxContext;
 pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
     properties::transform_number(text, angle, percentage)
 }
+mod animations;
 mod rule_index;
 pub(crate) mod shadow;
 mod sheet_cache;
@@ -274,6 +275,7 @@ pub struct Dom {
     /// Document registrations and the computed-value dependency stack.
     properties: properties::State,
     transitions: transitions::State,
+    animations: animations::State,
     /// Lazily built visibility cascade, valid for one STYLE epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
     parsed_sheets: RefCell<sheet_cache::Cache>,
@@ -677,6 +679,7 @@ impl Dom {
             cssom_inline,
             properties,
             transitions,
+            animations,
             style_cache,
             parsed_sheets,
             container_sizes,
@@ -858,6 +861,7 @@ impl Dom {
         bytes = bytes.saturating_add(properties.retained_bytes());
         bytes = bytes.saturating_add(pending_style_invalidations.retained_bytes());
         bytes = bytes.saturating_add(transitions.retained_bytes());
+        bytes = bytes.saturating_add(animations.retained_bytes());
         fixed_map!(cssom_sheets, (NodeId, cssom::Sheet));
         fixed_map!(cssom_sheet_versions, (NodeId, u64));
         for sheet in cssom_sheets.values() {
@@ -1154,6 +1158,7 @@ impl Dom {
             cssom_inline: FxHashMap::default(),
             properties: properties::State::default(),
             transitions: transitions::State::default(),
+            animations: animations::State::default(),
             style_cache: RefCell::new(None),
             parsed_sheets: RefCell::new(sheet_cache::Cache::default()),
             container_sizes: RefCell::new(FxHashMap::default()),
@@ -4392,6 +4397,11 @@ impl Dom {
         if let Some(value) = self.transitions.value(id, name) {
             return Some(value);
         }
+        // CSS Cascade 5 #cascade-origin: animations override normal author
+        // declarations (important ones were excluded when sampling).
+        if let Some(value) = self.animations.value(id, name) {
+            return Some(value);
+        }
         // Explicitly inherited lengths can depend on an ancestor's current
         // transition. Keep animation-origin values out of the base-style memo.
         let interpolating = self.transitions.affects_computation(name);
@@ -4892,6 +4902,16 @@ impl Dom {
                 .style_parent(id)
                 .map_or(FONT_SIZE_INITIAL, |parent| self.font_px(parent));
         };
+        // CSS Animations 1 #animations: an animated font-size is already a
+        // computed absolute length (the cache holds the underlying size).
+        if let Some(px) = self
+            .animations
+            .value(id, "font-size")
+            .and_then(|value| value.trim().strip_suffix("px")?.parse::<f32>().ok())
+            .filter(|px| px.is_finite())
+        {
+            return px.max(0.0);
+        }
         if let Some(&v) = self.font_cache.borrow().get(id, self.style_value_epoch) {
             return v;
         }
@@ -15763,6 +15783,13 @@ impl StyleIndex {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(String, Vec<KeyframeValue>)>()),
             );
+            bytes = bytes.saturating_add(
+                keyframes
+                    .easings
+                    .iter()
+                    .map(|(_, easing)| std::mem::size_of::<(f32, String)>() + easing.capacity())
+                    .sum::<usize>(),
+            );
             for (property, values) in &keyframes.properties {
                 bytes = bytes.saturating_add(property.capacity()).saturating_add(
                     values
@@ -15810,6 +15837,8 @@ impl StyleIndex {
 #[derive(Clone, Debug, Default)]
 struct KeyframesRule {
     properties: FxHashMap<String, Vec<KeyframeValue>>,
+    /// Per-keyframe `animation-timing-function` values by offset.
+    easings: Vec<(f32, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -17800,9 +17829,12 @@ fn media_px(value: &str) -> Option<f32> {
     Some(px.max(0.0))
 }
 
-/// Parse the supported declarations of an `@keyframes` rule. CSS Animations
-/// 1 §3 conceptually builds an independent sorted keyframe set per property;
+/// Parse the declarations of an `@keyframes` rule. CSS Animations 1 §3
+/// conceptually builds an independent sorted keyframe set per property;
 /// repeated selectors cascade in source order and `!important` is invalid.
+/// Shorthands expand to their longhands. The animation properties are
+/// ignored, except `animation-timing-function`, which eases the interval
+/// starting at its keyframe (#timing-functions).
 fn parse_keyframes_rule(block: &str, quirks: bool) -> KeyframesRule {
     let mut rule = KeyframesRule::default();
     let mut rest = block;
@@ -17821,18 +17853,33 @@ fn parse_keyframes_rule(block: &str, quirks: bool) -> KeyframesRule {
             let Some((property, value, important)) = parse_decl_in(decl, quirks) else {
                 continue;
             };
-            if important || !matches!(property.as_str(), "opacity" | "top" | "transform") {
+            if important {
                 continue;
             }
-            for &offset in &offsets {
-                let values = rule.properties.entry(property.clone()).or_default();
-                if let Some(existing) = values.iter_mut().find(|frame| frame.offset == offset) {
-                    existing.value = value.clone();
-                } else {
-                    values.push(KeyframeValue {
-                        offset,
-                        value: value.clone(),
-                    });
+            if property == "animation-timing-function" {
+                for &offset in &offsets {
+                    rule.easings.retain(|(existing, _)| *existing != offset);
+                    rule.easings.push((offset, value.clone()));
+                }
+                continue;
+            }
+            if property == "all" || !animations::keyframe_property(&property) {
+                continue;
+            }
+            for (longhand, value) in expand_box_shorthand(&property, &value) {
+                if !is_tracked(&longhand) || !animations::keyframe_property(&longhand) {
+                    continue;
+                }
+                for &offset in &offsets {
+                    let values = rule.properties.entry(longhand.clone()).or_default();
+                    if let Some(existing) = values.iter_mut().find(|frame| frame.offset == offset) {
+                        existing.value = value.clone();
+                    } else {
+                        values.push(KeyframeValue {
+                            offset,
+                            value: value.clone(),
+                        });
+                    }
                 }
             }
         }

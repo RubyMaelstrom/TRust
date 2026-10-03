@@ -109,14 +109,14 @@ impl Linear {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Easing {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Easing {
     Linear,
     Bezier(f32, f32, f32, f32),
     Steps(u32, bool, i32),
 }
 impl Easing {
-    fn parse(value: &str) -> Option<Self> {
+    pub(super) fn parse(value: &str) -> Option<Self> {
         let value = value.trim().to_ascii_lowercase();
         Some(match value.as_str() {
             "linear" => Self::Linear,
@@ -162,7 +162,7 @@ impl Easing {
             }
         })
     }
-    fn sample(self, x: f32) -> f32 {
+    pub(super) fn sample(self, x: f32) -> f32 {
         match self {
             Self::Linear => x,
             Self::Steps(n, start, delta) => {
@@ -533,7 +533,7 @@ impl State {
 /// Ancestors are resolved first: nothing below a non-rendered ancestor needs
 /// its own `display`, which layout never computes either (a full pass visits
 /// every element, so hidden menus would otherwise each pay a cascade).
-fn participates(dom: &Dom, node: NodeId, memo: &mut FxHashMap<NodeId, bool>) -> bool {
+pub(super) fn participates(dom: &Dom, node: NodeId, memo: &mut FxHashMap<NodeId, bool>) -> bool {
     let mut path = Vec::new();
     let mut cursor = Some(node);
     let mut result = loop {
