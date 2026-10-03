@@ -89,13 +89,24 @@
     function internalsOf(object) {
         return internalSlots.get(object) || noInternals;
     }
+    // The internal-slot record of a platform object, created on first use.
+    // Platform state never lives in author-visible properties of wrappers,
+    // events, collections or API objects. A primitive has no slots: it gets
+    // a detached record, as reading an absent property of it yields nothing.
     function internalsFor(object) {
         let record = internalSlots.get(object);
         if (record === undefined) {
             record = Object.create(null);
-            internalSlots.set(object, record);
+            if ((typeof object === "object" && object !== null) || typeof object === "function")
+                internalSlots.set(object, record);
         }
         return record;
+    }
+    // A legacy platform object implemented as a Proxy shares its target's
+    // internal slots, since its operations run with the proxy as receiver.
+    function shareInternals(proxy, target) {
+        internalSlots.set(proxy, internalsFor(target));
+        return proxy;
     }
     const trust = { errors: [], logs: [], readyState: "loading" };
     // The control object is private to the platform. The native host and the
@@ -379,7 +390,7 @@
     // explicit old roots when the replacement target is itself a shadow host.
     function snapshotRemovedWrapperSubtrees(target, removedRoots) {
         if ((!nativeWrapperCache && typeof g.WeakRef !== "function") || !removedRoots.length) return [];
-        const canWalkInclusiveTarget = target.__trustLN !== "template"
+        const canWalkInclusiveTarget = internalsFor(target).trustLN !== "template"
             && __dom_shadow_root(nodeIds.get(target)) == null;
         if (canWalkInclusiveTarget) {
             const ids = __dom_wrapper_subtree(nodeIds.get(target));
@@ -394,9 +405,9 @@
         return ids;
     }
     function seedElementName(element, localName, namespace, prefix) {
-        element.__trustLN = localName || "";
-        element.__trustNS = namespace === undefined ? null : namespace;
-        element.__trustPrefix = prefix === undefined ? null : prefix;
+        internalsFor(element).trustLN = localName || "";
+        internalsFor(element).trustNS = namespace === undefined ? null : namespace;
+        internalsFor(element).trustPrefix = prefix === undefined ? null : prefix;
         return element;
     }
     function cacheElementName(element) {
@@ -451,13 +462,13 @@
             // even when first reached through child.parentNode/getRootNode.
             rememberWrapper(id, w, knownConnected);
             if (info) {
-                w.__host = wrap(info[0]);
-                w.__mode = info[1] ? "closed" : "open";
-                w.__delegatesFocus = info[2];
-                w.__serializable = info[3];
-                w.__clonable = info[4];
-                w.__slotAssignment = info[5] ? "manual" : "named";
-                internalsFor(w.__host).sr = w;
+                internalsFor(w).host = wrap(info[0]);
+                internalsFor(w).mode = info[1] ? "closed" : "open";
+                internalsFor(w).delegatesFocus = info[2];
+                internalsFor(w).serializable = info[3];
+                internalsFor(w).clonable = info[4];
+                internalsFor(w).slotAssignment = info[5] ? "manual" : "named";
+                internalsFor(internalsFor(w).host).sr = w;
             }
             return w;
         } else {
@@ -559,7 +570,7 @@
     // pending until the CSS link loads, stalling every `React.lazy` route whose
     // `Promise.all` of chunks includes a CSS chunk (Twitch's whole page body).
     function maybeLoadStylesheet(node) {
-        if (!node || node.localName !== "link" || node.__cssStarted) return;
+        if (!node || node.localName !== "link" || internalsFor(node).cssStarted) return;
         // Loaders set `link.rel`/`link.href` as PROPERTIES (webpack's mini-css
         // loader: `c.rel="stylesheet"; c.href=url`), so read the property first
         // (the `rel` IDL attribute doesn't always reflect to getAttribute).
@@ -570,7 +581,7 @@
         if (!connected) return;
         if (rels.indexOf("stylesheet") >= 0) {
             if (!(node.href || node.getAttribute("href"))) return;
-            node.__cssStarted = true;
+            internalsFor(node).cssStarted = true;
             __dom_load_injected_stylesheet(nodeIds.get(node));
             return;
         }
@@ -580,7 +591,7 @@
         // `<link rel="preload" as="style">` and awaits `Promise.all` of their
         // load/error events BEFORE the view-transition swap.
         if (rels.indexOf("preload") >= 0) {
-            node.__cssStarted = true;
+            internalsFor(node).cssStarted = true;
             __dom_preload_link(nodeIds.get(node));
             return;
         }
@@ -589,7 +600,7 @@
         // a loader that `await`s the hint's `load` otherwise hangs forever.
         if (rels.some((r) => r === "prefetch" || r === "modulepreload"
                 || r === "preconnect" || r === "dns-prefetch")) {
-            node.__cssStarted = true;
+            internalsFor(node).cssStarted = true;
             // Async, like a real hint resolving — settles inside the same job drain.
             Promise.resolve().then(() => { try { node.dispatchEvent(new Event("load")); } catch (e) {} });
         }
@@ -608,10 +619,10 @@
         const changed = (type) => rels.indexOf(type) >= 0 &&
             (before.indexOf(type) < 0 || name === "href" || (name === "as" && type === "preload"));
         if (changed("stylesheet") && node.getAttribute("href")) {
-            node.__cssStarted = true;
+            internalsFor(node).cssStarted = true;
             __dom_load_injected_stylesheet(nodeIds.get(node));
         } else if (changed("preload")) {
-            node.__cssStarted = true;
+            internalsFor(node).cssStarted = true;
             __dom_preload_link(nodeIds.get(node));
         }
     }
@@ -1047,10 +1058,10 @@
         discardTasks(messageTasks);
         for (let i = MO.length - 1; i >= 0; i--) {
             const observer = MO[i].deref();
-            if (!observer || observer.__windowState === state) {
+            if (!observer || internalsFor(observer).windowState === state) {
                 if (observer) {
-                    observer.__targets = [];
-                    observer.__records = [];
+                    internalsFor(observer).targets = [];
+                    internalsFor(observer).records = [];
                     moPending.delete(observer);
                     __dom_observer_targets(observer, []);
                 }
@@ -1058,13 +1069,13 @@
             }
         }
         for (let i = IO.length - 1; i >= 0; i--) {
-            if (IO[i].__windowState === state) IO.splice(i, 1);
+            if (internalsFor(IO[i]).windowState === state) IO.splice(i, 1);
         }
         for (let i = RO.length - 1; i >= 0; i--) {
-            if (RO[i].__windowState === state) RO.splice(i, 1);
+            if (internalsFor(RO[i]).windowState === state) RO.splice(i, 1);
         }
         for (let i = ioNotify.length - 1; i >= 0; i--) {
-            if (ioNotify[i].__windowState === state) ioNotify.splice(i, 1);
+            if (internalsFor(ioNotify[i]).windowState === state) ioNotify.splice(i, 1);
         }
         moRecomputeKinds();
         if (!IO.length) ioInitialUpdatePending = false;
@@ -1088,12 +1099,12 @@
         installFrameWindowState(frame, createWindowState(frame));
         trust.detachChildWindow(internalsOf(frame).contentRealmWindow);
         internalsFor(frame).contentRealmWindow = undefined;
-        frame.__trustInitialAboutBlank = false;
+        internalsFor(frame).trustInitialAboutBlank = false;
         internalsFor(frame).contentDoc = undefined;
         // requestAnimationFrame is a writable Window property. A replacement
         // Window starts with the platform method rather than an override made
         // by the previous Document.
-        frame.__trustAnimationFrameMethods = undefined;
+        internalsFor(frame).trustAnimationFrameMethods = undefined;
     }
     function destroyFrameNavigable(frame) {
         if (!frame) return;
@@ -1103,23 +1114,23 @@
         try { descendants = internalsOf(frame).contentDoc ? internalsOf(frame).contentDoc.querySelectorAll("iframe, frame") : []; } catch (e) {}
         for (let i = descendants.length - 1; i >= 0; i--)
             destroyFrameNavigable(descendants[i]);
-        const pending = frame.__trustPendingNavigationReservations;
+        const pending = internalsFor(frame).trustPendingNavigationReservations;
         if (pending) {
             for (const reservation of pending.slice())
                 retireFrameNavigationReservation(frame, reservation);
-            frame.__trustPendingNavigationReservations = undefined;
+            internalsFor(frame).trustPendingNavigationReservations = undefined;
         }
         retireWindowState(frame, frameWindowStates.get(frame));
         frameWindowStates.delete(frame);
         frameNavigableNames.delete(frame);
         navigableNamesRevision++;
         framesWithNonInitialDocuments.delete(frame);
-        frame.__trustLoadGeneration = (frame.__trustLoadGeneration || 0) + 1;
-        frame.__loadedSrc = undefined;
-        frame.__loadedSrcdoc = undefined;
+        internalsFor(frame).trustLoadGeneration = (internalsFor(frame).trustLoadGeneration || 0) + 1;
+        internalsFor(frame).loadedSrc = undefined;
+        internalsFor(frame).loadedSrcdoc = undefined;
         internalsFor(frame).frameUrl = undefined;
         trust.detachChildWindow(internalsOf(frame).contentRealmWindow);
-        if (internalsOf(frame).contentDoc) internalsOf(frame).contentDoc.__destroyed = true;
+        if (internalsOf(frame).contentDoc) internalsFor(internalsOf(frame).contentDoc).destroyed = true;
         // HTML #destroy-a-child-navigable / #discard-a-document severs the browsing-context
         // association, not the retained Document's own DOM tree. Drop the presentation edge.
         const documentId = __dom_frame_document(nodeIds.get(frame));
@@ -1127,11 +1138,11 @@
         internalsFor(frame).contentDoc = undefined;
         internalsFor(frame).contentWin = undefined;
         internalsFor(frame).contentRealmWindow = undefined;
-        frame.__trustInitialAboutBlank = false;
-        frame.__trustInitialLoadFired = false;
+        internalsFor(frame).trustInitialAboutBlank = false;
+        internalsFor(frame).trustInitialLoadFired = false;
         internalsFor(frame).trustParentWindow = undefined;
         internalsFor(frame).trustTopWindow = undefined;
-        frame.__trustAnimationFrameMethods = undefined;
+        internalsFor(frame).trustAnimationFrameMethods = undefined;
     }
     function destroyFrameNavigableDescendantsIn(root) {
         if (!root || typeof nodeIds.get(root) !== "number") return;
@@ -1147,7 +1158,7 @@
     }
     function destroyFrameNavigablesIn(root) {
         if (!root) return;
-        if (root.__trustLN === "iframe" || root.__trustLN === "frame") {
+        if (internalsFor(root).trustLN === "iframe" || internalsFor(root).trustLN === "frame") {
             destroyFrameNavigable(root);
             return;
         }
@@ -1334,8 +1345,8 @@
         // assigning false cancels (honoring cancelable), true can't un-cancel.
         get returnValue() { return !this.defaultPrevented; }
         set returnValue(v) { if (!v) this.preventDefault(); }
-        stopPropagation() { this.__stop = true; }
-        stopImmediatePropagation() { this.__stop = this.__stopNow = true; }
+        stopPropagation() { internalsFor(this).stop = true; }
+        stopImmediatePropagation() { internalsFor(this).stop = internalsFor(this).stopNow = true; }
         // Legacy DOM init for events made via document.createEvent(): deprecated
         // but still used by feature-detection (webcomponentsjs probes it) and a
         // lot of older code. initCustomEvent is the CustomEvent variant.
@@ -1363,7 +1374,7 @@
         // root-of-closed-tree and `s` = slot-in-closed-tree, matching the
         // standard's event-path item fields.
         composedPath() {
-            const path = this.__path;
+            const path = internalsFor(this).path;
             if (!path || !path.length) {
                 // The one-struct fast path (a non-bubbling event with no
                 // capture listeners registered) skips building a path array;
@@ -1845,7 +1856,7 @@
         if (!cur) return null;
         const src = cur.getAttribute("on" + type);
         if (src === null) return null;
-        const cache = cur.__onCache || (cur.__onCache = {});
+        const cache = internalsFor(cur).onCache || (internalsFor(cur).onCache = {});
         const slot = cache[type];
         if (!slot || slot.src !== src) {
             let fn = null;
@@ -1864,11 +1875,12 @@
     // never runs in the capture phase. A `once` listener is removed BEFORE its
     // callback runs (spec), so a re-dispatch from inside it can't re-fire it.
     function invokeListeners(cur, ev, phase) {
+        const eventSlots = internalsFor(ev);
         if (phase !== 1) {
             const af = attrHandler(cur, ev.type);
             if (af) {
                 const afOwner = attrHandlerOwner(cur, ev.type);
-                const afSlot = afOwner.__onCache && afOwner.__onCache[ev.type];
+                const afSlot = internalsFor(afOwner).onCache && internalsFor(afOwner).onCache[ev.type];
                 try {
                     const result = runInFrame(afSlot && afSlot.frame,
                                               () => af.call(cur, ev));
@@ -1878,7 +1890,7 @@
                     eventsWithListenerExceptions.add(ev);
                     trust.errors.push("on" + ev.type + ": " + ((e && e.message) || e));
                 }
-                if (ev.__stopNow) return;
+                if (eventSlots.stopNow) return;
             }
         }
         const list = lsFor(cur, ev.type);
@@ -1901,7 +1913,7 @@
             // target was addressed. Without this filter, every child frame's
             // message listener also saw top-window traffic and reCAPTCHA
             // interpreted an unrelated message as its own protocol payload.
-            if (cur === g && ev.__windowTargetSet && entry.frame !== ev.__frameTarget) continue;
+            if (cur === g && eventSlots.windowTargetSet && entry.frame !== eventSlots.frameTarget) continue;
             if (phase === 1 && !entry.capture) continue;
             if (phase === 3 && entry.capture) continue;
             if (entry.once) removeL(cur, ev.type, entry.fn, { capture: entry.capture });
@@ -1915,7 +1927,7 @@
                 eventsWithListenerExceptions.add(ev);
                 trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""));
             }
-            if (ev.__stopNow) break;
+            if (eventSlots.stopNow) break;
         }
     }
     // DOM §2.9 "retargeting": walk A up out of any shadow tree whose root is
@@ -1943,7 +1955,7 @@
         let n = b;
         for (;;) {
             if (n === anc) return true;
-            n = n.parentNode || n.__host; // shadow-including: cross root→host
+            n = n.parentNode || internalsFor(n).host; // shadow-including: cross root→host
             if (!n) return false;
         }
     }
@@ -1951,9 +1963,9 @@
         for (;;) {
             if (!(a instanceof Node)) return a;
             const r = rootOfNode(a);
-            if (!r.__host) return a; // A's root is not a shadow root
+            if (!internalsFor(r).host) return a; // A's root is not a shadow root
             if (b instanceof Node && shadowInclusiveContains(r, b)) return a;
-            a = r.__host;
+            a = internalsFor(r).host;
         }
     }
     // DOM §4.2.2.3 and §4.4: assigned slots participate in Node's
@@ -1996,6 +2008,7 @@
     // inside a component, seen from outside), and propagation ends at the tree
     // where a hop makes them collapse mid-walk.
     function dispatch(target, ev, forceBubble, legacyTargetOverride = false, clickContext = null) {
+        const eventSlots = internalsFor(ev);
         const targetOverride = legacyTargetOverride ? g.document : target;
         eventsWithListenerExceptions.delete(ev);
         // Each browsing context owns a distinct Window/EventTarget. TRust
@@ -2010,11 +2023,11 @@
                 ? internalsOf(target).frame
                 : trust.__activeFrame || null;
         if (target instanceof Node || (target && target.nodeType === 9)) {
-            ev.__windowTargetSet = true;
-            ev.__frameTarget = targetFrame;
-        } else if (target === g && !ev.__windowTargetSet) {
-            ev.__windowTargetSet = true;
-            ev.__frameTarget = targetFrame;
+            eventSlots.windowTargetSet = true;
+            eventSlots.frameTarget = targetFrame;
+        } else if (target === g && !eventSlots.windowTargetSet) {
+            eventSlots.windowTargetSet = true;
+            eventSlots.frameTarget = targetFrame;
         }
         ev.target = targetOverride;
         const origRelated = ev.relatedTarget;
@@ -2055,11 +2068,11 @@
                         break;
                     }
                     if (parent) { n = parent; }
-                    else if (n.__host) {
+                    else if (internalsFor(n).host) {
                         // ShadowRoot's get-the-parent algorithm clips only
                         // when this root owns the original event target.
                         if (!ev.composed && rootOfNode(target) === n) { clipped = true; break; }
-                        n = n.__host;
+                        n = internalsFor(n).host;
                         // Internal targets retarget to their host outside the
                         // root; light-tree slottables remain themselves.
                         t = retarget(target, n);
@@ -2077,14 +2090,14 @@
                         // level until the matching closed shadow root.
                         slottable = null;
                         const root = rootOfNode(n);
-                        slotInClosedTree = root instanceof ShadowRoot && root.__mode === "closed";
+                        slotInClosedTree = root instanceof ShadowRoot && internalsFor(root).mode === "closed";
                     }
                     assignedSlot = assignedSlotInternal(n);
                     if (assignedSlot) slottable = n;
                     path.push({
                         n: n, t: t,
                         r: hasRelated ? retarget(origRelated, n) : null,
-                        c: n instanceof ShadowRoot && n.__mode === "closed",
+                        c: n instanceof ShadowRoot && internalsFor(n).mode === "closed",
                         s: slotInClosedTree,
                     });
                 }
@@ -2121,7 +2134,7 @@
                     path.push({ n: n, t: target, r: null, c: false, s: false });
                 }
             }
-            ev.__path = path; // composedPath() reads it; emptied on unwind (spec)
+            eventSlots.path = path; // composedPath() reads it; emptied on unwind (spec)
         }
         // DOM #concept-event-dispatch chooses the first activation target
         // BEFORE listeners, including for dispatchEvent(new PointerEvent("click"))
@@ -2146,7 +2159,7 @@
                 ev.target = path[i].t;
                 if (hasRelated) ev.relatedTarget = path[i].r;
                 invokeListeners(path[i].n, ev, 1);
-                if (ev.__stop) { stopped = true; break; }
+                if (eventSlots.stop) { stopped = true; break; }
             }
         }
         if (!stopped) {
@@ -2155,7 +2168,7 @@
             ev.target = targetOverride;
             if (hasRelated) ev.relatedTarget = relatedAtTarget;
             invokeListeners(target, ev, 2);
-            if (ev.__stop) stopped = true;
+            if (eventSlots.stop) stopped = true;
         }
         if (!stopped && path && (forceBubble || ev.bubbles)) {
             ev.eventPhase = 3; // BUBBLING_PHASE
@@ -2164,15 +2177,15 @@
                 ev.target = path[i].t;
                 if (hasRelated) ev.relatedTarget = path[i].r;
                 invokeListeners(path[i].n, ev, 3);
-                if (ev.__stop) break;
+                if (eventSlots.stop) break;
             }
         }
         ev.eventPhase = 0;
         ev.currentTarget = null;
-        ev.__path = null; // spec: "set event's path to the empty list"
+        eventSlots.path = null; // spec: "set event's path to the empty list"
         ev.target = targetOverride;
         if (hasRelated) ev.relatedTarget = origRelated;
-        ev.__stop = ev.__stopNow = false;
+        eventSlots.stop = eventSlots.stopNow = false;
         if (activationTarget) {
             if (ev.defaultPrevented) cancelInputActivation(inputActivation);
             else {
@@ -2215,9 +2228,9 @@
         trust.dispatchCssAnimationEvents(__dom_animation_events());
     };
     trust.setDocumentReadiness = function (value) {
-        const previous = realmRootFrame ? realmRootFrame.__trustReadyState : trust.readyState;
+        const previous = realmRootFrame ? internalsFor(realmRootFrame).trustReadyState : trust.readyState;
         if (previous === value) return;
-        if (realmRootFrame) realmRootFrame.__trustReadyState = value;
+        if (realmRootFrame) internalsFor(realmRootFrame).trustReadyState = value;
         trust.readyState = value;
         if (trust.performanceLifecycle && (value === 'interactive' || value === 'complete'))
             trust.performanceLifecycle(value === 'interactive' ? 'domInteractive' : 'domComplete');
@@ -2314,7 +2327,7 @@
     function retireFrameNavigationReservation(frame, reservation) {
         if (!reservation || !reservation.active) return;
         reservation.active = false;
-        const pending = frame && frame.__trustPendingNavigationReservations;
+        const pending = frame && internalsFor(frame).trustPendingNavigationReservations;
         if (pending) {
             const index = pending.indexOf(reservation);
             if (index >= 0) pending.splice(index, 1);
@@ -2323,7 +2336,7 @@
             0, trust.pendingFrameNavigationTasks - 1);
     }
     function retireFrameNavigation(frame, generation) {
-        const pending = frame && frame.__trustPendingNavigationReservations;
+        const pending = frame && internalsFor(frame).trustPendingNavigationReservations;
         if (!pending) return;
         for (const reservation of pending) {
             if (reservation.generation === generation) {
@@ -2334,7 +2347,7 @@
     }
     function queueFrameElementLoad(frame, generation) {
         __queue_dom_task(function () {
-            if (frame.__trustLoadGeneration !== generation) {
+            if (internalsFor(frame).trustLoadGeneration !== generation) {
                 retireFrameNavigation(frame, generation);
                 return;
             }
@@ -2376,9 +2389,9 @@
             // A queued completion belongs to the Document that initiated it.
             // If `src`/`srcdoc` navigated the element again in the meantime,
             // that old Document must not fire the new Document's load event.
-            if (frame.__trustLoadGeneration !== generation) return;
+            if (internalsFor(frame).trustLoadGeneration !== generation) return;
             if (frame === realmRootFrame) trust.setDocumentReadiness('complete');
-            else frame.__trustReadyState = "complete";
+            else internalsFor(frame).trustReadyState = "complete";
             try { runInFrame(frame, function () { trust.fire(g, "load", false); }); } catch (e) {}
             // The iframe element is an EventTarget in its node document's
             // Realm. Queue its load-event steps only after the child Window
@@ -2396,8 +2409,8 @@
     // recursive URL cycle required by HTML; navigation itself has no arbitrary
     // depth/count cutoff.
     function beginFrameLoad(frame, timingURL = null, timingStart = null) {
-        const generation = (frame.__trustLoadGeneration || 0) + 1;
-        frame.__trustLoadGeneration = generation;
+        const generation = (internalsFor(frame).trustLoadGeneration || 0) + 1;
+        internalsFor(frame).trustLoadGeneration = generation;
         frameResourceTimings.delete(frame);
         if (timingURL !== null && frame.localName === 'iframe') {
             frameResourceTimings.set(frame,{generation,url:timingURL,
@@ -2447,7 +2460,7 @@
         return childWindow;
     }
     function createInitialFrameWindow(frame, fireElementLoad) {
-        if (!frame || internalsOf(frame).contentRealmWindow || frame.__trustInitialAboutBlank)
+        if (!frame || internalsOf(frame).contentRealmWindow || internalsFor(frame).trustInitialAboutBlank)
             return frame && internalsOf(frame).contentRealmWindow || null;
 
         // HTML §7.3.2.1 creates and completely loads a populated initial
@@ -2458,7 +2471,7 @@
         frameAboutBaseURLs.set(frame, nodeBaseHref(frame));
         // HTML's initial about:blank creation copies the creator Document URL.
         frameReferrers.set(frame, frame.ownerDocument.URL);
-        frame.__trustReadyState = "complete";
+        internalsFor(frame).trustReadyState = "complete";
         const replacedRoots = internalsOf(frame).contentDoc ? [internalsOf(frame).contentDoc] : [];
         if (internalsOf(frame).contentDoc) detachListenerTarget(internalsOf(frame).contentDoc);
         internalsFor(frame).contentDoc = undefined;
@@ -2468,13 +2481,13 @@
             syncWrapperSubtreeRetention(nodeIds.get(replacedRoots[i]));
 
         const childWindow = createFrameWindowRealm(frame, "about:blank");
-        if (childWindow) frame.__trustInitialAboutBlank = true;
+        if (childWindow) internalsFor(frame).trustInitialAboutBlank = true;
         else internalsFor(frame).contentDoc = frameDocument(frame);
 
         // Processing missing/empty src on initial insertion runs the iframe
         // load-event steps against the already-complete initial Document.
-        if (fireElementLoad && !frame.__trustInitialLoadFired) {
-            frame.__trustInitialLoadFired = true;
+        if (fireElementLoad && !internalsFor(frame).trustInitialLoadFired) {
+            internalsFor(frame).trustInitialLoadFired = true;
             try { dispatch(frame, createTrustedEvent(Event, "load"), false); } catch (e) {}
         }
         return childWindow;
@@ -2484,19 +2497,19 @@
         if (frameBlobOrigins.get(frame)?.url !== frameUrl) frameBlobOrigins.delete(frame);
         frameReferrers.set(frame, referrer);
         ftrace("loadFrameMarkup url=" + frameUrl + " markup=" + String(markup == null ? "" : markup).length);
-        const initialWindow = frame.__trustInitialAboutBlank
+        const initialWindow = internalsFor(frame).trustInitialAboutBlank
             ? internalsOf(frame).contentRealmWindow : null;
         const reuseInitialWindow = !!(initialWindow && trustOf(initialWindow) &&
             frameSameOrigin(frameUrl, frame));
         if (initialWindow) framesWithNonInitialDocuments.add(frame);
         if (!reuseInitialWindow) resetFrameWindowState(frame);
-        frame.__trustInitialAboutBlank = false;
+        internalsFor(frame).trustInitialAboutBlank = false;
         internalsFor(frame).frameUrl = frameUrl;
         if (/^about:(?:blank|srcdoc)(?:[?#]|$)/.test(frameUrl)) frameAboutBaseURLs.set(frame, base);
         else frameAboutBaseURLs.delete(frame);
         internalsFor(frame).trustParentWindow = undefined;
         internalsFor(frame).trustTopWindow = undefined;
-        frame.__trustReadyState = "loading";
+        internalsFor(frame).trustReadyState = "loading";
         const replacedRoots = internalsOf(frame).contentDoc ? [internalsOf(frame).contentDoc] : [];
         if (reuseInitialWindow) {
             for (const root of replacedRoots) destroyFrameNavigablesIn(root);
@@ -2576,7 +2589,7 @@
         let stylesDone = false;
         let domContentLoaded = false;
         function maybeFinishLoad() {
-            if (generation !== frame.__trustLoadGeneration ||
+            if (generation !== internalsFor(frame).trustLoadGeneration ||
                 !domContentLoaded || !allScriptsDone || !stylesDone) return;
             fireFrameLoad(frame, generation);
         }
@@ -2585,7 +2598,7 @@
             maybeFinishLoad();
         });
         runFrameScripts(frame, function () {
-            if (generation !== frame.__trustLoadGeneration) return;
+            if (generation !== internalsFor(frame).trustLoadGeneration) return;
             try {
                 runInFrame(frame, function () {
                     trust.fire(g.document, "DOMContentLoaded", true);
@@ -2631,19 +2644,19 @@
         // not reprocess or mutate the embedding element's src/srcdoc attributes.
         const srcdoc = locationNavigation ? null : frame.getAttribute("srcdoc");
         if (srcdoc !== null) {
-            if (frame.__loadedSrcdoc === srcdoc) return;
-            frame.__loadedSrcdoc = srcdoc;
-            frame.__loadedSrc = undefined;
+            if (internalsFor(frame).loadedSrcdoc === srcdoc) return;
+            internalsFor(frame).loadedSrcdoc = srcdoc;
+            internalsFor(frame).loadedSrc = undefined;
             // about:srcdoc: the markup IS the document; base/origin inherit the
             // parent document.
             const generation = beginFrameLoad(frame, "about:srcdoc");
             loadFrameMarkup(frame, srcdoc, nodeBaseHref(frame), "about:srcdoc", generation);
             return;
         }
-        if (!locationNavigation) frame.__loadedSrcdoc = undefined;
+        if (!locationNavigation) internalsFor(frame).loadedSrcdoc = undefined;
         // Shared attribute processing steps → a URL, or null (= about:blank).
         const src = locationNavigation ? navigationURL.parsed[0] : frame.getAttribute("src");
-        if (!src || src.trim() === "") { frame.__loadedSrc = undefined; return; }
+        if (!src || src.trim() === "") { internalsFor(frame).loadedSrc = undefined; return; }
         // HTML §4.8.5's shared iframe/frame attribute-processing steps
         // encoding-parse this URL relative to the ELEMENT'S node Document.
         // The incumbent Window can already be the child when parent-side code
@@ -2652,7 +2665,7 @@
         const parsed = capturedURL ? capturedURL.parsed : __url_parse(src, nodeBaseHref(frame));
         if (!parsed) return;
         const url = parsed[0];
-        if (!locationNavigation && frame.__loadedSrc === url) return; // already processed this src
+        if (!locationNavigation && internalsFor(frame).loadedSrc === url) return; // already processed this src
         // HTML §7.4.2.3.2: a javascript: URL navigates by running its decoded
         // classic-script source in the target navigable. A normal completion
         // whose value is a string replaces the active document with that HTML;
@@ -2661,7 +2674,7 @@
         // is picked up by the ordinary queued src-attribute navigation below.
         if (/^javascript:/i.test(url)) {
             if (frameAncestorHasUrl(frame, url)) return;
-            if (!locationNavigation) frame.__loadedSrc = url;
+            if (!locationNavigation) internalsFor(frame).loadedSrc = url;
             const generation = beginFrameLoad(frame);
             const oldSrc = frame.getAttribute("src");
             let result = null;
@@ -2694,7 +2707,7 @@
         // to HTML's "navigate an iframe" steps.
         if (url.slice(0, 5).toLowerCase() === "data:") {
             if (frameAncestorHasUrl(frame, url)) return;
-            if (!locationNavigation) frame.__loadedSrc = url;
+            if (!locationNavigation) internalsFor(frame).loadedSrc = url;
             const generation = beginFrameLoad(frame, url);
             const parts = __dataURLParts(url);
             if (parts) loadFrameResource(frame, parts.text, parts.ctype, url, generation);
@@ -2703,7 +2716,7 @@
         }
         if (url.slice(0, 5).toLowerCase() === "blob:") {
             if (frameAncestorHasUrl(frame, url)) return;
-            if (!locationNavigation) frame.__loadedSrc = url;
+            if (!locationNavigation) internalsFor(frame).loadedSrc = url;
             const generation = beginFrameLoad(frame, url);
             const entry = capturedURL
                 ? __blobURLParts(capturedURL.blob) : __resolveBlobURL(url);
@@ -2718,35 +2731,35 @@
         }
         if (url.toLowerCase() === "about:blank") {
             if (frameAncestorHasUrl(frame, url)) return;
-            if (!locationNavigation) frame.__loadedSrc = url;
+            if (!locationNavigation) internalsFor(frame).loadedSrc = url;
             const generation = beginFrameLoad(frame, url);
             loadFrameMarkup(frame, "", locationNavigation ? navigationURL.base : nodeBaseHref(frame), "about:blank", generation);
             return;
         }
         // File navigation shares the native document loader; it retains the
         // real document client and rejects non-local callers before I/O.
-        if (!/^(?:https?|file):/i.test(url)) { if (!locationNavigation) frame.__loadedSrc = undefined; return; }
+        if (!/^(?:https?|file):/i.test(url)) { if (!locationNavigation) internalsFor(frame).loadedSrc = undefined; return; }
         if (frameAncestorHasUrl(frame, url)) return; // circular-navigation guard
         ftrace("processIframeAttributes resource src=" + url);
-        if (!locationNavigation) frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
+        if (!locationNavigation) internalsFor(frame).loadedSrc = url; // set before fetching so a re-sweep won't double-load
         const timingStart = navigationFloorTime(__clockNow()*10)/10;
         const sourceURL = locationNavigation ? navigationURL.sourceURL : frame.ownerDocument.URL;
         if (parallel && navigateDocumentAsync) {
             // A later navigation of this frame supersedes the response.
             const token = {};
-            frame.__trustNavigationToken = token;
+            internalsFor(frame).trustNavigationToken = token;
             let pending;
             try { pending = navigateDocumentAsync(url, sourceURL, frame.referrerPolicy || "", nodeIds.get(frame)); }
             catch (e) { pending = Promise.resolve(null); }
             return pending.then(function (r) {
-                if (frame.__trustNavigationToken !== token || !frame.isConnected) return;
-                frame.__trustNavigationToken = null;
+                if (internalsFor(frame).trustNavigationToken !== token || !frame.isConnected) return;
+                internalsFor(frame).trustNavigationToken = null;
                 processFrameNavigationResponse(frame, url, r, timingStart);
             });
         }
         let r;
         try { r = navigateDocument(url, sourceURL, frame.referrerPolicy || "", nodeIds.get(frame)); } catch (e) { r = null; }
-        frame.__trustNavigationToken = null;
+        internalsFor(frame).trustNavigationToken = null;
         processFrameNavigationResponse(frame, url, r, timingStart);
     }
     function processFrameNavigationResponse(frame, url, r, timingStart) {
@@ -2808,7 +2821,7 @@
         // byte body. A later src assignment replaces the queued URL snapshot.
         const source = frame.getAttribute("src");
         const previous = frameNavigationURLs.get(frame);
-        if (locationRequest || !frame.__trustNavigationQueued || !previous || previous.source !== source) {
+        if (locationRequest || !internalsFor(frame).trustNavigationQueued || !previous || previous.source !== source) {
             const parsed = locationRequest ? __url_parse(locationRequest[0], null) : frame.getAttribute("srcdoc") === null && source
                 ? __url_parse(source, nodeBaseHref(frame)) : null;
             if (parsed) {
@@ -2820,19 +2833,19 @@
                     blob: parsed[1] === "blob:" ? __blobURLStore[key] || null : null });
             } else frameNavigationURLs.delete(frame);
         }
-        if (frame.__trustNavigationQueued) return false;
-        frame.__trustNavigationQueued = true;
+        if (internalsFor(frame).trustNavigationQueued) return false;
+        internalsFor(frame).trustNavigationQueued = true;
         trust.pendingFrameNavigationTasks++;
         const reservation = { active: true, generation: null };
-        (frame.__trustPendingNavigationReservations ||=
+        (internalsFor(frame).trustPendingNavigationReservations ||=
             []).push(reservation);
         __queue_dom_task(function () {
-            frame.__trustNavigationQueued = false;
+            internalsFor(frame).trustNavigationQueued = false;
             if (!frame.isConnected) {
                 retireFrameNavigationReservation(frame, reservation);
                 return;
             }
-            const previousGeneration = frame.__trustLoadGeneration || 0;
+            const previousGeneration = internalsFor(frame).trustLoadGeneration || 0;
             // A successful navigation retires from queueFrameElementLoad,
             // after the child Window and iframe load-event tasks. If the
             // attributes changed before this task ran, or the navigation was
@@ -2842,7 +2855,7 @@
             const settle = function () {
                 try { loadFrameStyles(frame); }
                 catch (e) { ftrace("queueFrameNavigation styles threw " + ((e && e.message) || e)); }
-                const generation = frame.__trustLoadGeneration || 0;
+                const generation = internalsFor(frame).trustLoadGeneration || 0;
                 if (generation === previousGeneration)
                     retireFrameNavigationReservation(frame, reservation);
                 else reservation.generation = generation;
@@ -2909,7 +2922,7 @@
         const blank = frame.getAttribute("srcdoc") === null &&
             (src === null || src.trim() === "");
         createInitialFrameWindow(frame, blank);
-        if (frame.__trustNavigationQueued && frameNavigationURLs.get(frame)?.location) return;
+        if (internalsFor(frame).trustNavigationQueued && frameNavigationURLs.get(frame)?.location) return;
         if (blank) return;
         if (frame.getAttribute("src") !== null || frame.getAttribute("srcdoc") !== null) {
             try { processIframeAttributes(frame); } catch (e) {}
@@ -2928,7 +2941,7 @@
         const slot = assignedSlotInternal(node);
         if (slot) return slot;
         if (node.parentNode) return node.parentNode;
-        return node.__host || null;
+        return internalsFor(node).host || null;
     }
     function hyperlinkActivationTarget(node) {
         let current = node;
@@ -2995,23 +3008,23 @@
                 const options = control.querySelectorAll("option");
                 let any = false;
                 for (let j = 0; j < options.length; j++) {
-                    const selected = control.__trustResetSelected
-                        ? !!control.__trustResetSelected[j]
+                    const selected = internalsFor(control).trustResetSelected
+                        ? !!internalsFor(control).trustResetSelected[j]
                         : options[j].hasAttribute("selected");
                     options[j].selected = selected;
                     any = any || options[j].selected;
                 }
                 if (!any && options.length) options[0].selected = true;
             } else if (control.localName === "textarea") {
-                control.value = control.__trustResetValue === undefined
+                control.value = internalsFor(control).trustResetValue === undefined
                     ? (control.textContent || "")
-                    : control.__trustResetValue;
+                    : internalsFor(control).trustResetValue;
             } else {
                 const type = (control.getAttribute("type") || "text").toLowerCase();
                 if (type === "checkbox" || type === "radio") {
-                    control.checked = control.__trustResetChecked === undefined
+                    control.checked = internalsFor(control).trustResetChecked === undefined
                         ? control.hasAttribute("checked")
-                        : !!control.__trustResetChecked;
+                        : !!internalsFor(control).trustResetChecked;
                 } else if (! ["button", "submit", "reset", "image", "file"].includes(type)) {
                     __dom_input(elementIdentity(control), "reset", null);
                 }
@@ -3267,14 +3280,14 @@
         if (btn) {
             const form = formOwner(btn);
             if (form) {
-                if (!form.isConnected || form.__trustFiringSubmit) return true;
+                if (!form.isConnected || internalsFor(form).trustFiringSubmit) return true;
                 const sev = createTrustedEvent(SubmitEvent, "submit", { bubbles: true, cancelable: true, submitter: btn });
-                form.__trustFiringSubmit = true;
+                internalsFor(form).trustFiringSubmit = true;
                 try {
                     if (!form.hasAttribute("novalidate") && !btn.hasAttribute("formnovalidate")
                         && !HTMLFormElement.prototype.checkValidity.call(form)) return true;
                     dispatch(form, sev, false);
-                } finally { form.__trustFiringSubmit = false; }
+                } finally { internalsFor(form).trustFiringSubmit = false; }
                 const record = (context && context.record) || trust.keyDispatch;
                 if (record) trust.lastClickSubmit = { form: nodeIds.get(form), submitter: nodeIds.get(btn), prevented: sev.defaultPrevented };
                 if (!sev.defaultPrevented && form.isConnected && !handleDialogSubmission(form, btn) && !record)
@@ -3435,7 +3448,7 @@
     trust.scriptEvent = function (id, type) {
         const t = wrap(id);
         if (!t) return;
-        t.__trustResourceSettled = String(type);
+        internalsFor(t).trustResourceSettled = String(type);
         const ev = new Event(type);
         dispatch(t, ev, false);
     };
@@ -3824,7 +3837,7 @@
     function hoverPath(t) {
         const path = [];
         let n = t;
-        while (n && n !== g && n !== realmRootFrame) { path.push(n); n = n.parentNode || n.__host; }
+        while (n && n !== g && n !== realmRootFrame) { path.push(n); n = n.parentNode || internalsFor(n).host; }
         return path;
     }
     // One pointer/mouse compat pair. over/out/move bubble and are cancelable;
@@ -3995,7 +4008,7 @@
                 valueMissing = String(el.value || "") === "";
             }
         }
-        const customError = !!el.__trustValidationMessage;
+        const customError = !!internalsFor(el).trustValidationMessage;
         const numeric = el.localName === "input" ? __dom_input(elementIdentity(el), "validity", null) : [false,false,false,false];
         return {
             valueMissing: valueMissing, customError: customError,
@@ -4010,7 +4023,7 @@
             validity: { configurable: true, get() { return controlValidity(this); } },
             validationMessage: { configurable: true, get() {
                 if (!controlWillValidate(this)) return "";
-                if (this.__trustValidationMessage) return this.__trustValidationMessage;
+                if (internalsFor(this).trustValidationMessage) return internalsFor(this).trustValidationMessage;
                 const validity = controlValidity(this);
                 if (validity.badInput) return "Please enter a number.";
                 if (validity.valueMissing) return "Please fill out this field.";
@@ -4019,7 +4032,7 @@
                 return validity.stepMismatch ? "Please enter a value matching the step." : "";
             }},
         });
-        C.prototype.setCustomValidity = function (message) { this.__trustValidationMessage = String(message); };
+        C.prototype.setCustomValidity = function (message) { internalsFor(this).trustValidationMessage = String(message); };
         C.prototype.checkValidity = function () {
             if (!controlWillValidate(this) || controlValidity(this).valid) return true;
             dispatch(this, new Event("invalid", { cancelable: true }), false);
@@ -4434,7 +4447,7 @@
             if (textControl) {
                 if (!textEditBaselines.has(el)) textEditBaselines.set(el,previous);
                 userEditedText.add(el);
-                if (el.localName === "textarea" && el.__trustResetValue === undefined) el.__trustResetValue = previous;
+                if (el.localName === "textarea" && internalsFor(el).trustResetValue === undefined) internalsFor(el).trustResetValue = previous;
             }
             if (editable || el.localName === "textarea") el.textContent = value;
             else __dom_input(elementIdentity(el),"user",value);
@@ -4448,13 +4461,13 @@
         const isToggle = tag === "input" && (type === "checkbox" || type === "radio");
         let changed = false;
         if (isToggle) {
-            if (el.__trustResetChecked === undefined) el.__trustResetChecked = el.hasAttribute("checked");
+            if (internalsFor(el).trustResetChecked === undefined) internalsFor(el).trustResetChecked = el.hasAttribute("checked");
             const want = !!checked;
             if (type === "radio" && want && el.name) {
                 const scope = nearestForm(el) || g.document;
                 for (const r of scope.querySelectorAll("input")) {
                     if (r !== el && String(r.type || "").toLowerCase() === "radio" && r.name === el.name && r.checked) {
-                        if (r.__trustResetChecked === undefined) r.__trustResetChecked = r.hasAttribute("checked");
+                        if (internalsFor(r).trustResetChecked === undefined) internalsFor(r).trustResetChecked = r.hasAttribute("checked");
                         nativeSet(r, "checked", false);
                         changed = true;
                     }
@@ -4462,8 +4475,8 @@
             }
             if (el.checked !== want) { nativeSet(el, "checked", want); changed = true; }
         } else if (tag === "select") {
-            if (!el.__trustResetSelected) {
-                el.__trustResetSelected = Array.from(
+            if (!internalsFor(el).trustResetSelected) {
+                internalsFor(el).trustResetSelected = Array.from(
                     el.querySelectorAll("option"),
                     o => o.hasAttribute("selected")
                 );
@@ -4478,12 +4491,12 @@
                 }
             }
         } else if (tag === "textarea") {
-            if (el.__trustResetValue === undefined) el.__trustResetValue = el.textContent;
+            if (internalsFor(el).trustResetValue === undefined) internalsFor(el).trustResetValue = el.textContent;
             if (el.textContent !== value) { el.textContent = value; changed = true; }
         } else if (tag === "input") {
             changed = __dom_input(elementIdentity(el), "user", value);
         } else {
-            if (el.__trustResetValue === undefined) el.__trustResetValue = el.getAttribute("value") || "";
+            if (internalsFor(el).trustResetValue === undefined) internalsFor(el).trustResetValue = el.getAttribute("value") || "";
             if (el.value !== value) { nativeSet(el, "value", value); changed = true; }
         }
         if (changed && tag === "input" && type === "number") {
@@ -4691,7 +4704,7 @@
                         nodeIds.set(this, __dom_create_element(tag, nodeIds.get(g.document)));
                         seedElementName(this, tag, HTML_NS, null);
                         rememberElement(this, nodeIds.get(this));
-                        this.__ceUpgraded = true;
+                        internalsFor(this).ceUpgraded = true;
                         rememberWrapper(nodeIds.get(this), this);
                         return;
                     }
@@ -4791,13 +4804,13 @@
         getRootNode(options = {}) {
             let root = rootOfNode(this);
             if (options && options.composed)
-                while (root.__host) root = rootOfNode(root.__host);
+                while (internalsFor(root).host) root = rootOfNode(internalsFor(root).host);
             return root;
         }
         // Document.adoptNode is defined on Document, below.  Keeping the
         // operation there preserves the DOM's target-document semantics.
         appendChild(c) {
-            if (c && c.nodeType === 11 && !c.__host) { for (const k of Array.from(c.childNodes)) this.appendChild(k); return c; }
+            if (c && c.nodeType === 11 && !internalsFor(c).host) { for (const k of Array.from(c.childNodes)) this.appendChild(k); return c; }
             // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
             // (returns false, unmutated) when `c` is an inclusive ancestor.
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
@@ -4810,12 +4823,12 @@
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             maybeLoadStylesheet(c);
-            if (c.__trustLN === "base") baseHrefCache = null; // maybeRunScript already read .localName
+            if (internalsFor(c).trustLN === "base") baseHrefCache = null; // maybeRunScript already read .localName
             maybeProcessInsertedFrames(c, this);
             return c;
         }
         insertBefore(c, ref) {
-            if (c && c.nodeType === 11 && !c.__host) { for (const k of Array.from(c.childNodes)) this.insertBefore(k, ref); return c; }
+            if (c && c.nodeType === 11 && !internalsFor(c).host) { for (const k of Array.from(c.childNodes)) this.insertBefore(k, ref); return c; }
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
             const insertion = __dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null);
             if (insertion === -1) throw new DOMException("The reference node is not a child of this node.", "NotFoundError");
@@ -4828,7 +4841,7 @@
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             maybeLoadStylesheet(c);
-            if (c.__trustLN === "base") baseHrefCache = null;
+            if (internalsFor(c).trustLN === "base") baseHrefCache = null;
             maybeProcessInsertedFrames(c, this);
             return c;
         }
@@ -4837,7 +4850,7 @@
             // effects. A node belonging to some other parent is not silently detached.
             if (!c || !rangeSame(rangeParent(c),this)) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
             rangesRemove(c, this, rangeIndex(c));
-            if (c.__trustLN === "base") baseHrefCache = null;
+            if (internalsFor(c).trustLN === "base") baseHrefCache = null;
             moChildRemove(this, c);
             if (CE.defs.size) ceDisconnect(c);
             __dom_detach(nodeIds.get(c));
@@ -4878,7 +4891,7 @@
             if (CE.defs.size) ceScan(n);
             maybeRunScript(n);
             maybeLoadStylesheet(n);
-            if (n.__trustLN === "base" || old.__trustLN === "base") baseHrefCache = null;
+            if (internalsFor(n).trustLN === "base" || internalsFor(old).trustLN === "base") baseHrefCache = null;
             maybeProcessInsertedFrames(n, this);
             return old;
         }
@@ -4895,7 +4908,7 @@
             const clone = wrap(__dom_clone(nodeIds.get(this), !!deep));
             // Cloning creates a fresh script element rather than a
             // parser-inserted one, so its force-async flag starts true.
-            if (clone instanceof HTMLScriptElement) clone.__trustForceAsync = true;
+            if (clone instanceof HTMLScriptElement) internalsFor(clone).trustForceAsync = true;
             return clone;
         }
         contains(o) { while (o) { if (o === this) return true; o = o.parentNode; } return false; }
@@ -5177,48 +5190,48 @@
     // the live `class` attribute through `__el` so the list stays in sync with
     // direct attribute writes. `blocking` supplies its supported-token set;
     // lists such as classList with no supported tokens throw from supports().
+    function tokenListGet() { return (internalsFor(this).el.getAttribute(internalsFor(this).attr) || "").split(/\s+/).filter(Boolean); }
+    function tokenListSet(l) { internalsFor(this).el.setAttribute(internalsFor(this).attr, l.join(" ")); }
     class DOMTokenList {
         constructor(el, attr, supported) {
-            this.__el = el;
-            this.__attr = attr || "class";
-            this.__supported = supported || null;
+            internalsFor(this).el = el;
+            internalsFor(this).attr = attr || "class";
+            internalsFor(this).supported = supported || null;
         }
-        __get() { return (this.__el.getAttribute(this.__attr) || "").split(/\s+/).filter(Boolean); }
-        __set(l) { this.__el.setAttribute(this.__attr, l.join(" ")); }
-        add(...cs) { const l = this.__get(); for (const c of cs) if (!l.includes(String(c))) l.push(String(c)); this.__set(l); }
-        remove(...cs) { const ss = cs.map(String); this.__set(this.__get().filter((x) => !ss.includes(x))); }
+        add(...cs) { const l = tokenListGet.call(this); for (const c of cs) if (!l.includes(String(c))) l.push(String(c)); tokenListSet.call(this, l); }
+        remove(...cs) { const ss = cs.map(String); tokenListSet.call(this, tokenListGet.call(this).filter((x) => !ss.includes(x))); }
         toggle(c, force) {
-            const has = this.__get().includes(String(c));
+            const has = tokenListGet.call(this).includes(String(c));
             const want = force === undefined ? !has : !!force;
             if (want && !has) this.add(c);
             if (!want && has) this.remove(c);
             return want;
         }
         replace(oldT, newT) {
-            const l = this.__get(); const i = l.indexOf(String(oldT));
+            const l = tokenListGet.call(this); const i = l.indexOf(String(oldT));
             if (i < 0) return false;
             if (!l.includes(String(newT))) l[i] = String(newT); else l.splice(i, 1);
-            this.__set(l); return true;
+            tokenListSet.call(this, l); return true;
         }
-        contains(c) { return this.__get().includes(String(c)); }
-        item(i) { return this.__get()[i] ?? null; }
+        contains(c) { return tokenListGet.call(this).includes(String(c)); }
+        item(i) { return tokenListGet.call(this)[i] ?? null; }
         supports(token) {
-            if (!this.__supported) throw new TypeError("DOMTokenList has no supported tokens");
+            if (!internalsFor(this).supported) throw new TypeError("DOMTokenList has no supported tokens");
             // DOM §interface-DOMTokenList: supported-token matching first
             // ASCII-lowercases the argument. The supported-token lists below
             // are ASCII-lowercase, as are the HTML link-type keywords.
-            return this.__supported.includes(String(token).replace(/[A-Z]/g, (c) =>
+            return internalsFor(this).supported.includes(String(token).replace(/[A-Z]/g, (c) =>
                 String.fromCharCode(c.charCodeAt(0) + 0x20)));
         }
-        get length() { return this.__get().length; }
-        get value() { return this.__el.getAttribute(this.__attr) || ""; }
-        set value(v) { this.__el.setAttribute(this.__attr, String(v)); }
-        toString() { return this.__el.getAttribute(this.__attr) || ""; }
-        forEach(fn, thisArg) { this.__get().forEach((t, i) => fn.call(thisArg, t, i, this)); }
-        keys() { return this.__get().keys(); }
-        values() { return this.__get().values(); }
-        entries() { return this.__get().entries(); }
-        [Symbol.iterator]() { return this.__get()[Symbol.iterator](); }
+        get length() { return tokenListGet.call(this).length; }
+        get value() { return internalsFor(this).el.getAttribute(internalsFor(this).attr) || ""; }
+        set value(v) { internalsFor(this).el.setAttribute(internalsFor(this).attr, String(v)); }
+        toString() { return internalsFor(this).el.getAttribute(internalsFor(this).attr) || ""; }
+        forEach(fn, thisArg) { tokenListGet.call(this).forEach((t, i) => fn.call(thisArg, t, i, this)); }
+        keys() { return tokenListGet.call(this).keys(); }
+        values() { return tokenListGet.call(this).values(); }
+        entries() { return tokenListGet.call(this).entries(); }
+        [Symbol.iterator]() { return tokenListGet.call(this)[Symbol.iterator](); }
     }
 
     // HTML §4.2.4 (the link element) and §4.6.2 (hyperlink elements) define
@@ -5232,8 +5245,8 @@
     ];
     const HYPERLINK_REL_SUPPORTED = ["noopener", "noreferrer", "opener"];
     function relListFor(element, supported) {
-        return element.__trustRelList
-            || (element.__trustRelList = new DOMTokenList(element, "rel", supported));
+        return internalsFor(element).trustRelList
+            || (internalsFor(element).trustRelList = new DOMTokenList(element, "rel", supported));
     }
 
     // CSS Font Loading 3: the setlike interface is present, but runtime face
@@ -5244,14 +5257,14 @@
     class FontFace {
         constructor(family, source, descriptors) {
             this.family = String(family);
-            this.__source = source;
-            this.__status = "unloaded";
-            this.__sets = new Set();
-            this.__resolveLoaded = null;
-            this.__rejectLoaded = null;
-            this.__loaded = new Promise((resolve, reject) => {
-                this.__resolveLoaded = resolve;
-                this.__rejectLoaded = reject;
+            internalsFor(this).source = source;
+            internalsFor(this).status = "unloaded";
+            internalsFor(this).sets = new Set();
+            internalsFor(this).resolveLoaded = null;
+            internalsFor(this).rejectLoaded = null;
+            internalsFor(this).loaded = new Promise((resolve, reject) => {
+                internalsFor(this).resolveLoaded = resolve;
+                internalsFor(this).rejectLoaded = reject;
             });
             descriptors = descriptors || {};
             this.style = descriptors.style === undefined ? "normal" : String(descriptors.style);
@@ -5275,18 +5288,18 @@
             this.lineGapOverride = descriptors.lineGapOverride === undefined
                 ? "normal" : String(descriptors.lineGapOverride);
         }
-        get status() { return this.__status; }
-        get loaded() { return this.__loaded; }
+        get status() { return internalsFor(this).status; }
+        get loaded() { return internalsFor(this).loaded; }
         load() {
-            if (this.__status === "unloaded") {
-                this.__status = "loading";
+            if (internalsFor(this).status === "unloaded") {
+                internalsFor(this).status = "loading";
                 // Pending the actor-to-font-registry integration described above,
                 // this compatibility path still resolves using the fallback face.
-                this.__status = "loaded";
-                for (const set of this.__sets) set.__fontLoaded(this);
-                this.__resolveLoaded(this);
+                internalsFor(this).status = "loaded";
+                for (const set of internalsFor(this).sets) fontFaceSetLoaded.call(set, this);
+                internalsFor(this).resolveLoaded(this);
             }
-            return this.__loaded;
+            return internalsFor(this).loaded;
         }
     }
     class FontFaceSetLoadEvent extends Event {
@@ -5295,54 +5308,54 @@
             this.fontfaces = Object.freeze((init && init.fontfaces || []).slice());
         }
     }
+    function fontFaceSetLoaded(_font) {
+        internalsFor(this).status = "loaded";
+    }
     class FontFaceSet extends EventTarget {
         constructor(initialFaces) {
             super();
-            this.__faces = new Set();
+            internalsFor(this).faces = new Set();
             this.onloading = null;
             this.onloadingdone = null;
             this.onloadingerror = null;
-            this.__ready = Promise.resolve(this);
+            internalsFor(this).ready = Promise.resolve(this);
             for (const face of initialFaces || []) this.add(face);
         }
         add(font) {
             if (!(font instanceof FontFace)) throw new TypeError("FontFaceSet.add: argument is not a FontFace");
-            if (!this.__faces.has(font)) {
-                this.__faces.add(font);
-                font.__sets.add(this);
-                if (font.status === "loading") this.__status = "loading";
+            if (!internalsFor(this).faces.has(font)) {
+                internalsFor(this).faces.add(font);
+                internalsFor(font).sets.add(this);
+                if (font.status === "loading") internalsFor(this).status = "loading";
             }
             return this;
         }
         delete(font) {
-            if (!this.__faces.delete(font)) return false;
-            if (font.__sets) font.__sets.delete(this);
+            if (!internalsFor(this).faces.delete(font)) return false;
+            if (internalsFor(font).sets) internalsFor(font).sets.delete(this);
             return true;
         }
         clear() {
-            for (const font of this.__faces) if (font.__sets) font.__sets.delete(this);
-            this.__faces.clear();
+            for (const font of internalsFor(this).faces) if (internalsFor(font).sets) internalsFor(font).sets.delete(this);
+            internalsFor(this).faces.clear();
         }
-        has(font) { return this.__faces.has(font); }
-        get size() { return this.__faces.size; }
-        entries() { return Array.from(this.__faces, (font) => [font, font])[Symbol.iterator](); }
-        keys() { return this.__faces.keys(); }
-        values() { return this.__faces.values(); }
+        has(font) { return internalsFor(this).faces.has(font); }
+        get size() { return internalsFor(this).faces.size; }
+        entries() { return Array.from(internalsFor(this).faces, (font) => [font, font])[Symbol.iterator](); }
+        keys() { return internalsFor(this).faces.keys(); }
+        values() { return internalsFor(this).faces.values(); }
         forEach(callback, thisArg) {
-            this.__faces.forEach((font) => callback.call(thisArg, font, font, this));
+            internalsFor(this).faces.forEach((font) => callback.call(thisArg, font, font, this));
         }
         [Symbol.iterator]() { return this.values(); }
-        get status() { return this.__status || "loaded"; }
-        get ready() { return this.__ready; }
+        get status() { return internalsFor(this).status || "loaded"; }
+        get ready() { return internalsFor(this).ready; }
         load(_font, _text) {
-            return Promise.all(Array.from(this.__faces, (font) => font.load()))
-                .then(() => Array.from(this.__faces));
+            return Promise.all(Array.from(internalsFor(this).faces, (font) => font.load()))
+                .then(() => Array.from(internalsFor(this).faces));
         }
         check(_font, _text) {
-            return Array.from(this.__faces).every((font) => font.status === "loaded");
-        }
-        __fontLoaded(_font) {
-            this.__status = "loaded";
+            return Array.from(internalsFor(this).faces).every((font) => font.status === "loaded");
         }
         get [Symbol.toStringTag]() { return "FontFaceSet"; }
     }
@@ -5414,7 +5427,7 @@
         const slot = assignedSlotInternal(node);
         if (slot) return slot;
         let parent = node.parentNode;
-        if (parent && parent.nodeType === 11 && parent.__host) parent = parent.__host;
+        if (parent && parent.nodeType === 11 && internalsFor(parent).host) parent = internalsFor(parent).host;
         return parent && parent.nodeType === 1 ? parent : null;
     }
     function offsetBoxRect(element) {
@@ -5482,6 +5495,90 @@
         return Math.round((axis === "top" ? rect[1] - parentRect[1] : rect[0] - parentRect[0]) - border);
     }
 
+    function elementSnapInlinePosition(natural, direction) {
+        // CSS Scroll Snap 1 §6: an inline-axis snap container selects a
+        // valid descendant snap area's alignment position after a scroll.
+        // The exact selection algorithm is deliberately UA-defined; use
+        // the nearest candidate to the intended endpoint, while respecting
+        // the intended direction of relative (`scrollBy`) operations.
+        let type = "";
+        try { type = String(g.getComputedStyle(this).getPropertyValue("scroll-snap-type") || "").toLowerCase(); }
+        catch (e) { return natural; }
+        const typeParts = type.trim().split(/\s+/);
+        if (typeParts[0] !== "x" && typeParts[0] !== "inline" && typeParts[0] !== "both") return natural;
+
+        const current = this.scrollLeft;
+        const max = Math.max(0, this.scrollWidth - this.clientWidth);
+        const box = elementDocumentRect.call(this);
+        const candidates = [];
+        let descendants;
+        try { descendants = this.querySelectorAll("*"); } catch (e) { return natural; }
+        // A snap area can be a light-DOM child assigned through a slot in
+        // the scroller's shadow tree (Archive's carousel is exactly this
+        // standard composed-tree shape). `querySelectorAll` intentionally
+        // does not pierce that boundary, so include each slot's flattened
+        // assignments when collecting descendant snap areas.
+        // DOM querySelectorAll returns an iterable static NodeList, not
+        // an Array. Keep the platform's proper NodeList interface while
+        // making the private, appendable work list used by snap selection.
+        const areas = Array.from(descendants);
+        for (const node of descendants) {
+            if (node.localName !== "slot" || typeof node.assignedElements !== "function") continue;
+            try { areas.push.apply(areas, node.assignedElements({ flatten: true })); }
+            catch (e) {}
+        }
+        for (const area of areas) {
+            let align = "";
+            try { align = String(g.getComputedStyle(area).getPropertyValue("scroll-snap-align") || "").trim().toLowerCase(); }
+            catch (e) { continue; }
+            const parts = align.split(/\s+/);
+            // One value applies to both axes; with two values the second is
+            // the inline-axis alignment used by an x/inline container.
+            const inline = parts.length > 1 ? parts[1] : parts[0];
+            if (inline !== "start" && inline !== "center" && inline !== "end") continue;
+            const r = elementDocumentRect.call(area);
+            let candidate = r.left - box.left;
+            if (inline === "center") candidate += r.width / 2 - this.clientWidth / 2;
+            else if (inline === "end") candidate += r.width - this.clientWidth;
+            candidate = Math.max(0, Math.min(max, candidate));
+            if (direction > 0 && candidate + 0.01 < current) continue;
+            if (direction < 0 && candidate - 0.01 > current) continue;
+            candidates.push(candidate);
+        }
+        if (!candidates.length) return natural;
+        let best = candidates[0], distance = Math.abs(best - natural);
+        for (let i = 1; i < candidates.length; i++) {
+            const d = Math.abs(candidates[i] - natural);
+            if (d < distance) { best = candidates[i]; distance = d; }
+        }
+        return best;
+    }
+    function elementScrollToOptions(options, direction) {
+        checkedScrollBehavior(options);
+        let left = options.left === undefined ? this.scrollLeft : normalizedScrollNumber(options.left);
+        let top = options.top === undefined ? this.scrollTop : normalizedScrollNumber(options.top);
+        if (this.localName === "html") {
+            return g.scrollTo(left, top);
+        }
+        // CSSOM View clamps against the native scrolling area, including
+        // negative RTL/vertical ranges and non-scrollable overflow:clip.
+        left = elementSnapInlinePosition.call(this, left, direction || 0);
+        const changed = __dom_scroll_set(nodeIds.get(this), top, left);
+        if (!changed) return Promise.resolve();
+        const self = this;
+        return new Promise(function (resolve) { queueElementScroll(self, resolve); });
+    }
+    function elementDocumentRect() {
+        let r = null;
+        try { r = __dom_rect(nodeIds.get(this)); } catch (e) { r = null; }
+        if (r) {
+            const left = r[0], top = r[1], width = r[2], height = r[3];
+            return createDOMRect(left, top, width, height);
+        }
+        // CSSOM View §6: no associated layout box means an empty rectangle,
+        // including for hidden/detached embedded and replaced elements.
+        return createDOMRect();
+    }
     class Element extends Node {
         // DOM Standard ParentNode: selector methods are exposed on Element,
         // Document, and DocumentFragment—not on CharacterData/Text nodes.
@@ -5518,20 +5615,22 @@
         // where it expected its object (`"div".next = …` → "cannot set
         // non-writable property"). Keep every per-node internal field `__trust*`.
         get localName() {
-            if (this.__trustLN === undefined) cacheElementName(this);
-            return this.__trustLN;
+            const slots = internalsFor(this);
+            if (slots.trustLN === undefined) cacheElementName(this);
+            return slots.trustLN;
         }
         get prefix() {
-            if (this.__trustPrefix === undefined) cacheElementName(this);
-            return this.__trustPrefix;
+            const slots = internalsFor(this);
+            if (slots.trustPrefix === undefined) cacheElementName(this);
+            return slots.trustPrefix;
         }
         get tagName() {
-            let qualifiedName = this.__trustQN;
+            let qualifiedName = internalsFor(this).trustQN;
             if (qualifiedName === undefined) {
                 qualifiedName = this.prefix === null
                     ? this.localName
                     : this.prefix + ":" + this.localName;
-                this.__trustQN = qualifiedName;
+                internalsFor(this).trustQN = qualifiedName;
             }
             // Adoption can change HTMLness without changing the expanded name.
             return this.namespaceURI === HTML_NS && this.ownerDocument.contentType === "text/html"
@@ -5545,7 +5644,7 @@
             const slot = assignedSlotInternal(this);
             if (!slot) return null;
             const root = rootOfNode(slot);
-            return root instanceof ShadowRoot && root.__mode === "closed" ? null : slot;
+            return root instanceof ShadowRoot && internalsFor(root).mode === "closed" ? null : slot;
         }
         // `Element.namespaceURI` — immutable, so cache it (undefined = uncached,
         // null = the null namespace). HTML elements report the XHTML namespace;
@@ -5553,8 +5652,9 @@
         // `el.namespaceURI.includes("svg")`, so a missing value threw on every
         // SSR Vue/Nuxt page (joinpeertube).
         get namespaceURI() {
-            if (this.__trustNS === undefined) cacheElementName(this);
-            return this.__trustNS;
+            const slots = internalsFor(this);
+            if (slots.trustNS === undefined) cacheElementName(this);
+            return slots.trustNS;
         }
         get [Symbol.toStringTag]() {
             return this.namespaceURI === HTML_NS ? htmlInterfaceName(this.localName)
@@ -5587,7 +5687,7 @@
         // of patching one raw-cased key (cheap, and immune to mixed-case access).
         getAttribute(n) {
             n = String(n);
-            const c = this.__ac || (this.__ac = Object.create(null));
+            const c = internalsFor(this).ac || (internalsFor(this).ac = Object.create(null));
             const v = c[n];
             if (v !== undefined) return v;
             return (c[n] = __dom_get_attr(nodeIds.get(this), n));
@@ -5598,18 +5698,18 @@
             // HTMLScriptElement's force-async flag is cleared whenever its
             // async content attribute is added. Removing it later must not
             // restore force-async (HTML "prepare the script element").
-            if (lower === "async" && this.localName === "script") this.__trustForceAsync = false;
-            const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
+            if (lower === "async" && this.localName === "script") internalsFor(this).trustForceAsync = false;
+            const old = (internalsFor(this).ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             const linkOld = (lower === "rel" || lower === "href" || lower === "as") &&
                 this.localName === "link" ? this.getAttribute(n) : undefined;
             __dom_set_attr(nodeIds.get(this), n, v);
-            this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
+            internalsFor(this).ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             // DOM §4.9.1: NamedNodeMap is a live collection. Refresh the
             // existing [SameObject] map synchronously so a caller holding
             // `const attrs = el.attributes` observes this write immediately,
             // including while it is iterating the map.
-            this.__attrMapStale = true;
-            if (this.__attrMap) void this.attributes;
+            internalsFor(this).attrMapStale = true;
+            if (internalsFor(this).attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, v);
             moAttr(this, n, old);
@@ -5627,15 +5727,15 @@
         removeAttribute(n) {
             n = String(n);
             const lower = n.toLowerCase();
-            const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
+            const old = (internalsFor(this).ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_remove_attr(nodeIds.get(this), n);
-            this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
+            internalsFor(this).ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             // DOM §4.9.1 requires the same live-list behavior for removals.
             // FAST's standards-based template compiler removes marker Attrs
             // while walking `element.attributes`, so deferring this refresh
             // leaves the remaining bindings unprocessed.
-            this.__attrMapStale = true;
-            if (this.__attrMap) void this.attributes;
+            internalsFor(this).attrMapStale = true;
+            if (internalsFor(this).attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, null);
             moAttr(this, n, old);
@@ -5678,11 +5778,11 @@
         // for existing references as required by the DOM Standard.
         get attributes() {
             // Rebuild attribute values in place so existing list references stay live.
-            let list = this.__attrMap;
-            if (list && !this.__attrMapStale) return list;
+            let list = internalsFor(this).attrMap;
+            if (list && !internalsFor(this).attrMapStale) return list;
             if (!list) {
                 list = [];
-                list.__owner = this;
+                internalsFor(list).owner = this;
                 list.item = function (i) { return this[i] || null; };
                 list.getNamedItem = function (nm) {
                     for (var j = 0; j < this.length; j++) if (this[j].name === String(nm)) return this[j];
@@ -5690,15 +5790,15 @@
                 };
                 // setNamedItem/removeNamedItem round out the map (DOM §4.9.1);
                 // they route through the owner's set/removeAttribute funnels.
-                list.setNamedItem = function (attr) { return this.__owner.setAttributeNode(attr); };
-                list.setNamedItemNS = function (attr) { return this.__owner.setAttributeNode(attr); };
+                list.setNamedItem = function (attr) { return internalsFor(this).owner.setAttributeNode(attr); };
+                list.setNamedItemNS = function (attr) { return internalsFor(this).owner.setAttributeNode(attr); };
                 list.removeNamedItem = function (nm) {
                     const old = this.getNamedItem(nm);
                     if (!old) throw new (g.DOMException || TypeError)("No attribute named " + nm, "NotFoundError");
-                    this.__owner.removeAttribute(String(nm));
+                    internalsFor(this).owner.removeAttribute(String(nm));
                     return old;
                 };
-                this.__attrMap = list;
+                internalsFor(this).attrMap = list;
             } else {
                 // Rebuild in place (identity must survive): drop the named
                 // props of the OLD entries, then the entries themselves.
@@ -5725,7 +5825,7 @@
                 // Skip names that would clobber the array length / methods.
                 if (n !== "length" && n !== "item" && n !== "getNamedItem") list[n] = attr;
             }
-            this.__attrMapStale = false;
+            internalsFor(this).attrMapStale = false;
             return list;
         }
         // Lit's ?attr= boolean bindings commit through this.
@@ -5830,7 +5930,7 @@
         }
         get shadowRoot() {
             const root = internalsOf(this).sr || wrap(__dom_shadow_root(nodeIds.get(this)));
-            return root && root.__mode === "open" ? root : null;
+            return root && internalsFor(root).mode === "open" ? root : null;
         }
         // ElementInternals, minimally: form components construct with
         // this unguarded (archive.org's dropdowns) — always-valid,
@@ -5919,7 +6019,7 @@
         insertAdjacentText(p, text) {
             this.insertAdjacentElement(String(p).toLowerCase(), document.createTextNode(String(text)));
         }
-        get style() { if (!this.__style) this.__style = styleFor(this); return this.__style; }
+        get style() { if (!internalsFor(this).style) internalsFor(this).style = styleFor(this); return internalsFor(this).style; }
         // `.sheet` (<style>/<link> CSSOM) moved to HTMLStyleElement/HTMLLinkElement.
         // `el.style = "color:red"` — the [PutForwards=cssText] behaviour: assigning
         // a string to .style sets inline cssText (a getter-only .style throws in
@@ -5929,7 +6029,7 @@
             else this.setAttribute("style", String(v));
         }
         get dataset() {
-            if (!this.__ds) {
+            if (!internalsFor(this).ds) {
                 const el = this;
                 const target = Object.create(DOMStringMap.prototype);
                 // WHATWG HTML §3.2.6.6: supported named properties are the
@@ -5955,7 +6055,7 @@
                         if (list[index][0] === property) return list[index][1];
                     return null;
                 }
-                this.__ds = new Proxy(target, {
+                internalsFor(this).ds = new Proxy(target, {
                     get(t, p, receiver) {
                         if (typeof p === "string") {
                             const attribute = attributeFor(p);
@@ -5996,11 +6096,11 @@
                     },
                 });
             }
-            return this.__ds;
+            return internalsFor(this).ds;
         }
         get classList() {
-            if (!this.__cl) this.__cl = new DOMTokenList(this);
-            return this.__cl;
+            if (!internalsFor(this).cl) internalsFor(this).cl = new DOMTokenList(this);
+            return internalsFor(this).cl;
         }
         matches(s) { return selectorMatchesResult(__dom_matches(nodeIds.get(this), String(s))); }
         webkitMatchesSelector(s) { return this.matches(s); }
@@ -6010,10 +6110,10 @@
         // Was a no-op, so any programmatic click (consent "Accept" buttons,
         // framework-driven toggles, auto-clickers) silently did nothing.
         click() {
-            if (this.__trustClickInProgress || isActuallyDisabled(this)) return;
-            this.__trustClickInProgress = true;
+            if (internalsFor(this).trustClickInProgress || isActuallyDisabled(this)) return;
+            internalsFor(this).trustClickInProgress = true;
             try { activateClick(this, false, false); } catch (e) {}
-            finally { this.__trustClickInProgress = false; }
+            finally { internalsFor(this).trustClickInProgress = false; }
         }
         focus(options) { focusElement(this, options || {}); }
         blur() { blurElement(this); }
@@ -6096,82 +6196,9 @@
         // dict. `scrollIntoView()` scrolls each ancestor scroll container so this
         // element is visible (the recursive CSSOM scroll). The root element /
         // scrollingElement still mirrors the page scroll (the terminal owns it).
-        __snapInlinePosition(natural, direction) {
-            // CSS Scroll Snap 1 §6: an inline-axis snap container selects a
-            // valid descendant snap area's alignment position after a scroll.
-            // The exact selection algorithm is deliberately UA-defined; use
-            // the nearest candidate to the intended endpoint, while respecting
-            // the intended direction of relative (`scrollBy`) operations.
-            let type = "";
-            try { type = String(g.getComputedStyle(this).getPropertyValue("scroll-snap-type") || "").toLowerCase(); }
-            catch (e) { return natural; }
-            const typeParts = type.trim().split(/\s+/);
-            if (typeParts[0] !== "x" && typeParts[0] !== "inline" && typeParts[0] !== "both") return natural;
-
-            const current = this.scrollLeft;
-            const max = Math.max(0, this.scrollWidth - this.clientWidth);
-            const box = this.__rect();
-            const candidates = [];
-            let descendants;
-            try { descendants = this.querySelectorAll("*"); } catch (e) { return natural; }
-            // A snap area can be a light-DOM child assigned through a slot in
-            // the scroller's shadow tree (Archive's carousel is exactly this
-            // standard composed-tree shape). `querySelectorAll` intentionally
-            // does not pierce that boundary, so include each slot's flattened
-            // assignments when collecting descendant snap areas.
-            // DOM querySelectorAll returns an iterable static NodeList, not
-            // an Array. Keep the platform's proper NodeList interface while
-            // making the private, appendable work list used by snap selection.
-            const areas = Array.from(descendants);
-            for (const node of descendants) {
-                if (node.localName !== "slot" || typeof node.assignedElements !== "function") continue;
-                try { areas.push.apply(areas, node.assignedElements({ flatten: true })); }
-                catch (e) {}
-            }
-            for (const area of areas) {
-                let align = "";
-                try { align = String(g.getComputedStyle(area).getPropertyValue("scroll-snap-align") || "").trim().toLowerCase(); }
-                catch (e) { continue; }
-                const parts = align.split(/\s+/);
-                // One value applies to both axes; with two values the second is
-                // the inline-axis alignment used by an x/inline container.
-                const inline = parts.length > 1 ? parts[1] : parts[0];
-                if (inline !== "start" && inline !== "center" && inline !== "end") continue;
-                const r = area.__rect();
-                let candidate = r.left - box.left;
-                if (inline === "center") candidate += r.width / 2 - this.clientWidth / 2;
-                else if (inline === "end") candidate += r.width - this.clientWidth;
-                candidate = Math.max(0, Math.min(max, candidate));
-                if (direction > 0 && candidate + 0.01 < current) continue;
-                if (direction < 0 && candidate - 0.01 > current) continue;
-                candidates.push(candidate);
-            }
-            if (!candidates.length) return natural;
-            let best = candidates[0], distance = Math.abs(best - natural);
-            for (let i = 1; i < candidates.length; i++) {
-                const d = Math.abs(candidates[i] - natural);
-                if (d < distance) { best = candidates[i]; distance = d; }
-            }
-            return best;
-        }
-        __scrollToOptions(options, direction) {
-            checkedScrollBehavior(options);
-            let left = options.left === undefined ? this.scrollLeft : normalizedScrollNumber(options.left);
-            let top = options.top === undefined ? this.scrollTop : normalizedScrollNumber(options.top);
-            if (this.localName === "html") {
-                return g.scrollTo(left, top);
-            }
-            // CSSOM View clamps against the native scrolling area, including
-            // negative RTL/vertical ranges and non-scrollable overflow:clip.
-            left = this.__snapInlinePosition(left, direction || 0);
-            const changed = __dom_scroll_set(nodeIds.get(this), top, left);
-            if (!changed) return Promise.resolve();
-            const self = this;
-            return new Promise(function (resolve) { queueElementScroll(self, resolve); });
-        }
         scrollTo(x, y) {
             const options = (x !== null && typeof x === "object") ? x : { left: x, top: y };
-            return this.__scrollToOptions(options, 0);
+            return elementScrollToOptions.call(this, options, 0);
         }
         scroll(x, y) { return this.scrollTo(x, y); }
         scrollBy(x, y) {
@@ -6183,13 +6210,13 @@
             const dy = options.top === undefined ? 0 : normalizedScrollNumber(options.top);
             options.left = this.scrollLeft + dx;
             options.top = this.scrollTop + dy;
-            return this.__scrollToOptions(options, dx > 0 ? 1 : (dx < 0 ? -1 : 0));
+            return elementScrollToOptions.call(this, options, dx > 0 ? 1 : (dx < 0 ? -1 : 0));
         }
         scrollIntoView(arg) {
             // Boolean legacy: true ⇒ align top ("start"), false ⇒ bottom ("end").
             const block = (arg && typeof arg === "object" && arg.block) ? String(arg.block)
                 : (arg === false ? "end" : "start");
-            const top = this.__rect().top, bottom = this.__rect().bottom;
+            const top = elementDocumentRect.call(this).top, bottom = elementDocumentRect.call(this).bottom;
             // CSSOM View #scroll-a-target-into-view scrolls the scrolling boxes
             // that contain the target, i.e. those on its containing block chain
             // (WPT css/cssom-view/scrollintoview-containingblock-chain.html):
@@ -6211,7 +6238,7 @@
                 // (both measured at scroll 0 in the inline flow), so that offset
                 // IS the scrollTop that brings it to the container's top.
                 if (a.scrollHeight > a.clientHeight + 1) {
-                    const ar = a.__rect(), ch = a.clientHeight;
+                    const ar = elementDocumentRect.call(a), ch = a.clientHeight;
                     const offTop = top - ar.top, offBottom = bottom - ar.top;
                     if (block === "end") a.scrollTop = offBottom - ch;
                     else if (block === "center") a.scrollTop = (offTop + offBottom) / 2 - ch / 2;
@@ -6223,20 +6250,9 @@
         // Canonical fragment geometry in CSS pixels, before terminal-cell
         // quantization. Coordinates use the element's own Document origin,
         // including in nested navigables; a missing layout box returns null.
-        __rect() {
-            let r = null;
-            try { r = __dom_rect(nodeIds.get(this)); } catch (e) { r = null; }
-            if (r) {
-                const left = r[0], top = r[1], width = r[2], height = r[3];
-                return createDOMRect(left, top, width, height);
-            }
-            // CSSOM View §6: no associated layout box means an empty rectangle,
-            // including for hidden/detached embedded and replaced elements.
-            return createDOMRect();
-        }
         // getBoundingClientRect/getClientRects are VIEWPORT-relative (CSSOM
-        // View): the document-origin `__rect()` shifted up/left by the page
-        // scroll. At load scroll is 0 so this is `__rect()` unchanged; once the
+        // View): the document-origin `elementDocumentRect()` shifted up/left by the page
+        // scroll. At load scroll is 0 so this is `elementDocumentRect()` unchanged; once the
         // terminal threads a scroll position (PageCmd::Scroll → setScroll), a
         // scroll-based lazy-loader reading `getBoundingClientRect().top` sees the
         // box move through the viewport, exactly as in a browser. `offset*` stays
@@ -6290,7 +6306,7 @@
             v = normalizedScrollNumber(v);
             if (this.localName === "html") { g.scrollTo(v, g.scrollY || 0); return; }
             const direction = v > this.scrollLeft ? 1 : (v < this.scrollLeft ? -1 : 0);
-            v = this.__snapInlinePosition(v, direction);
+            v = elementSnapInlinePosition.call(this, v, direction);
             if (__dom_scroll_set(nodeIds.get(this), this.scrollTop, v)) queueElementScroll(this);
         }
     }
@@ -6370,7 +6386,7 @@
         if (state.network !== 0) queueMediaEvent(element, state, generation, "emptied");
         state.error = null;
         state.network = 3;
-        element.__ct = 0;
+        internalsFor(element).ct = 0;
         // Await a stable state. Reuse the private, captured microtask primitive,
         // which is initialized before any author script can invoke this path.
         imageMicrotask(function () {
@@ -6433,7 +6449,7 @@
         }
         pause() {}
         addTextTrack() { return { mode: "disabled", cues: null, activeCues: null, addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; }
-        fastSeek(t) { this.__ct = +t || 0; }
+        fastSeek(t) { internalsFor(this).ct = +t || 0; }
         get src() { const r = this.getAttribute("src"); if (r === null) return ""; const u = __url_parse(r, baseHref()); return u ? u[0] : r; }
         set src(v) { this.setAttribute("src", String(v)); }
         get currentSrc() { return mediaState(this).currentSrc; }
@@ -6446,19 +6462,19 @@
         get buffered() { return emptyTimeRanges(); }
         get played() { return emptyTimeRanges(); }
         get seekable() { return emptyTimeRanges(); }
-        get textTracks() { return this.__tt || (this.__tt = emptyTrackList()); }
-        get audioTracks() { return this.__at || (this.__at = emptyTrackList()); }
-        get videoTracks() { return this.__vt || (this.__vt = emptyTrackList()); }
-        get paused() { return this.__paused !== false; }
-        set paused(v) { this.__paused = !!v; }
-        get currentTime() { return this.__ct || 0; }
-        set currentTime(v) { this.__ct = +v || 0; }
-        get volume() { return this.__vol === undefined ? 1 : this.__vol; }
-        set volume(v) { this.__vol = +v; }
-        get muted() { return !!this.__muted; }
-        set muted(v) { this.__muted = !!v; }
-        get playbackRate() { return this.__pbr === undefined ? 1 : this.__pbr; }
-        set playbackRate(v) { this.__pbr = +v; }
+        get textTracks() { return internalsFor(this).tt || (internalsFor(this).tt = emptyTrackList()); }
+        get audioTracks() { return internalsFor(this).at || (internalsFor(this).at = emptyTrackList()); }
+        get videoTracks() { return internalsFor(this).vt || (internalsFor(this).vt = emptyTrackList()); }
+        get paused() { return internalsFor(this).paused !== false; }
+        set paused(v) { internalsFor(this).paused = !!v; }
+        get currentTime() { return internalsFor(this).ct || 0; }
+        set currentTime(v) { internalsFor(this).ct = +v || 0; }
+        get volume() { return internalsFor(this).vol === undefined ? 1 : internalsFor(this).vol; }
+        set volume(v) { internalsFor(this).vol = +v; }
+        get muted() { return !!internalsFor(this).muted; }
+        set muted(v) { internalsFor(this).muted = !!v; }
+        get playbackRate() { return internalsFor(this).pbr === undefined ? 1 : internalsFor(this).pbr; }
+        set playbackRate(v) { internalsFor(this).pbr = +v; }
         get defaultPlaybackRate() { return 1; }
         set defaultPlaybackRate(_v) {}
     }
@@ -8597,38 +8613,47 @@
     // HTMLSelectElement: options is the <option> descendants (optgroups included,
     // per spec) as a real Array. options/selectedOptions are read-only (getter-
     // only). value is the first selected option's value; set re-points it.
+    function selectOptions() { return this.querySelectorAll("option"); }
+    function selectSelectedOption() {
+        const os = selectOptions.call(this);
+        for (const o of os) if (o.selected) return o;
+        // A single (non-multiple) select with nothing explicitly selected
+        // defaults to its first option (HTML spec).
+        return (!this.multiple && os.length) ? os[0] : null;
+    }
+    function selectSetValue(val) {
+        const os = selectOptions.call(this); let matched = false;
+        for (const o of os) {
+            const m = !matched && o.value === val;
+            o.selected = m;
+            if (m) matched = true;
+        }
+    }
     class HTMLSelectElement extends HTMLElement {
-        __options() { return this.querySelectorAll("option"); }
-        __selectedOption() {
-            const os = this.__options();
-            for (const o of os) if (o.selected) return o;
-            // A single (non-multiple) select with nothing explicitly selected
-            // defaults to its first option (HTML spec).
-            return (!this.multiple && os.length) ? os[0] : null;
-        }
-        __selectValue(val) {
-            const os = this.__options(); let matched = false;
-            for (const o of os) {
-                const m = !matched && o.value === val;
-                o.selected = m;
-                if (m) matched = true;
+        get options() { return selectOptions.call(this); }
+        // HTML #dom-select-selectedoptions: a [SameObject] live HTMLCollection.
+        get selectedOptions() {
+            const slots = internalsFor(this);
+            if (!slots.selectedOptions) {
+                const select = this;
+                slots.selectedOptions = makeHTMLCollection(() =>
+                    Array.prototype.filter.call(selectOptions.call(select), (o) => o.selected));
             }
+            return slots.selectedOptions;
         }
-        get options() { return this.__options(); }
-        get selectedOptions() { return this.__options().filter((o) => o.selected); }
         get selectedIndex() {
-            const os = this.__options();
+            const os = selectOptions.call(this);
             for (let i = 0; i < os.length; i++) if (os[i].selected) return i;
             return this.multiple ? -1 : (os.length ? 0 : -1);
         }
         set selectedIndex(i) {
-            const os = this.__options(); i = Number(i);
+            const os = selectOptions.call(this); i = Number(i);
             for (let k = 0; k < os.length; k++) os[k].selected = (k === i);
         }
         get multiple() { return this.hasAttribute("multiple"); }
         set multiple(v) { if (v) this.setAttribute("multiple", ""); else this.removeAttribute("multiple"); }
-        get value() { const o = this.__selectedOption(); return o ? o.value : ""; }
-        set value(v) { this.__selectValue(String(v)); }
+        get value() { const o = selectSelectedOption.call(this); return o ? o.value : ""; }
+        set value(v) { selectSetValue.call(this, String(v)); }
     }
     // HTMLOptionElement.value falls back to text when the attribute is absent
     // (round-trips a valueless <option>). selected/defaultSelected both reflect
@@ -8698,8 +8723,8 @@
             }
             if (v) this.setAttribute("checked", ""); else this.removeAttribute("checked");
         }
-        get indeterminate() { return !!this.__trustIndeterminate; }
-        set indeterminate(v) { this.__trustIndeterminate = !!v; }
+        get indeterminate() { return !!internalsFor(this).trustIndeterminate; }
+        set indeterminate(v) { internalsFor(this).trustIndeterminate = !!v; }
         get type() { requireHTMLInterface(this,["input"]); return __dom_input(elementIdentity(this), "type", null); }
         set type(v) { requireHTMLInterface(this,["input"]); this.setAttribute("type", domString(v)); }
     }
@@ -8816,16 +8841,16 @@
         set src(v) { this.setAttribute("src", String(v)); }
         get noModule() { return this.hasAttribute("nomodule"); }
         set noModule(v) { if (v) this.setAttribute("nomodule", ""); else this.removeAttribute("nomodule"); }
-        get async() { return this.__trustForceAsync === true || this.hasAttribute("async"); }
+        get async() { return internalsFor(this).trustForceAsync === true || this.hasAttribute("async"); }
         set async(v) {
-            this.__trustForceAsync = false;
+            internalsFor(this).trustForceAsync = false;
             if (v) this.setAttribute("async", ""); else this.removeAttribute("async");
         }
         get defer() { return this.hasAttribute("defer"); }
         set defer(v) { if (v) this.setAttribute("defer", ""); else this.removeAttribute("defer"); }
         get blocking() {
-            return this.__trustBlocking
-                || (this.__trustBlocking = new DOMTokenList(this, "blocking", ["render"]));
+            return internalsFor(this).trustBlocking
+                || (internalsFor(this).trustBlocking = new DOMTokenList(this, "blocking", ["render"]));
         }
         get crossOrigin() {
             const raw = this.getAttribute("crossorigin");
@@ -8866,8 +8891,8 @@
         constructor(...args) { super(...args); return formElementProxy(this); }
         reset() { requireHTMLInterface(this,["form"]); resetForm(this); }
         get elements() {
-            return this.__trustElements
-                || (this.__trustElements = new HTMLFormControlsCollection(this));
+            return internalsFor(this).trustElements
+                || (internalsFor(this).trustElements = new HTMLFormControlsCollection(this));
         }
         get length() { return this.elements.length; }
         checkValidity() {
@@ -8900,7 +8925,7 @@
             }
             // The form submission algorithm aborts before validation/event
             // dispatch when the form cannot navigate.
-            if (!this.isConnected || this.__trustFiringSubmit) return;
+            if (!this.isConnected || internalsFor(this).trustFiringSubmit) return;
             const skipValidation = this.hasAttribute("novalidate")
                 || (submitter && submitter.hasAttribute("formnovalidate"));
             if (!skipValidation && !this.checkValidity()) return;
@@ -8909,11 +8934,11 @@
                 cancelable: true,
                 submitter: submitter,
             });
-            this.__trustFiringSubmit = true;
+            internalsFor(this).trustFiringSubmit = true;
             try {
                 dispatch(this, ev, false);
             } finally {
-                this.__trustFiringSubmit = false;
+                internalsFor(this).trustFiringSubmit = false;
             }
             if (!ev.defaultPrevented) {
                 if (handleDialogSubmission(this, submitter)) return;
@@ -9177,15 +9202,15 @@
     function elementSheet(owner) {
         const raw=__css_sheet(nodeIds.get(owner), "");
         if (raw===null) {
-            if (owner.__sheet) owner.__sheet.ownerNode=null;
-            owner.__sheet=null; return null;
+            if (internalsFor(owner).sheet) internalsFor(owner).sheet.ownerNode=null;
+            internalsFor(owner).sheet=null; return null;
         }
         const [version,text]=JSON.parse(raw);
-        if (!owner.__sheet || owner.__sheetVersion!==version || owner.__sheetText!==text) {
-            if (owner.__sheet) owner.__sheet.ownerNode=null;
-            owner.__sheet=makeStyleSheet(text,owner); owner.__sheetVersion=version; owner.__sheetText=text;
+        if (!internalsFor(owner).sheet || internalsFor(owner).sheetVersion!==version || internalsFor(owner).sheetText!==text) {
+            if (internalsFor(owner).sheet) internalsFor(owner).sheet.ownerNode=null;
+            internalsFor(owner).sheet=makeStyleSheet(text,owner); internalsFor(owner).sheetVersion=version; internalsFor(owner).sheetText=text;
         }
-        return owner.__sheet;
+        return internalsFor(owner).sheet;
     }
     class HTMLStyleElement extends HTMLElement {
         get sheet() { return elementSheet(this); }
@@ -9213,11 +9238,28 @@
     // and fires `close`. beforetoggle/toggle (ToggleEvent) fire like popovers.
     // `closedBy` is intentionally omitted (its enumerated defaults are too new
     // to implement without guessing — feature-detectable as undefined).
+    function dialogClose(result) {
+        if (!this.hasAttribute("open")) return;
+        dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
+        if (!this.hasAttribute("open")) return;
+        this.removeAttribute("open");
+        __dom_dialog_modal(nodeIds.get(this), false);
+        if (result !== null) internalsFor(this).dlgReturn = result;
+        const self = this;
+        g.setTimeout(function () {
+            dispatch(self, new g.ToggleEvent("toggle", { oldState: "open", newState: "closed" }), false);
+            dispatch(self, new Event("close"), false);
+        }, 0);
+    }
+    function dialogToggle(oldState, newState) {
+        const self = this;
+        g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: oldState, newState: newState }), false); }, 0);
+    }
     class HTMLDialogElement extends HTMLElement {
         get open() { return this.hasAttribute("open"); }
         set open(v) { if (v) this.setAttribute("open", ""); else this.removeAttribute("open"); }
-        get returnValue() { return this.__dlgReturn == null ? "" : this.__dlgReturn; }
-        set returnValue(v) { this.__dlgReturn = v == null ? "" : String(v); }
+        get returnValue() { return internalsFor(this).dlgReturn == null ? "" : internalsFor(this).dlgReturn; }
+        set returnValue(v) { internalsFor(this).dlgReturn = v == null ? "" : String(v); }
         show() {
             if (this.hasAttribute("open")) {
                 if (!__dom_dialog_modal(nodeIds.get(this))) return; // already open (non-modal): no-op
@@ -9227,7 +9269,7 @@
             dispatch(this, bev, false);
             if (bev.defaultPrevented || this.hasAttribute("open")) return;
             this.setAttribute("open", "");
-            this.__dlgToggle("closed", "open");
+            dialogToggle.call(this, "closed", "open");
         }
         showModal() {
             if (this.hasAttribute("open")) {
@@ -9240,36 +9282,19 @@
             if (bev.defaultPrevented || this.hasAttribute("open")) return;
             this.setAttribute("open", "");
             __dom_dialog_modal(nodeIds.get(this), true);
-            this.__dlgToggle("closed", "open");
+            dialogToggle.call(this, "closed", "open");
         }
         close(returnValue) {
-            this.__dlgClose(arguments.length ? String(returnValue) : null);
+            dialogClose.call(this, arguments.length ? String(returnValue) : null);
         }
         requestClose(returnValue) {
             if (!this.hasAttribute("open")) return;
             const cev = new Event("cancel", { cancelable: true });
             dispatch(this, cev, false);
             if (cev.defaultPrevented) return;
-            this.__dlgClose(arguments.length ? String(returnValue) : null);
+            dialogClose.call(this, arguments.length ? String(returnValue) : null);
         }
         // "Close the dialog": remove `open`, set returnValue, queue toggle + close.
-        __dlgClose(result) {
-            if (!this.hasAttribute("open")) return;
-            dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
-            if (!this.hasAttribute("open")) return;
-            this.removeAttribute("open");
-            __dom_dialog_modal(nodeIds.get(this), false);
-            if (result !== null) this.__dlgReturn = result;
-            const self = this;
-            g.setTimeout(function () {
-                dispatch(self, new g.ToggleEvent("toggle", { oldState: "open", newState: "closed" }), false);
-                dispatch(self, new Event("close"), false);
-            }, 0);
-        }
-        __dlgToggle(oldState, newState) {
-            const self = this;
-            g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: oldState, newState: newState }), false); }, 0);
-        }
     }
 
     // Obsolete but required by HTML §16.3.1. The rendering layer samples the
@@ -10009,7 +10034,7 @@
             const slot = assignedSlotInternal(this);
             if (!slot) return null;
             const root = rootOfNode(slot);
-            return root instanceof ShadowRoot && root.__mode === "closed" ? null : slot;
+            return root instanceof ShadowRoot && internalsFor(root).mode === "closed" ? null : slot;
         }
         get [Symbol.toStringTag]() { return "Text"; }
     }
@@ -10095,7 +10120,7 @@
     function documentLocation() {
         if (!(this instanceof Document)) throw new TypeError("Expected a Document");
         if (internalsOf(this).frame) {
-            if (this.__destroyed || __dom_frame_document(nodeIds.get(internalsOf(this).frame)) !== nodeIds.get(this) ||
+            if (internalsFor(this).destroyed || __dom_frame_document(nodeIds.get(internalsOf(this).frame)) !== nodeIds.get(this) ||
                 !internalsOf(this).frame.isConnected || internalsOf(this).frame.ownerDocument.location === null) return null;
             return trust.__activeFrame === internalsOf(this).frame ? g.location : internalsOf(this).frame.contentWindow.location;
         }
@@ -10167,7 +10192,7 @@
         // CSS Font Loading Module Level 3 §4.2: a document's font source is a
         // stable FontFaceSet.  Its setlike collection is independent per
         // Document, including detached documents created by DOMParser.
-        get fonts() { return this.__fonts || (this.__fonts = new FontFaceSet()); }
+        get fonts() { return internalsFor(this).fonts || (internalsFor(this).fonts = new FontFaceSet()); }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         // HTML §the title element: setting with no <title> CREATES one in the
         // head (the old setter silently dropped the write); no head → no-op.
@@ -10203,8 +10228,8 @@
         // it so a `document.domain = document.domain` round-trips, but it has
         // no cross-origin effect here. Missing this throws on sites that read
         // it (GitHub's behaviors bundle: "Unable to get document domain").
-        get domain() { return this.__domain !== undefined ? this.__domain : g.location.hostname; }
-        set domain(v) { this.__domain = String(v); }
+        get domain() { return internalsFor(this).domain !== undefined ? internalsFor(this).domain : g.location.hostname; }
+        set domain(v) { internalsFor(this).domain = String(v); }
         get defaultView() { return nodeIds.get(this) === 0 ? g : null; }
         // HTML Document creation: snapshot the final request referrer, or the
         // empty default for a Document without navigation request metadata.
@@ -10274,8 +10299,8 @@
         // elements' parsed sheets. Didn't exist at all before — code iterating
         // it threw on `undefined`.
         get styleSheets() {
-            if (!this.__styleSheets) this.__styleSheets = new StyleSheetList(() => Array.from(this.querySelectorAll("style, link[rel~='stylesheet']"), (s) => s.sheet).filter(Boolean));
-            return this.__styleSheets;
+            if (!internalsFor(this).styleSheets) internalsFor(this).styleSheets = new StyleSheetList(() => Array.from(this.querySelectorAll("style, link[rel~='stylesheet']"), (s) => s.sheet).filter(Boolean));
+            return internalsFor(this).styleSheets;
         }
         createElement(t) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createElement': 1 argument required");
@@ -10290,7 +10315,7 @@
             // scripts a true force-async flag. Setting async (as an IDL or
             // content attribute) clears it; parser-created wrappers never get
             // this marker and therefore default to false.
-            if (el.localName === "script") el.__trustForceAsync = true;
+            if (el.localName === "script") internalsFor(el).trustForceAsync = true;
             const ctor = namespace === HTML_NS ? CE.defs.get(localName) : null;
             if (ctor) upgradeElement(el, ctor);
             return el;
@@ -10307,7 +10332,7 @@
                 __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName, nodeIds.get(this)),
                 localName, extracted[0], extracted[1]
             );
-            if (extracted[0] === HTML_NS && localName === "script") el.__trustForceAsync = true;
+            if (extracted[0] === HTML_NS && localName === "script") internalsFor(el).trustForceAsync = true;
             if (extracted[0] === HTML_NS) {
                 const ctor = CE.defs.get(localName);
                 if (ctor) upgradeElement(el, ctor);
@@ -10430,7 +10455,7 @@
             const url = frameEl === realmRootFrame ? String(cfg.url) : frameURLFor(frameEl);
             documentURLs.set(this, url);
             const inheritedBase = frameEl === realmRootFrame ? cfg.aboutBaseURL : frameAboutBaseURLs.get(frameEl);
-            this.__fallbackBaseURL = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(url) && inheritedBase
+            internalsFor(this).fallbackBaseURL = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(url) && inheritedBase
                 ? inheritedBase : url;
             documentReferrers.set(this, frameEl === realmRootFrame
                 ? configuredReferrer : frameReferrers.get(frameEl) || "");
@@ -10458,10 +10483,10 @@
         get head() { return this.documentElement?.querySelector("head") || null; }
         get body() { return this.documentElement?.querySelector("body, frameset") || null; }
         get defaultView() {
-            if (this.__destroyed) return null;
+            if (internalsFor(this).destroyed) return null;
             return trust.__activeFrame === internalsOf(this).frame ? g : internalsOf(this).frame.contentWindow;
         }
-        get readyState() { return internalsOf(this).frame.__trustReadyState || "complete"; }
+        get readyState() { return internalsFor(internalsOf(this).frame).trustReadyState || "complete"; }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
         get URL() { return documentURLs.get(this); }
@@ -10471,7 +10496,7 @@
         // the currently active page scope.
         get baseURI() {
             const base = this.querySelector("base[href]");
-            const fallback = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(this.URL) ? this.__fallbackBaseURL : this.URL;
+            const fallback = /^about:(?:blank|srcdoc)(?:[?#]|$)/.test(this.URL) ? internalsFor(this).fallbackBaseURL : this.URL;
             const parsed = base && __url_parse(base.getAttribute("href"), fallback);
             return parsed ? parsed[0] : fallback;
         }
@@ -10649,18 +10674,18 @@
         const rawCurrent = trust.currentScript;
         const script = typeof rawCurrent === "number" ? wrap(rawCurrent) : null;
         const ownerFrame = doc instanceof FrameDocument ? internalsOf(doc).frame : null;
-        if (script && script.localName === "script" && script.__trustForceAsync !== true &&
+        if (script && script.localName === "script" && internalsFor(script).trustForceAsync !== true &&
             frameOwnerForNode(script) === ownerFrame && script.parentNode) {
             const parent = script.parentNode;
-            let cursor = typeof script.__trustWriteCursor === "number"
-                ? wrap(script.__trustWriteCursor) : script;
+            let cursor = typeof internalsFor(script).trustWriteCursor === "number"
+                ? wrap(internalsFor(script).trustWriteCursor) : script;
             if (!cursor || cursor.parentNode !== parent) cursor = script;
             const sourceSuccessor = cursor.nextSibling;
             cursor.insertAdjacentHTML("afterend", markup);
             let tail = cursor;
             while (tail.nextSibling && tail.nextSibling !== sourceSuccessor)
                 tail = tail.nextSibling;
-            script.__trustWriteCursor = nodeIds.get(tail);
+            internalsFor(script).trustWriteCursor = nodeIds.get(tail);
             if (tail !== cursor) prepareWrittenScripts(cursor.nextSibling, tail, script);
             return;
         }
@@ -10812,7 +10837,7 @@
             get origin() { return inherited ? parentLocation.origin : state[8]; },
             assign(v) { try { frame.setAttribute("src", String(v)); } catch (e) {} },
             replace(v) { try { frame.setAttribute("src", String(v)); } catch (e) {} },
-            reload() { try { frame.__loadedSrc = undefined; queueFrameNavigation(frame); } catch (e) {} },
+            reload() { try { internalsFor(frame).loadedSrc = undefined; queueFrameNavigation(frame); } catch (e) {} },
             toString() { return state[0]; },
         };
     }
@@ -10920,12 +10945,12 @@
     }
     function saveAnimationFrameMethods(frame) {
         const methods = animationFrameMethods();
-        if (frame) frame.__trustAnimationFrameMethods = methods;
+        if (frame) internalsFor(frame).trustAnimationFrameMethods = methods;
         else topAnimationFrameMethods = methods;
     }
     function restoreAnimationFrameMethods(frame) {
         const methods = frame
-            ? (frame.__trustAnimationFrameMethods || pristineAnimationFrameMethods)
+            ? (internalsFor(frame).trustAnimationFrameMethods || pristineAnimationFrameMethods)
             : topAnimationFrameMethods;
         if (!methods) return;
         g.requestAnimationFrame = methods.request;
@@ -10989,7 +11014,7 @@
                     data: message, origin: origin || "", source: receiverSource || source || g,
                     ports: ports || [],
                 });
-                ev.__windowTargetSet = true; ev.__frameTarget = frame || null;
+                internalsFor(ev).windowTargetSet = true; internalsFor(ev).frameTarget = frame || null;
                 g.dispatchEvent(ev);
             });
         }, 0);
@@ -11001,7 +11026,7 @@
                     data: message, origin: origin || "", source: source || g,
                     ports: ports || [],
                 });
-                ev.__windowTargetSet = true; ev.__frameTarget = null;
+                internalsFor(ev).windowTargetSet = true; internalsFor(ev).frameTarget = null;
                 g.dispatchEvent(ev);
             });
         }, 0);
@@ -11138,7 +11163,7 @@
     };
 
     function waitForFrameResource(node, start, done) {
-        if (node.__trustResourceSettled) { done(); return; }
+        if (internalsFor(node).trustResourceSettled) { done(); return; }
         let finished = false;
         function finish() {
             if (finished) return;
@@ -11152,7 +11177,7 @@
         start();
         // Host failures can dispatch synchronously when no resource task can
         // be queued. Do not strand the document lifecycle in that case.
-        if (node.__trustResourceSettled) finish();
+        if (internalsFor(node).trustResourceSettled) finish();
     }
     function loadFrameStyles(frame, done) {
         done = typeof done === "function" ? done : function () {};
@@ -11186,7 +11211,7 @@
             for (const link of sheets) {
                 waitForFrameResource(link, function () {
                     try { maybeLoadStylesheet(link); }
-                    catch (e) { link.__trustResourceSettled = "error"; }
+                    catch (e) { internalsFor(link).trustResourceSettled = "error"; }
                 }, settled);
             }
         });
@@ -11204,10 +11229,10 @@
             try { scripts = frameDocument(frame).querySelectorAll("script"); }
             catch (e) { parserDone(); allDone(); return; }
             ftrace("runFrameScripts found=" + scripts.length);
-            const generation = frame.__trustLoadGeneration;
+            const generation = internalsFor(frame).trustLoadGeneration;
             const orderedScripts = [];
             let pendingResources = 0, parserFinished = false, loadFinished = false;
-            function active() { return generation === frame.__trustLoadGeneration; }
+            function active() { return generation === internalsFor(frame).trustLoadGeneration; }
             function finishLoad() {
                 if (!active() || loadFinished || !parserFinished || pendingResources) return;
                 loadFinished = true;
@@ -11278,7 +11303,7 @@
                 // list. DOMContentLoaded waits for that list; load also waits
                 // for every asynchronous classic or module script.
                 if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
-                else frame.__trustReadyState = "interactive";
+                else internalsFor(frame).trustReadyState = "interactive";
                 startOrdered(0);
             }
             // Empty/text documents and inline-only fragments never suspend
@@ -11304,7 +11329,7 @@
                     if (!active()) return;
                 }
                 if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
-                else frame.__trustReadyState = 'interactive';
+                else internalsFor(frame).trustReadyState = 'interactive';
                 parserDone();
                 allDone();
                 return;
@@ -11333,6 +11358,50 @@
     // those methods threw `… is not a callable (reading 'firstChild')` during
     // React render, which GitHub's top-level boundary turned into "Unable to
     // load page." (FILTER_ACCEPT=1, FILTER_REJECT=2, FILTER_SKIP=3.)
+    function treeWalkerFilter(n) {
+        const t = n.nodeType;
+        const bit = (t >= 1 && t <= 32) ? (1 << (t - 1)) : 0;
+        if ((this.whatToShow & bit) === 0) return 3; // FILTER_SKIP
+        const f = this.filter;
+        if (f === null) return 1; // FILTER_ACCEPT
+        return typeof f === "function" ? f(n) : f.acceptNode(n);
+    }
+    function treeWalkerChildren(first) {
+        let node = first ? this.currentNode.firstChild : this.currentNode.lastChild;
+        while (node) {
+            const result = treeWalkerFilter.call(this, node);
+            if (result === 1) { this.currentNode = node; return node; }
+            if (result === 3) {
+                const child = first ? node.firstChild : node.lastChild;
+                if (child) { node = child; continue; }
+            }
+            while (node) {
+                const sibling = first ? node.nextSibling : node.previousSibling;
+                if (sibling) { node = sibling; break; }
+                const parent = node.parentNode;
+                if (!parent || parent === this.root || parent === this.currentNode) return null;
+                node = parent;
+            }
+        }
+        return null;
+    }
+    function treeWalkerSiblings(next) {
+        let node = this.currentNode;
+        if (node === this.root) return null;
+        for (;;) {
+            let sibling = next ? node.nextSibling : node.previousSibling;
+            while (sibling) {
+                node = sibling;
+                const result = treeWalkerFilter.call(this, node);
+                if (result === 1) { this.currentNode = node; return node; }
+                sibling = next ? node.firstChild : node.lastChild;
+                if (result === 2 || !sibling) sibling = next ? node.nextSibling : node.previousSibling;
+            }
+            node = node.parentNode;
+            if (!node || node === this.root) return null;
+            if (treeWalkerFilter.call(this, node) === 1) return null;
+        }
+    }
     class TreeWalker {
         constructor(root, whatToShow, filter) {
             this.root = root;
@@ -11340,61 +11409,17 @@
             this.whatToShow = (whatToShow === undefined ? 0xFFFFFFFF : whatToShow) >>> 0;
             this.filter = filter || null;
         }
-        __filter(n) {
-            const t = n.nodeType;
-            const bit = (t >= 1 && t <= 32) ? (1 << (t - 1)) : 0;
-            if ((this.whatToShow & bit) === 0) return 3; // FILTER_SKIP
-            const f = this.filter;
-            if (f === null) return 1; // FILTER_ACCEPT
-            return typeof f === "function" ? f(n) : f.acceptNode(n);
-        }
         // "traverse children", first=true -> firstChild(), false -> lastChild().
-        __children(first) {
-            let node = first ? this.currentNode.firstChild : this.currentNode.lastChild;
-            while (node) {
-                const result = this.__filter(node);
-                if (result === 1) { this.currentNode = node; return node; }
-                if (result === 3) {
-                    const child = first ? node.firstChild : node.lastChild;
-                    if (child) { node = child; continue; }
-                }
-                while (node) {
-                    const sibling = first ? node.nextSibling : node.previousSibling;
-                    if (sibling) { node = sibling; break; }
-                    const parent = node.parentNode;
-                    if (!parent || parent === this.root || parent === this.currentNode) return null;
-                    node = parent;
-                }
-            }
-            return null;
-        }
-        firstChild() { return this.__children(true); }
-        lastChild() { return this.__children(false); }
+        firstChild() { return treeWalkerChildren.call(this, true); }
+        lastChild() { return treeWalkerChildren.call(this, false); }
         // "traverse siblings", next=true -> nextSibling(), false -> previousSibling().
-        __siblings(next) {
-            let node = this.currentNode;
-            if (node === this.root) return null;
-            for (;;) {
-                let sibling = next ? node.nextSibling : node.previousSibling;
-                while (sibling) {
-                    node = sibling;
-                    const result = this.__filter(node);
-                    if (result === 1) { this.currentNode = node; return node; }
-                    sibling = next ? node.firstChild : node.lastChild;
-                    if (result === 2 || !sibling) sibling = next ? node.nextSibling : node.previousSibling;
-                }
-                node = node.parentNode;
-                if (!node || node === this.root) return null;
-                if (this.__filter(node) === 1) return null;
-            }
-        }
-        nextSibling() { return this.__siblings(true); }
-        previousSibling() { return this.__siblings(false); }
+        nextSibling() { return treeWalkerSiblings.call(this, true); }
+        previousSibling() { return treeWalkerSiblings.call(this, false); }
         parentNode() {
             let node = this.currentNode;
             while (node && node !== this.root) {
                 node = node.parentNode;
-                if (node && this.__filter(node) === 1) { this.currentNode = node; return node; }
+                if (node && treeWalkerFilter.call(this, node) === 1) { this.currentNode = node; return node; }
             }
             return null;
         }
@@ -11404,7 +11429,7 @@
             for (;;) {
                 while (result !== 2 && node.firstChild) {
                     node = node.firstChild;
-                    result = this.__filter(node);
+                    result = treeWalkerFilter.call(this, node);
                     if (result === 1) { this.currentNode = node; return node; }
                 }
                 let temporary = node;
@@ -11416,7 +11441,7 @@
                     temporary = temporary.parentNode;
                 }
                 if (!broke) return null;
-                result = this.__filter(node);
+                result = treeWalkerFilter.call(this, node);
                 if (result === 1) { this.currentNode = node; return node; }
             }
         }
@@ -11426,17 +11451,17 @@
                 let sibling = node.previousSibling;
                 while (sibling) {
                     node = sibling;
-                    let result = this.__filter(node);
+                    let result = treeWalkerFilter.call(this, node);
                     while (result !== 2 && node.lastChild) {
                         node = node.lastChild;
-                        result = this.__filter(node);
+                        result = treeWalkerFilter.call(this, node);
                     }
                     if (result === 1) { this.currentNode = node; return node; }
                     sibling = node.previousSibling;
                 }
                 if (node === this.root || !node.parentNode) return null;
                 node = node.parentNode;
-                if (this.__filter(node) === 1) { this.currentNode = node; return node; }
+                if (treeWalkerFilter.call(this, node) === 1) { this.currentNode = node; return node; }
             }
             return null;
         }
@@ -11446,6 +11471,36 @@
     // (`ownerDocument.createNodeIterator(body, …)`). Live, not a snapshot —
     // a sanitizer that removes the current node detaches it, so iteration
     // would stop at that subtree; benign for the content we run it on.
+    function nodeIteratorFilter(n) {
+        const bit = n.nodeType === 1 ? 1 : n.nodeType === 3 ? 4 : n.nodeType === 8 ? 128 : 0;
+        if ((this.whatToShow & bit) === 0) return 3;
+        if (this.filter === null) return 1;
+        if (internalsFor(this).active) throw new DOMException("The traversal filter is active", "InvalidStateError");
+        internalsFor(this).active = true;
+        try {
+            return typeof this.filter === "function"
+                ? this.filter(n) : this.filter.acceptNode(n);
+        } finally {
+            internalsFor(this).active = false;
+        }
+    }
+    function nodeIteratorAfter(n) {
+        let next = n.firstChild;
+        if (next) return next;
+        let cur = n;
+        while (cur && cur !== this.root) {
+            if (cur.nextSibling) return cur.nextSibling;
+            cur = cur.parentNode;
+        }
+        return null;
+    }
+    function nodeIteratorBefore(n) {
+        if (n === this.root) return null;
+        let previous = n.previousSibling;
+        if (!previous) return n.parentNode;
+        while (previous.lastChild) previous = previous.lastChild;
+        return previous;
+    }
     class NodeIterator {
         constructor(root, whatToShow, filter) {
             this.root = root;
@@ -11453,57 +11508,27 @@
             this.pointerBeforeReferenceNode = true;
             this.whatToShow = (whatToShow === undefined ? 0xFFFFFFFF : whatToShow) >>> 0;
             this.filter = filter || null;
-            this.__active = false;
-        }
-        __filter(n) {
-            const bit = n.nodeType === 1 ? 1 : n.nodeType === 3 ? 4 : n.nodeType === 8 ? 128 : 0;
-            if ((this.whatToShow & bit) === 0) return 3;
-            if (this.filter === null) return 1;
-            if (this.__active) throw new DOMException("The traversal filter is active", "InvalidStateError");
-            this.__active = true;
-            try {
-                return typeof this.filter === "function"
-                    ? this.filter(n) : this.filter.acceptNode(n);
-            } finally {
-                this.__active = false;
-            }
+            internalsFor(this).active = false;
         }
         // The document-order successor of `n` within `root`.
-        __after(n) {
-            let next = n.firstChild;
-            if (next) return next;
-            let cur = n;
-            while (cur && cur !== this.root) {
-                if (cur.nextSibling) return cur.nextSibling;
-                cur = cur.parentNode;
-            }
-            return null;
-        }
         nextNode() {
             let node = this.referenceNode;
             let before = this.pointerBeforeReferenceNode;
             for (;;) {
                 if (before) { before = false; }
                 else {
-                    const nx = this.__after(node);
+                    const nx = nodeIteratorAfter.call(this, node);
                     if (!nx) return null;
                     node = nx;
                 }
                 // NodeIterator treats FILTER_REJECT like FILTER_SKIP: unlike a
                 // TreeWalker it never prunes a rejected node's descendants.
-                if (this.__filter(node) === 1) {
+                if (nodeIteratorFilter.call(this, node) === 1) {
                     this.referenceNode = node;
                     this.pointerBeforeReferenceNode = false;
                     return node;
                 }
             }
-        }
-        __before(n) {
-            if (n === this.root) return null;
-            let previous = n.previousSibling;
-            if (!previous) return n.parentNode;
-            while (previous.lastChild) previous = previous.lastChild;
-            return previous;
         }
         previousNode() {
             let node = this.referenceNode;
@@ -11511,10 +11536,10 @@
             for (;;) {
                 if (!before) before = true;
                 else {
-                    node = this.__before(node);
+                    node = nodeIteratorBefore.call(this, node);
                     if (!node) return null;
                 }
-                if (this.__filter(node) === 1) {
+                if (nodeIteratorFilter.call(this, node) === 1) {
                     this.referenceNode = node;
                     this.pointerBeforeReferenceNode = true;
                     return node;
@@ -11568,12 +11593,12 @@
         get nodeType() { return 11; }
         get nodeName() { return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "ShadowRoot"; }
-        get host() { return this.__host || null; }
-        get mode() { return this.__mode || "open"; }
-        get delegatesFocus() { return !!this.__delegatesFocus; }
-        get serializable() { return !!this.__serializable; }
-        get clonable() { return !!this.__clonable; }
-        get slotAssignment() { return this.__slotAssignment || "named"; }
+        get host() { return internalsFor(this).host || null; }
+        get mode() { return internalsFor(this).mode || "open"; }
+        get delegatesFocus() { return !!internalsFor(this).delegatesFocus; }
+        get serializable() { return !!internalsFor(this).serializable; }
+        get clonable() { return !!internalsFor(this).clonable; }
+        get slotAssignment() { return internalsFor(this).slotAssignment || "named"; }
         get activeElement() { return activeElementFor(this); }
         get innerHTML() { return __dom_inner_html(nodeIds.get(this)); }
         set innerHTML(v) {
@@ -11646,8 +11671,8 @@
         for (const root of roots) {
             for (const slot of root.querySelectorAll("slot")) {
                 const signature = __dom_slot_assigned(nodeIds.get(slot)).join(",");
-                const previous = slot.__trustSlotSignature === undefined ? "" : slot.__trustSlotSignature;
-                slot.__trustSlotSignature = signature;
+                const previous = internalsFor(slot).trustSlotSignature === undefined ? "" : internalsFor(slot).trustSlotSignature;
+                internalsFor(slot).trustSlotSignature = signature;
                 if (signature !== previous) changed.push(slot);
             }
         }
@@ -11657,8 +11682,8 @@
 
     // --- the custom elements registry ---
     function upgradeElement(el, ctor) {
-        if (el.__ceUpgraded) return;
-        el.__ceUpgraded = true;
+        if (internalsFor(el).ceUpgraded) return;
+        internalsFor(el).ceUpgraded = true;
         // Read observedAttributes BEFORE constructing — the platform
         // contract define() relies on. Lit's static getter runs its
         // finalize() here, creating reactive accessors; construct
@@ -11680,9 +11705,9 @@
         maybeConnect(el);
     }
     function maybeConnect(el) {
-        if (el.__ceUpgraded && !el.__ceConnected && el.isConnected
+        if (internalsFor(el).ceUpgraded && !internalsFor(el).ceConnected && el.isConnected
             && typeof el.connectedCallback === "function") {
-            el.__ceConnected = true;
+            internalsFor(el).ceConnected = true;
             try { el.connectedCallback(); }
             catch (e) { trust.errors.push("connectedCallback: " + ((e && e.message) || e)); }
         }
@@ -11708,7 +11733,7 @@
         const ids = __dom_ce_candidates(nodeIds.get(node));
         for (let i = 0; i < ids.length; i++) {
             const el = wrap(ids[i]);
-            if (el.__ceUpgraded && typeof el.adoptedCallback === "function") {
+            if (internalsFor(el).ceUpgraded && typeof el.adoptedCallback === "function") {
                 try { el.adoptedCallback(oldDocument, newDocument); }
                 catch (e) { trust.errors.push("adoptedCallback: " + ((e && e.message) || e)); }
             }
@@ -11738,20 +11763,20 @@
         const ids = __dom_upgrade_candidates(nodeIds.get(g.document), name);
         for (let i = 0; i < ids.length; i++) {
             const el = wrap(ids[i]);
-            if (el.__ceUpgraded) maybeConnect(el);
+            if (internalsFor(el).ceUpgraded) maybeConnect(el);
         }
     }
     function ceDisconnect(node) {
         if (!node || typeof node !== "object") return;
-        if (node.__ceConnected && typeof node.disconnectedCallback === "function") {
-            node.__ceConnected = false;
+        if (internalsFor(node).ceConnected && typeof node.disconnectedCallback === "function") {
+            internalsFor(node).ceConnected = false;
             try { node.disconnectedCallback(); }
             catch (e) { trust.errors.push("disconnectedCallback: " + ((e && e.message) || e)); }
         }
         if (node.childNodes) for (const c of node.childNodes) ceDisconnect(c);
     }
     function ceAttrChanged(el, name, old, val) {
-        if (!el.__ceUpgraded || old === val) return;
+        if (!internalsFor(el).ceUpgraded || old === val) return;
         const observed = (el.constructor && el.constructor.observedAttributes) || [];
         if (observed.includes(name) && typeof el.attributeChangedCallback === "function") {
             try { el.attributeChangedCallback(name, old, val); }
@@ -11770,25 +11795,25 @@
         return VALID_CUSTOM_ELEMENT_NAME.test(name) &&
             !RESERVED_CUSTOM_ELEMENT_NAMES.has(name);
     }
+    function registryIsCurrentWindow() {
+        if (!internalsFor(this).windowState) return false;
+        const current = internalsOf(this).frame
+            ? frameWindowStates.get(internalsOf(this).frame)
+            : topWindowState;
+        return current === internalsFor(this).windowState;
+    }
+    function registryWithAssociatedDocument(callback) {
+        if (!registryIsCurrentWindow.call(this)) return;
+        runInFrame(internalsOf(this).frame, callback);
+    }
     class CustomElementRegistry {
         constructor(state, windowState, frame) {
             // The public constructor creates an initially-empty scoped
             // registry. Window-associated registries pass their state through
             // the internal three-argument path below.
-            this.__state = state || createCustomElementState();
-            this.__windowState = windowState || null;
+            internalsFor(this).state = state || createCustomElementState();
+            internalsFor(this).windowState = windowState || null;
             internalsFor(this).frame = frame || null;
-        }
-        __isCurrentWindowRegistry() {
-            if (!this.__windowState) return false;
-            const current = internalsOf(this).frame
-                ? frameWindowStates.get(internalsOf(this).frame)
-                : topWindowState;
-            return current === this.__windowState;
-        }
-        __withAssociatedDocument(callback) {
-            if (!this.__isCurrentWindowRegistry()) return;
-            runInFrame(internalsOf(this).frame, callback);
         }
         define(name, ctor) {
             name = String(name);
@@ -11796,27 +11821,27 @@
                 throw new TypeError("Custom element constructor must be a constructor");
             if (!isValidCustomElementName(name))
                 throw new DOMException("Invalid custom element name", "SyntaxError");
-            const state = this.__state;
+            const state = internalsFor(this).state;
             if (state.defs.has(name) || state.tags.has(ctor))
                 throw new DOMException("Custom element already defined", "NotSupportedError");
             // The registration-time observedAttributes read (see above).
             try { void (ctor.observedAttributes || []); } catch (e) { /* page's problem */ }
             state.defs.set(name, ctor);
             state.tags.set(ctor, name);
-            this.__withAssociatedDocument(() => {
+            registryWithAssociatedDocument.call(this, () => {
                 ceUpgradeName(name, ctor);
                 Promise.resolve().then(() => ceConnectName(name));
             });
             const w = state.waiting.get(name);
             if (w) { state.waiting.delete(name); w.resolve(ctor); }
         }
-        get(name) { return this.__state.defs.get(String(name)); }
-        getName(ctor) { return this.__state.tags.get(ctor) || null; }
+        get(name) { return internalsFor(this).state.defs.get(String(name)); }
+        getName(ctor) { return internalsFor(this).state.tags.get(ctor) || null; }
         whenDefined(name) {
             name = String(name);
             if (!isValidCustomElementName(name))
                 return Promise.reject(new DOMException("Invalid custom element name", "SyntaxError"));
-            const state = this.__state;
+            const state = internalsFor(this).state;
             if (state.defs.has(name)) return Promise.resolve(state.defs.get(name));
             let w = state.waiting.get(name);
             if (!w) {
@@ -11827,7 +11852,7 @@
             return w.promise;
         }
         upgrade(root) {
-            const state = this.__state;
+            const state = internalsFor(this).state;
             const old = CE;
             CE = state;
             try { if (state.defs.size) ceScan(root); }
@@ -11857,7 +11882,7 @@
     // CSSOM adoptedStyleSheets and Web IDL observable-array operations:
     // indexed mutation changes the active sheet list just like assignment.
     function adoptedArray(scope) {
-        if (scope.__adopted) return scope.__adopted;
+        if (internalsFor(scope).adopted) return internalsFor(scope).adopted;
         const array = [];
         const indexOf = (p) => typeof p === "string" && /^(0|[1-9][0-9]*)$/.test(p) && Number(p) < 4294967295 ? Number(p) : null;
         const validType = (v) => {
@@ -11876,11 +11901,11 @@
             if (index > array.length) return false;
             const sheet = validType(value);
             const doc = scope.ownerDocument || scope;
-            if (!sheet.__constructed || sheet.__constructorDocument !== nodeIds.get(doc))
+            if (!internalsFor(sheet).constructed || internalsFor(sheet).constructorDocument !== nodeIds.get(doc))
                 throw new DOMException("Stylesheet belongs to another document or is not constructed", "NotAllowedError");
             array[index] = sheet; adoptedSync(scope); return true;
         };
-        scope.__adopted = new Proxy(array, {
+        internalsFor(scope).adopted = new Proxy(array, {
             set(_, p, v) { return set(p, v); },
             deleteProperty(_, p) {
                 if (p === "length") return false;
@@ -11897,7 +11922,7 @@
             },
             preventExtensions() { return false; },
         });
-        return scope.__adopted;
+        return internalsFor(scope).adopted;
     }
     function setAdoptedArray(scope, value) {
         if (value == null || typeof value[Symbol.iterator] !== "function") throw new TypeError("Expected a stylesheet sequence");
@@ -11917,8 +11942,8 @@
             adoptedScopeFinalizer.register(scope, reference);
         }
         const sheets = [];
-        for (const s of scope.__adopted || []) {
-            if (s) sheets.push([s.__appliedText || "", s.__baseURL || scope.baseURI || g.document.baseURI]);
+        for (const s of internalsFor(scope).adopted || []) {
+            if (s) sheets.push([sheetAppliedText.call(s) || "", internalsFor(s).baseURL || scope.baseURI || g.document.baseURI]);
         }
         cssOp("adopted-sheets", String(nodeIds.get(scope)), JSON.stringify(sheets));
     };
@@ -11926,7 +11951,7 @@
         for (const reference of adoptedScopes) {
             const scope = reference.deref();
             if (!scope) { adoptedScopes.delete(reference); continue; }
-            if ((scope.__adopted || []).includes(sheet)) adoptedSync(scope);
+            if ((internalsFor(scope).adopted || []).includes(sheet)) adoptedSync(scope);
         }
     };
     // ---- CSSOM: <style>.sheet.cssRules and the CSSRule hierarchy ----
@@ -11941,7 +11966,7 @@
     // A sheet parses in its Document's mode: the owner node's, or a
     // constructed sheet's constructor document.
     function sheetQuirks(sheet) {
-        const document = sheet?.ownerNode ? sheet.ownerNode.ownerDocument : sheet?.__constructorDocumentObject;
+        const document = sheet?.ownerNode ? sheet.ownerNode.ownerDocument : (sheet ? internalsFor(sheet).constructorDocumentObject : undefined);
         return !!document && __dom_document_quirks(nodeIds.get(document));
     }
     // Split stylesheet text into its top-level rules (string/comment/brace
@@ -11971,7 +11996,7 @@
     // updates its sheet in the canonical arena without changing DOM text.
     function ruleStyle(rule, pairs, descriptors = null) {
         let text = (pairs || []).map(([k, v, p]) => k + ":" + v + (p ? " !important" : "") + ";").join(" ");
-        return declarationFor(() => text, (value) => { text = value; rule.__changed(); }, rule, descriptors, () => sheetQuirks(rule.__sheet));
+        return declarationFor(() => text, (value) => { text = value; cssChanged(rule); }, rule, descriptors, () => sheetQuirks(internalsFor(rule).sheet));
     }
     function cssSplitList(text) {
         const parts = []; let start = 0, depth = 0, quote = null;
@@ -11986,28 +12011,36 @@
         }
         parts.push(text.slice(start).trim()); return parts;
     }
+    // A MediaList's media query list; `read` refreshes it from an owner's
+    // media attribute before each observation.
+    function mediaListSet(list, text) {
+        internalsFor(list).parts = String(text || "").trim() ? cssSplitList(String(text)).map((q) => q || "not all") : [];
+    }
+    function mediaListRead(list) {
+        const read = internalsFor(list).read;
+        if (read) read();
+    }
     class MediaList {
         constructor(text = "", changed = () => {}) {
-            this.__parts = []; this.__changed = changed; this.__set(text);
-            return new Proxy(this, {
-                get(t, p, r) { if(typeof p==="string" && /^(0|[1-9]\d*)$/.test(p)){t.__read?.();return t.__parts[Number(p)];}return Reflect.get(t,p,r); }
-            });
+            internalsFor(this).parts = []; internalsFor(this).changed = changed; mediaListSet(this, text);
+            return shareInternals(new Proxy(this, {
+                get(t, p, r) { if(typeof p==="string" && /^(0|[1-9]\d*)$/.test(p)){mediaListRead(t);return internalsFor(t).parts[Number(p)];}return Reflect.get(t,p,r); }
+            }), this);
         }
-        __set(text) { this.__parts = String(text || "").trim() ? cssSplitList(String(text)).map((q) => q || "not all") : []; }
-        get mediaText() { this.__read?.(); return this.__parts.join(", "); }
-        set mediaText(value) { this.__set(value == null ? "" : domString(value)); this.__changed(); }
-        get length() {this.__read?.(); return this.__parts.length; }
-        item(index) {this.__read?.(); return this.__parts[Number(index) >>> 0] ?? null; }
+        get mediaText() { mediaListRead(this); return internalsFor(this).parts.join(", "); }
+        set mediaText(value) { mediaListSet(this, value == null ? "" : domString(value)); internalsFor(this).changed(); }
+        get length() {mediaListRead(this); return internalsFor(this).parts.length; }
+        item(index) {mediaListRead(this); return internalsFor(this).parts[Number(index) >>> 0] ?? null; }
         appendMedium(medium) {
-            this.__read?.();
+            mediaListRead(this);
             const parts = cssSplitList(domString(medium)); if (parts.length !== 1 || !parts[0]) return;
-            if (!this.__parts.includes(parts[0])) { this.__parts.push(parts[0]); this.__changed(); }
+            if (!internalsFor(this).parts.includes(parts[0])) { internalsFor(this).parts.push(parts[0]); internalsFor(this).changed(); }
         }
         deleteMedium(medium) {
-            this.__read?.();
+            mediaListRead(this);
             const parts = cssSplitList(domString(medium)); if (parts.length !== 1 || !parts[0]) return;
-            if (!this.__parts.includes(parts[0])) throw new DOMException("Media query not found", "NotFoundError");
-            this.__parts = this.__parts.filter((q) => q !== parts[0]); this.__changed();
+            if (!internalsFor(this).parts.includes(parts[0])) throw new DOMException("Media query not found", "NotFoundError");
+            internalsFor(this).parts = internalsFor(this).parts.filter((q) => q !== parts[0]); internalsFor(this).changed();
         }
         toString() { return this.mediaText; }
         get [Symbol.toStringTag]() { return "MediaList"; }
@@ -12015,42 +12048,55 @@
     function mediaList(text, changed) { return new MediaList(text, changed); }
     class CSSRuleList {
         constructor(items) {
-            this.__items = items;
-            return new Proxy(this, {
-                get(t, p, r) { return typeof p === "string" && /^(0|[1-9]\d*)$/.test(p) ? t.__items[Number(p)] : Reflect.get(t, p, r); },
+            internalsFor(this).items = items;
+            return shareInternals(new Proxy(this, {
+                get(t, p, r) { return typeof p === "string" && /^(0|[1-9]\d*)$/.test(p) ? internalsFor(t).items[Number(p)] : Reflect.get(t, p, r); },
                 set(t, p, v, r) { if (typeof p === "string" && /^(0|[1-9]\d*)$/.test(p)) return false; return Reflect.set(t, p, v, r); }
-            });
+            }), this);
         }
-        get length() { return this.__items.length; }
-        item(index) { return this.__items[Number(index) >>> 0] ?? null; }
-        [Symbol.iterator]() { return this.__items[Symbol.iterator](); }
+        get length() { return internalsFor(this).items.length; }
+        item(index) { return internalsFor(this).items[Number(index) >>> 0] ?? null; }
+        [Symbol.iterator]() { return internalsFor(this).items[Symbol.iterator](); }
         get [Symbol.toStringTag]() { return "CSSRuleList"; }
     }
     class StyleSheetList {
         constructor(read) {
-            this.__read = typeof read === "function" ? read : () => read;
-            return new Proxy(this, { get(t, p, r) { return typeof p === "string" && /^(0|[1-9]\d*)$/.test(p) ? t.__read()[Number(p)] : Reflect.get(t, p, r); } });
+            internalsFor(this).read = typeof read === "function" ? read : () => read;
+            return shareInternals(new Proxy(this, { get(t, p, r) { return typeof p === "string" && /^(0|[1-9]\d*)$/.test(p) ? internalsFor(t).read()[Number(p)] : Reflect.get(t, p, r); } }), this);
         }
-        get length() { return this.__read().length; }
-        item(index) { return this.__read()[Number(index) >>> 0] ?? null; }
-        [Symbol.iterator]() { return this.__read()[Symbol.iterator](); }
+        get length() { return internalsFor(this).read().length; }
+        item(index) { return internalsFor(this).read()[Number(index) >>> 0] ?? null; }
+        [Symbol.iterator]() { return internalsFor(this).read()[Symbol.iterator](); }
         get [Symbol.toStringTag]() { return "StyleSheetList"; }
     }
+    // CSSOM serialization and change propagation are internal operations of
+    // rules and style sheets, selected by the object's interface.
+    const cssSerializers = new Map();
+    function cssSerialize(rule, internal) {
+        for (let proto = Object.getPrototypeOf(rule); proto; proto = Object.getPrototypeOf(proto)) {
+            const serialize = cssSerializers.get(proto);
+            if (serialize) return serialize.call(rule, internal);
+        }
+        return "";
+    }
+    function cssChanged(target) {
+        if (internalsFor(target).isStyleSheet) sheetChanged.call(target);
+        else if (internalsFor(target).sheet) cssChanged(internalsFor(target).sheet);
+    }
     class CSSRule {
-        constructor(j = {}) { this.__json = j; this.__parent = null; this.__sheet = null; }
-        get parentRule() { return this.__parent; }
-        get parentStyleSheet() { return this.__sheet; }
+        constructor(j = {}) { internalsFor(this).json = j; internalsFor(this).parent = null; internalsFor(this).sheet = null; }
+        get parentRule() { return internalsFor(this).parent; }
+        get parentStyleSheet() { return internalsFor(this).sheet; }
         get type() { return 0; }
-        get cssText() { return this.__serialize(); }
+        get cssText() { return cssSerialize(this); }
         // CSSOM expressly specifies that this setter does nothing.
         set cssText(_) {}
-        __changed() { if (this.__sheet) this.__sheet.__changed(); }
-        __serialize() { return ""; }
         get [Symbol.toStringTag]() { return this.constructor.name; }
     }
+    cssSerializers.set(CSSRule.prototype, function () { return ""; });
     function attachCssRule(rule, parent, sheet) {
-        rule.__parent = parent; rule.__sheet = sheet;
-        for (const child of rule.__children || []) attachCssRule(child, rule, sheet);
+        internalsFor(rule).parent = parent; internalsFor(rule).sheet = sheet;
+        for (const child of internalsFor(rule).children || []) attachCssRule(child, rule, sheet);
     }
     function singleCssRule(text, nested=false, quirks=false) {
         const chunks = splitCssRules(text), parsed = parseCss(text, quirks);
@@ -12060,11 +12106,11 @@
         return buildRule(j);
     }
     function insertCssRule(owner, text, index) {
-        const list = owner.__children;
+        const list = internalsFor(owner).children;
         if (index > list.length) throw new DOMException("Rule index out of range", "IndexSizeError");
         let ancestor=owner, nestedSelector=false;
         while(ancestor instanceof CSSRule){if(ancestor instanceof CSSStyleRule){nestedSelector=true;break;}ancestor=ancestor.parentRule;}
-        const rule = singleCssRule(text,nestedSelector,sheetQuirks(owner instanceof CSSRule ? owner.__sheet : owner));
+        const rule = singleCssRule(text,nestedSelector,sheetQuirks(owner instanceof CSSRule ? internalsFor(owner).sheet : owner));
         const nested = owner instanceof CSSRule;
         if (nested && (rule.type === 3 || rule.type === 10)) throw new DOMException("Rule is not allowed in a group", "HierarchyRequestError");
         const trial = list.slice(); trial.splice(index, 0, rule);
@@ -12076,150 +12122,150 @@
             else if (item.type !== 3) sawBody = true;
         }
         if (rule.type === 10 && list.some((r) => r.type !== 3 && r.type !== 10)) throw new DOMException("Namespace cannot be changed after style rules", "InvalidStateError");
-        list.splice(index, 0, rule); attachCssRule(rule, nested ? owner : null, nested ? owner.__sheet : owner);
-        owner.__changed(); return index;
+        list.splice(index, 0, rule); attachCssRule(rule, nested ? owner : null, nested ? internalsFor(owner).sheet : owner);
+        cssChanged(owner); return index;
     }
     function deleteCssRule(owner, index) {
-        const list = owner.__children;
+        const list = internalsFor(owner).children;
         if (index >= list.length) throw new DOMException("Rule index out of range", "IndexSizeError");
         if (list[index].type === 10 && list.some((r) => r.type !== 3 && r.type !== 10)) throw new DOMException("Namespace is in use", "InvalidStateError");
-        const [removed] = list.splice(index, 1); attachCssRule(removed, null, null); owner.__changed();
+        const [removed] = list.splice(index, 1); attachCssRule(removed, null, null); cssChanged(owner);
     }
     class CSSGroupingRule extends CSSRule {
-        constructor(j) { super(j); this.__children = buildRules(j.r); this.__list = new CSSRuleList(this.__children); }
-        get cssRules() { return this.__list; }
+        constructor(j) { super(j); internalsFor(this).children = buildRules(j.r); internalsFor(this).list = new CSSRuleList(internalsFor(this).children); }
+        get cssRules() { return internalsFor(this).list; }
         insertRule(text, index = 0) { return insertCssRule(this, domString(text), Number(index) >>> 0); }
         deleteRule(index) { if (!arguments.length) throw new TypeError("Rule index is required"); deleteCssRule(this, Number(index) >>> 0); }
-        __serialize(internal = false) { return "@" + this.__json.t + (this.__json.q ? " " + this.__json.q : "") + " { " + this.__children.map((r) => r.__serialize(internal)).join(" ") + " }"; }
     }
+    cssSerializers.set(CSSGroupingRule.prototype, function (internal = false) { return "@" + internalsFor(this).json.t + (internalsFor(this).json.q ? " " + internalsFor(this).json.q : "") + " { " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") + " }"; });
     class CSSStyleRule extends CSSGroupingRule {
-        constructor(j) { super(j); this.__selector = j.sel || ""; this.__style = ruleStyle(this, j.d); }
+        constructor(j) { super(j); internalsFor(this).selector = j.sel || ""; internalsFor(this).style = ruleStyle(this, j.d); }
         get type() { return 1; }
-        get style() { return this.__style; }
-        set style(value) { this.__style.cssText = value; }
-        get selectorText() { return this.__selector; }
-        set selectorText(value) { value = domString(value); if (cssOp("selector",value,this.parentRule instanceof CSSStyleRule ? "nested" : "")) { this.__selector = value; this.__changed(); } }
-        __serialize(internal = false) { return this.selectorText + " { " + declarationText(this.style, internal) + (this.__children.length ? " " + this.__children.map((r) => r.__serialize(internal)).join(" ") : "") + " }"; }
+        get style() { return internalsFor(this).style; }
+        set style(value) { internalsFor(this).style.cssText = value; }
+        get selectorText() { return internalsFor(this).selector; }
+        set selectorText(value) { value = domString(value); if (cssOp("selector",value,this.parentRule instanceof CSSStyleRule ? "nested" : "")) { internalsFor(this).selector = value; cssChanged(this); } }
     }
+    cssSerializers.set(CSSStyleRule.prototype, function (internal = false) { return this.selectorText + " { " + declarationText(this.style, internal) + (internalsFor(this).children.length ? " " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") : "") + " }"; });
     class CSSMediaRule extends CSSGroupingRule {
-        constructor(j) { super(j); this.__media = mediaList(j.q, () => this.__changed()); }
+        constructor(j) { super(j); internalsFor(this).media = mediaList(j.q, () => cssChanged(this)); }
         get type() { return 4; }
-        get media() { return this.__media; }
-        set media(v) { this.__media.mediaText = v; }
+        get media() { return internalsFor(this).media; }
+        set media(v) { internalsFor(this).media.mediaText = v; }
         get conditionText() { return this.media.mediaText; }
         set conditionText(value) { this.media.mediaText = value; }
-        __serialize(internal = false) { return "@media " + this.conditionText + " { " + this.__children.map((r) => r.__serialize(internal)).join(" ") + " }"; }
     }
+    cssSerializers.set(CSSMediaRule.prototype, function (internal = false) { return "@media " + this.conditionText + " { " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") + " }"; });
     class CSSSupportsRule extends CSSGroupingRule {
         get type() { return 12; }
-        get conditionText() { return this.__json.q || ""; }
-        set conditionText(value) { this.__json.q = domString(value); this.__changed(); }
+        get conditionText() { return internalsFor(this).json.q || ""; }
+        set conditionText(value) { internalsFor(this).json.q = domString(value); cssChanged(this); }
     }
     class CSSContainerRule extends CSSGroupingRule {
-        get conditionText() { return this.__json.q || ""; }
+        get conditionText() { return internalsFor(this).json.q || ""; }
         get containerName() { return this.conditionText.match(/^([^\s(]+)\s+/)?.[1] || ""; }
         get containerQuery() { return this.conditionText.slice(this.containerName.length).trim(); }
     }
-    class CSSLayerBlockRule extends CSSGroupingRule { get name() { return this.__json.q || ""; } }
+    class CSSLayerBlockRule extends CSSGroupingRule { get name() { return internalsFor(this).json.q || ""; } }
     class CSSLayerStatementRule extends CSSRule {
-        get nameList() { return Object.freeze(cssSplitList(this.__json.q || "")); }
-        __serialize(internal = false) { return "@layer " + this.nameList.join(", ") + ";"; }
+        get nameList() { return Object.freeze(cssSplitList(internalsFor(this).json.q || "")); }
     }
+    cssSerializers.set(CSSLayerStatementRule.prototype, function (internal = false) { return "@layer " + this.nameList.join(", ") + ";"; });
     class CSSFontFaceRule extends CSSRule {
-        constructor(j) { super(j); this.__style = ruleStyle(this, j.d, ["font-family", "src", "font-style", "font-weight", "font-stretch", "font-display", "unicode-range", "font-feature-settings", "font-variation-settings", "ascent-override", "descent-override", "line-gap-override", "size-adjust"]); }
+        constructor(j) { super(j); internalsFor(this).style = ruleStyle(this, j.d, ["font-family", "src", "font-style", "font-weight", "font-stretch", "font-display", "unicode-range", "font-feature-settings", "font-variation-settings", "ascent-override", "descent-override", "line-gap-override", "size-adjust"]); }
         get type() { return 5; }
-        get style() { return this.__style; }
-        set style(v) { this.__style.cssText = v; }
-        __serialize(internal = false) { return "@font-face { " + declarationText(this.style, internal) + " }"; }
+        get style() { return internalsFor(this).style; }
+        set style(v) { internalsFor(this).style.cssText = v; }
     }
+    cssSerializers.set(CSSFontFaceRule.prototype, function (internal = false) { return "@font-face { " + declarationText(this.style, internal) + " }"; });
     class CSSPageRule extends CSSGroupingRule {
-        constructor(j) { super(j); this.__selector = j.sel || ""; this.__style = ruleStyle(this, j.d); }
+        constructor(j) { super(j); internalsFor(this).selector = j.sel || ""; internalsFor(this).style = ruleStyle(this, j.d); }
         get type() { return 6; }
-        get style() { return this.__style; }
-        set style(v) { this.__style.cssText = v; }
-        get selectorText() { return this.__selector; }
-        set selectorText(v) { v = domString(v); if (/^(?:[\w-]+)?(?::(?:left|right|first|blank))?(?:\s*,\s*(?:[\w-]+)?(?::(?:left|right|first|blank))?)*$/.test(v)) { this.__selector = v; this.__changed(); } }
-        __serialize(internal = false) { return "@page" + (this.selectorText ? " " + this.selectorText : "") + " { " + declarationText(this.style, internal) + " }"; }
+        get style() { return internalsFor(this).style; }
+        set style(v) { internalsFor(this).style.cssText = v; }
+        get selectorText() { return internalsFor(this).selector; }
+        set selectorText(v) { v = domString(v); if (/^(?:[\w-]+)?(?::(?:left|right|first|blank))?(?:\s*,\s*(?:[\w-]+)?(?::(?:left|right|first|blank))?)*$/.test(v)) { internalsFor(this).selector = v; cssChanged(this); } }
     }
+    cssSerializers.set(CSSPageRule.prototype, function (internal = false) { return "@page" + (this.selectorText ? " " + this.selectorText : "") + " { " + declarationText(this.style, internal) + " }"; });
     function keyframeKey(text) {
         const parts = cssSplitList(text).map((v) => asciiLower(v) === "from" ? "0%" : asciiLower(v) === "to" ? "100%" : v);
         if (!parts.length || parts.some((v) => !/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?%$/.test(v) || Number(v.slice(0, -1)) > 100 || Number(v.slice(0, -1)) < 0)) return null;
         return parts.map((v) => Number(v.slice(0, -1)) + "%").join(", ");
     }
     class CSSKeyframeRule extends CSSRule {
-        constructor(j) { super(j); this.__key = keyframeKey(j.key || "") || "0%"; this.__style = ruleStyle(this, j.d); }
+        constructor(j) { super(j); internalsFor(this).key = keyframeKey(j.key || "") || "0%"; internalsFor(this).style = ruleStyle(this, j.d); }
         get type() { return 8; }
-        get style() { return this.__style; }
-        set style(v) { this.__style.cssText = v; }
-        get keyText() { return this.__key; }
-        set keyText(v) { const key = keyframeKey(domString(v)); if (key === null) throw new DOMException("Invalid keyframe selector", "SyntaxError"); this.__key = key; this.__changed(); }
-        __serialize(internal = false) { return this.keyText + " { " + declarationText(this.style, internal) + " }"; }
+        get style() { return internalsFor(this).style; }
+        set style(v) { internalsFor(this).style.cssText = v; }
+        get keyText() { return internalsFor(this).key; }
+        set keyText(v) { const key = keyframeKey(domString(v)); if (key === null) throw new DOMException("Invalid keyframe selector", "SyntaxError"); internalsFor(this).key = key; cssChanged(this); }
     }
+    cssSerializers.set(CSSKeyframeRule.prototype, function (internal = false) { return this.keyText + " { " + declarationText(this.style, internal) + " }"; });
     class CSSKeyframesRule extends CSSRule {
-        constructor(j) { super(j); this.__name = j.name || ""; this.__children = buildRules(j.r); this.__list = new CSSRuleList(this.__children); }
+        constructor(j) { super(j); internalsFor(this).name = j.name || ""; internalsFor(this).children = buildRules(j.r); internalsFor(this).list = new CSSRuleList(internalsFor(this).children); }
         get type() { return 7; }
-        get name() { return this.__name; }
-        set name(v) { this.__name = domString(v); this.__changed(); }
-        get cssRules() { return this.__list; }
+        get name() { return internalsFor(this).name; }
+        set name(v) { internalsFor(this).name = domString(v); cssChanged(this); }
+        get cssRules() { return internalsFor(this).list; }
         appendRule(text) {
-            text = domString(text); const parsed = parseCss("@keyframes x { " + text + " }", sheetQuirks(this.__sheet));
+            text = domString(text); const parsed = parseCss("@keyframes x { " + text + " }", sheetQuirks(internalsFor(this).sheet));
             const j = parsed[0]?.r; if (!j || j.length !== 1 || keyframeKey(j[0].key) === null) return;
-            const rule = buildRule(j[0]); this.__children.push(rule); attachCssRule(rule, this, this.__sheet); this.__changed();
+            const rule = buildRule(j[0]); internalsFor(this).children.push(rule); attachCssRule(rule, this, internalsFor(this).sheet); cssChanged(this);
         }
-        findRule(key) { key = keyframeKey(domString(key)); return this.__children.slice().reverse().find((r) => r.keyText === key) || null; }
-        deleteRule(key) { const rule = this.findRule(key); if (rule) { this.__children.splice(this.__children.indexOf(rule), 1); attachCssRule(rule, null, null); this.__changed(); } }
-        __serialize(internal = false) { return "@keyframes " + this.name + " { " + this.__children.map((r) => r.__serialize(internal)).join(" ") + " }"; }
+        findRule(key) { key = keyframeKey(domString(key)); return internalsFor(this).children.slice().reverse().find((r) => r.keyText === key) || null; }
+        deleteRule(key) { const rule = this.findRule(key); if (rule) { internalsFor(this).children.splice(internalsFor(this).children.indexOf(rule), 1); attachCssRule(rule, null, null); cssChanged(this); } }
     }
+    cssSerializers.set(CSSKeyframesRule.prototype, function (internal = false) { return "@keyframes " + this.name + " { " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") + " }"; });
     class CSSImportRule extends CSSRule {
         constructor(j) {
             super(j); const m = (j.q || "").match(/^(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))\s*([\s\S]*)$/i);
-            this.__href = m ? (m[1] || m[2]).replace(/^['"]|['"]$/g, "") : "";
-            this.__media = mediaList(m?.[3] || "", () => this.__changed());
+            internalsFor(this).href = m ? (m[1] || m[2]).replace(/^['"]|['"]$/g, "") : "";
+            internalsFor(this).media = mediaList(m?.[3] || "", () => cssChanged(this));
         }
         get type() { return 3; }
-        get href() { return this.__href; }
-        get media() { return this.__media; }
-        set media(v) { this.__media.mediaText = v; }
+        get href() { return internalsFor(this).href; }
+        get media() { return internalsFor(this).media; }
+        set media(v) { internalsFor(this).media.mediaText = v; }
         get styleSheet() { return null; }
-        __serialize(internal = false) { return "@import url(" + JSON.stringify(this.href) + ")" + (this.media.mediaText ? " " + this.media.mediaText : "") + ";"; }
     }
+    cssSerializers.set(CSSImportRule.prototype, function (internal = false) { return "@import url(" + JSON.stringify(this.href) + ")" + (this.media.mediaText ? " " + this.media.mediaText : "") + ";"; });
     class CSSNamespaceRule extends CSSRule {
-        constructor(j) { super(j); const m = (j.q || "").match(/^(?:([^\s]+)\s+)?(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))$/i); this.__prefix = m?.[1] || ""; this.__namespace = (m?.[2] || m?.[3] || "").replace(/^['"]|['"]$/g, ""); }
+        constructor(j) { super(j); const m = (j.q || "").match(/^(?:([^\s]+)\s+)?(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))$/i); internalsFor(this).prefix = m?.[1] || ""; internalsFor(this).namespace = (m?.[2] || m?.[3] || "").replace(/^['"]|['"]$/g, ""); }
         get type() { return 10; }
-        get prefix() { return this.__prefix; }
-        get namespaceURI() { return this.__namespace; }
-        __serialize(internal = false) { return "@namespace " + (this.prefix ? this.prefix + " " : "") + "url(" + JSON.stringify(this.namespaceURI) + ");"; }
+        get prefix() { return internalsFor(this).prefix; }
+        get namespaceURI() { return internalsFor(this).namespace; }
     }
+    cssSerializers.set(CSSNamespaceRule.prototype, function (internal = false) { return "@namespace " + (this.prefix ? this.prefix + " " : "") + "url(" + JSON.stringify(this.namespaceURI) + ");"; });
     const counterDescriptors = ["system", "symbols", "additive-symbols", "negative", "prefix", "suffix", "range", "pad", "fallback", "speak-as"];
     class CSSCounterStyleRule extends CSSRule {
-        constructor(j) { super(j); this.__name = j.name || ""; this.__style = ruleStyle(this, j.d, counterDescriptors); }
-        get name() { return this.__name; }
-        set name(v) { v = domString(v); if (["none", "decimal", "disc", "circle", "square", "disclosure-open", "disclosure-closed"].includes(asciiLower(v))) return; this.__name = cssOp("counter-name", v); this.__changed(); }
+        constructor(j) { super(j); internalsFor(this).name = j.name || ""; internalsFor(this).style = ruleStyle(this, j.d, counterDescriptors); }
+        get name() { return internalsFor(this).name; }
+        set name(v) { v = domString(v); if (["none", "decimal", "disc", "circle", "square", "disclosure-open", "disclosure-closed"].includes(asciiLower(v))) return; internalsFor(this).name = cssOp("counter-name", v); cssChanged(this); }
         get type() { return 11; }
-        __serialize(internal = false) { return "@counter-style " + CSS.escape(this.name) + " { " + declarationText(this.__style, internal) + " }"; }
     }
+    cssSerializers.set(CSSCounterStyleRule.prototype, function (internal = false) { return "@counter-style " + CSS.escape(this.name) + " { " + declarationText(internalsFor(this).style, internal) + " }"; });
     for (const descriptor of counterDescriptors) {
         const name = descriptor.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
         Object.defineProperty(CSSCounterStyleRule.prototype, name, { configurable: true, enumerable: true,
-            get() { return this.__style.getPropertyValue(descriptor); }, set(v) {
+            get() { return internalsFor(this).style.getPropertyValue(descriptor); }, set(v) {
                 v = domString(v);
                 if (!cssOp("counter-descriptor", descriptor, v)) return;
                 if (descriptor === "system" && (this.system || "symbolic").split(/\s+/)[0] !== v.trim().split(/\s+/)[0]) return;
-                if (!cssOp("counter-style-valid", this.__style.cssText + " " + descriptor + ": " + v + ";")) return;
-                this.__style.setProperty(descriptor, v);
+                if (!cssOp("counter-style-valid", internalsFor(this).style.cssText + " " + descriptor + ": " + v + ";")) return;
+                internalsFor(this).style.setProperty(descriptor, v);
             } });
     }
     class CSSPropertyRule extends CSSRule {
-        get name() { return this.__json.name || ""; }
-        get syntax() { return this.__json.syntax; }
-        get inherits() { return this.__json.inherits; }
-        get initialValue() { return this.__json.initialValue; }
-        __serialize() {
-            return "@property " + this.__json.names.map((name) => cssOp("identifier", name)).join(", ") + " { syntax: " + cssOp("string", this.syntax) +
-                "; inherits: " + this.inherits + ";" +
-                (this.initialValue === null ? "" : " initial-value: " + this.initialValue + ";") + " }";
-        }
+        get name() { return internalsFor(this).json.name || ""; }
+        get syntax() { return internalsFor(this).json.syntax; }
+        get inherits() { return internalsFor(this).json.inherits; }
+        get initialValue() { return internalsFor(this).json.initialValue; }
     }
+    cssSerializers.set(CSSPropertyRule.prototype, function () {
+        return "@property " + internalsFor(this).json.names.map((name) => cssOp("identifier", name)).join(", ") + " { syntax: " + cssOp("string", this.syntax) +
+            "; inherits: " + this.inherits + ";" +
+            (this.initialValue === null ? "" : " initial-value: " + this.initialValue + ";") + " }";
+    });
     const RULE_CTORS = { style: CSSStyleRule, media: CSSMediaRule, supports: CSSSupportsRule,
         container: CSSContainerRule, layer: CSSLayerBlockRule, "layer-statement": CSSLayerStatementRule,
         scope: CSSGroupingRule, document: CSSGroupingRule, "font-face": CSSFontFaceRule, page: CSSPageRule,
@@ -12232,101 +12278,102 @@
         Object.defineProperty(CSSRule, name, { value: number, enumerable: true });
         Object.defineProperty(CSSRule.prototype, name, { value: number, enumerable: true });
     }
+    function sheetChanged() {
+        internalsFor(this).serializedText = undefined;
+        if (this.ownerNode) {
+            const owner=this.ownerNode;
+            if (owner.sheet===this) __css_sheet(nodeIds.get(owner), JSON.stringify([sheetText.call(this), this.media.mediaText, this.disabled]));
+        } else sheetSync(this);
+    }
+    function sheetText() {
+        // CSSOM rule mutations call cssChanged, including nested rules. Sharing
+        // one constructed sheet among shadow roots must not serialize its
+        // entire rule tree again on every adoption.
+        if (internalsFor(this).serializedText === undefined)
+            internalsFor(this).serializedText = internalsFor(this).children.map((r) => cssSerialize(r, true)).join("\n");
+        return internalsFor(this).serializedText;
+    }
+    function sheetAppliedText() { return this.disabled ? "" : this.media.mediaText ? "@media " + this.media.mediaText + " { " + sheetText.call(this) + " }" : sheetText.call(this); }
+    function sheetCheck() { if (!internalsFor(this).clean) throw new DOMException("Cross-origin stylesheet", "SecurityError"); }
+    function sheetReplace(text) {
+        for (const rule of internalsFor(this).children) attachCssRule(rule, null, null);
+        internalsFor(this).children.splice(0, internalsFor(this).children.length, ...buildRules(parseCss(text, sheetQuirks(this))).filter((r) => r.type !== 3));
+        for (const rule of internalsFor(this).children) attachCssRule(rule, null, this);
+        cssChanged(this);
+    }
     class CSSStyleSheet {
         constructor(options = {}) {
-            this.__children = []; this.__list = new CSSRuleList(this.__children);
-            this.__constructorDocument = nodeIds.get(g.document);
+            internalsFor(this).isStyleSheet = true;
+            internalsFor(this).children = []; internalsFor(this).list = new CSSRuleList(internalsFor(this).children);
+            internalsFor(this).constructorDocument = nodeIds.get(g.document);
             // CSSOM's constructor document is an associated Document, not merely an arena
             // number. A surviving sheet keeps this Document across Window reuse/navigation.
-            this.__constructorDocumentObject = g.document;
-            this.__baseURL = g.document.baseURI;
+            internalsFor(this).constructorDocumentObject = g.document;
+            internalsFor(this).baseURL = g.document.baseURI;
             if (options.baseURL != null) {
-                try { this.__baseURL = new URL(domString(options.baseURL), this.__baseURL).href; } catch (_) {}
+                try { internalsFor(this).baseURL = new URL(domString(options.baseURL), internalsFor(this).baseURL).href; } catch (_) {}
             }
-            this.ownerNode = null; this.__constructed = true; this.__locked = false; this.__clean = true;
-            this.__disabled = !!options.disabled; this.__media = mediaList(String(options.media || ""), () => this.__changed());
+            this.ownerNode = null; internalsFor(this).constructed = true; internalsFor(this).locked = false; internalsFor(this).clean = true;
+            internalsFor(this).disabled = !!options.disabled; internalsFor(this).media = mediaList(String(options.media || ""), () => cssChanged(this));
         }
         get type() { return "text/css"; }
         get href() { return this.ownerNode?.localName === "link" ? this.ownerNode.href : null; }
         get title() { return this.ownerNode ? this.ownerNode.getAttribute("title") || "" : null; }
         get parentStyleSheet() { return null; }
         get ownerRule() { return null; }
-        get media() { return this.__media; }
-        set media(v) { this.__media.mediaText = v; }
+        get media() { return internalsFor(this).media; }
+        set media(v) { internalsFor(this).media.mediaText = v; }
         get disabled() {
-            if(this.ownerNode) {const attr=this.ownerNode.hasAttribute("disabled");if(attr!==this.__disabledAttr){this.__disabledAttr=attr;this.__disabled=attr;}}
-            return this.__disabled;
+            if(this.ownerNode) {const attr=this.ownerNode.hasAttribute("disabled");if(attr!==internalsFor(this).disabledAttr){internalsFor(this).disabledAttr=attr;internalsFor(this).disabled=attr;}}
+            return internalsFor(this).disabled;
         }
-        set disabled(v) { this.__disabled = !!v; this.__changed(); }
-        get __text() {
-            // CSSOM rule mutations call __changed, including nested rules. Sharing
-            // one constructed sheet among shadow roots must not serialize its
-            // entire rule tree again on every adoption.
-            if (this.__serializedText === undefined)
-                this.__serializedText = this.__children.map((r) => r.__serialize(true)).join("\n");
-            return this.__serializedText;
-        }
-        get __appliedText() { return this.disabled ? "" : this.media.mediaText ? "@media " + this.media.mediaText + " { " + this.__text + " }" : this.__text; }
-        __check() { if (!this.__clean) throw new DOMException("Cross-origin stylesheet", "SecurityError"); }
-        get cssRules() { this.__check(); return this.__list; }
+        set disabled(v) { internalsFor(this).disabled = !!v; cssChanged(this); }
+        get cssRules() { sheetCheck.call(this); return internalsFor(this).list; }
         get rules() { return this.cssRules; }
-        __replace(text) {
-            for (const rule of this.__children) attachCssRule(rule, null, null);
-            this.__children.splice(0, this.__children.length, ...buildRules(parseCss(text, sheetQuirks(this))).filter((r) => r.type !== 3));
-            for (const rule of this.__children) attachCssRule(rule, null, this);
-            this.__changed();
-        }
         replace(text) {
             text = domString(text);
-            if (!this.__constructed || this.__locked) return Promise.reject(new DOMException("Sheet cannot be replaced", "NotAllowedError"));
-            this.__locked = true;
-            return Promise.resolve().then(() => { this.__replace(text); this.__locked = false; return this; });
+            if (!internalsFor(this).constructed || internalsFor(this).locked) return Promise.reject(new DOMException("Sheet cannot be replaced", "NotAllowedError"));
+            internalsFor(this).locked = true;
+            return Promise.resolve().then(() => { sheetReplace.call(this, text); internalsFor(this).locked = false; return this; });
         }
         replaceSync(text) {
             text = domString(text);
-            if (!this.__constructed || this.__locked) throw new DOMException("Sheet cannot be replaced", "NotAllowedError");
-            this.__replace(text);
+            if (!internalsFor(this).constructed || internalsFor(this).locked) throw new DOMException("Sheet cannot be replaced", "NotAllowedError");
+            sheetReplace.call(this, text);
         }
         insertRule(text, index = 0) {
-            this.__check(); if (this.__locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
+            sheetCheck.call(this); if (internalsFor(this).locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
             text = domString(text); index = Number(index) >>> 0;
             const rule = singleCssRule(text);
-            if (rule.type === 3 && this.__constructed) throw new DOMException("Constructed sheets cannot import", "SyntaxError");
+            if (rule.type === 3 && internalsFor(this).constructed) throw new DOMException("Constructed sheets cannot import", "SyntaxError");
             return insertCssRule(this, text, index);
         }
         deleteRule(index) {
-            this.__check(); if (this.__locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
+            sheetCheck.call(this); if (internalsFor(this).locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
             if (!arguments.length) throw new TypeError("Rule index is required"); deleteCssRule(this, Number(index) >>> 0);
         }
-        addRule(selector = "undefined", style = "undefined", index = this.__children.length) { this.insertRule(domString(selector) + " { " + domString(style) + " }", index); return -1; }
+        addRule(selector = "undefined", style = "undefined", index = internalsFor(this).children.length) { this.insertRule(domString(selector) + " { " + domString(style) + " }", index); return -1; }
         removeRule(index = 0) { this.deleteRule(index); }
-        __changed() {
-            this.__serializedText = undefined;
-            if (this.ownerNode) {
-                const owner=this.ownerNode;
-                if (owner.sheet===this) __css_sheet(nodeIds.get(owner), JSON.stringify([this.__text, this.media.mediaText, this.disabled]));
-            } else sheetSync(this);
-        }
         get [Symbol.toStringTag]() { return "CSSStyleSheet"; }
     }
     function makeStyleSheet(text, owner) {
         const sheet = new CSSStyleSheet({ media: owner?.getAttribute("media") || "", disabled: owner?.hasAttribute("disabled") || false });
-        sheet.ownerNode = owner || null; sheet.__constructed = !owner;
-        sheet.__disabledAttr=owner?.hasAttribute("disabled")||false;
+        sheet.ownerNode = owner || null; internalsFor(sheet).constructed = !owner;
+        internalsFor(sheet).disabledAttr=owner?.hasAttribute("disabled")||false;
         if(owner) {
             let mediaAttr=owner.getAttribute("media")||"";
-            sheet.__media.__read=()=>{const value=owner.getAttribute("media")||"";if(value!==mediaAttr){mediaAttr=value;sheet.__media.__set(value);}};
+            internalsFor(internalsFor(sheet).media).read=()=>{const value=owner.getAttribute("media")||"";if(value!==mediaAttr){mediaAttr=value;mediaListSet(internalsFor(sheet).media, value);}};
         }
-        sheet.__children.push(...buildRules(parseCss(text, sheetQuirks(sheet))));
-        for (const rule of sheet.__children) attachCssRule(rule, null, sheet);
+        internalsFor(sheet).children.push(...buildRules(parseCss(text, sheetQuirks(sheet))));
+        for (const rule of internalsFor(sheet).children) attachCssRule(rule, null, sheet);
         if (owner?.localName === "link") {
             try {
                 const origin = new URL(owner.href).origin;
                 // CSSOM origin-clean / HTML link processing: no-CORS file
                 // sheets can render, but their rules are not script-readable.
-                sheet.__clean = origin !== "null" && origin === new URL(owner.ownerDocument.URL).origin;
+                internalsFor(sheet).clean = origin !== "null" && origin === new URL(owner.ownerDocument.URL).origin;
             }
-            catch (_) { sheet.__clean = false; }
+            catch (_) { internalsFor(sheet).clean = false; }
         }
         return sheet;
     }
@@ -12648,7 +12695,7 @@
         for (const element of list) {
             // A form's named getter can shadow .id and .getAttribute.
             if (__dom_get_attr(nodeIds.get(element), "id") === name ||
-                (element.__trustNS === HTML_NS && __dom_get_attr(nodeIds.get(element), "name") === name))
+                (internalsFor(element).trustNS === HTML_NS && __dom_get_attr(nodeIds.get(element), "name") === name))
                 return element;
         }
         return null;
@@ -12725,7 +12772,7 @@
                 for (let i = 0; i < list.length; i++) keys.push(String(i));
                 for (const element of list) {
                     const names = [__dom_get_attr(nodeIds.get(element), "id")];
-                    if (element.__trustNS === HTML_NS) names.push(__dom_get_attr(nodeIds.get(element), "name"));
+                    if (internalsFor(element).trustNS === HTML_NS) names.push(__dom_get_attr(nodeIds.get(element), "name"));
                     for (const name of names) {
                         if (name && nodeListArrayIndex(name) < 0 && !Reflect.has(t, name) && !keys.includes(name)) keys.push(name);
                     }
@@ -12758,7 +12805,7 @@
     // removals, and `form=id` reassociation are visible through an already-held
     // collection object.
     function collectionProxy(target) {
-        return new Proxy(target, {
+        return shareInternals(new Proxy(target, {
             get(t, p, r) {
                 if (typeof p === "string" && /^(0|[1-9][0-9]*)$/.test(p))
                     return t.item(Number(p));
@@ -12769,7 +12816,7 @@
                 }
                 return undefined;
             },
-        });
+        }), target);
     }
     const RADIO_NODE_LIST_TOKEN = {};
     class RadioNodeList extends NodeList {
@@ -12778,17 +12825,16 @@
             // NodeList has no public constructor. Allocate this live subtype
             // without invoking that deliberately throwing constructor.
             const list = Object.create(new.target.prototype);
-            list.__resolve = resolve;
+            internalsFor(list).resolve = resolve;
             return collectionProxy(list);
         }
-        __list() { return this.__resolve(); }
-        get length() { return this.__list().length; }
+        get length() { return internalsFor(this).resolve().length; }
         item(index) {
             index = Number(index);
-            return Number.isInteger(index) && index >= 0 ? (this.__list()[index] || null) : null;
+            return Number.isInteger(index) && index >= 0 ? (internalsFor(this).resolve()[index] || null) : null;
         }
         get value() {
-            for (const el of this.__list()) {
+            for (const el of internalsFor(this).resolve()) {
                 if (el.localName === "input" && String(el.type).toLowerCase() === "radio" && el.checked)
                     return el.value;
             }
@@ -12796,40 +12842,40 @@
         }
         set value(value) {
             value = String(value);
-            for (const el of this.__list()) {
+            for (const el of internalsFor(this).resolve()) {
                 if (el.localName === "input" && String(el.type).toLowerCase() === "radio" && el.value === value) {
                     el.checked = true;
                     return;
                 }
             }
         }
-        forEach(fn, thisArg) { return this.__list().forEach(fn, thisArg); }
-        entries() { return this.__list().entries(); }
-        keys() { return this.__list().keys(); }
-        values() { return this.__list().values(); }
-        [Symbol.iterator]() { return this.__list()[Symbol.iterator](); }
+        forEach(fn, thisArg) { return internalsFor(this).resolve().forEach(fn, thisArg); }
+        entries() { return internalsFor(this).resolve().entries(); }
+        keys() { return internalsFor(this).resolve().keys(); }
+        values() { return internalsFor(this).resolve().values(); }
+        [Symbol.iterator]() { return internalsFor(this).resolve()[Symbol.iterator](); }
         get [Symbol.toStringTag]() { return "RadioNodeList"; }
     }
+    function formControlsList() { return listedFormControls(internalsFor(this).form); }
     class HTMLFormControlsCollection extends HTMLCollection {
         constructor(form) {
             super(HTML_COLLECTION_TOKEN);
-            this.__form = form;
+            internalsFor(this).form = form;
             const proxy = collectionProxy(this);
             const resolve = () => listedFormControls(form);
             HTML_COLLECTION_DATA.set(this, resolve);
             HTML_COLLECTION_DATA.set(proxy, resolve);
             return proxy;
         }
-        __list() { return listedFormControls(this.__form); }
-        get length() { return this.__list().length; }
+        get length() { return formControlsList.call(this).length; }
         item(index) {
             index = Number(index);
-            return Number.isInteger(index) && index >= 0 ? (this.__list()[index] || null) : null;
+            return Number.isInteger(index) && index >= 0 ? (formControlsList.call(this)[index] || null) : null;
         }
         namedItem(name) {
             name = String(name);
             if (name === "") return null;
-            const form = this.__form;
+            const form = internalsFor(this).form;
             const matches = function () {
                 return listedFormControls(form).filter(function (el) {
                     return el.id === name || el.getAttribute("name") === name;
@@ -12840,8 +12886,8 @@
             if (list.length === 1) return list[0];
             return new RadioNodeList(RADIO_NODE_LIST_TOKEN, matches);
         }
-        forEach(fn, thisArg) { return this.__list().forEach(fn, thisArg); }
-        [Symbol.iterator]() { return this.__list()[Symbol.iterator](); }
+        forEach(fn, thisArg) { return formControlsList.call(this).forEach(fn, thisArg); }
+        [Symbol.iterator]() { return formControlsList.call(this)[Symbol.iterator](); }
         get [Symbol.toStringTag]() { return "HTMLFormControlsCollection"; }
     }
     class NamedNodeMap {}
@@ -13082,9 +13128,9 @@
     // used to return an EMPTY blob, so upload chunkers sent nothing).
     g.Blob = class Blob {
         constructor(parts, opts) {
-            this.__parts = Array.isArray(parts) ? parts.slice() : (parts ? [parts] : []);
+            internalsFor(this).parts = Array.isArray(parts) ? parts.slice() : (parts ? [parts] : []);
             let size = 0;
-            for (const p of this.__parts) {
+            for (const p of internalsFor(this).parts) {
                 if (typeof p === "string") size += p.length;
                 else if (p && typeof p.byteLength === "number") size += p.byteLength;
                 else if (p && typeof p.size === "number") size += p.size;
@@ -13212,9 +13258,21 @@
     // §"constructing the entry list" — the common cases). Used as a fetch/XHR
     // body it encodes as multipart/form-data (`__formDataWire` below). Steam's
     // store main.js news-up a FormData in a timer — a ReferenceError without it.
+    function formDataValue(value, filename) {
+        if (value && Array.isArray(internalsFor(value).parts)) {
+            if (!(value instanceof g.File)) {
+                return new g.File(internalsFor(value).parts.slice(), filename === undefined ? "blob" : String(filename), { type: value.type });
+            }
+            if (filename !== undefined) {
+                return new g.File(internalsFor(value).parts.slice(), String(filename), { type: value.type, lastModified: value.lastModified });
+            }
+            return value;
+        }
+        return String(value);
+    }
     g.FormData = class FormData {
         constructor(form) {
-            this.__entries = [];
+            internalsFor(this).entries = [];
             if (form === undefined || form === null) return;
             if (typeof form.querySelectorAll !== "function" || form.localName !== "form") {
                 throw new TypeError("FormData constructor: argument 1 is not a form element");
@@ -13230,49 +13288,37 @@
                     const opts = el.querySelectorAll("option");
                     for (let j = 0; j < opts.length; j++) {
                         if (opts[j].selected && !opts[j].disabled) {
-                            this.__entries.push({ name: name, value: String(opts[j].value) });
+                            internalsFor(this).entries.push({ name: name, value: String(opts[j].value) });
                         }
                     }
                 } else if (tag === "textarea") {
-                    this.__entries.push({ name: name, value: String(el.value == null ? "" : el.value) });
+                    internalsFor(this).entries.push({ name: name, value: String(el.value == null ? "" : el.value) });
                 } else {
                     const type = (el.getAttribute("type") || "text").toLowerCase();
                     if (type === "checkbox" || type === "radio") {
                         if (!el.checked) continue;
-                        this.__entries.push({ name: name, value: el.hasAttribute("value") ? String(el.getAttribute("value")) : "on" });
+                        internalsFor(this).entries.push({ name: name, value: el.hasAttribute("value") ? String(el.getAttribute("value")) : "on" });
                     } else if (type === "file") {
                         // No real file selection in this engine — the spec's
                         // "no files selected" entry: a single empty File.
-                        this.__entries.push({ name: name, value: new g.File([], "", { type: "application/octet-stream" }) });
+                        internalsFor(this).entries.push({ name: name, value: new g.File([], "", { type: "application/octet-stream" }) });
                     } else if (type === "submit" || type === "button" || type === "reset" || type === "image") {
                         continue; // buttons enter only as the submitter (we pass none)
                     } else if (type === "hidden" && name === "_charset_") {
-                        this.__entries.push({ name: name, value: "UTF-8" });
+                        internalsFor(this).entries.push({ name: name, value: "UTF-8" });
                     } else {
-                        this.__entries.push({ name: name, value: String(el.value == null ? "" : el.value) });
+                        internalsFor(this).entries.push({ name: name, value: String(el.value == null ? "" : el.value) });
                     }
                 }
             }
         }
         // Blob → File conversion on append/set (spec: a Blob value becomes a
         // File named "blob"; an explicit filename renames either).
-        __val(value, filename) {
-            if (value && Array.isArray(value.__parts)) {
-                if (!(value instanceof g.File)) {
-                    return new g.File(value.__parts.slice(), filename === undefined ? "blob" : String(filename), { type: value.type });
-                }
-                if (filename !== undefined) {
-                    return new g.File(value.__parts.slice(), String(filename), { type: value.type, lastModified: value.lastModified });
-                }
-                return value;
-            }
-            return String(value);
-        }
-        append(name, value, filename) { this.__entries.push({ name: String(name), value: this.__val(value, filename) }); }
+        append(name, value, filename) { internalsFor(this).entries.push({ name: String(name), value: formDataValue.call(this, value, filename) }); }
         set(name, value, filename) {
             const n = String(name);
-            const v = this.__val(value, filename);
-            const es = this.__entries;
+            const v = formDataValue.call(this, value, filename);
+            const es = internalsFor(this).entries;
             let placed = false;
             for (let i = 0; i < es.length; i++) {
                 if (es[i].name !== n) continue;
@@ -13284,32 +13330,32 @@
         }
         delete(name) {
             const n = String(name);
-            const es = this.__entries;
+            const es = internalsFor(this).entries;
             for (let i = 0; i < es.length; i++) {
                 if (es[i].name === n) { es.splice(i, 1); i--; }
             }
         }
         get(name) {
             const n = String(name);
-            for (let i = 0; i < this.__entries.length; i++) if (this.__entries[i].name === n) return this.__entries[i].value;
+            for (let i = 0; i < internalsFor(this).entries.length; i++) if (internalsFor(this).entries[i].name === n) return internalsFor(this).entries[i].value;
             return null;
         }
         getAll(name) {
             const n = String(name);
             const out = [];
-            for (let i = 0; i < this.__entries.length; i++) if (this.__entries[i].name === n) out.push(this.__entries[i].value);
+            for (let i = 0; i < internalsFor(this).entries.length; i++) if (internalsFor(this).entries[i].name === n) out.push(internalsFor(this).entries[i].value);
             return out;
         }
         has(name) {
             const n = String(name);
-            for (let i = 0; i < this.__entries.length; i++) if (this.__entries[i].name === n) return true;
+            for (let i = 0; i < internalsFor(this).entries.length; i++) if (internalsFor(this).entries[i].name === n) return true;
             return false;
         }
-        entries() { return this.__entries.map((e) => [e.name, e.value])[Symbol.iterator](); }
-        keys() { return this.__entries.map((e) => e.name)[Symbol.iterator](); }
-        values() { return this.__entries.map((e) => e.value)[Symbol.iterator](); }
+        entries() { return internalsFor(this).entries.map((e) => [e.name, e.value])[Symbol.iterator](); }
+        keys() { return internalsFor(this).entries.map((e) => e.name)[Symbol.iterator](); }
+        values() { return internalsFor(this).entries.map((e) => e.value)[Symbol.iterator](); }
         forEach(fn, thisArg) {
-            const es = this.__entries.slice();
+            const es = internalsFor(this).entries.slice();
             for (let i = 0; i < es.length; i++) fn.call(thisArg, es[i].value, es[i].name, this);
         }
         get [Symbol.toStringTag]() { return "FormData"; }
@@ -13320,6 +13366,29 @@
     // bytes in JS, so the read is local; we still settle on a macrotask
     // (setTimeout 0) like the platform, firing loadstart -> load -> loadend
     // (or error) and the matching on* handlers.
+    function readerFire(t) {
+        const ev = new Event(t); ev.target = this; ev.currentTarget = this;
+        const on = this["on" + t];
+        if (typeof on === "function") { try { on.call(this, ev); } catch (e) { trust.errors.push("filereader on" + t + ": " + ((e && e.message) || e)); } }
+        try { dispatch(this, ev, false); } catch (e) {}
+    }
+    function readerRead(blob, makeResult) {
+        this.readyState = 1; // LOADING
+        this.result = null; this.error = null;
+        readerFire.call(this, "loadstart");
+        const self = this;
+        g.setTimeout(() => {
+            try {
+                const r = makeResult(blob);
+                self.result = r; self.readyState = 2;
+                readerFire.call(self, "progress"); readerFire.call(self, "load"); readerFire.call(self, "loadend");
+            } catch (e) {
+                self.error = g.DOMException ? new g.DOMException(String((e && e.message) || e), "NotReadableError") : e;
+                self.readyState = 2;
+                readerFire.call(self, "error"); readerFire.call(self, "loadend");
+            }
+        }, 0);
+    }
     g.FileReader = class FileReader extends EventTarget {
         constructor() {
             super();
@@ -13332,46 +13401,23 @@
         get EMPTY() { return 0; }
         get LOADING() { return 1; }
         get DONE() { return 2; }
-        __fire(t) {
-            const ev = new Event(t); ev.target = this; ev.currentTarget = this;
-            const on = this["on" + t];
-            if (typeof on === "function") { try { on.call(this, ev); } catch (e) { trust.errors.push("filereader on" + t + ": " + ((e && e.message) || e)); } }
-            try { dispatch(this, ev, false); } catch (e) {}
-        }
-        __read(blob, makeResult) {
-            this.readyState = 1; // LOADING
-            this.result = null; this.error = null;
-            this.__fire("loadstart");
-            const self = this;
-            g.setTimeout(() => {
-                try {
-                    const r = makeResult(blob);
-                    self.result = r; self.readyState = 2;
-                    self.__fire("progress"); self.__fire("load"); self.__fire("loadend");
-                } catch (e) {
-                    self.error = g.DOMException ? new g.DOMException(String((e && e.message) || e), "NotReadableError") : e;
-                    self.readyState = 2;
-                    self.__fire("error"); self.__fire("loadend");
-                }
-            }, 0);
-        }
         // Byte-faithful reads via `__blobBytes` (string-only blobs read
         // identically to the old text-part join; binary parts now survive).
-        readAsText(blob) { this.__read(blob, (b) => new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(b)))); }
-        readAsBinaryString(blob) { this.__read(blob, (b) => __blobBytes(b)); }
+        readAsText(blob) { readerRead.call(this, blob, (b) => new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(b)))); }
+        readAsBinaryString(blob) { readerRead.call(this, blob, (b) => __blobBytes(b)); }
         readAsDataURL(blob) {
-            this.__read(blob, (b) => {
+            readerRead.call(this, blob, (b) => {
                 const type = (b && b.type) || "application/octet-stream";
                 return "data:" + type + ";base64," + g.btoa(__blobBytes(b));
             });
         }
         readAsArrayBuffer(blob) {
-            this.__read(blob, (b) => __latin1ToBytes(__blobBytes(b)).buffer);
+            readerRead.call(this, blob, (b) => __latin1ToBytes(__blobBytes(b)).buffer);
         }
         abort() {
             if (this.readyState !== 1) return;
             this.readyState = 2; this.result = null;
-            this.__fire("abort"); this.__fire("loadend");
+            readerFire.call(this, "abort"); readerFire.call(this, "loadend");
         }
     };
     g.FileReader.EMPTY = 0; g.FileReader.LOADING = 1; g.FileReader.DONE = 2;
@@ -14625,7 +14671,7 @@
                 end[0] === range.endContainer && end[1] === range.endOffset) continue;
             [range.startContainer, range.startOffset] = start;
             [range.endContainer, range.endOffset] = end;
-            range.__upd();
+            rangeUpdate.call(range);
         }
     }
     function rangesReplaceData(node, offset, count, length) {
@@ -14664,7 +14710,7 @@
         if (nativeDomTraversal) return relativeNode(node, 0);
         if (node.nodeType === 9) return null;
         const parent = wrap(__dom_parent(nodeIds.get(node)));
-        return parent && (parent.__trustLN === "iframe" || parent.__trustLN === "frame") &&
+        return parent && (internalsFor(parent).trustLN === "iframe" || internalsFor(parent).trustLN === "frame") &&
             internalsOf(parent).contentDoc ? internalsOf(parent).contentDoc : parent;
     }
     function rangeContains(parent,node) {
@@ -14697,6 +14743,13 @@
         if (offset > rangeLength(node)) throw new DOMException("Offset exceeds node length", "IndexSizeError");
         return offset;
     }
+    function rangeUpdate() {
+        this.collapsed = this.startContainer === this.endContainer && this.startOffset === this.endOffset;
+        let ancestor = this.startContainer;
+        while (ancestor && !ancestor.contains(this.endContainer)) ancestor = ancestor.parentNode;
+        this.commonAncestorContainer = ancestor || this.startContainer;
+        if (documentSelection._range === this) queueSelectionChange();
+    }
     class Range {
         constructor() {
             this.startContainer = g.document; this.endContainer = g.document;
@@ -14704,26 +14757,19 @@
             this.commonAncestorContainer = g.document;
             registerLiveRange(this);
         }
-        __upd() {
-            this.collapsed = this.startContainer === this.endContainer && this.startOffset === this.endOffset;
-            let ancestor = this.startContainer;
-            while (ancestor && !ancestor.contains(this.endContainer)) ancestor = ancestor.parentNode;
-            this.commonAncestorContainer = ancestor || this.startContainer;
-            if (documentSelection._range === this) queueSelectionChange();
-        }
         setStart(node, off) {
             off = rangeBoundary(node, off);
             if (rangeOrder(node, off, this.endContainer, this.endOffset) !== -1) {
                 this.endContainer = node; this.endOffset = off;
             }
-            this.startContainer = node; this.startOffset = off; this.__upd();
+            this.startContainer = node; this.startOffset = off; rangeUpdate.call(this);
         }
         setEnd(node, off) {
             off = rangeBoundary(node, off);
             if (rangeOrder(this.startContainer, this.startOffset, node, off) !== -1) {
                 this.startContainer = node; this.startOffset = off;
             }
-            this.endContainer = node; this.endOffset = off; this.__upd();
+            this.endContainer = node; this.endOffset = off; rangeUpdate.call(this);
         }
         setStartBefore(node) { if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError"); this.setStart(node.parentNode, rangeIndex(node)); }
         setStartAfter(node) { if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError"); this.setStart(node.parentNode, rangeIndex(node) + 1); }
@@ -14733,17 +14779,17 @@
             if (!node?.parentNode) throw new DOMException("Node has no parent", "InvalidNodeTypeError");
             const parent = node.parentNode, index = rangeIndex(node);
             this.startContainer = this.endContainer = parent;
-            this.startOffset = index; this.endOffset = index + 1; this.__upd();
+            this.startOffset = index; this.endOffset = index + 1; rangeUpdate.call(this);
         }
         selectNodeContents(node) {
             rangeBoundary(node, 0);
             this.startContainer = this.endContainer = node;
-            this.startOffset = 0; this.endOffset = rangeLength(node); this.__upd();
+            this.startOffset = 0; this.endOffset = rangeLength(node); rangeUpdate.call(this);
         }
         collapse(toStart) {
             if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; }
             else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
-            this.__upd();
+            rangeUpdate.call(this);
         }
         cloneRange() { const r = new Range(); r.startContainer = this.startContainer; r.endContainer = this.endContainer; r.startOffset = this.startOffset; r.endOffset = this.endOffset; r.collapsed = this.collapsed; r.commonAncestorContainer = this.commonAncestorContainer; return r; }
         cloneContents() { return g.document.createDocumentFragment(); }
@@ -14780,7 +14826,7 @@
             }
             this.startContainer = this.endContainer = newNode;
             this.startOffset = this.endOffset = newOffset;
-            this.__upd();
+            rangeUpdate.call(this);
             if (rangeCharacterData(start))
                 start.deleteData(startOffset, start.length - startOffset);
             for (const child of contained) child.remove();
@@ -14947,7 +14993,7 @@
         for (let i = 0; i < MO.length; i++) {
             const observer = MO[i].deref();
             if (!observer) { MO.splice(i--, 1); continue; }
-            const regs = observer.__targets;
+            const regs = internalsFor(observer).targets;
             for (let j = 0; j < regs.length; j++) {
                 const r = regs[j];
                 moHasChildList = moHasChildList || r.childList;
@@ -14962,7 +15008,7 @@
         if (moDisabled) return;
         if (++moChain > MO_CHAIN_CAP) {
             moDisabled = true;
-            for (const observer of moPending) observer.__records = [];
+            for (const observer of moPending) internalsFor(observer).records = [];
             moPending.clear();
             trust.errors.push("MutationObserver: delivery exceeded " + MO_CHAIN_CAP +
                 " microtask turns (observer loop?) — disabled for this page");
@@ -14974,14 +15020,14 @@
         moPending.clear();
         for (let i = 0; i < obs.length; i++) {
             const o = obs[i];
-            const recs = o.__records;
-            o.__records = [];
-            if (o.__targets.some(reg => reg.source)) {
-                o.__targets = o.__targets.filter(reg => !reg.source);
+            const recs = internalsFor(o).records;
+            internalsFor(o).records = [];
+            if (internalsFor(o).targets.some(reg => reg.source)) {
+                internalsFor(o).targets = internalsFor(o).targets.filter(reg => !reg.source);
                 moRetainTargets(o);
             }
             if (!recs.length) continue;
-            try { o.__cb(recs, o); }
+            try { internalsFor(o).cb.call(o, recs, o); }
             catch (e) { trust.errors.push("MutationObserver callback: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         }
         // The chain has ended iff no callback re-queued during this turn; only
@@ -15022,7 +15068,7 @@
         for (let i = 0; i < MO.length; i++) {
             const o = MO[i].deref();
             if (!o) { MO.splice(i--, 1); continue; }
-            const regs = o.__targets;
+            const regs = internalsFor(o).targets;
             let matched = false, wantOld = false, rank = Infinity, order = Infinity;
             for (let j = 0; j < regs.length; j++) {
                 const opts = regs[j];
@@ -15052,7 +15098,7 @@
                 prevSib = s ? wrap(__dom_prev(nodeIds.get(s))) : null;
                 nextSib = s ? wrap(__dom_next(nodeIds.get(s))) : null;
             }
-            o.__records.push({
+            internalsFor(o).records.push({
                 type: rec.type,
                 target: rec.target,
                 addedNodes: rec.addedNodes || MO_EMPTY,
@@ -15104,14 +15150,14 @@
     }
 
     function moRetainTargets(observer) {
-        observer.__targets = observer.__targets.filter(reg => reg.target.deref() !== undefined);
-        __dom_observer_targets(observer, Array.from(new Set(observer.__targets.map(reg => reg.id))));
+        internalsFor(observer).targets = internalsFor(observer).targets.filter(reg => reg.target.deref() !== undefined);
+        __dom_observer_targets(observer, Array.from(new Set(internalsFor(observer).targets.map(reg => reg.id))));
     }
     function moRetainTransient(parent, removed) {
         for (let i = 0; i < MO.length; i++) {
             const observer = MO[i].deref();
             if (!observer) { MO.splice(i--, 1); continue; }
-            const regs = observer.__targets;
+            const regs = internalsFor(observer).targets;
             const length = regs.length;
             let added = false;
             for (let j = 0; j < length; j++) {
@@ -15130,12 +15176,12 @@
         constructor(cb) {
             if (typeof cb !== "function")
                 throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not a function");
-            this.__cb = cb;
-            this.__windowState = activeWindowState();
-            this.__records = [];
-            this.__targets = []; // array of registrations: { target, childList, … }
-            this.__reference = new WeakRef(this);
-            moFinalizer.register(this, this.__reference);
+            internalsFor(this).cb = cb;
+            internalsFor(this).windowState = activeWindowState();
+            internalsFor(this).records = [];
+            internalsFor(this).targets = []; // array of registrations: { target, childList, … }
+            internalsFor(this).reference = new WeakRef(this);
+            moFinalizer.register(this, internalsFor(this).reference);
         }
         observe(target, options) {
             if (!target || typeof nodeIds.get(target) !== "number")
@@ -15166,29 +15212,29 @@
                 childList, attributes, characterData, subtree,
                 attributeOldValue, characterDataOldValue, attributeFilter };
             let replaced = false;
-            for (let i = 0; i < this.__targets.length; i++) {
-                if (!this.__targets[i].source && this.__targets[i].target.deref() === target) {
-                    const source = this.__targets[i];
+            for (let i = 0; i < internalsFor(this).targets.length; i++) {
+                if (!internalsFor(this).targets[i].source && internalsFor(this).targets[i].target.deref() === target) {
+                    const source = internalsFor(this).targets[i];
                     reg.order = source.order;
-                    this.__targets[i] = reg;
-                    this.__targets = this.__targets.filter(entry => entry.source !== source);
+                    internalsFor(this).targets[i] = reg;
+                    internalsFor(this).targets = internalsFor(this).targets.filter(entry => entry.source !== source);
                     replaced = true; break;
                 }
             }
-            if (!replaced) this.__targets.push(reg);
-            if (MO.indexOf(this.__reference) < 0) MO.push(this.__reference);
+            if (!replaced) internalsFor(this).targets.push(reg);
+            if (MO.indexOf(internalsFor(this).reference) < 0) MO.push(internalsFor(this).reference);
             moRetainTargets(this);
             moRecomputeKinds();
         }
         disconnect() {
-            this.__targets = [];
-            this.__records = [];
+            internalsFor(this).targets = [];
+            internalsFor(this).records = [];
             __dom_observer_targets(this, []);
-            const i = MO.indexOf(this.__reference);
+            const i = MO.indexOf(internalsFor(this).reference);
             if (i >= 0) MO.splice(i, 1);
             moRecomputeKinds();
         }
-        takeRecords() { const r = this.__records; this.__records = []; return r; }
+        takeRecords() { const r = internalsFor(this).records; internalsFor(this).records = []; return r; }
     };
     // IntersectionObserver — HONEST viewport intersection (W3C Intersection
     // Observer + CSSOM View). The terminal now threads the real scroll position
@@ -15266,42 +15312,42 @@
     }
     g.IntersectionObserver = class {
         constructor(cb, opts) {
-            this.__cb = cb;
-            this.__windowState = activeWindowState();
+            internalsFor(this).cb = cb;
+            internalsFor(this).windowState = activeWindowState();
             opts = opts || {};
             // An element root (scroll container) isn't modelled — the terminal
             // has one scroll, the document's — so any root is treated as the
             // viewport. rootMargin/threshold are honoured.
             this.root = opts.root || null;
             this.rootMargin = opts.rootMargin == null ? "0px 0px 0px 0px" : String(opts.rootMargin);
-            this.__rm = ioParseRootMargin(opts.rootMargin);
+            internalsFor(this).rm = ioParseRootMargin(opts.rootMargin);
             this.thresholds = ioNormThresholds(opts.threshold);
             // Each registration: {el, lastIndex, lastIx}. Start lastIndex at -1
             // so the FIRST update always queues an entry (the spec's
             // previousThresholdIndex = -1) — i.e. observe() yields one initial
             // callback with the current state, isIntersecting possibly false.
-            this.__targets = [];
-            this.__queuedEntries = [];
+            internalsFor(this).targets = [];
+            internalsFor(this).queuedEntries = [];
         }
         observe(el) {
             if (!el) return;
-            for (let i = 0; i < this.__targets.length; i++) if (this.__targets[i].el === el) return;
-            this.__targets.push({ el: el, lastIndex: -1, lastIx: false });
+            for (let i = 0; i < internalsFor(this).targets.length; i++) if (internalsFor(this).targets[i].el === el) return;
+            internalsFor(this).targets.push({ el: el, lastIndex: -1, lastIx: false });
             if (IO.indexOf(this) < 0) IO.push(this);
             // Intersection Observer §3.2.4 requests an update during HTML's
             // next rendering opportunity. It does not manufacture a timer.
             ioInitialUpdatePending = true;
         }
         unobserve(el) {
-            for (let i = 0; i < this.__targets.length; i++) {
-                if (this.__targets[i].el === el) { this.__targets.splice(i, 1); break; }
+            for (let i = 0; i < internalsFor(this).targets.length; i++) {
+                if (internalsFor(this).targets[i].el === el) { internalsFor(this).targets.splice(i, 1); break; }
             }
-            if (!this.__targets.length) { const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
+            if (!internalsFor(this).targets.length) { const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
         }
-        disconnect() { this.__targets = []; const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
+        disconnect() { internalsFor(this).targets = []; const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
         takeRecords() {
-            const entries = this.__queuedEntries;
-            this.__queuedEntries = [];
+            const entries = internalsFor(this).queuedEntries;
+            internalsFor(this).queuedEntries = [];
             return entries;
         }
     };
@@ -15327,7 +15373,7 @@
             }
             if (!init.target || typeof nodeIds.get(init.target) !== "number")
                 throw new TypeError("Failed to construct 'IntersectionObserverEntry': target is not an Element");
-            Object.defineProperty(this, "__entry", { value: Object.freeze({
+            internalsFor(this).entry = Object.freeze({
                 time: Number(init.time),
                 rootBounds: init.rootBounds === null ? null : ioEntryRect(init.rootBounds),
                 boundingClientRect: ioEntryRect(init.boundingClientRect),
@@ -15335,17 +15381,17 @@
                 isIntersecting: Boolean(init.isIntersecting),
                 intersectionRatio: Number(init.intersectionRatio),
                 target: init.target,
-            }) });
+            });
         }
     };
     Object.defineProperties(g.IntersectionObserverEntry.prototype, {
-        time: { get() { return this.__entry.time; }, enumerable: true, configurable: true },
-        rootBounds: { get() { return this.__entry.rootBounds; }, enumerable: true, configurable: true },
-        boundingClientRect: { get() { return this.__entry.boundingClientRect; }, enumerable: true, configurable: true },
-        intersectionRect: { get() { return this.__entry.intersectionRect; }, enumerable: true, configurable: true },
-        isIntersecting: { get() { return this.__entry.isIntersecting; }, enumerable: true, configurable: true },
-        intersectionRatio: { get() { return this.__entry.intersectionRatio; }, enumerable: true, configurable: true },
-        target: { get() { return this.__entry.target; }, enumerable: true, configurable: true },
+        time: { get() { return internalsFor(this).entry.time; }, enumerable: true, configurable: true },
+        rootBounds: { get() { return internalsFor(this).entry.rootBounds; }, enumerable: true, configurable: true },
+        boundingClientRect: { get() { return internalsFor(this).entry.boundingClientRect; }, enumerable: true, configurable: true },
+        intersectionRect: { get() { return internalsFor(this).entry.intersectionRect; }, enumerable: true, configurable: true },
+        isIntersecting: { get() { return internalsFor(this).entry.isIntersecting; }, enumerable: true, configurable: true },
+        intersectionRatio: { get() { return internalsFor(this).entry.intersectionRatio; }, enumerable: true, configurable: true },
+        target: { get() { return internalsFor(this).entry.target; }, enumerable: true, configurable: true },
     });
 
     function queueIntersectionObserverTask(observer) {
@@ -15358,10 +15404,10 @@
             const notify = ioNotify.splice(0);
             for (let i = 0; i < notify.length; i++) {
                 const o = notify[i];
-                const entries = o.__queuedEntries;
-                o.__queuedEntries = [];
+                const entries = internalsFor(o).queuedEntries;
+                internalsFor(o).queuedEntries = [];
                 if (!entries.length) continue;
-                try { o.__cb(entries, o); }
+                try { internalsFor(o).cb.call(o, entries, o); }
                 catch (e) { trust.errors.push("IntersectionObserver: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
             }
         }});
@@ -15383,7 +15429,7 @@
         const observers = IO.slice();
         for (let oi = 0; oi < observers.length; oi++) {
             const o = observers[oi];
-            const rm = o.__rm;
+            const rm = internalsFor(o).rm;
             const mT = rm[0].pct ? (rm[0].v / 100) * vh : rm[0].v;
             const mR = rm[1].pct ? (rm[1].v / 100) * vw : rm[1].v;
             const mB = rm[2].pct ? (rm[2].v / 100) * vh : rm[2].v;
@@ -15397,7 +15443,7 @@
             };
             const ths = o.thresholds;
             const entries = [];
-            const targets = o.__targets.slice();
+            const targets = internalsFor(o).targets.slice();
             for (let ti = 0; ti < targets.length; ti++) {
                 const rec = targets[ti];
                 let dr = null;
@@ -15439,7 +15485,7 @@
             }
             if (entries.length) {
                 queued += entries.length;
-                o.__queuedEntries.push(...entries);
+                internalsFor(o).queuedEntries.push(...entries);
                 queueIntersectionObserverTask(o);
             }
         }
@@ -15536,30 +15582,30 @@
         return { initial: ioInitialUpdatePending, taskQueued: ioTaskQueued,
             tasks: intersectionTasks.length, notify: ioNotify.length,
             observers: IO.map(o => ({rootMargin:o.rootMargin, root:o.root && nodeIds.get(o.root),
-                pending:o.__queuedEntries.length, targets:o.__targets.map(t => ({
+                pending:internalsFor(o).queuedEntries.length, targets:internalsFor(o).targets.map(t => ({
                     node:nodeIds.get(t.el), id:t.el.id, index:t.lastIndex, intersecting:t.lastIx
                 }))})) };
     };
     g.ResizeObserver = class {
-        constructor(cb) { this.__cb = cb; this.__targets = []; this.__windowState = activeWindowState(); }
+        constructor(cb) { internalsFor(this).cb = cb; internalsFor(this).targets = []; internalsFor(this).windowState = activeWindowState(); }
         observe(el) {
             if (!el) return;
-            for (let i = 0; i < this.__targets.length; i++) if (this.__targets[i].el === el) return;
+            for (let i = 0; i < internalsFor(this).targets.length; i++) if (internalsFor(this).targets[i].el === el) return;
             // lastW/lastH = -1 so the FIRST delivery always fires (spec: observe
             // queues an initial observation with the current size).
-            this.__targets.push({ el: el, lastW: -1, lastH: -1 });
+            internalsFor(this).targets.push({ el: el, lastW: -1, lastH: -1 });
             if (RO.indexOf(this) < 0) RO.push(this);
             // Resize Observer §3.4 integrates this initial delivery into
             // HTML's next rendering update; it is not a timer task.
             roInitialUpdatePending = true;
         }
         unobserve(el) {
-            for (let i = 0; i < this.__targets.length; i++) {
-                if (this.__targets[i].el === el) { this.__targets.splice(i, 1); break; }
+            for (let i = 0; i < internalsFor(this).targets.length; i++) {
+                if (internalsFor(this).targets[i].el === el) { internalsFor(this).targets.splice(i, 1); break; }
             }
-            if (!this.__targets.length) { const k = RO.indexOf(this); if (k >= 0) RO.splice(k, 1); }
+            if (!internalsFor(this).targets.length) { const k = RO.indexOf(this); if (k >= 0) RO.splice(k, 1); }
         }
-        disconnect() { this.__targets = []; const k = RO.indexOf(this); if (k >= 0) RO.splice(k, 1); }
+        disconnect() { internalsFor(this).targets = []; const k = RO.indexOf(this); if (k >= 0) RO.splice(k, 1); }
     };
     // The spec's ResizeObserver delivery ("gather active observations" → "broadcast"):
     // for each observer × target, measure the target's CURRENT border box and fire
@@ -15577,7 +15623,7 @@
         for (let oi = 0; oi < observers.length; oi++) {
             const o = observers[oi];
             const entries = [];
-            const targets = o.__targets.slice();
+            const targets = internalsFor(o).targets.slice();
             for (let ti = 0; ti < targets.length; ti++) {
                 const rec = targets[ti];
                 let r = null;
@@ -15591,7 +15637,7 @@
             }
             if (entries.length) {
                 delivered += entries.length;
-                try { o.__cb(entries, o); }
+                try { internalsFor(o).cb.call(o, entries, o); }
                 catch (e) { trust.errors.push("ResizeObserver: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
             }
         }
@@ -16200,7 +16246,7 @@
                     data: packet.data, origin, source: windowForRealm(source),
                     ports: Object.freeze(packet.ports)
                 });
-                event.__windowTargetSet = true; event.__frameTarget = frame;
+                internalsFor(event).windowTargetSet = true; internalsFor(event).frameTarget = frame;
                 if (traceChallengeMessage) traceChallengeMessage("dispatch", wire, origin,
                     messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
                 dispatch(g, event, false);
@@ -16448,7 +16494,7 @@
                     if (WINDOW_REFLECTING_BODY_HANDLERS.has(type) &&
                         this instanceof Element && reflectsWindowHandlers(this))
                         return g["on" + type];
-                    return (this.__trustOn && this.__trustOn[type]) || null;
+                    return (internalsFor(this).trustOn && internalsFor(this).trustOn[type]) || null;
                 },
                 set(v) {
                     if (WINDOW_REFLECTING_BODY_HANDLERS.has(type) &&
@@ -16456,11 +16502,11 @@
                         g["on" + type] = v;
                         return;
                     }
-                    if (!this.__trustOn) this.__trustOn = {};
-                    const prev = this.__trustOn[type];
+                    if (!internalsFor(this).trustOn) internalsFor(this).trustOn = {};
+                    const prev = internalsFor(this).trustOn[type];
                     if (prev) this.removeEventListener(type, prev);
                     const fn = typeof v === "function" ? v : null;
-                    this.__trustOn[type] = fn;
+                    internalsFor(this).trustOn[type] = fn;
                     if (fn) this.addEventListener(type, fn);
                 },
             });
@@ -17270,42 +17316,42 @@
         constructor(label, options) {
             const l = (label === undefined ? "utf-8" : `${label}`).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "").toLowerCase();
             const utf8 = ["unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "utf-8", "utf8", "x-unicode20utf8"];
-            if (utf8.indexOf(l) >= 0) this.__encoding = "utf-8";
-            else if (l === "unicodefffe" || l === "utf-16be") this.__encoding = "utf-16be";
-            else if (["csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le"].indexOf(l) >= 0) this.__encoding = "utf-16le";
+            if (utf8.indexOf(l) >= 0) internalsFor(this).encoding = "utf-8";
+            else if (l === "unicodefffe" || l === "utf-16be") internalsFor(this).encoding = "utf-16be";
+            else if (["csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le"].indexOf(l) >= 0) internalsFor(this).encoding = "utf-16le";
             // Encoding §4.2: Latin-1/ASCII labels select windows-1252 on
             // the web, including its non-Latin-1 mappings at 0x80–0x9f.
-            else if (["ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819", "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "l1", "latin1", "us-ascii", "windows-1252", "x-cp1252"].indexOf(l) >= 0) this.__encoding = "windows-1252";
+            else if (["ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819", "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "l1", "latin1", "us-ascii", "windows-1252", "x-cp1252"].indexOf(l) >= 0) internalsFor(this).encoding = "windows-1252";
             else throw new RangeError("The encoding label is invalid");
-            this.__fatal = !!(options && options.fatal);
-            this.__ignoreBOM = !!(options && options.ignoreBOM);
-            this.__doNotFlush = false;
-            this.__pendingBytes = [];
-            this.__pendingHigh = null;
-            this.__bomSeen = false;
+            internalsFor(this).fatal = !!(options && options.fatal);
+            internalsFor(this).ignoreBOM = !!(options && options.ignoreBOM);
+            internalsFor(this).doNotFlush = false;
+            internalsFor(this).pendingBytes = [];
+            internalsFor(this).pendingHigh = null;
+            internalsFor(this).bomSeen = false;
         }
-        get encoding() { return this.__encoding; }
-        get fatal() { return this.__fatal; }
-        get ignoreBOM() { return this.__ignoreBOM; }
+        get encoding() { return internalsFor(this).encoding; }
+        get fatal() { return internalsFor(this).fatal; }
+        get ignoreBOM() { return internalsFor(this).ignoreBOM; }
         decode(input, options) {
             const stream = !!(options && options.stream);
-            if (!this.__doNotFlush) {
-                this.__pendingBytes = [];
-                this.__pendingHigh = null;
-                this.__bomSeen = false;
+            if (!internalsFor(this).doNotFlush) {
+                internalsFor(this).pendingBytes = [];
+                internalsFor(this).pendingHigh = null;
+                internalsFor(this).bomSeen = false;
             }
-            this.__doNotFlush = stream;
+            internalsFor(this).doNotFlush = stream;
             let b;
             if (input === undefined) b = new Uint8Array(0);
             else if (input instanceof ArrayBuffer) b = new Uint8Array(input);
             else if (ArrayBuffer.isView(input)) b = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
             else b = new Uint8Array(input);
-            if (this.__pendingBytes.length) {
-                const joined = new Uint8Array(this.__pendingBytes.length + b.length);
-                joined.set(this.__pendingBytes); joined.set(b, this.__pendingBytes.length); b = joined;
-                this.__pendingBytes = [];
+            if (internalsFor(this).pendingBytes.length) {
+                const joined = new Uint8Array(internalsFor(this).pendingBytes.length + b.length);
+                joined.set(internalsFor(this).pendingBytes); joined.set(b, internalsFor(this).pendingBytes.length); b = joined;
+                internalsFor(this).pendingBytes = [];
             }
-            if (this.__encoding === "windows-1252") {
+            if (internalsFor(this).encoding === "windows-1252") {
                 const special = [0x20ac,0x81,0x201a,0x192,0x201e,0x2026,0x2020,0x2021,0x2c6,0x2030,0x160,0x2039,0x152,0x8d,0x17d,0x8f,0x90,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,0x2dc,0x2122,0x161,0x203a,0x153,0x9d,0x17e,0x178];
                 let out = "";
                 for (let i = 0; i < b.length; i++) {
@@ -17314,44 +17360,44 @@
                 }
                 return out;
             }
-            if (this.__encoding === "utf-8") {
-                const decoded = __text_decode_utf8(b, stream, this.__fatal);
+            if (internalsFor(this).encoding === "utf-8") {
+                const decoded = __text_decode_utf8(b, stream, internalsFor(this).fatal);
                 let out;
                 if (typeof decoded === "string") out = decoded;
                 else {
-                    this.__pendingBytes = decoded[1];
+                    internalsFor(this).pendingBytes = decoded[1];
                     if (decoded[2]) throw new TypeError("The encoded data was not valid");
                     out = decoded[0];
                 }
                 // Encoding #concept-td-serialize: empty chunks do not consume
                 // the BOM, and a fatal call never serializes its partial output.
-                if (!this.__ignoreBOM && !this.__bomSeen && out.length) {
-                    this.__bomSeen = true;
+                if (!internalsFor(this).ignoreBOM && !internalsFor(this).bomSeen && out.length) {
+                    internalsFor(this).bomSeen = true;
                     if (out.charCodeAt(0) === 0xfeff) out = out.slice(1);
                 }
                 return out;
             }
 
-            let orderLE = this.__encoding === "utf-16le", offset = 0;
-            if (!this.__bomSeen && b.length >= 2) {
+            let orderLE = internalsFor(this).encoding === "utf-16le", offset = 0;
+            if (!internalsFor(this).bomSeen && b.length >= 2) {
                 if (b[0] === 0xfe && b[1] === 0xff) orderLE = false;
                 else if (b[0] === 0xff && b[1] === 0xfe) orderLE = true;
-                if (!this.__ignoreBOM && ((orderLE && b[0] === 0xff && b[1] === 0xfe) || (!orderLE && b[0] === 0xfe && b[1] === 0xff))) offset = 2;
-                this.__bomSeen = true;
+                if (!internalsFor(this).ignoreBOM && ((orderLE && b[0] === 0xff && b[1] === 0xfe) || (!orderLE && b[0] === 0xfe && b[1] === 0xff))) offset = 2;
+                internalsFor(this).bomSeen = true;
             }
             let danglingByte = false;
             if (((b.length - offset) & 1) !== 0) {
                 if (stream) {
-                    this.__pendingBytes = [b[b.length - 1]];
+                    internalsFor(this).pendingBytes = [b[b.length - 1]];
                     b = b.slice(0, b.length - 1);
                 } else {
-                    if (this.__fatal) throw new TypeError("The encoded data was not valid");
+                    if (internalsFor(this).fatal) throw new TypeError("The encoded data was not valid");
                     danglingByte = true;
                     b = b.slice(0, b.length - 1);
                 }
             }
-            let out = "", high = this.__pendingHigh;
-            const error = () => { if (this.__fatal) throw new TypeError("The encoded data was not valid"); out += "�"; };
+            let out = "", high = internalsFor(this).pendingHigh;
+            const error = () => { if (internalsFor(this).fatal) throw new TypeError("The encoded data was not valid"); out += "�"; };
             if (danglingByte) error();
             for (let i = offset; i < b.length; i += 2) {
                 const u = orderLE ? b[i] | (b[i + 1] << 8) : (b[i] << 8) | b[i + 1];
@@ -17364,9 +17410,9 @@
                 else out += String.fromCharCode(u);
             }
             if (high !== null) {
-                if (stream) this.__pendingHigh = high;
-                else { error(); this.__pendingHigh = null; }
-            } else this.__pendingHigh = null;
+                if (stream) internalsFor(this).pendingHigh = high;
+                else { error(); internalsFor(this).pendingHigh = null; }
+            } else internalsFor(this).pendingHigh = null;
             return out;
         }
     };
@@ -17695,6 +17741,15 @@
     // (UTF-8) everything else. NOT encodeURIComponent, which emits "%20" for space
     // and leaves `! ' ( ) ~` unescaped — both wrong for a query string.
     const fenc = (s) => encodeURIComponent(String(s)).replace(/[!'()~]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()).replace(/%20/g, "+");
+    function searchParamsNotify() { if (internalsFor(this).url) urlSetSearchFromParams.call(internalsFor(this).url, this.toString()); }
+    function searchParamsSetList(query) {
+        internalsFor(this).p = [];
+        for (const kv of String(query).replace(/^\?/, "").split("&")) {
+            if (!kv) continue;
+            const i = kv.indexOf("=");
+            internalsFor(this).p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
+        }
+    }
     class URLSearchParams {
         // WHATWG: init may be a string ("?"-prefixed query), another
         // URLSearchParams (copy its list), a sequence of [name,value] pairs, or
@@ -17705,56 +17760,47 @@
         // on later pages (Twitch's app threw on it). Passing the battery keeps our
         // native, url-crate-backed implementation in play.
         constructor(init) {
-            this.__p = [];
+            internalsFor(this).p = [];
             if (init === undefined || init === null) return;
             if (init instanceof URLSearchParams) {
-                for (const p of init.__p) this.__p.push([p[0], p[1]]);
+                for (const p of internalsFor(init).p) internalsFor(this).p.push([p[0], p[1]]);
             } else if (typeof init === "string") {
                 for (const kv of init.replace(/^\?/, "").split("&")) {
                     if (!kv) continue;
                     const i = kv.indexOf("=");
-                    this.__p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
+                    internalsFor(this).p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
                 }
             } else if (typeof init[Symbol.iterator] === "function") {
                 for (const pair of init) {
                     const a = Array.from(pair);
-                    this.__p.push([String(a[0]), String(a[1])]);
+                    internalsFor(this).p.push([String(a[0]), String(a[1])]);
                 }
             } else if (typeof init === "object") {
-                for (const k of Object.keys(init)) this.__p.push([String(k), String(init[k])]);
+                for (const k of Object.keys(init)) internalsFor(this).p.push([String(k), String(init[k])]);
             }
         }
-        get(k) { const e = this.__p.find((p) => p[0] === String(k)); return e ? e[1] : null; }
-        getAll(k) { return this.__p.filter((p) => p[0] === String(k)).map((p) => p[1]); }
-        has(k) { return this.__p.some((p) => p[0] === String(k)); }
-        set(k, v) { this.__p = this.__p.filter((p) => p[0] !== String(k)); this.__p.push([String(k), String(v)]); this.__notify(); }
-        append(k, v) { this.__p.push([String(k), String(v)]); this.__notify(); }
-        delete(k) { this.__p = this.__p.filter((p) => p[0] !== String(k)); this.__notify(); }
-        get size() { return this.__p.length; }
-        sort() { this.__p.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this.__notify(); }
+        get(k) { const e = internalsFor(this).p.find((p) => p[0] === String(k)); return e ? e[1] : null; }
+        getAll(k) { return internalsFor(this).p.filter((p) => p[0] === String(k)).map((p) => p[1]); }
+        has(k) { return internalsFor(this).p.some((p) => p[0] === String(k)); }
+        set(k, v) { internalsFor(this).p = internalsFor(this).p.filter((p) => p[0] !== String(k)); internalsFor(this).p.push([String(k), String(v)]); searchParamsNotify.call(this); }
+        append(k, v) { internalsFor(this).p.push([String(k), String(v)]); searchParamsNotify.call(this); }
+        delete(k) { internalsFor(this).p = internalsFor(this).p.filter((p) => p[0] !== String(k)); searchParamsNotify.call(this); }
+        get size() { return internalsFor(this).p.length; }
+        sort() { internalsFor(this).p.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); searchParamsNotify.call(this); }
         // Live binding to an owning URL (set by URL.searchParams). WHATWG makes
         // url.searchParams the URL's "query object": mutating it reflows the
         // URL's query. Undefined for a standalone URLSearchParams (no-op).
-        __notify() { if (this.__url) this.__url.__setSearchFromParams(this.toString()); }
         // Rebuild the list from a query string (called by the owning URL when its
         // .search/.href is set, so the shared object stays in sync both ways).
-        __setList(query) {
-            this.__p = [];
-            for (const kv of String(query).replace(/^\?/, "").split("&")) {
-                if (!kv) continue;
-                const i = kv.indexOf("=");
-                this.__p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
-            }
-        }
         // Live iteration (WebIDL maplike forEach): re-read length/index each step,
         // so deleting/appending during the callback affects what's visited — what
         // core-js's `r.delete("b")`-inside-forEach probe asserts ("a1c3").
-        forEach(fn, thisArg) { for (let i = 0; i < this.__p.length; i++) { const e = this.__p[i]; fn.call(thisArg, e[1], e[0], this); } }
-        keys() { return this.__p.map((p) => p[0])[Symbol.iterator](); }
-        values() { return this.__p.map((p) => p[1])[Symbol.iterator](); }
-        entries() { return this.__p.slice()[Symbol.iterator](); }
+        forEach(fn, thisArg) { for (let i = 0; i < internalsFor(this).p.length; i++) { const e = internalsFor(this).p[i]; fn.call(thisArg, e[1], e[0], this); } }
+        keys() { return internalsFor(this).p.map((p) => p[0])[Symbol.iterator](); }
+        values() { return internalsFor(this).p.map((p) => p[1])[Symbol.iterator](); }
+        entries() { return internalsFor(this).p.slice()[Symbol.iterator](); }
         [Symbol.iterator]() { return this.entries(); }
-        toString() { return this.__p.map(([k, v]) => fenc(k) + "=" + fenc(v)).join("&"); }
+        toString() { return internalsFor(this).p.map(([k, v]) => fenc(k) + "=" + fenc(v)).join("&"); }
     }
     // --- Blob URL store (File API §"Creating and Revoking a blob URL") ---
     // RAM-only, page-lifetime, per-realm: a map from a minted `blob:` URL string
@@ -17769,13 +17815,13 @@
     // our string-backed Blob.arrayBuffer() (which leaves binary empty), so a blob
     // built from a Uint8Array still round-trips through createObjectURL+fetch.
     function __blobBytes(b) {
-        if (!b || !Array.isArray(b.__parts)) return "";
+        if (!b || !Array.isArray(internalsFor(b).parts)) return "";
         let out = "";
-        for (const p of b.__parts) {
+        for (const p of internalsFor(b).parts) {
             if (typeof p === "string") out += utf8Binary(p);
             else if (p instanceof ArrayBuffer) { const v = new Uint8Array(p); for (let i = 0; i < v.length; i++) out += String.fromCharCode(v[i]); }
             else if (p && typeof p.byteLength === "number" && p.buffer) { const v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (let i = 0; i < v.length; i++) out += String.fromCharCode(v[i]); }
-            else if (p && Array.isArray(p.__parts)) out += __blobBytes(p);
+            else if (p && Array.isArray(internalsFor(p).parts)) out += __blobBytes(p);
             else if (p != null) out += utf8Binary(String(p));
         }
         return out;
@@ -17801,10 +17847,13 @@
         // Only Blob-shaped entries carry retrievable bytes; an unmodeled MediaSource
         // still mints a URL but yields no media here (no media pipeline — a
         // documented terminal deviation: we delegate playback to mpv).
-        return { bytes: Array.isArray(obj.__parts) ? __blobBytes(obj) : "", type: obj.type || "",
+        return { bytes: Array.isArray(internalsFor(obj).parts) ? __blobBytes(obj) : "", type: obj.type || "",
             origin: entry.origin, originKey: entry.originKey };
     }
     const urlWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
+    function urlSet(which, v) { const r = __url_set(internalsFor(this).p[0], which, String(v)); if (r) internalsFor(this).p = r; }
+    function urlSyncSearchParams() { if (internalsFor(this).sp) searchParamsSetList.call(internalsFor(this).sp, internalsFor(this).p[6]); }
+    function urlSetSearchFromParams(qs) { const r = __url_set(internalsFor(this).p[0], "search", qs); if (r) internalsFor(this).p = r; }
     class URL {
         // URL Standard #dom-url-parse / #dom-url-canparse (local snapshot
         // 55d66993). Conversion errors propagate; only parser failure is null.
@@ -17813,8 +17862,8 @@
             const parts = __url_parse(urlWellFormed(domString(url)), base === undefined ? null : urlWellFormed(domString(base)));
             if (!parts) return null;
             const result = Object.create(URL.prototype);
-            result.__p = parts;
-            result.__sp = null;
+            internalsFor(result).p = parts;
+            internalsFor(result).sp = null;
             return result;
         }
         static canParse(url, base = undefined) {
@@ -17834,33 +17883,30 @@
         constructor(href, base) {
             const r = __url_parse(String(href), base === undefined || base === null ? null : String(base));
             if (!r) throw new TypeError("Invalid URL: " + href);
-            this.__p = r;      // [href, protocol, host, hostname, port, pathname, search, hash, origin, username, password]
-            this.__sp = null;  // lazily-created bound URLSearchParams (the "query object")
+            internalsFor(this).p = r;      // [href, protocol, host, hostname, port, pathname, search, hash, origin, username, password]
+            internalsFor(this).sp = null;  // lazily-created bound URLSearchParams (the "query object")
         }
-        get href() { return this.__p[0]; }
+        get href() { return internalsFor(this).p[0]; }
         // The href setter re-parses from scratch (no base) and throws on failure.
-        set href(v) { const r = __url_parse(String(v), null); if (!r) throw new TypeError("Invalid URL: " + v); this.__p = r; this.__syncSP(); }
-        get protocol() { return this.__p[1]; } set protocol(v) { this.__set("protocol", v); }
-        get host() { return this.__p[2]; } set host(v) { this.__set("host", v); }
-        get hostname() { return this.__p[3]; } set hostname(v) { this.__set("hostname", v); }
-        get port() { return this.__p[4]; } set port(v) { this.__set("port", v); }
-        get pathname() { return this.__p[5]; } set pathname(v) { this.__set("pathname", v); }
-        get search() { return this.__p[6]; } set search(v) { this.__set("search", v); this.__syncSP(); }
-        get hash() { return this.__p[7]; } set hash(v) { this.__set("hash", v); }
-        get origin() { return this.__p[8]; }
-        get username() { return this.__p[9]; } set username(v) { this.__set("username", v); }
-        get password() { return this.__p[10]; } set password(v) { this.__set("password", v); }
+        set href(v) { const r = __url_parse(String(v), null); if (!r) throw new TypeError("Invalid URL: " + v); internalsFor(this).p = r; urlSyncSearchParams.call(this); }
+        get protocol() { return internalsFor(this).p[1]; } set protocol(v) { urlSet.call(this, "protocol", v); }
+        get host() { return internalsFor(this).p[2]; } set host(v) { urlSet.call(this, "host", v); }
+        get hostname() { return internalsFor(this).p[3]; } set hostname(v) { urlSet.call(this, "hostname", v); }
+        get port() { return internalsFor(this).p[4]; } set port(v) { urlSet.call(this, "port", v); }
+        get pathname() { return internalsFor(this).p[5]; } set pathname(v) { urlSet.call(this, "pathname", v); }
+        get search() { return internalsFor(this).p[6]; } set search(v) { urlSet.call(this, "search", v); urlSyncSearchParams.call(this); }
+        get hash() { return internalsFor(this).p[7]; } set hash(v) { urlSet.call(this, "hash", v); }
+        get origin() { return internalsFor(this).p[8]; }
+        get username() { return internalsFor(this).p[9]; } set username(v) { urlSet.call(this, "username", v); }
+        get password() { return internalsFor(this).p[10]; } set password(v) { urlSet.call(this, "password", v); }
         // Apply a component setter; a spec no-op (invalid value) returns the
         // unchanged parts, so href only moves when the assignment is valid.
-        __set(which, v) { const r = __url_set(this.__p[0], which, String(v)); if (r) this.__p = r; }
         // Refresh the bound query object after .search/.href changes (one-way,
-        // URL→params; the reverse, params→URL, is __setSearchFromParams).
-        __syncSP() { if (this.__sp) this.__sp.__setList(this.__p[6]); }
+        // URL→params; the reverse, params→URL, is urlSetSearchFromParams).
         // Called BY the bound searchParams when it is mutated: reflow the query.
-        __setSearchFromParams(qs) { const r = __url_set(this.__p[0], "search", qs); if (r) this.__p = r; }
-        get searchParams() { if (!this.__sp) { this.__sp = new URLSearchParams(this.__p[6]); this.__sp.__url = this; } return this.__sp; }
-        toString() { return this.__p[0]; }
-        toJSON() { return this.__p[0]; }
+        get searchParams() { if (!internalsFor(this).sp) { internalsFor(this).sp = new URLSearchParams(internalsFor(this).p[6]); internalsFor(internalsFor(this).sp).url = this; } return internalsFor(this).sp; }
+        toString() { return internalsFor(this).p[0]; }
+        toJSON() { return internalsFor(this).p[0]; }
         // createObjectURL/revokeObjectURL (File API). The minted URL is
         // `blob:<origin>/<uuid>`; the store is RAM-only (above).
         static createObjectURL(obj) {
@@ -17875,7 +17921,7 @@
             // `<img src="blob:…">` (Steam's client-generated QR code); only
             // Blob-shaped objects carry bytes (a MediaSource mints a URL but
             // has no retrievable data here).
-            if (Array.isArray(obj.__parts) && typeof __blob_mirror === "function") {
+            if (Array.isArray(internalsFor(obj).parts) && typeof __blob_mirror === "function") {
                 try { __blob_mirror(u, __blobBytes(obj), obj.type || ""); } catch (e) {}
             }
             return u;
@@ -17912,6 +17958,18 @@
     // are referenced from outside.
     /*__URLPATTERN_BEGIN__*/
     (function (g) {
+    const internalsForMap = __platform_slots("internals", new WeakMap());
+    function internalsFor(object) {
+        // Internal slots shared with the platform, in Window and Worker realms.
+        const map = internalsForMap;
+        let record = Reflect.apply(WeakMap.prototype.get, map, [object]);
+        if (record === undefined) {
+            record = Object.create(null);
+            if ((typeof object === "object" && object !== null) || typeof object === "function")
+                Reflect.apply(WeakMap.prototype.set, map, [object, record]);
+        }
+        return record;
+    }
     const UP_COMPONENTS = ["protocol", "username", "password", "hostname", "port", "pathname", "search", "hash"];
     function upSeg(comp) { return comp === "pathname" ? "[^/]+?" : comp === "hostname" ? "[^.]+?" : ".+?"; }
     function upSepChar(comp) { return comp === "pathname" ? "/" : comp === "hostname" ? "." : ""; }
@@ -18006,37 +18064,37 @@
             let options = {}, base;
             if (typeof input === "string") {
                 if (typeof a === "string") { base = a; options = b || {}; } else options = a || {};
-                this.__parts = upParsePatternStr(input, base);
+                internalsFor(this).parts = upParsePatternStr(input, base);
             } else if (input && typeof input === "object") {
                 options = a || {};
                 const bp = input.baseURL ? upFromParsed(__url_parse(String(input.baseURL), null)) : null;
-                this.__parts = {};
-                for (const cc of UP_COMPONENTS) this.__parts[cc] = input[cc] !== undefined ? String(input[cc]) : (bp ? bp[cc] : "*");
-            } else { this.__parts = {}; for (const cc of UP_COMPONENTS) this.__parts[cc] = "*"; }
-            this.__ic = !!(options && options.ignoreCase);
-            this.__re = {}; this.__hasReg = false;
+                internalsFor(this).parts = {};
+                for (const cc of UP_COMPONENTS) internalsFor(this).parts[cc] = input[cc] !== undefined ? String(input[cc]) : (bp ? bp[cc] : "*");
+            } else { internalsFor(this).parts = {}; for (const cc of UP_COMPONENTS) internalsFor(this).parts[cc] = "*"; }
+            internalsFor(this).ic = !!(options && options.ignoreCase);
+            internalsFor(this).re = {}; internalsFor(this).hasReg = false;
             for (const cc of UP_COMPONENTS) {
-                const cm = upCompile(this.__parts[cc], cc);
-                this.__re[cc] = { rx: new RegExp(cm.source, this.__ic ? "i" : ""), names: cm.names };
-                if (cm.hasReg) this.__hasReg = true;
+                const cm = upCompile(internalsFor(this).parts[cc], cc);
+                internalsFor(this).re[cc] = { rx: new RegExp(cm.source, internalsFor(this).ic ? "i" : ""), names: cm.names };
+                if (cm.hasReg) internalsFor(this).hasReg = true;
             }
         }
-        get protocol() { return this.__parts.protocol; }
-        get username() { return this.__parts.username; }
-        get password() { return this.__parts.password; }
-        get hostname() { return this.__parts.hostname; }
-        get port() { return this.__parts.port; }
-        get pathname() { return this.__parts.pathname; }
-        get search() { return this.__parts.search; }
-        get hash() { return this.__parts.hash; }
-        get hasRegExpGroups() { return this.__hasReg; }
+        get protocol() { return internalsFor(this).parts.protocol; }
+        get username() { return internalsFor(this).parts.username; }
+        get password() { return internalsFor(this).parts.password; }
+        get hostname() { return internalsFor(this).parts.hostname; }
+        get port() { return internalsFor(this).parts.port; }
+        get pathname() { return internalsFor(this).parts.pathname; }
+        get search() { return internalsFor(this).parts.search; }
+        get hash() { return internalsFor(this).parts.hash; }
+        get hasRegExpGroups() { return internalsFor(this).hasReg; }
         test(input, base) { return this.exec(input, base) !== null; }
         exec(input, base) {
             const parts = upResolveInput(input, base);
             if (!parts) return null;
             const out = { inputs: base != null ? [input, base] : [input] };
             for (const cc of UP_COMPONENTS) {
-                const rc = this.__re[cc], val = parts[cc] || "";
+                const rc = internalsFor(this).re[cc], val = parts[cc] || "";
                 const m = rc.rx.exec(val);
                 if (!m) return null;
                 const groups = {};
@@ -18056,44 +18114,56 @@
     // parallel. The promise settles when the bytes arrive. Only legacy
     // synchronous XHR still blocks (via the __http_fetch syscall).
     /*__HEADERS_BEGIN__*/
+    const headerSlotsMap = __platform_slots("internals", new WeakMap());
+    function headerSlots(object) {
+        // Internal slots shared with the platform, in Window and Worker realms.
+        const map = headerSlotsMap;
+        let record = Reflect.apply(WeakMap.prototype.get, map, [object]);
+        if (record === undefined) {
+            record = Object.create(null);
+            if ((typeof object === "object" && object !== null) || typeof object === "function")
+                Reflect.apply(WeakMap.prototype.set, map, [object, record]);
+        }
+        return record;
+    }
+    function headersSorted() { return Object.keys(headerSlots(this).h).sort(); }
     class Headers {
         constructor(init) {
             // Null-proto: header names are arbitrary strings, and a plain {}
             // leaks Object.prototype ("constructor" in {} is true, so
             // has("constructor") lied and get() returned a function).
-            this.__h = Object.create(null);
+            headerSlots(this).h = Object.create(null);
             if (init) {
                 // A sequence init APPENDS each pair (Fetch §Headers: "fill" runs
                 // append), so `[["accept","a"],["accept","b"]]` combines to
                 // "a, b" instead of the last one clobbering.
                 if (Array.isArray(init)) { for (const kv of init) this.append(kv[0], kv[1]); }
-                else if (init.__h) { Object.assign(this.__h, init.__h); }
+                else if (headerSlots(init).h) { Object.assign(headerSlots(this).h, headerSlots(init).h); }
                 else if (typeof init === "object") { for (const k of Object.keys(init)) this.append(k, init[k]); }
             }
         }
-        get(k) { const v = this.__h[String(k).toLowerCase()]; return v === undefined ? null : v; }
-        set(k, v) { this.__h[String(k).toLowerCase()] = String(v); }
+        get(k) { const v = headerSlots(this).h[String(k).toLowerCase()]; return v === undefined ? null : v; }
+        set(k, v) { headerSlots(this).h[String(k).toLowerCase()] = String(v); }
         // append COMBINES with an existing value (Fetch §"header list append":
         // `", "`-joined) — it is not set. Pages building multi-value headers
         // (Accept variants, custom lists) get the spec wire form.
         append(k, v) {
             const key = String(k).toLowerCase();
-            const cur = this.__h[key];
-            this.__h[key] = cur === undefined ? String(v) : cur + ", " + String(v);
+            const cur = headerSlots(this).h[key];
+            headerSlots(this).h[key] = cur === undefined ? String(v) : cur + ", " + String(v);
         }
-        has(k) { return String(k).toLowerCase() in this.__h; }
-        delete(k) { delete this.__h[String(k).toLowerCase()]; }
+        has(k) { return String(k).toLowerCase() in headerSlots(this).h; }
+        delete(k) { delete headerSlots(this).h[String(k).toLowerCase()]; }
         // Set-Cookie never reaches page JS (the Rust side strips it — a
         // forbidden response-header name), so the list is honestly empty.
         getSetCookie() { return []; }
         // Iteration is SORTED by (lowercased) name with combined values —
         // the Fetch spec's "sort and combine" — and Headers is iterable
         // (`for (const [k, v] of resp.headers)`).
-        __sorted() { return Object.keys(this.__h).sort(); }
-        forEach(fn, thisArg) { for (const k of this.__sorted()) fn.call(thisArg, this.__h[k], k, this); }
-        keys() { return this.__sorted()[Symbol.iterator](); }
-        values() { const out = []; for (const k of this.__sorted()) out.push(this.__h[k]); return out[Symbol.iterator](); }
-        entries() { const out = []; for (const k of this.__sorted()) out.push([k, this.__h[k]]); return out[Symbol.iterator](); }
+        forEach(fn, thisArg) { for (const k of headersSorted.call(this)) fn.call(thisArg, headerSlots(this).h[k], k, this); }
+        keys() { return headersSorted.call(this)[Symbol.iterator](); }
+        values() { const out = []; for (const k of headersSorted.call(this)) out.push(headerSlots(this).h[k]); return out[Symbol.iterator](); }
+        entries() { const out = []; for (const k of headersSorted.call(this)) out.push([k, headerSlots(this).h[k]]); return out[Symbol.iterator](); }
         [Symbol.iterator]() { return this.entries(); }
         get [Symbol.toStringTag]() { return "Headers"; }
     }
@@ -18108,7 +18178,7 @@
         if (body === null || body === undefined) return null;
         if (typeof body === "string") return body;
         if (body instanceof URLSearchParams) return body.toString();
-        if (Array.isArray(body.__parts)) return new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(body))); // Blob/File, byte-faithful
+        if (Array.isArray(internalsFor(body).parts)) return new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(body))); // Blob/File, byte-faithful
         if (typeof body.byteLength === "number") {
             try {
                 const v = body instanceof ArrayBuffer ? new Uint8Array(body)
@@ -18131,7 +18201,7 @@
         if (body === null || body === undefined) return null;
         if (typeof body === "string") return utf8Binary(body);
         if (body instanceof URLSearchParams) return utf8Binary(body.toString());
-        if (Array.isArray(body.__parts)) return __blobBytes(body); // Blob/File: the true bytes ARE the wire form
+        if (Array.isArray(internalsFor(body).parts)) return __blobBytes(body); // Blob/File: the true bytes ARE the wire form
         if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return __body_buffer(body);
         return utf8Binary(String(body));
     };
@@ -18145,11 +18215,11 @@
         for (let i = 0; i < 16; i++) boundary += "0123456789abcdef"[(Math.random() * 16) | 0];
         const escName = (s) => String(s).replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
         let out = "";
-        const es = fd.__entries;
+        const es = internalsFor(fd).entries;
         for (let i = 0; i < es.length; i++) {
             const e = es[i];
             out += "--" + boundary + "\r\n";
-            if (e.value && Array.isArray(e.value.__parts)) { // File
+            if (e.value && Array.isArray(internalsFor(e.value).parts)) { // File
                 out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"; filename="' + escName(e.value.name == null ? "blob" : e.value.name) + '"') + "\r\n";
                 out += "Content-Type: " + (e.value.type || "application/octet-stream") + "\r\n\r\n";
                 out += __blobBytes(e.value) + "\r\n";
@@ -18170,7 +18240,7 @@
         if (body === null || body === undefined) return null;
         if (typeof body === "string") return "text/plain;charset=UTF-8";
         if (body instanceof URLSearchParams) return "application/x-www-form-urlencoded;charset=UTF-8";
-        if (Array.isArray(body.__parts)) return body.type || null; // Blob/File
+        if (Array.isArray(internalsFor(body).parts)) return body.type || null; // Blob/File
         if (typeof body.byteLength === "number") return null;
         return "text/plain;charset=UTF-8";
     };
@@ -18179,11 +18249,11 @@
     // the method-specific result. This is also the final consumer in the
     // standard CompressionStream example (`new Response(stream).arrayBuffer`).
     const __consumeBodyBytes = (owner) => {
-        if (owner.__body instanceof g.ReadableStream) {
-            if (owner.__bodyUsed || owner.__body.locked)
+        if (internalsFor(owner).body instanceof g.ReadableStream) {
+            if (internalsFor(owner).bodyUsed || internalsFor(owner).body.locked)
                 return Promise.reject(new TypeError("Body is unusable"));
-            owner.__bodyUsed = true;
-            const reader = owner.__body.getReader();
+            internalsFor(owner).bodyUsed = true;
+            const reader = internalsFor(owner).body.getReader();
             const chunks = [];
             let total = 0;
             const pump = () => reader.read().then((result) => {
@@ -18205,10 +18275,10 @@
             });
             return pump();
         }
-        owner.__bodyUsed = true;
-        const bin = owner.__bytes != null ? owner.__bytes :
-            owner.__body instanceof ArrayBuffer || ArrayBuffer.isView(owner.__body)
-                ? __body_buffer(owner.__body) : __bodyWire(owner.__body || "");
+        internalsFor(owner).bodyUsed = true;
+        const bin = internalsFor(owner).bytes != null ? internalsFor(owner).bytes :
+            internalsFor(owner).body instanceof ArrayBuffer || ArrayBuffer.isView(internalsFor(owner).body)
+                ? __body_buffer(internalsFor(owner).body) : __bodyWire(internalsFor(owner).body || "");
         return Promise.resolve(__bodyBytes(bin));
     };
     // Body mixin shared by Request and Response. Stream bodies follow Fetch's
@@ -18239,58 +18309,58 @@
             // request field in an internal slot and expose readonly prototype
             // accessors below. An author may shadow `request.url`/`method`/body
             // with own properties; cloning/fetch must still copy these slots.
-            this.__url = fromReq ? input.__url
+            internalsFor(this).url = fromReq ? internalsFor(input).url
                 : resolveURL(String((input && input.url !== undefined) ? input.url : input));
             const method = String(init.method !== undefined
                 ? init.method
-                : (fromReq ? input.__method : "GET"));
+                : (fromReq ? internalsFor(input).method : "GET"));
             const upperMethod = method.toUpperCase();
             // Fetch §2.2.1 normalizes only the six standard methods listed by
             // the byte-case-insensitive match. Extension tokens (for example
             // `m-search`) retain their exact casing and punctuation.
-            this.__method = ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"].includes(upperMethod)
+            internalsFor(this).method = ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"].includes(upperMethod)
                 ? upperMethod
                 : method;
-            this.__headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? input.__headers : undefined));
-            this.__body = init.body !== undefined ? init.body : (fromReq ? input.__body : null);
-            if (this.__body instanceof ArrayBuffer || ArrayBuffer.isView(this.__body))
-                this.__body = __body_buffer(this.__body);
+            internalsFor(this).headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? internalsFor(input).headers : undefined));
+            internalsFor(this).body = init.body !== undefined ? init.body : (fromReq ? internalsFor(input).body : null);
+            if (internalsFor(this).body instanceof ArrayBuffer || ArrayBuffer.isView(internalsFor(this).body))
+                internalsFor(this).body = __body_buffer(internalsFor(this).body);
             const credentials = init.credentials !== undefined
                 ? String(init.credentials)
-                : (fromReq ? input.__credentials : "same-origin");
+                : (fromReq ? internalsFor(input).credentials : "same-origin");
             if (credentials !== "omit" && credentials !== "same-origin" && credentials !== "include")
                 throw new TypeError("Invalid credentials mode");
             const mode = init.mode !== undefined
                 ? String(init.mode)
-                : (fromReq ? input.__mode : "cors");
+                : (fromReq ? internalsFor(input).mode : "cors");
             if (mode !== "cors" && mode !== "no-cors" && mode !== "same-origin")
                 throw new TypeError("Invalid request mode");
-            this.__credentials = credentials;
-            this.__mode = mode;
-            this.__cache = init.cache || (fromReq ? input.__cache : "default");
-            this.__redirect = init.redirect || (fromReq ? input.__redirect : "follow");
-            this.__referrer = init.referrer !== undefined ? init.referrer : (fromReq ? input.__referrer : "about:client");
-            this.__referrerPolicy = init.referrerPolicy || (fromReq ? input.__referrerPolicy : "");
-            this.__integrity = init.integrity || (fromReq ? input.__integrity : "");
-            this.__keepalive = init.keepalive !== undefined ? !!init.keepalive : (fromReq ? input.__keepalive : false);
-            this.__signal = init.signal || (fromReq ? input.__signal : null);
-            this.__destination = "";
-            this.__bodyUsed = false;
+            internalsFor(this).credentials = credentials;
+            internalsFor(this).mode = mode;
+            internalsFor(this).cache = init.cache || (fromReq ? internalsFor(input).cache : "default");
+            internalsFor(this).redirect = init.redirect || (fromReq ? internalsFor(input).redirect : "follow");
+            internalsFor(this).referrer = init.referrer !== undefined ? init.referrer : (fromReq ? internalsFor(input).referrer : "about:client");
+            internalsFor(this).referrerPolicy = init.referrerPolicy || (fromReq ? internalsFor(input).referrerPolicy : "");
+            internalsFor(this).integrity = init.integrity || (fromReq ? internalsFor(input).integrity : "");
+            internalsFor(this).keepalive = init.keepalive !== undefined ? !!init.keepalive : (fromReq ? internalsFor(input).keepalive : false);
+            internalsFor(this).signal = init.signal || (fromReq ? internalsFor(input).signal : null);
+            internalsFor(this).destination = "";
+            internalsFor(this).bodyUsed = false;
         }
-        get url() { return this.__url; }
-        get method() { return this.__method; }
-        get headers() { return this.__headers; }
-        get credentials() { return this.__credentials; }
-        get mode() { return this.__mode; }
-        get cache() { return this.__cache; }
-        get redirect() { return this.__redirect; }
-        get referrer() { return this.__referrer; }
-        get referrerPolicy() { return this.__referrerPolicy; }
-        get integrity() { return this.__integrity; }
-        get keepalive() { return this.__keepalive; }
-        get signal() { return this.__signal; }
-        get destination() { return this.__destination; }
-        get bodyUsed() { return this.__bodyUsed; }
+        get url() { return internalsFor(this).url; }
+        get method() { return internalsFor(this).method; }
+        get headers() { return internalsFor(this).headers; }
+        get credentials() { return internalsFor(this).credentials; }
+        get mode() { return internalsFor(this).mode; }
+        get cache() { return internalsFor(this).cache; }
+        get redirect() { return internalsFor(this).redirect; }
+        get referrer() { return internalsFor(this).referrer; }
+        get referrerPolicy() { return internalsFor(this).referrerPolicy; }
+        get integrity() { return internalsFor(this).integrity; }
+        get keepalive() { return internalsFor(this).keepalive; }
+        get signal() { return internalsFor(this).signal; }
+        get destination() { return internalsFor(this).destination; }
+        get bodyUsed() { return internalsFor(this).bodyUsed; }
         get body() { return null; } // no request ReadableStream yet
         clone() { return new Request(this); }
     }
@@ -18300,13 +18370,13 @@
     class Response {
         constructor(body, init) {
             init = init || {};
-            this.__body = body !== undefined ? body : null;
+            internalsFor(this).body = body !== undefined ? body : null;
             // Fetch #concept-bodyinit-extract snapshots a BufferSource at
             // construction. Preserve its byte range and avoid per-byte JS
             // string conversion for multi-megabyte Wasm/image/cache bodies.
             if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-                this.__bytes = __body_buffer(body);
-                this.__body = null;
+                internalsFor(this).bytes = __body_buffer(body);
+                internalsFor(this).body = null;
             }
             this.status = init.status !== undefined ? (init.status | 0) : 200;
             this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
@@ -18315,10 +18385,10 @@
             this.url = init.url ? String(init.url) : "";
             this.redirected = false;
             this.type = "default";
-            this.__bodyUsed = false;
-            this.__bodyStream = undefined;
+            internalsFor(this).bodyUsed = false;
+            internalsFor(this).bodyStream = undefined;
         }
-        get bodyUsed() { return this.__bodyUsed; }
+        get bodyUsed() { return internalsFor(this).bodyUsed; }
         // The response body as a ReadableStream (lazy + cached). Streaming
         // consumers read `response.body.getReader()` — Open WebUI reads chat
         // completions (SSE) exactly this way; a null body made `getReader()`
@@ -18326,23 +18396,23 @@
         // buffers the whole body, so the stream yields it as one UTF-8 chunk then
         // closes; an SSE parser splits it identically. null only for empty bodies.
         get body() {
-            if (this.__bodyStream !== undefined) return this.__bodyStream;
-            if ((this.__body === null || this.__body === undefined) && this.__bytes == null) { this.__bodyStream = null; return null; }
-            if (this.__body instanceof g.ReadableStream) { this.__bodyStream = this.__body; return this.__bodyStream; }
+            if (internalsFor(this).bodyStream !== undefined) return internalsFor(this).bodyStream;
+            if ((internalsFor(this).body === null || internalsFor(this).body === undefined) && internalsFor(this).bytes == null) { internalsFor(this).bodyStream = null; return null; }
+            if (internalsFor(this).body instanceof g.ReadableStream) { internalsFor(this).bodyStream = internalsFor(this).body; return internalsFor(this).bodyStream; }
             // A fetched response streams its byte-exact native ArrayBuffer;
             // only a Response constructed in JS from a text body falls back
             // to UTF-8 bytes of that text.
-            const bytes = this.__bytes != null
-                ? __bodyBytes(this.__bytes)
-                : new g.TextEncoder().encode(__bodyText(this.__body) || "");
-            this.__bodyStream = new g.ReadableStream({
+            const bytes = internalsFor(this).bytes != null
+                ? __bodyBytes(internalsFor(this).bytes)
+                : new g.TextEncoder().encode(__bodyText(internalsFor(this).body) || "");
+            internalsFor(this).bodyStream = new g.ReadableStream({
                 start(c) { if (bytes.length) c.enqueue(bytes); c.close(); },
             });
-            return this.__bodyStream;
+            return internalsFor(this).bodyStream;
         }
         clone() {
-            const r = new Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
-            r.type = this.type; r.redirected = this.redirected; r.__bytes = this.__bytes; return r;
+            const r = new Response(internalsFor(this).body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
+            r.type = this.type; r.redirected = this.redirected; internalsFor(r).bytes = internalsFor(this).bytes; return r;
         }
         static error() { const r = new Response(null, { status: 0 }); r.type = "error"; return r; }
         static redirect(url, status) { const r = new Response(null, { status: status || 302 }); r.headers.set("location", String(url)); return r; }
@@ -18425,9 +18495,9 @@
     }
     function __cacheRequestRecord(request) {
         return {
-            url: request.__url,
-            method: request.__method,
-            headers: __cacheHeaders(request.__headers),
+            url: internalsFor(request).url,
+            method: internalsFor(request).method,
+            headers: __cacheHeaders(internalsFor(request).headers),
         };
     }
     function __cacheComparableURL(value, ignoreSearch) {
@@ -18470,12 +18540,12 @@
         // The old representation stored binary strings. Read those existing
         // session entries too; new entries use the engine's native base64
         // codec so Cache.put/match do linear work over binary payloads.
-        response.__bytes = record.body64 === undefined ? record.body : cacheBytesFromBase64(record.body64);
+        internalsFor(response).bytes = record.body64 === undefined ? record.body : cacheBytesFromBase64(record.body64);
         return response;
     }
     function __cacheResponseRecord(request, response) {
-        const protocol = new URL(request.__url).protocol;
-        if ((protocol !== "http:" && protocol !== "https:") || request.__method !== "GET")
+        const protocol = new URL(internalsFor(request).url).protocol;
+        if ((protocol !== "http:" && protocol !== "https:") || internalsFor(request).method !== "GET")
             return Promise.reject(new TypeError("Cache.put only accepts HTTP(S) GET requests"));
         if (!(response instanceof Response))
             return Promise.reject(new TypeError("Cache.put requires a Response"));
@@ -18548,8 +18618,8 @@
             try { list = Array.from(requests, (request) => __cacheRequest(request)); }
             catch (error) { return Promise.reject(error); }
             for (let index = 0; index < list.length; index++) {
-                const protocol = new URL(list[index].__url).protocol;
-                if ((protocol !== "http:" && protocol !== "https:") || list[index].__method !== "GET")
+                const protocol = new URL(internalsFor(list[index]).url).protocol;
+                if ((protocol !== "http:" && protocol !== "https:") || internalsFor(list[index]).method !== "GET")
                     return Promise.reject(new TypeError("Cache.addAll only accepts HTTP(S) GET requests"));
             }
             return Promise.all(list.map((request) => g.fetch(request))).then((responses) => {
@@ -18935,11 +19005,11 @@
     class IDBKeyRange {
         constructor(token, lower, upper, lowerOpen, upperOpen) {
             if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.__lower = lower; this.__upper = upper;
+            internalsFor(this).lower = lower; internalsFor(this).upper = upper;
             this.lowerOpen = !!lowerOpen; this.upperOpen = !!upperOpen;
         }
-        get lower() { return this.__lower === null ? undefined : __idbKeyValue(this.__lower); }
-        get upper() { return this.__upper === null ? undefined : __idbKeyValue(this.__upper); }
+        get lower() { return internalsFor(this).lower === null ? undefined : __idbKeyValue(internalsFor(this).lower); }
+        get upper() { return internalsFor(this).upper === null ? undefined : __idbKeyValue(internalsFor(this).upper); }
         includes(value) { return __idbRangeIncludes(this, __idbKey(value)); }
         static only(value) {
             const key = __idbKey(value); return new IDBKeyRange(__idbToken, key, key, false, false);
@@ -18964,12 +19034,12 @@
     }
     function __idbRangeIncludes(range, key) {
         if (range === null) return true;
-        if (range.__lower !== null) {
-            const lower = __idbCompare(key, range.__lower);
+        if (internalsFor(range).lower !== null) {
+            const lower = __idbCompare(key, internalsFor(range).lower);
             if (lower < 0 || (lower === 0 && range.lowerOpen)) return false;
         }
-        if (range.__upper !== null) {
-            const upper = __idbCompare(key, range.__upper);
+        if (internalsFor(range).upper !== null) {
+            const upper = __idbCompare(key, internalsFor(range).upper);
             if (upper > 0 || (upper === 0 && range.upperOpen)) return false;
         }
         return true;
@@ -18979,20 +19049,20 @@
         constructor(token, source, transaction) {
             super();
             if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.__source = source || null; this.__transaction = transaction || null;
-            this.__done = false; this.__result = undefined; this.__error = null;
+            internalsFor(this).source = source || null; internalsFor(this).transaction = transaction || null;
+            internalsFor(this).done = false; internalsFor(this).result = undefined; internalsFor(this).error = null;
         }
         get result() {
-            if (!this.__done) throw __idbException("InvalidStateError", "The request is still pending.");
-            return this.__result;
+            if (!internalsFor(this).done) throw __idbException("InvalidStateError", "The request is still pending.");
+            return internalsFor(this).result;
         }
         get error() {
-            if (!this.__done) throw __idbException("InvalidStateError", "The request is still pending.");
-            return this.__error;
+            if (!internalsFor(this).done) throw __idbException("InvalidStateError", "The request is still pending.");
+            return internalsFor(this).error;
         }
-        get source() { return this.__source; }
-        get transaction() { return this.__transaction; }
-        get readyState() { return this.__done ? "done" : "pending"; }
+        get source() { return internalsFor(this).source; }
+        get transaction() { return internalsFor(this).transaction; }
+        get readyState() { return internalsFor(this).done ? "done" : "pending"; }
         get [Symbol.toStringTag]() { return "IDBRequest"; }
     }
     class IDBOpenDBRequest extends IDBRequest {
@@ -19023,114 +19093,114 @@
         return event;
     }
     function __idbScopesOverlap(a, b) {
-        for (const name of a.__scope) if (b.__scope.includes(name)) return true;
+        for (const name of internalsFor(a).scope) if (internalsFor(b).scope.includes(name)) return true;
         return false;
     }
     function __idbCanStart(transaction) {
-        const transactions = transaction.__db.transactions;
+        const transactions = internalsFor(transaction).db.transactions;
         const index = transactions.indexOf(transaction);
         for (let priorIndex = 0; priorIndex < index; priorIndex++) {
             const prior = transactions[priorIndex];
-            if (prior.__state === "finished" || !__idbScopesOverlap(transaction, prior)) continue;
+            if (internalsFor(prior).state === "finished" || !__idbScopesOverlap(transaction, prior)) continue;
             if (transaction.mode !== "readonly" || prior.mode !== "readonly") return false;
         }
         return true;
     }
     function __idbMaybeStartTransactions(database) {
         for (const transaction of database.transactions) {
-            if (transaction.__started || transaction.__state === "finished") continue;
+            if (internalsFor(transaction).started || internalsFor(transaction).state === "finished") continue;
             if (!__idbCanStart(transaction)) continue;
-            transaction.__started = true;
-            transaction.__data = __idbCloneData(database.data);
+            internalsFor(transaction).started = true;
+            internalsFor(transaction).data = __idbCloneData(database.data);
             __idbProcess(transaction);
         }
     }
     function __idbFinishConnectionClose(connection) {
-        if (!connection.__closePending) return;
-        if (connection.__db.transactions.some((transaction) =>
-            transaction.__connection === connection && transaction.__state !== "finished")) return;
-        connection.__closed = true;
-        connection.__db.connections.delete(connection);
+        if (!internalsFor(connection).closePending) return;
+        if (internalsFor(connection).db.transactions.some((transaction) =>
+            internalsFor(transaction).connection === connection && internalsFor(transaction).state !== "finished")) return;
+        internalsFor(connection).closed = true;
+        internalsFor(connection).db.connections.delete(connection);
         // §§5.1–5.3 wait on actual closure, not merely close-pending. Notify
         // blocked open/delete operations without polling or an idle spin.
-        for (const waiter of Array.from(connection.__db.connectionWaiters)) waiter();
+        for (const waiter of Array.from(internalsFor(connection).db.connectionWaiters)) waiter();
     }
     function __idbCommit(transaction) {
-        if (transaction.__state === "finished" || transaction.__commitTask) return;
-        transaction.__state = "committing";
-        transaction.__commitTask = true;
+        if (internalsFor(transaction).state === "finished" || internalsFor(transaction).commitTask) return;
+        internalsFor(transaction).state = "committing";
+        internalsFor(transaction).commitTask = true;
         __queue_dom_task(() => {
-            if (transaction.__state === "finished") return;
+            if (internalsFor(transaction).state === "finished") return;
             try {
                 if (transaction.mode !== "readonly") {
-                    __idbSaveData(transaction.__db.name, transaction.__data);
-                    transaction.__db.data = transaction.__data;
-                    transaction.__connection.__version = transaction.__data.version;
+                    __idbSaveData(internalsFor(transaction).db.name, internalsFor(transaction).data);
+                    internalsFor(transaction).db.data = internalsFor(transaction).data;
+                    internalsFor(internalsFor(transaction).connection).version = internalsFor(transaction).data.version;
                 }
-                transaction.__state = "finished";
-                transaction.__db.transactions = transaction.__db.transactions.filter((item) => item !== transaction);
+                internalsFor(transaction).state = "finished";
+                internalsFor(transaction).db.transactions = internalsFor(transaction).db.transactions.filter((item) => item !== transaction);
                 dispatch(transaction, createTrustedEvent(Event, "complete"), false);
-                if (transaction.__openRequest) {
-                    transaction.__openRequest.__transaction = null;
-                    transaction.__connection.__db.__upgrade = null;
-                    __idbOpenSuccess(transaction.__openRequest, transaction.__connection);
+                if (internalsFor(transaction).openRequest) {
+                    internalsFor(internalsFor(transaction).openRequest).transaction = null;
+                    internalsFor(internalsFor(internalsFor(transaction).connection).db).upgrade = null;
+                    __idbOpenSuccess(internalsFor(transaction).openRequest, internalsFor(transaction).connection);
                 }
             } catch (error) { __idbAbort(transaction, error); return; }
-            __idbFinishConnectionClose(transaction.__connection);
-            __idbMaybeStartTransactions(transaction.__db);
+            __idbFinishConnectionClose(internalsFor(transaction).connection);
+            __idbMaybeStartTransactions(internalsFor(transaction).db);
         });
     }
     function __idbAbort(transaction, error) {
-        if (transaction.__state === "finished") return;
-        transaction.__state = "finished";
-        transaction.__error = error || null;
-        transaction.__db.transactions = transaction.__db.transactions.filter((item) => item !== transaction);
-        const pending = transaction.__requests.splice(0);
+        if (internalsFor(transaction).state === "finished") return;
+        internalsFor(transaction).state = "finished";
+        internalsFor(transaction).error = error || null;
+        internalsFor(transaction).db.transactions = internalsFor(transaction).db.transactions.filter((item) => item !== transaction);
+        const pending = internalsFor(transaction).requests.splice(0);
         for (const request of pending) {
-            request.__done = true; request.__result = undefined;
-            request.__error = __idbException("AbortError", "The transaction was aborted.");
+            internalsFor(request).done = true; internalsFor(request).result = undefined;
+            internalsFor(request).error = __idbException("AbortError", "The transaction was aborted.");
             __queue_dom_task(() => __idbRequestEvent(request, "error", true, true));
         }
         __queue_dom_task(() => {
             dispatch(transaction,
                 createTrustedEvent(Event, "abort", { bubbles: true }), false);
-            if (transaction.__openRequest) {
-                transaction.__connection.__db.__upgrade = null;
-                transaction.__openRequest.__transaction = null;
-                transaction.__openRequest.__done = true;
-                transaction.__openRequest.__result = undefined;
-                transaction.__openRequest.__error = __idbException("AbortError", "The version change transaction was aborted.");
-                __idbRequestEvent(transaction.__openRequest, "error", true, true);
+            if (internalsFor(transaction).openRequest) {
+                internalsFor(internalsFor(internalsFor(transaction).connection).db).upgrade = null;
+                internalsFor(internalsFor(transaction).openRequest).transaction = null;
+                internalsFor(internalsFor(transaction).openRequest).done = true;
+                internalsFor(internalsFor(transaction).openRequest).result = undefined;
+                internalsFor(internalsFor(transaction).openRequest).error = __idbException("AbortError", "The version change transaction was aborted.");
+                __idbRequestEvent(internalsFor(transaction).openRequest, "error", true, true);
                 // §5.1 closes a connection whose upgrade request failed before
                 // allowing the next same-name connection request to proceed.
-                transaction.__connection.__closePending = true;
-                __idbFinishConnectionRequest(transaction.__openRequest);
+                internalsFor(internalsFor(transaction).connection).closePending = true;
+                __idbFinishConnectionRequest(internalsFor(transaction).openRequest);
             }
-            __idbFinishConnectionClose(transaction.__connection);
-            __idbMaybeStartTransactions(transaction.__db);
+            __idbFinishConnectionClose(internalsFor(transaction).connection);
+            __idbMaybeStartTransactions(internalsFor(transaction).db);
         });
     }
     function __idbProcess(transaction) {
-        if (!transaction.__started || transaction.__processing ||
-            transaction.__state === "finished") return;
-        if (!transaction.__requests.length) {
-            if (transaction.__state === "inactive" || transaction.__state === "committing") __idbCommit(transaction);
+        if (!internalsFor(transaction).started || internalsFor(transaction).processing ||
+            internalsFor(transaction).state === "finished") return;
+        if (!internalsFor(transaction).requests.length) {
+            if (internalsFor(transaction).state === "inactive" || internalsFor(transaction).state === "committing") __idbCommit(transaction);
             return;
         }
-        transaction.__processing = true;
+        internalsFor(transaction).processing = true;
         __queue_dom_task(() => {
-            if (transaction.__state === "finished") { transaction.__processing = false; return; }
-            const request = transaction.__requests.shift();
+            if (internalsFor(transaction).state === "finished") { internalsFor(transaction).processing = false; return; }
+            const request = internalsFor(transaction).requests.shift();
             let result, error = null;
-            try { result = request.__operation(); }
+            try { result = internalsFor(request).operation(); }
             catch (caught) { error = caught instanceof DOMException ? caught : __idbException("UnknownError", String(caught && caught.message || caught)); }
-            request.__done = true;
-            request.__result = error ? undefined : result;
-            request.__error = error;
-            transaction.__state = "active";
+            internalsFor(request).done = true;
+            internalsFor(request).result = error ? undefined : result;
+            internalsFor(request).error = error;
+            internalsFor(transaction).state = "active";
             const event = __idbRequestEvent(request, error ? "error" : "success", !!error, !!error);
-            if (transaction.__state === "active") transaction.__state = "inactive";
-            transaction.__processing = false;
+            if (internalsFor(transaction).state === "active") internalsFor(transaction).state = "inactive";
+            internalsFor(transaction).processing = false;
             // Indexed Database 3 §§5.9–5.10: a listener exception aborts with
             // AbortError even if an error event was canceled. DOM dispatch
             // reports that condition through its IndexedDB-only legacy output.
@@ -19144,21 +19214,21 @@
         });
     }
     function __idbQueueRequest(source, operation, request) {
-        const transaction = source instanceof IDBCursor ? source.__transaction
+        const transaction = source instanceof IDBCursor ? internalsFor(source).transaction
             : source instanceof IDBIndex ? source.objectStore.transaction : source.transaction;
         request = request || new IDBRequest(__idbToken, source, transaction);
-        request.__operation = operation;
-        request.__done = false; request.__error = null; request.__result = undefined;
+        internalsFor(request).operation = operation;
+        internalsFor(request).done = false; internalsFor(request).error = null; internalsFor(request).result = undefined;
         // Indexed Database 3 §2.8: ordinary requests return their transaction
         // from EventTarget's get-the-parent algorithm. Open requests are never
         // queued here and therefore retain their required null parent.
         eventParents.set(request, transaction);
-        transaction.__requests.push(request);
+        internalsFor(transaction).requests.push(request);
         __idbProcess(transaction);
         return request;
     }
     function __idbRequireActive(transaction) {
-        if (transaction.__state !== "active")
+        if (internalsFor(transaction).state !== "active")
             throw __idbException("TransactionInactiveError", "The transaction is not active.");
     }
 
@@ -19166,45 +19236,45 @@
         constructor(token, connection, scope, mode, durability, upgradeData, openRequest) {
             super();
             if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.__connection = connection; this.__db = connection.__db;
-            this.__scope = scope.slice(); this.mode = mode; this.durability = durability;
-            this.__state = "active"; this.__started = mode === "versionchange";
-            this.__processing = false; this.__requests = []; this.__error = null;
-            this.__data = upgradeData || null; this.__openRequest = openRequest || null;
-            this.__handles = new Map(); this.__commitTask = false;
+            internalsFor(this).connection = connection; internalsFor(this).db = internalsFor(connection).db;
+            internalsFor(this).scope = scope.slice(); this.mode = mode; this.durability = durability;
+            internalsFor(this).state = "active"; internalsFor(this).started = mode === "versionchange";
+            internalsFor(this).processing = false; internalsFor(this).requests = []; internalsFor(this).error = null;
+            internalsFor(this).data = upgradeData || null; internalsFor(this).openRequest = openRequest || null;
+            internalsFor(this).handles = new Map(); internalsFor(this).commitTask = false;
             // Indexed Database 3 §2.7.1: a transaction's event parent is its
             // database connection, whose own event parent is null.
             eventParents.set(this, connection);
-            this.__db.transactions.push(this);
+            internalsFor(this).db.transactions.push(this);
         }
-        get objectStoreNames() { return __idbSortedNames(this.__scope); }
-        get db() { return this.__connection; }
-        get error() { return this.__error; }
+        get objectStoreNames() { return __idbSortedNames(internalsFor(this).scope); }
+        get db() { return internalsFor(this).connection; }
+        get error() { return internalsFor(this).error; }
         objectStore(name) {
             name = __idbDOMString(name);
-            if (this.__state === "finished") throw __idbException("InvalidStateError", "The transaction has finished.");
-            if (!this.__scope.includes(name)) throw __idbException("NotFoundError", "The object store is outside this transaction's scope.");
-            let handle = this.__handles.get(name);
-            if (!handle) { handle = new IDBObjectStore(__idbToken, this, name); this.__handles.set(name, handle); }
+            if (internalsFor(this).state === "finished") throw __idbException("InvalidStateError", "The transaction has finished.");
+            if (!internalsFor(this).scope.includes(name)) throw __idbException("NotFoundError", "The object store is outside this transaction's scope.");
+            let handle = internalsFor(this).handles.get(name);
+            if (!handle) { handle = new IDBObjectStore(__idbToken, this, name); internalsFor(this).handles.set(name, handle); }
             return handle;
         }
         abort() {
-            if (this.__state === "committing" || this.__state === "finished")
+            if (internalsFor(this).state === "committing" || internalsFor(this).state === "finished")
                 throw __idbException("InvalidStateError", "The transaction cannot be aborted.");
             __idbAbort(this, null);
         }
         commit() {
             __idbRequireActive(this);
-            this.__state = "committing";
-            if (!this.__requests.length && !this.__processing) __idbCommit(this);
+            internalsFor(this).state = "committing";
+            if (!internalsFor(this).requests.length && !internalsFor(this).processing) __idbCommit(this);
         }
         get [Symbol.toStringTag]() { return "IDBTransaction"; }
     }
     installHandlerProps(IDBTransaction.prototype, ["abort", "complete", "error"]);
 
     function __idbStoreForHandle(handle) {
-        const data = handle.transaction.__data || handle.transaction.__db.data;
-        const store = __idbStore(data, handle.__name);
+        const data = internalsFor(handle.transaction).data || internalsFor(handle.transaction).db.data;
+        const store = __idbStore(data, internalsFor(handle).name);
         if (!store) throw __idbException("InvalidStateError", "The object store was deleted.");
         return store;
     }
@@ -19229,7 +19299,7 @@
     // transaction snapshot, avoiding a second persisted copy that could drift
     // from its object store after rollback.
     function __idbIndexRecordList(handle, range, direction) {
-        const index = handle.__index(), store = __idbStoreForHandle(handle.objectStore);
+        const index = indexRecord.call(handle), store = __idbStoreForHandle(handle.objectStore);
         let records = [];
         for (const record of store.records) {
             for (const key of __idbIndexKeys(index, record.value)) {
@@ -19299,59 +19369,88 @@
         }
         return { key: key, value: serialized };
     }
+    function objectStoreAddOrPut(value, key, keyGiven, noOverwrite) {
+        const transaction = this.transaction; __idbRequireActive(transaction);
+        if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+        // Clone during the method call, before the request is returned.
+        const serialized = messageSerialize(value, true);
+        const initialStore = __idbStoreForHandle(this);
+        if (initialStore.keyPath !== null && keyGiven)
+            throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
+        if (initialStore.keyPath === null && !initialStore.autoIncrement && !keyGiven)
+            throw __idbException("DataError", "An out-of-line key is required.");
+        if (keyGiven) __idbKey(key);
+        return __idbQueueRequest(this, () => {
+            const store = __idbStoreForHandle(this);
+            // A failed request reverts every change made by that operation
+            // (§5.6), including key-generator advancement. Stage against a
+            // private store copy and publish only after all constraints pass.
+            const staged = __idbCloneData(store);
+            const record = __idbStoreKey(staged, serialized, keyGiven, key);
+            const index = staged.records.findIndex((item) => __idbCompare(item.key, record.key) === 0);
+            if (index >= 0 && noOverwrite) throw __idbException("ConstraintError", "The key already exists.");
+            __idbValidateUniqueIndexes(staged, record, index >= 0 ? record.key : null);
+            if (index >= 0) staged.records[index] = record; else staged.records.push(record);
+            Object.assign(store, staged);
+            return __idbKeyValue(record.key);
+        });
+    }
+    function objectStoreFirst(query, keyOnly) {
+        __idbRequireActive(this.transaction);
+        const range = __idbRange(query, false);
+        return __idbQueueRequest(this, () => {
+            const record = __idbRecordList(__idbStoreForHandle(this), range, "next")[0];
+            if (!record) return undefined;
+            return keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value);
+        });
+    }
+    function objectStoreAll(query, count, keyOnly, queryGiven) {
+        __idbRequireActive(this.transaction);
+        const range = __idbRange(queryGiven ? query : null, true), limit = __idbCount(count);
+        return __idbQueueRequest(this, () => {
+            let records = __idbRecordList(__idbStoreForHandle(this), range, "next");
+            if (limit !== undefined && limit !== 0) records = records.slice(0, limit);
+            return records.map((record) => keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value));
+        });
+    }
+    function objectStoreOpenCursor(query, direction, keyOnly, queryGiven) {
+        __idbRequireActive(this.transaction);
+        direction = direction === undefined ? "next" : String(direction);
+        if (!["next", "nextunique", "prev", "prevunique"].includes(direction)) throw new TypeError("Invalid cursor direction.");
+        const range = __idbRange(queryGiven ? query : null, true);
+        const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
+            : new IDBCursorWithValue(__idbToken, this, direction, range);
+        const request = new IDBRequest(__idbToken, this, this.transaction);
+        internalsFor(cursor).request = request;
+        return __idbQueueRequest(this, () => cursorIterate.call(cursor), request);
+    }
     class IDBObjectStore {
         constructor(token, transaction, name) {
             if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.transaction = transaction; this.__name = name; this.__keyPathValue = undefined;
+            this.transaction = transaction; internalsFor(this).name = name; internalsFor(this).keyPathValue = undefined;
         }
-        get name() { return this.__name; }
+        get name() { return internalsFor(this).name; }
         set name(value) {
             const transaction = this.transaction;
             if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Renaming requires a versionchange transaction.");
             __idbRequireActive(transaction);
             const name = __idbDOMString(value), store = __idbStoreForHandle(this);
-            if (name === this.__name) return;
-            if (__idbStore(transaction.__data, name)) throw __idbException("ConstraintError", "An object store already has that name.");
-            const old = this.__name; store.name = name; this.__name = name;
-            const scopeIndex = transaction.__scope.indexOf(old); if (scopeIndex >= 0) transaction.__scope[scopeIndex] = name;
-            transaction.__handles.delete(old); transaction.__handles.set(name, this);
+            if (name === internalsFor(this).name) return;
+            if (__idbStore(internalsFor(transaction).data, name)) throw __idbException("ConstraintError", "An object store already has that name.");
+            const old = internalsFor(this).name; store.name = name; internalsFor(this).name = name;
+            const scopeIndex = internalsFor(transaction).scope.indexOf(old); if (scopeIndex >= 0) internalsFor(transaction).scope[scopeIndex] = name;
+            internalsFor(transaction).handles.delete(old); internalsFor(transaction).handles.set(name, this);
         }
         get keyPath() {
             const path = __idbStoreForHandle(this).keyPath;
             if (!Array.isArray(path)) return path;
-            if (this.__keyPathValue === undefined) this.__keyPathValue = path.slice();
-            return this.__keyPathValue;
+            if (internalsFor(this).keyPathValue === undefined) internalsFor(this).keyPathValue = path.slice();
+            return internalsFor(this).keyPathValue;
         }
         get indexNames() { return __idbSortedNames(__idbStoreForHandle(this).indexes.map((index) => index.name)); }
         get autoIncrement() { return !!__idbStoreForHandle(this).autoIncrement; }
-        put(value, key) { return this.__addOrPut(value, key, arguments.length > 1, false); }
-        add(value, key) { return this.__addOrPut(value, key, arguments.length > 1, true); }
-        __addOrPut(value, key, keyGiven, noOverwrite) {
-            const transaction = this.transaction; __idbRequireActive(transaction);
-            if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-            // Clone during the method call, before the request is returned.
-            const serialized = messageSerialize(value, true);
-            const initialStore = __idbStoreForHandle(this);
-            if (initialStore.keyPath !== null && keyGiven)
-                throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
-            if (initialStore.keyPath === null && !initialStore.autoIncrement && !keyGiven)
-                throw __idbException("DataError", "An out-of-line key is required.");
-            if (keyGiven) __idbKey(key);
-            return __idbQueueRequest(this, () => {
-                const store = __idbStoreForHandle(this);
-                // A failed request reverts every change made by that operation
-                // (§5.6), including key-generator advancement. Stage against a
-                // private store copy and publish only after all constraints pass.
-                const staged = __idbCloneData(store);
-                const record = __idbStoreKey(staged, serialized, keyGiven, key);
-                const index = staged.records.findIndex((item) => __idbCompare(item.key, record.key) === 0);
-                if (index >= 0 && noOverwrite) throw __idbException("ConstraintError", "The key already exists.");
-                __idbValidateUniqueIndexes(staged, record, index >= 0 ? record.key : null);
-                if (index >= 0) staged.records[index] = record; else staged.records.push(record);
-                Object.assign(store, staged);
-                return __idbKeyValue(record.key);
-            });
-        }
+        put(value, key) { return objectStoreAddOrPut.call(this, value, key, arguments.length > 1, false); }
+        add(value, key) { return objectStoreAddOrPut.call(this, value, key, arguments.length > 1, true); }
         delete(query) {
             const transaction = this.transaction; __idbRequireActive(transaction);
             if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
@@ -19367,46 +19466,17 @@
             if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
             return __idbQueueRequest(this, () => { __idbStoreForHandle(this).records = []; return undefined; });
         }
-        get(query) { return this.__first(query, false); }
-        getKey(query) { return this.__first(query, true); }
-        __first(query, keyOnly) {
-            __idbRequireActive(this.transaction);
-            const range = __idbRange(query, false);
-            return __idbQueueRequest(this, () => {
-                const record = __idbRecordList(__idbStoreForHandle(this), range, "next")[0];
-                if (!record) return undefined;
-                return keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value);
-            });
-        }
-        getAll(query, count) { return this.__all(query, count, false, arguments.length > 0); }
-        getAllKeys(query, count) { return this.__all(query, count, true, arguments.length > 0); }
-        __all(query, count, keyOnly, queryGiven) {
-            __idbRequireActive(this.transaction);
-            const range = __idbRange(queryGiven ? query : null, true), limit = __idbCount(count);
-            return __idbQueueRequest(this, () => {
-                let records = __idbRecordList(__idbStoreForHandle(this), range, "next");
-                if (limit !== undefined && limit !== 0) records = records.slice(0, limit);
-                return records.map((record) => keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value));
-            });
-        }
+        get(query) { return objectStoreFirst.call(this, query, false); }
+        getKey(query) { return objectStoreFirst.call(this, query, true); }
+        getAll(query, count) { return objectStoreAll.call(this, query, count, false, arguments.length > 0); }
+        getAllKeys(query, count) { return objectStoreAll.call(this, query, count, true, arguments.length > 0); }
         count(query) {
             __idbRequireActive(this.transaction);
             const range = __idbRange(arguments.length ? query : null, true);
             return __idbQueueRequest(this, () => __idbRecordList(__idbStoreForHandle(this), range, "next").length);
         }
-        openCursor(query, direction) { return this.__openCursor(query, direction, false, arguments.length > 0); }
-        openKeyCursor(query, direction) { return this.__openCursor(query, direction, true, arguments.length > 0); }
-        __openCursor(query, direction, keyOnly, queryGiven) {
-            __idbRequireActive(this.transaction);
-            direction = direction === undefined ? "next" : String(direction);
-            if (!["next", "nextunique", "prev", "prevunique"].includes(direction)) throw new TypeError("Invalid cursor direction.");
-            const range = __idbRange(queryGiven ? query : null, true);
-            const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
-                : new IDBCursorWithValue(__idbToken, this, direction, range);
-            const request = new IDBRequest(__idbToken, this, this.transaction);
-            cursor.__request = request;
-            return __idbQueueRequest(this, () => cursor.__iterate(), request);
-        }
+        openCursor(query, direction) { return objectStoreOpenCursor.call(this, query, direction, false, arguments.length > 0); }
+        openKeyCursor(query, direction) { return objectStoreOpenCursor.call(this, query, direction, true, arguments.length > 0); }
         createIndex(name, keyPath, options) {
             const transaction = this.transaction;
             if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Index creation requires a versionchange transaction.");
@@ -19449,160 +19519,160 @@
         get [Symbol.toStringTag]() { return "IDBObjectStore"; }
     }
 
+    function indexRecord() {
+        const index = __idbStoreForHandle(this.objectStore).indexes.find((item) => item.name === internalsFor(this).name);
+        if (!index) throw __idbException("InvalidStateError", "The index was deleted.");
+        return index;
+    }
+    function indexFirst(query, keyOnly) {
+        __idbRequireActive(this.objectStore.transaction);
+        const range = __idbRange(query, false);
+        return __idbQueueRequest(this, () => {
+            const record = __idbIndexRecordList(this, range, "next")[0];
+            if (!record) return undefined;
+            return keyOnly ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value);
+        });
+    }
+    function indexAll(query, count, keyOnly, queryGiven) {
+        __idbRequireActive(this.objectStore.transaction);
+        let direction = "next", rangeQuery = queryGiven ? query : null, limit = count;
+        if (queryGiven && query && typeof query === "object" && !(query instanceof IDBKeyRange) &&
+            !(query instanceof Date) && !Array.isArray(query) &&
+            !(query instanceof ArrayBuffer) && !ArrayBuffer.isView(query) &&
+            ("query" in query || "count" in query || "direction" in query)) {
+            rangeQuery = query.query === undefined ? null : query.query;
+            limit = query.count;
+            direction = query.direction === undefined ? "next" : String(query.direction);
+        }
+        if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
+            throw new TypeError("Invalid retrieval direction.");
+        const range = __idbRange(rangeQuery, true), bounded = __idbCount(limit);
+        return __idbQueueRequest(this, () => {
+            let records = __idbIndexRecordList(this, range, direction);
+            if (bounded !== undefined && bounded !== 0) records = records.slice(0, bounded);
+            return records.map((record) => keyOnly
+                ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value));
+        });
+    }
+    function indexOpenCursor(query, direction, keyOnly, queryGiven) {
+        __idbRequireActive(this.objectStore.transaction);
+        direction = direction === undefined ? "next" : String(direction);
+        if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
+            throw new TypeError("Invalid cursor direction.");
+        const range = __idbRange(queryGiven ? query : null, true);
+        const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
+            : new IDBCursorWithValue(__idbToken, this, direction, range);
+        const request = new IDBRequest(__idbToken, this, this.objectStore.transaction);
+        internalsFor(cursor).request = request;
+        return __idbQueueRequest(this, () => cursorIterate.call(cursor), request);
+    }
     class IDBIndex {
         constructor(token, objectStore, name) {
             if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.objectStore = objectStore; this.__name = name; this.__keyPathValue = undefined;
+            this.objectStore = objectStore; internalsFor(this).name = name; internalsFor(this).keyPathValue = undefined;
         }
-        __index() {
-            const index = __idbStoreForHandle(this.objectStore).indexes.find((item) => item.name === this.__name);
-            if (!index) throw __idbException("InvalidStateError", "The index was deleted.");
-            return index;
-        }
-        get name() { return this.__name; }
+        get name() { return internalsFor(this).name; }
         set name(value) {
             const transaction = this.objectStore.transaction;
             if (transaction.mode !== "versionchange")
                 throw __idbException("InvalidStateError", "Renaming an index requires a versionchange transaction.");
             __idbRequireActive(transaction);
-            const name = __idbDOMString(value), index = this.__index();
-            if (name === this.__name) return;
+            const name = __idbDOMString(value), index = indexRecord.call(this);
+            if (name === internalsFor(this).name) return;
             const store = __idbStoreForHandle(this.objectStore);
             if (store.indexes.some((item) => item.name === name))
                 throw __idbException("ConstraintError", "An index already has that name.");
-            index.name = name; this.__name = name;
+            index.name = name; internalsFor(this).name = name;
         }
         get keyPath() {
-            const path = this.__index().keyPath;
+            const path = indexRecord.call(this).keyPath;
             if (!Array.isArray(path)) return path;
-            if (this.__keyPathValue === undefined) this.__keyPathValue = path.slice();
-            return this.__keyPathValue;
+            if (internalsFor(this).keyPathValue === undefined) internalsFor(this).keyPathValue = path.slice();
+            return internalsFor(this).keyPathValue;
         }
-        get multiEntry() { return this.__index().multiEntry; }
-        get unique() { return this.__index().unique; }
-        get(query) { return this.__first(query, false); }
-        getKey(query) { return this.__first(query, true); }
-        __first(query, keyOnly) {
-            __idbRequireActive(this.objectStore.transaction);
-            const range = __idbRange(query, false);
-            return __idbQueueRequest(this, () => {
-                const record = __idbIndexRecordList(this, range, "next")[0];
-                if (!record) return undefined;
-                return keyOnly ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value);
-            });
-        }
-        getAll(query, count) { return this.__all(query, count, false, arguments.length > 0); }
-        getAllKeys(query, count) { return this.__all(query, count, true, arguments.length > 0); }
-        __all(query, count, keyOnly, queryGiven) {
-            __idbRequireActive(this.objectStore.transaction);
-            let direction = "next", rangeQuery = queryGiven ? query : null, limit = count;
-            if (queryGiven && query && typeof query === "object" && !(query instanceof IDBKeyRange) &&
-                !(query instanceof Date) && !Array.isArray(query) &&
-                !(query instanceof ArrayBuffer) && !ArrayBuffer.isView(query) &&
-                ("query" in query || "count" in query || "direction" in query)) {
-                rangeQuery = query.query === undefined ? null : query.query;
-                limit = query.count;
-                direction = query.direction === undefined ? "next" : String(query.direction);
-            }
-            if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
-                throw new TypeError("Invalid retrieval direction.");
-            const range = __idbRange(rangeQuery, true), bounded = __idbCount(limit);
-            return __idbQueueRequest(this, () => {
-                let records = __idbIndexRecordList(this, range, direction);
-                if (bounded !== undefined && bounded !== 0) records = records.slice(0, bounded);
-                return records.map((record) => keyOnly
-                    ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value));
-            });
-        }
+        get multiEntry() { return indexRecord.call(this).multiEntry; }
+        get unique() { return indexRecord.call(this).unique; }
+        get(query) { return indexFirst.call(this, query, false); }
+        getKey(query) { return indexFirst.call(this, query, true); }
+        getAll(query, count) { return indexAll.call(this, query, count, false, arguments.length > 0); }
+        getAllKeys(query, count) { return indexAll.call(this, query, count, true, arguments.length > 0); }
         count(query) {
             __idbRequireActive(this.objectStore.transaction);
             const range = __idbRange(arguments.length ? query : null, true);
             return __idbQueueRequest(this, () => __idbIndexRecordList(this, range, "next").length);
         }
-        openCursor(query, direction) { return this.__openCursor(query, direction, false, arguments.length > 0); }
-        openKeyCursor(query, direction) { return this.__openCursor(query, direction, true, arguments.length > 0); }
-        __openCursor(query, direction, keyOnly, queryGiven) {
-            __idbRequireActive(this.objectStore.transaction);
-            direction = direction === undefined ? "next" : String(direction);
-            if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
-                throw new TypeError("Invalid cursor direction.");
-            const range = __idbRange(queryGiven ? query : null, true);
-            const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
-                : new IDBCursorWithValue(__idbToken, this, direction, range);
-            const request = new IDBRequest(__idbToken, this, this.objectStore.transaction);
-            cursor.__request = request;
-            return __idbQueueRequest(this, () => cursor.__iterate(), request);
-        }
+        openCursor(query, direction) { return indexOpenCursor.call(this, query, direction, false, arguments.length > 0); }
+        openKeyCursor(query, direction) { return indexOpenCursor.call(this, query, direction, true, arguments.length > 0); }
         get [Symbol.toStringTag]() { return "IDBIndex"; }
     }
 
+    function cursorIterate(skip, target) {
+        internalsFor(this).records = __idbSourceRecordList(this.source, internalsFor(this).range, this.direction);
+        let next = internalsFor(this).position + (skip || 1);
+        if (target) {
+            while (next < internalsFor(this).records.length &&
+                (this.direction.startsWith("prev")
+                    ? __idbCompare(internalsFor(this).records[next].key, target) > 0
+                    : __idbCompare(internalsFor(this).records[next].key, target) < 0)) next++;
+        }
+        if (next >= internalsFor(this).records.length) {
+            internalsFor(this).gotValue = false; internalsFor(this).position = internalsFor(this).records.length;
+            internalsFor(this).key = internalsFor(this).primaryKey = internalsFor(this).value = undefined;
+            return null;
+        }
+        internalsFor(this).position = next;
+        const record = internalsFor(this).records[next];
+        internalsFor(this).key = __idbKeyValue(record.key);
+        internalsFor(this).primaryKey = __idbKeyValue(record.primaryKey || record.key);
+        internalsFor(this).value = messageDeserialize(record.value); internalsFor(this).gotValue = true;
+        return this;
+    }
     class IDBCursor {
         constructor(token, source, direction, range) {
             if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.source = source; this.direction = direction; this.__range = range;
-            this.__transaction = source instanceof IDBIndex
+            this.source = source; this.direction = direction; internalsFor(this).range = range;
+            internalsFor(this).transaction = source instanceof IDBIndex
                 ? source.objectStore.transaction : source.transaction;
-            this.__request = null;
-            this.__gotValue = false; this.__position = -1; this.__records = null;
-            this.__key = undefined; this.__primaryKey = undefined; this.__value = undefined;
+            internalsFor(this).request = null;
+            internalsFor(this).gotValue = false; internalsFor(this).position = -1; internalsFor(this).records = null;
+            internalsFor(this).key = undefined; internalsFor(this).primaryKey = undefined; internalsFor(this).value = undefined;
         }
-        get request() { return this.__request; }
+        get request() { return internalsFor(this).request; }
         get key() {
-            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            return this.__key;
+            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            return internalsFor(this).key;
         }
         get primaryKey() {
-            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            return this.__primaryKey;
-        }
-        __iterate(skip, target) {
-            this.__records = __idbSourceRecordList(this.source, this.__range, this.direction);
-            let next = this.__position + (skip || 1);
-            if (target) {
-                while (next < this.__records.length &&
-                    (this.direction.startsWith("prev")
-                        ? __idbCompare(this.__records[next].key, target) > 0
-                        : __idbCompare(this.__records[next].key, target) < 0)) next++;
-            }
-            if (next >= this.__records.length) {
-                this.__gotValue = false; this.__position = this.__records.length;
-                this.__key = this.__primaryKey = this.__value = undefined;
-                return null;
-            }
-            this.__position = next;
-            const record = this.__records[next];
-            this.__key = __idbKeyValue(record.key);
-            this.__primaryKey = __idbKeyValue(record.primaryKey || record.key);
-            this.__value = messageDeserialize(record.value); this.__gotValue = true;
-            return this;
+            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            return internalsFor(this).primaryKey;
         }
         continue(key) {
-            __idbRequireActive(this.__transaction);
-            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
+            __idbRequireActive(internalsFor(this).transaction);
+            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
             let target = null;
             if (arguments.length) {
                 target = __idbKey(key);
-                const compared = __idbCompare(target, __idbKey(this.__key));
+                const compared = __idbCompare(target, __idbKey(internalsFor(this).key));
                 if ((this.direction.startsWith("next") && compared <= 0) ||
                     (this.direction.startsWith("prev") && compared >= 0))
                     throw __idbException("DataError", "The continuation key does not advance the cursor.");
             }
-            this.__gotValue = false;
-            return __idbQueueRequest(this, () => this.__iterate(1, target), this.__request), undefined;
+            internalsFor(this).gotValue = false;
+            return __idbQueueRequest(this, () => cursorIterate.call(this, 1, target), internalsFor(this).request), undefined;
         }
         advance(count) {
             count = Number(count);
             if (!Number.isInteger(count) || count <= 0 || count > 4294967295) throw new TypeError("Cursor advance count must be a positive unsigned long.");
-            __idbRequireActive(this.__transaction);
-            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
-            this.__gotValue = false;
-            return __idbQueueRequest(this, () => this.__iterate(count), this.__request), undefined;
+            __idbRequireActive(internalsFor(this).transaction);
+            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
+            internalsFor(this).gotValue = false;
+            return __idbQueueRequest(this, () => cursorIterate.call(this, count), internalsFor(this).request), undefined;
         }
         delete() {
-            __idbRequireActive(this.__transaction);
-            if (this.__transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            const key = __idbKey(this.__primaryKey);
+            __idbRequireActive(internalsFor(this).transaction);
+            if (internalsFor(this).transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            const key = __idbKey(internalsFor(this).primaryKey);
             return __idbQueueRequest(this, () => {
                 const store = __idbStoreForHandle(this.source instanceof IDBIndex
                     ? this.source.objectStore : this.source);
@@ -19611,19 +19681,19 @@
             });
         }
         update(value) {
-            __idbRequireActive(this.__transaction);
-            if (this.__transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-            if (!this.__gotValue || !(this instanceof IDBCursorWithValue))
+            __idbRequireActive(internalsFor(this).transaction);
+            if (internalsFor(this).transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
+            if (!internalsFor(this).gotValue || !(this instanceof IDBCursorWithValue))
                 throw __idbException("InvalidStateError", "The cursor cannot update a value.");
             const store = this.source instanceof IDBIndex ? this.source.objectStore : this.source;
-            return store.put(value, this.__primaryKey);
+            return store.put(value, internalsFor(this).primaryKey);
         }
         get [Symbol.toStringTag]() { return "IDBCursor"; }
     }
     class IDBCursorWithValue extends IDBCursor {
         get value() {
-            if (!this.__gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            return this.__value;
+            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
+            return internalsFor(this).value;
         }
         get [Symbol.toStringTag]() { return "IDBCursorWithValue"; }
     }
@@ -19632,26 +19702,26 @@
         constructor(token, state, version) {
             super();
             if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.__db = state; this.__version = version;
-            this.__closePending = false; this.__closed = false;
+            internalsFor(this).db = state; internalsFor(this).version = version;
+            internalsFor(this).closePending = false; internalsFor(this).closed = false;
             state.connections.add(this);
         }
-        get name() { return this.__db.name; }
-        get version() { return this.__version; }
+        get name() { return internalsFor(this).db.name; }
+        get version() { return internalsFor(this).version; }
         get objectStoreNames() {
-            const data = this.__db.__upgrade && this.__db.__upgrade.__connection === this
-                ? this.__db.__upgrade.__data : this.__db.data;
+            const data = internalsFor(internalsFor(this).db).upgrade && internalsFor(internalsFor(internalsFor(this).db).upgrade).connection === this
+                ? internalsFor(internalsFor(internalsFor(this).db).upgrade).data : internalsFor(this).db.data;
             return __idbSortedNames(data.stores.map((store) => store.name));
         }
         transaction(storeNames, mode, options) {
             if (arguments.length === 0) throw new TypeError("IDBDatabase.transaction requires store names.");
-            if (this.__db.__upgrade) throw __idbException("InvalidStateError", "A versionchange transaction is active.");
-            if (this.__closePending || this.__closed) throw __idbException("InvalidStateError", "The connection is closing.");
+            if (internalsFor(internalsFor(this).db).upgrade) throw __idbException("InvalidStateError", "A versionchange transaction is active.");
+            if (internalsFor(this).closePending || internalsFor(this).closed) throw __idbException("InvalidStateError", "The connection is closing.");
             const scope = typeof storeNames === "string" ? [storeNames]
                 : Array.from(storeNames, __idbDOMString);
             const unique = Array.from(new Set(scope));
             if (!unique.length) throw __idbException("InvalidAccessError", "A transaction scope cannot be empty.");
-            for (const name of unique) if (!__idbStore(this.__db.data, name))
+            for (const name of unique) if (!__idbStore(internalsFor(this).db.data, name))
                 throw __idbException("NotFoundError", "An object store in the scope does not exist.");
             mode = mode === undefined ? "readonly" : String(mode);
             if (mode !== "readonly" && mode !== "readwrite") throw new TypeError("Invalid transaction mode.");
@@ -19662,15 +19732,15 @@
             // This queued database task is therefore behind all synchronous
             // requests made by the author in the creating task.
             __queue_dom_task(() => {
-                if (transaction.__state === "active") transaction.__state = "inactive";
-                __idbMaybeStartTransactions(transaction.__db);
+                if (internalsFor(transaction).state === "active") internalsFor(transaction).state = "inactive";
+                __idbMaybeStartTransactions(internalsFor(transaction).db);
                 __idbProcess(transaction);
             });
             return transaction;
         }
         createObjectStore(name, options) {
-            const transaction = this.__db.__upgrade;
-            if (!transaction || transaction.__connection !== this)
+            const transaction = internalsFor(internalsFor(this).db).upgrade;
+            if (!transaction || internalsFor(transaction).connection !== this)
                 throw __idbException("InvalidStateError", "Object stores can only be created during an upgrade.");
             __idbRequireActive(transaction); name = __idbDOMString(name); options = options || {};
             let keyPath = options.keyPath === undefined ? null : options.keyPath;
@@ -19678,31 +19748,31 @@
                 if (!__idbKeyPathValid(keyPath)) throw __idbException("SyntaxError", "The object store key path is invalid.");
                 keyPath = Array.isArray(keyPath) ? keyPath.slice() : String(keyPath);
             }
-            if (__idbStore(transaction.__data, name)) throw __idbException("ConstraintError", "The object store already exists.");
+            if (__idbStore(internalsFor(transaction).data, name)) throw __idbException("ConstraintError", "The object store already exists.");
             if (options.autoIncrement && (keyPath === "" || Array.isArray(keyPath)))
                 throw __idbException("InvalidAccessError", "This key path cannot use autoIncrement.");
-            transaction.__data.stores.push({ name: name, keyPath: keyPath, autoIncrement: !!options.autoIncrement, nextKey: 1, indexes: [], records: [] });
-            if (!transaction.__scope.includes(name)) transaction.__scope.push(name);
+            internalsFor(transaction).data.stores.push({ name: name, keyPath: keyPath, autoIncrement: !!options.autoIncrement, nextKey: 1, indexes: [], records: [] });
+            if (!internalsFor(transaction).scope.includes(name)) internalsFor(transaction).scope.push(name);
             return transaction.objectStore(name);
         }
         deleteObjectStore(name) {
-            const transaction = this.__db.__upgrade;
-            if (!transaction || transaction.__connection !== this)
+            const transaction = internalsFor(internalsFor(this).db).upgrade;
+            if (!transaction || internalsFor(transaction).connection !== this)
                 throw __idbException("InvalidStateError", "Object stores can only be deleted during an upgrade.");
             __idbRequireActive(transaction); name = __idbDOMString(name);
-            const index = transaction.__data.stores.findIndex((store) => store.name === name);
+            const index = internalsFor(transaction).data.stores.findIndex((store) => store.name === name);
             if (index < 0) throw __idbException("NotFoundError", "The object store does not exist.");
-            transaction.__data.stores.splice(index, 1);
-            transaction.__scope = transaction.__scope.filter((item) => item !== name);
+            internalsFor(transaction).data.stores.splice(index, 1);
+            internalsFor(transaction).scope = internalsFor(transaction).scope.filter((item) => item !== name);
         }
-        close() { this.__closePending = true; __idbFinishConnectionClose(this); }
+        close() { internalsFor(this).closePending = true; __idbFinishConnectionClose(this); }
         get [Symbol.toStringTag]() { return "IDBDatabase"; }
     }
     installHandlerProps(IDBDatabase.prototype, ["abort", "close", "error", "versionchange"]);
 
     function __idbOpenSuccess(request, connection) {
         __queue_dom_task(() => {
-            request.__result = connection; request.__error = null; request.__done = true;
+            internalsFor(request).result = connection; internalsFor(request).error = null; internalsFor(request).done = true;
             __idbRequestEvent(request, "success", false, false);
             __idbFinishConnectionRequest(request);
         });
@@ -19711,22 +19781,22 @@
         // Capture the standard's openConnections set. Connections that are
         // already close-pending receive no versionchange event, but still block
         // until their outstanding transactions finish and they truly close.
-        const open = Array.from(state.connections).filter((connection) => !connection.__closed);
+        const open = Array.from(state.connections).filter((connection) => !internalsFor(connection).closed);
         if (!open.length) { continuation(); return; }
         for (const connection of open) {
-            if (connection.__closePending) continue;
+            if (internalsFor(connection).closePending) continue;
             __queue_dom_task(() => {
-                if (!connection.__closed && !connection.__closePending)
+                if (!internalsFor(connection).closed && !internalsFor(connection).closePending)
                     __idbVersionEvent(connection, "versionchange", state.data.version, version);
             });
         }
         __queue_dom_task(() => {
-            const remaining = open.filter((connection) => !connection.__closed);
+            const remaining = open.filter((connection) => !internalsFor(connection).closed);
             if (remaining.length) __idbVersionEvent(request, "blocked", state.data.version, version);
             if (!remaining.length) { continuation(); return; }
             let waiting = true;
             const resume = () => {
-                if (!waiting || open.some((connection) => !connection.__closed)) return;
+                if (!waiting || open.some((connection) => !internalsFor(connection).closed)) return;
                 waiting = false;
                 state.connectionWaiters.delete(resume);
                 __queue_dom_task(continuation);
@@ -19755,7 +19825,7 @@
                 const state = __idbDatabaseState(name, true);
                 const requested = version === undefined ? (state.data.version || 1) : version;
                 if (state.data.version > requested) {
-                    request.__done = true; request.__error = __idbException("VersionError", "The requested version is lower than the database version.");
+                    internalsFor(request).done = true; internalsFor(request).error = __idbException("VersionError", "The requested version is lower than the database version.");
                     __idbRequestEvent(request, "error", true, true);
                     __idbFinishConnectionRequest(request);
                     return;
@@ -19767,11 +19837,11 @@
                     const data = __idbCloneData(state.data); data.version = requested;
                     const transaction = new IDBTransaction(__idbToken, connection,
                         data.stores.map((store) => store.name), "versionchange", "default", data, request);
-                    state.__upgrade = transaction;
-                    request.__result = connection; request.__transaction = transaction; request.__done = true;
-                    transaction.__state = "active";
+                    internalsFor(state).upgrade = transaction;
+                    internalsFor(request).result = connection; internalsFor(request).transaction = transaction; internalsFor(request).done = true;
+                    internalsFor(transaction).state = "active";
                     __idbVersionEvent(request, "upgradeneeded", oldVersion, requested);
-                    if (transaction.__state === "active") transaction.__state = "inactive";
+                    if (internalsFor(transaction).state === "active") internalsFor(transaction).state = "inactive";
                     __idbProcess(transaction);
                 };
                 if (state.data.version < requested)
@@ -19791,7 +19861,7 @@
                 const oldVersion = state ? state.data.version : 0;
                 const remove = () => {
                     __storage_remove(__idbDataKind, name); __idbCatalog.delete(name);
-                    request.__done = true; request.__result = undefined; request.__error = null;
+                    internalsFor(request).done = true; internalsFor(request).result = undefined; internalsFor(request).error = null;
                     __idbVersionEvent(request, "success", oldVersion, null);
                     __idbFinishConnectionRequest(request);
                 };
@@ -19837,28 +19907,28 @@
     // statics `abort`/`timeout`/`any` are widely referenced — YouTube's
     // kevlar bundle reads the bare `AbortSignal` global, a ReferenceError
     // without it.
+    function abortSignalAbort(reason) {
+        if (this.aborted) return;
+        this.aborted = true;
+        this.reason = reason !== undefined ? reason : new DOMException("signal is aborted without reason", "AbortError");
+        const ev = new Event("abort");
+        if (typeof this.onabort === "function") { try { this.onabort.call(this, ev); } catch (e) {} }
+        this.dispatchEvent(ev);
+    }
     class AbortSignal extends EventTarget {
         constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }
         throwIfAborted() { if (this.aborted) throw this.reason; }
-        __abort(reason) {
-            if (this.aborted) return;
-            this.aborted = true;
-            this.reason = reason !== undefined ? reason : new DOMException("signal is aborted without reason", "AbortError");
-            const ev = new Event("abort");
-            if (typeof this.onabort === "function") { try { this.onabort.call(this, ev); } catch (e) {} }
-            this.dispatchEvent(ev);
-        }
-        static abort(reason) { const s = new AbortSignal(); s.__abort(reason); return s; }
+        static abort(reason) { const s = new AbortSignal(); abortSignalAbort.call(s, reason); return s; }
         static timeout(ms) {
             const s = new AbortSignal();
-            g.setTimeout(() => s.__abort(new DOMException("signal timed out", "TimeoutError")), Number(ms) || 0);
+            g.setTimeout(() => abortSignalAbort.call(s, new DOMException("signal timed out", "TimeoutError")), Number(ms) || 0);
             return s;
         }
         static any(signals) {
             const s = new AbortSignal();
             for (const sig of signals || []) {
-                if (sig && sig.aborted) { s.__abort(sig.reason); break; }
-                if (sig && sig.addEventListener) sig.addEventListener("abort", () => s.__abort(sig.reason));
+                if (sig && sig.aborted) { abortSignalAbort.call(s, sig.reason); break; }
+                if (sig && sig.addEventListener) sig.addEventListener("abort", () => abortSignalAbort.call(s, sig.reason));
             }
             return s;
         }
@@ -19866,7 +19936,7 @@
     g.AbortSignal = AbortSignal;
     g.AbortController = class AbortController {
         constructor() { this.signal = new AbortSignal(); }
-        abort(reason) { this.signal.__abort(reason); }
+        abort(reason) { abortSignalAbort.call(this.signal, reason); }
     };
 
     // Window and Worker use the same HTML port/transfer implementation.
@@ -20211,18 +20281,18 @@
             super();
             this.name = String(name);
             this.onmessage = null; this.onmessageerror = null;
-            this.__closed = false;
+            internalsFor(this).closed = false;
             let list = BC.get(this.name);
             if (!list) { list = []; BC.set(this.name, list); }
             list.push(this);
         }
         postMessage(message) {
-            if (this.__closed) throw new DOMException("channel is closed", "InvalidStateError");
+            if (internalsFor(this).closed) throw new DOMException("channel is closed", "InvalidStateError");
             const list = BC.get(this.name) || [];
             for (const ch of list.slice()) {
-                if (ch === this || ch.__closed) continue;
+                if (ch === this || internalsFor(ch).closed) continue;
                 __queue_dom_task(() => {
-                    if (ch.__closed) return;
+                    if (internalsFor(ch).closed) return;
                     const ev = new MessageEvent("message", {
                         data: message,
                         origin: (g.location && g.location.origin) || "",
@@ -20233,7 +20303,7 @@
             }
         }
         close() {
-            this.__closed = true;
+            internalsFor(this).closed = true;
             const list = BC.get(this.name);
             if (list) { const i = list.indexOf(this); if (i >= 0) list.splice(i, 1); }
         }
@@ -20247,6 +20317,13 @@
     // the page's own socket.io-client runs the protocol over these frames.
     const WS_REGISTRY = {};
     const socketIds = privateSlots();
+    function socketFire(type, init) {
+        let ev;
+        if (type === "message") ev = createTrustedEvent(MessageEvent, "message", init);
+        else if (type === "close") ev = createTrustedEvent(CloseEvent, "close", init);
+        else ev = createTrustedEvent(Event, type, init);
+        dispatch(this, ev, false);
+    }
     class WebSocket extends EventTarget {
         constructor(url, protocols) {
             super();
@@ -20278,7 +20355,7 @@
             this.bufferedAmount = 0;
             this.extensions = "";
             this.protocol = "";
-            this.__binaryType = "blob";
+            internalsFor(this).binaryType = "blob";
             socketIds.set(this, __ws_open(this.url, protocolList.join(",")));
             if (socketIds.get(this) < 0) {
                 // Synchronous open failure (bad URL / blocked / no net grant):
@@ -20286,8 +20363,8 @@
                 const self = this;
                 g.setTimeout(() => {
                     self.readyState = 3;
-                    self.__fire("error", {});
-                    self.__fire("close", { code: 1006, reason: "", wasClean: false });
+                    socketFire.call(self, "error", {});
+                    socketFire.call(self, "close", { code: 1006, reason: "", wasClean: false });
                 }, 0);
             } else {
                 WS_REGISTRY[socketIds.get(this)] = this;
@@ -20295,11 +20372,11 @@
         }
         get CONNECTING() { return 0; } get OPEN() { return 1; }
         get CLOSING() { return 2; } get CLOSED() { return 3; }
-        get binaryType() { return this.__binaryType; }
+        get binaryType() { return internalsFor(this).binaryType; }
         set binaryType(value) {
             value = String(value);
             if (value !== "blob" && value !== "arraybuffer") throw new TypeError("Invalid WebSocket binaryType");
-            this.__binaryType = value;
+            internalsFor(this).binaryType = value;
         }
         send(data) {
             if (this.readyState === 0) throw new DOMException("WebSocket is still CONNECTING", "InvalidStateError");
@@ -20340,13 +20417,6 @@
             this.readyState = 2; // CLOSING
             __ws_close(socketIds.get(this), code === undefined ? 0 : code, reason);
         }
-        __fire(type, init) {
-            let ev;
-            if (type === "message") ev = createTrustedEvent(MessageEvent, "message", init);
-            else if (type === "close") ev = createTrustedEvent(CloseEvent, "close", init);
-            else ev = createTrustedEvent(Event, type, init);
-            dispatch(this, ev, false);
-        }
     }
     installHandlerProps(WebSocket.prototype, ["open", "message", "error", "close"]);
     WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
@@ -20358,7 +20428,7 @@
         if (kind === "open") {
             ws.readyState = 1; // OPEN
             ws.protocol = protocol || "";
-            ws.__fire("open", {});
+            socketFire.call(ws, "open", {});
         } else if (kind === "message") {
             let payload = data;
             if (isBinary) {
@@ -20368,14 +20438,14 @@
             }
             let origin = "";
             try { origin = new g.URL(ws.url).origin; } catch (_) {}
-            ws.__fire("message", { data: payload, origin: origin });
+            socketFire.call(ws, "message", { data: payload, origin: origin });
         } else if (kind === "drain") {
             ws.bufferedAmount = Math.max(0, ws.bufferedAmount - (Number(code) || 0));
         } else if (kind === "close") {
             ws.readyState = 3; // CLOSED
             delete WS_REGISTRY[id];
-            if (failed) ws.__fire("error", {});
-            ws.__fire("close", { code: code, reason: reason || "", wasClean: !!wasClean });
+            if (failed) socketFire.call(ws, "error", {});
+            socketFire.call(ws, "close", { code: code, reason: reason || "", wasClean: !!wasClean });
         }
     };
 
@@ -20391,6 +20461,18 @@
     // in the page realm and a worker realm.)
     /*__SC_CODEC_BEGIN__*/
     (function (G) {
+    const codecSlotsMap = __platform_slots("internals", new WeakMap());
+    function codecSlots(object) {
+        // Internal slots shared with the platform, in Window and Worker realms.
+        const map = codecSlotsMap;
+        let record = Reflect.apply(WeakMap.prototype.get, map, [object]);
+        if (record === undefined) {
+            record = Object.create(null);
+            if ((typeof object === "object" && object !== null) || typeof object === "function")
+                Reflect.apply(WeakMap.prototype.set, map, [object, record]);
+        }
+        return record;
+    }
         // HTML ImageData / Web IDL buffer sources, overload resolution and dictionary conversion.
         // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagedata
         // The shared codec block installs the same interface in Window and Worker realms.
@@ -20520,13 +20602,13 @@
         // survives postMessage instead of arriving empty. Self-contained
         // (the codec runs in both the page and worker realms).
         function blobBytes(b) {
-            var parts = b.__parts || [], out = "", i, j, v, p;
+            var parts = codecSlots(b).parts || [], out = "", i, j, v, p;
             for (i = 0; i < parts.length; i++) {
                 p = parts[i];
                 if (typeof p === "string") { v = new G.TextEncoder().encode(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
                 else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
                 else if (p && typeof p.byteLength === "number" && p.buffer) { v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-                else if (p && p.__parts) out += blobBytes(p);
+                else if (p && codecSlots(p).parts) out += blobBytes(p);
             }
             return out;
         }
@@ -21990,6 +22072,7 @@
     // (the actor dispatches them like a click). Mirrors the WebSocket class.
     trust.workers = {};
     const workerIds = privateSlots();
+    function workerFire(type, ev) { dispatch(this, ev, false); }
     class Worker extends EventTarget {
         constructor(url, options) {
             super();
@@ -22029,7 +22112,6 @@
                 workerIds.set(this, -1);
             }
         }
-        __fire(type, ev) { dispatch(this, ev, false); }
     }
     installHandlerProps(Worker.prototype, ["message", "messageerror", "error"]);
     g.Worker = Worker;
@@ -22038,14 +22120,14 @@
         if (!w) return;
         let packet;
         try { packet = deserializeMessage(JSON.parse(s)); }
-        catch (e) { w.__fire("messageerror", createTrustedEvent(MessageEvent, "messageerror", { origin: "" })); return; }
-        w.__fire("message", createTrustedEvent(MessageEvent, "message", {
+        catch (e) { workerFire.call(w, "messageerror", createTrustedEvent(MessageEvent, "messageerror", { origin: "" })); return; }
+        workerFire.call(w, "message", createTrustedEvent(MessageEvent, "message", {
             data: packet.data, origin: "", ports: Object.freeze(packet.ports)
         }));
     };
     trust.workerError = function (id, msg) {
         const w = trust.workers[id];
-        if (w) w.__fire("error", createTrustedEvent(ErrorEvent, "error", { message: String(msg), cancelable: true }));
+        if (w) workerFire.call(w, "error", createTrustedEvent(ErrorEvent, "error", { message: String(msg), cancelable: true }));
     };
     trust.workerExited = function (id) {
         // HTML #worker-processing-model: once the agent and its queued replies
@@ -22209,14 +22291,14 @@
             // Operate on the associated request, never on shadowable public
             // attributes (Fetch §5.6 step 3). YouTube intentionally shadows
             // these getters as a platform-integrity probe.
-            const url = req.__url;
+            const url = internalsFor(req).url;
             // AbortSignal (Fetch §"abort fetch"): an already-aborted signal
             // rejects immediately with its reason; an abort while in flight
             // wins the race below. The wire request itself isn't torn down —
             // it completes into a dropped promise — but the OBSERVABLE
             // contract (the rejection, and stale responses never reaching
             // .then) is the part pages depend on (abort-and-retype search).
-            const sig = req.__signal;
+            const sig = internalsFor(req).signal;
             const abortReason = () => (sig && sig.reason !== undefined && sig.reason !== null)
                 ? sig.reason : new DOMException("The operation was aborted.", "AbortError");
             if (sig && sig.aborted) return Promise.reject(abortReason());
@@ -22239,7 +22321,7 @@
                 if (!dp) return Promise.reject(new TypeError("fetch failed: invalid data: URL"));
                 const dresp = new Response(dp.text, { status: 200, statusText: "", headers: { "content-type": dp.ctype }, url: url });
                 dresp.type = "basic";
-                dresp.__bytes = dp.bytes; // byte-exact body for arrayBuffer()/blob()
+                internalsFor(dresp).bytes = dp.bytes; // byte-exact body for arrayBuffer()/blob()
                 return Promise.resolve(dresp);
             }
             // A `blob:` URL is served from the in-realm store, never the wire
@@ -22251,17 +22333,17 @@
                 const bh = {}; if (be.type) bh["content-type"] = be.type;
                 const bresp = new Response(new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), { status: 200, statusText: "", headers: bh, url: url });
                 bresp.type = "basic";
-                bresp.__bytes = be.bytes; // byte-exact body for arrayBuffer()/blob()
+                internalsFor(bresp).bytes = be.bytes; // byte-exact body for arrayBuffer()/blob()
                 return Promise.resolve(bresp);
             }
-            const isFD = req.__body instanceof g.FormData && Array.isArray(req.__body.__entries);
-            const enc = isFD ? __formDataWire(req.__body) : null;
-            const body = isFD ? enc.wire : __bodyWire(req.__body);
-            const ctype = req.__headers.get("content-type")
-                || (isFD ? enc.type : __bodyType(req.__body));
+            const isFD = internalsFor(req).body instanceof g.FormData && Array.isArray(internalsFor(internalsFor(req).body).entries);
+            const enc = isFD ? __formDataWire(internalsFor(req).body) : null;
+            const body = isFD ? enc.wire : __bodyWire(internalsFor(req).body);
+            const ctype = internalsFor(req).headers.get("content-type")
+                || (isFD ? enc.type : __bodyType(internalsFor(req).body));
             return raceAbort(__http_fetch_async(
-                url, req.__method, body, ctype, __hdrBlob(req.__headers.__h),
-                req.__mode, req.__credentials, 'fetch'
+                url, internalsFor(req).method, body, ctype, __hdrBlob(internalsFor(internalsFor(req).headers).h),
+                internalsFor(req).mode, internalsFor(req).credentials, 'fetch'
             ).then(function (r) {
                 if (!r) throw new TypeError("fetch failed or blocked: " + url);
                 const status = r[0], respCType = r[1], text = r[2];
@@ -22284,8 +22366,8 @@
                 try {
                     crossOrigin = new g.URL(url).origin !== ((g.location && g.location.origin) || "");
                 } catch (_) {}
-                resp.type = (req.__mode === "cors" && crossOrigin) ? "cors" : "basic";
-                resp.__bytes = r[3]; // native byte-exact body for arrayBuffer()
+                resp.type = (internalsFor(req).mode === "cors" && crossOrigin) ? "cors" : "basic";
+                internalsFor(resp).bytes = r[3]; // native byte-exact body for arrayBuffer()
                 return resp;
             }));
         } catch (e) { return Promise.reject(e); }
@@ -22352,58 +22434,139 @@
     function isXmlMime(mime) {
         return mime === "text/xml" || mime === "application/xml" || mime.endsWith("+xml");
     }
+    function xhrFire(t) {
+        const ev = new Event(t); ev.target = this;
+        const on = this["on" + t];
+        if (typeof on === "function") { try { on.call(this, ev); } catch (e) { trust.errors.push("xhr on" + t + ": " + ((e && e.message) || e)); } }
+        // Fire addEventListener listeners (app's + Zone's internal
+        // readystatechange handler) through the shared EventTarget dispatch.
+        dispatch(this, ev, false);
+    }
+    function xhrFinish(r) {
+        // A late result for an aborted/timed-out request is discarded —
+        // its events already fired from abort()/the timeout timer.
+        if (internalsFor(this).aborted || !internalsFor(this).inFlight) return;
+        internalsFor(this).inFlight = false;
+        if (!r) {
+            this.readyState = 4; this.status = 0;
+            internalsFor(this).text = ""; internalsFor(this).bytes = null; internalsFor(this).decodedText = "";
+            internalsFor(this).respObj = null; internalsFor(this).respXML = null;
+            xhrFire.call(this, "readystatechange"); xhrFire.call(this, "error"); xhrFire.call(this, "loadend");
+            return;
+        }
+        this.status = r[0]; internalsFor(this).ctype = r[1];
+        internalsFor(this).text = r[2] == null ? "" : r[2];
+        // Keep XHR's internal response body as a byte view. The host Fetch
+        // result is an ArrayBuffer so it can cross the realm boundary
+        // without stale typed-array bookkeeping; XHR's byte sequence is
+        // exposed through Array.from() and response consumers via this view.
+        internalsFor(this).bytes = r[3] != null ? __bodyBytes(r[3]) : null;
+        internalsFor(this).hdrs = r.length > 4 ? __parseHdrBlob(r[4]) : null;
+        if (internalsFor(this).hdrs && internalsFor(this).ctype && internalsFor(this).hdrs["content-type"] === undefined) internalsFor(this).hdrs["content-type"] = internalsFor(this).ctype;
+        internalsFor(this).respObj = undefined; internalsFor(this).respXML = undefined;
+        internalsFor(this).decodedText = undefined;
+        this.responseURL = internalsFor(this).url;
+        this.readyState = 4;
+        xhrFire.call(this, "readystatechange"); xhrFire.call(this, "load"); xhrFire.call(this, "loadend");
+    }
+    function xhrFinalMime() { return internalsFor(this).overrideMime || parseMimeType(internalsFor(this).ctype || "") || parseMimeType("text/xml"); }
+    function xhrEnsureText() {
+        if (this.readyState < 3) return "";
+        if (internalsFor(this).decodedText === undefined) internalsFor(this).decodedText = xhrDecodeText.call(this, false);
+        return internalsFor(this).decodedText;
+    }
+    function xhrDecodeText(fatal) {
+        if (internalsFor(this).bytes == null) return internalsFor(this).text || "";
+        const bytes = __bodyBytes(internalsFor(this).bytes);
+        const responseMime = parseMimeType(internalsFor(this).ctype || "");
+        let label = responseMime && responseMime.parameters.get("charset");
+        if (internalsFor(this).overrideMime && internalsFor(this).overrideMime.parameters.has("charset")) label = internalsFor(this).overrideMime.parameters.get("charset");
+        if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) label = "utf-8";
+        else if (bytes[0] === 0xff && bytes[1] === 0xfe) label = "utf-16le";
+        else if (bytes[0] === 0xfe && bytes[1] === 0xff) label = "utf-16be";
+        else if (!label && isXmlMime(xhrFinalMime.call(this).essence) && (internalsFor(this).respType === "" || internalsFor(this).respType === "document")) {
+            if (bytes[0] === 0 && bytes[1] === 60) label = "utf-16be";
+            else if (bytes[0] === 60 && bytes[1] === 0) label = "utf-16le";
+            else {
+                let prolog = "";
+                for (let i = 0; i < Math.min(1024, bytes.length); i++) prolog += String.fromCharCode(bytes[i]);
+                const match = /^<\?xml[\t\n\r ][\s\S]*?encoding[\t\n\r ]*=[\t\n\r ]*(['"])([^'"]+)\1/.exec(prolog);
+                if (match) label = match[2];
+            }
+        }
+        let decoder;
+        try { decoder = new g.TextDecoder(label || "utf-8", { fatal }); }
+        catch (error) { if (fatal) throw error; decoder = new g.TextDecoder("utf-8"); }
+        return decoder.decode(bytes);
+    }
+    function xhrDocumentResponse() {
+        if (internalsFor(this).respXML !== undefined) return internalsFor(this).respXML;
+        const ct = xhrFinalMime.call(this).essence;
+        const isXml = isXmlMime(ct);
+        const isHtml = ct === "text/html";
+        let out = null;
+        if (isXml || (isHtml && internalsFor(this).respType === "document")) {
+            try { out = wrap(__dom_parse_document(xhrDecodeText.call(this, isXml), ct)); }
+            catch (error) { internalsFor(this).respXML = null; return null; }
+            documentURLs.set(out, this.responseURL);
+            const root = out.documentElement;
+            if (isXml && root && root.localName === "parsererror" && root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml") out = null;
+        }
+        internalsFor(this).respXML = out;
+        return out;
+    }
     class XMLHttpRequest extends EventTarget {
         constructor() {
             super();
             this.readyState = 0; this.status = 0; this.statusText = "";
-            this.__text = ""; this.__bytes = null; this.__respType = ""; this.__respObj = undefined;
-            this.responseURL = ""; this.__timeout = 0; this.withCredentials = false;
-            this.__h = {}; this.__aborted = false; this.__inFlight = false;
+            internalsFor(this).text = ""; internalsFor(this).bytes = null; internalsFor(this).respType = ""; internalsFor(this).respObj = undefined;
+            this.responseURL = ""; internalsFor(this).timeout = 0; this.withCredentials = false;
+            internalsFor(this).h = {}; internalsFor(this).aborted = false; internalsFor(this).inFlight = false;
         }
         // XHR §the timeout attribute: setting it while the request is
         // synchronous (in a window realm — ours always is) throws
         // InvalidStateError. All send paths (wire, data:, blob:) read the
         // getter, so the rule can't be bypassed per-scheme.
-        get timeout() { return this.__timeout; }
+        get timeout() { return internalsFor(this).timeout; }
         set timeout(v) {
-            if (this.__sync) throw new DOMException("timeout cannot be set on a synchronous XMLHttpRequest in a window context", "InvalidStateError");
-            this.__timeout = Math.max(0, Number(v) || 0);
+            if (internalsFor(this).sync) throw new DOMException("timeout cannot be set on a synchronous XMLHttpRequest in a window context", "InvalidStateError");
+            internalsFor(this).timeout = Math.max(0, Number(v) || 0);
         }
         // `responseType` is a WebIDL enum: an invalid assignment is silently
         // ignored; changing it once loading, or on a sync request, throws
         // InvalidStateError (XHR spec §the responseType attribute).
-        get responseType() { return this.__respType; }
+        get responseType() { return internalsFor(this).respType; }
         set responseType(v) {
             v = String(v);
             if (v !== "" && v !== "text" && v !== "arraybuffer" && v !== "blob" && v !== "document" && v !== "json") return;
             if (this.readyState >= 3) throw new DOMException("responseType cannot be set once loading", "InvalidStateError");
-            if (this.__sync) throw new DOMException("responseType is unsupported on a synchronous request", "InvalidStateError");
-            this.__respType = v;
+            if (internalsFor(this).sync) throw new DOMException("responseType is unsupported on a synchronous request", "InvalidStateError");
+            internalsFor(this).respType = v;
         }
         // `responseText` is only readable in text mode (spec: throw unless
         // responseType is "" or "text"). Binary consumers must use `response`,
         // which is built from the byte-EXACT body (`r[3]`) — the UTF-8-lossy
         // text corrupts binary payloads (Steam's protobuf WebAPI responses).
         get responseText() {
-            if (this.__respType !== "" && this.__respType !== "text") throw new DOMException("responseText is only available for '' or 'text' responseType", "InvalidStateError");
-            return this.__ensureText();
+            if (internalsFor(this).respType !== "" && internalsFor(this).respType !== "text") throw new DOMException("responseText is only available for '' or 'text' responseType", "InvalidStateError");
+            return xhrEnsureText.call(this);
         }
         get response() {
-            const rt = this.__respType;
-            if (rt === "" || rt === "text") return this.__ensureText();
+            const rt = internalsFor(this).respType;
+            if (rt === "" || rt === "text") return xhrEnsureText.call(this);
             if (this.readyState !== 4) return null;
-            if (this.__respObj !== undefined) return this.__respObj;
+            if (internalsFor(this).respObj !== undefined) return internalsFor(this).respObj;
             let out = null;
             if (rt === "arraybuffer" || rt === "blob") {
-                const bytes = __bodyBytes(this.__bytes != null ? this.__bytes : utf8Binary(this.__text));
+                const bytes = __bodyBytes(internalsFor(this).bytes != null ? internalsFor(this).bytes : utf8Binary(internalsFor(this).text));
                 const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-                out = rt === "blob" ? new g.Blob([buf], { type: serializeMimeType(this.__finalMime()) }) : buf;
+                out = rt === "blob" ? new g.Blob([buf], { type: serializeMimeType(xhrFinalMime.call(this)) }) : buf;
             } else if (rt === "json") {
-                try { out = JSON.parse(this.__ensureText()); } catch (e) { out = null; }
+                try { out = JSON.parse(xhrEnsureText.call(this)); } catch (e) { out = null; }
             } else if (rt === "document") {
-                out = this.__documentResponse();
+                out = xhrDocumentResponse.call(this);
             }
-            this.__respObj = out;
+            internalsFor(this).respObj = out;
             return out;
         }
         // XHR §the responseXML attribute: only readable in ""/"document" mode;
@@ -22413,200 +22576,119 @@
         // Both getters use the same cached document response. XML errors yield
         // null here, unlike DOMParser's parsererror document (XHR §3.6.3).
         get responseXML() {
-            if (this.__respType !== "" && this.__respType !== "document")
+            if (internalsFor(this).respType !== "" && internalsFor(this).respType !== "document")
                 throw new DOMException("responseXML is only available for '' or 'document' responseType", "InvalidStateError");
             if (this.readyState !== 4) return null;
-            return this.__documentResponse();
-        }
-        __documentResponse() {
-            if (this.__respXML !== undefined) return this.__respXML;
-            const ct = this.__finalMime().essence;
-            const isXml = isXmlMime(ct);
-            const isHtml = ct === "text/html";
-            let out = null;
-            if (isXml || (isHtml && this.__respType === "document")) {
-                try { out = wrap(__dom_parse_document(this.__decodeText(isXml), ct)); }
-                catch (error) { this.__respXML = null; return null; }
-                documentURLs.set(out, this.responseURL);
-                const root = out.documentElement;
-                if (isXml && root && root.localName === "parsererror" && root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml") out = null;
-            }
-            this.__respXML = out;
-            return out;
+            return xhrDocumentResponse.call(this);
         }
         open(method, url, isAsync) {
-            this.__method = String(method).toUpperCase();
+            internalsFor(this).method = String(method).toUpperCase();
             // Resolve against the document base URL (XHR `open()`: parse url with
             // the API base URL of the relevant settings object). blob: stays as-is.
-            this.__url = resolveURL(String(url));
+            internalsFor(this).url = resolveURL(String(url));
             // XHR §open() step 11: a sync request in a window realm with a
             // non-zero timeout or a non-"" responseType already set is an
             // InvalidAccessError (the setters catch the after-open order).
-            if (isAsync === false && (this.__timeout !== 0 || this.__respType !== ""))
+            if (isAsync === false && (internalsFor(this).timeout !== 0 || internalsFor(this).respType !== ""))
                 throw new DOMException("synchronous XMLHttpRequest cannot have a timeout or responseType", "InvalidAccessError");
-            this.__sync = isAsync === false;
+            internalsFor(this).sync = isAsync === false;
             this.readyState = 1;
-            this.__fire("readystatechange");
+            xhrFire.call(this, "readystatechange");
         }
-        setRequestHeader(k, v) { this.__h[String(k).toLowerCase()] = String(v); }
+        setRequestHeader(k, v) { internalsFor(this).h[String(k).toLowerCase()] = String(v); }
         getResponseHeader(k) {
             k = String(k).toLowerCase();
-            if (this.__hdrs) return Object.prototype.hasOwnProperty.call(this.__hdrs, k) ? this.__hdrs[k] : null;
-            return k === "content-type" ? (this.__ctype || null) : null;
+            if (internalsFor(this).hdrs) return Object.prototype.hasOwnProperty.call(internalsFor(this).hdrs, k) ? internalsFor(this).hdrs[k] : null;
+            return k === "content-type" ? (internalsFor(this).ctype || null) : null;
         }
         getAllResponseHeaders() {
-            if (this.__hdrs) {
+            if (internalsFor(this).hdrs) {
                 let s = "";
-                for (const k of Object.keys(this.__hdrs).sort()) s += k + ": " + this.__hdrs[k] + "\r\n";
+                for (const k of Object.keys(internalsFor(this).hdrs).sort()) s += k + ": " + internalsFor(this).hdrs[k] + "\r\n";
                 return s;
             }
-            return this.__ctype ? "content-type: " + this.__ctype + "\r\n" : "";
-        }
-        __ensureText() {
-            if (this.readyState < 3) return "";
-            if (this.__decodedText === undefined) this.__decodedText = this.__decodeText(false);
-            return this.__decodedText;
-        }
-        __finalMime() { return this.__overrideMime || parseMimeType(this.__ctype || "") || parseMimeType("text/xml"); }
-        __decodeText(fatal) {
-            if (this.__bytes == null) return this.__text || "";
-            const bytes = __bodyBytes(this.__bytes);
-            const responseMime = parseMimeType(this.__ctype || "");
-            let label = responseMime && responseMime.parameters.get("charset");
-            if (this.__overrideMime && this.__overrideMime.parameters.has("charset")) label = this.__overrideMime.parameters.get("charset");
-            if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) label = "utf-8";
-            else if (bytes[0] === 0xff && bytes[1] === 0xfe) label = "utf-16le";
-            else if (bytes[0] === 0xfe && bytes[1] === 0xff) label = "utf-16be";
-            else if (!label && isXmlMime(this.__finalMime().essence) && (this.__respType === "" || this.__respType === "document")) {
-                if (bytes[0] === 0 && bytes[1] === 60) label = "utf-16be";
-                else if (bytes[0] === 60 && bytes[1] === 0) label = "utf-16le";
-                else {
-                    let prolog = "";
-                    for (let i = 0; i < Math.min(1024, bytes.length); i++) prolog += String.fromCharCode(bytes[i]);
-                    const match = /^<\?xml[\t\n\r ][\s\S]*?encoding[\t\n\r ]*=[\t\n\r ]*(['"])([^'"]+)\1/.exec(prolog);
-                    if (match) label = match[2];
-                }
-            }
-            let decoder;
-            try { decoder = new g.TextDecoder(label || "utf-8", { fatal }); }
-            catch (error) { if (fatal) throw error; decoder = new g.TextDecoder("utf-8"); }
-            return decoder.decode(bytes);
+            return internalsFor(this).ctype ? "content-type: " + internalsFor(this).ctype + "\r\n" : "";
         }
         overrideMimeType(mime) {
             if (!arguments.length) throw new TypeError("overrideMimeType requires a MIME type");
             mime = domString(mime);
             if (this.readyState === 3 || this.readyState === 4)
                 throw new DOMException("The response is already loading or done", "InvalidStateError");
-            this.__overrideMime = parseMimeType(mime) || parseMimeType("application/octet-stream");
-            this.__decodedText = undefined;
+            internalsFor(this).overrideMime = parseMimeType(mime) || parseMimeType("application/octet-stream");
+            internalsFor(this).decodedText = undefined;
         }
         // XHR §the abort() method: an in-flight request runs the "request error
         // steps" for abort (state DONE, readystatechange, abort, loadend), then
         // state resets to UNSENT. The wire request isn't torn down — its late
-        // result is discarded by the `__aborted` guard in `__finish` — but the
+        // result is discarded by the aborted-flag guard in `xhrFinish` — but the
         // page-observable contract (events fire, the response never lands) holds.
         abort() {
-            this.__aborted = true;
-            if (this.__inFlight) {
-                this.__inFlight = false;
-                this.status = 0; this.__text = ""; this.__bytes = null; this.__respObj = undefined; this.__respXML = undefined;
+            internalsFor(this).aborted = true;
+            if (internalsFor(this).inFlight) {
+                internalsFor(this).inFlight = false;
+                this.status = 0; internalsFor(this).text = ""; internalsFor(this).bytes = null; internalsFor(this).respObj = undefined; internalsFor(this).respXML = undefined;
                 this.readyState = 4;
-                this.__fire("readystatechange");
-                this.__fire("abort");
-                this.__fire("loadend");
+                xhrFire.call(this, "readystatechange");
+                xhrFire.call(this, "abort");
+                xhrFire.call(this, "loadend");
             }
             if (this.readyState === 4) this.readyState = 0; // DONE → UNSENT, silently
         }
         // addEventListener/removeEventListener are inherited from EventTarget so
         // listeners land in the shared `lsFor` store (and Zone's patched wrapper
         // sees them). The `on<type>` JS properties stay plain instance props.
-        __fire(t) {
-            const ev = new Event(t); ev.target = this;
-            const on = this["on" + t];
-            if (typeof on === "function") { try { on.call(this, ev); } catch (e) { trust.errors.push("xhr on" + t + ": " + ((e && e.message) || e)); } }
-            // Fire addEventListener listeners (app's + Zone's internal
-            // readystatechange handler) through the shared EventTarget dispatch.
-            dispatch(this, ev, false);
-        }
-        __finish(r) {
-            // A late result for an aborted/timed-out request is discarded —
-            // its events already fired from abort()/the timeout timer.
-            if (this.__aborted || !this.__inFlight) return;
-            this.__inFlight = false;
-            if (!r) {
-                this.readyState = 4; this.status = 0;
-                this.__text = ""; this.__bytes = null; this.__decodedText = "";
-                this.__respObj = null; this.__respXML = null;
-                this.__fire("readystatechange"); this.__fire("error"); this.__fire("loadend");
-                return;
-            }
-            this.status = r[0]; this.__ctype = r[1];
-            this.__text = r[2] == null ? "" : r[2];
-            // Keep XHR's internal response body as a byte view. The host Fetch
-            // result is an ArrayBuffer so it can cross the realm boundary
-            // without stale typed-array bookkeeping; XHR's byte sequence is
-            // exposed through Array.from() and response consumers via this view.
-            this.__bytes = r[3] != null ? __bodyBytes(r[3]) : null;
-            this.__hdrs = r.length > 4 ? __parseHdrBlob(r[4]) : null;
-            if (this.__hdrs && this.__ctype && this.__hdrs["content-type"] === undefined) this.__hdrs["content-type"] = this.__ctype;
-            this.__respObj = undefined; this.__respXML = undefined;
-            this.__decodedText = undefined;
-            this.responseURL = this.__url;
-            this.readyState = 4;
-            this.__fire("readystatechange"); this.__fire("load"); this.__fire("loadend");
-        }
         send(body) {
-            this.__aborted = false;
-            this.__inFlight = true;
+            internalsFor(this).aborted = false;
+            internalsFor(this).inFlight = true;
             internalsFor(this).frame = trust.__activeFrame || null;
             // Async requests fire `loadstart` synchronously from send() (XHR
             // §the send() method; a SYNC request deliberately doesn't), and an
             // armed `timeout` runs the timeout request-error steps if the
             // response hasn't landed by then (the late result is then dropped).
-            if (!this.__sync) {
-                this.__fire("loadstart");
+            if (!internalsFor(this).sync) {
+                xhrFire.call(this, "loadstart");
                 if (this.timeout > 0) {
                     const xhr = this;
                     g.setTimeout(function () {
-                        if (!xhr.__inFlight || xhr.__aborted) return;
-                        xhr.__inFlight = false; xhr.__aborted = true;
-                        xhr.status = 0; xhr.__text = ""; xhr.__bytes = null; xhr.__respObj = undefined;
+                        if (!internalsFor(xhr).inFlight || internalsFor(xhr).aborted) return;
+                        internalsFor(xhr).inFlight = false; internalsFor(xhr).aborted = true;
+                        xhr.status = 0; internalsFor(xhr).text = ""; internalsFor(xhr).bytes = null; internalsFor(xhr).respObj = undefined;
                         xhr.readyState = 4;
-                        xhr.__fire("readystatechange");
-                        xhr.__fire("timeout");
-                        xhr.__fire("loadend");
+                        xhrFire.call(xhr, "readystatechange");
+                        xhrFire.call(xhr, "timeout");
+                        xhrFire.call(xhr, "loadend");
                     }, this.timeout);
                 }
             }
             // A `data:` URL decodes in-realm, mirroring fetch (a malformed one
             // is a network error → the `error` event).
-            if (typeof this.__url === "string" && this.__url.slice(0, 5) === "data:") {
-                const dp = __dataURLParts(this.__url);
+            if (typeof internalsFor(this).url === "string" && internalsFor(this).url.slice(0, 5) === "data:") {
+                const dp = __dataURLParts(internalsFor(this).url);
                 const arr = dp ? [200, dp.ctype || null, dp.text, dp.bytes] : null;
                 const xhr = this;
-                if (this.__sync) this.__finish(arr);
-                else __queue_network_task(function () { xhr.__finish(arr); }, internalsOf(this).frame);
+                if (internalsFor(this).sync) xhrFinish.call(this, arr);
+                else __queue_network_task(function () { xhrFinish.call(xhr, arr); }, internalsOf(this).frame);
                 return;
             }
             // A `blob:` URL resolves from the in-realm store, off the wire; a
-            // missing/revoked entry is a network error (__finish(null) → error
-            // event). Async still delivers __finish as a macrotask, like a real GET.
-            if (typeof this.__url === "string" && this.__url.slice(0, 5) === "blob:") {
-                const be = __resolveBlobURL(this.__url);
+            // missing/revoked entry is a network error (xhrFinish(null) → error
+            // event). Async still delivers xhrFinish as a macrotask, like a real GET.
+            if (typeof internalsFor(this).url === "string" && internalsFor(this).url.slice(0, 5) === "blob:") {
+                const be = __resolveBlobURL(internalsFor(this).url);
                 const arr = be ? [200, be.type || null, new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), be.bytes] : null;
                 const xhr = this;
-                if (this.__sync) this.__finish(arr);
-                else __queue_network_task(function () { xhr.__finish(arr); }, internalsOf(this).frame);
+                if (internalsFor(this).sync) xhrFinish.call(this, arr);
+                else __queue_network_task(function () { xhrFinish.call(xhr, arr); }, internalsOf(this).frame);
                 return;
             }
-            const isFD = body instanceof g.FormData && Array.isArray(body.__entries);
+            const isFD = body instanceof g.FormData && Array.isArray(internalsFor(body).entries);
             const enc = isFD ? __formDataWire(body) : null;
             const b = isFD ? enc.wire : __bodyWire(body);
-            const ctype = this.__h["content-type"] || (isFD ? enc.type : __bodyType(body));
-            const hdrs = __hdrBlob(this.__h);
-            if (this.__sync) {
-                this.__finish(__http_fetch(
-                    this.__url, this.__method || "GET", b, ctype, hdrs,
+            const ctype = internalsFor(this).h["content-type"] || (isFD ? enc.type : __bodyType(body));
+            const hdrs = __hdrBlob(internalsFor(this).h);
+            if (internalsFor(this).sync) {
+                xhrFinish.call(this, __http_fetch(
+                    internalsFor(this).url, internalsFor(this).method || "GET", b, ctype, hdrs,
                     "cors", this.withCredentials ? "include" : "same-origin", 'xmlhttprequest'
                 ));
             } else {
@@ -22620,16 +22702,22 @@
                 // starved consent mutations behind the throttled timer source.
                 const xhr = this;
                 __http_fetch_async(
-                    this.__url, this.__method || "GET", b, ctype, hdrs,
+                    internalsFor(this).url, internalsFor(this).method || "GET", b, ctype, hdrs,
                     "cors", this.withCredentials ? "include" : "same-origin", 'xmlhttprequest'
                 )
                     .then(function (r) {
-                        __queue_network_task(function () { xhr.__finish(r); }, internalsOf(xhr).frame);
+                        __queue_network_task(function () { xhrFinish.call(xhr, r); }, internalsOf(xhr).frame);
                     });
             }
         }
     }
     g.XMLHttpRequest = XMLHttpRequest;
+    // Response assembly for an XHR whose request is in flight, without the
+    // network: a private hook for native diagnostics and tests.
+    trust.finishXhrResponse = function (xhr, response) {
+        internalsFor(xhr).inFlight = true;
+        xhrFinish.call(xhr, response);
+    };
 
     // ============================ WebAssembly =============================
 // The `WebAssembly` namespace (js-api / web-api specs) over the pure-Rust wasmi
@@ -22956,7 +23044,7 @@
         if (t) return t;
         t = Object.create(Table.prototype);
         setWasmAddress(t, "wasmTable", tableId);
-        Object.defineProperty(t, "__element", { value: element });
+        setWasmAddress(t, "tableElement", element);
         tableWrappers.set(tableId, t);
         return t;
     }
@@ -22978,7 +23066,7 @@
             if (arguments.length < 2) value = defaultWasmValue(element);
             const id = __wasm_table_new(element, initial, maximum, value);
             setWasmAddress(this, "wasmTable", id);
-            Object.defineProperty(this, "__element", { value: element });
+            setWasmAddress(this, "tableElement", element);
             tableWrappers.set(id, this);
         }
         get length() {
@@ -22988,11 +23076,11 @@
             return __wasm_table_get(wasmAddress(this, "wasmTable"), addressU32(index));
         }
         set(index, value) {
-            if (arguments.length < 2) value = defaultWasmValue(this.__element);
+            if (arguments.length < 2) value = defaultWasmValue(wasmAddress(this, "tableElement"));
             return __wasm_table_set(wasmAddress(this, "wasmTable"), addressU32(index), value);
         }
         grow(delta, value) {
-            if (arguments.length < 2) value = defaultWasmValue(this.__element);
+            if (arguments.length < 2) value = defaultWasmValue(wasmAddress(this, "tableElement"));
             return __wasm_table_grow(wasmAddress(this, "wasmTable"), addressU32(delta), value);
         }
     }
