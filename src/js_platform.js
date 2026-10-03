@@ -5412,8 +5412,14 @@
         }
         const parentRect = offsetBoxRect(parent);
         if (!parentRect) return Math.round(axis === "top" ? rect[1] : rect[0]);
-        const border = parseFloat(__dom_computed(parent.__id,
-            axis === "top" ? "border-top-width" : "border-left-width")) || 0;
+        // The padding edge lies inside the parent's USED border: a collapsed
+        // table's is half its outer collapsed border (CSS 2.2 §17.6.2), not
+        // its computed border-width. Inline boxes have no client metrics.
+        let border = __dom_scroll_get(parent.__id, axis === "top" ? 8 : 9);
+        if (typeof border !== "number") {
+            border = parseFloat(__dom_computed(parent.__id,
+                axis === "top" ? "border-top-width" : "border-left-width")) || 0;
+        }
         return Math.round((axis === "top" ? rect[1] - parentRect[1] : rect[0] - parentRect[0]) - border);
     }
 
