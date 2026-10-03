@@ -739,6 +739,9 @@ pub(super) mod tests {
         controls: &ControlMap,
         images: &ImageSizes,
     ) -> (usize, usize) {
+        // A parallel page-load test must not change page fonts or document
+        // SVG inputs between the warm paint and its cold reconstruction.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let warm = measure_retained_layout(dom, base, viewport, forms, controls, images);
         let hits = (warm.work.item_hits, warm.work.intrinsic_hits);
         let painted = paint_retained_layout(
