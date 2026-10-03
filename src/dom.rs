@@ -6908,8 +6908,11 @@ impl Dom {
         let selectors = if let Some(selectors) = cached_selectors {
             selectors
         } else {
+            // Only elements are selector subjects: a compound never matches a
+            // node without a tag name, so other nodes match no rule.
+            let element = self.tag_name(id).is_some();
             let selectors = match (index.scopes.get(&scope), index.buckets.get(&scope)) {
-                (Some(rules), Some(b)) => {
+                (Some(rules), Some(b)) if element => {
                     let view = self.style_view();
                     let mut ancestors = None;
                     let mut out = Vec::new();
