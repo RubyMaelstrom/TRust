@@ -20701,11 +20701,13 @@ mod tests {
         };
         // Page loads running concurrently begin navigations; a source made
         // in one navigation never draws an image recorded for another.
-        for _ in 0..64 {
+        // Each attempt uses its own image URL: a retried attempt must not see
+        // the image an interrupted one recorded in the same navigation.
+        for attempt in 0..64 {
             let navigation = crate::img::document_svg_navigation();
-            let dom = Dom::parse_document(
-                r#"<svg width=4 height=4><image href="arrival-texture.png" width=4 height=4/></svg>"#,
-            );
+            let dom = Dom::parse_document(&format!(
+                r#"<svg width=4 height=4><image href="arrival-texture-{attempt}.png" width=4 height=4/></svg>"#
+            ));
             let (before, red) = paint(&dom);
             assert_eq!(red, 0, "nothing draws before the image loads");
             // The frontend's page-image load for the SVG's request records it.
@@ -20713,7 +20715,7 @@ mod tests {
             let image = crate::img::document_svg_image_target(&request).unwrap();
             assert_eq!(
                 image.url(),
-                "https://example.test/flood/arrival-texture.png"
+                format!("https://example.test/flood/arrival-texture-{attempt}.png")
             );
             crate::img::record_document_svg_image(&image, Some(&crate::img::red_png()));
             let (after, red) = paint(&dom);
