@@ -42,7 +42,7 @@ const WORK_PER_PARTICIPANT: Duration = Duration::from_micros(250);
 /// finished chunks reveal the cost, but a wasted wake-up is not recovered.
 const FIRST_ELEMENT_COST: Duration = Duration::from_nanos(500);
 /// Elements per claimed unit of work.
-const CHUNK: usize = 32;
+pub(super) const CHUNK: usize = 32;
 
 /// When to attempt a pass, per arena.
 #[derive(Default)]
@@ -58,55 +58,70 @@ pub(super) struct Trigger {
 }
 
 /// Estimated matching work of `elements` at `cost` each.
-fn work(elements: usize, cost: Duration) -> Duration {
+pub(super) fn work(elements: usize, cost: Duration) -> Duration {
     cost.saturating_mul(elements.min(u32::MAX as usize) as u32)
 }
 
 /// Participants that `remaining` work repays, counting the page thread.
-fn participants_for(remaining: Duration) -> usize {
+pub(super) fn participants_for(remaining: Duration) -> usize {
     1 + (remaining.as_nanos() / WORK_PER_PARTICIPANT.as_nanos()) as usize
 }
 
 /// One tree scope's rules, borrowed from the style index for a pass.
-struct ScopeRules<'r> {
+pub(super) struct ScopeRules<'r> {
     rules: &'r [StyleRule],
     buckets: Option<&'r RuleBuckets>,
     shadow_host: Option<NodeId>,
 }
 
 /// The work list: stale elements published in tree order by the page thread.
-struct Stream {
+pub(super) struct Stream<C = Chunk> {
     /// `node << 16 | scope slot` per stale element, each written once before
     /// `published` covers it.
     entries: Box<[AtomicU64]>,
-    published: AtomicUsize,
+    pub(super) published: AtomicUsize,
     /// Set once the walk has published its last entry (or unwound).
     complete: AtomicBool,
     /// Index of the next chunk to claim.
     next: AtomicUsize,
-    /// Matched chunks waiting for the page thread.
-    done: Mutex<Vec<Chunk>>,
+    /// Finished chunks waiting for the page thread.
+    pub(super) done: Mutex<Vec<C>>,
+    /// Elements per claimed chunk.
+    chunk: usize,
 }
 
-impl Stream {
-    fn entry(&self, index: usize) -> (NodeId, usize) {
+impl<C> Stream<C> {
+    /// A work list for up to `capacity` elements, claimed `chunk` at a time.
+    pub(super) fn new(capacity: usize, chunk: usize) -> Self {
+        Stream {
+            entries: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
+            published: AtomicUsize::new(0),
+            complete: AtomicBool::new(false),
+            next: AtomicUsize::new(0),
+            done: Mutex::new(Vec::new()),
+            chunk: chunk.max(1),
+        }
+    }
+
+    pub(super) fn entry(&self, index: usize) -> (NodeId, usize) {
         let entry = self.entries[index].load(Ordering::Relaxed);
         ((entry >> 16) as NodeId, (entry & 0xffff) as usize)
     }
 
     /// Claim the next chunk, waiting while the walk has yet to publish it.
     /// `None` once every published entry has been claimed.
-    fn claim(&self) -> Option<std::ops::Range<usize>> {
-        let start = self.next.fetch_add(1, Ordering::Relaxed) * CHUNK;
+    pub(super) fn claim(&self) -> Option<std::ops::Range<usize>> {
+        let chunk = self.chunk;
+        let start = self.next.fetch_add(1, Ordering::Relaxed) * chunk;
         let mut spins = 0u32;
         loop {
             let published = self.published.load(Ordering::Acquire);
-            if published >= start + CHUNK {
-                return Some(start..start + CHUNK);
+            if published >= start + chunk {
+                return Some(start..start + chunk);
             }
             if self.complete.load(Ordering::Acquire) {
                 let published = self.published.load(Ordering::Acquire);
-                return (start < published).then(|| start..published.min(start + CHUNK));
+                return (start < published).then(|| start..published.min(start + chunk));
             }
             // The walk publishes a chunk every few microseconds.
             spins += 1;
@@ -120,9 +135,9 @@ impl Stream {
 }
 
 /// Marks the walk complete even if it unwinds, so no participant waits on it.
-struct Published<'a>(&'a Stream);
+pub(super) struct Published<'a, C>(pub(super) &'a Stream<C>);
 
-impl Drop for Published<'_> {
+impl<C> Drop for Published<'_, C> {
     fn drop(&mut self) {
         self.0.complete.store(true, Ordering::Release);
     }
@@ -131,19 +146,19 @@ impl Drop for Published<'_> {
 /// One matched chunk. Few elements have a rule list of their own (a
 /// Wikipedia article's 6,400 elements match 300 distinct lists), so each
 /// participant interns its lists and reports per element only an index.
-struct Chunk {
-    participant: usize,
-    start: usize,
+pub(super) struct Chunk {
+    pub(super) participant: usize,
+    pub(super) start: usize,
     /// Per element, an index into the participant's lists.
-    lists: Vec<u32>,
+    pub(super) lists: Vec<u32>,
     /// Lists this chunk added to the participant's lists, in index order.
-    new_lists: Vec<Box<[u32]>>,
-    candidates: u64,
-    busy: Duration,
+    pub(super) new_lists: Vec<Box<[u32]>>,
+    pub(super) candidates: u64,
+    pub(super) busy: Duration,
 }
 
 /// One participant's matching state, kept across the chunks it claims.
-struct Participant<'p, 'a, 'r> {
+pub(super) struct Participant<'p, 'a, 'r> {
     index: usize,
     view: &'p StyleView<'a>,
     scopes: &'p [ScopeRules<'r>],
@@ -155,7 +170,7 @@ struct Participant<'p, 'a, 'r> {
 }
 
 impl<'p, 'a, 'r> Participant<'p, 'a, 'r> {
-    fn new(index: usize, view: &'p StyleView<'a>, scopes: &'p [ScopeRules<'r>]) -> Self {
+    pub(super) fn new(index: usize, view: &'p StyleView<'a>, scopes: &'p [ScopeRules<'r>]) -> Self {
         Participant {
             index,
             view,
@@ -168,7 +183,11 @@ impl<'p, 'a, 'r> Participant<'p, 'a, 'r> {
         }
     }
 
-    fn match_chunk(&mut self, stream: &Stream, range: std::ops::Range<usize>) -> Chunk {
+    pub(super) fn match_chunk<C>(
+        &mut self,
+        stream: &Stream<C>,
+        range: std::ops::Range<usize>,
+    ) -> Chunk {
         let began = Instant::now();
         let mut chunk = Chunk {
             participant: self.index,
@@ -218,31 +237,47 @@ impl<'p, 'a, 'r> Participant<'p, 'a, 'r> {
 /// reverse, so it visits light children, then shadow children, as
 /// `push_composed_children` orders them. A nested Document or a shadow root
 /// starts its own tree scope. Character data has no element descendants.
-struct Walk {
+pub(super) struct Walk {
     stack: Vec<(NodeId, usize)>,
-    count: usize,
+    pub(super) count: usize,
 }
 
 impl Walk {
-    /// Publish stale elements into `stream.entries` until `count` reaches
-    /// `limit` or the tree is exhausted. `false` if an entry cannot be
-    /// represented (the pass must be abandoned).
-    fn advance(
+    pub(super) fn new(slots: &FxHashMap<NodeId, usize>) -> Self {
+        Walk {
+            stack: vec![(DOCUMENT, slots.get(&DOCUMENT).copied().unwrap_or(0))],
+            count: 0,
+        }
+    }
+
+    pub(super) fn is_done(&self) -> bool {
+        self.stack.is_empty()
+    }
+
+    /// Publish elements that are `stale` into `stream.entries` until `count`
+    /// reaches `limit` or the tree is exhausted, skipping the subtree of a
+    /// node that is `pruned`. `false` if an entry cannot be represented (the
+    /// pass must be abandoned).
+    pub(super) fn advance<C>(
         &mut self,
         dom: &Dom,
         slots: &FxHashMap<NodeId, usize>,
-        stream: &Stream,
+        stream: &Stream<C>,
         limit: usize,
+        stale: impl Fn(NodeId) -> bool,
+        pruned: impl Fn(NodeId) -> bool,
     ) -> bool {
         let view = dom.style_view();
         let nodes = view.nodes;
         let slot_of = |scope: NodeId| slots.get(&scope).copied().unwrap_or(0);
-        let cache = dom.selector_cache.borrow();
         let shadows = !dom.shadow_roots.is_empty();
         while self.count < limit
             && let Some((node, slot)) = self.stack.pop()
         {
-            if nodes.is_element(node) && cache.get(node, dom.selector_epoch).is_none() {
+            if pruned(node) {
+                continue;
+            }
+            if nodes.is_element(node) && stale(node) {
                 if node >= 1 << 48 || self.count == stream.entries.len() {
                     return false;
                 }
@@ -315,6 +350,35 @@ impl Store<'_> {
 }
 
 impl Dom {
+    /// Every tree scope with rules gets a slot; slot 0 matches nothing.
+    /// `None` if there are too many scopes to represent.
+    pub(super) fn scope_rules<'r>(
+        &self,
+        index: &'r StyleIndex,
+    ) -> Option<(FxHashMap<NodeId, usize>, Vec<ScopeRules<'r>>)> {
+        let mut slots: FxHashMap<NodeId, usize> = FxHashMap::default();
+        let mut scopes = vec![ScopeRules {
+            rules: &[],
+            buckets: None,
+            shadow_host: None,
+        }];
+        for (&scope, rules) in &index.scopes {
+            let Some(buckets) = index.buckets.get(&scope) else {
+                continue;
+            };
+            if scopes.len() > 0xffff {
+                return None;
+            }
+            slots.insert(scope, scopes.len());
+            scopes.push(ScopeRules {
+                rules,
+                buckets: Some(buckets),
+                shadow_host: self.shadow_hosts.get(&scope).copied(),
+            });
+        }
+        Some((slots, scopes))
+    }
+
     /// Called on each lazy selector-cache miss of an element. Returns whether
     /// a parallel pass ran (so the caller should look in the cache again).
     pub(super) fn parallel_match_on_miss(&self) -> bool {
@@ -360,45 +424,24 @@ impl Dom {
         let index = self.style_index();
         let epoch = self.selector_epoch;
         let view = self.style_view();
-
-        // Every tree scope with rules gets a slot; slot 0 matches nothing.
-        let mut slots: FxHashMap<NodeId, usize> = FxHashMap::default();
-        let mut scopes = vec![ScopeRules {
-            rules: &[],
-            buckets: None,
-            shadow_host: None,
-        }];
-        for (&scope, rules) in &index.scopes {
-            let Some(buckets) = index.buckets.get(&scope) else {
-                continue;
-            };
-            if scopes.len() > 0xffff {
-                return false;
-            }
-            slots.insert(scope, scopes.len());
-            scopes.push(ScopeRules {
-                rules,
-                buckets: Some(buckets),
-                shadow_host: self.shadow_hosts.get(&scope).copied(),
-            });
-        }
-
-        let stream = Stream {
-            entries: (0..self.nodes.len()).map(|_| AtomicU64::new(0)).collect(),
-            published: AtomicUsize::new(0),
-            complete: AtomicBool::new(false),
-            next: AtomicUsize::new(0),
-            done: Mutex::new(Vec::new()),
+        let Some((slots, scopes)) = self.scope_rules(&index) else {
+            return false;
         };
-        let mut walk = Walk {
-            stack: vec![(DOCUMENT, slots.get(&DOCUMENT).copied().unwrap_or(0))],
-            count: 0,
+        let stream = Stream::new(self.nodes.len(), CHUNK);
+        let mut walk = Walk::new(&slots);
+        let stale = |node| {
+            self.selector_cache
+                .borrow()
+                .get(node, self.selector_epoch)
+                .is_none()
         };
         // Find enough work before involving other threads.
         let min_elements = min_elements
             .max(1)
             .max((MIN_WORK.as_nanos() / element_cost.as_nanos().max(1)) as usize);
-        if !walk.advance(self, &slots, &stream, min_elements) || walk.count < min_elements {
+        if !walk.advance(self, &slots, &stream, min_elements, stale, |_| false)
+            || walk.count < min_elements
+        {
             return false;
         }
 
@@ -431,10 +474,10 @@ impl Dom {
                 loop {
                     stream.published.store(walk.count, Ordering::Release);
                     lead.wake(participants_for(work(walk.count, element_cost)));
-                    if walk.stack.is_empty() {
+                    if walk.is_done() {
                         break true;
                     }
-                    if !walk.advance(self, &slots, stream, walk.count + CHUNK) {
+                    if !walk.advance(self, &slots, stream, walk.count + CHUNK, stale, |_| false) {
                         break false;
                     }
                 }
@@ -562,7 +605,7 @@ impl Dom {
     }
 }
 
-fn verify_enabled() -> bool {
+pub(super) fn verify_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("TRUST_STYLE_VERIFY").is_some())
 }
