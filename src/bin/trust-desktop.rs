@@ -1832,12 +1832,14 @@ fn native_cursor_pixels(
 
 impl DesktopApp {
     fn new(
-        browser: BrowserController,
+        mut browser: BrowserController,
         runtime: Handle,
         event_proxy: EventLoopProxy<DesktopEvent>,
         renderer_preference: RendererPreference,
         initial_navigation: Option<String>,
     ) -> Self {
+        let clipboard = arboard::Clipboard::new().ok();
+        browser.set_clipboard_available(clipboard.is_some());
         let style = chrome_text_style();
         let image_store = ImageStore::default();
         if let Err(error) = ensure_embedded_heart_assets(&image_store) {
@@ -1905,7 +1907,7 @@ impl DesktopApp {
             selecting: false,
             find_matches: Vec::new(),
             find_index: 0,
-            clipboard: arboard::Clipboard::new().ok(),
+            clipboard,
             exit_requested: false,
             terminal: None,
             bookmark_terminal: None,
@@ -2329,6 +2331,7 @@ impl DesktopApp {
         }
         let outcome = self.browser.handle_action(action);
         self.sync_pointer_lock();
+        self.sync_clipboard_writes();
         self.launch_external_media_requests();
         if outcome.loading_retired {
             self.retire_page_loading();
@@ -2514,6 +2517,7 @@ impl DesktopApp {
         let outcome = self.browser.process_async_events();
         self.sync_actor_focus();
         self.sync_pointer_lock();
+        self.sync_clipboard_writes();
         self.launch_external_media_requests();
         if self.browser.download_offer().is_some()
             && !matches!(self.focus, FocusTarget::Command | FocusTarget::Download)
@@ -6272,6 +6276,19 @@ impl DesktopApp {
             self.step_number_control(form, field, direction);
         }
         true
+    }
+
+    /// Clipboard API writes that passed the page's permission check (transient
+    /// activation) go to the native system clipboard; the page learns the result.
+    fn sync_clipboard_writes(&mut self) {
+        while let Some((request, text)) = self.browser.take_clipboard_write() {
+            let ok = self
+                .clipboard
+                .as_mut()
+                .is_some_and(|clipboard| clipboard.set_text(text).is_ok());
+            self.browser
+                .handle_action(UserAction::ClipboardResult { request, ok });
+        }
     }
 
     /// Pointer Lock 2.0: capture must succeed before acknowledging the page.

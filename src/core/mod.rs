@@ -219,6 +219,11 @@ pub enum UserAction {
         request: u64,
         error: Option<String>,
     },
+    /// The frontend's answer to a page clipboard write from `take_clipboard_write`.
+    ClipboardResult {
+        request: u64,
+        ok: bool,
+    },
     ReleasePointerLock,
     InputModifiers(Modifiers),
     PointerMotion {
@@ -616,6 +621,10 @@ pub struct BrowserController {
     user_input_retry: Option<JoinHandle<()>>,
     pending_fragment: Option<String>,
     pending_pointer_lock: VecDeque<(u64, Option<usize>, bool)>,
+    /// Clipboard API writes for the embedding frontend's system clipboard. A frontend that
+    /// has one opts in with `set_clipboard_available`; otherwise requests are refused here.
+    clipboard_available: bool,
+    pending_clipboard_writes: VecDeque<(u64, String)>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
     gemini_prompt: Option<crate::gemini::Prompt>,
@@ -687,6 +696,8 @@ impl BrowserController {
             user_input_retry: None,
             pending_fragment: None,
             pending_pointer_lock: VecDeque::new(),
+            clipboard_available: false,
+            pending_clipboard_writes: VecDeque::new(),
             external_media: VecDeque::new(),
             download_offer: None,
             gemini_prompt: None,
@@ -1017,6 +1028,18 @@ impl BrowserController {
         self.pending_pointer_lock.pop_front()
     }
 
+    /// Declare whether this frontend can place text on a system clipboard. Without one,
+    /// page clipboard writes are refused (Clipboard API: the permission is not granted).
+    pub fn set_clipboard_available(&mut self, available: bool) {
+        self.clipboard_available = available;
+    }
+
+    /// The next page clipboard write for a frontend that declared a system clipboard. Answer
+    /// it with `UserAction::ClipboardResult`.
+    pub fn take_clipboard_write(&mut self) -> Option<(u64, String)> {
+        self.pending_clipboard_writes.pop_front()
+    }
+
     /// Queue the decoded intrinsic-size map for the resident page. The native
     /// frontend calls this from an event loop and must never block; a full
     /// command queue is therefore a normal retry condition, not a successful
@@ -1042,6 +1065,10 @@ impl BrowserController {
         let invalidated = match action {
             UserAction::PointerLockResult { request, error } => {
                 self.send_user(crate::js::PageCmd::PointerLockResult { request, error });
+                false
+            }
+            UserAction::ClipboardResult { request, ok } => {
+                self.send_user(crate::js::PageCmd::ClipboardResult { request, ok });
                 false
             }
             UserAction::ReleasePointerLock => {
@@ -2612,6 +2639,7 @@ impl BrowserController {
 
     fn drop_live_page(&mut self) {
         self.pending_pointer_lock.clear();
+        self.pending_clipboard_writes.clear();
         if let Some(retry) = self.user_input_retry.take() {
             retry.abort();
         }
@@ -2847,6 +2875,15 @@ impl BrowserController {
                 self.pending_pointer_lock
                     .push_back((request, node, unadjusted));
                 true
+            }
+            PageEvt::ClipboardWrite { request, text } => {
+                if self.clipboard_available {
+                    self.pending_clipboard_writes.push_back((request, text));
+                    true
+                } else {
+                    self.send_user(crate::js::PageCmd::ClipboardResult { request, ok: false });
+                    false
+                }
             }
             PageEvt::Trouble(errors) => {
                 if let Some(error) = errors.first() {
@@ -4106,6 +4143,50 @@ mod tests {
             "report.pdf"
         );
         assert!(browser.pending.is_none());
+    }
+
+    #[test]
+    fn page_clipboard_writes_need_a_frontend_clipboard() {
+        // Clipboard API #dom-clipboard-writetext: a frontend without a system
+        // clipboard refuses the write; one with a clipboard receives it.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.handle_page_event(crate::js::PageEvt::ClipboardWrite {
+            request: 7,
+            text: "copied".into(),
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::ClipboardResult {
+                request: 7,
+                ok: false
+            })
+        ));
+        assert!(browser.take_clipboard_write().is_none());
+        browser.set_clipboard_available(true);
+        browser.handle_page_event(crate::js::PageEvt::ClipboardWrite {
+            request: 8,
+            text: "copied".into(),
+        });
+        assert!(rx.try_recv().is_err());
+        assert_eq!(browser.take_clipboard_write(), Some((8, "copied".into())));
+        browser.handle_action(UserAction::ClipboardResult {
+            request: 8,
+            ok: true,
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::ClipboardResult {
+                request: 8,
+                ok: true
+            })
+        ));
     }
 
     #[test]

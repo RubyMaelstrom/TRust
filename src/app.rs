@@ -6111,6 +6111,20 @@ impl App {
                 }
                 Some(PageEvt::ScrollToFragment(frag)) => scroll_fragment = Some(frag),
                 Some(PageEvt::ViewportScrolled { x: _, y }) => viewport_scroll = Some(y),
+                Some(PageEvt::ClipboardWrite { request, text }) => {
+                    // Clipboard API writes reach the host clipboard through the
+                    // terminal's OSC 52 control, like the frontend's own copies.
+                    use std::io::Write as _;
+                    let mut out = std::io::stdout();
+                    let ok = out
+                        .write_all(osc52_copy(&text).as_bytes())
+                        .and_then(|()| out.flush())
+                        .is_ok();
+                    if let Some(page) = &self.live_page {
+                        let _ =
+                            page.try_send_user(crate::js::PageCmd::ClipboardResult { request, ok });
+                    }
+                }
                 Some(PageEvt::PointerLock { request, node, .. }) => {
                     if node.is_some()
                         && let Some(page) = &self.live_page
