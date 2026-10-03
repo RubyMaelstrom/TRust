@@ -3,8 +3,9 @@
 //! #animating-properties (animation types "by computed value", "repeatable
 //! list" and "discrete"), CSS Color 4 #interpolation, #interpolation-space
 //! and #interpolation-alpha, CSS Backgrounds 3 #box-shadow and CSS Text
-//! Decoration 4 #text-shadow-property (shadow lists), CSS Display 4
-//! #visibility. CSSWG snapshot 81c27f686901 (2026-09-06).
+//! Decoration 4 #text-shadow-property (shadow lists), Filter Effects 1
+//! #interpolation-of-filters, CSS Display 4 #visibility. CSSWG snapshot
+//! 81c27f686901 (2026-09-06).
 
 use super::super::{Dom, NodeId, split_top_level_commas, split_top_level_ws};
 use crate::layout2::value::{Len, Node as Length, Vp};
@@ -32,6 +33,8 @@ pub(super) enum Kind {
     FontWeight,
     /// CSS Display 4 #visibility.
     Visibility,
+    /// Filter Effects 1 `<filter-value-list>`.
+    Filter,
     /// Every other animatable property.
     Discrete,
 }
@@ -104,6 +107,7 @@ impl Kind {
             },
             "font-weight" => Self::FontWeight,
             "visibility" => Self::Visibility,
+            "filter" => Self::Filter,
             _ => Self::Discrete,
         }
     }
@@ -420,11 +424,199 @@ fn parse_position(dom: &Dom, id: NodeId, text: &str, vertical: bool, vp: Vp) -> 
     }
 }
 
+/// One `<filter-function>` (Filter Effects 1 #filter-functions), with
+/// amounts as numbers, angles in degrees and lengths in CSS px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Filter {
+    Blur(f32),
+    Amount(&'static str, f32),
+    HueRotate(f32),
+    DropShadow(Shadow),
+}
+
+impl Filter {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Blur(_) => "blur",
+            Self::Amount(name, _) => name,
+            Self::HueRotate(_) => "hue-rotate",
+            Self::DropShadow(_) => "drop-shadow",
+        }
+    }
+
+    /// Filter Effects 1 #filter-functions: each function's initial value
+    /// for interpolation (no effect), which can differ from the default for
+    /// an omitted argument.
+    fn neutral(self) -> Self {
+        match self {
+            Self::Blur(_) => Self::Blur(0.0),
+            Self::Amount(name, _) => Self::Amount(
+                name,
+                if matches!(name, "grayscale" | "invert" | "sepia") {
+                    0.0
+                } else {
+                    1.0
+                },
+            ),
+            Self::HueRotate(_) => Self::HueRotate(0.0),
+            Self::DropShadow(_) => Self::DropShadow(Shadow::blank(false)),
+        }
+    }
+
+    fn css(self) -> String {
+        match self {
+            Self::Blur(px) => format!("blur({}px)", number(px)),
+            Self::Amount(name, amount) => format!("{name}({})", number(amount)),
+            Self::HueRotate(degrees) => format!("hue-rotate({}deg)", number(degrees)),
+            Self::DropShadow(shadow) => format!("drop-shadow({})", shadow.css(false)),
+        }
+    }
+
+    /// Filter Effects 1 #interpolation-of-filter-functions.
+    fn mix(self, end: Self, t: f32, current: &dyn Fn() -> Option<Color>) -> Option<Self> {
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        Some(match (self, end) {
+            (Self::Blur(a), Self::Blur(b)) => Self::Blur(lerp(a, b).max(0.0)),
+            (Self::Amount(name, a), Self::Amount(other, b)) if name == other => {
+                Self::Amount(name, lerp(a, b).max(0.0))
+            }
+            (Self::HueRotate(a), Self::HueRotate(b)) => Self::HueRotate(lerp(a, b)),
+            (Self::DropShadow(a), Self::DropShadow(b)) => Self::DropShadow(Shadow {
+                color: a.color.mix(b.color, t, current)?,
+                x: lerp(a.x, b.x),
+                y: lerp(a.y, b.y),
+                blur: lerp(a.blur, b.blur).max(0.0),
+                spread: 0.0,
+                inset: false,
+            }),
+            _ => return None,
+        })
+    }
+}
+
+/// `none | <filter-value-list>`; a `url()` reference is not interpolable.
+fn parse_filters(dom: &Dom, id: NodeId, text: &str, vp: Vp) -> Option<Vec<Filter>> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    let units = crate::layout2::Units::of(dom, id);
+    split_top_level_ws(text)
+        .into_iter()
+        .map(|function| {
+            let (name, rest) = function.split_once('(')?;
+            let argument = rest.strip_suffix(')')?.trim();
+            let name = name.trim().to_ascii_lowercase();
+            let amount = |default: f32| -> Option<f32> {
+                if argument.is_empty() {
+                    return Some(default);
+                }
+                let value = match argument.strip_suffix('%') {
+                    Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+                    None => argument.parse::<f32>().ok()?,
+                };
+                (value.is_finite() && value >= 0.0).then_some(value)
+            };
+            Some(match name.as_str() {
+                "blur" if argument.is_empty() => Filter::Blur(0.0),
+                "blur" => match Len::parse(argument, units, vp)? {
+                    Len::Val(Length::Lin { k, b }) if k == 0.0 && b >= 0.0 => Filter::Blur(b),
+                    _ => return None,
+                },
+                "brightness" | "contrast" | "opacity" | "saturate" => {
+                    Filter::Amount(amount_name(&name), amount(1.0)?)
+                }
+                "grayscale" | "invert" | "sepia" => {
+                    Filter::Amount(amount_name(&name), amount(1.0)?)
+                }
+                "hue-rotate" => Filter::HueRotate(angle(argument)?),
+                "drop-shadow" => {
+                    let mut shadow = parse_shadows(dom, id, argument, false, vp)?;
+                    if shadow.len() != 1 {
+                        return None;
+                    }
+                    Filter::DropShadow(shadow.remove(0))
+                }
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+fn amount_name(name: &str) -> &'static str {
+    match name {
+        "brightness" => "brightness",
+        "contrast" => "contrast",
+        "opacity" => "opacity",
+        "saturate" => "saturate",
+        "grayscale" => "grayscale",
+        "invert" => "invert",
+        _ => "sepia",
+    }
+}
+
+/// An `<angle>` (or unitless zero) in degrees (CSS Values 4 #angles).
+fn angle(text: &str) -> Option<f32> {
+    let text = text.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return Some(0.0);
+    }
+    let (number, scale) = if let Some(number) = text.strip_suffix("grad") {
+        (number, 0.9)
+    } else if let Some(number) = text.strip_suffix("deg") {
+        (number, 1.0)
+    } else if let Some(number) = text.strip_suffix("rad") {
+        (number, 180.0 / std::f32::consts::PI)
+    } else if let Some(number) = text.strip_suffix("turn") {
+        (number, 360.0)
+    } else if text.parse::<f32>().ok() == Some(0.0) {
+        (text.as_str(), 0.0)
+    } else {
+        return None;
+    };
+    number
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| value * scale)
+}
+
+/// Filter Effects 1 #interpolation-of-filters: matching function lists
+/// interpolate pairwise, padding the shorter (or `none`) list with the
+/// longer list's functions at their initial values for interpolation.
+fn mix_filters(
+    start: &[Filter],
+    end: &[Filter],
+    t: f32,
+    current: &dyn Fn() -> Option<Color>,
+) -> Option<String> {
+    if start.iter().zip(end).any(|(a, b)| a.name() != b.name()) {
+        return None;
+    }
+    let length = start.len().max(end.len());
+    if length == 0 {
+        return Some("none".into());
+    }
+    let mut out = Vec::with_capacity(length);
+    for index in 0..length {
+        let (a, b) = match (start.get(index), end.get(index)) {
+            (Some(a), Some(b)) => (*a, *b),
+            (Some(a), None) => (*a, a.neutral()),
+            (None, Some(b)) => (b.neutral(), *b),
+            (None, None) => unreachable!("index below the longer list"),
+        };
+        out.push(a.mix(b, t, current)?.css());
+    }
+    Some(out.join(" "))
+}
+
 /// A computed keyframe or underlying value, parsed for interpolation.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Value {
     Color(Color),
     Shadows(Vec<Shadow>),
+    Filters(Vec<Filter>),
     Length(Linear),
     Positions(Vec<Linear>),
     Number(f32),
@@ -466,6 +658,7 @@ impl Value {
                     .filter(|value| (1.0..=1000.0).contains(value))
                     .map(Self::Number),
             },
+            Kind::Filter => parse_filters(dom, id, trimmed, vp).map(Self::Filters),
             Kind::Visibility | Kind::Discrete => None,
         };
         parsed.unwrap_or_else(|| Self::Other(trimmed.to_string()))
@@ -483,6 +676,12 @@ impl Value {
                     .collect::<Vec<_>>()
                     .join(", ")
             }
+            Self::Filters(filters) if filters.is_empty() => "none".into(),
+            Self::Filters(filters) => filters
+                .iter()
+                .map(|filter| filter.css())
+                .collect::<Vec<_>>()
+                .join(" "),
             Self::Length(length) => length.css(),
             Self::Positions(layers) => layers
                 .iter()
@@ -545,6 +744,7 @@ fn interpolated(
             let spread = matches!(kind, Kind::Shadow { spread: true });
             mix_shadows(a, b, t, spread, current)?
         }
+        (Value::Filters(a), Value::Filters(b)) => mix_filters(a, b, t, current)?,
         (Value::Length(a), Value::Length(b)) => {
             let mut value = a.mix(*b, t);
             // CSS Values 4 #combining-range: clamp to the property's range.
@@ -802,6 +1002,46 @@ mod tests {
             "calc(50% + -5px)"
         );
         assert_eq!(mix(&dom, Kind::Discrete, "solid", "dashed", 0.6), "dashed");
+        // Filter Effects 1 #interpolation-of-filters.
+        assert_eq!(
+            mix(
+                &dom,
+                Kind::Filter,
+                "hue-rotate(0deg)",
+                "hue-rotate(1turn)",
+                0.25
+            ),
+            "hue-rotate(90deg)"
+        );
+        assert_eq!(
+            mix(&dom, Kind::Filter, "none", "blur(4px) invert(100%)", 0.5),
+            "blur(2px) invert(0.5)"
+        );
+        assert_eq!(
+            mix(
+                &dom,
+                Kind::Filter,
+                "brightness(2)",
+                "brightness(1) sepia(1)",
+                0.5
+            ),
+            "brightness(1.5) sepia(0.5)"
+        );
+        assert_eq!(
+            mix(
+                &dom,
+                Kind::Filter,
+                "drop-shadow(0 0 4px red)",
+                "drop-shadow(2px 2px 8px red)",
+                0.5
+            ),
+            "drop-shadow(rgb(255, 0, 0) 1px 1px 6px)"
+        );
+        // Mismatched function lists animate discretely.
+        assert_eq!(
+            mix(&dom, Kind::Filter, "blur(2px)", "sepia(1)", 0.4),
+            "blur(2px)"
+        );
         // CSS Display 4 #visibility.
         assert_eq!(
             mix(&dom, Kind::Visibility, "hidden", "visible", 0.1),
