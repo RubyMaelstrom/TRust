@@ -9498,6 +9498,111 @@ b</xmp></body>"#;
         assert_eq!((r, x.col), (2, 2));
     }
 
+    /// Every glyph run whose text is exactly `text`, as origins in paint order.
+    fn glyph_origins(layout: &GraphicalLayout, text: &str) -> Vec<(f32, f32)> {
+        layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                    if shaped.text == text =>
+                {
+                    Some((origin.x, origin.y))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[track_caller]
+    fn assert_near(actual: f64, expected: f64, what: &str) {
+        assert!(
+            (actual - expected).abs() < 0.05,
+            "{what}: {actual}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn relatively_positioned_inline_boxes_move_after_line_layout() {
+        // CSS 2 §9.4.3 / CSS Positioned Layout 3 #relpos-insets: a relatively
+        // positioned inline box and its contents move after line layout, at
+        // their laid size, while the content after them keeps its place.
+        // Percentages refer to the containing block, the block container's
+        // content box (CSS 2 §10.1 item 2); a vertical one against an auto
+        // height acts as auto. Opposing insets are over-constrained: left
+        // (ltr) and top win. Nested offsets add up, and the outer box spans
+        // its own content at its own offset. Gecko and Blink agree on all.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <div style="width:400px;height:100px">aa <span id=r style="position:relative;left:20px;top:10px">rel</span><span id=ra>bb</span></div>
+            <div style="width:400px;height:100px">aa <span id=s>rel</span><span id=sa>bb</span></div>
+            <div style="width:400px;height:100px">aa <span id=p style="position:relative;left:10%;top:50%">rel</span></div>
+            <div style="width:400px">aa <span id=q style="position:relative;left:-10%;top:50%">rel</span></div>
+            <div style="width:400px;height:20px">aa <span id=rb style="position:relative;right:15px;bottom:4px">rel</span></div>
+            <div style="width:400px;height:20px">aa <span id=oc style="position:relative;left:5px;right:50px;top:3px;bottom:40px">rel</span></div>
+            <div style="height:20px">aa <span id=o style="position:relative;left:10px">x<span id=i style="position:relative;left:5px;top:2px">y</span></span></div>
+            <div style="height:20px">aa <span id=o2>x<span id=i2>y</span></span></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        // `id`'s displacement from its unpositioned twin, whose block lies
+        // `blocks` px further down.
+        let moved = |id: &str, twin: &str, blocks: f64, expected: (f64, f64)| {
+            let (a, b) = (rect(id), rect(twin));
+            assert_near(a.width, b.width, &format!("{id} width"));
+            assert_near(a.height, b.height, &format!("{id} height"));
+            assert_near(a.left - b.left, expected.0, &format!("{id} dx"));
+            assert_near(a.top - b.top + blocks, expected.1, &format!("{id} dy"));
+        };
+        moved("r", "s", 100.0, (20.0, 10.0));
+        moved("ra", "sa", 100.0, (0.0, 0.0));
+        moved("p", "s", -100.0, (40.0, 50.0));
+        moved("q", "s", -200.0, (-40.0, 0.0));
+        moved("rb", "s", -220.0, (-15.0, -4.0));
+        moved("oc", "s", -240.0, (5.0, 3.0));
+        moved("o", "o2", 20.0, (10.0, 0.0));
+        moved("i", "i2", 20.0, (15.0, 2.0));
+        // The text paints where the box is measured.
+        let rel = glyph_origins(&layout, "rel");
+        assert_near(f64::from(rel[0].0), rect("r").left, "painted r");
+        assert_near(f64::from(rel[0].0 - rel[1].0), 20.0, "painted dx");
+        assert_near(f64::from(rel[1].1 - rel[0].1), 90.0, "painted dy");
+    }
+
+    #[test]
+    fn normalize_css_superscripts_rise_without_growing_their_line() {
+        // normalize.css sets `sub, sup { position: relative; vertical-align:
+        // baseline; line-height: 0 }` with `sup { top: -0.5em }` and
+        // `sub { bottom: -0.25em }`: the offsets apply after line layout
+        // (CSS 2 §9.4.3), so the line box keeps its height.
+        let html = r#"<!doctype html><body style="margin:0;font:16px/20px sans-serif">
+            <style>sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sup{top:-0.5em}sub{bottom:-0.25em}</style>
+            <div id=da>E=mc<sup id=sup>2</sup> H<sub id=sub>2</sub>O</div>
+            <div id=db>E=mc<sup id=sup2 style="position:static">2</sup> H<sub id=sub2 style="position:static">2</sub>O</div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert_eq!(rect("da").height, rect("db").height);
+        let blocks = rect("db").top - rect("da").top;
+        for (id, twin, dy) in [("sup", "sup2", -6.0), ("sub", "sub2", 3.0)] {
+            let (a, b) = (rect(id), rect(twin));
+            assert_near(a.left, b.left, id);
+            assert_near(a.top - (b.top - blocks), dy, id);
+        }
+        let digits = glyph_origins(&layout, "2");
+        assert_eq!(digits.len(), 4);
+        assert_near(
+            f64::from(digits[2].1 - digits[0].1) - blocks,
+            6.0,
+            "painted sup",
+        );
+        assert_near(
+            f64::from(digits[3].1 - digits[1].1) - blocks,
+            -3.0,
+            "painted sub",
+        );
+    }
+
     #[test]
     fn abspos_right_bottom_anchor_and_shrink_to_fit() {
         // right/bottom anchoring solves left/top through the §10.3.7/§10.6.4

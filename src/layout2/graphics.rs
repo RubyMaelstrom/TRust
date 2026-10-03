@@ -4153,44 +4153,24 @@ fn paint_inline_box_decorations(
     if line.sideways {
         return;
     }
-    let mut runs: Vec<Run> = Vec::new();
-    for piece in &line.pieces {
-        let Some(boxes) = &piece.boxes else {
-            continue;
-        };
-        let start = fragment.x + piece.x;
-        let end = start + piece.box_width;
-        for entry in boxes.chain.iter().filter(|entry| entry.decorated) {
-            let node = entry.key;
-            let index = runs
-                .iter()
-                .position(|run| run.node == node)
-                .unwrap_or_else(|| {
-                    let (top, bottom) = entry.content_area(fragment.y, line.height, line.baseline);
-                    runs.push(Run {
-                        node,
-                        left: start,
-                        right: end,
-                        top,
-                        bottom,
-                        starts: false,
-                        ends: false,
-                    });
-                    runs.len() - 1
-                });
-            let run = &mut runs[index];
-            run.left = run.left.min(start);
-            run.right = run.right.max(end);
-            if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == node) {
-                run.left = run.left.min(start - distance);
-                run.starts = true;
+    // A relatively positioned box paints at its offset (CSS 2 §9.4.3), which
+    // its fragments and content area include.
+    let runs = super::inline::line_box_fragments(&line.pieces, |entry| entry.decorated)
+        .into_iter()
+        .map(|run| {
+            let (top, bottom) = run
+                .entry
+                .content_area(fragment.y, line.height, line.baseline);
+            Run {
+                node: run.entry.key,
+                left: fragment.x + run.x0,
+                right: fragment.x + run.x1,
+                top,
+                bottom,
+                starts: run.starts,
+                ends: run.ends,
             }
-            if let Some(&(_, distance)) = boxes.closes.iter().find(|(close, _)| *close == node) {
-                run.right = run.right.max(end + distance);
-                run.ends = true;
-            }
-        }
-    }
+        });
     for run in runs {
         let (node, pseudo) = run.node;
         let style = match pseudo {
