@@ -71,6 +71,11 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 # the WHATWG Compression Streams API; the latter prevents sites from falling
 # back to large interpreted JavaScript codecs.
 flate2 = "1"
+# Pure-Rust decoders for the `br` (RFC 7932) and `zstd` (RFC 9659) HTTP
+# content codings every browser advertises. brotli-decompressor is already in
+# the tree through the WOFF2 decoder.
+brotli-decompressor = "5.0.3"
+ruzstd = "0.9.0"
 futures = "0.3.34"
 # HTTP/2 framing, HPACK and stream state; TRust owns connections and all
 # browser policy. This is not a second general-purpose HTTP client.
