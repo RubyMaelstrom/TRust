@@ -23,6 +23,78 @@ pub(super) struct Row {
 
 pub(super) type SharedRow = Rc<RefCell<Row>>;
 
+/// A row's values and box records as owned data, detached from its nodes,
+/// thread and budgets: what a parallel style pass hands to the page thread.
+pub(super) struct RowExport {
+    slots: Vec<u16>,
+    values: Vec<Option<String>>,
+    boxes: Vec<(BoxContext, BoxStyle)>,
+}
+
+/// A node's own state besides its (possibly shared) row: the contextual
+/// values and the node-private records.
+pub(super) struct NodeExport {
+    contextual: RowExport,
+    inline: Option<InlineExport>,
+    display: Option<Option<String>>,
+}
+
+struct InlineExport {
+    epoch: u64,
+    clickable: bool,
+    parent: InlineStyle,
+    base: url::Url,
+    value: InlineStyle,
+}
+
+impl RowExport {
+    /// The populated `(property, value)` pairs.
+    pub(super) fn entries(&self) -> impl Iterator<Item = (usize, &Option<String>)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| **slot != MISSING)
+            .map(|(property, slot)| (property, &self.values[usize::from(*slot)]))
+    }
+
+    pub(super) fn boxes(&self) -> &[(BoxContext, BoxStyle)] {
+        &self.boxes
+    }
+}
+
+impl NodeExport {
+    pub(super) fn contextual(&self) -> &RowExport {
+        &self.contextual
+    }
+
+    pub(super) fn inline(&self) -> Option<(&InlineStyle, &InlineStyle)> {
+        self.inline
+            .as_ref()
+            .map(|record| (&record.parent, &record.value))
+    }
+
+    pub(super) fn display(&self) -> Option<&Option<String>> {
+        self.display.as_ref()
+    }
+}
+
+fn box_record_bytes(context: &BoxContext, value: &BoxStyle) -> usize {
+    std::mem::size_of::<BoxRecord>()
+        + context.display.as_ref().map_or(0, String::capacity)
+        + crate::layout2::box_style_bytes(value)
+}
+
+fn inline_record_bytes(base: &url::Url, parent: &InlineStyle, value: &InlineStyle) -> usize {
+    std::mem::size_of::<InlineRecord>()
+        + base.as_str().len()
+        + parent.retained_text_bytes()
+        + value.retained_text_bytes()
+}
+
+fn display_record_bytes(value: &Option<String>) -> usize {
+    std::mem::size_of::<DisplayRecord>() + value.as_ref().map_or(0, String::capacity)
+}
+
 #[derive(Default)]
 struct NodeRows {
     common: Option<SharedRow>,
@@ -39,6 +111,27 @@ fn contextual(property: usize) -> bool {
 }
 
 impl Row {
+    fn export(&self) -> RowExport {
+        RowExport {
+            slots: self.slots.clone(),
+            values: self.values.clone(),
+            boxes: self
+                .boxes
+                .iter()
+                .flatten()
+                .map(|record| (record.context.clone(), record.value.clone()))
+                .collect(),
+        }
+    }
+
+    fn from_export(export: RowExport) -> Self {
+        Row {
+            slots: export.slots,
+            values: export.values,
+            ..Row::default()
+        }
+    }
+
     fn get(&self, property: usize) -> Option<Option<String>> {
         let slot = *self.slots.get(property)?;
         (slot != MISSING).then(|| self.values[usize::from(slot)].clone())
@@ -184,9 +277,7 @@ impl Values {
     }
 
     pub(super) fn put_box_record(&mut self, node: NodeId, context: BoxContext, value: BoxStyle) {
-        let bytes = std::mem::size_of::<BoxRecord>()
-            + context.display.as_ref().map_or(0, String::capacity)
-            + crate::layout2::box_style_bytes(&value);
+        let bytes = box_record_bytes(&context, &value);
         let Some(common) = self.row(node) else { return };
         let mut row = common.borrow_mut();
         // A style shared by many nodes must not accumulate unbounded viewport,
@@ -238,10 +329,7 @@ impl Values {
             return;
         };
         row.inline = None;
-        let bytes = std::mem::size_of::<InlineRecord>()
-            + base.as_str().len()
-            + parent.retained_text_bytes()
-            + value.retained_text_bytes();
+        let bytes = inline_record_bytes(&base, &parent, &value);
         if let Some(lease) = self.record_budget.reserve(bytes) {
             row.inline = Some(Box::new(InlineRecord {
                 epoch,
@@ -266,8 +354,7 @@ impl Values {
             return;
         };
         row.display = None;
-        let bytes =
-            std::mem::size_of::<DisplayRecord>() + value.as_ref().map_or(0, String::capacity);
+        let bytes = display_record_bytes(&value);
         if let Some(lease) = self.record_budget.reserve(bytes) {
             row.display = Some(DisplayRecord { value, lease });
         }
@@ -320,6 +407,87 @@ impl Values {
                 .borrow_mut()
                 .insert(property, value);
         }
+    }
+
+    /// A copy of `row` as owned data.
+    pub(super) fn export_row(row: &SharedRow) -> RowExport {
+        row.borrow().export()
+    }
+
+    /// A copy of `node`'s own state as owned data.
+    pub(super) fn export_node(&self, node: NodeId) -> Option<NodeExport> {
+        let rows = self.rows.get(node)?;
+        Some(NodeExport {
+            contextual: rows.contextual.export(),
+            inline: rows.inline.as_ref().map(|record| InlineExport {
+                epoch: record.epoch,
+                clickable: record.clickable,
+                parent: record.parent.clone(),
+                base: record.base.clone(),
+                value: record.value.clone(),
+            }),
+            display: rows.display.as_ref().map(|record| record.value.clone()),
+        })
+    }
+
+    /// A row of this cache made from exported data. Its box records are
+    /// leased from this cache's record budget like any other.
+    pub(super) fn adopt_row(&self, mut export: RowExport) -> SharedRow {
+        let boxes = std::mem::take(&mut export.boxes);
+        let mut row = Row::from_export(export);
+        for (slot, (context, value)) in boxes.into_iter().take(2).enumerate() {
+            if let Some(lease) = self
+                .record_budget
+                .reserve(box_record_bytes(&context, &value))
+            {
+                row.boxes[slot] = Some(Box::new(BoxRecord {
+                    context,
+                    value,
+                    lease,
+                }));
+            }
+        }
+        Rc::new(RefCell::new(row))
+    }
+
+    /// Install `node`'s computed state from a parallel style pass: its
+    /// (possibly shared) row and its own exported state. Replaces whatever
+    /// the node had.
+    pub(super) fn adopt_node(
+        &mut self,
+        node: NodeId,
+        common: Option<SharedRow>,
+        export: Option<NodeExport>,
+    ) {
+        let mut rows = NodeRows {
+            common,
+            ..NodeRows::default()
+        };
+        if let Some(export) = export {
+            rows.contextual = Row::from_export(export.contextual);
+            if let Some(record) = export.inline
+                && let Some(lease) = self.record_budget.reserve(inline_record_bytes(
+                    &record.base,
+                    &record.parent,
+                    &record.value,
+                ))
+            {
+                rows.inline = Some(Box::new(InlineRecord {
+                    epoch: record.epoch,
+                    clickable: record.clickable,
+                    parent: record.parent,
+                    base: record.base,
+                    value: record.value,
+                    lease,
+                }));
+            }
+            if let Some(value) = export.display
+                && let Some(lease) = self.record_budget.reserve(display_record_bytes(&value))
+            {
+                rows.display = Some(DisplayRecord { value, lease });
+            }
+        }
+        self.rows.insert_dense(node, rows, NodeRows::default);
     }
 
     pub(super) fn remove_node(&mut self, node: NodeId) {
