@@ -325,6 +325,10 @@ struct LumenPageWorkers {
     events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     workers: HashMap<usize, LumenWorkerHandle>,
     next_id: usize,
+    /// HTML #shared-workers-and-the-sharedworker-interface: this page's shared worker global
+    /// scopes, keyed by constructor storage key (origin), constructor URL and name. Each
+    /// records its worker type and secure-context state for the constructor's match checks.
+    shared: HashMap<String, (usize, LumenWorkerKind, bool)>,
 }
 
 struct LumenWorkerSelf {
@@ -354,6 +358,8 @@ struct LumenWorkerLaunch {
     name: String,
     script_body: Option<Vec<u8>>,
     secure_context: bool,
+    /// A SharedWorkerGlobalScope rather than a DedicatedWorkerGlobalScope.
+    shared: bool,
     agent_cluster: u64,
     port_registry: Arc<std::sync::Mutex<message_port_host::Registry>>,
     port_wake: message_port_host::Wake,
@@ -696,6 +702,7 @@ impl HostState {
             events: events.clone(),
             workers: HashMap::new(),
             next_id: 1,
+            shared: HashMap::new(),
         });
         self.network = Some(LumenNetwork {
             handle,
@@ -11883,7 +11890,13 @@ fn lumen_potentially_trustworthy(url: &url::Url) -> bool {
 /// worker realm, script fetch, and evaluation start in parallel on a dedicated agent thread.
 fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let target = host_arg_string(ctx, args, 0);
-    let kind = if host_arg_string(ctx, args, 1) == "module" {
+    // "shared:classic" / "shared:module" request a SharedWorkerGlobalScope.
+    let requested = host_arg_string(ctx, args, 1);
+    let (shared, kind) = match requested.strip_prefix("shared:") {
+        Some(kind) => (true, kind),
+        None => (false, requested.as_str()),
+    };
+    let kind = if kind == "module" {
         LumenWorkerKind::Module
     } else {
         LumenWorkerKind::Classic
@@ -11908,6 +11921,24 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         return Err(ctx.make_error("InvalidStateError", "worker host is unavailable"));
     };
     let workers = state.workers.as_mut().unwrap();
+    // HTML #dom-sharedworker: match an existing shared worker global scope by constructor
+    // storage key, constructor URL and name. A type or secure-context mismatch is reported
+    // to the constructor as -1, after which it fires error without connecting.
+    let shared_key = shared.then(|| {
+        format!(
+            "{}\0{}\0{}",
+            owner_page.origin().ascii_serialization(),
+            script_url.as_str(),
+            name
+        )
+    });
+    if let Some(key) = &shared_key
+        && let Some(&(id, existing_kind, existing_secure)) = workers.shared.get(key)
+        && workers.workers.contains_key(&id)
+    {
+        let matches = existing_kind == kind && existing_secure == secure_context;
+        return Ok(Value::Num(if matches { id as f64 } else { -1.0 }));
+    }
     if let Err(error) = workers.workers.try_reserve(1) {
         return Err(ctx.make_error(
             "QuotaExceededError",
@@ -11916,6 +11947,9 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     }
     let id = workers.next_id;
     workers.next_id += 1;
+    if let Some(key) = shared_key {
+        workers.shared.insert(key, (id, kind, secure_context));
+    }
     let (ctl, ctl_rx) = LumenWorkerInbox::new();
     let launch = LumenWorkerLaunch {
         id,
@@ -11926,6 +11960,7 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         name,
         script_body,
         secure_context,
+        shared,
         agent_cluster: state.agent_cluster,
         port_registry: state.message_ports.registry.clone(),
         port_wake: message_port_host::Wake::Worker(Arc::downgrade(&ctl)),
@@ -12553,7 +12588,7 @@ fn run_lumen_worker(
         "classic"
     };
     let config = format!(
-        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, ua: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {} }};",
+        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, ua: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {}, shared: {} }};",
         launch.id,
         serde_json::to_string(&launch.name).unwrap_or_else(|_| String::from("\"\"")),
         serde_json::to_string(worker_type).expect("static worker type serializes"),
@@ -12568,6 +12603,7 @@ fn run_lumen_worker(
         crate::http::GLOBAL_PRIVACY_CONTROL,
         launch.secure_context,
         clock.origin_ms,
+        launch.shared,
     );
     for platform in [false, true] {
         let setup = if platform {
@@ -12630,6 +12666,14 @@ fn run_lumen_worker(
     {
         return;
     }
+    // HTML #report-an-exception: once a shared worker's script has run, its uncaught
+    // errors are reported within the worker (and possibly a developer console), never to
+    // the SharedWorker objects. Their channel is closed, so those reports are discarded.
+    let events = if launch.shared {
+        tokio::sync::mpsc::unbounded_channel().0
+    } else {
+        events
+    };
     enum WorkerTask {
         Command(LumenWorkerCtl),
         Timer,
@@ -13722,6 +13766,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .and_then(|state| state.workers.as_mut())
             {
                 workers.workers.remove(&id);
+                workers.shared.retain(|_, (shared, ..)| *shared != id);
             }
             result?;
         }
@@ -25203,6 +25248,109 @@ mod tests {
             task_tx,
         );
         (runtime, configured_engine(state, page.as_str()), task_rx)
+    }
+
+    #[test]
+    fn shared_workers_connect_matching_constructors_through_message_ports() {
+        // HTML #shared-workers-and-the-sharedworker-interface and
+        // #shared-workers-and-the-sharedworkerglobalscope-interface (local
+        // whatwg/html@e5071a2): constructors with the same origin, URL and name
+        // share one global, each connecting with a fresh port and a connect event;
+        // a type mismatch fires error and does not connect.
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.sharedResults = [];
+            const url = URL.createObjectURL(new Blob([`
+                let connections = 0;
+                onconnect = event => {
+                    const port = event.ports[0];
+                    connections++;
+                    port.postMessage([connections, self instanceof SharedWorkerGlobalScope,
+                        self instanceof WorkerGlobalScope, typeof postMessage, typeof onmessage, self.name,
+                        event.source === port, event.data, Object.isFrozen(event.ports), event.isTrusted,
+                        event instanceof MessageEvent].join());
+                    port.onmessage = message => port.postMessage('echo:' + message.data);
+                };
+            `], {type: 'text/javascript'}));
+            const check = (ok, message) => { if (!ok) throw Error(message); };
+            check(typeof SharedWorker === 'function' && SharedWorker.length === 1, 'SharedWorker interface');
+            check(Object.getPrototypeOf(SharedWorker) === EventTarget, 'SharedWorker inherits EventTarget');
+            check(Object.prototype.toString.call(SharedWorker.prototype) === '[object SharedWorker]', 'tag');
+            try { new SharedWorker('https://[bad'); throw Error('invalid URL accepted'); }
+            catch (error) { check(error.name === 'SyntaxError', 'invalid URL: ' + error.name); }
+            try { new SharedWorker(url, {type: 'shared'}); throw Error('invalid type accepted'); }
+            catch (error) { check(error.name === 'TypeError', 'invalid type: ' + error.name); }
+            const first = new SharedWorker(url, 'counter');
+            const second = new SharedWorker(url, {name: 'counter'});
+            const other = new SharedWorker(url, {name: 'other'});
+            const mismatch = new SharedWorker(url, {name: 'counter', type: 'module'});
+            check(first.port instanceof MessagePort && first.port === first.port && first.port !== second.port,
+                'per-object outside ports');
+            check(Object.getOwnPropertyNames(first).length === 0, 'no own SharedWorker properties');
+            first.port.onmessage = event => sharedResults.push('first:' + event.data);
+            second.port.onmessage = event => sharedResults.push('second:' + event.data);
+            other.port.onmessage = event => sharedResults.push('other:' + event.data);
+            mismatch.onerror = event => sharedResults.push('mismatch:' + event.type + ':' + event.isTrusted);
+            mismatch.port.onmessage = event => sharedResults.push('mismatch-message');
+            "#,
+            "shared workers",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut echoed = false;
+        loop {
+            let log = string_value(&mut engine, "sharedResults.join('|')");
+            if !echoed && log.matches("first:").count() == 1 && log.contains("second:") {
+                eval(&mut engine, "first.port.postMessage('ping')", "shared ping").unwrap();
+                echoed = true;
+            }
+            if log.contains("first:echo:ping")
+                && log.contains("other:")
+                && log.contains("mismatch:")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "shared workers stalled: {log}");
+            if matches!(
+                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
+                Ok(Value::Bool(true))
+            ) {
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
+                    |error| panic!("{}", describe_eval_error(&mut engine, error, "shared task")),
+                );
+            } else if let Ok(Some(task)) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(200), task_rx.recv()).await
+            }) {
+                dispatch_host_task(&mut engine, task).unwrap();
+            }
+            run_microtask_checkpoint(&mut engine);
+        }
+        let log = string_value(&mut engine, "sharedResults.join('|')");
+        let mut entries: Vec<_> = log.split('|').collect();
+        entries.sort_unstable();
+        assert_eq!(
+            entries,
+            [
+                "first:1,true,true,undefined,undefined,counter,true,,true,true,true",
+                "first:echo:ping",
+                "mismatch:error:true",
+                "other:1,true,true,undefined,undefined,other,true,,true,true,true",
+                "second:2,true,true,undefined,undefined,counter,true,,true,true,true",
+            ],
+            "{log}"
+        );
+        let workers = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .workers
+            .as_ref()
+            .unwrap()
+            .workers
+            .len();
+        assert_eq!(workers, 2, "one global per origin, URL and name");
     }
 
     #[test]

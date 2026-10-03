@@ -48,7 +48,21 @@
         message: function (s) {
             var packet;
             try { packet = portAPI.deserialize(JSON.parse(s)); }
-            catch (e) { fireScope("messageerror", trustedScopeEvent(MessageEvent, "messageerror", {})); return; }
+            catch (e) {
+                if (!cfg.shared) fireScope("messageerror", trustedScopeEvent(MessageEvent, "messageerror", {}));
+                return;
+            }
+            if (cfg.shared) {
+                // HTML #dom-sharedworker step "enqueue to the shared worker
+                // manager" and #run-a-worker: each SharedWorker connection
+                // delivers its entangled inside port in a connect event.
+                var port = packet.ports[0];
+                if (!port) return;
+                fireScope("connect", trustedScopeEvent(MessageEvent, "connect", {
+                    data: "", origin: "", ports: Object.freeze([port]), source: port
+                }));
+                return;
+            }
             fireScope("message", trustedScopeEvent(MessageEvent, "message", {
                 data: packet.data, origin: "", ports: Object.freeze(packet.ports)
             }));
@@ -267,7 +281,9 @@
     // Event-handler IDL attributes participate in the same listener list, at
     // the point where a non-null callback is assigned. This preserves the DOM
     // event listener registration order relative to addEventListener().
-    ["message", "messageerror", "error"].forEach(function (type) {
+    // SharedWorkerGlobalScope has onconnect instead of DedicatedWorkerGlobalScope's
+    // onmessage/onmessageerror (HTML #shared-workers-and-the-sharedworkerglobalscope-interface).
+    (cfg.shared ? ["connect", "error"] : ["message", "messageerror", "error"]).forEach(function (type) {
         var callback = null, wrapper = null;
         Object.defineProperty(g, "on" + type, {
             configurable: true, enumerable: true,
@@ -320,11 +336,29 @@
     // --- self / postMessage / close / on* (DedicatedWorkerGlobalScope) ---
     g.self = g;
     g.name = cfg.name || "";
-    g.postMessage = function (message, options) {
+    if (!cfg.shared) g.postMessage = function (message, options) {
         if (arguments.length === 0) throw new TypeError("postMessage requires a message");
         __worker_self_post(JSON.stringify(portAPI.serialize(message, portAPI.optionsTransfer(options))));
     };
     g.close = function () { __worker_self_close(); };
+    if (cfg.shared) {
+        // A shared worker's global is a SharedWorkerGlobalScope, which scripts
+        // use to tell the two worker kinds apart. Its members stay own
+        // properties of the global; only the interface chain is installed.
+        const illegal = function () { throw new TypeError("Illegal constructor"); };
+        const WorkerGlobalScope = function WorkerGlobalScope() { illegal(); };
+        const SharedWorkerGlobalScope = function SharedWorkerGlobalScope() { illegal(); };
+        Object.setPrototypeOf(WorkerGlobalScope, g.EventTarget);
+        Object.setPrototypeOf(WorkerGlobalScope.prototype, g.EventTarget.prototype);
+        Object.setPrototypeOf(SharedWorkerGlobalScope, WorkerGlobalScope);
+        Object.setPrototypeOf(SharedWorkerGlobalScope.prototype, WorkerGlobalScope.prototype);
+        for (const [C, tag] of [[WorkerGlobalScope, "WorkerGlobalScope"], [SharedWorkerGlobalScope, "SharedWorkerGlobalScope"]]) {
+            Object.defineProperty(C, "prototype", {writable: false});
+            Object.defineProperty(C.prototype, Symbol.toStringTag, {value: tag, configurable: true});
+            Object.defineProperty(g, tag, {value: C, writable: true, configurable: true});
+        }
+        Object.setPrototypeOf(g, SharedWorkerGlobalScope.prototype);
+    }
 
     // --- timers / microtasks / performance ---
     g.setTimeout = function (fn, delay) { return addTimer(fn, delay, Array.prototype.slice.call(arguments, 2), false); };

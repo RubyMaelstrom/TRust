@@ -20699,6 +20699,103 @@
         delete trust.workers[id];
     };
 
+    // HTML #shared-workers-and-the-sharedworker-interface (local whatwg/html@e5071a2).
+    // The shared worker manager is the page's native worker host: it matches
+    // an existing SharedWorkerGlobalScope by constructor origin, URL and name
+    // or runs a new one on its own agent thread. Each SharedWorker connects
+    // through a fresh entangled port pair; the inside port is transferred to
+    // the worker, which fires connect. Only a script that fails to load or
+    // run initially is reported to the SharedWorker objects.
+    const sharedWorkerSlots = privateSlots();
+    const SharedMessageChannel = g.MessageChannel;
+    const sharedWorkerWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
+    trust.sharedWorkers = {};
+    const sharedWorkerTypes = ["classic", "module"], sharedWorkerCredentials = ["omit", "same-origin", "include"];
+    class SharedWorker extends EventTarget {
+        constructor(scriptURL, options = undefined) {
+            if (arguments.length < 1) throw new TypeError("SharedWorker requires a script URL");
+            scriptURL = sharedWorkerWellFormed(`${scriptURL}`);
+            // (DOMString or SharedWorkerOptions): null, undefined and objects
+            // convert to the dictionary (members in lexicographic order).
+            let name = "", type = "classic";
+            if (options === undefined || options === null || typeof options === "object" || typeof options === "function") {
+                const credentials = options == null ? undefined : options.credentials;
+                if (credentials !== undefined && !sharedWorkerCredentials.includes(`${credentials}`))
+                    throw new TypeError("Invalid SharedWorker credentials mode");
+                if (options != null) !!options.extendedLifetime;
+                const workerName = options == null ? undefined : options.name;
+                if (workerName !== undefined) name = `${workerName}`;
+                const workerType = options == null ? undefined : options.type;
+                if (workerType !== undefined) {
+                    type = `${workerType}`;
+                    if (!sharedWorkerTypes.includes(type)) throw new TypeError("Invalid SharedWorker type");
+                }
+            } else name = `${options}`;
+            const parsed = __url_parse(scriptURL, messageWindowState.apiBaseURL());
+            if (!parsed) throw new DOMException("Invalid shared worker script URL", "SyntaxError");
+            const href = parsed[0];
+            super();
+            const channel = new SharedMessageChannel();
+            sharedWorkerSlots.set(this, {port: channel.port1, handler: null});
+            let blobSource = null;
+            if (href.slice(0, 5) === "blob:") {
+                const entry = __resolveBlobURL(href);
+                if (entry) blobSource = entry.bytes;
+            }
+            const id = __worker_spawn(href, "shared:" + type, name, blobSource);
+            if (!(id > 0)) {
+                // A matching scope with a different type or secure-context
+                // state: fire error and do not connect.
+                const target = this;
+                __queue_dom_task(() => dispatch(target, createTrustedEvent(Event, "error", {}), false));
+                return;
+            }
+            (trust.sharedWorkers[id] || (trust.sharedWorkers[id] = new Set())).add(this);
+            __worker_post(id, JSON.stringify(serializeMessage("", [channel.port2])));
+        }
+        get port() { return sharedWorkerState(this).port; }
+        // AbstractWorker's onerror (HTML #event-handler-attributes keeps a
+        // replaced handler's listener position).
+        get onerror() { const handler = sharedWorkerState(this).handler; return handler ? handler.value : null; }
+        set onerror(value) {
+            const state = sharedWorkerState(this);
+            value = typeof value === "function" || (value !== null && typeof value === "object") ? value : null;
+            let handler = state.handler;
+            if (value === null) {
+                if (handler) removeL(this, "error", handler.listener, false);
+                state.handler = null;
+            } else if (handler) handler.value = value;
+            else {
+                const target = this;
+                handler = state.handler = {value, listener(event) {
+                    const callback = handler.value;
+                    if (typeof callback === "function" && callback.call(target, event) === false) event.preventDefault();
+                }};
+                addL(this, "error", handler.listener, false);
+            }
+        }
+    }
+    function sharedWorkerState(object) {
+        const state = sharedWorkerSlots.get(object);
+        if (!state) throw new TypeError("Illegal SharedWorker invocation");
+        return state;
+    }
+    for (const key of ["port", "onerror"])
+        Object.defineProperty(SharedWorker.prototype, key, {enumerable: true});
+    Object.defineProperty(SharedWorker.prototype, Symbol.toStringTag, {value: "SharedWorker", configurable: true});
+    Object.defineProperty(g, "SharedWorker", {value: SharedWorker, writable: true, configurable: true});
+    const dedicatedWorkerError = trust.workerError, dedicatedWorkerExited = trust.workerExited;
+    trust.workerError = function (id, message) {
+        const shared = trust.sharedWorkers[id];
+        if (!shared) return dedicatedWorkerError(id, message);
+        // HTML #run-a-worker: the script could not be fetched or run.
+        for (const worker of shared) dispatch(worker, createTrustedEvent(Event, "error", {}), false);
+    };
+    trust.workerExited = function (id) {
+        delete trust.sharedWorkers[id];
+        return dedicatedWorkerExited(id);
+    };
+
     // Flatten a header map ({lowercased-name: value}) into the `k\nv\nk\nv`
     // blob the `__http_fetch` syscalls forward to the request. Lets a page's
     // `setRequestHeader`/`init.headers` (X-Requested-With, Authorization, …)
