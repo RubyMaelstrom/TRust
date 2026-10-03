@@ -20023,6 +20023,12 @@ mod tests {
         );
         // WorkerGlobalScope has no print(); the engine's Test262 hook is removed too.
         assert_eq!(string_value(&mut worker, "typeof print"), "undefined");
+        // Platform frames are strict: an author callback cannot reach them, or their
+        // arguments, through the legacy Function.prototype.caller extension.
+        let caller_probe = "(() => { let seen = 'unset'; function listener() { seen = String(listener.caller); } \
+            addEventListener('probe', listener); dispatchEvent(new Event('probe')); return seen; })()";
+        assert_eq!(string_value(&mut worker, caller_probe), "null", "worker");
+        assert_eq!(string_value(&mut engine, caller_probe), "null", "Window");
         assert!(matches!(platform_control(worker.ctx()), Ok(Value::Obj(_))));
     }
 

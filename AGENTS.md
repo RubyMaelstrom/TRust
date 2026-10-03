@@ -139,6 +139,13 @@ The project favors:
   measurements match rendered boxes.
 - Background panics and per-resource failures must remain contained; only the
   terminal-owner thread may tear down the TUI.
+- Author script never reaches the host boundary. `js::private_bootstrap` captures
+  every host binding lexically and deletes all `__` globals before author code
+  runs; prelude code must use the captured bindings, not `g.__name` lookups at
+  run time. Rust reaches a Realm's prelude only through `platform_control()`,
+  never by evaluating `__trust` snippets. Wrapper state that carries host
+  identity (node ids, child Windows, store handles) lives in internal slots,
+  and DOM host operations refuse nodes of cross-origin Documents.
 - Keep session caches bounded. Avoid copying large scripts, DOMs, images, or
   bytecode unnecessarily.
 
