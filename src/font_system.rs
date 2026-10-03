@@ -453,6 +453,57 @@ pub(crate) fn page_font_epoch() -> u64 {
     PAGE_FONT_EPOCH.load(Ordering::Acquire)
 }
 
+/// The family list for a cluster that requests emoji presentation. CSS Fonts
+/// 4 #font-variant-emoji-prop says the presentation is expected to affect
+/// font fallback, and that a UA may disregard fonts without color tables for
+/// an emoji-style request. Such a cluster therefore tries the list's color
+/// families, then the generic `emoji` family, and only then the whole list
+/// (whose text faces keep any sequence no color face supports).
+pub(crate) fn emoji_family_source(family: &str, context: &mut FontContext) -> String {
+    let source = css_family_source(family);
+    let mut stack = String::new();
+    for raw in split_css_families(&source) {
+        let generic = !is_quoted_css_family(raw)
+            && decode_css_family(raw)
+                .and_then(|name| GenericFamily::parse(&name.to_ascii_lowercase()))
+                .is_some();
+        if generic {
+            continue;
+        }
+        if let Some(name) = decode_css_family(raw)
+            && family_has_color_tables(context, &name)
+        {
+            stack.push_str(raw.trim());
+            stack.push_str(", ");
+        }
+    }
+    stack.push_str("emoji, ");
+    stack.push_str(&source);
+    stack
+}
+
+/// Whether a family's faces carry color glyph tables (OpenType COLR, CBDT,
+/// SVG or Apple's sbix).
+fn family_has_color_tables(context: &mut FontContext, name: &str) -> bool {
+    let Some(family) = context
+        .collection
+        .family_id(name)
+        .and_then(|id| context.collection.family(id))
+    else {
+        return false;
+    };
+    family.fonts().iter().any(|font| {
+        font.load(Some(&mut context.source_cache))
+            .is_some_and(|blob| {
+                skrifa::FontRef::from_index(blob.as_ref(), font.index()).is_ok_and(|face| {
+                    [b"COLR", b"CBDT", b"SVG ", b"sbix"]
+                        .iter()
+                        .any(|tag| face.table_data(skrifa::Tag::new(tag)).is_some())
+                })
+            })
+    })
+}
+
 /// Applies installed aliases to a CSS family list without changing its
 /// computed value. This is only needed on platforms using our catalog; native
 /// Fontique backends perform platform aliases internally.
