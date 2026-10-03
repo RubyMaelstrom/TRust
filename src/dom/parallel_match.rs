@@ -134,6 +134,45 @@ impl<C> Stream<C> {
     }
 }
 
+impl<C> Stream<C> {
+    /// Publish a work list walked in full before the pass.
+    pub(super) fn publish_all(&self, count: usize) {
+        self.published.store(count, Ordering::Release);
+        self.complete.store(true, Ordering::Release);
+    }
+
+    /// Claim the next run of a list published in full, by guided
+    /// self-scheduling: the `divisor`th part of what remains, within
+    /// `min..=max`. Early runs are long, the last are short. Not to be mixed
+    /// with `claim` on one stream.
+    pub(super) fn claim_guided(
+        &self,
+        divisor: usize,
+        min: usize,
+        max: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let total = self.published.load(Ordering::Acquire);
+        let mut start = self.next.load(Ordering::Relaxed);
+        loop {
+            if start >= total {
+                return None;
+            }
+            let len = ((total - start) / divisor.max(1))
+                .clamp(min, max)
+                .min(total - start);
+            match self.next.compare_exchange_weak(
+                start,
+                start + len,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(start..start + len),
+                Err(current) => start = current,
+            }
+        }
+    }
+}
+
 /// Marks the walk complete even if it unwinds, so no participant waits on it.
 pub(super) struct Published<'a, C>(pub(super) &'a Stream<C>);
 
