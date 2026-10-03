@@ -52,6 +52,7 @@ impl StyleView<'_> {
                 cache.borrow_mut().put(id, 0, tokens);
                 matches
             }
+            ClassMemo::Local(cache) => all(cache.borrow_mut().entry(id).or_insert_with(tokenize)),
         }
     }
 }

@@ -34,7 +34,9 @@ mod html_hints;
 mod input;
 mod invalidation;
 mod media;
+mod parallel_match;
 mod properties;
+mod style_pool;
 mod style_records;
 mod style_sharing;
 mod style_view;
@@ -148,9 +150,43 @@ pub struct CascDiag {
     pub selector_cache_hits: u64,
     /// Cumulative selector matching time for those cold memo builds.
     pub matched_us: u64,
+    /// Parallel selector-matching passes (`parallel_match`): elements
+    /// matched, distinct rule lists, candidate rules tested, the most
+    /// participants of one pass, the passes' wall time, the page thread's
+    /// time walking the tree and storing results, and every participant's
+    /// summed matching time.
+    pub parallel_passes: u64,
+    pub parallel_elements: u64,
+    pub parallel_distinct: u64,
+    pub parallel_candidates: u64,
+    pub parallel_threads: u64,
+    pub parallel_wall_us: u64,
+    pub parallel_collect_us: u64,
+    pub parallel_merge_us: u64,
+    pub parallel_busy_us: u64,
 }
 
 impl CascDiag {
+    /// The parallel selector-matching passes: `passes/elements/distinct
+    /// lists/candidates/participants`, then milliseconds of pass wall time,
+    /// of the page thread walking the tree and storing results (both
+    /// overlap the matching), and of all participants' matching.
+    pub fn parallel_summary(&self) -> String {
+        let ms = |us: u64| us as f64 / 1000.0;
+        format!(
+            "{}/{}el/{}lists/{}cand/{}thr/wall:{:.2}/walk:{:.2}/store:{:.2}/busy:{:.2}ms",
+            self.parallel_passes,
+            self.parallel_elements,
+            self.parallel_distinct,
+            self.parallel_candidates,
+            self.parallel_threads,
+            ms(self.parallel_wall_us),
+            ms(self.parallel_collect_us),
+            ms(self.parallel_merge_us),
+            ms(self.parallel_busy_us),
+        )
+    }
+
     const ZERO: Self = CascDiag {
         style_index_us: 0,
         style_index_builds: 0,
@@ -160,6 +196,15 @@ impl CascDiag {
         matched_candidates: 0,
         selector_cache_hits: 0,
         matched_us: 0,
+        parallel_passes: 0,
+        parallel_elements: 0,
+        parallel_distinct: 0,
+        parallel_candidates: 0,
+        parallel_threads: 0,
+        parallel_wall_us: 0,
+        parallel_collect_us: 0,
+        parallel_merge_us: 0,
+        parallel_busy_us: 0,
     };
 }
 
@@ -309,6 +354,8 @@ pub struct Dom {
     /// writes invalidate reachable subjects via the compiled dependency index.
     selector_cache: RefCell<NodeCache<std::rc::Rc<Vec<u32>>>>,
     selector_epoch: u64,
+    /// When to fill `selector_cache` with a parallel pass.
+    parallel_match: parallel_match::Trigger,
     /// Long class lists parsed once per attribute value, not once per restyle.
     /// Explicit class-attribute invalidation owns freshness (stamp is zero).
     class_cache: RefCell<NodeCache<class_tokens::ClassTokens>>,
@@ -694,6 +741,7 @@ impl Dom {
             matched_cache,
             selector_cache,
             selector_epoch,
+            parallel_match: _, // Counters only; no owned allocation.
             class_cache,
             child_lists,
             cascaded_cache,
@@ -1173,6 +1221,7 @@ impl Dom {
             matched_cache: RefCell::new(NodeCache::default()),
             selector_cache: RefCell::new(NodeCache::default()),
             selector_epoch: 0,
+            parallel_match: Default::default(),
             class_cache: RefCell::new(NodeCache::default()),
             child_lists: RefCell::new(child_collections::State::default()),
             cascaded_cache: RefCell::new(NodeCache::default()),
@@ -6895,22 +6944,29 @@ impl Dom {
         if let Some(hit) = self.matched_cache.borrow().get(id, self.style_value_epoch) {
             return hit.clone();
         }
-        let started = casc_diag_on().then(std::time::Instant::now);
-        let mut candidate_count = 0u64;
         let index = self.style_index();
         let scope = self.tree_scope(id);
-        let cached_selectors = self
-            .selector_cache
-            .borrow()
-            .get(id, self.selector_epoch)
-            .cloned();
+        let cached = || {
+            self.selector_cache
+                .borrow()
+                .get(id, self.selector_epoch)
+                .cloned()
+        };
+        let mut cached_selectors = cached();
+        // Only elements are selector subjects: a compound never matches a
+        // node without a tag name, so other nodes match no rule.
+        let element = self.tag_name(id).is_some();
+        // A broad invalidation leaves many stale results: match them all at
+        // once, in parallel, instead of one per lazy read.
+        if cached_selectors.is_none() && element && self.parallel_match_on_miss() {
+            cached_selectors = cached();
+        }
+        let started = casc_diag_on().then(std::time::Instant::now);
+        let mut candidate_count = 0u64;
         let selector_cache_hit = cached_selectors.is_some();
         let selectors = if let Some(selectors) = cached_selectors {
             selectors
         } else {
-            // Only elements are selector subjects: a compound never matches a
-            // node without a tag name, so other nodes match no rule.
-            let element = self.tag_name(id).is_some();
             let selectors = match (index.scopes.get(&scope), index.buckets.get(&scope)) {
                 (Some(rules), Some(b)) if element => {
                     let view = self.style_view();

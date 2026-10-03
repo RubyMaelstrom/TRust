@@ -1,4 +1,4 @@
-//! Read-only style inputs of the selector matcher.
+//! Read-only style inputs shared by the serial and parallel selector matchers.
 //!
 //! Selectors 4 #match-against-element is a function of the element tree, its
 //! attributes and a few document states: the hover chain, focused areas, the
@@ -8,16 +8,16 @@
 //! deliberately unreachable from it; callers pass per-thread memo storage in
 //! `SelectorContext` instead.
 //!
-//! The view is not `Sync`: the node arena stores attribute values as
-//! `StrTendril`s, which are `!Sync`. Every other input is plain shared data.
+//! The view is not `Sync` by itself: the node arena stores attribute values as
+//! `StrTendril`s, which are `!Sync`. `SharedView` is the one narrowly scoped
+//! exception, used only while `style_pool` runs a parallel pass.
 
 use super::*;
 
 /// Read access to the node arena. This is the only path by which matcher code
 /// reaches `Node` data, and it only ever yields ids, booleans, names and
-/// `&str` slices: never `&Node`, `&Attribute` or `&StrTendril`, whose
-/// non-atomic reference counts must stay on the arena's thread. Keep new
-/// accessors in the same shape.
+/// `&str` slices: never `&Node`, `&Attribute` or `&StrTendril`. `SharedView`'s
+/// safety argument depends on that, so keep new accessors in the same shape.
 #[derive(Clone, Copy)]
 pub(super) struct NodesRef<'a>(&'a arena::DenseIdMap<Node>);
 
@@ -57,6 +57,11 @@ impl<'a> NodesRef<'a> {
     }
 
     #[inline]
+    pub(super) fn last_child(self, id: NodeId) -> Option<NodeId> {
+        self.0[id].last_child
+    }
+
+    #[inline]
     pub(super) fn next_sibling(self, id: NodeId) -> Option<NodeId> {
         self.0[id].next_sibling
     }
@@ -79,6 +84,16 @@ impl<'a> NodesRef<'a> {
     #[inline]
     pub(super) fn is_element(self, id: NodeId) -> bool {
         matches!(self.0[id].data, NodeData::Element { .. })
+    }
+
+    /// Whether `id` can have element descendants in its tree: an element, a
+    /// Document or a DocumentFragment, rather than character data.
+    #[inline]
+    pub(super) fn is_container(self, id: NodeId) -> bool {
+        matches!(
+            self.0[id].data,
+            NodeData::Element { .. } | NodeData::Document | NodeData::Fragment
+        )
     }
 
     /// The character data of a Text node.
@@ -136,7 +151,8 @@ impl<'a> NodesRef<'a> {
 }
 
 /// Document state consulted by selector matching, apart from the node arena.
-/// Every field is plain shared data.
+/// Every field must be `Sync` on its own (asserted below), so that
+/// `SharedView` needs no argument beyond the arena's.
 #[derive(Clone, Copy)]
 pub(super) struct ViewState<'a> {
     pub(super) shadow_hosts: &'a FxHashMap<NodeId, NodeId>,
@@ -150,6 +166,15 @@ pub(super) struct ViewState<'a> {
     pub(super) input_values: &'a FxHashMap<NodeId, input::InputValue>,
     pub(super) render_live: bool,
 }
+
+const _: () = {
+    const fn sync<T: Sync>() {}
+    sync::<ViewState<'static>>();
+    // `NodesRef` hands out these; they must not need the arena's exemption.
+    sync::<QualName>();
+    sync::<Complex>();
+    sync::<RuleBuckets>();
+};
 
 /// The matcher's complete input: the node arena plus document state.
 #[derive(Clone, Copy)]
@@ -225,8 +250,46 @@ impl StyleView<'_> {
     }
 }
 
+/// A `StyleView` that style worker threads share during one parallel pass.
+pub(super) struct SharedView<'a>(StyleView<'a>);
+
+// SAFETY: `ViewState` is `Sync` (asserted above), so the only non-`Sync`
+// component is `NodesRef`, and only because attribute values are
+// `StrTendril`s. A tendril is `!Sync` because `&StrTendril` permits `clone()`,
+// which writes its non-atomic header (the `Cell` pointer and refcount). Every
+// other `Node` field is plain owned data or an atomically refcounted
+// `string_cache` atom. `NodesRef` never clones a tendril and never exposes
+// `&Node`, `&Attribute` or `&StrTendril`; it only dereferences values to
+// `&str`, which reads the header without writing it. Concurrent reads are
+// race-free as long as no thread writes a header while the view is shared,
+// which is the contract of `SharedView::new`. Arena mutation itself needs
+// `&mut Dom`, which the `'a` borrow excludes.
+unsafe impl Sync for SharedView<'_> {}
+
+impl<'a> SharedView<'a> {
+    /// # Safety
+    ///
+    /// While a reference to the returned value may be used on another thread,
+    /// the arena's owning thread must not clone, or otherwise write through a
+    /// shared reference to, any attribute tendril of this arena. Share it only
+    /// with a `style_pool::Pool::run` job: workers can reach it only inside
+    /// the pass (the job is `Sync`, so it cannot capture `&Dom` either), and
+    /// `run` returns only after every worker has left. Meanwhile the owning
+    /// thread's `lead` closure must only read the tree (as `NodesRef` does)
+    /// and write state outside the node arena.
+    pub(super) unsafe fn new(view: StyleView<'a>) -> Self {
+        Self(view)
+    }
+
+    #[inline]
+    pub(super) fn view(&self) -> &StyleView<'a> {
+        &self.0
+    }
+}
+
 /// Where long class lists keep their tokens during one match (see
-/// `class_tokens`).
+/// `class_tokens`). The document cache is main-thread state; a style worker
+/// brings its own map for one parallel pass.
 #[derive(Clone, Copy, Default)]
 pub(super) enum ClassMemo<'a> {
     /// Tokenize on every test (allocation-free for short lists).
@@ -234,4 +297,6 @@ pub(super) enum ClassMemo<'a> {
     None,
     /// The arena's attribute-owned cache, invalidated by class writes.
     Document(&'a RefCell<NodeCache<class_tokens::ClassTokens>>),
+    /// A worker-private cache, discarded after the pass.
+    Local(&'a RefCell<FxHashMap<NodeId, class_tokens::ClassTokens>>),
 }
