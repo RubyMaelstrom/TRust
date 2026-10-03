@@ -457,6 +457,7 @@ mod tests {
         );
         assert_eq!(first.work.query_updates, 1);
         assert_eq!(first.boxes[&dom.get_by_id("child").unwrap()].width, 120.);
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let warm = measure_retained_layout(&dom, &base, viewport, &[], &controls, &images);
         assert_eq!(
             warm.work.passes, 1,
@@ -503,6 +504,7 @@ mod tests {
         let viewport = Viewport::new(640., 480.);
         let controls = HashMap::new();
         let images = HashMap::new();
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         for width in [480, 220, 600, 220, 480] {
             let style = format!("width:{width}px");
             dom.set_attr(dom.get_by_id("outer").unwrap(), "style", &style);

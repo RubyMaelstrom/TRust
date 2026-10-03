@@ -2615,6 +2615,7 @@ mod tests {
                 &Default::default(),
             )
         };
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let outer = dom.get_by_id("outer").unwrap();
         let sub = dom.get_by_id("sub").unwrap();
         assert!(!dom.establishes_independent_formatting_context(sub));
