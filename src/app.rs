@@ -9083,6 +9083,9 @@ impl App {
         let entry = crate::history::traverse(&mut g.history, &mut g.forward, Some(parked), delta)
             .expect("validated traversal");
         self.document_generation = self.document_generation.wrapping_add(1);
+        // A document restored from RAM is a new top-level navigation too: its
+        // re-laid inline SVG must not draw images the page we left loaded.
+        crate::img::begin_document_svg_navigation();
         // The old top of the receiving stack just became non-adjacent.
         Self::enforce_retention(g);
         g.selected = entry.pos.selected;
@@ -9496,9 +9499,9 @@ async fn load_image_with_cookie_policy(
     let Some(document_image) = crate::img::document_svg_image_target(url) else {
         return load_page_image(page, url, blobs, restricted).await;
     };
-    let decoded = load_page_image(page, document_image, blobs, restricted).await;
+    let decoded = load_page_image(page, document_image.url(), blobs, restricted).await;
     crate::img::record_document_svg_image(
-        document_image,
+        &document_image,
         decoded.as_ref().map(|decoded| &decoded.raw[..]),
     );
     decoded
@@ -15678,13 +15681,15 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image href="{blob_url}" width="4" height="4"/></svg>"#
         );
         let images = [blob_url.to_string()];
-        let before = crate::img::document_svg_data_url(&svg, 0, &images);
+        let before =
+            crate::img::document_svg_data_url_for_navigation(&svg, 0, &images, u64::MAX / 2 + 101);
         let request = crate::img::document_svg_image_requests(&before).remove(0);
         let decoded = super::load_one_image(&page, &request, Some(&blobs))
             .await
             .expect("the document image decodes as a page image");
         assert_eq!(decoded.raw.as_ref(), crate::img::red_png().as_slice());
-        let after = crate::img::document_svg_data_url(&svg, 0, &images);
+        let after =
+            crate::img::document_svg_data_url_for_navigation(&svg, 0, &images, u64::MAX / 2 + 101);
         let bytes = crate::img::decode_data_url(&after).unwrap();
         let image = crate::img::decode(&bytes).unwrap().0.to_rgba8();
         assert!(image.pixels().all(|pixel| pixel.0 == [255, 0, 0, 255]));

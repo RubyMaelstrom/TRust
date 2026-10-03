@@ -823,9 +823,9 @@ pub async fn fetch_graphical_image_with_cookie_policy(
             .await
             .map(|(_, bytes)| bytes);
     };
-    let result = fetch_page_image(page, document_image, blobs, restricted).await;
+    let result = fetch_page_image(page, document_image.url(), blobs, restricted).await;
     crate::img::record_document_svg_image(
-        document_image,
+        &document_image,
         result
             .as_ref()
             .ok()
@@ -6393,6 +6393,9 @@ async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_
     .filter_map(|font| async move { font })
     .collect()
     .await;
+    // A new foreground document: its inline SVG must not draw document
+    // images another page loaded under its own cookies and credentials.
+    crate::img::begin_document_svg_navigation();
     crate::font_system::install_page_fonts(fonts);
 }
 
@@ -9205,7 +9208,8 @@ mod tests {
                 .filter(|pixel| pixel.0 == [255, 0, 0, 255])
                 .count()
         };
-        let before = crate::img::document_svg_data_url(&svg, 0, &images);
+        let before =
+            crate::img::document_svg_data_url_for_navigation(&svg, 0, &images, u64::MAX / 2 + 100);
         assert_eq!(red(&before), 0);
         let requests = crate::img::document_svg_image_requests(&before);
         assert_eq!(
@@ -9214,7 +9218,8 @@ mod tests {
                 .unwrap(),
             crate::img::red_png()
         );
-        let after = crate::img::document_svg_data_url(&svg, 0, &images);
+        let after =
+            crate::img::document_svg_data_url_for_navigation(&svg, 0, &images, u64::MAX / 2 + 100);
         assert_ne!(before, after);
         assert_eq!(red(&after), 16);
 
@@ -9224,7 +9229,15 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(red(&crate::img::document_svg_data_url(&svg, 0, &images)), 0);
+        assert_eq!(
+            red(&crate::img::document_svg_data_url_for_navigation(
+                &svg,
+                0,
+                &images,
+                u64::MAX / 2 + 100
+            )),
+            0
+        );
     }
 
     #[test]
