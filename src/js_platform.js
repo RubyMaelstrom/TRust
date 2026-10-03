@@ -9166,6 +9166,39 @@
     // insertion point (`__trustForceAsync` is their creation-time marker), so
     // they retain the existing graceful append behavior until document.open's
     // script-created parser is modeled in full.
+    //
+    // HTML §13.2.6.4.8 (an end tag whose tag name is "script"): the parser
+    // prepares each script it meets in that input as parser-inserted. An
+    // inline classic one executes immediately, inside the document.write()
+    // call; any other becomes pending, and the parser takes nothing further
+    // (later written scripts included) until it has run. The native parser
+    // loop drains `writtenScripts` before its next source script. Only a
+    // parser-blocking writer has an insertion point to resume from, so an
+    // async or deferred writer's scripts stay inert as before.
+    const writtenScripts = [];
+    trust.takeWrittenScripts = function () {
+        return writtenScripts.splice(0).map((node) => node.__id).join(",");
+    };
+    function prepareWrittenScripts(first, last, writer) {
+        // async/defer have no effect on an inline classic writer.
+        const ty = (writer.getAttribute("type") || "").trim().toLowerCase();
+        if (ty === "module" || (writer.hasAttribute("src")
+            && (writer.hasAttribute("async") || writer.hasAttribute("defer")))) return;
+        const scripts = [];
+        for (let node = first; node; node = node.nextSibling) {
+            if (node.nodeType === 1) {
+                if (node.localName === "script" && node.namespaceURI === HTML_NS) scripts.push(node);
+                const nested = node.querySelectorAll("script");
+                for (let i = 0; i < nested.length; i++)
+                    if (nested[i].namespaceURI === HTML_NS) scripts.push(nested[i]);
+            }
+            if (node === last) break;
+        }
+        for (const node of scripts) {
+            if (writtenScripts.length || node.hasAttribute("src")) writtenScripts.push(node);
+            else maybeRunScript(node);
+        }
+    }
     function documentWrite(doc, values, lineFeed) {
         let markup = "";
         for (const value of values) markup += String(value);
@@ -9186,6 +9219,7 @@
             while (tail.nextSibling && tail.nextSibling !== sourceSuccessor)
                 tail = tail.nextSibling;
             script.__trustWriteCursor = tail.__id;
+            if (tail !== cursor) prepareWrittenScripts(cursor.nextSibling, tail, script);
             return;
         }
 

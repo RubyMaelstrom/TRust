@@ -3047,7 +3047,7 @@ mod desktop {
         // The parser owns its pending script list independently of the live DOM.
         // An earlier script may detach a later entry while this native list still
         // needs its identity for the preparation/connectedness checks.
-        let _script_leases: Vec<_> = page
+        let mut script_leases: Vec<_> = page
             .engine
             .ctx()
             .host_mut::<HostState>()
@@ -3062,8 +3062,15 @@ mod desktop {
                     .collect()
             })
             .unwrap_or_default();
-        for node in scripts {
-            process_parser_links(&mut page, &mut parser_links, Some(node));
+        // Scripts a parser-blocking script's document.write() calls left
+        // pending run before the parser resumes, ahead of the next source
+        // script (HTML #parsing-main-incdata).
+        let mut queue: std::collections::VecDeque<(usize, bool)> =
+            scripts.into_iter().map(|node| (node, false)).collect();
+        while let Some((node, written)) = queue.pop_front() {
+            if !written {
+                process_parser_links(&mut page, &mut parser_links, Some(node));
+            }
             // Earlier scripts may change a later element before the parser
             // prepares it. The speculative scanner is never authoritative.
             let (src, inline, ty) = {
@@ -3110,6 +3117,7 @@ mod desktop {
                     page.outcome.errors.push(error);
                 }
                 checkpoint(&mut page, "inline parser script");
+                take_written_scripts(&mut page, &mut queue, &mut script_leases);
                 continue;
             }
             let asynchronous = page.dom.borrow().attr(node, "async").is_some();
@@ -3157,8 +3165,11 @@ mod desktop {
                 page.outcome.errors.push(message);
                 continue;
             }
-            if !asynchronous && !defer && !tasks.execute_when_ready(&mut page, node) {
-                return Err(page.outcome);
+            if !asynchronous && !defer {
+                if !tasks.execute_when_ready(&mut page, node) {
+                    return Err(page.outcome);
+                }
+                take_written_scripts(&mut page, &mut queue, &mut script_leases);
             }
         }
         process_parser_links(&mut page, &mut parser_links, None);
@@ -3180,6 +3191,35 @@ mod desktop {
         );
         checkpoint(&mut page, "DOMContentLoaded");
         Ok(page)
+    }
+
+    /// Queue the scripts that the parser-blocking script just run left
+    /// pending through document.write() ahead of the remaining source
+    /// scripts, in tree order, retaining their identity like source scripts.
+    fn take_written_scripts(
+        page: &mut LumenPage,
+        queue: &mut std::collections::VecDeque<(usize, bool)>,
+        leases: &mut Vec<DomResourceLease>,
+    ) {
+        let Some(value) = call_trust(page, "takeWrittenScripts", &[], "written scripts") else {
+            return;
+        };
+        let Ok(joined) = page.engine.ctx().coerce_string(&value) else {
+            return;
+        };
+        let written: Vec<usize> = joined
+            .split(',')
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            for &node in &written {
+                state.dom_gc.start_resource(node);
+                leases.push(state.dom_gc.resource_lease(node));
+            }
+        }
+        for &node in written.iter().rev() {
+            queue.push_front((node, true));
+        }
     }
 
     /// Process the parser-inserted links that precede `before` (all of them
@@ -7165,6 +7205,51 @@ mod desktop {
             .await
             .expect("slotted hyperlink navigation timed out");
             assert_eq!(navigated, "https://archive.org/details/vhskids");
+        }
+
+        #[tokio::test]
+        async fn parser_document_write_runs_the_scripts_it_writes_in_parser_order() {
+            // HTML §13.2.6.4.8: a script in document.write() input is
+            // parser-inserted. The inline one runs inside the write; the
+            // external one, and everything written after it, before the next
+            // source script. demisdesignart.neocities.org's websiteout counter
+            // writes the script that writes its image. Chromium agrees.
+            let html = r#"<!doctype html><html><body><script>
+                    var log = [];
+                    document.write('<script>log.push("inline")<\/script>');
+                    log.push("seen:" + log.includes("inline"));
+                    document.write('<script src="written.js"><\/script><script>log.push("tail")<\/script>');
+                    log.push("writer");
+                </script><script>document.getElementById("out").textContent = log.join(" ");</script>
+                <p id="out"></p>
+            </body></html>"#;
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.externals.push((
+                "written.js".to_string(),
+                Some(std::sync::Arc::new(b"log.push('external')".to_vec())),
+            ));
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+            let expected = "inline seen:true writer external tail";
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. } | PageEvt::Static { html, .. })
+                            if html.contains("id=\"out\">")
+                                && !html.contains("id=\"out\"></p>") =>
+                        {
+                            assert!(html.contains(expected), "{html}");
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("written scripts failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the written scripts ran"),
+                    }
+                }
+            })
+            .await
+            .expect("written scripts render timed out");
         }
 
         #[tokio::test]
