@@ -128,6 +128,10 @@ impl ScrollTree {
             return;
         }
         let border = match fragment.paint.position {
+            // CSS Position 3 #absolute-cb: a positioned inline box of the
+            // parent's formatting context contains it; that box scrolls and
+            // clips with the parent's in-flow content.
+            Pos::Absolute if fragment.flow.inline_cb => context.normal,
             Pos::Absolute => context.absolute,
             Pos::Fixed => context.fixed,
             _ => context.normal,

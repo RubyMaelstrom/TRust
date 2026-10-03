@@ -56,6 +56,13 @@ pub(crate) struct OofMark<'t> {
     /// descendants, the hypothetical box included (CSS 2 §9.4.3).
     pub dy: f32,
     pub ctx: InlineStyle,
+    /// CSS 2 §10.1 item 4 / CSS Positioned Layout 3 #absolute-cb: the
+    /// containing block formed by the nearest positioned inline ancestor,
+    /// as (x, y, width, height) with x/y relative to the static position.
+    /// `None` when no inline box of this formatting context positions it.
+    pub inline_cb: Option<[f32; 4]>,
+    /// The nearest enclosing positioned inline box (`Ifc::positioned`).
+    cb: Option<usize>,
     /// `x_px` includes its line's text-align offset.
     aligned: bool,
 }
@@ -514,6 +521,12 @@ pub(crate) struct AtomBoxPlace {
     pub line: usize,
     pub x: f32,
     pub y: f32,
+    /// The containing block that the box's nearest positioned inline
+    /// ancestor forms for absolutely positioned descendants of the box that
+    /// no closer box contains (CSS 2 §10.1 item 4), as (x, y, width, height)
+    /// in the formatting context's frame: x from the content edge, y from
+    /// the first line box's top.
+    pub inline_cb: Option<[f32; 4]>,
 }
 
 /// One finished line box.
@@ -546,6 +559,17 @@ pub(crate) struct LineOut {
     pub gap_before: f32,
     /// Inline boxes that hold no content on this line (CSS 2 §10.8).
     pub empty_boxes: Vec<EmptyInlineBox>,
+}
+
+/// A positioned (relative or sticky) non-replaced inline box met in the
+/// formatting context: CSS 2 §10.1 item 4 forms the containing block of its
+/// absolutely positioned descendants from its padding boxes, so it retains
+/// its used borders and padding (TRBL).
+#[derive(Clone, Copy, Debug)]
+struct PositionedInline {
+    key: InlineBoxKey,
+    border: [f32; 4],
+    padding: [f32; 4],
 }
 
 /// The inline formatting context builder. Feed it the IFC's inline content,
@@ -589,14 +613,20 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// Out-of-flow boxes met (static-position marks for the positioned
     /// post-pass) — they emit no pieces.
     oofs: Vec<OofMark<'t>>,
+    /// Positioned inline boxes met, in walk order, and the currently open
+    /// ones (indices, innermost last).
+    positioned: Vec<PositionedInline>,
+    positioned_open: Vec<usize>,
     /// Whether a tracked inline box has a relative offset to apply after
     /// line layout. Sideways text keeps its boxes in place: its pieces are
     /// in rotated inline/block coordinates.
     relative_offsets: bool,
     sideways: bool,
     /// Tracked inline boxes that closed without content on the current
-    /// line.
+    /// line, and those on lines that generated no line box (with the index
+    /// of the line box that follows them).
     cur_empty: Vec<EmptyInlineBox>,
+    unlined_empty: Vec<(usize, EmptyInlineBox)>,
     pen: f32,
     line_start: f32,
     pending_space: bool,
@@ -730,9 +760,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             cur: Vec::new(),
             marks: Vec::new(),
             oofs: Vec::new(),
+            positioned: Vec::new(),
+            positioned_open: Vec::new(),
             relative_offsets: false,
             sideways: false,
             cur_empty: Vec::new(),
+            unlined_empty: Vec::new(),
             pen: 0.0,
             line_start: 0.0,
             pending_space: false,
@@ -1078,6 +1111,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     } + offset[0],
                     dy: offset[1],
                     ctx: ctx.clone(),
+                    inline_cb: None,
+                    cb: self.positioned_open.last().copied(),
                     aligned: !inline_level,
                 })
             }
@@ -1149,7 +1184,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     let dy = tracked.map_or(0.0, |entry| entry.offset[1]);
                     self.marks.push((*node, self.lines.len(), dy));
                 }
-                self.relative_offsets |= tracked.is_some_and(|entry| entry.offset != [0.0; 2]);
+                let positioned_index = tracked.filter(|_| positioned).map(|entry| {
+                    let padding = |side: usize| {
+                        style.padding[side]
+                            .resolve(Some(self.cb_w_px))
+                            .unwrap_or(0.0)
+                    };
+                    self.positioned.push(PositionedInline {
+                        key: entry.key,
+                        border: style.border,
+                        padding: [padding(TOP), padding(RIGHT), padding(BOTTOM), padding(LEFT)],
+                    });
+                    self.positioned_open.push(self.positioned.len() - 1);
+                    self.relative_offsets |= entry.offset != [0.0; 2];
+                });
                 if let Some(entry) = tracked {
                     self.pending_opens
                         .push((entry.key, self.pending_gap_px + self.margin_px(style, LEFT)));
@@ -1169,6 +1217,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 }
                 if let Some(entry) = tracked {
                     self.close_box(entry, style, ctx);
+                }
+                if positioned_index.is_some() {
+                    self.positioned_open.pop();
                 }
                 self.pending_gap_px += self.edge_px(style, RIGHT);
             }
@@ -2827,8 +2878,23 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         if pieces.is_empty() && !forced {
             self.align_oof_marks(0.0, align);
             // CSS 2 §9.4.2: a line holding only empty inline boxes is a
-            // zero-height line box that does not exist for other purposes.
-            self.cur_empty.clear();
+            // zero-height line box for positioning the boxes inside it and
+            // does not exist otherwise. Keep them, aligned like the static
+            // positions above, beside the line boxes.
+            if !self.cur_empty.is_empty() {
+                let free = (self.line_right - self.line_left).max(0.0);
+                let off = match align {
+                    Align2::Center => free / 2.0,
+                    Align2::Right => free,
+                    Align2::Left | Align2::Justify => 0.0,
+                };
+                let line = self.lines.len();
+                for mut empty in std::mem::take(&mut self.cur_empty) {
+                    empty.x0 += off;
+                    empty.x1 += off;
+                    self.unlined_empty.push((line, empty));
+                }
+            }
             self.pen = self.line_start;
             self.pending_space = false;
             return;
@@ -2929,6 +2995,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         line: li,
                         x: p.x,
                         y: p.y,
+                        inline_cb: None,
                     });
                 }
             }
@@ -3020,6 +3087,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         if self.relative_offsets {
             self.offset_relative_boxes();
         }
+        if !self.positioned.is_empty() {
+            self.resolve_inline_containing_blocks();
+        }
         (
             self.lines,
             self.marks,
@@ -3062,6 +3132,124 @@ impl Ifc<'_, '_, '_> {
                     place.y += offset[1];
                 }
             }
+        }
+    }
+
+    /// CSS 2 §10.1 item 4 / CSS Positioned Layout 3 #absolute-cb: when the
+    /// nearest positioned ancestor of an absolutely positioned box is an
+    /// inline box, its containing block runs from the start-most edges of
+    /// that box's first fragment to the end-most edges of its last fragment.
+    /// CSS 2 takes those edges from the fragments' padding boxes, as Gecko
+    /// and Blink do (the css-position-3 draft says content edges). A box split
+    /// across lines can yield a negative extent, which clamps to zero, as in
+    /// both engines. An empty box on a line without other content sits on a
+    /// zero-height line box (CSS 2 §9.4.2) and forms an empty rectangle there.
+    ///
+    /// Out-of-flow marks receive the rectangle relative to their static
+    /// position, which the block flow translates along with the line boxes;
+    /// atomic inline boxes receive it in this formatting context's frame for
+    /// the absolutely positioned boxes inside them.
+    fn resolve_inline_containing_blocks(&mut self) {
+        let innermost_positioned = |positioned: &[PositionedInline], piece: &Piece| {
+            piece.boxes.as_ref().and_then(|boxes| {
+                boxes.chain.iter().rev().find_map(|entry| {
+                    positioned
+                        .iter()
+                        .position(|candidate| candidate.key == entry.key)
+                })
+            })
+        };
+        let atom_cbs: Vec<Option<usize>> = self
+            .atom_places
+            .iter()
+            .map(|place| {
+                self.lines
+                    .get(place.line)?
+                    .atom_boxes
+                    .iter()
+                    .find(|piece| piece.item.node == place.node)
+                    .and_then(|piece| innermost_positioned(&self.positioned, piece))
+            })
+            .collect();
+        let mut wanted: Vec<usize> = self
+            .oofs
+            .iter()
+            .filter_map(|mark| mark.cb)
+            .chain(atom_cbs.iter().flatten().copied())
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        // Line-box tops in the formatting context's frame, then the bottom
+        // of the last line box (where marks after it sit).
+        let mut tops = Vec::with_capacity(self.lines.len() + 1);
+        let mut y = 0.0;
+        for line in &self.lines {
+            y += line.gap_before;
+            tops.push(y);
+            y += line.height;
+        }
+        tops.push(y);
+        let positioned = &self.positioned;
+        let slot = |key: InlineBoxKey| {
+            wanted
+                .iter()
+                .position(|&index| positioned[index].key == key)
+        };
+        // Per wanted box: the first fragment's start padding edges (x, top)
+        // and the last fragment's end padding edges (x, bottom).
+        let mut first: Vec<Option<[f32; 2]>> = vec![None; wanted.len()];
+        let mut last: Vec<Option<[f32; 2]>> = vec![None; wanted.len()];
+        for (line, &top) in self.lines.iter().zip(&tops) {
+            let fragments = line_box_fragments(
+                line.pieces.iter().chain(&line.atom_boxes),
+                &line.empty_boxes,
+                |entry| slot(entry.key).is_some(),
+            );
+            for fragment in fragments {
+                let Some(at) = slot(fragment.entry.key) else {
+                    continue;
+                };
+                let edges = &positioned[wanted[at]];
+                let (content_top, content_bottom) =
+                    fragment.entry.content_area(top, line.height, line.baseline);
+                // A fragment has its start (end) border only where the box
+                // begins (ends).
+                let border = |present: bool, side: usize| {
+                    if present { edges.border[side] } else { 0.0 }
+                };
+                let start = fragment.x0 + border(fragment.starts, LEFT);
+                let end = fragment.x1 - border(fragment.ends, RIGHT);
+                first[at].get_or_insert([start, content_top - edges.padding[TOP]]);
+                last[at] = Some([end, content_bottom + edges.padding[BOTTOM]]);
+            }
+        }
+        for (line, empty) in &self.unlined_empty {
+            let Some(at) = slot(empty.entry.key).filter(|&at| first[at].is_none()) else {
+                continue;
+            };
+            let edges = &positioned[wanted[at]];
+            let top = tops[(*line).min(tops.len() - 1)] + empty.entry.offset[1];
+            let [dx, _] = empty.entry.offset;
+            first[at] = Some([empty.x0 + dx + edges.border[LEFT], top]);
+            last[at] = Some([empty.x1 + dx - edges.border[RIGHT], top]);
+        }
+        let rect = |index: usize| {
+            let at = wanted.binary_search(&index).ok()?;
+            let ([x0, y0], [x1, y1]) = (first[at]?, last[at]?);
+            Some([x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)])
+        };
+        for mark in &mut self.oofs {
+            let Some([x, y, width, height]) = mark.cb.and_then(rect) else {
+                continue;
+            };
+            let top = tops[mark.line.min(tops.len() - 1)] + mark.dy;
+            mark.inline_cb = Some([x - mark.x_px, y - top, width, height]);
+        }
+        for (place, cb) in self.atom_places.iter_mut().zip(atom_cbs) {
+            place.inline_cb = cb.and_then(rect);
         }
     }
 }

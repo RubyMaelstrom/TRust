@@ -25,6 +25,12 @@ pub(super) struct FlowInfo {
     pub margin_bottom: f32,
     /// The box's own relative/transform translation, excluded from flow size.
     pub offset_y: f32,
+    /// An absolutely positioned box whose containing block is a positioned
+    /// inline box of its parent's formatting context (CSS 2 §10.1 item 4):
+    /// its clip and scroll ancestry are that inline box's, its parent's
+    /// in-flow content's, rather than those of the nearest fragment ancestor
+    /// that establishes a containing block.
+    pub inline_cb: bool,
 }
 
 struct Budget {

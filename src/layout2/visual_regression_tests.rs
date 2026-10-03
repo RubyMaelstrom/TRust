@@ -632,6 +632,48 @@ fn relatively_positioned_links_move_with_their_hit_regions() {
 }
 
 #[test]
+fn positioned_inline_boxes_clip_their_abspos_content_and_hits() {
+    // skullmund.neocities.org's "danger zone": an empty positioned span
+    // alone in a centered `overflow:hidden` block holds absolutely
+    // positioned images. The span is their containing block (CSS 2 §10.1
+    // item 4), so the block, in their containing-block chain, clips them
+    // and their hit regions (CSS Overflow 3 §3). The link's text carries its
+    // hit region.
+    for clip in [true, false] {
+        let scene = inline_positioning_scene(&format!(
+            "<body style='margin:0;background:white'><div style='height:60px'></div><div style='width:100px;height:50px;text-align:center;background:blue;{}'> <span style='position:relative'><a href='/abs' style='position:absolute;left:10px;top:30px;width:40px;height:40px;background:red;color:red;font:40px/40px sans-serif;white-space:nowrap'>XX</a></span> </div></body>",
+            if clip { "overflow:hidden" } else { "" }
+        ));
+        let frame = crate::render::vello_cpu::VelloCpuRenderer::new()
+            .render_rgba(&scene)
+            .unwrap();
+        let sample = |x: usize, y: usize| &frame.pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 4];
+        // The span sits at the zone's center (50, 60): the box covers
+        // (60, 90)-(100, 130), and the zone ends at y = 110.
+        assert_eq!(sample(70, 100), [255, 0, 0, 255], "clip={clip}");
+        assert_eq!(sample(55, 100), [0, 0, 255, 255], "clip={clip}");
+        assert_eq!(
+            sample(70, 120),
+            if clip {
+                [255, 255, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            },
+            "clip={clip}"
+        );
+        assert_eq!(
+            link_at(&scene, CssPoint::new(70., 100.)).as_deref(),
+            Some("/abs")
+        );
+        assert_eq!(
+            link_at(&scene, CssPoint::new(70., 120.)),
+            (!clip).then(|| "/abs".to_owned()),
+            "clip={clip}"
+        );
+    }
+}
+
+#[test]
 fn graphical_infinite_and_huge_radii_keep_their_rounded_shape() {
     use crate::render::{DisplayCommand, PaintShape};
     for radius in [
