@@ -2132,7 +2132,7 @@ mod desktop {
                 outcome.elapsed = page.started.elapsed();
                 outcome.rendered = Some(Box::new(rendered));
                 let _ = events.blocking_send(PageEvt::Static {
-                    html: shell,
+                    html: static_document_source(&page, shell),
                     outcome,
                 });
                 return;
@@ -3817,6 +3817,20 @@ mod desktop {
     /// ResizeObserver broadcasts. Intersection Observer §3.2.4 instead queues
     /// notification on its own task source after recording intersections; its
     /// callbacks cannot force another layout inside this rendering opportunity.
+    /// The document source a retiring actor leaves behind. Frontends rebuild
+    /// a static page from its response body on later viewport, device-pixel
+    /// or image-size reflows, so the body must be the settled DOM rather
+    /// than the server's pre-script markup. Renders skip this serialization
+    /// outside tests; an inert page pays it once, when its actor exits.
+    fn static_document_source(page: &LumenPage, rendered_html: String) -> String {
+        if !rendered_html.is_empty() {
+            return rendered_html;
+        }
+        page.dom
+            .borrow()
+            .serialize_live(DOCUMENT, &std::collections::HashSet::new())
+    }
+
     fn render_with_observers(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
         let _animation_sample = CssAnimationSample::new(page.engine.ctx());
         let mut rendered = extract_live(page);
