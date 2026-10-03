@@ -5291,10 +5291,14 @@ impl Dom {
         match tag {
             "button" => Some("buttontext"),
             "textarea" => Some("fieldtext"),
-            "input" => Some(match self.input_type(id).as_str() {
-                "button" | "submit" | "reset" | "color" => "buttontext",
-                _ => "fieldtext",
-            }),
+            "input" => match self.input_type(id).as_str() {
+                "button" | "submit" | "reset" | "color" => Some("buttontext"),
+                // Checkboxes and radios paint as a glyph in the control's
+                // color with no native surface behind it, so they keep the
+                // inherited color that stays legible on the page.
+                "checkbox" | "radio" | "hidden" => None,
+                _ => Some("fieldtext"),
+            },
             _ => None,
         }
     }
@@ -23819,7 +23823,8 @@ mod tests {
         let dom = Dom::parse_document(
             r#"<div style="color:white"><button id=b><span id=i>b</span></button>
             <input id=s type=submit><input id=t><textarea id=x></textarea>
-            <select id=l></select><button id=c style="color:red">c</button><span id=p>p</span></div>"#,
+            <select id=l></select><button id=c style="color:red">c</button><span id=p>p</span>
+            <input id=r type=radio><input id=k type=checkbox></div>"#,
         );
         let color = |id: &str| {
             dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "color")
@@ -23831,6 +23836,9 @@ mod tests {
         assert_eq!(color("c"), "red");
         assert_eq!(color("l"), "white");
         assert_eq!(color("p"), "white");
+        // Surfaceless checkbox and radio glyphs keep the page's color.
+        assert_eq!(color("r"), "white");
+        assert_eq!(color("k"), "white");
     }
 
     #[test]
