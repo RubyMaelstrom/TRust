@@ -1835,12 +1835,13 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 .filter(|_| style_node != NO_NODE);
             let control_rect = piece.paint_control_box.then_some(piece_rect).flatten();
             if let Some(rect) = control_rect {
-                paint_atomic_control_box(
+                paint_atomic_box(
                     builder,
                     fragment,
                     style_node,
                     rect,
                     piece.item.link.clone(),
+                    true,
                 );
             }
             let mut clip = builder.effective_clip(paint_node, fragment.clip);
@@ -2099,10 +2100,35 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     ),
                     ratio,
                 );
+                let inline_border = piece
+                    .replaced_edges
+                    .filter(|_| !builder.replaced_border_boxes.contains_key(&node))
+                    .map(|[top, right, bottom, left]| {
+                        snap_to_device_pixels(
+                            CssRect::new(
+                                fragment.x + piece.x - left,
+                                fragment.y + piece.y - top,
+                                piece.box_width + left + right,
+                                piece.box_height + top + bottom,
+                            ),
+                            ratio,
+                        )
+                    });
+                if let Some(rect) = inline_border {
+                    paint_atomic_box(
+                        builder,
+                        fragment,
+                        node,
+                        rect,
+                        piece.item.link.clone(),
+                        false,
+                    );
+                }
                 let border = builder
                     .replaced_border_boxes
                     .get(&node)
                     .copied()
+                    .or(inline_border)
                     .unwrap_or(content);
                 let radii = (style_node != NO_NODE)
                     .then(|| border_radii(builder.dom, PaintStyle::Element(style_node), border));
@@ -2259,17 +2285,20 @@ fn intersect_css_rects(existing: Option<CssRect>, rect: CssRect) -> Option<CssRe
     Some(CssRect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)))
 }
 
-/// Direct `<input>` controls are atomic pieces inside an anonymous line box,
-/// but CSS backgrounds, borders, shadows, outlines, and pointer hit testing
-/// apply to their complete replaced-element border box just as they do to a
-/// normal fragment (CSS UI 4 §7.2 / HTML Rendering §15.5). Reuse the
-/// canonical fragment decorators over a temporary geometry-only fragment.
-fn paint_atomic_control_box(
+/// Direct `<input>` controls and inline-level replaced elements are atomic
+/// pieces inside an anonymous line box, but CSS backgrounds, borders,
+/// shadows, outlines, and pointer hit testing apply to their complete
+/// border box just as they do to a normal fragment (CSS 2 Appendix E step
+/// 7.2.1, CSS UI 4 §7.2 / HTML Rendering §15.5). Reuse the canonical
+/// fragment decorators over a temporary geometry-only fragment; `native`
+/// adds a control's native surface and spin buttons.
+fn paint_atomic_box(
     builder: &mut Builder<'_>,
     parent: &Frag,
     node: NodeId,
     rect: CssRect,
     link: Option<crate::doc::Link>,
+    native: bool,
 ) {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
@@ -2304,7 +2333,9 @@ fn paint_atomic_control_box(
     let shape = rounded_shape(rect, radii);
     let style = PaintStyle::Element(node);
     paint_box_shadows(builder, style, rect, radii, control.border, false);
-    paint_native_control_surface(&control, radii, builder);
+    if native {
+        paint_native_control_surface(&control, radii, builder);
+    }
     if let Some(color) = background_color(builder.dom, node)
         && !color.is_transparent()
     {
@@ -2316,7 +2347,9 @@ fn paint_atomic_control_box(
     paint_background_images(&control, shape, builder, None);
     paint_box_shadows(builder, style, rect, radii, control.border, true);
     paint_borders(&control, radii, builder);
-    paint_number_spin_buttons(&control, builder);
+    if native {
+        paint_number_spin_buttons(&control, builder);
+    }
     if builder.dom.point_hit_testable(node) {
         builder.commands.push(DisplayCommand::HitRegion(HitRegion {
             rect,
