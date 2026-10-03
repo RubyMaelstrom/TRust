@@ -145,7 +145,7 @@ impl UaContext {
     fn of(dom: &Dom, id: NodeId, tag: &str) -> Self {
         match tag {
             "a" | "area" => Self::Link(dom.attr(id, "href").is_some()),
-            "ul" => Self::List(dom.ul_marker_default(id)),
+            "ul" | "menu" | "dir" => Self::List(dom.ul_marker_default(id)),
             "ol" => Self::List(dom.ol_marker_default(id)),
             "input" => Self::Input(dom.ua_input_border_box(id)),
             "summary" => Self::Summary(

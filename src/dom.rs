@@ -5195,7 +5195,7 @@ impl Dom {
             {
                 "monospace"
             }
-            "list-style-type" if tag == "ul" => self.ul_marker_default(id),
+            "list-style-type" if matches!(tag, "ul" | "menu" | "dir") => self.ul_marker_default(id),
             "list-style-type" if tag == "ol" => self.ol_marker_default(id),
             // HTML Rendering #the-details-and-summary-elements: only the
             // first summary child is the disclosure's list-item caption.
@@ -5279,22 +5279,22 @@ impl Dom {
             .find(|value| align.eq_ignore_ascii_case(value))
     }
 
-    /// The default bullet for a `<ul>` by nesting depth, matching browsers:
-    /// disc at the top level, circle one deep, square thereafter. An inner
-    /// list inherits this through `computed_value`, so authors can still
+    /// HTML Rendering #lists: `dir`, `menu` and `ul` default to a disc
+    /// bullet, a circle inside one `dir`/`menu`/`ol`/`ul` ancestor and a
+    /// square inside two or more (an `ol` counts too). Authors can still
     /// override it anywhere.
     fn ul_marker_default(&self, id: NodeId) -> &'static str {
         let mut depth = 0u32;
-        let mut cur = Some(id);
+        let mut cur = self.nodes[id].parent;
         while let Some(c) = cur {
-            if self.tag_name(c) == Some("ul") {
+            if matches!(self.tag_name(c), Some("dir" | "menu" | "ol" | "ul")) {
                 depth += 1;
             }
             cur = self.nodes[c].parent;
         }
         match depth {
-            0 | 1 => "disc",
-            2 => "circle",
+            0 => "disc",
+            1 => "circle",
             _ => "square",
         }
     }
@@ -23387,6 +23387,31 @@ mod tests {
         assert_eq!(css_integer("1.5"), None);
         assert_eq!(css_integer("1e3"), None);
         assert_eq!(css_integer("auto"), None);
+    }
+
+    #[test]
+    fn nested_list_bullets_count_every_list_ancestor() {
+        // HTML Rendering #lists: `:is(dir, menu, ol, ul) :is(dir, menu, ul)`
+        // is a circle and a third level a square, so a `ul` inside an `ol`
+        // (or a `menu` inside a `ul`) is already one level deep.
+        let dom = Dom::parse_document(
+            r#"<ul id=a><li><ol><li><ul id=c></ul></li></ol></li></ul>
+            <ol><li><ul id=b></ul></li></ol><ul><li><menu id=d></menu></li></ul><menu id=e></menu>"#,
+        );
+        for (id, bullet) in [
+            ("a", "disc"),
+            ("b", "circle"),
+            ("c", "square"),
+            ("d", "circle"),
+            ("e", "disc"),
+        ] {
+            assert_eq!(
+                dom.computed_value(dom.get_by_id(id).unwrap(), "list-style-type")
+                    .as_deref(),
+                Some(bullet),
+                "{id}"
+            );
+        }
     }
 
     #[test]
