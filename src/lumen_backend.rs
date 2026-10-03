@@ -33009,6 +33009,45 @@ mod tests {
     }
 
     #[test]
+    fn file_inputs_expose_a_file_list_interface() {
+        // File API #filelist-section and HTML #dom-input-files: FileList is
+        // an exposed, non-constructible interface; a file input returns one
+        // stable (empty) list and other inputs return null. Inertia's router
+        // tests `instanceof FileList` on every link visit.
+        let html = r#"<!doctype html><body><input type=file id=f><input id=t>
+            <script>
+                const f = document.getElementById('f'), t = document.getElementById('t');
+                let ctor;
+                try { new FileList(); ctor = 'constructed'; } catch (e) { ctor = e.constructor.name; }
+                const list = f.files;
+                document.body.dataset.result = [
+                    typeof FileList, ctor, list instanceof FileList, list === f.files,
+                    list.length, list.item(0), list[0], [...list].length,
+                    Object.prototype.toString.call(list), t.files, ({}) instanceof FileList,
+                ].join(',');
+                document.body.innerHTML += '<div id=h contenteditable><p id=c>x</p><p id=n contenteditable=false>y</p></div>';
+                const e = id => document.getElementById(id);
+                document.body.dataset.editable = [e('h').isContentEditable, e('c').isContentEditable,
+                    e('n').isContentEditable, e('f').isContentEditable, e('h').contentEditable,
+                    e('c').contentEditable, e('n').contentEditable].join(',');
+            </script>
+        </body>"#;
+        let (rendered, outcome) =
+            crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            rendered.contains(
+                "data-result=\"function,TypeError,true,true,0,,,0,[object FileList],,false\""
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("data-editable=\"true,true,false,false,true,inherit,false\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn diagnostic_snapshot_waits_for_async_scripts_but_not_unsettled_module_promises() {
         let html = r#"<!doctype html><body>
             <script>

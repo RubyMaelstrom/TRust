@@ -11605,6 +11605,86 @@
     g.File = class File extends g.Blob {
         constructor(parts, name, opts) { super(parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
     };
+    // File API #filelist-section: a static, indexed list of File objects,
+    // not constructible by script. TRust has no file chooser yet, so a file
+    // input's selected files stay empty. Libraries test `instanceof FileList`
+    // while preparing requests (Inertia's router does on every visit), so a
+    // missing interface aborted their link navigation with a ReferenceError.
+    const FILE_LIST_FILES = new WeakMap();
+    const fileListToken = Symbol("FileList");
+    const fileListFiles = (list) => {
+        const files = FILE_LIST_FILES.get(list);
+        if (!files) throw new TypeError("Illegal invocation");
+        return files;
+    };
+    class FileList {
+        constructor(...args) {
+            if (args[0] !== fileListToken) throw new TypeError("Illegal constructor");
+            const files = Array.from(args[1] || []);
+            FILE_LIST_FILES.set(this, files);
+            files.forEach((file, index) => Object.defineProperty(this, index, {
+                value: file, enumerable: true, configurable: true,
+            }));
+        }
+        get length() { return fileListFiles(this).length; }
+        item(index) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            const files = fileListFiles(this);
+            index = index >>> 0;
+            return index < files.length ? files[index] : null;
+        }
+        get [Symbol.toStringTag]() { return "FileList"; }
+    }
+    // Web IDL #es-iterator: an indexed getter with an integer `length`
+    // iterates like an Array.
+    Object.defineProperty(FileList.prototype, Symbol.iterator, {
+        value: Array.prototype[Symbol.iterator], writable: true, configurable: true,
+    });
+    g.FileList = FileList;
+    // HTML #dom-input-files: a file input exposes its selected files as one
+    // FileList object (null for other types); setting it to a FileList
+    // replaces the selection.
+    // HTML #dom-iscontenteditable and #dom-contenteditable: an element is
+    // editable inside an editing host, unless a `contenteditable=false`
+    // boundary intervenes. Inertia's link interception also reads
+    // `event.target.isContentEditable`.
+    Object.defineProperty(g.HTMLElement.prototype, "isContentEditable", {
+        get() { return editingHostOf(this) !== null || g.document?.designMode === "on"; },
+        enumerable: true, configurable: true,
+    });
+    Object.defineProperty(g.HTMLElement.prototype, "contentEditable", {
+        get() {
+            if (!this.hasAttribute("contenteditable")) return "inherit";
+            const value = this.getAttribute("contenteditable").toLowerCase();
+            if (value === "" || value === "true") return "true";
+            if (value === "false" || value === "plaintext-only") return value;
+            return "inherit";
+        },
+        set(value) {
+            const lower = String(value).toLowerCase();
+            if (lower === "inherit") this.removeAttribute("contenteditable");
+            else if (lower === "true" || lower === "false" || lower === "plaintext-only") this.setAttribute("contenteditable", lower);
+            else throw new DOMException("contentEditable must be true, false, plaintext-only or inherit", "SyntaxError");
+        },
+        enumerable: true, configurable: true,
+    });
+    const INPUT_FILE_LISTS = new WeakMap();
+    Object.defineProperty(g.HTMLInputElement.prototype, "files", {
+        get() {
+            requireHTMLInterface(this, ["input"]);
+            if (this.type !== "file") return null;
+            let list = INPUT_FILE_LISTS.get(this);
+            if (!list) INPUT_FILE_LISTS.set(this, list = new FileList(fileListToken, []));
+            return list;
+        },
+        set(value) {
+            requireHTMLInterface(this, ["input"]);
+            if (this.type !== "file" || value === null) return;
+            if (!(value instanceof FileList)) throw new TypeError("files must be a FileList");
+            INPUT_FILE_LISTS.set(this, value);
+        },
+        enumerable: true, configurable: true,
+    });
     // Text -> its UTF-8 bytes as a binary (latin1) string, so btoa() and
     // ArrayBuffer views see real bytes (not surrogate-pair chars).
     const utf8Binary = (s) => {
