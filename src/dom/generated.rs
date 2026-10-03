@@ -405,6 +405,49 @@ fn ensure(
         starts,
     )
 }
+/// CSS Lists 3 #list-item-counter: `list-item` values should reflect the
+/// host language's numbering, and HTML #ordinal-value numbers an `li` among
+/// the items of its nearest list ancestor. A list that is a misnested
+/// sibling of `li` elements (`<ol><li>..</li><ul>..</ul><li>`) would instead
+/// lend its counter to the following items under the sibling-scope rule of
+/// #inheriting-counters, so an element that increments or sets `list-item`
+/// without resetting it uses the counter of its nearest ancestor that
+/// resets it. Gecko does the same pending csswg-drafts#5477
+/// (nsCounterList::SetScope).
+fn list_item_ancestor_scope(
+    state: &mut std::rc::Rc<Vec<usize>>,
+    counters: &[Counter],
+    events: &[Event],
+    event_id: usize,
+) {
+    let mut ancestor = events[event_id].parent;
+    while let Some(index) = ancestor {
+        if events[index].reset.iter().any(|c| c.name == "list-item") {
+            break;
+        }
+        ancestor = events[index].parent;
+    }
+    let Some(ancestor) = ancestor else {
+        return;
+    };
+    let Some(position) = state
+        .iter()
+        .rposition(|&i| counters[i].name == "list-item" && counters[i].creator == ancestor)
+    else {
+        return;
+    };
+    if state[position + 1..]
+        .iter()
+        .any(|&i| counters[i].name == "list-item")
+    {
+        let state = std::rc::Rc::make_mut(state);
+        let mut index = 0;
+        state.retain(|&i| {
+            index += 1;
+            index <= position + 1 || counters[i].name != "list-item"
+        });
+    }
+}
 fn quotes(dom: &Dom, event: &Event) -> Vec<(String, String)> {
     let raw = event
         .pseudo
@@ -456,6 +499,16 @@ fn run(dom: &Dom, events: &[Event], starts: Option<&[i64]>) -> (Generated, Vec<i
         let mut state = source.map(|i| states[i].clone()).unwrap_or_default();
         for change in &event.reset {
             instantiate(&mut state, &mut counters, events, event_id, change, starts);
+        }
+        if (event.list_item
+            || event
+                .increment
+                .iter()
+                .chain(&event.set)
+                .any(|c| c.name == "list-item"))
+            && !event.reset.iter().any(|c| c.name == "list-item")
+        {
+            list_item_ancestor_scope(&mut state, &counters, events, event_id);
         }
         let mut increments = event.increment.clone();
         if event.list_item && !increments.iter().any(|c| c.name == "list-item") {
@@ -688,6 +741,37 @@ mod tests {
             dom.take_dirty_targets().is_none(),
             "counter dependencies require full relayout"
         );
+    }
+    #[test]
+    fn misnested_lists_do_not_lend_their_counter_to_following_items() {
+        // CSS Lists 3 #list-item-counter and HTML #ordinal-value: the items
+        // after a `ul` that is a direct child of an `ol` (tw33dlieweenie.
+        // neocities.org's menu) continue the `ol`'s numbering, as in Gecko
+        // and Blink. An item resetting `list-item` itself starts its own
+        // counter, which the next item does not inherit (Gecko: X, IX).
+        let dom = Dom::parse_document(
+            r#"<ol><li id=a></li><li></li><li id=c></li>
+            <ul><li></li><li></li><li></li><li id=d></li></ul>
+            <li id=e></li><li></li><li></li><li id=h></li><ul><li id=i></li></ul>
+            <li id=k></li><li id=m style="counter-reset:list-item 9"></li><li id=n></li></ol>"#,
+        );
+        for (id, value) in [
+            ("a", 1),
+            ("c", 3),
+            ("d", 4),
+            ("e", 4),
+            ("h", 7),
+            ("i", 1),
+            ("k", 8),
+            ("m", 10),
+            ("n", 9),
+        ] {
+            assert_eq!(
+                dom.generated_values().list_items[&dom.get_by_id(id).unwrap()],
+                value,
+                "{id}"
+            );
+        }
     }
     #[test]
     fn generated_reversed_counters_quotes_and_custom_styles() {
