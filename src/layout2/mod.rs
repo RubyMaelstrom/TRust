@@ -11651,6 +11651,37 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn collapsed_row_groups_and_column_groups_take_part_in_conflicts() {
+        // CSS 2.2 §17.6.2.1: row groups and column groups paint no border
+        // boxes in this model, but their borders compete at the grid edges
+        // their own edges lie on (§17.5: in this model those are grid
+        // lines): the colgroup's 6px around its two columns, the first
+        // tbody's 4px around its row. Interior edges keep the cells' 1px.
+        let (dom, boxes) = collapsed_fixture(
+            r#"<style>table{border-collapse:collapse}
+            td{padding:0;width:10px;height:10px;border:1px solid}</style>
+            <table id=t><colgroup style="border:6px solid"><col><col></colgroup><col>
+            <tbody style="border:4px solid"><tr><td id=a></td><td id=b></td><td id=c></td></tr></tbody>
+            <tbody><tr><td id=d></td><td id=e></td><td id=f></td></tr></tbody></table>"#,
+        );
+        let table = *rect(&dom, &boxes, "t");
+        let at = |id: &str| {
+            let cell = rect(&dom, &boxes, id);
+            (cell.left - table.left, cell.top - table.top)
+        };
+        // Left 6/2; columns 3 + 10 + 0.5, 0.5 + 10 + 3, then 3 + 10 + 4/2.
+        assert_eq!(at("a"), (3., 3.));
+        assert_eq!(at("b"), (16.5, 3.));
+        assert_eq!(at("c"), (30., 3.));
+        // Rows 3 + 10 + 4/2, then 2 + 10 + 6/2.
+        assert_eq!(at("d"), (3., 18.));
+        assert_eq!(
+            (table.width, table.height),
+            (3. + 13.5 + 13.5 + 15. + 2., 3. + 15. + 15. + 3.)
+        );
+    }
+
+    #[test]
     fn collapsed_spanning_cells_take_their_widest_edge() {
         // CSS 2.2 §17.6.2.1 resolves each grid edge segment separately; a
         // cell spanning two rows holds half the widest of the collapsed
