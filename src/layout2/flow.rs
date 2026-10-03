@@ -2911,8 +2911,11 @@ impl Flow<'_> {
                 if k + 1 < n {
                     run += between + gap_main;
                 }
+                // CSS Flexbox 1 #flex-direction-property: reversing swaps
+                // main-start and main-end, not the item's physical margins;
+                // its left margin still lies on its left side.
                 fi[i].border_x = if fs.reverse {
-                    content_w - (margin_x + outer_full) + mr
+                    content_w - (margin_x + outer_full) + ml
                 } else {
                     margin_x + ml
                 };
@@ -3329,8 +3332,9 @@ impl Flow<'_> {
                 if k + 1 < n {
                     run += between + gap_main;
                 }
+                // As for rows: the top margin stays on the item's top side.
                 fi[i].border_y = if fs.reverse {
-                    main_size - (margin_y + outer_full) + mb
+                    main_size - (margin_y + outer_full) + mt
                 } else {
                     margin_y + mt
                 };

@@ -4963,6 +4963,44 @@ mod tests {
     }
 
     #[test]
+    fn reversed_flex_items_keep_physical_margins_and_writing_mode_alignment() {
+        // CSS Flexbox 1 #flex-direction-property: a reversed container swaps
+        // main-start and main-end, not an item's margins, so a negative
+        // bottom margin still overlaps the container's bottom edge
+        // (uuupah.neocities.org's column-reverse page). CSS Box Alignment 3
+        // #positional-values: `start`/`end` (and `left`/`right` in a row)
+        // name the container's own edges, unlike `flex-start`/`flex-end`.
+        let html = r#"<!doctype html><style>body{margin:0}
+            .f{display:flex;width:300px;height:200px}.i{width:50px;height:30px}</style>
+            <div style="display:flex;flex-direction:column-reverse;width:200px">
+              <div id=a style="height:50px;margin-bottom:-20px"></div><div id=b style="height:30px"></div></div>
+            <div class=f style="flex-direction:row-reverse"><div class=i id=c style="margin:0 30px 0 10px"></div></div>
+            <div class=f style="flex-direction:column-reverse;justify-content:start"><div class=i id=d></div></div>
+            <div class=f style="flex-direction:column-reverse;justify-content:flex-start"><div class=i id=e></div></div>
+            <div class=f style="flex-direction:column-reverse;justify-content:end"><div class=i id=g></div></div>
+            <div class=f style="flex-direction:row-reverse;justify-content:left"><div class=i id=h></div></div>
+            <div class=f style="flex-direction:row-reverse;justify-content:right"><div class=i id=j></div></div>
+            <div class=f style="flex-direction:column;justify-content:right"><div class=i id=k></div></div>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1024.0, &HashMap::new());
+        let offset = |id: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            let parent = dom.node(node).parent.unwrap();
+            let (rect, container) = (layout.boxes[&node], layout.boxes[&parent]);
+            (rect.left - container.left, rect.top - container.top)
+        };
+        assert_eq!(offset("a"), (0.0, 30.0));
+        assert_eq!(offset("b"), (0.0, 0.0));
+        assert_eq!(offset("c"), (220.0, 0.0));
+        assert_eq!(offset("d"), (0.0, 0.0));
+        assert_eq!(offset("e"), (0.0, 170.0));
+        assert_eq!(offset("g"), (0.0, 170.0));
+        assert_eq!(offset("h"), (0.0, 0.0));
+        assert_eq!(offset("j"), (250.0, 0.0));
+        assert_eq!(offset("k"), (0.0, 0.0));
+    }
+
+    #[test]
     fn leading_floats_sit_below_a_margin_collapsing_through_their_parent() {
         // CSS 2 §8.3.1: a parent's top margin collapses with its first in-flow
         // child's through the empty anonymous block holding preceding floats,

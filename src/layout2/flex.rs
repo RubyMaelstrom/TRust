@@ -102,13 +102,26 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     } else {
         (wrap_v.contains("wrap"), false)
     };
+    // CSS Box Alignment 3 #positional-values: `flex-start`/`flex-end` name
+    // the main-start/main-end sides, `start`/`end` the container's own
+    // writing-mode edges, so they swap in a reversed container. `left` and
+    // `right` are physical in a row and behave as `start` in a column.
+    let (start, end) = if reverse {
+        (Justify::End, Justify::Start)
+    } else {
+        (Justify::Start, Justify::End)
+    };
     let justify = match cv("justify-content")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "flex-end" | "end" | "right" => Justify::End,
+        "flex-end" => Justify::End,
+        "start" | "left" => start,
+        "end" => end,
+        "right" if row => end,
+        "right" => start,
         "center" => Justify::Center,
         "space-between" => Justify::Between,
         "space-around" => Justify::Around,
