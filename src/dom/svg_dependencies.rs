@@ -525,6 +525,10 @@ mod tests {
     }
 
     fn warm_matches_cold(dom: &mut Dom) {
+        // Inline SVG sources carry the page's font environment and document
+        // image navigation; a parallel page-load test must not change those
+        // between the warm paint and its cold reconstruction.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
         let base = url::Url::parse("https://example.com/").unwrap();
         let warm = measure(dom);
         let paint = paint_retained_layout(

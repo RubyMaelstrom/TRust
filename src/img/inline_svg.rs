@@ -103,6 +103,8 @@ static NAVIGATION: AtomicU64 = AtomicU64::new(1);
 /// gets a fresh, empty document-image partition. Partitions older than the
 /// retained window are dropped.
 pub(crate) fn begin_document_svg_navigation() {
+    #[cfg(test)]
+    let _inputs = crate::layout2::global_layout_input_change();
     let current = NAVIGATION.fetch_add(1, Ordering::AcqRel) + 1;
     let oldest = current.saturating_sub(RETAINED_NAVIGATIONS);
     let mut store = DOCUMENT_IMAGES
