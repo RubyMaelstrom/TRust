@@ -12554,6 +12554,13 @@ b</xmp></body>"#;
             let d = layout.boxes[&dom.get_by_id("d").unwrap()];
             assert!((d.width - width).abs() < 0.01, "{style}: {}", d.width);
         }
+        // The same through a flex item's own `height:100%` of a definite
+        // 40px row (featherfae.neocities.org's banners; Chromium: 379px).
+        let html = r#"<body style="margin:0"><nav style="display:flex;height:40px;justify-content:center"><div id=d style="height:100%"><img src="i.gif" height=200% style="max-width:100%"></div></nav></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1000.0, &images);
+        let d = layout.boxes[&dom.get_by_id("d").unwrap()];
+        assert!((d.width - 378.67).abs() < 0.01, "flex item: {}", d.width);
     }
 
     #[test]

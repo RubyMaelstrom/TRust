@@ -76,6 +76,39 @@ impl Flow<'_> {
     /// per element from the cascade, so element results are context-free
     /// and memoizable; anonymous boxes use the passed context).
     pub(crate) fn intrinsic_w(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
+        self.intrinsic_w_keyed(b, mode, inl, None)
+    }
+
+    /// `intrinsic_w` for a box whose containing block has the definite
+    /// content height `cb_h`. css-sizing-3 #cyclic-percentage-contribution:
+    /// that basis does not depend on the width being measured, so the box's
+    /// own percentage height resolves against it, and its children's
+    /// percentages against the result (featherfae.neocities.org's
+    /// `height:100%` flex items holding `height=200%` banners).
+    pub(crate) fn intrinsic_w_in(
+        &self,
+        b: &BoxNode,
+        mode: IMode,
+        inl: &InlineStyle,
+        cb_h: Option<f32>,
+    ) -> f32 {
+        let resolved = self.intrinsic_height_basis_in(b, cb_h);
+        if resolved == self.intrinsic_height_basis(b) {
+            self.intrinsic_w(b, mode, inl)
+        } else {
+            self.intrinsic_w_keyed(b, mode, inl, Some(resolved))
+        }
+    }
+
+    /// `height` overrides the box's own height basis; it is part of the
+    /// memo key, and the per-pass memo holds only the context-free results.
+    fn intrinsic_w_keyed(
+        &self,
+        b: &BoxNode,
+        mode: IMode,
+        inl: &InlineStyle,
+        height: Option<Option<f32>>,
+    ) -> f32 {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::Intrinsic);
         // CSS Containment 2 §3.1/§3.2: content cannot contribute to a size
         // container's inline intrinsic size, otherwise queries form a cycle.
@@ -83,6 +116,7 @@ impl Flow<'_> {
             return 0.0;
         }
         if b.node != NO_NODE
+            && height.is_none()
             && let Some(hit) = self.imemo.borrow().get(&(b.node, mode == IMode::Min))
         {
             self.dom
@@ -94,18 +128,21 @@ impl Flow<'_> {
         let request = super::memo::Request {
             node: b,
             parent: inl,
-            constraint: super::memo::Constraint::Intrinsic(mode == IMode::Min),
+            constraint: super::memo::Constraint::Intrinsic(mode == IMode::Min, height),
         };
         let reuse = self.reuse && b.node != NO_NODE;
         if reuse && let Some(value) = self.dom.layout_cache.borrow_mut().intrinsic(&request) {
             let width = value.value;
-            self.imemo
-                .borrow_mut()
-                .insert((b.node, mode == IMode::Min), value);
+            if height.is_none() {
+                self.imemo
+                    .borrow_mut()
+                    .insert((b.node, mode == IMode::Min), value);
+            }
             return width;
         }
         let inputs = super::memo::ReadScope::new(self.dom, reuse);
-        let v = self.intrinsic_w_inner(b, mode, inl);
+        let basis = height.unwrap_or_else(|| self.intrinsic_height_basis(b));
+        let v = self.intrinsic_w_inner(b, mode, inl, basis);
         let value = super::memo::Intrinsic {
             value: v,
             inputs: inputs.finish(),
@@ -116,7 +153,7 @@ impl Flow<'_> {
                 .borrow_mut()
                 .store_intrinsic(&request, &value);
         }
-        if b.node != NO_NODE {
+        if b.node != NO_NODE && height.is_none() {
             self.imemo
                 .borrow_mut()
                 .insert((b.node, mode == IMode::Min), value);
@@ -124,7 +161,13 @@ impl Flow<'_> {
         v
     }
 
-    fn intrinsic_w_inner(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
+    fn intrinsic_w_inner(
+        &self,
+        b: &BoxNode,
+        mode: IMode,
+        inl: &InlineStyle,
+        basis: Option<f32>,
+    ) -> f32 {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::IntrinsicCompute);
         let here = if b.node == NO_NODE {
             inl.with_pseudo(self.dom, b.style.pseudo)
@@ -149,7 +192,6 @@ impl Flow<'_> {
         {
             return 0.0;
         }
-        let basis = self.intrinsic_height_basis(b);
         match &b.content {
             Content::Blocks(kids) => kids
                 .iter()
@@ -280,6 +322,13 @@ impl Flow<'_> {
     /// height would tie the per-element measurement to its context, so it
     /// stays indefinite here, as does an automatic height.
     fn intrinsic_height_basis(&self, b: &BoxNode) -> Option<f32> {
+        self.intrinsic_height_basis_in(b, None)
+    }
+
+    /// `intrinsic_height_basis`, with percentages of the box's min, max and
+    /// preferred heights resolved against its containing block's definite
+    /// content height `cb_h` when there is one.
+    fn intrinsic_height_basis_in(&self, b: &BoxNode, cb_h: Option<f32>) -> Option<f32> {
         let s = &b.style;
         let side = |l: &Len| l.resolve(Some(0.0)).unwrap_or(0.0).max(0.0);
         let edges = s.border[super::style::TOP]
@@ -287,7 +336,7 @@ impl Flow<'_> {
             + side(&s.padding[super::style::TOP])
             + side(&s.padding[super::style::BOTTOM]);
         let content = |l: &Len| {
-            l.resolve(None).map(|v| {
+            l.resolve(cb_h).map(|v| {
                 if s.border_box {
                     (v - edges).max(0.0)
                 } else {
@@ -386,7 +435,7 @@ impl Flow<'_> {
                 if frame {
                     FRAME_DEFAULT_WIDTH
                 } else {
-                    self.intrinsic_w(b, mode, inl)
+                    self.intrinsic_w_in(b, mode, inl, cb_h)
                 }
             });
         // Only an auto width has a ratio here.

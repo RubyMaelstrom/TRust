@@ -2817,7 +2817,7 @@ impl Flow<'_> {
                 }
                 l => l.resolve(Some(content_w)).map(to_content),
             }
-            .unwrap_or_else(|| self.intrinsic_w(it, IMode::Max, inl));
+            .unwrap_or_else(|| self.intrinsic_w_in(it, IMode::Max, inl, def_ch));
             let max_main = match &s.max_width {
                 Len::None => f32::INFINITY,
                 l => intrinsic_main(l)
@@ -2833,7 +2833,7 @@ impl Flow<'_> {
                     if self.scroll_container(it.node) {
                         0.0
                     } else {
-                        let mut v = self.intrinsic_w(it, IMode::Min, inl);
+                        let mut v = self.intrinsic_w_in(it, IMode::Min, inl, def_ch);
                         if let Some(sp) = width_def {
                             v = v.min(sp.max(0.0));
                         }

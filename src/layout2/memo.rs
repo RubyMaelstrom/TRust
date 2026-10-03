@@ -56,7 +56,9 @@ pub(super) struct Intrinsic {
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Constraint {
-    Intrinsic(bool),
+    /// Min- or max-content, and a height basis that overrides the box's
+    /// own when its containing block resolves its percentage height.
+    Intrinsic(bool, Option<Option<f32>>),
     /// CSS 2 §§8.3.1, 9.4.1: normal flow also depends on its incoming
     /// collapsed margins and cursor, not just containing-block dimensions.
     /// Only contexts with no incoming or escaping floats use this key.
@@ -1618,7 +1620,7 @@ pub(super) mod tests {
             let request = Request {
                 node: &root,
                 parent: &large_parent,
-                constraint: Constraint::Intrinsic(true),
+                constraint: Constraint::Intrinsic(true, None),
             };
             cache.store_intrinsic(
                 &request,
