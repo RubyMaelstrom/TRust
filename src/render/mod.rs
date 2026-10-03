@@ -2690,6 +2690,22 @@ pub fn page_element_hits_at(
     scroll: CssPoint,
     point: CssPoint,
 ) -> Vec<PageHit> {
+    chromeless_scene(page, viewport, scroll).page_element_hits_at(point)
+}
+
+/// The graphical frontend's activation hit test ([`Scene::page_hit_at`])
+/// against a page without browser chrome, for frontends that retain no
+/// scene (headless click replay). `point` is viewport-relative.
+pub fn page_activation_hit_at(
+    page: &PagePaint,
+    viewport: CssSize,
+    scroll: CssPoint,
+    point: CssPoint,
+) -> Option<PageHit> {
+    chromeless_scene(page, viewport, scroll).page_hit_at(point)
+}
+
+fn chromeless_scene(page: &PagePaint, viewport: CssSize, scroll: CssPoint) -> Scene {
     let physical = PhysicalSize::new(
         viewport.width.ceil().max(1.0) as u32,
         viewport.height.ceil().max(1.0) as u32,
@@ -2706,7 +2722,7 @@ pub fn page_element_hits_at(
         page_size: CssSize::default(),
     };
     scene.append_page(page, scroll);
-    scene.page_element_hits_at(point)
+    scene
 }
 
 /// Sample HTML's discrete marquee motion. The scroll interval and distance
