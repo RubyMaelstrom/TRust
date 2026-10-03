@@ -11674,6 +11674,27 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn collapsed_top_captions_sit_outside_the_grid_border() {
+        // CSS Tables 3 #drawing-table-backgrounds-and-borders: a caption is
+        // outside the table grid's border. Collapsed borders straddle the
+        // grid lines, so the grid's half border lies between the caption and
+        // the cells, and the caption spans the table's border box.
+        let (dom, boxes) = collapsed_fixture(
+            r#"<style>table{border-collapse:collapse;border:6px solid}
+            td{padding:0;width:20px;height:10px;border:2px solid}
+            caption{height:15px}</style>
+            <table id=t><caption id=cap></caption><tr><td id=a></td></tr></table>"#,
+        );
+        let table = *rect(&dom, &boxes, "t");
+        let caption = rect(&dom, &boxes, "cap");
+        let cell = rect(&dom, &boxes, "a");
+        assert_eq!((caption.left, caption.top), (table.left, table.top));
+        assert_eq!(caption.width, table.width);
+        assert_eq!(cell.top - table.top, 15. + 3.);
+        assert_eq!(table.height, 15. + 3. + 3. + 10. + 3. + 3.);
+    }
+
+    #[test]
     fn css_padding_overrides_cellpadding_per_side() {
         // HTML Rendering #tables-2: `cellpadding` is a presentational hint for
         // each padding longhand, so author CSS overrides only the sides it
