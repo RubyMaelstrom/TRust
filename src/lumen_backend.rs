@@ -5735,6 +5735,16 @@ mod desktop {
                     handle.cmds.try_send(command).unwrap();
                 }
             }
+            // A frame the actor rendered before it received the commands may
+            // still be in flight (common on a loaded machine); let it arrive
+            // before counting what the commands' state produces.
+            let grace = tokio::time::Instant::now() + Duration::from_millis(100);
+            while let Ok(event) = tokio::time::timeout_at(grace, events.recv()).await {
+                assert!(
+                    !matches!(event, Some(PageEvt::Static { .. }) | None),
+                    "animated page retired"
+                );
+            }
             let (mut frames, mut colors) = (0, Vec::new());
             let deadline = tokio::time::Instant::now() + window;
             while let Ok(event) = tokio::time::timeout_at(deadline, events.recv()).await {
