@@ -17461,12 +17461,49 @@ mod tests {
         assert_eq!(probe.unavailable, 0);
     }
 
+    #[test]
+    fn non_isolated_globals_hide_shared_array_buffer() {
+        // HTML #dom-crossoriginisolated and the realm creation steps: a
+        // Window or worker outside a cross-origin isolated agent cluster
+        // reports false and has no global SharedArrayBuffer (Chromium and
+        // Firefox agree).
+        for mut engine in [platform_engine(), worker_platform_engine()] {
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "[typeof SharedArrayBuffer, crossOriginIsolated, \
+                      typeof Object.getOwnPropertyDescriptor(globalThis, 'crossOriginIsolated').get, \
+                      'SharedArrayBuffer' in globalThis].join()"
+                ),
+                "undefined,false,function,false"
+            );
+        }
+    }
+
     fn platform_engine() -> lumen::Engine {
         let clock = Rc::new(RealmClock::new());
         configured_engine(
             HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
             DEFAULT_URL,
         )
+    }
+
+    /// A Window realm whose agent cluster is cross-origin isolated, so it
+    /// keeps SharedArrayBuffer (HTML's realm creation steps).
+    fn isolated_platform_engine() -> lumen::Engine {
+        let clock = Rc::new(RealmClock::new());
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
+            DEFAULT_URL,
+        );
+        eval(
+            &mut engine,
+            "globalThis.__trust_cfg.crossOriginIsolated = true;",
+            "isolation",
+        )
+        .unwrap();
+        eval_platform_prelude(&mut engine).unwrap();
+        engine
     }
 
     fn worker_platform_engine() -> lumen::Engine {
@@ -18848,7 +18885,7 @@ mod tests {
     #[test]
     fn image_data_constructor_and_structured_clone_conformance() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-            let mut engine = platform_engine();
+            let mut engine = isolated_platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             assert_eq!(
@@ -18871,6 +18908,12 @@ mod tests {
             ),
             DEFAULT_URL,
         );
+        eval(
+            &mut engine,
+            "globalThis.__worker_cfg = { crossOriginIsolated: true };",
+            "isolation",
+        )
+        .unwrap();
         eval(&mut engine, crate::js::worker_prelude(), "worker prelude").unwrap();
         assert_eq!(
             string_value(&mut engine, include_str!("fixtures/image_data.mjs")),
@@ -20351,7 +20394,7 @@ mod tests {
     #[ignore = "requires an installed EGL/GLES driver"]
     fn webgl_numeric_lists_use_typed_storage_before_iterators() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-            let mut engine = platform_engine();
+            let mut engine = isolated_platform_engine();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             eval(&mut engine, r#"
@@ -28045,6 +28088,12 @@ mod tests {
                 Rc::new(RealmClock::new()),
             ));
         install_lumen_worker_boundary(&mut engine);
+        eval(
+            &mut engine,
+            "globalThis.__worker_cfg = { crossOriginIsolated: true };",
+            "isolation",
+        )
+        .unwrap();
         eval(
             &mut engine,
             crate::js::worker_prelude(),

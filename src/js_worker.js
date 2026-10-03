@@ -342,6 +342,19 @@
     Object.defineProperty(g, "isSecureContext", {
         configurable: true, enumerable: true, value: !!cfg.secureContext, writable: false,
     });
+    // HTML #dom-crossoriginisolated: the settings object's cross-origin
+    // isolated capability. TRust does not yet isolate agent clusters with
+    // COOP/COEP, so the host never sets cfg.crossOriginIsolated outside
+    // tests. HTML's realm creation steps delete SharedArrayBuffer from the
+    // globals of an agent cluster that is not cross-origin isolated.
+    const crossOriginIsolatedCapability = cfg.crossOriginIsolated === true;
+    Object.defineProperty(g, "crossOriginIsolated", {
+        configurable: true, enumerable: true,
+        get: Object.getOwnPropertyDescriptor({
+            get crossOriginIsolated() { return crossOriginIsolatedCapability; },
+        }, "crossOriginIsolated").get,
+    });
+    if (!crossOriginIsolatedCapability) delete g.SharedArrayBuffer;
 
     // --- navigator (WorkerNavigator), the same honest values as the page ---
     // WHATWG HTML §NavigatorLanguage: languages is a stable FrozenArray and
