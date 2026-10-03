@@ -498,6 +498,11 @@ struct HostState {
     /// embedding page. about:blank/srcdoc inherit their creator's origin.
     window_request_urls: HashMap<u64, url::Url>,
     window_cookie_contexts: HashMap<u64, (usize, url::Url, crate::http::CookieContext)>,
+    /// HTML #concept-settings-object-origin of each Window Realm, by host settings context.
+    /// Opaque origins are created once, so identity (not serialization) decides equality.
+    realm_origins: HashMap<u64, url::Origin>,
+    /// The newest Window Realm created for each navigable container element.
+    frame_contexts: HashMap<usize, u64>,
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
     image_data_slots: Option<Value>,
@@ -596,6 +601,8 @@ impl HostState {
             window_realms: HashMap::new(),
             window_request_urls: HashMap::new(),
             window_cookie_contexts: HashMap::new(),
+            realm_origins: HashMap::new(),
+            frame_contexts: HashMap::new(),
             image_data_slots: None,
             image_bitmap_slots: None,
             canvas_gradient_slots: None,
@@ -625,6 +632,11 @@ impl HostState {
             agent_cluster: NEXT_CLUSTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             test_hooks: TestHooks::default(),
         }
+    }
+
+    fn forget_realm_origin(&mut self, context: u64) {
+        self.realm_origins.remove(&context);
+        self.frame_contexts.retain(|_, owner| *owner != context);
     }
 
     #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
@@ -795,6 +807,8 @@ impl RetainedMemory for HostState {
             window_realms,
             window_request_urls,
             window_cookie_contexts,
+            realm_origins,
+            frame_contexts,
             image_data_slots,
             image_bitmap_slots,
             canvas_gradient_slots,
@@ -1228,6 +1242,15 @@ impl RetainedMemory for HostState {
                                 + context.client.as_ref().map_or(0, |u| u.as_str().len())
                         })
                         .sum::<usize>(),
+            ));
+        }
+        if !realm_origins.is_empty() || !frame_contexts.is_empty() {
+            visitor.opaque_storage(); // url::Origin hosts own unreported heap strings.
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.realm-origins",
+                realm_origins as *const _ as usize,
+                realm_origins.capacity() * std::mem::size_of::<(u64, url::Origin)>()
+                    + frame_contexts.capacity() * std::mem::size_of::<(usize, u64)>(),
             ));
         }
         if !window_request_urls.is_empty() {
@@ -8372,27 +8395,27 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__live_range_register", 1, host_live_range_register),
     ("__live_range_snapshot", 0, host_live_range_snapshot),
     ("__pointer_event_slots", 1, host_pointer_event_slots),
-    ("__canvas_2d", 4, canvas_host::call),
-    ("__webgl", 4, webgl_host::call),
-    ("__dom_create_element", 2, host_create_element),
-    ("__dom_create_element_ns", 4, host_create_element_ns),
-    ("__dom_create_text", 2, host_create_text),
-    ("__dom_create_fragment", 1, host_create_fragment),
+    ("__canvas_2d", 4, guarded_canvas_2d),
+    ("__webgl", 4, guarded_webgl),
+    ("__dom_create_element", 2, guarded_create_element),
+    ("__dom_create_element_ns", 4, guarded_create_element_ns),
+    ("__dom_create_text", 2, guarded_create_text),
+    ("__dom_create_fragment", 1, guarded_create_fragment),
     ("__dom_parse_document", 2, host_parse_document),
     ("__dom_create_document", 1, host_create_document),
     ("__dom_document_content_type", 1, host_document_content_type),
     ("__dom_document_quirks", 1, host_document_quirks),
-    ("__dom_pi_target", 1, host_pi_target),
-    ("__dom_create_comment", 2, host_create_comment),
-    ("__dom_append", 2, host_append),
-    ("__dom_insert_before", 3, host_insert_before),
-    ("__dom_detach", 1, host_detach),
+    ("__dom_pi_target", 1, guarded_pi_target),
+    ("__dom_create_comment", 2, guarded_create_comment),
+    ("__dom_append", 2, guarded_append),
+    ("__dom_insert_before", 3, guarded_insert_before),
+    ("__dom_detach", 1, guarded_detach),
     ("__dom_owner_document", 1, host_owner_document),
-    ("__dom_adopt", 2, host_adopt),
+    ("__dom_adopt", 2, guarded_adopt),
     ("__dom_parent", 1, host_parent),
-    ("__dom_form_owner", 1, host_form_owner),
-    ("__dom_form_named_items", 1, host_form_named_items),
-    ("__dom_window_named_items", 1, host_window_named_items),
+    ("__dom_form_owner", 1, guarded_form_owner),
+    ("__dom_form_named_items", 1, guarded_form_named_items),
+    ("__dom_window_named_items", 1, guarded_window_named_items),
     ("__dom_window_names_epoch", 0, host_window_names_epoch),
     ("__dom_frame_owner", 1, host_frame_owner),
     ("__dom_frame_document", 1, host_frame_document),
@@ -8406,70 +8429,74 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ),
     ("__dom_nodelist_for_each", 4, host_nodelist_for_each),
     ("__dom_contains", 2, host_contains),
-    ("__dom_set_hover", 1, host_set_hover),
-    ("__dom_focus", 2, host_focus),
+    ("__dom_set_hover", 1, guarded_set_hover),
+    ("__dom_focus", 2, guarded_focus),
     ("__dom_fragment_target", 1, host_fragment_target),
     ("__dom_children", 1, host_children),
-    ("__dom_slot_assigned", 1, host_slot_assigned),
-    ("__dom_assigned_slot", 1, host_assigned_slot),
+    ("__dom_slot_assigned", 1, guarded_slot_assigned),
+    ("__dom_assigned_slot", 1, guarded_assigned_slot),
     ("__dom_next", 1, host_next),
     ("__dom_prev", 1, host_prev),
     ("__dom_node_type", 1, host_node_type),
     ("__dom_tag", 1, host_tag),
     ("__dom_namespace", 1, host_namespace),
     ("__dom_element_name", 1, host_element_name),
-    ("__dom_get_attr", 2, host_get_attr),
-    ("__dom_input", 3, host_input),
-    ("__dom_set_attr", 3, host_set_attr),
-    ("__dom_remove_attr", 2, host_remove_attr),
-    ("__dom_attr_names", 1, host_attr_names),
-    ("__dom_text", 1, host_text),
-    ("__dom_set_text", 2, host_set_text),
-    ("__dom_inner_html", 1, host_inner_html),
-    ("__dom_set_inner_html", 2, host_set_inner_html),
-    ("__dom_outer_html", 1, host_outer_html),
-    ("__dom_insert_adjacent", 3, host_insert_adjacent),
-    ("__dom_query", 3, host_query),
-    ("__dom_elements_by_tag", 3, host_elements_by_tag),
-    ("__dom_elements_by_class", 3, host_elements_by_class),
-    ("__dom_matches", 2, host_matches),
-    ("__dom_get_by_id", 1, host_get_by_id),
-    ("__dom_upgrade_candidates", 2, host_upgrade_candidates),
-    ("__dom_ce_candidates", 1, host_ce_candidates),
+    ("__dom_get_attr", 2, guarded_get_attr),
+    ("__dom_input", 3, guarded_input),
+    ("__dom_set_attr", 3, guarded_set_attr),
+    ("__dom_remove_attr", 2, guarded_remove_attr),
+    ("__dom_attr_names", 1, guarded_attr_names),
+    ("__dom_text", 1, guarded_text),
+    ("__dom_set_text", 2, guarded_set_text),
+    ("__dom_inner_html", 1, guarded_inner_html),
+    ("__dom_set_inner_html", 2, guarded_set_inner_html),
+    ("__dom_outer_html", 1, guarded_outer_html),
+    ("__dom_insert_adjacent", 3, guarded_insert_adjacent),
+    ("__dom_query", 3, guarded_query),
+    ("__dom_elements_by_tag", 3, guarded_elements_by_tag),
+    ("__dom_elements_by_class", 3, guarded_elements_by_class),
+    ("__dom_matches", 2, guarded_matches),
+    ("__dom_get_by_id", 1, guarded_get_by_id),
+    ("__dom_upgrade_candidates", 2, guarded_upgrade_candidates),
+    ("__dom_ce_candidates", 1, guarded_ce_candidates),
     ("__dom_wrapper_subtree", 1, host_wrapper_subtree),
     ("__dom_rendering_frames", 1, host_rendering_frames),
-    ("__dom_clone", 2, host_clone),
-    ("__dom_doc_element", 0, host_doc_element),
+    ("__dom_clone", 2, guarded_clone),
+    ("__dom_doc_element", 0, guarded_doc_element),
     ("__html_dda", 0, host_html_dda),
     ("__url_parse", 2, host_url_parse),
     ("__url_set", 3, host_url_set),
-    ("__dom_attach_shadow", 6, host_attach_shadow),
+    ("__dom_attach_shadow", 6, guarded_attach_shadow),
     ("__dom_shadow_info", 1, host_shadow_info),
-    ("__dom_shadow_root", 1, host_shadow_root),
-    ("__dom_adopt_styles", 2, host_adopt_styles),
+    ("__dom_shadow_root", 1, guarded_shadow_root),
+    ("__dom_adopt_styles", 2, guarded_adopt_styles),
     ("__css_parse", 1, host_css_parse),
     ("__css_style", 3, host_css_style),
-    ("__css_sheet", 2, host_css_sheet),
+    ("__css_sheet", 2, guarded_css_sheet),
     ("__css_supports_selector", 1, host_css_supports_selector),
     ("__css_supports_color", 1, host_css_supports_color),
-    ("__dom_template_content", 1, host_template_content),
+    ("__dom_template_content", 1, guarded_template_content),
     ("__http_fetch", 5, host_http_fetch),
     ("__http_navigate", 3, host_http_navigate),
     ("__http_navigate_async", 4, host_http_navigate_async),
     ("__http_fetch_async", 5, host_http_fetch_async),
-    ("__dom_run_injected_script", 1, host_run_injected_script),
-    ("__dom_run_classic_script", 3, host_run_classic_script),
-    ("__dom_fetch_classic_script", 1, host_fetch_classic_script),
+    ("__dom_run_injected_script", 1, guarded_run_injected_script),
+    ("__dom_run_classic_script", 3, guarded_run_classic_script),
+    (
+        "__dom_fetch_classic_script",
+        1,
+        guarded_fetch_classic_script,
+    ),
     ("__dom_allocate_job_context", 0, host_allocate_job_context),
-    ("__dom_create_window_realm", 9, host_create_window_realm),
+    ("__dom_create_window_realm", 9, guarded_create_window_realm),
     ("__dom_set_job_context", 1, host_set_job_context),
     ("__dom_release_job_context", 1, host_release_job_context),
     (
         "__dom_load_injected_stylesheet",
         1,
-        host_load_injected_stylesheet,
+        guarded_load_injected_stylesheet,
     ),
-    ("__dom_preload_link", 1, host_preload_link),
+    ("__dom_preload_link", 1, guarded_preload_link),
     ("__ws_open", 2, host_ws_open),
     ("__ws_send", 3, host_ws_send),
     ("__ws_close", 3, host_ws_close),
@@ -8478,20 +8505,20 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__worker_terminate", 1, host_worker_terminate),
     ("__worker_self_post", 1, host_worker_self_post),
     ("__worker_self_close", 0, host_worker_self_close),
-    ("__dom_computed", 2, host_computed_style),
+    ("__dom_computed", 2, guarded_computed_style),
     ("__dom_transition_events", 0, host_transition_events),
     ("__dom_animation_events", 0, host_animation_events),
-    ("__dom_offset_style", 1, host_offset_style),
-    ("__image_current_src", 1, host_image_current_src),
-    ("__image_complete", 1, host_image_complete),
-    ("__media_failed", 2, host_media_failed),
+    ("__dom_offset_style", 1, guarded_offset_style),
+    ("__image_current_src", 1, guarded_image_current_src),
+    ("__image_complete", 1, guarded_image_complete),
+    ("__media_failed", 2, guarded_media_failed),
     ("__match_media", 3, host_match_media),
-    ("__dom_rect", 1, host_rect),
+    ("__dom_rect", 1, guarded_rect),
     ("__geometry_bind", 2, geometry_host::bind),
-    ("__dom_elements_from_point", 5, host_elements_from_point),
-    ("__dom_scroll_get", 2, host_scroll_get),
-    ("__dom_scroll_set", 3, host_scroll_set),
-    ("__dom_load_frame", 3, host_load_frame),
+    ("__dom_elements_from_point", 5, guarded_elements_from_point),
+    ("__dom_scroll_get", 2, guarded_scroll_get),
+    ("__dom_scroll_set", 3, guarded_scroll_set),
+    ("__dom_load_frame", 3, guarded_load_frame),
     ("__cookie_get", 3, host_cookie_get),
     ("__cookie_set", 4, host_cookie_set),
     ("__clock_now", 0, host_clock_now),
@@ -8515,8 +8542,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__text_decode_utf8", 3, host_text_decode_utf8),
     ("__body_buffer", 1, host_body_buffer),
     ("__base64_convert", 2, host_base64_convert),
-    ("__dom_popover", 2, host_dom_popover),
-    ("__dom_dialog_modal", 2, host_dom_dialog_modal),
+    ("__dom_popover", 2, guarded_popover),
+    ("__dom_dialog_modal", 2, guarded_dialog_modal),
     ("__wasm_validate", 1, lumen_wasm::host_validate),
     ("__wasm_compile", 1, lumen_wasm::host_compile),
     ("__wasm_module_imports", 1, lumen_wasm::host_module_imports),
@@ -8934,6 +8961,282 @@ fn host_arg_node(dom: &Dom, args: &[Value], index: usize) -> Option<usize> {
     let number = args.get(index)?.as_num_opt()?;
     let id = number as usize;
     (number.is_finite() && number >= 0.0 && number.fract() == 0.0 && dom.is_valid(id)).then_some(id)
+}
+
+/// The origin of a Window Realm's environment settings object. The top-level Window's is
+/// derived (once) from its creation URL; child Window Realms record theirs when created.
+fn realm_origin(state: &mut HostState, context: u64) -> url::Origin {
+    realm_origin_ref(state, context).clone()
+}
+
+fn realm_origin_ref(state: &mut HostState, context: u64) -> &url::Origin {
+    if !state.realm_origins.contains_key(&context) {
+        let origin = state
+            .window_request_urls
+            .get(&context)
+            .unwrap_or(&state.base)
+            .origin();
+        state.realm_origins.insert(context, origin);
+    }
+    &state.realm_origins[&context]
+}
+
+/// The Window Realm whose Document contains `node`: the top-level Document belongs to context
+/// zero and a navigable's Document to the newest Realm created for its container. Documents
+/// outside any navigable (DOMParser, templates, createDocument) have none.
+fn node_window_context(state: &HostState, dom: &Dom, node: usize) -> Option<u64> {
+    let document = if matches!(dom.node(node).data, NodeData::Document) {
+        node
+    } else {
+        dom.owner_document(node)?
+    };
+    if document == DOCUMENT {
+        return Some(0);
+    }
+    let container = dom.node(document).parent?;
+    state.frame_contexts.get(&container).copied()
+}
+
+/// Defense in depth for DOM host operations (HTML #same-origin-domain, applied as
+/// IsPlatformObjectSameOrigin would to the node's relevant settings object): the calling
+/// Window Realm may act on a node only when the node's Document is same origin-domain with it.
+/// `document.domain` has no effect in TRust, so every origin's domain is null and this is the
+/// same-origin check. A Realm may also administer its own navigable container element.
+fn node_accessible(state: &mut HostState, dom: &Dom, caller: u64, node: usize) -> bool {
+    let Some(target) = node_window_context(state, dom, node) else {
+        return true;
+    };
+    if target == caller
+        || state
+            .window_cookie_contexts
+            .get(&caller)
+            .is_some_and(|(container, _, _)| *container == node)
+    {
+        return true;
+    }
+    realm_origin_ref(state, target);
+    realm_origin_ref(state, caller);
+    state.realm_origins.get(&caller) == state.realm_origins.get(&target)
+}
+
+/// Bit `i` is set when the node id at `indices[i]` names a node the calling Realm may not
+/// access. A page with one Window Realm, and a worker, take the fast path.
+fn inaccessible_node_arguments(
+    ctx: &mut Ctx,
+    operation: &str,
+    args: &[Value],
+    indices: &[usize],
+) -> u32 {
+    let caller = ctx.host_job_context();
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return 0;
+    };
+    if state.window_realms.is_empty() {
+        return 0;
+    }
+    let handle = state.dom.clone();
+    let Ok(dom) = handle.try_borrow() else {
+        return 0;
+    };
+    let mut denied = 0;
+    for (bit, &index) in indices.iter().enumerate() {
+        if let Some(node) = host_arg_node(&dom, args, index)
+            && !node_accessible(state, &dom, caller, node)
+        {
+            if std::env::var_os("TRUST_TRACE_NODE_ACCESS").is_some() {
+                eprintln!("[node-access] {operation}: context {caller} denied node {node}");
+            }
+            denied |= 1 << bit;
+        }
+    }
+    denied
+}
+
+/// How a guarded DOM host operation treats a node the calling Realm may not access.
+#[derive(Clone, Copy)]
+enum NodeDenial {
+    /// Substitute an invalid id: the operation behaves as for a stale or missing node.
+    Invalidate,
+    /// The operation would otherwise fall back to the top-level Document; refuse it.
+    Throw,
+}
+
+fn guard_node_arguments(
+    ctx: &mut Ctx,
+    this: Value,
+    args: &[Value],
+    (name, indices, denial): (&str, &[usize], NodeDenial),
+    operation: NativeFn,
+) -> Result<Value, Value> {
+    let denied = inaccessible_node_arguments(ctx, name, args, indices);
+    if denied == 0 {
+        return operation(ctx, this, args);
+    }
+    match denial {
+        NodeDenial::Throw => Err(ctx.make_error(
+            "SecurityError",
+            "the node belongs to a cross-origin Document",
+        )),
+        NodeDenial::Invalidate => {
+            let mut args = args.to_vec();
+            for (bit, &index) in indices.iter().enumerate() {
+                if denied & (1 << bit) != 0 {
+                    args[index] = Value::Num(f64::NAN);
+                }
+            }
+            operation(ctx, this, &args)
+        }
+    }
+}
+
+/// Wrap content-bearing DOM host operations: their node-id arguments must be accessible to the
+/// calling Window Realm. Structural queries the platform needs to route native input across
+/// navigables (parent, children, node type and name, owner/frame Document) stay unguarded.
+macro_rules! node_access_guards {
+    ($($guard:ident = $operation:path, [$($index:literal),*], $denial:ident;)*) => {
+        $(
+            fn $guard(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+                let guard = (stringify!($operation), &[$($index),*][..], NodeDenial::$denial);
+                guard_node_arguments(ctx, this, args, guard, $operation)
+            }
+        )*
+    };
+}
+
+node_access_guards! {
+    guarded_create_element = host_create_element, [1], Throw;
+    guarded_create_element_ns = host_create_element_ns, [3], Throw;
+    guarded_create_text = host_create_text, [1], Throw;
+    guarded_create_comment = host_create_comment, [1], Throw;
+    guarded_create_fragment = host_create_fragment, [0], Throw;
+    guarded_elements_from_point = host_elements_from_point, [0], Throw;
+    guarded_append = host_append, [0, 1], Invalidate;
+    guarded_insert_before = host_insert_before, [0, 1, 2], Invalidate;
+    guarded_adopt = host_adopt, [0, 1], Invalidate;
+    guarded_clone = host_clone, [0], Invalidate;
+    guarded_get_attr = host_get_attr, [0], Invalidate;
+    guarded_set_attr = host_set_attr, [0], Invalidate;
+    guarded_remove_attr = host_remove_attr, [0], Invalidate;
+    guarded_attr_names = host_attr_names, [0], Invalidate;
+    guarded_text = host_text, [0], Invalidate;
+    guarded_set_text = host_set_text, [0], Invalidate;
+    guarded_inner_html = host_inner_html, [0], Invalidate;
+    guarded_set_inner_html = host_set_inner_html, [0], Invalidate;
+    guarded_outer_html = host_outer_html, [0], Invalidate;
+    guarded_insert_adjacent = host_insert_adjacent, [0], Invalidate;
+    guarded_query = host_query, [0], Invalidate;
+    guarded_elements_by_tag = host_elements_by_tag, [0], Invalidate;
+    guarded_elements_by_class = host_elements_by_class, [0], Invalidate;
+    guarded_matches = host_matches, [0], Invalidate;
+    guarded_upgrade_candidates = host_upgrade_candidates, [0], Invalidate;
+    guarded_ce_candidates = host_ce_candidates, [0], Invalidate;
+    guarded_input = host_input, [0], Invalidate;
+    guarded_computed_style = host_computed_style, [0], Invalidate;
+    guarded_offset_style = host_offset_style, [0], Invalidate;
+    guarded_rect = host_rect, [0], Invalidate;
+    guarded_scroll_get = host_scroll_get, [0], Invalidate;
+    guarded_scroll_set = host_scroll_set, [0], Invalidate;
+    guarded_set_hover = host_set_hover, [0], Invalidate;
+    guarded_focus = host_focus, [0, 1], Invalidate;
+    guarded_popover = host_dom_popover, [0], Invalidate;
+    guarded_dialog_modal = host_dom_dialog_modal, [0], Invalidate;
+    guarded_template_content = host_template_content, [0], Invalidate;
+    guarded_shadow_root = host_shadow_root, [0], Invalidate;
+    guarded_attach_shadow = host_attach_shadow, [0], Invalidate;
+    guarded_adopt_styles = host_adopt_styles, [0], Invalidate;
+    guarded_slot_assigned = host_slot_assigned, [0], Invalidate;
+    guarded_assigned_slot = host_assigned_slot, [0], Invalidate;
+    guarded_form_owner = host_form_owner, [0], Invalidate;
+    guarded_form_named_items = host_form_named_items, [0], Invalidate;
+    guarded_window_named_items = host_window_named_items, [0], Invalidate;
+    guarded_pi_target = host_pi_target, [0], Invalidate;
+    guarded_css_sheet = host_css_sheet, [0], Invalidate;
+    guarded_image_current_src = host_image_current_src, [0], Invalidate;
+    guarded_image_complete = host_image_complete, [0], Invalidate;
+    guarded_media_failed = host_media_failed, [0], Invalidate;
+    guarded_load_frame = host_load_frame, [0], Invalidate;
+    guarded_create_window_realm = host_create_window_realm, [1], Invalidate;
+    guarded_run_injected_script = host_run_injected_script, [0], Invalidate;
+    guarded_run_classic_script = host_run_classic_script, [0], Invalidate;
+    guarded_fetch_classic_script = host_fetch_classic_script, [0], Invalidate;
+    guarded_load_injected_stylesheet = host_load_injected_stylesheet, [0], Invalidate;
+    guarded_preload_link = host_preload_link, [0], Invalidate;
+}
+
+/// Detaching a navigable's Document is its container's operation (HTML #destroy-a-child-
+/// navigable), so the embedder may detach a cross-origin child Document but nothing inside it.
+fn guarded_detach(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let container = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)
+            .filter(|&node| matches!(dom.node(node).data, NodeData::Document))
+            .and_then(|document| dom.node(document).parent)
+            .filter(|&parent| matches!(dom.tag_name(parent), Some("iframe" | "frame")))
+    };
+    match container {
+        Some(container) => {
+            let checked = [Value::Num(container as f64)];
+            if inaccessible_node_arguments(ctx, "host_detach", &checked, &[0]) != 0 {
+                return Ok(Value::Undefined);
+            }
+            host_detach(ctx, this, args)
+        }
+        None => {
+            let guard = ("host_detach", &[0][..], NodeDenial::Invalidate);
+            guard_node_arguments(ctx, this, args, guard, host_detach)
+        }
+    }
+}
+
+/// Canvas and WebGL operations take a canvas element id, or zero for agent-wide operations
+/// (private slots, capability probes). Zero names a Document, never a canvas, so it is not a
+/// node argument here.
+fn guarded_canvas_operation(
+    ctx: &mut Ctx,
+    this: Value,
+    args: &[Value],
+    name: &str,
+    operation: NativeFn,
+) -> Result<Value, Value> {
+    if args.first().and_then(Value::as_num_opt) == Some(DOCUMENT as f64) {
+        return operation(ctx, this, args);
+    }
+    guard_node_arguments(
+        ctx,
+        this,
+        args,
+        (name, &[0], NodeDenial::Invalidate),
+        operation,
+    )
+}
+
+fn guarded_canvas_2d(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    guarded_canvas_operation(ctx, this, args, "canvas_host::call", canvas_host::call)
+}
+
+fn guarded_webgl(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    guarded_canvas_operation(ctx, this, args, "webgl_host::call", webgl_host::call)
+}
+
+/// Operations that implicitly address the top-level Document.
+fn top_document_accessible(ctx: &mut Ctx, operation: &str) -> bool {
+    let checked = [Value::Num(DOCUMENT as f64)];
+    inaccessible_node_arguments(ctx, operation, &checked, &[0]) == 0
+}
+
+fn guarded_get_by_id(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if !top_document_accessible(ctx, "host_get_by_id") {
+        return Ok(Value::Null);
+    }
+    host_get_by_id(ctx, this, args)
+}
+
+fn guarded_doc_element(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    if !top_document_accessible(ctx, "host_doc_element") {
+        return Ok(Value::Null);
+    }
+    host_doc_element(ctx, this, args)
 }
 
 fn host_arg_string(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
@@ -10333,13 +10636,15 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     let url = host_arg_string(ctx, args, 2);
     let parent_cookie_context = request_cookie_context(ctx);
     let creator_url = request_client_url(ctx);
+    let creator_context = ctx.host_job_context();
     let parsed_url = url::Url::parse(&url).unwrap_or_else(|_| creator_url.clone());
-    let client_url =
-        if parsed_url.scheme() == "about" && matches!(parsed_url.path(), "blank" | "srcdoc") {
-            creator_url
-        } else {
-            parsed_url
-        };
+    let inherits_origin =
+        parsed_url.scheme() == "about" && matches!(parsed_url.path(), "blank" | "srcdoc");
+    let client_url = if inherits_origin {
+        creator_url
+    } else {
+        parsed_url.clone()
+    };
     let cookie_opaque = host_dom(ctx)
         .borrow()
         .attr(frame_id, "sandbox")
@@ -10391,6 +10696,18 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     // published through the iframe element.
     if let Some(state) = ctx.host_mut::<HostState>() {
         state.window_realms.insert(context, realm.clone());
+        // HTML #determining-the-origin: about:blank and about:srcdoc inherit their creator's
+        // origin; a sandboxed browsing context without allow-same-origin gets a fresh opaque
+        // origin; other URLs use their own (blob: URLs their creator's; data: a new opaque one).
+        let origin = if cookie_opaque {
+            url::Origin::new_opaque()
+        } else if inherits_origin {
+            realm_origin(state, creator_context)
+        } else {
+            parsed_url.origin()
+        };
+        state.realm_origins.insert(context, origin);
+        state.frame_contexts.insert(frame_id, context);
         let mut cookie_context = crate::http::CookieContext::subresource(&client_url);
         cookie_context
             .top_level_site
@@ -10501,6 +10818,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 state.window_realms.remove(&context);
                 state.window_request_urls.remove(&context);
                 state.window_cookie_contexts.remove(&context);
+                state.forget_realm_origin(context);
             }
             return Err(error);
         }
@@ -10533,6 +10851,7 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         state.message_ports.release(Some(context));
         state.window_request_urls.remove(&context);
         state.window_cookie_contexts.remove(&context);
+        state.forget_realm_origin(context);
         if let Some(network) = state.network.as_mut() {
             network
                 .pending_fetches
@@ -19825,6 +20144,149 @@ mod tests {
             matches!(reached, Value::Bool(false)),
             "child Realm reachable"
         );
+    }
+
+    #[test]
+    fn dom_host_operations_refuse_nodes_of_cross_origin_documents() {
+        // Defense in depth below the private prelude (HTML #same-origin-domain): a Window
+        // Realm's DOM host operations act only on nodes whose Document is same origin-domain
+        // with it, whatever node id reaches the boundary. Containers stay administrable.
+        let mut engine = sealed_platform_engine("https://top.example/");
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            body.appendChild(document.createElement('p')).textContent = 'TOP-SECRET';
+            const cross = document.createElement('iframe');
+            cross.src = 'data:text/html,<p>CROSS-SECRET</p>';
+            const same = document.createElement('iframe');
+            same.srcdoc = '<p>SAME-TEXT</p>';
+            body.append(cross, same);
+            "#,
+            "frame setup",
+        )
+        .unwrap_or_else(|_| panic!("host operation threw"));
+        call_trust_method(&mut engine, "hydrateFrames", &[]);
+        let (frames, documents, realms) = {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let dom = state.dom.clone();
+            let dom = dom.borrow();
+            let frames: Vec<usize> = dom
+                .descendants(DOCUMENT)
+                .filter(|&node| dom.tag_name(node) == Some("iframe"))
+                .collect();
+            let documents: Vec<usize> = frames
+                .iter()
+                .map(|&frame| dom.frame_document(frame).expect("child Document"))
+                .collect();
+            let realms: Vec<Value> = frames
+                .iter()
+                .map(|frame| state.window_realms[&state.frame_contexts[frame]].clone())
+                .collect();
+            (frames, documents, realms)
+        };
+        let id = |node: usize| Value::Num(node as f64);
+        let serialize = |engine: &mut lumen::Engine, node: usize| {
+            let value = guarded_outer_html(engine.ctx(), Value::Undefined, &[id(node)])
+                .unwrap_or_else(|_| panic!("outerHTML threw"));
+            value_string(engine, &value)
+        };
+        // The embedding Window cannot read its cross-origin child's Document...
+        assert!(!serialize(&mut engine, documents[0]).contains("CROSS-SECRET"));
+        // ...but reads a same-origin child's, and administers both containers.
+        assert!(serialize(&mut engine, documents[1]).contains("SAME-TEXT"));
+        let src = guarded_get_attr(
+            engine.ctx(),
+            Value::Undefined,
+            &[id(frames[0]), Value::from_string("src".into())],
+        )
+        .unwrap_or_else(|_| panic!("host operation threw"));
+        assert!(value_string(&mut engine, &src).starts_with("data:"));
+
+        let cross_reads = engine
+            .with_embed_realm(&realms[0], |engine| {
+                let top = serialize(engine, DOCUMENT);
+                let own = serialize(engine, documents[0]);
+                let sibling = serialize(engine, documents[1]);
+                let container = guarded_get_attr(
+                    engine.ctx(),
+                    Value::Undefined,
+                    &[id(frames[0]), Value::from_string("src".into())],
+                )
+                .unwrap_or_else(|_| panic!("host operation threw"));
+                let container = value_string(engine, &container);
+                let created = guarded_create_element(
+                    engine.ctx(),
+                    Value::Undefined,
+                    &[Value::from_string("p".into()), id(DOCUMENT)],
+                )
+                .is_err();
+                let by_id = guarded_get_by_id(
+                    engine.ctx(),
+                    Value::Undefined,
+                    &[Value::from_string("x".into())],
+                )
+                .unwrap_or_else(|_| panic!("host operation threw"));
+                (
+                    top,
+                    own,
+                    sibling,
+                    container,
+                    created,
+                    matches!(by_id, Value::Null),
+                )
+            })
+            .unwrap_or_else(|_| panic!("enter the cross-origin child Realm"));
+        assert!(
+            !cross_reads.0.contains("TOP-SECRET"),
+            "child read its embedder"
+        );
+        assert!(
+            cross_reads.1.contains("CROSS-SECRET"),
+            "child reads its own Document"
+        );
+        assert!(
+            !cross_reads.2.contains("SAME-TEXT"),
+            "child read a cross-origin sibling"
+        );
+        assert!(
+            cross_reads.3.starts_with("data:"),
+            "child administers its container"
+        );
+        assert!(
+            cross_reads.4,
+            "creation in a cross-origin Document is refused"
+        );
+        assert!(cross_reads.5, "top-level Document lookups are refused");
+
+        let same_reads = engine
+            .with_embed_realm(&realms[1], |engine| serialize(engine, DOCUMENT))
+            .unwrap_or_else(|_| panic!("enter the same-origin child Realm"));
+        assert!(
+            same_reads.contains("TOP-SECRET"),
+            "same-origin child reads its embedder"
+        );
+
+        // The embedder may detach the cross-origin child Document (destroying the navigable),
+        // but not a node inside it.
+        let inner = {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let dom = state.dom.borrow();
+            dom.descendants(documents[0])
+                .find(|&node| dom.tag_name(node) == Some("p"))
+                .expect("child paragraph")
+        };
+        assert!(guarded_detach(engine.ctx(), Value::Undefined, &[id(inner)]).is_ok());
+        assert!(serialize_native(&mut engine, documents[0]).contains("CROSS-SECRET"));
+        assert!(guarded_detach(engine.ctx(), Value::Undefined, &[id(documents[0])]).is_ok());
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        assert_eq!(state.dom.borrow().node(documents[0]).parent, None);
+    }
+
+    fn serialize_native(engine: &mut lumen::Engine, node: usize) -> String {
+        let state = engine.ctx().host_mut::<HostState>().unwrap();
+        state.dom.borrow().serialize_js(node)
     }
 
     #[test]
