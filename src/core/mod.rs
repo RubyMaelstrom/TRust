@@ -245,6 +245,8 @@ pub enum UserAction {
     /// Client-window origin in CSS pixels, independent of viewport scrolling.
     ScreenPosition(i32, i32),
     Focus(bool),
+    /// The native window became hidden (`true`) or visible again.
+    Occluded(bool),
     PointerMove(CssPoint),
     PointerButton {
         position: CssPoint,
@@ -586,6 +588,8 @@ pub struct BrowserController {
     /// The last `process_async_events` round delivered only CSS animation
     /// frames (see `crate::js::Outcome::animation_frame`).
     animation_frames_only: bool,
+    /// The native window cannot currently be seen.
+    occluded: bool,
     back: Vec<HistoryEntry>,
     forward: Vec<HistoryEntry>,
     pending: Option<PendingNavigation>,
@@ -664,6 +668,7 @@ impl BrowserController {
             rx,
             current: None,
             animation_frames_only: false,
+            occluded: false,
             back: Vec::new(),
             forward: Vec::new(),
             pending: None,
@@ -1127,6 +1132,13 @@ impl BrowserController {
                 let changed = self.interaction.focused != focused;
                 self.interaction.focused = focused;
                 changed
+            }
+            UserAction::Occluded(occluded) => {
+                if self.occluded != occluded {
+                    self.occluded = occluded;
+                    self.send_live(crate::js::PageCmd::Occluded(occluded));
+                }
+                false
             }
             UserAction::PointerMove(point) => {
                 self.interaction.pointer = Some(point);
@@ -2437,6 +2449,9 @@ impl BrowserController {
                         self.screen_position.0,
                         self.screen_position.1,
                     ));
+                    if self.occluded {
+                        self.send_live(crate::js::PageCmd::Occluded(true));
+                    }
                 }
                 if let Some(refresh) = declarative_refresh {
                     self.schedule_declarative_refresh(generation, refresh);

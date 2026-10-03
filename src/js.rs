@@ -405,6 +405,10 @@ pub enum PageCmd {
     Viewport(crate::layout2::Viewport),
     DevicePixelRatio(f32),
     ScreenPosition(i32, i32),
+    /// The native window cannot be seen (minimized or fully covered). Like
+    /// Gecko for an inactive presentation, the actor then requests no frames
+    /// for paint-only CSS animations.
+    Occluded(bool),
 }
 
 impl PageCmd {
