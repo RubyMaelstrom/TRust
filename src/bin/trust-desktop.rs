@@ -8488,6 +8488,9 @@ fn parse_desktop_args(args: impl IntoIterator<Item = String>) -> Result<DesktopO
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Unlike a terminal grid, the graphical desktop animates smoothly, and
+    // its user has stated no motion preference.
+    trust::dom::set_prefers_reduced_motion(false);
     let options = parse_desktop_args(std::env::args().skip(1))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if options.help {

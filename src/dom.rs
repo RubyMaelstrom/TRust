@@ -17798,9 +17798,9 @@ fn media_query_one(q: &str, vp: (f32, f32), density: f32) -> bool {
 /// (`color: 8` — the terminal is truecolor even though the render style is
 /// monochromatic), a CHARACTER GRID (`grid: 1` — the tty case the feature
 /// was specified for), at 1 device pixel per CSS pixel (`resolution:
-/// 1dppx`). The preferences: `prefers-reduced-motion: reduce` (cells can't
-/// animate smoothly) and `prefers-color-scheme: dark` (the terminal
-/// aesthetic).
+/// 1dppx`). The preferences: `prefers-reduced-motion` (see
+/// [`set_prefers_reduced_motion`]) and `prefers-color-scheme: dark` (the
+/// terminal aesthetic).
 fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
     let (vw, vh) = vp;
     let Some((name, value)) = inner.split_once(':') else {
@@ -17816,6 +17816,7 @@ fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
             "aspect-ratio" | "orientation" => vw != 0.0 && vh != 0.0,
             "color" | "color-gamut" | "hover" | "any-hover" | "pointer" | "any-pointer"
             | "update" | "scripting" | "resolution" | "grid" => true,
+            "prefers-reduced-motion" => reduced_motion_matches(None),
             "monochrome" => false,
             _ => false,
         };
@@ -17853,7 +17854,7 @@ fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
         "hover" | "any-hover" => value == "hover",
         "pointer" | "any-pointer" => value == "fine",
         "prefers-color-scheme" => value == color_scheme::PREFERRED.keyword(),
-        "prefers-reduced-motion" => value == "reduce",
+        "prefers-reduced-motion" => reduced_motion_matches(Some(value)),
         "prefers-contrast" => value == "no-preference",
         "forced-colors" => value == "none",
         "color" => num() == Some(8.0),
@@ -17873,6 +17874,33 @@ fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
         "-webkit-min-device-pixel-ratio" => num().is_some_and(|n| n <= density),
         "-webkit-max-device-pixel-ratio" => num().is_some_and(|n| n >= density),
         _ => false,
+    }
+}
+
+static PREFERS_REDUCED_MOTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Media Queries 5 #prefers-reduced-motion for this process. Terminal cells
+/// cannot animate smoothly, so TRust answers `reduce` by default; the
+/// graphical desktop animates and answers `no-preference`. Set it once at
+/// startup, before any document evaluates a media query.
+pub fn set_prefers_reduced_motion(reduce: bool) {
+    PREFERS_REDUCED_MOTION.store(reduce, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(prefers-reduced-motion: value)`, or the boolean context for `None`,
+/// where `no-preference` is false.
+fn reduced_motion_matches(value: Option<&str>) -> bool {
+    reduced_motion_feature(
+        value,
+        PREFERS_REDUCED_MOTION.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn reduced_motion_feature(value: Option<&str>, reduce: bool) -> bool {
+    match value {
+        None => reduce,
+        Some(value) => value == if reduce { "reduce" } else { "no-preference" },
     }
 }
 
