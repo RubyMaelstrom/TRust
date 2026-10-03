@@ -4251,7 +4251,7 @@ fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, Stri
                 .unwrap_or(crate::locale::ACCEPT_LANGUAGE)
                 .into(),
         ),
-        ("Accept-Encoding".into(), "gzip, deflate".into()),
+        ("Accept-Encoding".into(), "gzip, deflate, br, zstd".into()),
     ];
     if GLOBAL_PRIVACY_CONTROL {
         // GPC §3.3: the field value is exactly the single character `1`.
@@ -4878,17 +4878,16 @@ async fn read_to_eof<R: AsyncRead + Unpin>(io: &mut BufReader<R>) -> Result<Vec<
 }
 
 /// Undo `Content-Encoding` on a fully-read body. We advertise the codings we
-/// can decode (`Accept-Encoding: gzip, deflate`) and tolerate servers that
-/// compress regardless; a browser decodes it, so we do too. Layering: this
-/// runs AFTER framing
+/// can decode (`Accept-Encoding: gzip, deflate, br, zstd`) and tolerate
+/// servers that compress regardless; a browser decodes it, so we do too.
+/// Layering: this runs AFTER framing
 /// (Content-Length / dechunking) — `Content-Encoding` is the payload, not
 /// the message framing, so it never affects connection reuse.
 ///
-/// `gzip`/`deflate` only (pure-Rust miniz_oxide via flate2). Brotli/zstd are
-/// left as-is — we don't advertise them, so a compliant server won't send
-/// them; if a misbehaving one does, the parser sees the raw bytes (the best
-/// we can do without those decoders). Truncated streams are tolerated like a
-/// missing TLS close_notify: keep whatever decoded.
+/// All four decoders are pure Rust (miniz_oxide via flate2,
+/// brotli-decompressor, ruzstd). An unknown coding is left as-is: the parser
+/// sees the raw bytes. Truncated streams are tolerated like a missing TLS
+/// close_notify: keep whatever decoded.
 fn decode_content_encoding(headers: &Headers, body: Vec<u8>) -> Vec<u8> {
     let Some(enc) = headers.get("content-encoding") else {
         return body;
@@ -4906,8 +4905,18 @@ fn decode_content_encoding(headers: &Headers, body: Vec<u8>) -> Vec<u8> {
             "identity" => body,
             "gzip" | "x-gzip" => inflate_tolerant(flate2::read::GzDecoder::new(body.as_slice())),
             "deflate" => decode_deflate(&body),
-            // Brotli/zstd/unknown: can't undo it, so stop and hand back what
-            // we have (any remaining leftward codings stay applied).
+            "br" => inflate_tolerant(brotli_decompressor::Decompressor::new(
+                body.as_slice(),
+                16384,
+            )),
+            // RFC 9659 §3: a zstd decoder must accept frames needing up to an
+            // 8 MB window; ruzstd's limit is higher.
+            "zstd" => match ruzstd::decoding::StreamingDecoder::new(body.as_slice()) {
+                Ok(decoder) => inflate_tolerant(decoder),
+                Err(_) => break,
+            },
+            // Unknown: can't undo it, so stop and hand back what we have (any
+            // remaining leftward codings stay applied).
             _ => break,
         };
     }
@@ -17437,7 +17446,7 @@ customElements.define('lit-counter', LitCounter);
             "no duplicate Accept-Language header: {head}"
         );
         assert!(
-            head.contains("Accept-Encoding: gzip, deflate"),
+            head.contains("Accept-Encoding: gzip, deflate, br, zstd\r\n"),
             "supported response compression is advertised: {head}"
         );
         assert!(
@@ -18291,6 +18300,32 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[test]
+    fn decodes_brotli_and_zstd() {
+        // `brotli` and `zstd -19` (reference CLIs) output for the same text.
+        let payload = "hello brotli and zstd world, ".repeat(20).into_bytes();
+        let br = [
+            0xa1, 0x18, 0x12, 0x00, 0x25, 0x6e, 0x63, 0xeb, 0xca, 0xef, 0x9e, 0xc2, 0x13, 0x44,
+            0x41, 0xb9, 0xca, 0x41, 0x16, 0xa2, 0xac, 0x34, 0x26, 0x9d, 0x65, 0xec, 0xa8, 0x12,
+            0xde, 0xc4, 0x9f, 0x08, 0x38, 0xdc, 0x60,
+        ];
+        let zstd = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x64, 0x44, 0x01, 0x2d, 0x01, 0x00, 0xe8, 0x68, 0x65, 0x6c,
+            0x6c, 0x6f, 0x20, 0x62, 0x72, 0x6f, 0x74, 0x6c, 0x69, 0x20, 0x61, 0x6e, 0x64, 0x20,
+            0x7a, 0x73, 0x74, 0x64, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x2c, 0x20, 0x01, 0x00,
+            0x91, 0x00, 0x95, 0x72, 0x02, 0x98, 0xcf, 0x36, 0xa0,
+        ];
+        for (coding, body) in [("br", &br[..]), ("zstd", &zstd[..])] {
+            let mut h = Headers::new();
+            h.insert("content-encoding".into(), coding.into());
+            assert_eq!(
+                decode_content_encoding(&h, body.to_vec()),
+                payload,
+                "{coding}"
+            );
+        }
+    }
+
+    #[test]
     fn tolerates_a_truncated_gzip_stream() {
         use flate2::{Compression, write::GzEncoder};
         use std::io::Write as _;
@@ -18319,9 +18354,9 @@ customElements.define('lit-counter', LitCounter);
         let mut h = Headers::new();
         h.insert("content-encoding".into(), "identity".into());
         assert_eq!(decode_content_encoding(&h, raw.clone()), raw);
-        // br/zstd we don't decode (never advertised) — hand the bytes through.
+        // An unknown coding hands the bytes through.
         let mut h = Headers::new();
-        h.insert("content-encoding".into(), "br".into());
+        h.insert("content-encoding".into(), "compress".into());
         assert_eq!(decode_content_encoding(&h, raw.clone()), raw);
     }
 
