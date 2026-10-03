@@ -867,45 +867,18 @@ impl Flow<'_> {
         // element display value) turns an intrinsic logo into a full-width
         // block and pushes following content out of the viewport.
         if s.width.is_auto()
-            && let Content::Atomic(Atom {
-                kind:
-                    AtomKind::Img {
-                        url,
-                        density,
-                        dimension_source,
-                        ..
-                    },
-                ..
-            }) = &b.content
+            && let Some(replaced) = self.replaced_box(b, cb_w, cb_h)
         {
-            let natural = crate::responsive_image::density_corrected_size(
-                url.as_deref()
-                    .and_then(|url| super::memo::image_size(self.dom, self.images, url)),
-                *density,
-            );
-            if let Some(replaced) = super::replaced::size(
-                self.dom,
-                b.node,
-                super::replaced::ImageInput {
-                    dimension_source: *dimension_source,
-                    natural,
-                    url: url.as_deref(),
-                },
-                Some(cb_w),
-                cb_h,
-                self.vp,
-            ) {
-                let ml = s.margin[LEFT].resolve(Some(cb_w));
-                let mr = s.margin[RIGHT].resolve(Some(cb_w));
-                let free = cb_w - replaced.box_w - h.bp_l - h.bp_r;
-                h.ml = match (s.margin[LEFT].is_auto(), s.margin[RIGHT].is_auto()) {
-                    (true, true) => (free / 2.0).max(0.0),
-                    (true, false) => (free - mr.unwrap_or(0.0)).max(0.0),
-                    _ => ml.unwrap_or(0.0),
-                };
-                h.content_w = replaced.box_w.max(0.0);
-                h.auto_w = false;
-            }
+            let ml = s.margin[LEFT].resolve(Some(cb_w));
+            let mr = s.margin[RIGHT].resolve(Some(cb_w));
+            let free = cb_w - replaced.box_w - h.bp_l - h.bp_r;
+            h.ml = match (s.margin[LEFT].is_auto(), s.margin[RIGHT].is_auto()) {
+                (true, true) => (free / 2.0).max(0.0),
+                (true, false) => (free - mr.unwrap_or(0.0)).max(0.0),
+                _ => ml.unwrap_or(0.0),
+            };
+            h.content_w = replaced.box_w.max(0.0);
+            h.auto_w = false;
         }
         let mut x_border = cb_x + h.ml;
         let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
@@ -2397,6 +2370,48 @@ impl Flow<'_> {
     /// heights to an indefinite min/max width. `None` when the width is not
     /// auto or there is no ratio. Replaced content keeps its own
     /// natural-ratio sizing, and tables their own width algorithm.
+    /// The used size of an `img`-kind replaced box against containing block
+    /// (`cb_w`, `cb_h`): CSS 2 §10.3.2's inline-replaced algorithm, which also
+    /// sizes block-level replaced elements (§10.3.4) and the stacking-context
+    /// wrapper an inline one gets (it is not an inline-block).
+    fn replaced_box(
+        &self,
+        b: &BoxNode,
+        cb_w: f32,
+        cb_h: Option<f32>,
+    ) -> Option<super::replaced::Replaced> {
+        let Content::Atomic(Atom {
+            kind:
+                AtomKind::Img {
+                    url,
+                    density,
+                    dimension_source,
+                    ..
+                },
+            ..
+        }) = &b.content
+        else {
+            return None;
+        };
+        let natural = crate::responsive_image::density_corrected_size(
+            url.as_deref()
+                .and_then(|url| super::memo::image_size(self.dom, self.images, url)),
+            *density,
+        );
+        super::replaced::size(
+            self.dom,
+            b.node,
+            super::replaced::ImageInput {
+                dimension_source: *dimension_source,
+                natural,
+                url: url.as_deref(),
+            },
+            Some(cb_w),
+            cb_h,
+            self.vp,
+        )
+    }
+
     pub(super) fn ratio_auto_width(
         &self,
         b: &BoxNode,
@@ -4983,6 +4998,13 @@ impl Flow<'_> {
                 // element; anonymous/generated atom boxes use shrink-to-fit.
                 if ab.node != NO_NODE && self.dom.tag_name(ab.node) == Some("marquee") {
                     avail.clamp(min_w, max_w)
+                } else if let Some(replaced) = self.replaced_box(ab, cb_w, cb_h) {
+                    // A stacking context does not make an inline replaced
+                    // element an inline-block: it keeps its own used size
+                    // against the containing block (a ratio-only SVG fills
+                    // it; archive.org's filtered media icons). Its min/max
+                    // widths already apply.
+                    replaced.box_w.max(0.0)
                 } else {
                     self.ratio_or_auto_width(ab, [bp_h, bt, bb], cb_h, max_w, parent_inl, || {
                         self.shrink_to_fit(ab, avail, parent_inl)
