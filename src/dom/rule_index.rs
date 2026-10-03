@@ -319,6 +319,96 @@ pub(super) fn ancestor_requirements(selector: &Complex) -> Vec<u16> {
     required
 }
 
+/// The ancestor keys of a document-order walk (like Stylo's `StyleBloom`):
+/// a counting filter over the same key hashes as `Ancestors`, holding the
+/// keys of every composed ancestor element of the current subject. Moving to
+/// the next subject pops the elements that are not its ancestors, so a walk
+/// pays for each element's keys once instead of once per descendant. A
+/// discontinuity (a new chunk, a skipped branch) rebuilds from the parents.
+pub(super) struct AncestorBloom {
+    counts: Box<[u32; 2048]>,
+    /// The subject's composed element ancestors, root first, each with the
+    /// end of its key bits in `bits`.
+    stack: Vec<(NodeId, usize)>,
+    bits: Vec<u16>,
+}
+
+impl AncestorBloom {
+    pub(super) fn new() -> Self {
+        Self {
+            counts: Box::new([0; 2048]),
+            stack: Vec::new(),
+            bits: Vec::new(),
+        }
+    }
+
+    /// Like `Ancestors::may_match`, without its traversal budget.
+    #[inline]
+    pub(super) fn may_match(&self, required: &[u16]) -> bool {
+        required.iter().all(|&bit| self.counts[bit as usize] != 0)
+    }
+
+    /// Make the filter hold exactly `id`'s composed element ancestors.
+    pub(super) fn enter(&mut self, view: &StyleView<'_>, id: NodeId) {
+        let parent = composed_element_parent(view, id);
+        while let Some(&(top, _)) = self.stack.last() {
+            if Some(top) == parent {
+                return;
+            }
+            self.pop();
+        }
+        let mut chain = Vec::new();
+        let mut cursor = parent;
+        while let Some(node) = cursor {
+            chain.push(node);
+            cursor = composed_element_parent(view, node);
+        }
+        for &node in chain.iter().rev() {
+            self.push(view, node);
+        }
+    }
+
+    /// Add `node`, the subject just entered, for its descendants.
+    pub(super) fn push(&mut self, view: &StyleView<'_>, node: NodeId) {
+        for (kind, value) in view
+            .attr(node, "class")
+            .into_iter()
+            .flat_map(str::split_ascii_whitespace)
+            .map(|s| (0, s))
+            .chain(view.attr(node, "id").map(|s| (1, s)))
+            .chain(view.tag_name(node).map(|s| (2, s)))
+        {
+            for bit in bits(kind, value) {
+                self.counts[bit as usize] += 1;
+                self.bits.push(bit);
+            }
+        }
+        self.stack.push((node, self.bits.len()));
+    }
+
+    fn pop(&mut self) {
+        if self.stack.pop().is_none() {
+            return;
+        }
+        let start = self.stack.last().map_or(0, |&(_, end)| end);
+        for bit in self.bits.drain(start..) {
+            self.counts[bit as usize] -= 1;
+        }
+    }
+}
+
+/// Composed ancestry skipping document/fragment nodes, which carry no keys.
+fn composed_element_parent(view: &StyleView<'_>, id: NodeId) -> Option<NodeId> {
+    let mut cursor = view.parent_composed(id);
+    while let Some(node) = cursor {
+        if view.tag_name(node).is_some() {
+            return Some(node);
+        }
+        cursor = view.parent_composed(node);
+    }
+    None
+}
+
 impl Ancestors {
     pub(super) fn of(dom: &StyleView<'_>, id: NodeId) -> Self {
         Self {

@@ -14236,13 +14236,13 @@ fn ensure_host_geometry(
         if let Some(measure_started) = measure_started {
             let cascade = crate::dom::take_casc_diag();
             eprintln!(
-                "DIAGGEOM reason={reason} nodes={} total={}ms cascade={}ms matched={}builds/{}candidates/{}ms css_parse={}ms rules={} passes={} query_updates={} selector_reuse={} tree={}ms flow={}ms item_reuse={} intrinsic_reuse={} tree_reuse={} tree_build={}",
+                "DIAGGEOM reason={reason} nodes={} total={}ms cascade={}ms matched={}builds/{}candidates/{:.1}ms css_parse={}ms rules={} passes={} query_updates={} selector_reuse={} tree={}ms flow={}ms item_reuse={} intrinsic_reuse={} tree_reuse={} tree_build={} pmatch={}",
                 dom.node_count(),
                 measure_started.elapsed().as_millis(),
                 cascade.cascaded_us / 1000,
                 cascade.matched_rule_builds,
                 cascade.matched_candidates,
-                cascade.matched_us / 1000,
+                cascade.matched_us as f64 / 1000.0,
                 cascade.style_index_us / 1000,
                 cascade.rules,
                 measured.work.passes,
@@ -14254,6 +14254,7 @@ fn ensure_host_geometry(
                 measured.work.intrinsic_hits,
                 measured.work.tree_hits,
                 measured.work.tree_builds,
+                cascade.parallel_summary(),
             );
         }
         cached.complete_geometry = measured.complete_geometry;
