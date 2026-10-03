@@ -441,6 +441,8 @@ pub(super) struct State {
     events: Vec<PendingEvent>,
     /// The element whose underlying (non-animated) values are being read.
     excluded: Cell<Option<NodeId>>,
+    /// Changes of the animation set, for frame scheduling caches.
+    generation: u64,
     /// Animation-origin changes that only need the retained paint redone.
     paint_pending: bool,
     /// Animation-origin changes that need style/layout again (a presentation
@@ -558,8 +560,9 @@ impl State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameTarget {
     pub node: NodeId,
-    /// Every sampled property only repaints: a terminal, whose cells show no
-    /// CSS colors, never needs frames for it.
+    /// Every sampled property only repaints (Gecko's
+    /// `KeyframeEffect::CanIgnoreIfNotVisible`): the animation may be
+    /// throttled while it cannot be seen.
     pub paint_only: bool,
 }
 
@@ -964,6 +967,99 @@ impl Dom {
             .collect()
     }
 
+    /// Gecko `KeyframeEffect::CanThrottleIfNotVisible` for a paint-only
+    /// animated element: nothing it paints can currently be seen, because
+    /// it is in a `visibility: hidden` subtree without visible descendants,
+    /// under a non-animated `opacity: 0` group, or scrolled out of `view`
+    /// (the viewport in document CSS px, with a margin for ink overflow such
+    /// as glows). `rect` gives retained border boxes in the same space.
+    /// Anything that can move content relative to the page scroll (fixed or
+    /// sticky positioning, transforms, scrolled inner containers) or lacks a
+    /// box counts as visible.
+    pub(crate) fn css_animation_invisible(
+        &self,
+        node: NodeId,
+        view: (f64, f64, f64, f64),
+        rect: &dyn Fn(NodeId) -> Option<(f64, f64, f64, f64)>,
+    ) -> bool {
+        const LIMIT: usize = 512;
+        const MARGIN: f64 = 128.0;
+        let hidden = |id: NodeId| {
+            self.computed_value_resolved(id, "visibility")
+                .is_some_and(|value| matches!(value.trim(), "hidden" | "collapse"))
+        };
+        let subtree = |id: NodeId| {
+            let mut out = Vec::new();
+            let mut stack = vec![id];
+            while let Some(node) = stack.pop() {
+                if out.len() > LIMIT {
+                    return None;
+                }
+                if self.tag_name(node).is_some() {
+                    out.push(node);
+                    self.push_composed_children(node, &mut stack);
+                    if self.tag_name(node) == Some("slot") {
+                        stack.extend(self.flat_slot_nodes(node));
+                    }
+                }
+            }
+            Some(out)
+        };
+        // Gecko nsIFrame::IsVisibleOrMayHaveVisibleDescendants.
+        if hidden(node) && subtree(node).is_some_and(|nodes| nodes.into_iter().all(hidden)) {
+            return true;
+        }
+        let mut moving = false;
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if self.tag_name(id).is_some() {
+                // CanOptimizeAwayDueToOpacity: the root of an opacity:0 group
+                // that cannot become visible by its own animation.
+                let transparent = self
+                    .computed_value_resolved(id, "opacity")
+                    .and_then(|value| parse_alpha(value.trim()))
+                    .is_some_and(|opacity| opacity <= 0.0);
+                let compositor = || {
+                    self.css_animation_definitions(id).iter().any(|definition| {
+                        definition.keyframes.iter().any(|frame| {
+                            frame.opacity.is_some()
+                                || frame.transform.is_some()
+                                || frame.top.is_some()
+                        })
+                    })
+                };
+                if transparent && !compositor() && self.transitions.value(id, "opacity").is_none() {
+                    return true;
+                }
+                let position = self.computed_value_resolved(id, "position");
+                moving |= matches!(position.as_deref().map(str::trim), Some("fixed" | "sticky"))
+                    || self
+                        .computed_value_resolved(id, "transform")
+                        .is_some_and(|value| value.trim() != "none")
+                    || compositor()
+                    || (id != node
+                        && (self.scroll_metric(id, 0).unwrap_or(0.0) != 0.0
+                            || self.scroll_metric(id, 1).unwrap_or(0.0) != 0.0));
+            }
+            current = self.parent_flat(id);
+        }
+        if moving {
+            return false;
+        }
+        // nsIFrame::IsScrolledOutOfView, with border boxes standing in for
+        // ink overflow rectangles.
+        let Some(nodes) = subtree(node) else {
+            return false;
+        };
+        let (x, y, w, h) = view;
+        let (left, top, right, bottom) = (x - MARGIN, y - MARGIN, x + w + MARGIN, y + h + MARGIN);
+        let mut boxes = nodes.into_iter().filter_map(rect).peekable();
+        if boxes.peek().is_none() {
+            return false;
+        }
+        boxes.all(|(bx, by, bw, bh)| bx + bw < left || bx > right || by + bh < top || by > bottom)
+    }
+
     /// The next timeline time (seconds) at which a running animation changes
     /// phase: its effect starts or ends, so values and events change even
     /// without per-frame sampling.
@@ -987,6 +1083,12 @@ impl Dom {
                     .map(|boundary| animation.start + boundary)
             })
             .min_by(f64::total_cmp)
+    }
+
+    /// Changes to the set of animations or their phases since the caller's
+    /// last look, for scheduling caches.
+    pub(crate) fn css_animation_generation(&self) -> u64 {
+        self.animations.generation
     }
 
     /// Take the presentation work produced by sampling since the last call:
@@ -1116,6 +1218,7 @@ impl Dom {
             let mut old = previous.map(|element| element.animations);
             if specs.is_empty() {
                 if let Some(old) = old {
+                    self.animations.generation += 1;
                     for (index, animation) in old.iter().enumerate() {
                         cancel(events, id, animation, now, order, index);
                     }
@@ -1171,18 +1274,22 @@ impl Dom {
                         animation.tracks = tracks;
                         animation
                     }
-                    None => Animation {
-                        name: spec.name.clone(),
-                        timing: spec.timing,
-                        start: now,
-                        hold: (!spec.timing.running).then_some(0.0),
-                        phase: Phase::Idle,
-                        iteration: 0.0,
-                        tracks,
-                    },
+                    None => {
+                        self.animations.generation += 1;
+                        Animation {
+                            name: spec.name.clone(),
+                            timing: spec.timing,
+                            start: now,
+                            hold: (!spec.timing.running).then_some(0.0),
+                            phase: Phase::Idle,
+                            iteration: 0.0,
+                            tracks,
+                        }
+                    }
                 });
             }
             for (index, animation) in old.unwrap_or_default().iter().enumerate() {
+                self.animations.generation += 1;
                 cancel(events, id, animation, now, order, index);
             }
             elements.insert(
@@ -1263,6 +1370,9 @@ impl Dom {
                         push("animationend", timing.interval_start(), start);
                     }
                     _ => {}
+                }
+                if previous != phase {
+                    self.animations.generation += 1;
                 }
                 animation.phase = phase;
                 animation.iteration = iteration;

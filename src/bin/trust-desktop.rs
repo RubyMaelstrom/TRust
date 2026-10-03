@@ -7752,6 +7752,11 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.request_redraw();
                 self.dispatch(UserAction::Focus(focused));
             }
+            WindowEvent::Occluded(occluded) => {
+                // Paint-only CSS animations stop requesting actor frames
+                // while the window cannot be seen.
+                self.dispatch(UserAction::Occluded(occluded));
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
                 self.dispatch(UserAction::InputModifiers(translate_modifiers(

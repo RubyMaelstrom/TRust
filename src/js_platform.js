@@ -13711,6 +13711,10 @@
         return queued;
     };
 
+    // The host throttles invisible paint-only CSS animations against the
+    // Window's scroll position (document coordinates).
+    trust.windowScrollX = function () { return +(g.scrollX || 0); };
+    trust.windowScrollY = function () { return +(g.scrollY || 0); };
     // Apply a viewport scroll (CSS px, document origin): update the scroll
     // position properties, fire the viewport `scroll` event, and re-run the
     // intersection observations. Driven by the actor's PageCmd::Scroll as the

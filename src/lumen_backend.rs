@@ -1983,6 +1983,8 @@ mod desktop {
         /// Native edits run their input events and microtasks in order, but
         /// acknowledge presentation only after the next rendering opportunity.
         pending_form_acknowledgements: Vec<usize>,
+        /// The frontend's window cannot be seen (`PageCmd::Occluded`).
+        occluded: bool,
         task_trace: Option<ActorTaskTrace>,
         engine_metrics: Option<lumen::PerformanceMetricsSampler>,
     }
@@ -2209,12 +2211,12 @@ mod desktop {
                 page.render_pending = true;
             }
             // CSS Animations 1 #animations: running style-origin animations
-            // need rendering opportunities.
+            // need rendering opportunities only while they can be seen.
             let animation_wake = css_animation_wake(&mut page, &mut animation_schedule);
             let animation_due = animation_wake.is_some_and(|at| at <= Instant::now());
             if !page.render_pending && !animation_due {
-                // An animation frame queued before its animations stopped
-                // needing frames is no longer needed.
+                // An animation frame queued before the animation became
+                // throttled (scrolled away, occluded) is no longer needed.
                 render_deadline = None;
             }
             if (page.render_pending || animation_due)
@@ -2653,35 +2655,84 @@ mod desktop {
     /// rewrites them over the TTY.
     const TERMINAL_ANIMATION_INTERVAL: Duration = Duration::from_millis(250);
 
-    /// Frame scheduling state for style-origin CSS animations.
+    /// Cached throttling decision for style-origin CSS animations (Gecko
+    /// `KeyframeEffect::CanThrottle`): recomputed only when the animation
+    /// set, layout, scroll position, viewport or presentation changes.
     #[derive(Default)]
     struct AnimationSchedule {
+        key: Option<(u64, u64, u64, u64, u64, u64, usize)>,
+        frames: bool,
         last_frame: Option<Instant>,
     }
 
     /// When the actor next needs a rendering opportunity for CSS animations:
-    /// now (at the frame cadence) while one runs, or when a running
-    /// animation next starts or ends.
+    /// now (at the frame cadence) while an unthrottled animation runs, or
+    /// when a running animation next starts or ends.
     fn css_animation_wake(
         page: &mut LumenPage,
         schedule: &mut AnimationSchedule,
     ) -> Option<Instant> {
         let targets = page.dom.borrow().css_animation_frame_targets();
         let mut wake = None;
-        // The terminal's cell compositor paints no CSS colors, shadows or
-        // backgrounds: a paint-only animation can never change a cell there,
-        // so it is sampled only with other rendering updates.
-        if targets
-            .iter()
-            .any(|target| !target.paint_only || !page.terminal_presentation)
-        {
-            wake = Some(if page.terminal_presentation {
-                schedule
-                    .last_frame
-                    .map_or_else(Instant::now, |last| last + TERMINAL_ANIMATION_INTERVAL)
+        if !targets.is_empty() {
+            // The terminal's cell compositor paints no CSS colors, shadows
+            // or backgrounds: a paint-only animation can never change a cell
+            // there, so it is sampled only with other rendering updates.
+            let visible_paint = !page.terminal_presentation && !page.occluded;
+            let scroll = if visible_paint && targets.iter().any(|target| target.paint_only) {
+                (
+                    trust_number(page, "windowScrollX").unwrap_or(0.0),
+                    trust_number(page, "windowScrollY").unwrap_or(0.0),
+                )
             } else {
-                Instant::now()
-            });
+                (0.0, 0.0)
+            };
+            let viewport = page
+                .engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map_or(DEFAULT_VIEWPORT, |state| state.viewport.get());
+            let dom = page.dom.borrow();
+            let render = page
+                .last_render
+                .as_ref()
+                .map_or(0, |render| std::sync::Arc::as_ptr(&render.layout) as usize);
+            let key = (
+                dom.css_animation_generation() ^ (u64::from(visible_paint) << 63),
+                dom.epoch(),
+                dom.layout_presentation_epoch(),
+                scroll.0.to_bits(),
+                scroll.1.to_bits(),
+                (u64::from(viewport.width.to_bits()) << 32) | u64::from(viewport.height.to_bits()),
+                render,
+            );
+            if schedule.key != Some(key) {
+                let boxes = page.last_render.as_ref().map(|render| &render.layout.boxes);
+                let rect = |node: crate::dom::NodeId| {
+                    let rect = boxes?.get(&node)?;
+                    Some((rect.left, rect.top, rect.width, rect.height))
+                };
+                let view = (
+                    scroll.0,
+                    scroll.1,
+                    f64::from(viewport.width),
+                    f64::from(viewport.height),
+                );
+                schedule.frames = targets.iter().any(|target| {
+                    !target.paint_only
+                        || (visible_paint && !dom.css_animation_invisible(target.node, view, &rect))
+                });
+                schedule.key = Some(key);
+            }
+            if schedule.frames {
+                wake = Some(if page.terminal_presentation {
+                    schedule
+                        .last_frame
+                        .map_or_else(Instant::now, |last| last + TERMINAL_ANIMATION_INTERVAL)
+                } else {
+                    Instant::now()
+                });
+            }
         }
         let next = page.dom.borrow().css_animation_next_change();
         if let Some(next) = next {
@@ -2954,6 +3005,7 @@ mod desktop {
             render_environment_dirty: false,
             render_pending: false,
             pending_form_acknowledgements: Vec::new(),
+            occluded: false,
             task_trace: ActorTaskTrace::enabled(),
             engine_metrics: lumen::PerformanceMetricsSampler::from_env(),
         };
@@ -4474,6 +4526,11 @@ mod desktop {
                 // Moving a client window does not resize or relayout its DOM.
                 true
             }
+            PageCmd::Occluded(occluded) => {
+                // Only frame scheduling changes; nothing is rendered.
+                page.occluded = occluded;
+                true
+            }
             PageCmd::Viewport(viewport) => {
                 let viewport = crate::layout2::Viewport::new(viewport.width, viewport.height);
                 let changed = page
@@ -5691,7 +5748,7 @@ mod desktop {
         }
 
         #[tokio::test]
-        async fn css_animations_paint_frames_and_slow_terminals() {
+        async fn css_animations_paint_frames_throttle_offscreen_and_slow_terminals() {
             // CSS Animations 1 #animations: a script-free page keeps its
             // actor for a running color animation and repaints it without
             // relayout on every rendering opportunity.
@@ -5718,6 +5775,38 @@ mod desktop {
             let (frames, _) =
                 css_animation_frames(spacing, true, Duration::from_millis(1500), vec![]).await;
             assert!((2..=8).contains(&frames), "frames={frames}");
+            // Gecko KeyframeEffect::CanThrottle: a paint-only animation
+            // scrolled out of view requests no frames, and resumes when the
+            // viewport reaches it.
+            let far = r#"<!doctype html><style>body{margin:0}
+                #far{margin:4000px 0 0;height:20px;animation:c 1s linear infinite}
+                @keyframes c{from{color:rgb(255, 0, 0)}to{color:rgb(0, 0, 255)}}</style>
+                <p>static</p><p id=far>far away</p><div style=height:4000px></div>"#;
+            let (frames, _) =
+                css_animation_frames(far, false, Duration::from_millis(700), vec![]).await;
+            assert_eq!(frames, 0, "an invisible animation scheduled frames");
+            let scroll = PageCmd::Scroll { x: 0., y: 3900. };
+            let (frames, _) =
+                css_animation_frames(far, false, Duration::from_millis(1500), vec![scroll]).await;
+            assert!(frames >= 4, "scrolling into view did not resume: {frames}");
+            // An occluded window requests no paint-only frames, and the
+            // animation resumes (at its current time) once it is visible.
+            let (frames, _) = css_animation_frames(
+                near,
+                false,
+                Duration::from_millis(700),
+                vec![PageCmd::Occluded(true)],
+            )
+            .await;
+            assert_eq!(frames, 0, "an occluded window kept animating");
+            let (frames, _) = css_animation_frames(
+                near,
+                false,
+                Duration::from_millis(1000),
+                vec![PageCmd::Occluded(true), PageCmd::Occluded(false)],
+            )
+            .await;
+            assert!(frames >= 4, "a visible window did not resume: {frames}");
         }
 
         #[tokio::test]

@@ -325,6 +325,39 @@ fn frame_targets_report_running_paint_only_animations() {
 }
 
 #[test]
+fn invisible_paint_only_animations_can_be_throttled() {
+    let dom = setup(
+        "p{animation:c 1s infinite;height:20px;margin:0}
+         @keyframes c{to{color:red}}
+         .hidden{visibility:hidden}.clear{opacity:0}
+         .fixed{position:fixed;top:2000px}",
+        "<p id=near>near</p><p id=hidden class=hidden>h</p>
+         <p id=shown class=hidden><span style='visibility:visible'>v</span></p>
+         <div class=clear><p id=clear>c</p></div><p id=far>far</p><p id=fixed class=fixed>f</p>",
+    );
+    let far = dom.get_by_id("far").unwrap();
+    let fixed = dom.get_by_id("fixed").unwrap();
+    let rect = |id: NodeId| {
+        Some(if id == far || id == fixed {
+            (0., 5000., 100., 20.)
+        } else {
+            (0., 0., 100., 20.)
+        })
+    };
+    let view = (0., 0., 800., 600.);
+    let invisible = |id: &str| dom.css_animation_invisible(dom.get_by_id(id).unwrap(), view, &rect);
+    assert!(!invisible("near"));
+    assert!(invisible("hidden"));
+    assert!(!invisible("shown"));
+    assert!(invisible("clear"));
+    assert!(invisible("far"));
+    // Fixed boxes move with the viewport rather than the document.
+    assert!(!invisible("fixed"));
+    // Scrolling the far element into view resumes it.
+    assert!(!dom.css_animation_invisible(far, (0., 4800., 800., 600.), &rect));
+}
+
+#[test]
 fn unanimated_documents_do_no_animation_work() {
     let mut dom = setup("p{color:red}", "<p id=a>a</p>");
     dom.update_css_animations(0.);
