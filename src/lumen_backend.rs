@@ -20284,6 +20284,93 @@ mod tests {
         assert_eq!(state.dom.borrow().node(documents[0]).parent, None);
     }
 
+    #[test]
+    fn cross_origin_children_reach_ancestors_only_through_cross_origin_window_proxies() {
+        // HTML #cross-origin-objects / #dom-frameelement / #sandboxed-origin-browsing-
+        // context-flag: a child of another origin, including a sandboxed child without
+        // allow-same-origin, sees its ancestors only through CrossOriginProperties.
+        let mut engine = sealed_platform_engine("https://top.example/");
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            body.appendChild(document.createElement('p')).textContent = 'TOP-SECRET';
+            globalThis.received = [];
+            addEventListener('message', event => received.push(event));
+            for (const [name, attributes] of [
+                ['cross', {src: 'data:text/html,<p>cross</p>'}],
+                ['sandboxed', {sandbox: 'allow-scripts', srcdoc: '<p>sandboxed</p>'}],
+                ['same', {srcdoc: '<p>same</p>'}],
+            ]) {
+                const frame = document.createElement('iframe');
+                frame.name = name;
+                for (const [key, value] of Object.entries(attributes)) frame.setAttribute(key, value);
+                body.appendChild(frame);
+            }
+            "#,
+            "frame setup",
+        )
+        .unwrap();
+        call_trust_method(&mut engine, "hydrateFrames", &[]);
+        let realms: Vec<Value> = {
+            let state = engine.ctx().host_mut::<HostState>().unwrap();
+            let dom = state.dom.clone();
+            let dom = dom.borrow();
+            dom.descendants(DOCUMENT)
+                .filter(|&node| dom.tag_name(node) == Some("iframe"))
+                .map(|frame| state.window_realms[&state.frame_contexts[&frame]].clone())
+                .collect()
+        };
+        let probe = r#"(() => {
+            const result = [];
+            const attempt = (label, read) => {
+                try { result.push(label + '=' + read()); }
+                catch (error) { result.push(label + '!' + error.name); }
+            };
+            attempt('document', () => parent.document.body.firstChild.textContent);
+            attempt('frameElement', () => frameElement);
+            attempt('href', () => parent.location.href);
+            attempt('keys', () => Object.keys(parent).length);
+            attempt('top', () => parent === top && parent.self === parent && parent.parent === parent);
+            attempt('sibling', () => typeof parent.same.postMessage);
+            attempt('post', () => (parent.postMessage('hello', '*'), 'sent'));
+            return result.join(' ');
+        })()"#;
+        let run = |engine: &mut lumen::Engine, realm: &Value| {
+            engine
+                .with_embed_realm(realm, |engine| string_value(engine, probe))
+                .unwrap_or_else(|_| panic!("enter child Realm"))
+        };
+        let cross = run(&mut engine, &realms[0]);
+        let sandboxed = run(&mut engine, &realms[1]);
+        let same = run(&mut engine, &realms[2]);
+        let restricted = "document!SecurityError frameElement=null href!SecurityError keys=0 \
+                          top=true sibling=function post=sent";
+        assert_eq!(cross, restricted, "cross-origin child");
+        assert_eq!(sandboxed, restricted, "sandboxed child");
+        assert!(
+            same.starts_with("document=TOP-SECRET frameElement=[object HTMLIFrameElement]"),
+            "{same}"
+        );
+        for _ in 0..16 {
+            call_trust_method(&mut engine, "runPlatformTask", &[]);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const frames = document.querySelectorAll('iframe');
+                    const sources = received.map(event => [...frames].findIndex(frame =>
+                        frame.contentWindow === event.source));
+                    return [received.length, received.map(event => event.origin).join(),
+                        sources.join(), frames[1].contentDocument === null].join('|');
+                })()"#
+            ),
+            "3|null,null,https://top.example|0,1,2|true"
+        );
+    }
+
     fn serialize_native(engine: &mut lumen::Engine, node: usize) -> String {
         let state = engine.ctx().host_mut::<HostState>().unwrap();
         state.dom.borrow().serialize_js(node)
