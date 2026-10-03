@@ -765,17 +765,20 @@ impl_replace_for! {
 }
 
 /// Executes a Wasm `i8x16.shuffle` instruction.
+///
+/// Core #exec-vshuffle: each selector lane indexes the 32 lanes of `a ++ b`.
+/// One table lookup per lane avoids a data-dependent branch per lane, and
+/// [`ImmLaneIdx32`] masks every index into the table.
+#[inline]
 pub fn i8x16_shuffle(a: V128, b: V128, s: [ImmLaneIdx32; 16]) -> V128 {
-    let a = I8x16::from_v128(a).0;
-    let b = I8x16::from_v128(b).0;
-    I8x16(array::from_fn(|i| match usize::from(u8::from(s[i])) {
-        i @ 0..16 => a[i],
-        i => b[i - 16],
-    }))
-    .into_v128()
+    let mut table = [0_u8; 32];
+    table[..16].copy_from_slice(&U8x16::from_v128(a).0);
+    table[16..].copy_from_slice(&U8x16::from_v128(b).0);
+    U8x16(array::from_fn(|i| table[usize::from(u8::from(s[i]))])).into_v128()
 }
 
 /// Executes a Wasm `i8x16.swizzle` instruction.
+#[inline]
 pub fn i8x16_swizzle(a: V128, s: V128) -> V128 {
     let a = U8x16::from_v128(a).0;
     let s = U8x16::from_v128(s).0;
