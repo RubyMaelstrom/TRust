@@ -12,6 +12,7 @@ use std::cell::{Cell, Ref, RefCell};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use compute::{ComputeView, StyleBackend};
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, ns};
@@ -23,6 +24,7 @@ pub(crate) mod arena;
 mod child_collections;
 mod class_tokens;
 pub(crate) mod color_scheme;
+mod compute;
 mod computed_cache;
 mod container_queries;
 mod counter_styles;
@@ -3733,11 +3735,15 @@ impl Dom {
             None => false,
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub fn is_hidden(&self, id: NodeId) -> bool {
         self.box_generation(id).hidden
     }
+}
 
+impl Dom {
     /// CSS Display 3 #box-tree: `none` and `contents` have no principal box.
     /// A descendant's overflow extent does not give its boxless ancestor one.
     /// Share the typed result with the formatting pass so projecting retained
@@ -3745,20 +3751,24 @@ impl Dom {
     pub(crate) fn generates_principal_box(&self, id: NodeId) -> bool {
         self.box_generation(id).principal
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn box_generation(&self, id: NodeId) -> BoxGeneration {
         // Box-generation state, not an estimate of painted visibility. A
         // clipped or zero-area box remains observable through CSSOM View.
-        if let Some(&hit) = self.hidden_cache.borrow().get(id, self.epoch) {
+        if let Some(&hit) = self.hidden_cache().borrow().get(id, self.epoch()) {
             return hit;
         }
         let generation = self.box_generation_inner(id);
-        self.hidden_cache
+        self.hidden_cache()
             .borrow_mut()
-            .put(id, self.epoch, generation);
+            .put(id, self.epoch(), generation);
         generation
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn box_generation_inner(&self, id: NodeId) -> BoxGeneration {
         if self.attr(id, "hidden").is_some() {
             return BoxGeneration::HIDDEN;
@@ -3810,7 +3820,9 @@ impl Dom {
             ),
         }
     }
+}
 
+impl Dom {
     /// Whether an authored CSS/HTML state omits this element and all descendants
     /// from the box tree. Keep this narrower than [`Self::is_hidden`]: UA-hidden
     /// metadata/resource elements can affect the document outside their own
@@ -3847,7 +3859,9 @@ impl Dom {
         // from the content attribute and author cascade.
         !self.is_popover_showing(id) && self.attr(id, "popover").is_some()
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether the element's own PAINT is suppressed by an effective
     /// `opacity` of exactly zero. Unlike `is_hidden` (box generation),
     /// this does NOT remove the element from layout: CSS Color/Compositing lays
@@ -3866,7 +3880,9 @@ impl Dom {
         (self.style_index().has_opacity || has_inline_opacity())
             && self.effective_opacity(id) <= 0.0
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether the element's own PAINT is suppressed by `visibility:hidden`
     /// (or `collapse`) — CSS2 §11.2. Like `opacity:0` this keeps the box (the
     /// element is fully laid out and occupies its normal space; only its cells
@@ -3882,7 +3898,9 @@ impl Dom {
             Some("hidden" | "force-hidden" | "collapse")
         )
     }
+}
 
+impl Dom {
     /// Whether this element's generated boxes may participate in point hit
     /// testing. CSS UI 4 §6.2 removes `pointer-events:none` boxes, CSS Display
     /// 4 §5 excludes invisible boxes, and HTML/CSS UI inertness suppresses the
@@ -3908,7 +3926,9 @@ impl Dom {
         }
         true
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The element's effective opacity for visibility: its cascaded `opacity`
     /// (default 1), or — when an `animation-fill-mode:forwards|both` animation
     /// names a keyframe set whose END opacity is known — that resting value.
@@ -3939,7 +3959,9 @@ impl Dom {
         }
         base.clamp(0.0, 1.0)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The element's animations as `(name, fill-mode)` pairs. Both the
     /// longhands (`animation-name`/`animation-fill-mode`) and the `animation`
     /// shorthand are COMMA lists (css-animations-1 §4: one animation per
@@ -3979,7 +4001,9 @@ impl Dom {
             })
             .collect()
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Resolve CSS Animations 1's comma-matched animation lists and attach
     /// the retained keyframe values used by graphical paint. Shorter
     /// longhand lists repeat to the `animation-name` list length (§3.2).
@@ -4105,7 +4129,9 @@ impl Dom {
             })
             .collect()
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The cascaded `display` value for an element (the mini-cascade
     /// winner), or `None` when no rule sets it. `hidden` attribute counts
     /// as `display:none`. Drives block/inline flow in the layout pass and
@@ -4114,7 +4140,9 @@ impl Dom {
     pub fn computed_display(&self, id: NodeId) -> Option<String> {
         self.retained_display(id, || self.computed_display_uncached(id))
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn computed_display_uncached(&self, id: NodeId) -> Option<String> {
         if self.attr(id, "hidden").is_some() {
             return Some("none".to_string());
@@ -4144,7 +4172,9 @@ impl Dom {
             None => Some(v),
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The EFFECTIVE `display` — the author's cascaded `display` if set, else
     /// the tag's UA-stylesheet default (so an un-styled `<table>` reports
     /// `"table"`, a `<tr>` `"table-row"`, a `<td>` `"table-cell"`). Unlike
@@ -4169,7 +4199,9 @@ impl Dom {
         }
         Some(display)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn effective_display_before_blockification(&self, id: NodeId) -> Option<String> {
         if let Some(d) = self.computed_display(id) {
             // CSS Overflow 4 #continue: the legacy vertical line-clamp
@@ -4199,7 +4231,9 @@ impl Dom {
         self.tag_name(id)?;
         self.ua_default(id, "display")
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(crate) fn legacy_line_clamp(&self, id: NodeId) -> Option<usize> {
         if !matches!(
             self.computed_display(id).as_deref(),
@@ -4216,7 +4250,9 @@ impl Dom {
             .ok()
             .filter(|&n| n > 0)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// True when `id` must establish a table formatting context for its
     /// children EVEN THOUGH its own `display` is not `table`/`inline-table` —
     /// i.e. it holds misparented "proper table children" (table rows /
@@ -4255,7 +4291,9 @@ impl Dom {
             self.child_iter(id).any(is_row_ish)
         }
     }
+}
 
+impl Dom {
     /// The cascaded value of any tracked property (the layout reads
     /// margin/padding/text-align through this), or `None` when unset.
     /// Author cascade only (no UA defaults, no inheritance) — the
@@ -4371,7 +4409,9 @@ impl Dom {
                 .is_some_and(|px| px > 0.0)
         })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn logical_property(&self, id: NodeId, pseudo: Option<PseudoEl>, name: &str) -> Option<String> {
         logical_to_physical(name)?;
         let value = |property| {
@@ -4388,7 +4428,9 @@ impl Dom {
             &value("text-orientation"),
         )
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The computed value of a property — the single inheritance authority.
     /// For an inherited property (per the registry) an element that doesn't
     /// set it resolves to the parent's computed value; otherwise this is the
@@ -4423,17 +4465,17 @@ impl Dom {
         {
             return Some("none".into());
         }
-        if let Some(value) = self.transitions.value(id, name) {
+        if let Some(value) = self.transition_value(id, name) {
             return Some(value);
         }
         // CSS Cascade 5 #cascade-origin: animations override normal author
         // declarations (important ones were excluded when sampling).
-        if let Some(value) = self.animations.value(id, name) {
+        if let Some(value) = self.animation_value(id, name) {
             return Some(value);
         }
         // Explicitly inherited lengths can depend on an ancestor's current
         // transition. Keep animation-origin values out of the base-style memo.
-        let interpolating = self.transitions.affects_computation(name);
+        let interpolating = self.transition_affects(name);
         if name.starts_with("--") {
             return self.custom_prop(id, name);
         }
@@ -4522,7 +4564,7 @@ impl Dom {
                 text_stroke_width_px(
                     &value,
                     crate::layout2::Units::of(self, id),
-                    self.viewport_px,
+                    self.viewport_px(),
                 )
                 .map(|px| format!("{px}px"))
             })
@@ -4556,7 +4598,9 @@ impl Dom {
         }
         v
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// `computed_value` with `var()` references substituted — what
     /// getComputedStyle exposes to JS. CSS variables resolve in computed
     /// style (`Supports.variable` sets `margin-right:var(--x)` and reads
@@ -4595,7 +4639,9 @@ impl Dom {
             None => None,
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn computed_value_unschemed(&self, id: NodeId, name: &str) -> Option<String> {
         let value = self.computed_value(id, name)?;
         // CSS Variables 1 #invalid-at-computed-value-time: a declaration whose
@@ -4637,7 +4683,9 @@ impl Dom {
             None => Some(value),
         }
     }
+}
 
+impl Dom {
     /// The resolved value exposed by `getComputedStyle()`.
     ///
     /// Internally, `computed_value` uses `None` as a compact signal for an
@@ -4841,7 +4889,9 @@ impl Dom {
             _ => color.to_string(),
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Pure memoization for CSS Values 3 #font-relative-lengths. Repeated
     /// flex/grid probes use the same element metrics; no layout width or
     /// inherited caller context participates in this numeric result.
@@ -4853,9 +4903,9 @@ impl Dom {
         self.flush_style_invalidations();
         let font_epoch = crate::font_system::page_font_epoch();
         if let Some(&(stamp, units)) = self
-            .font_units_cache
+            .font_units_cache()
             .borrow()
-            .get(id, self.style_value_epoch)
+            .get(id, self.style_value_epoch())
             && stamp == font_epoch
         {
             return units;
@@ -4863,13 +4913,17 @@ impl Dom {
         let units = compute();
         // Anonymous/synthetic layout ids must never grow a node-indexed cache.
         if self.is_valid(id) {
-            self.font_units_cache
-                .borrow_mut()
-                .put(id, self.style_value_epoch, (font_epoch, units));
+            self.font_units_cache().borrow_mut().put(
+                id,
+                self.style_value_epoch(),
+                (font_epoch, units),
+            );
         }
         units
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether text placed DIRECTLY in this element renders at zero font size —
     /// `Some(true)`/`Some(false)` when the element's own `font-size` is
     /// definitive, `None` to defer to the inherited value (so the layout, which
@@ -4880,27 +4934,34 @@ impl Dom {
             .as_deref()
             .and_then(classify_font_size_zero)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The document's root element (`<html>`) — the element `rem` units and
     /// `:root` refer to.
     pub(crate) fn document_element(&self) -> Option<NodeId> {
         self.child_iter(DOCUMENT)
             .find(|&c| self.tag_name(c).is_some())
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// DOM document-element identity, without crossing a child navigable or
     /// treating a shadow root / arbitrary `html` element as a Document root.
     pub(crate) fn is_document_element(&self, id: NodeId) -> bool {
-        self.nodes.get(id).is_some_and(|node| {
-            node.parent == Some(node.owner_document)
+        let nodes = self.style_view().nodes;
+        nodes.owner_document_of(id).is_some_and(|owner_document| {
+            nodes.parent(id) == Some(owner_document)
                 && self.tag_name(id).is_some()
                 && self
-                    .child_iter(node.owner_document)
+                    .child_iter(owner_document)
                     .find(|&child| self.tag_name(child).is_some())
                     == Some(id)
         })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The root element's computed `font-size` in CSS px — the `rem` basis.
     /// Twitch-idiom sites set `html { font-size: 62.5% }` so 1rem = 10px;
     /// resolving rem against a fixed 16px inflated every rem length 1.6×.
@@ -4908,13 +4969,17 @@ impl Dom {
         self.document_element()
             .map_or(FONT_SIZE_INITIAL, |r| self.font_px(r))
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn style_scope_root_element(&self, id: NodeId) -> Option<NodeId> {
         let document = self.registration_document(id);
         self.child_iter(document)
             .find(|&child| self.tag_name(child).is_some())
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The element's COMPUTED `font-size` in CSS px (CSS Fonts §6.1) — the
     /// `em` basis, and (on the root) the `rem` basis. Numeric composition,
     /// not string inheritance: the own declaration resolves against the
@@ -4934,14 +4999,13 @@ impl Dom {
         // CSS Animations 1 #animations: an animated font-size is already a
         // computed absolute length (the cache holds the underlying size).
         if let Some(px) = self
-            .animations
-            .value(id, "font-size")
+            .animation_value(id, "font-size")
             .and_then(|value| value.trim().strip_suffix("px")?.parse::<f32>().ok())
             .filter(|px| px.is_finite())
         {
             return px.max(0.0);
         }
-        if let Some(&v) = self.font_cache.borrow().get(id, self.style_value_epoch) {
+        if let Some(&v) = self.font_cache().borrow().get(id, self.style_value_epoch()) {
             return v;
         }
         let parent_px = match self.style_parent(id) {
@@ -4959,9 +5023,9 @@ impl Dom {
         let author = self.cascaded(id, "font-size");
         let v = if let Some(raw) = author {
             let decl = self.resolve_vars(id, &raw);
-            font_size_px_at(&decl, parent_px, root_px, self.viewport_px).unwrap_or(parent_px)
+            font_size_px_at(&decl, parent_px, root_px, self.viewport_px()).unwrap_or(parent_px)
         } else if let Some(size) = self.ua_font_size(id) {
-            font_size_px_at(size, parent_px, root_px, self.viewport_px).unwrap_or(parent_px)
+            font_size_px_at(size, parent_px, root_px, self.viewport_px()).unwrap_or(parent_px)
         } else {
             self.tag_name(id)
                 .and_then(ua_font_factor)
@@ -4972,12 +5036,14 @@ impl Dom {
         } else {
             self.generic_keyword_font_px(id).unwrap_or(v)
         };
-        self.font_cache
+        self.font_cache()
             .borrow_mut()
-            .put(id, self.style_value_epoch, v);
+            .put(id, self.style_value_epoch(), v);
         v
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Form controls do not inherit their font size: Gecko's and Blink's UA
     /// sheets give input, button and select 13.333px (`font: -moz-field`,
     /// `-webkit-small-control`) and textarea `font: medium monospace`.
@@ -4993,7 +5059,9 @@ impl Dom {
             _ => None,
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Gecko and Blink size a keyword-derived font against the medium size
     /// of its generic family when the family list is exactly `monospace`
     /// (13px rather than 16px, hence the `monospace, monospace` idiom); a
@@ -5020,7 +5088,9 @@ impl Dom {
         }?;
         Some(size * factor)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The absolute-size keyword `id`'s font size derives from, and the
     /// factor relative sizes applied since (Gecko's `KeywordInfo`); `None`
     /// once an absolute length or root-relative size intervenes. The root's
@@ -5060,14 +5130,16 @@ impl Dom {
         }
         Some(("medium", factor))
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn computed_cache_get(&self, id: NodeId, idx: usize) -> Option<Option<String>> {
         let stamp = (
-            self.style_value_epoch,
+            self.style_value_epoch(),
             crate::font_system::page_font_epoch(),
         );
         let (mut result, prepare) = {
-            let cache = self.computed_cache.borrow();
+            let cache = self.computed_cache().borrow();
             let result = (cache.0 == stamp)
                 .then(|| cache.1.get(&(id, idx)))
                 .flatten();
@@ -5078,7 +5150,7 @@ impl Dom {
         };
         if prepare {
             self.prepare_computed_row(id, 0);
-            result = self.computed_cache.borrow().1.get(&(id, idx));
+            result = self.computed_cache().borrow().1.get(&(id, idx));
         }
         #[cfg(feature = "architecture-diagnostics")]
         architecture_diagnostics::cache_read(
@@ -5091,11 +5163,13 @@ impl Dom {
         );
         result
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn computed_cache_put(&self, id: NodeId, idx: usize, v: Option<String>) {
-        let mut cache = self.computed_cache.borrow_mut();
+        let mut cache = self.computed_cache().borrow_mut();
         let stamp = (
-            self.style_value_epoch,
+            self.style_value_epoch(),
             crate::font_system::page_font_epoch(),
         );
         if cache.0 != stamp {
@@ -5104,9 +5178,11 @@ impl Dom {
         }
         cache.1.insert((id, idx), v);
         drop(cache);
-        self.style_sharing.borrow_mut().trim_payloads();
+        self.style_sharing().borrow_mut().trim_payloads();
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The user-agent stylesheet defaults, below the author cascade and
     /// before inheritance. Decoration lines are established here and then
     /// accumulated by `text_decoration`; font sizing also uses `ua_font_scale`.
@@ -5232,7 +5308,10 @@ impl Dom {
             "list-style-position" if self.is_details_summary(id) => "inside",
             "counter-increment" if self.is_details_summary(id) => "list-item 0",
             "list-style-type" if self.is_details_summary(id) => {
-                if self.attr(self.nodes[id].parent.unwrap(), "open").is_some() {
+                if self
+                    .attr(self.style_view().nodes.parent(id).unwrap(), "open")
+                    .is_some()
+                {
                     "disclosure-open"
                 } else {
                     "disclosure-closed"
@@ -5282,7 +5361,9 @@ impl Dom {
         };
         Some(v.to_string())
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn ol_marker_default(&self, id: NodeId) -> &'static str {
         match self.attr(id, "type") {
             Some("a") => "lower-alpha",
@@ -5292,7 +5373,9 @@ impl Dom {
             _ => "decimal",
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The UA foreground of a form control. HTML leaves widget appearance to
     /// the UA, and layout paints a native ButtonFace or Field surface behind
     /// buttons, inputs and textareas; CSS Color 4 #system-color-pairs pairs
@@ -5313,14 +5396,18 @@ impl Dom {
             _ => None,
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn ua_input_border_box(&self, id: NodeId) -> bool {
         matches!(
             self.input_type(id).as_str(),
             "radio" | "checkbox" | "reset" | "button" | "submit" | "color" | "search"
         )
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// HTML Rendering #tables-2's UA sheet aligns p and h1–h6 by their
     /// `align` attribute (`p[align=left i] { text-align: left }` and so on).
     fn ua_paragraph_align(&self, id: NodeId, tag: &str) -> Option<&'static str> {
@@ -5334,19 +5421,22 @@ impl Dom {
             .into_iter()
             .find(|value| align.eq_ignore_ascii_case(value))
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// HTML Rendering #lists: `dir`, `menu` and `ul` default to a disc
     /// bullet, a circle inside one `dir`/`menu`/`ol`/`ul` ancestor and a
     /// square inside two or more (an `ol` counts too). Authors can still
     /// override it anywhere.
     fn ul_marker_default(&self, id: NodeId) -> &'static str {
         let mut depth = 0u32;
-        let mut cur = self.nodes[id].parent;
+        let nodes = self.style_view().nodes;
+        let mut cur = nodes.parent(id);
         while let Some(c) = cur {
             if matches!(self.tag_name(c), Some("dir" | "menu" | "ol" | "ul")) {
                 depth += 1;
             }
-            cur = self.nodes[c].parent;
+            cur = nodes.parent(c);
         }
         match depth {
             0 => "disc",
@@ -5354,20 +5444,23 @@ impl Dom {
             _ => "square",
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// HTML #summary-for-its-parent-details (light-tree child order).
     pub(crate) fn is_details_summary(&self, id: NodeId) -> bool {
         self.tag_name(id) == Some("summary")
-            && self.nodes[id].parent.is_some_and(|parent| {
+            && self.style_view().nodes.parent(id).is_some_and(|parent| {
                 self.tag_name(parent) == Some("details")
                     && self
-                        .children(parent)
-                        .into_iter()
+                        .child_iter(parent)
                         .find(|&child| self.tag_name(child) == Some("summary"))
                         == Some(id)
             })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The accumulated `(underline, line-through)` for an element's text.
     ///
     /// CSS Text Decoration 3 §2.1 says line decorations are not inherited:
@@ -5379,9 +5472,9 @@ impl Dom {
     pub fn text_decoration(&self, id: NodeId) -> (bool, bool) {
         self.flush_style_invalidations();
         if let Some(&hit) = self
-            .decoration_cache
+            .decoration_cache()
             .borrow()
-            .get(id, self.style_value_epoch)
+            .get(id, self.style_value_epoch())
         {
             return hit;
         }
@@ -5403,12 +5496,14 @@ impl Dom {
         }
 
         let result = (underline, strike);
-        self.decoration_cache
+        self.decoration_cache()
             .borrow_mut()
-            .put(id, self.style_value_epoch, result);
+            .put(id, self.style_value_epoch(), result);
         result
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The author-cascade winner for one property on the element itself:
     /// one hash lookup into the element's per-epoch winner maps. Inline
     /// styles beat tree rules, `!important`/layers/specificity/source order
@@ -5424,7 +5519,9 @@ impl Dom {
             Some(value)
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether the author cascade supplies this property on the element.
     ///
     /// This differs deliberately from [`computed_value`](Self::computed_value):
@@ -5435,7 +5532,9 @@ impl Dom {
     pub(crate) fn author_declares(&self, id: NodeId, prop: &str) -> bool {
         self.cascaded_maps(id).elem.contains_key(prop)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether the author origin gives `prop` a cascaded value once any
     /// `revert`/`revert-layer` has rolled back, as CSS UI 4
     /// #appearance-disabling-properties asks. Unlike the computed value, an
@@ -5445,13 +5544,19 @@ impl Dom {
             !matches!(resolved_wide_keyword(&value), Some(WideKeyword::Revert))
         })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The element's full cascade winner maps for the current epoch, built
     /// on the first read of ANY of its properties (one pass over its author
     /// sources), then shared by every further read.
     fn cascaded_maps(&self, id: NodeId) -> std::rc::Rc<CascadedMaps> {
         self.flush_style_invalidations();
-        if let Some(hit) = self.cascaded_cache.borrow().get(id, self.style_value_epoch) {
+        if let Some(hit) = self
+            .cascaded_cache()
+            .borrow()
+            .get(id, self.style_value_epoch())
+        {
             return hit.clone();
         }
         let shared_input = self.shared_cascade_input(id);
@@ -5459,9 +5564,9 @@ impl Dom {
             .as_ref()
             .and_then(|key| self.shared_cascade_get(key))
         {
-            self.cascaded_cache
+            self.cascaded_cache()
                 .borrow_mut()
-                .put(id, self.style_value_epoch, hit.clone());
+                .put(id, self.style_value_epoch(), hit.clone());
             return hit;
         }
         let _t = casc_diag_on().then(std::time::Instant::now);
@@ -5473,12 +5578,14 @@ impl Dom {
             let us = t.elapsed().as_micros() as u64;
             casc_bump(|d| d.cascaded_us += us);
         }
-        self.cascaded_cache
+        self.cascaded_cache()
             .borrow_mut()
-            .put(id, self.style_value_epoch, maps.clone());
+            .put(id, self.style_value_epoch(), maps.clone());
         maps
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// ONE pass over the element's author sources — its inline `style`
     /// (parsed once, where it used to be re-parsed per property read), its
     /// matched rules (each rule's declarations land in the map for the box
@@ -5496,25 +5603,7 @@ impl Dom {
         let index = self.style_index();
         let scope = self.tree_scope(id);
         let matched = self.matched_rules(id);
-        // CSS Shadow 1 §3.2.4: `::slotted()` is an alias for the flattened
-        // element assigned to a slot; it does not create a box of its own.
-        // The light-DOM element still receives the declaration in its own
-        // cascade map, with the shadow-tree encapsulation context preserved.
-        let assigned_slots = index.slotted_assignments(self, id);
-        let slotted: Vec<&StyleRule> = index
-            .slotted_rules
-            .iter()
-            .filter(|&&(scope, _)| {
-                assigned_slots
-                    .iter()
-                    .any(|&(slot_scope, _)| slot_scope == scope)
-            })
-            .filter_map(|&(scope, ri)| {
-                let r = &index.scopes.get(&scope)?[ri as usize];
-                self.slotted_rule_matches(id, scope, r, &assigned_slots)
-                    .then_some(r)
-            })
-            .collect();
+        let slotted = self.slotted_rules(&index, id);
         let winners = self.style_view().cascade_winners(
             id,
             CascadeSources {
@@ -5522,9 +5611,8 @@ impl Dom {
                 matched: &matched,
                 slotted: &slotted,
                 host_rules: self
-                    .shadow_roots
-                    .get(&id)
-                    .and_then(|sr| index.scopes.get(sr))
+                    .shadow_root(id)
+                    .and_then(|sr| index.scopes.get(&sr))
                     .map(Vec::as_slice),
                 revert_layer: index.has_revert_layer,
             },
@@ -5548,9 +5636,9 @@ impl Dom {
         // cascade first, so evaluating container-type/font-size does not recurse
         // into an unfinished cascade for the same node.
         if !conditional_pseudos.is_empty() {
-            self.cascaded_cache.borrow_mut().put(
+            self.cascaded_cache().borrow_mut().put(
                 id,
-                self.style_value_epoch,
+                self.style_value_epoch(),
                 std::rc::Rc::new(CascadedMaps {
                     elem: elem
                         .iter()
@@ -5564,7 +5652,11 @@ impl Dom {
                 }),
             );
             for r in conditional_pseudos {
-                if !r.containers.iter().all(|q| q.matches(self, id, true)) {
+                if !r
+                    .containers
+                    .iter()
+                    .all(|q| self.container_matches(q, id, true))
+                {
                     continue;
                 }
                 let target = match rule_pseudo(r) {
@@ -5626,9 +5718,9 @@ impl Dom {
             ] {
                 let custom_count = winners.keys().filter(|k| k.starts_with("--")).count();
                 for pass in 0..=custom_count + 1 {
-                    self.cascaded_cache.borrow_mut().put(
+                    self.cascaded_cache().borrow_mut().put(
                         id,
-                        self.style_value_epoch,
+                        self.style_value_epoch(),
                         std::rc::Rc::new(maps.clone()),
                     );
                     let mut changed = false;
@@ -5674,9 +5766,9 @@ impl Dom {
                     if !changed {
                         // Dependencies are settled; ordinary properties still
                         // need one pass through the same resolved environment.
-                        self.cascaded_cache.borrow_mut().put(
+                        self.cascaded_cache().borrow_mut().put(
                             id,
-                            self.style_value_epoch,
+                            self.style_value_epoch(),
                             std::rc::Rc::new(maps.clone()),
                         );
                         for (property, winner) in
@@ -5713,9 +5805,9 @@ impl Dom {
             .iter()
             .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
         {
-            self.cascaded_cache.borrow_mut().put(
+            self.cascaded_cache().borrow_mut().put(
                 id,
-                self.style_value_epoch,
+                self.style_value_epoch(),
                 std::rc::Rc::new(maps.clone()),
             );
             for (pseudo, winners) in [
@@ -5787,14 +5879,39 @@ impl Dom {
                         .to_owned();
                     maps.target_mut(pseudo).insert(name, value);
                 }
-                self.cascaded_cache.borrow_mut().put(
+                self.cascaded_cache().borrow_mut().put(
                     id,
-                    self.style_value_epoch,
+                    self.style_value_epoch(),
                     std::rc::Rc::new(maps.clone()),
                 );
             }
         }
         maps
+    }
+}
+
+impl Dom {
+    /// The `::slotted()` rules matching a light-DOM element.
+    fn slotted_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<&'i StyleRule> {
+        // CSS Shadow 1 §3.2.4: `::slotted()` is an alias for the flattened
+        // element assigned to a slot; it does not create a box of its own.
+        // The light-DOM element still receives the declaration in its own
+        // cascade map, with the shadow-tree encapsulation context preserved.
+        let assigned_slots = index.slotted_assignments(self, id);
+        index
+            .slotted_rules
+            .iter()
+            .filter(|&&(scope, _)| {
+                assigned_slots
+                    .iter()
+                    .any(|&(slot_scope, _)| slot_scope == scope)
+            })
+            .filter_map(|&(scope, ri)| {
+                let r = &index.scopes.get(&scope)?[ri as usize];
+                self.slotted_rule_matches(id, scope, r, &assigned_slots)
+                    .then_some(r)
+            })
+            .collect()
     }
 
     /// Match a `::slotted(<compound-selector>)` rule against a light-DOM
@@ -5840,7 +5957,9 @@ impl Dom {
             None => html_hints::DocumentBase::Unknown,
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// An element's computed value for a custom property (`--foo`): its own
     /// cascaded declaration, else inherited from the composed parent (custom
     /// properties inherit). Cache computed token streams: CSS Cascade 5 §7.2
@@ -5849,10 +5968,10 @@ impl Dom {
     fn custom_prop(&self, id: NodeId, name: &str) -> Option<String> {
         self.flush_style_invalidations();
         if let Some(hit) = {
-            let cache = self.custom_prop_cache.borrow();
+            let cache = self.custom_prop_cache().borrow();
             (cache.0
                 == (
-                    self.style_value_epoch,
+                    self.style_value_epoch(),
                     crate::font_system::page_font_epoch(),
                 ))
                 .then(|| cache.1.get(&id).and_then(|node| node.get(name)).cloned())
@@ -5864,9 +5983,9 @@ impl Dom {
             VarResult::Resolved(value) => Some(value),
             VarResult::Undefined | VarResult::Cycle => None,
         };
-        let mut cache = self.custom_prop_cache.borrow_mut();
+        let mut cache = self.custom_prop_cache().borrow_mut();
         let stamp = (
-            self.style_value_epoch,
+            self.style_value_epoch(),
             crate::font_system::page_font_epoch(),
         );
         if cache.0 != stamp {
@@ -5880,7 +5999,9 @@ impl Dom {
             .insert(name.to_owned(), value.clone());
         value
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Substitute `var(--name, fallback)` references in a CSS value to a plain
     /// string — the public entry. Balanced-paren aware so `var()` inside
     /// `calc()` and nested `var()` both resolve. A value that is *invalid at
@@ -5891,7 +6012,9 @@ impl Dom {
         self.substitute_vars(id, value, &mut Vec::new())
             .unwrap_or_default()
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// CSS Variables 1 #using-variables (CSSWG 81c27f68): a value without a
     /// substitution keeps its tokens. Reuse an already owned value on the same
     /// no-substitution path as `substitute_vars_for`, avoiding a second copy
@@ -5905,7 +6028,9 @@ impl Dom {
             value
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Resolve a shorthand that contains `var()` only after custom-property
     /// substitution, then extract this longhand from the resulting shorthand.
     /// CSS Variables §3 makes such shorthands pending-substitution values at
@@ -5927,7 +6052,9 @@ impl Dom {
                     .then_some(value)
             })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn resolve_pseudo_pending_shorthand(
         &self,
         id: NodeId,
@@ -5953,7 +6080,9 @@ impl Dom {
                     .then_some(value)
             })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The computed value of custom property `name` on `id`, with its own
     /// `var()` references substituted (CSS Variables L1). `active` is the set of
     /// custom properties currently being resolved further up the call chain —
@@ -5965,7 +6094,9 @@ impl Dom {
     fn resolve_custom_prop(&self, id: NodeId, name: &str, _active: &mut Vec<String>) -> VarResult {
         self.registered_custom_value(id, None, name)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Substitute every `var(--name, fallback)` in `value` against `id`'s
     /// computed custom properties. Returns `None` when the value is *invalid at
     /// computed-value time* — a `var()` references a guaranteed-invalid/undefined
@@ -5973,12 +6104,16 @@ impl Dom {
     fn substitute_vars(&self, id: NodeId, value: &str, active: &mut Vec<String>) -> Option<String> {
         self.substitute_vars_for(id, None, value, active)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn resolve_pseudo_vars(&self, id: NodeId, which: PseudoEl, value: &str) -> String {
         self.substitute_vars_for(id, Some(which), value, &mut Vec::new())
             .unwrap_or_default()
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn resolve_pseudo_custom_prop(
         &self,
         id: NodeId,
@@ -5988,7 +6123,9 @@ impl Dom {
     ) -> VarResult {
         self.registered_custom_value(id, Some(which), name)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn substitute_vars_for(
         &self,
         id: NodeId,
@@ -6003,7 +6140,9 @@ impl Dom {
         }
         properties::substitute(self, id, pseudo, value)
     }
+}
 
+impl Dom {
     /// Textual projection of generated content. Image items still generate a
     /// pseudo box but contribute no characters to this projection.
     pub fn pseudo_content(&self, id: NodeId, which: PseudoEl) -> Option<String> {
@@ -6108,7 +6247,9 @@ impl Dom {
             marker
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The cascade-winning value of `prop` on `id`'s `::before`/`::after`
     /// pseudo-element, or `None` if no matching rule sets it. One hash
     /// lookup into the pseudo's bucket of the element's winner maps.
@@ -6118,7 +6259,9 @@ impl Dom {
         }
         self.cascaded_maps(id).pseudo(which).get(prop).cloned()
     }
+}
 
+impl Dom {
     /// Whether `::first-letter` declarations apply to `id`, from the cascade
     /// or (in a stylesheet-free snapshot) from their baked attribute.
     pub(crate) fn has_first_letter_style(&self, id: NodeId) -> bool {
@@ -6134,14 +6277,18 @@ impl Dom {
         self.effective_display(id)
             .is_some_and(|display| display.split_whitespace().any(|v| v == "list-item"))
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether `::marker` declarations apply to `id`, from the cascade or
     /// (in a stylesheet-free snapshot) from their baked attribute.
     pub(crate) fn has_marker_style(&self, id: NodeId) -> bool {
         self.attr(id, PseudoEl::Marker.baked_style_attr()).is_some()
             || (self.style_index().has_marker && !self.cascaded_maps(id).marker.is_empty())
     }
+}
 
+impl Dom {
     /// CSS Lists 3 #content-property: the contents of list item `id`'s
     /// marker box when `content` on its `::marker` is not `normal`, as for
     /// `::before`; empty for `none`, which generates no marker box. `None`
@@ -6156,7 +6303,9 @@ impl Dom {
         let content = self.pseudo_layout_value(id, PseudoEl::Marker, "content")?;
         content.trim().eq_ignore_ascii_case("none").then(Vec::new)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// The layout-facing computed value on a generated `::before`/`::after`
     /// box. Tree-abiding pseudo-elements inherit from their originating
     /// element (CSS Pseudo 4 §4), while non-inherited properties take their
@@ -6198,7 +6347,9 @@ impl Dom {
             value
         }
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Recover one declaration from the serialized pseudo style. The value was
     /// produced by `baked_pseudo_style` from the same parsed declaration model;
     /// parsing it through `parse_decl`/`expand_box_shorthand` keeps semicolons,
@@ -6224,7 +6375,9 @@ impl Dom {
         }
         found
     }
+}
 
+impl Dom {
     /// Whether `id` carries the clearfix idiom — a `::before`/`::after`
     /// pseudo-element that `clear`s floats (`.clearfix`, Bootstrap's `.row`,
     /// `.group`, …). Such a block CONTAINS its descendant floats (the universal
@@ -6366,7 +6519,9 @@ impl Dom {
                 .filter(|_| self.tree_scope(node) == document)
         })
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Retained font environment for the tree where the font-family reference
     /// was declared. CSS Shadow 1 #shadow-names preserves this reference during
     /// inheritance; a child document always starts a separate environment.
@@ -6390,7 +6545,9 @@ impl Dom {
         }
         self.scope_font_set(source)
     }
+}
 
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub(crate) fn scope_font_set(
         &self,
         id: NodeId,
@@ -6401,11 +6558,13 @@ impl Dom {
             if let Some(fonts) = index.font_sets.get(&scope) {
                 return Some(fonts.clone());
             }
-            let host = self.shadow_hosts.get(&scope)?;
+            let host = self.style_view().state.shadow_hosts.get(&scope)?;
             scope = self.tree_scope(*host);
         }
     }
+}
 
+impl Dom {
     fn build_font_sets(
         &self,
         mut faces: FxHashMap<NodeId, Vec<crate::http::CssFontFace>>,
@@ -21753,7 +21912,11 @@ mod tests {
         let invalid = dom.get_by_id("invalid").unwrap();
         for property in ["flex-grow", "flex-shrink", "flex-basis"] {
             let value = dom.computed_value_resolved(invalid, property);
-            assert_eq!(value, dom.ua_default(invalid, property), "{property}");
+            assert_eq!(
+                value,
+                ComputeView(&dom).ua_default(invalid, property),
+                "{property}"
+            );
         }
     }
 

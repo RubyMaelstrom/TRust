@@ -415,6 +415,9 @@ impl Dom {
     pub(crate) fn has_container_unit_dependencies(&self) -> bool {
         self.container_dependencies.borrow().units
     }
+}
+
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// 0: no size container, 1: inline axis, 2: both axes. The layout engine
     /// currently lays out horizontal writing modes; do not claim vertical queries.
     pub(crate) fn size_container_kind(&self, node: NodeId) -> u8 {
@@ -445,7 +448,9 @@ impl Dom {
             _ => 0,
         }
     }
+}
 
+impl Dom {
     /// Container rules and observed container-relative lengths require a
     /// settled layout before computed styles or incremental patches escape.
     pub(crate) fn style_depends_on_layout(&self) -> bool {

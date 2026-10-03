@@ -81,6 +81,12 @@ impl<'a> NodesRef<'a> {
         self.0[id].owner_document
     }
 
+    /// Node document, `None` for an unknown id.
+    #[inline]
+    pub(super) fn owner_document_of(self, id: NodeId) -> Option<NodeId> {
+        Some(self.0.get(id)?.owner_document)
+    }
+
     #[inline]
     pub(super) fn is_document(self, id: NodeId) -> bool {
         matches!(self.0[id].data, NodeData::Document)

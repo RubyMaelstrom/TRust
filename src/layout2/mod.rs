@@ -107,7 +107,11 @@ pub(crate) fn container_query_length(dom: &Dom, node: NodeId, text: &str) -> Opt
     value::Len::parse(text, Units::of(dom, node), Vp { w, h })?.resolve(None)
 }
 
-pub(crate) fn line_height_length(dom: &Dom, node: NodeId, text: &str) -> Option<f32> {
+pub(crate) fn line_height_length<D: UnitSource + ?Sized>(
+    dom: &D,
+    node: NodeId,
+    text: &str,
+) -> Option<f32> {
     let (w, h) = dom.viewport_px();
     let units = Units::of(dom, node);
     value::Len::parse(text, units, Vp { w, h })?

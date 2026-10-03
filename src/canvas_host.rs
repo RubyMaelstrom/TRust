@@ -188,7 +188,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                         ancestor = dom.parent_flat(node);
                     }
                     let units = if rendered {
-                        crate::layout2::Units::of(&dom, id)
+                        crate::layout2::Units::of(&*dom, id)
                     } else {
                         crate::layout2::Units {
                             fs: 10.,
