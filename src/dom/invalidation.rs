@@ -79,11 +79,11 @@ impl SelectorDependencyIndex {
             // Source order does not affect a dependency union. Identity is
             // safe here because the complete rule set remains Rc-owned by
             // this immutable StyleIndex throughout construction and use.
-            rules.sort_unstable_by_key(|rule| std::rc::Rc::as_ptr(&rule.data));
-            rules.dedup_by(|a, b| std::rc::Rc::ptr_eq(&a.data, &b.data));
+            rules.sort_unstable_by_key(|rule| std::sync::Arc::as_ptr(&rule.data));
+            rules.dedup_by(|a, b| std::sync::Arc::ptr_eq(&a.data, &b.data));
             let key = rules
                 .iter()
-                .map(|rule| std::rc::Rc::as_ptr(&rule.data))
+                .map(|rule| std::sync::Arc::as_ptr(&rule.data))
                 .collect();
             // Compare the complete identity vector, never just its hash.
             // Shared sheets contribute in EVERY Document without duplicating
@@ -1954,7 +1954,7 @@ mod tests {
         let leaves = panels.map(|panel| dom.child_iter(panel).next().unwrap());
         let index = dom.style_index();
         assert!(
-            std::rc::Rc::ptr_eq(
+            std::sync::Arc::ptr_eq(
                 &index.scopes[&documents[0]][0].data,
                 &index.scopes[&documents[1]][0].data,
             ),

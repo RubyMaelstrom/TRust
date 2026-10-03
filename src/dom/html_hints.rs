@@ -5,21 +5,51 @@
 //! color parsing: #rules-for-parsing-a-legacy-colour-value. These are CSS
 //! declarations in the presentational-hint origin, not inline author styles.
 
-use super::{Dom, NodeId};
+use super::{Dom, NodeId, StyleView};
+
+/// Where a presentational hint's URL resolves (HTML #the-page: against the
+/// node document's base URL).
+pub(super) enum DocumentBase {
+    Url(url::Url),
+    /// No document URL: the reference stays relative, like author CSS.
+    Unknown,
+}
 
 impl Dom {
+    pub(crate) fn marquee_scrolls_vertically(&self, id: NodeId) -> bool {
+        self.style_view().marquee_scrolls_vertically(id)
+    }
+
+    pub(super) fn html_presentational_hints(
+        &self,
+        id: NodeId,
+        hint: impl FnMut(&'static str, String),
+    ) {
+        self.style_view()
+            .html_presentational_hints(id, &|node| self.document_base(node), hint);
+    }
+
+    /// An attribute that maps to a dimension property ignoring zero, parsed
+    /// by HTML's rules for parsing non-zero dimension values: `"450px;"`
+    /// is 450 pixels and `"80%"` a percentage (as `450px`/`80%`).
+    pub(crate) fn nonzero_dimension_attr(&self, id: NodeId, name: &str) -> Option<String> {
+        self.attr(id, name).and_then(nonzero_dimension_value)
+    }
+}
+
+impl StyleView<'_> {
     /// The table a td/th belongs to through its row (and row group): the
     /// `table > tr > td` and `table > tbody > tr > td` shapes the HTML
     /// rendering rules select.
     fn cell_table(&self, cell: NodeId) -> Option<NodeId> {
         let row = self
-            .node(cell)
-            .parent
+            .nodes
+            .parent(cell)
             .filter(|&row| self.tag_name(row) == Some("tr"))?;
-        let parent = self.node(row).parent?;
+        let parent = self.nodes.parent(row)?;
         let table = match self.tag_name(parent) {
             Some("table") => parent,
-            Some("thead" | "tbody" | "tfoot") => self.node(parent).parent?,
+            Some("thead" | "tbody" | "tfoot") => self.nodes.parent(parent)?,
             _ => return None,
         };
         (self.tag_name(table) == Some("table")
@@ -29,22 +59,18 @@ impl Dom {
 
     /// Whether a marquee's `direction` attribute is in the up or down state
     /// (HTML #attr-marquee-direction; the default is left).
-    pub(crate) fn marquee_scrolls_vertically(&self, id: NodeId) -> bool {
+    fn marquee_scrolls_vertically(&self, id: NodeId) -> bool {
         self.attr(id, "direction").is_some_and(|direction| {
             direction.eq_ignore_ascii_case("up") || direction.eq_ignore_ascii_case("down")
         })
     }
 
-    /// An attribute that maps to a dimension property ignoring zero, parsed
-    /// by HTML's rules for parsing non-zero dimension values: `"450px;"`
-    /// is 450 pixels and `"80%"` a percentage (as `450px`/`80%`).
-    pub(crate) fn nonzero_dimension_attr(&self, id: NodeId, name: &str) -> Option<String> {
-        self.attr(id, name).and_then(nonzero_dimension_value)
-    }
-
+    /// The presentational hints of `id`. `base` resolves the node
+    /// document's base URL for the `background` attribute.
     pub(super) fn html_presentational_hints(
         &self,
         id: NodeId,
+        base: &dyn Fn(NodeId) -> DocumentBase,
         mut hint: impl FnMut(&'static str, String),
     ) {
         if self.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml") {
@@ -236,13 +262,9 @@ impl Dom {
             tag,
             "body" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
         ) && let Some(source) = self.attr(id, "background").filter(|s| !s.is_empty())
-            && let Some(resolved) = match self.doc_url.as_ref() {
-                Some(page) => self
-                    .resource_base_url(id, page)
-                    .join(source)
-                    .ok()
-                    .map(String::from),
-                None => Some(source.trim().to_string()),
+            && let Some(resolved) = match base(id) {
+                DocumentBase::Url(base) => base.join(source).ok().map(String::from),
+                DocumentBase::Unknown => Some(source.trim().to_string()),
             }
         {
             let escaped = resolved.replace('\\', "\\\\").replace('"', "\\\"");
@@ -280,8 +302,8 @@ impl Dom {
         }
         if matches!(tag, "frameset" | "frame") {
             let nested = self
-                .node(id)
-                .parent
+                .nodes
+                .parent(id)
                 .is_some_and(|parent| self.tag_name(parent) == Some("frameset"));
             hint("width", "100%".into());
             hint("height", if nested { "100%" } else { "100vh" }.into());

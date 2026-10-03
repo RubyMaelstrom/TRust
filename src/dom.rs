@@ -2807,8 +2807,7 @@ impl Dom {
 
     /// Whether `id`'s node document is in quirks mode (DOM #concept-document-quirks).
     pub(crate) fn in_quirks_mode(&self, id: NodeId) -> bool {
-        self.owner_document(id)
-            .is_some_and(|document| self.document_mode(document) == QuirksMode::Quirks)
+        self.style_view().in_quirks_mode(id)
     }
 
     /// DOM creation establishes provenance before publishing a wrapper or invoking a custom
@@ -3344,13 +3343,7 @@ impl Dom {
     /// hydration reads `el.namespaceURI.includes("svg")`, so a missing value
     /// throws on every SSR Vue/Nuxt page.
     pub fn namespace_uri(&self, id: NodeId) -> Option<&str> {
-        match &self.nodes.get(id)?.data {
-            NodeData::Element { name, .. } => {
-                let ns = &*name.ns;
-                (!ns.is_empty()).then_some(ns)
-            }
-            _ => None,
-        }
+        style_view::NodesRef::new(&self.nodes).namespace_uri(id)
     }
 
     /// DOM `Element.prefix`, retained as part of the element's qualified name.
@@ -5483,217 +5476,56 @@ impl Dom {
     fn build_cascaded_maps(&self, id: NodeId) -> CascadedMaps {
         type Winners = FxHashMap<String, CascadeWinner>;
         let index = self.style_index();
-        let preserve_layers = index.has_revert_layer
-            || self
-                .attr(id, "style")
-                .is_some_and(|s| s.to_ascii_lowercase().contains("revert-layer"))
-            || self.cssom_inline.get(&id).is_some_and(|ds| {
-                ds.iter()
-                    .any(|(_, v, _)| v.to_ascii_lowercase().contains("revert-layer"))
-            });
-        // Clone only on first sight or a WIN — a losing declaration costs a
-        // lookup and a key compare, never an allocation.
-        let declaration_order = Cell::new(0usize);
-        let consider_into = |map: &mut Winners, prop: &str, mut key: CascadeKey, value: &str| {
-            key.7 = declaration_order.get();
-            declaration_order.set(key.7 + 1);
-            match map.get_mut(prop) {
-                Some(slot) => slot.consider(key, value, preserve_layers),
-                None => {
-                    map.insert(
-                        prop.to_string(),
-                        CascadeWinner::One((key, value.to_string())),
-                    );
-                }
-            }
-        };
-        let mut elem = Winners::default();
-        let mut before = Winners::default();
-        let mut after = Winners::default();
-        let mut first_letter = Winners::default();
-        let mut marker = Winners::default();
-        let mut conditional_pseudos = Vec::new();
-        // HTML rendering hints have their own origin below every author
-        // layer. `revert` discards them, while `revert-layer` can reveal them
-        // (CSS Cascade 5 #preshint and #revert-layer).
-        self.html_presentational_hints(id, |property, value| {
-            consider_into(
-                &mut elem,
-                property,
-                (false, false, true, false, 0, (0, 0, 0), 0, 0),
-                &value,
-            );
-        });
-        if let Some(style) = self.attr(id, "style") {
-            let parsed;
-            let declarations = match self.cssom_inline.get(&id) {
-                Some(declarations) => declarations,
-                None => {
-                    let quirks = self.in_quirks_mode(id);
-                    parsed = parse_declaration_block(style, quirks);
-                    &parsed
-                }
-            };
-            for (k, v, important) in declarations {
-                let important = *important;
-                for (pk, pv) in expand_box_shorthand(k, v) {
-                    // Element-attached: the inline flag outranks the layer
-                    // component, so the (unlayered) encoding is inert. This
-                    // declaration belongs to the element's OUTER tree context.
-                    // (Inline styles can't target a pseudo-element.)
-                    consider_into(
-                        &mut elem,
-                        &pk,
-                        (
-                            important,
-                            true,
-                            !important,
-                            true,
-                            encode_layer(&[], important),
-                            (0, 0, 0),
-                            usize::MAX,
-                            0,
-                        ),
-                        &pv,
-                    );
-                }
-            }
-        }
-        if let Some(rules) = index.scopes.get(&self.tree_scope(id)) {
-            for &ri in self.matched_rules(id).iter() {
-                let r = &rules[ri as usize];
-                if rule_pseudo(r).is_some() && !r.containers.is_empty() {
-                    conditional_pseudos.push(r);
-                    continue;
-                }
-                // A `div::before{…}` rule targets the generated box, not
-                // the element — its winners land in that box's own map.
-                let target = match rule_pseudo(r) {
-                    None => &mut elem,
-                    Some(PseudoEl::Before) => &mut before,
-                    Some(PseudoEl::After) => &mut after,
-                    Some(PseudoEl::FirstLetter) => &mut first_letter,
-                    Some(PseudoEl::Marker) => &mut marker,
-                };
-                for (pk, (imp, v)) in &r.decls {
-                    consider_into(
-                        target,
-                        pk,
-                        (
-                            *imp,
-                            true,
-                            !*imp,
-                            false,
-                            r.layer_key(*imp),
-                            r.specificity,
-                            r.order,
-                            0,
-                        ),
-                        v,
-                    );
-                }
-            }
-        }
+        let scope = self.tree_scope(id);
+        let matched = self.matched_rules(id);
         // CSS Shadow 1 §3.2.4: `::slotted()` is an alias for the flattened
         // element assigned to a slot; it does not create a box of its own.
         // The light-DOM element still receives the declaration in its own
         // cascade map, with the shadow-tree encapsulation context preserved.
         let assigned_slots = index.slotted_assignments(self, id);
-        for &(scope, ri) in &index.slotted_rules {
-            if !assigned_slots
-                .iter()
-                .any(|&(slot_scope, _)| slot_scope == scope)
-            {
-                continue;
-            }
-            let Some(rules) = index.scopes.get(&scope) else {
-                continue;
-            };
-            let r = &rules[ri as usize];
-            if !self.slotted_rule_matches(id, scope, r, &assigned_slots) {
-                continue;
-            }
-            for (pk, (imp, v)) in &r.decls {
-                consider_into(
-                    &mut elem,
-                    pk,
-                    (
-                        *imp,
-                        true,
-                        *imp,
-                        false,
-                        r.layer_key(*imp),
-                        r.specificity,
-                        r.order,
-                        0,
-                    ),
-                    v,
-                );
-            }
-        }
-        // `:host` rules: a shadow root's own stylesheet styles ITS host element
-        // (CSS Scoping §3.3) via `:host`/`:host(<compound>)`. The host lives in
-        // the parent tree, so these aren't in its matched set — pull them from
-        // the host's shadow scope. (`<style>` baked into the serialized HTML is
-        // dropped, so this is the JS-pipeline adoptedStyleSheets path.)
-        if let Some(&sr) = self.shadow_roots.get(&id)
-            && let Some(rules) = index.scopes.get(&sr)
-        {
-            for r in rules {
-                if rule_pseudo(r).is_some() || !self.host_rule_matches(id, r) {
-                    continue;
-                }
-                for (pk, (imp, v)) in &r.decls {
-                    consider_into(
-                        &mut elem,
-                        pk,
-                        (
-                            *imp,
-                            true,
-                            *imp,
-                            false,
-                            r.layer_key(*imp),
-                            r.specificity,
-                            r.order,
-                            0,
-                        ),
-                        v,
-                    );
-                }
-            }
-        }
-        // SVG 2 §6.6 / §7.8: geometry presentation attributes participate
-        // below all author stylesheets. HTML attributes and <use>/<symbol>
-        // dimensions are not CSS geometry properties. Keep unitless SVG user
-        // units as CSS px in the snapshot consumed by flex/grid and CSSOM.
-        if self.namespace_uri(id) == Some("http://www.w3.org/2000/svg")
-            && (matches!(self.tag_name(id), Some("rect" | "image" | "foreignObject"))
-                || (self.tag_name(id) == Some("svg") && !self.ancestor_is_svg(id)))
-        {
-            for property in ["width", "height"] {
-                if !elem.contains_key(property)
-                    && let Some(value) = self
-                        .attr(id, property)
-                        .and_then(crate::layout2::svg_dimension_hint)
-                {
-                    consider_into(
-                        &mut elem,
-                        property,
-                        (
-                            false,
-                            true,
-                            true,
-                            false,
-                            encode_layer(&[], false),
-                            (0, 0, 0),
-                            0,
-                            0,
-                        ),
-                        &value,
-                    );
-                }
-            }
-        }
+        let slotted: Vec<&StyleRule> = index
+            .slotted_rules
+            .iter()
+            .filter(|&&(scope, _)| {
+                assigned_slots
+                    .iter()
+                    .any(|&(slot_scope, _)| slot_scope == scope)
+            })
+            .filter_map(|&(scope, ri)| {
+                let r = &index.scopes.get(&scope)?[ri as usize];
+                self.slotted_rule_matches(id, scope, r, &assigned_slots)
+                    .then_some(r)
+            })
+            .collect();
+        let winners = self.style_view().cascade_winners(
+            id,
+            CascadeSources {
+                rules: index.scopes.get(&scope).map_or(&[], Vec::as_slice),
+                matched: &matched,
+                slotted: &slotted,
+                host_rules: self
+                    .shadow_roots
+                    .get(&id)
+                    .and_then(|sr| index.scopes.get(sr))
+                    .map(Vec::as_slice),
+                revert_layer: index.has_revert_layer,
+            },
+            &|node| self.document_base(node),
+        );
+        let preserve_layers = winners.preserve_layers;
+        let declaration_order = Cell::new(winners.declarations);
+        let consider_into = |map: &mut Winners, prop: &str, key: CascadeKey, value: &str| {
+            consider_winner(map, prop, key, value, preserve_layers, &declaration_order);
+        };
+        let CascadeWinners {
+            mut elem,
+            mut before,
+            mut after,
+            mut first_letter,
+            mut marker,
+            conditional: conditional_pseudos,
+            ..
+        } = winners;
         // Pseudos may query their own originating element. Finish that element's
         // cascade first, so evaluating container-type/font-size does not recurse
         // into an unfinished cascade for the same node.
@@ -5742,33 +5574,23 @@ impl Dom {
                 }
             }
         }
-        let strip = |m: &Winners| {
-            m.iter()
-                .map(|(k, v)| (k.clone(), v.resolve(|_| false).to_owned()))
-                .collect()
-        };
         let mut maps = CascadedMaps {
-            elem: strip(&elem),
-            before: strip(&before),
-            after: strip(&after),
-            first_letter: strip(&first_letter),
-            marker: strip(&marker),
+            elem: strip_winners(&elem),
+            before: strip_winners(&before),
+            after: strip_winners(&after),
+            first_letter: strip_winners(&first_letter),
+            marker: strip_winners(&marker),
             custom_bases: Default::default(),
         };
-        for (pseudo, winners) in [
+        for (pseudo, name, order) in custom_property_sources([
             (None, &elem),
             (Some(PseudoEl::Before), &before),
             (Some(PseudoEl::After), &after),
             (Some(PseudoEl::FirstLetter), &first_letter),
             (Some(PseudoEl::Marker), &marker),
-        ] {
-            for (name, winner) in winners.iter().filter(|(name, _)| name.starts_with("--")) {
-                if let Some((key, _)) = winner.resolve_with_key(|_| false)
-                    && let Some(base) = index.rule_bases.get(&key.6)
-                {
-                    maps.custom_bases
-                        .insert((pseudo, name.clone()), base.clone());
-                }
+        ]) {
+            if let Some(base) = index.rule_bases.get(&order) {
+                maps.custom_bases.insert((pseudo, name), base.clone());
             }
         }
         if preserve_layers {
@@ -5989,22 +5811,16 @@ impl Dom {
     /// host-matching (`:host`, `:host(.x)`); a `:host(.x) .y` rule targets
     /// shadow content and is matched against that content in its own scope.
     fn host_rule_matches(&self, host: NodeId, r: &StyleRule) -> bool {
-        let parts = &r.selector.0;
-        let [(_, c)] = parts.as_slice() else {
-            return false;
-        };
-        self.matches_compound_in(
-            host,
-            c,
-            SelectorContext {
-                scope: None,
-                shadow_host: Some(host),
-                memo: None,
-                memo_prefixes: false,
-                ancestors: None,
-                classes: ClassMemo::Document(&self.class_cache),
-            },
-        )
+        self.style_view()
+            .host_rule_matches(host, r, ClassMemo::Document(&self.class_cache))
+    }
+
+    /// The node document's base URL for presentational hints.
+    fn document_base(&self, id: NodeId) -> html_hints::DocumentBase {
+        match self.doc_url.as_ref() {
+            Some(page) => html_hints::DocumentBase::Url(self.resource_base_url(id, page)),
+            None => html_hints::DocumentBase::Unknown,
+        }
     }
 
     /// An element's computed value for a custom property (`--foo`): its own
@@ -6862,7 +6678,7 @@ impl Dom {
             .scopes
             .values()
             .flatten()
-            .filter(|rule| seen.insert(std::rc::Rc::as_ptr(&rule.data)))
+            .filter(|rule| seen.insert(std::sync::Arc::as_ptr(&rule.data)))
             .collect::<Vec<_>>();
         index.has_opacity = unique
             .iter()
@@ -7630,25 +7446,7 @@ impl Dom {
     /// Walking the composed parent chain also keeps shadow-tree descendants in
     /// their containing document without exposing a deeper nested document.
     pub fn frame_owner(&self, id: NodeId) -> Option<NodeId> {
-        // Ownership does not depend on being inserted. A detached node created in a child
-        // Window keeps that Document until adoption, including shadow descendants.
-        let document = self.nodes.get(id)?.owner_document;
-        if let Some(parent) = self.nodes.get(document)?.parent
-            && matches!(self.tag_name(parent), Some("iframe" | "frame"))
-        {
-            return Some(parent);
-        }
-        let mut current = Some(id);
-        while let Some(node) = current {
-            let parent = self.parent_composed(node)?;
-            if matches!(self.tag_name(parent), Some("iframe" | "frame"))
-                && self.frame_body(parent).is_some()
-            {
-                return Some(parent);
-            }
-            current = Some(parent);
-        }
-        None
+        self.style_view().frame_owner(id)
     }
 
     /// HTML #document-base-url / #updating-the-image-data: a resource uses
@@ -9073,14 +8871,7 @@ impl Dom {
     }
 
     fn ancestor_is_svg(&self, id: NodeId) -> bool {
-        let mut cur = self.nodes[id].parent;
-        while let Some(p) = cur {
-            if self.tag_name(p) == Some("svg") {
-                return true;
-            }
-            cur = self.nodes[p].parent;
-        }
-        false
+        self.style_view().ancestor_is_svg(id)
     }
 
     /// The SVG's accessible name for `<img alt>` (a fallback shown only if the
@@ -10156,6 +9947,84 @@ impl<'a> StyleView<'a> {
     /// See `Dom::is_modal`.
     pub(super) fn is_modal(&self, id: NodeId) -> bool {
         self.state.modal_dialogs.contains(&id) || self.attr(id, "data-trust-modal").is_some()
+    }
+
+    pub(super) fn namespace_uri(&self, id: NodeId) -> Option<&'a str> {
+        self.nodes.namespace_uri(id)
+    }
+
+    /// Whether `id`'s node document is in quirks mode (DOM #concept-document-quirks).
+    pub(super) fn in_quirks_mode(&self, id: NodeId) -> bool {
+        self.nodes.contains(id)
+            && self
+                .state
+                .document_modes
+                .get(&self.nodes.owner_document(id))
+                .is_some_and(|&mode| mode == QuirksMode::Quirks)
+    }
+
+    /// See `Dom::frame_owner`.
+    pub(super) fn frame_owner(&self, id: NodeId) -> Option<NodeId> {
+        // Ownership does not depend on being inserted. A detached node created in a child
+        // Window keeps that Document until adoption, including shadow descendants.
+        if !self.nodes.contains(id) {
+            return None;
+        }
+        let document = self.nodes.owner_document(id);
+        if let Some(parent) = self.nodes.try_parent(document)?
+            && matches!(self.tag_name(parent), Some("iframe" | "frame"))
+        {
+            return Some(parent);
+        }
+        let mut current = Some(id);
+        while let Some(node) = current {
+            let parent = self.parent_composed(node)?;
+            if matches!(self.tag_name(parent), Some("iframe" | "frame"))
+                && self.frame_body(parent).is_some()
+            {
+                return Some(parent);
+            }
+            current = Some(parent);
+        }
+        None
+    }
+
+    /// Whether an ancestor of `id` is an `svg` element.
+    /// Whether a shadow-scope rule is a `:host`/`:host(<compound>)` rule that
+    /// matches its host element (see `Dom::host_rule_matches`).
+    pub(super) fn host_rule_matches(
+        &self,
+        host: NodeId,
+        r: &StyleRule,
+        classes: ClassMemo<'_>,
+    ) -> bool {
+        let parts = &r.selector.0;
+        let [(_, c)] = parts.as_slice() else {
+            return false;
+        };
+        self.matches_compound_in(
+            host,
+            c,
+            SelectorContext {
+                scope: None,
+                shadow_host: Some(host),
+                memo: None,
+                memo_prefixes: false,
+                ancestors: None,
+                classes,
+            },
+        )
+    }
+
+    pub(super) fn ancestor_is_svg(&self, id: NodeId) -> bool {
+        let mut cur = self.nodes.parent(id);
+        while let Some(p) = cur {
+            if self.tag_name(p) == Some("svg") {
+                return true;
+            }
+            cur = self.nodes.parent(p);
+        }
+        false
     }
 }
 
@@ -15581,7 +15450,7 @@ fn list_style_shorthand_image(value: &str) -> Option<&str> {
 struct StyleRule {
     /// Source position is assigned afresh when the current sheet list is assembled.
     order: usize,
-    data: std::rc::Rc<StyleRuleData>,
+    data: std::sync::Arc<StyleRuleData>,
 }
 
 impl std::ops::Deref for StyleRule {
@@ -15601,7 +15470,7 @@ struct StyleRuleData {
     layer_normal: u64,
     layer_important: u64,
     decls: Vec<(String, (bool, String))>,
-    containers: Vec<std::rc::Rc<container_queries::Query>>,
+    containers: Vec<std::sync::Arc<container_queries::Query>>,
 }
 
 impl StyleRule {
@@ -15611,6 +15480,289 @@ impl StyleRule {
             self.layer_important
         } else {
             self.layer_normal
+        }
+    }
+}
+
+/// One element's author declarations sorted to a winner per property and
+/// box (CSS Cascade 5 #cascade-sort), before any step that needs computed
+/// values: container-conditional pseudo-element rules, `revert-layer`
+/// rollback through `var()`, and logical-property mapping.
+struct CascadeWinners<'r> {
+    elem: FxHashMap<String, CascadeWinner>,
+    before: FxHashMap<String, CascadeWinner>,
+    after: FxHashMap<String, CascadeWinner>,
+    first_letter: FxHashMap<String, CascadeWinner>,
+    marker: FxHashMap<String, CascadeWinner>,
+    /// Pseudo-element rules whose container conditions need layout sizes.
+    conditional: Vec<&'r StyleRule>,
+    preserve_layers: bool,
+    /// Declarations considered so far (`CascadeKey`'s source-order tiebreak).
+    declarations: usize,
+}
+
+/// The author sources of one element's cascade, gathered by the caller.
+struct CascadeSources<'r> {
+    /// The element's tree-scope rules, and the indices of those it matches.
+    rules: &'r [StyleRule],
+    matched: &'r [u32],
+    /// Matching `::slotted()` rules of the shadow trees it is assigned into.
+    slotted: &'r [&'r StyleRule],
+    /// The rules of its own shadow root's scope, for `:host`.
+    host_rules: Option<&'r [StyleRule]>,
+    /// Whether any sheet uses `revert-layer`.
+    revert_layer: bool,
+}
+
+/// Consider one declaration for `map`'s winner of `prop`. Clone only on first
+/// sight or a win: a losing declaration costs a lookup and a key compare.
+fn consider_winner(
+    map: &mut FxHashMap<String, CascadeWinner>,
+    prop: &str,
+    mut key: CascadeKey,
+    value: &str,
+    preserve_layers: bool,
+    order: &Cell<usize>,
+) {
+    key.7 = order.get();
+    order.set(key.7 + 1);
+    match map.get_mut(prop) {
+        Some(slot) => slot.consider(key, value, preserve_layers),
+        None => {
+            map.insert(
+                prop.to_string(),
+                CascadeWinner::One((key, value.to_string())),
+            );
+        }
+    }
+}
+
+/// The winning value per property, without any `revert-layer` rollback
+/// through substituted values.
+fn strip_winners(map: &FxHashMap<String, CascadeWinner>) -> FxHashMap<String, String> {
+    map.iter()
+        .map(|(k, v)| (k.clone(), v.resolve(|_| false).to_owned()))
+        .collect()
+}
+
+/// The source order (`StyleRule::order`) of each custom property's winning
+/// declaration, for resolving its `url()`s against its sheet.
+fn custom_property_sources<'m>(
+    maps: [(Option<PseudoEl>, &'m FxHashMap<String, CascadeWinner>); 5],
+) -> impl Iterator<Item = (Option<PseudoEl>, String, usize)> + 'm {
+    maps.into_iter().flat_map(|(pseudo, winners)| {
+        winners
+            .iter()
+            .filter(|(name, _)| name.starts_with("--"))
+            .filter_map(move |(name, winner)| {
+                winner
+                    .resolve_with_key(|_| false)
+                    .map(|(key, _)| (pseudo, name.clone(), key.6))
+            })
+    })
+}
+
+impl StyleView<'_> {
+    /// ONE pass over the element's author sources: its HTML presentational
+    /// hints, its inline `style`, its matched rules (each rule's declarations
+    /// land in the map for the box it targets: the element, or a
+    /// pseudo-element), `::slotted()` rules and its shadow root's `:host`
+    /// rules, resolving the cascade winner of every declared property.
+    fn cascade_winners<'r>(
+        &self,
+        id: NodeId,
+        sources: CascadeSources<'r>,
+        base: &dyn Fn(NodeId) -> html_hints::DocumentBase,
+    ) -> CascadeWinners<'r> {
+        type Winners = FxHashMap<String, CascadeWinner>;
+        let preserve_layers = sources.revert_layer
+            || self
+                .attr(id, "style")
+                .is_some_and(|s| s.to_ascii_lowercase().contains("revert-layer"))
+            || self.state.cssom_inline.get(&id).is_some_and(|ds| {
+                ds.iter()
+                    .any(|(_, v, _)| v.to_ascii_lowercase().contains("revert-layer"))
+            });
+        let declaration_order = Cell::new(0usize);
+        let consider_into = |map: &mut Winners, prop: &str, key: CascadeKey, value: &str| {
+            consider_winner(map, prop, key, value, preserve_layers, &declaration_order);
+        };
+        let mut elem = Winners::default();
+        let mut before = Winners::default();
+        let mut after = Winners::default();
+        let mut first_letter = Winners::default();
+        let mut marker = Winners::default();
+        let mut conditional_pseudos = Vec::new();
+        // HTML rendering hints have their own origin below every author
+        // layer. `revert` discards them, while `revert-layer` can reveal them
+        // (CSS Cascade 5 #preshint and #revert-layer).
+        self.html_presentational_hints(id, base, |property, value| {
+            consider_into(
+                &mut elem,
+                property,
+                (false, false, true, false, 0, (0, 0, 0), 0, 0),
+                &value,
+            );
+        });
+        if let Some(style) = self.attr(id, "style") {
+            let parsed;
+            let declarations = match self.state.cssom_inline.get(&id) {
+                Some(declarations) => declarations,
+                None => {
+                    let quirks = self.in_quirks_mode(id);
+                    parsed = parse_declaration_block(style, quirks);
+                    &parsed
+                }
+            };
+            for (k, v, important) in declarations {
+                let important = *important;
+                for (pk, pv) in expand_box_shorthand(k, v) {
+                    // Element-attached: the inline flag outranks the layer
+                    // component, so the (unlayered) encoding is inert. This
+                    // declaration belongs to the element's OUTER tree context.
+                    // (Inline styles can't target a pseudo-element.)
+                    consider_into(
+                        &mut elem,
+                        &pk,
+                        (
+                            important,
+                            true,
+                            !important,
+                            true,
+                            encode_layer(&[], important),
+                            (0, 0, 0),
+                            usize::MAX,
+                            0,
+                        ),
+                        &pv,
+                    );
+                }
+            }
+        }
+        for &ri in sources.matched {
+            let r = &sources.rules[ri as usize];
+            if rule_pseudo(r).is_some() && !r.containers.is_empty() {
+                conditional_pseudos.push(r);
+                continue;
+            }
+            // A `div::before{…}` rule targets the generated box, not
+            // the element — its winners land in that box's own map.
+            let target = match rule_pseudo(r) {
+                None => &mut elem,
+                Some(PseudoEl::Before) => &mut before,
+                Some(PseudoEl::After) => &mut after,
+                Some(PseudoEl::FirstLetter) => &mut first_letter,
+                Some(PseudoEl::Marker) => &mut marker,
+            };
+            for (pk, (imp, v)) in &r.decls {
+                consider_into(
+                    target,
+                    pk,
+                    (
+                        *imp,
+                        true,
+                        !*imp,
+                        false,
+                        r.layer_key(*imp),
+                        r.specificity,
+                        r.order,
+                        0,
+                    ),
+                    v,
+                );
+            }
+        }
+        // `::slotted()` declarations keep the shadow tree's encapsulation
+        // context (CSS Shadow 1 §3.2.4).
+        for r in sources.slotted {
+            for (pk, (imp, v)) in &r.decls {
+                consider_into(
+                    &mut elem,
+                    pk,
+                    (
+                        *imp,
+                        true,
+                        *imp,
+                        false,
+                        r.layer_key(*imp),
+                        r.specificity,
+                        r.order,
+                        0,
+                    ),
+                    v,
+                );
+            }
+        }
+        // `:host` rules: a shadow root's own stylesheet styles ITS host element
+        // (CSS Scoping §3.3) via `:host`/`:host(<compound>)`. The host lives in
+        // the parent tree, so these aren't in its matched set — pull them from
+        // the host's shadow scope. (`<style>` baked into the serialized HTML is
+        // dropped, so this is the JS-pipeline adoptedStyleSheets path.)
+        if let Some(rules) = sources.host_rules {
+            for r in rules {
+                if rule_pseudo(r).is_some() || !self.host_rule_matches(id, r, ClassMemo::None) {
+                    continue;
+                }
+                for (pk, (imp, v)) in &r.decls {
+                    consider_into(
+                        &mut elem,
+                        pk,
+                        (
+                            *imp,
+                            true,
+                            *imp,
+                            false,
+                            r.layer_key(*imp),
+                            r.specificity,
+                            r.order,
+                            0,
+                        ),
+                        v,
+                    );
+                }
+            }
+        }
+        // SVG 2 §6.6 / §7.8: geometry presentation attributes participate
+        // below all author stylesheets. HTML attributes and <use>/<symbol>
+        // dimensions are not CSS geometry properties. Keep unitless SVG user
+        // units as CSS px in the snapshot consumed by flex/grid and CSSOM.
+        if self.namespace_uri(id) == Some("http://www.w3.org/2000/svg")
+            && (matches!(self.tag_name(id), Some("rect" | "image" | "foreignObject"))
+                || (self.tag_name(id) == Some("svg") && !self.ancestor_is_svg(id)))
+        {
+            for property in ["width", "height"] {
+                if !elem.contains_key(property)
+                    && let Some(value) = self
+                        .attr(id, property)
+                        .and_then(crate::layout2::svg_dimension_hint)
+                {
+                    consider_into(
+                        &mut elem,
+                        property,
+                        (
+                            false,
+                            true,
+                            true,
+                            false,
+                            encode_layer(&[], false),
+                            (0, 0, 0),
+                            0,
+                            0,
+                        ),
+                        &value,
+                    );
+                }
+            }
+        }
+        CascadeWinners {
+            elem,
+            before,
+            after,
+            first_letter,
+            marker,
+            conditional: conditional_pseudos,
+            preserve_layers,
+            declarations: declaration_order.get(),
         }
     }
 }
@@ -16078,7 +16230,7 @@ impl StyleIndex {
         for rules in scopes.values() {
             bytes = bytes.saturating_add(rules.capacity() * std::mem::size_of::<StyleRule>());
             for rule in rules {
-                if !seen_rules.insert(std::rc::Rc::as_ptr(&rule.data)) {
+                if !seen_rules.insert(std::sync::Arc::as_ptr(&rule.data)) {
                     continue;
                 }
                 bytes += std::mem::size_of::<StyleRuleData>();
@@ -16092,9 +16244,9 @@ impl StyleIndex {
                 } = rule.data.as_ref();
                 let _ = (specificity, layer_normal, layer_important);
                 bytes += containers.capacity()
-                    * std::mem::size_of::<std::rc::Rc<container_queries::Query>>();
+                    * std::mem::size_of::<std::sync::Arc<container_queries::Query>>();
                 for query in containers {
-                    if queries.insert(std::rc::Rc::as_ptr(query)) {
+                    if queries.insert(std::sync::Arc::as_ptr(query)) {
                         bytes += std::mem::size_of::<container_queries::Query>()
                             + query.retained_bytes();
                     }
@@ -17462,7 +17614,7 @@ fn parse_sheet(
                     .is_none_or(|c| c.is_whitespace() || c == '(')
                 && let Some(brace) = after.find('{')
             {
-                let query = std::rc::Rc::new(container_queries::Query::parse(
+                let query = std::sync::Arc::new(container_queries::Query::parse(
                     &after[after.len() - query.len()..brace],
                 ));
                 let (block, tail) = take_block(&after[brace..]);
@@ -17481,7 +17633,7 @@ fn parse_sheet(
                     layer,
                 );
                 for rule in &mut out[start..] {
-                    std::rc::Rc::get_mut(&mut rule.data)
+                    std::sync::Arc::get_mut(&mut rule.data)
                         .expect("freshly parsed rule")
                         .containers
                         .push(query.clone());
@@ -17662,7 +17814,7 @@ fn parse_style_rule(
         for selector in complexes {
             out.push(StyleRule {
                 order: *order,
-                data: std::rc::Rc::new(StyleRuleData {
+                data: std::sync::Arc::new(StyleRuleData {
                     specificity: selector.specificity(),
                     selector,
                     layer_normal: encode_layer(layer, false),
@@ -17696,11 +17848,11 @@ fn parse_style_rule(
                 parse_style_rule(resolved, nblock, order, out, media, layer);
             }
             if kw_ok("container") {
-                let query = std::rc::Rc::new(container_queries::Query::parse(&at[9..]));
+                let query = std::sync::Arc::new(container_queries::Query::parse(&at[9..]));
                 let start = out.len();
                 parse_style_rule(resolved, nblock, order, out, media, layer);
                 for rule in &mut out[start..] {
-                    std::rc::Rc::get_mut(&mut rule.data)
+                    std::sync::Arc::get_mut(&mut rule.data)
                         .expect("freshly parsed rule")
                         .containers
                         .push(query.clone());
