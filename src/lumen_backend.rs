@@ -15027,12 +15027,20 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 /// only mutable scroll offsets come from canonical DOM state.
 fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u8;
-    if (4..=7).contains(&which) {
+    // 4–7: clientHeight/Width/Top/Left; 8/9: the unrounded used top/left
+    // border widths that place offsetTop/offsetLeft's padding edge, null
+    // for a box without client metrics (a non-replaced inline).
+    if (4..=9).contains(&which) {
+        let missing = if which >= 8 {
+            Value::Null
+        } else {
+            Value::Num(0.)
+        };
         let cache = ensure_host_geom_cache(ctx, "client-metrics");
         let dom_handle = host_dom(ctx);
         let dom = dom_handle.borrow();
         let Some(id) = host_arg_node(&dom, args, 0) else {
-            return Ok(Value::Num(0.));
+            return Ok(missing);
         };
         let cached = cache.borrow();
         let Some(metrics) = cached
@@ -15040,7 +15048,7 @@ fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             .as_ref()
             .and_then(|fragments| fragments.client_metrics(id))
         else {
-            return Ok(Value::Num(0.));
+            return Ok(missing);
         };
         let value = if which <= 5 && dom.cssom_client_viewport(id) {
             if let Some(frame) = dom.frame_owner(id) {
@@ -15063,11 +15071,12 @@ fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             metrics[match which {
                 4 => 3,
                 5 => 2,
-                6 => 1,
+                6 | 8 => 1,
                 _ => 0,
             }]
         };
-        return Ok(Value::Num(f64::from(value.round())));
+        let value = if which >= 8 { value } else { value.round() };
+        return Ok(Value::Num(f64::from(value)));
     }
     let scrolling_area = if matches!(which, 2 | 3) {
         let cache = ensure_host_geom_cache(ctx, "scrolling-area");
@@ -30747,6 +30756,39 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn collapsed_table_offsets_use_the_used_half_borders() {
+        // CSSOM View #dom-htmlelement-offsetleft measures from the offset
+        // parent's padding edge, which lies inside its USED border: in the
+        // collapsing border model (CSS 2.2 §17.6.2) a table's is half its
+        // outer collapsed border and a cell's border box holds half of each
+        // collapsed border, not the computed border-width.
+        let mut engine = platform_engine();
+        let result = eval_value(
+            &mut engine,
+            r##"
+            document.append(document.createElement('html'));
+            document.documentElement.innerHTML = '<head><style>html,body{margin:0}' +
+                'table{border-collapse:collapse;border:6px solid}' +
+                'td{border:2px solid;padding:0;width:20px;height:20px}</style></head>' +
+                '<body><table id="t"><tr><td id="a"></td><td id="b"></td></tr></table></body>';
+            const t = document.getElementById('t');
+            const a = document.getElementById('a');
+            const b = document.getElementById('b');
+            const left = e => e.getBoundingClientRect().left - t.getBoundingClientRect().left;
+            [t.clientLeft, t.clientTop, t.offsetWidth, t.offsetHeight,
+             a.offsetParent === t, a.offsetLeft, a.offsetTop, left(a), a.clientLeft, a.offsetWidth,
+             b.offsetLeft, b.offsetTop, left(b), b.clientLeft, b.offsetWidth].join()
+        "##,
+            "collapsed offsets",
+        )
+        .unwrap();
+        let Value::Str(result) = result else {
+            panic!("collapsed offsets did not return a string");
+        };
+        assert_eq!(result.as_ref(), "3,3,54,32,true,0,0,3,3,24,24,0,27,1,24");
     }
 
     #[test]
