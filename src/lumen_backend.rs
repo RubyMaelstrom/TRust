@@ -137,6 +137,13 @@ enum LumenHostTask {
         result: LumenFetchResult,
         timing: Option<LumenResourceTiming>,
     },
+    NavigateDone {
+        id: usize,
+        details: Option<Box<crate::http::FetchResponseDetails>>,
+        node: Option<usize>,
+        target: String,
+        destination: &'static str,
+    },
     ResourceDone {
         context: u64,
         node_id: usize,
@@ -7802,6 +7809,76 @@ mod desktop {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn slow_iframe_navigation_fetch_does_not_block_the_parent_event_loop() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // HTML #navigate fetches a nested navigable's document in parallel.
+            // While a slow frame server withholds the response, the parent's
+            // tasks (and user input) keep running; only its load event waits
+            // for the iframe (#delay-the-load-event).
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}/", listener.local_addr().unwrap());
+            let (release, gate) = tokio::sync::watch::channel(false);
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 2048];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                assert!(String::from_utf8_lossy(&request).starts_with("GET /frame "));
+                let mut gate = gate;
+                gate.wait_for(|ready| *ready).await.unwrap();
+                let body = "<!doctype html><p>child</p>";
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let html = r#"<!doctype html><body><output id="result">waiting</output><script>
+                const out = document.querySelector('output');
+                const frame = document.createElement('iframe');
+                frame.onload = () => { out.textContent += '|frame'; };
+                frame.src = '/frame';
+                document.body.appendChild(frame);
+                addEventListener('load', () => { out.textContent += '|load'; });
+                setTimeout(() => { out.textContent = 'tick'; }, 50);
+            </script>"#;
+            let mut env = PageEnv::bare(&origin);
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let mut released = false;
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, outcome }) => {
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            if !released && html.contains(">tick") {
+                                assert!(
+                                    !html.contains("|load"),
+                                    "load ran before the frame: {html}"
+                                );
+                                released = true;
+                                release.send(true).unwrap();
+                            }
+                            if html.contains(">tick|frame|load</output>") {
+                                assert!(released);
+                                break;
+                            }
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended before the frame loaded"),
+                    }
+                }
+            })
+            .await
+            .expect("the frame fetch blocked its parent's timers, or load never followed it");
+            server.await.unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn iframe_parser_wait_yields_to_messages_and_load_waits_for_async_script() {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             // HTML #scriptTagParserResumes / #the-end: a blocked child parser
@@ -8242,6 +8319,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_template_content", 1, host_template_content),
     ("__http_fetch", 5, host_http_fetch),
     ("__http_navigate", 3, host_http_navigate),
+    ("__http_navigate_async", 4, host_http_navigate_async),
     ("__http_fetch_async", 5, host_http_fetch_async),
     ("__dom_run_injected_script", 1, host_run_injected_script),
     ("__dom_run_classic_script", 3, host_run_classic_script),
@@ -9453,7 +9531,18 @@ fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 
 /// HTML's Document-creation steps retain the navigation request's final
 /// referrer. Keep it alongside Fetch's final URL, not a guessed parent URL.
-fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+/// A prepared nested-navigable navigation request (HTML #navigate-fetch).
+struct NavigationFetch {
+    handle: tokio::runtime::Handle,
+    cache: Arc<crate::http::PageCache>,
+    request: crate::http::Request,
+    policy: crate::referrer_policy::ReferrerPolicy,
+    node: Option<usize>,
+    target: String,
+    destination: &'static str,
+}
+
+fn prepare_navigation_fetch(ctx: &mut Ctx, args: &[Value]) -> Option<NavigationFetch> {
     use crate::referrer_policy::ReferrerPolicy;
     let target = host_arg_string(ctx, args, 0);
     let policy = ReferrerPolicy::parse(&host_arg_string(ctx, args, 2)).unwrap_or_default();
@@ -9476,7 +9565,7 @@ fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
         } else {
             "iframe"
         };
-    let work = ctx.host_mut::<HostState>().and_then(|state| {
+    let (handle, cache, mut request) = ctx.host_mut::<HostState>().and_then(|state| {
         prepare_client_request(
             state,
             &client,
@@ -9486,34 +9575,117 @@ fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
             Vec::new(),
             None,
         )
-    });
-    let details = match work {
-        Some((handle, cache, mut request)) => {
-            crate::http::set_fetch_metadata(&mut request, &client, destination, "navigate");
-            request.cookie_context = Some(cookie_context);
-            request
-                .headers
-                .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
-            if let Some(referrer) = policy.determine(&client, &request.url) {
-                request
-                    .headers
-                    .push(("Referer".into(), referrer.to_string()));
-            }
-            let (sender, receiver) = std::sync::mpsc::channel();
-            cache.spawn(&handle, async move {
-                let _ = sender.send(
-                    crate::http::fetch_with_metadata(&request, policy)
-                        .await
-                        .ok(),
-                );
-            });
-            receiver.recv().ok().flatten()
-        }
-        None => None,
-    };
-    let Some(details) = details else {
+    })?;
+    crate::http::set_fetch_metadata(&mut request, &client, destination, "navigate");
+    request.cookie_context = Some(cookie_context);
+    request
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
+    if let Some(referrer) = policy.determine(&client, &request.url) {
+        request
+            .headers
+            .push(("Referer".into(), referrer.to_string()));
+    }
+    Some(NavigationFetch {
+        handle,
+        cache,
+        request,
+        policy,
+        node,
+        target,
+        destination,
+    })
+}
+
+/// A synchronous navigation fetch, for one-shot document transforms and a
+/// script's first read of a frame that has not been navigated yet.
+fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Some(navigation) = prepare_navigation_fetch(ctx, args) else {
         return Ok(Value::Null);
     };
+    let NavigationFetch {
+        handle,
+        cache,
+        request,
+        policy,
+        node,
+        target,
+        destination,
+    } = navigation;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    cache.spawn(&handle, async move {
+        let _ = sender.send(
+            crate::http::fetch_with_metadata(&request, policy)
+                .await
+                .ok(),
+        );
+    });
+    let Some(details) = receiver.recv().ok().flatten() else {
+        return Ok(Value::Null);
+    };
+    navigation_result_value(ctx, details, node, &target, destination)
+}
+
+/// HTML #navigate: the fetch runs in parallel and its response is processed
+/// by a later task, so a slow frame server never blocks the parent's event
+/// loop (ad iframes held hanime.moe's page thread, and its clicks, for
+/// seconds). Resolves with the same record as `__http_navigate`, or null.
+fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+    let context = ctx.host_job_context();
+    let navigation = prepare_navigation_fetch(ctx, args);
+    let dispatch = navigation.and_then(|navigation| {
+        let state = ctx.host_mut::<HostState>()?;
+        let events = state.task_events.clone()?;
+        let network = state.network.as_mut()?;
+        let id = network.next_fetch_id;
+        network.next_fetch_id += 1;
+        network.pending_fetches.insert(
+            id,
+            LumenPendingFetch {
+                context,
+                resolve: resolve.clone(),
+                native_lease: None,
+            },
+        );
+        Some((id, events, navigation))
+    });
+    let Some((id, events, navigation)) = dispatch else {
+        let _ = ctx.invoke(resolve, Value::Undefined, &[Value::Null]);
+        return Ok(promise);
+    };
+    let NavigationFetch {
+        handle,
+        cache,
+        request,
+        policy,
+        node,
+        target,
+        destination,
+    } = navigation;
+    cache.spawn(&handle, async move {
+        let details = crate::http::fetch_with_metadata(&request, policy)
+            .await
+            .ok()
+            .map(Box::new);
+        let _ = events.send(LumenHostTask::NavigateDone {
+            id,
+            details,
+            node,
+            target,
+            destination,
+        });
+    });
+    Ok(promise)
+}
+
+fn navigation_result_value(
+    ctx: &mut Ctx,
+    details: crate::http::FetchResponseDetails,
+    node: Option<usize>,
+    target: &str,
+    destination: &str,
+) -> Result<Value, Value> {
     let final_url = details.response.url.to_string();
     let referrer = details.referrer;
     let timing = match details.response.timing.as_ref() {
@@ -9527,7 +9699,7 @@ fn host_http_navigate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     // be reused as the parent's ResourceTiming entry.
     let resource_timing = match details.response.timing.as_ref() {
         Some(timing) if node.is_some() && timing.resource_timing_allowed => {
-            host_timing_data_value(ctx, &timing.resource_data(&target, destination))?
+            host_timing_data_value(ctx, &timing.resource_data(target, destination))?
         }
         _ => Value::Null,
     };
@@ -12627,6 +12799,19 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             settle_network_task(engine, id, move |ctx| {
                 record_resource_timing(ctx, timing);
                 image_host::result_value(ctx, result)
+            })?;
+        }
+        LumenHostTask::NavigateDone {
+            id,
+            details,
+            node,
+            target,
+            destination,
+        } => {
+            settle_network_task(engine, id, move |ctx| match details {
+                Some(details) => navigation_result_value(ctx, *details, node, &target, destination)
+                    .unwrap_or(Value::Null),
+                None => Value::Null,
             })?;
         }
         LumenHostTask::FetchDone { id, result, timing } => {
@@ -19003,7 +19188,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 189, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 190, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -19014,7 +19199,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 189);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 190);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -19488,10 +19673,14 @@ mod tests {
                         ),
                         DEFAULT_URL,
                     );
+                    // The fixture drains tasks in a script loop without
+                    // microtask checkpoints, so it uses the synchronous
+                    // navigation fetch; actor tests cover the parallel one.
                     eval(
                         &mut engine,
                         "globalThis.frameNavigationResponses = Object.create(null); \
-                 globalThis.__http_navigate = url => frameNavigationResponses[url] || null;",
+                 globalThis.__http_navigate = url => frameNavigationResponses[url] || null; \
+                 globalThis.__http_navigate_async = undefined;",
                         "HTTP navigation response fixture",
                     )
                     .unwrap();

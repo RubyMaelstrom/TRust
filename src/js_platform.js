@@ -48,6 +48,8 @@
     const configuredReferrer = typeof cfg.referrer === "string" ? cfg.referrer : "";
     const navigateDocument = g.__http_navigate;
     delete g.__http_navigate;
+    const navigateDocumentAsync = g.__http_navigate_async;
+    delete g.__http_navigate_async;
     delete g.__dom_fetch_classic_script;
     const makeWindowMessageBinding = g.__window_message_binding;
     delete g.__window_message_binding;
@@ -2564,7 +2566,11 @@
     // collapse into one idempotent function: the __loaded* de-dup makes a
     // repeat call for the SAME state a no-op, so the load sweep, the lazy
     // contentDocument getter, and src/srcdoc attribute changes all route here.
-    function processIframeAttributes(frame) {
+    // `parallel`: a queued navigation fetches in parallel (HTML #navigate)
+    // and returns a promise for the response's processing, so a slow frame
+    // server never blocks this event loop. Synchronous callers (one-shot
+    // transforms, a first contentDocument read) keep the blocking fetch.
+    function processIframeAttributes(frame, parallel = false) {
         // A queued attribute task may outlive removal of its iframe. The
         // removed navigable is destroyed by the DOM removal steps and must not
         // be resurrected by that stale task.
@@ -2678,9 +2684,26 @@
         ftrace("processIframeAttributes resource src=" + url);
         if (!locationNavigation) frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
         const timingStart = navigationFloorTime(__clockNow()*10)/10;
+        const sourceURL = locationNavigation ? navigationURL.sourceURL : frame.ownerDocument.URL;
+        if (parallel && navigateDocumentAsync) {
+            // A later navigation of this frame supersedes the response.
+            const token = {};
+            frame.__trustNavigationToken = token;
+            let pending;
+            try { pending = navigateDocumentAsync(url, sourceURL, frame.referrerPolicy || "", frame.__id); }
+            catch (e) { pending = Promise.resolve(null); }
+            return pending.then(function (r) {
+                if (frame.__trustNavigationToken !== token || !frame.isConnected) return;
+                frame.__trustNavigationToken = null;
+                processFrameNavigationResponse(frame, url, r, timingStart);
+            });
+        }
         let r;
-        try { r = navigateDocument(url, locationNavigation ? navigationURL.sourceURL : frame.ownerDocument.URL,
-            frame.referrerPolicy || "", frame.__id); } catch (e) { r = null; }
+        try { r = navigateDocument(url, sourceURL, frame.referrerPolicy || "", frame.__id); } catch (e) { r = null; }
+        frame.__trustNavigationToken = null;
+        processFrameNavigationResponse(frame, url, r, timingStart);
+    }
+    function processFrameNavigationResponse(frame, url, r, timingStart) {
         ftrace("frame fetch -> " + (r ? r[0] + " " + r[1] + " len=" + String(r[2] || "").length : "null"));
         // HTML #process-a-navigate-response / #read-html: HTTP error responses
         // are documents too. Only 204/205 abort without replacing the active
@@ -2764,19 +2787,27 @@
                 return;
             }
             const previousGeneration = frame.__trustLoadGeneration || 0;
-            try {
-                ftrace("queueFrameNavigation task -> processIframeAttributes src=" + frame.getAttribute("src") + " connected=" + frame.isConnected);
-                processIframeAttributes(frame);
-                loadFrameStyles(frame);
-            } catch (e) { ftrace("queueFrameNavigation task threw " + ((e && e.message) || e)); }
             // A successful navigation retires from queueFrameElementLoad,
             // after the child Window and iframe load-event tasks. If the
-            // attributes changed before this task ran, no load task exists;
-            // retire the stale navigation entry here instead.
-            const generation = frame.__trustLoadGeneration || 0;
-            if (generation === previousGeneration)
-                retireFrameNavigationReservation(frame, reservation);
-            else reservation.generation = generation;
+            // attributes changed before this task ran, or the navigation was
+            // aborted or superseded, no load task exists; retire the stale
+            // navigation entry here instead. A parallel fetch keeps the entry
+            // (and so the parent's load event) until its response is handled.
+            const settle = function () {
+                try { loadFrameStyles(frame); }
+                catch (e) { ftrace("queueFrameNavigation styles threw " + ((e && e.message) || e)); }
+                const generation = frame.__trustLoadGeneration || 0;
+                if (generation === previousGeneration)
+                    retireFrameNavigationReservation(frame, reservation);
+                else reservation.generation = generation;
+            };
+            let pending;
+            try {
+                ftrace("queueFrameNavigation task -> processIframeAttributes src=" + frame.getAttribute("src") + " connected=" + frame.isConnected);
+                pending = processIframeAttributes(frame, true);
+            } catch (e) { ftrace("queueFrameNavigation task threw " + ((e && e.message) || e)); }
+            if (pending && typeof pending.then === "function") pending.then(settle, settle);
+            else settle();
         });
         return true;
     }
