@@ -12334,6 +12334,25 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn intrinsic_widths_resolve_inline_image_percentage_heights_against_a_definite_height() {
+        // css-sizing-3 #cyclic-percentage-contribution: a percentage height
+        // against a definite containing block is not cyclic, so a 200%-tall
+        // 568x120 image in a 40px-tall float is 80px tall and contributes
+        // 568 * 80 / 120 px (Chromium: 379), not its natural 568px.
+        let mut images = HashMap::new();
+        images.insert("http://e.com/i.gif".to_string(), (568u32, 120u32));
+        for (style, width) in [("height:200%", 378.67), ("", 568.0)] {
+            let html = format!(
+                r#"<body style="margin:0"><div id=d style="height:40px;float:left"><img src="i.gif" style="{style}"></div></body>"#
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 1000.0, &images);
+            let d = layout.boxes[&dom.get_by_id("d").unwrap()];
+            assert!((d.width - width).abs() < 0.01, "{style}: {}", d.width);
+        }
+    }
+
+    #[test]
     fn inline_replaced_images_paint_their_background_and_border() {
         // CSS 2 Appendix E step 7.2.1: each box in a line box paints its
         // background and border, then an inline-level replaced element its
