@@ -133,6 +133,53 @@ thread_local! {
     static CASC_DIAG: std::cell::Cell<CascDiag> = const { std::cell::Cell::new(CascDiag::ZERO) };
 }
 
+/// Diagnostic (`TRUST_DIAG_FRAME`): times the outermost style computation
+/// on this thread (the cascade, computed values, typed records and parallel
+/// style passes) into `CascDiag::style_us`. Nested entries add nothing;
+/// disabled, it is a flag test.
+pub(super) struct StyleTimer {
+    active: bool,
+    started: Option<std::time::Instant>,
+}
+
+thread_local! {
+    static STYLE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl StyleTimer {
+    #[inline]
+    pub(super) fn start() -> Self {
+        if !casc_diag_on() {
+            return StyleTimer {
+                active: false,
+                started: None,
+            };
+        }
+        let outermost = STYLE_DEPTH.with(|depth| {
+            depth.set(depth.get() + 1);
+            depth.get() == 1
+        });
+        StyleTimer {
+            active: true,
+            started: outermost.then(std::time::Instant::now),
+        }
+    }
+}
+
+impl Drop for StyleTimer {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        STYLE_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        if let Some(started) = self.started {
+            let us = started.elapsed().as_micros() as u64;
+            casc_bump(|d| d.style_us += us);
+        }
+    }
+}
+
 /// Cascade-cost counters accumulated during one layout pass (diagnostic).
 #[derive(Clone, Copy, Default)]
 pub struct CascDiag {
@@ -178,6 +225,9 @@ pub struct CascDiag {
     pub style_walk_us: u64,
     pub style_adopt_us: u64,
     pub style_busy_us: u64,
+    /// Time in the outermost style computation on the page thread (see
+    /// `StyleTimer`), including parallel passes.
+    pub style_us: u64,
 }
 
 impl CascDiag {
@@ -244,6 +294,7 @@ impl CascDiag {
         style_walk_us: 0,
         style_adopt_us: 0,
         style_busy_us: 0,
+        style_us: 0,
     };
 }
 
@@ -3825,6 +3876,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
 
 impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn box_generation_inner(&self, id: NodeId) -> BoxGeneration {
+        let _timer = StyleTimer::start();
         if self.attr(id, "hidden").is_some() {
             return BoxGeneration::HIDDEN;
         }
@@ -4569,6 +4621,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         if !interpolating && let Some(hit) = self.computed_cache_get(id, idx) {
             return hit;
         }
+        let _timer = StyleTimer::start();
         let parent_computed = || {
             self.style_parent(id)
                 .and_then(|p| self.computed_value(p, name))
@@ -4965,7 +5018,10 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         {
             return units;
         }
-        let units = compute();
+        let units = {
+            let _timer = StyleTimer::start();
+            compute()
+        };
         // Anonymous/synthetic layout ids must never grow a node-indexed cache.
         if self.is_valid(id) {
             self.font_units_cache().borrow_mut().put(
@@ -5063,6 +5119,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         if let Some(&v) = self.font_cache().borrow().get(id, self.style_value_epoch()) {
             return v;
         }
+        let _timer = StyleTimer::start();
         let parent_px = match self.style_parent(id) {
             Some(p) if p != DOCUMENT => self.font_px(p),
             _ => FONT_SIZE_INITIAL,
@@ -5534,6 +5591,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             return hit;
         }
 
+        let _timer = StyleTimer::start();
         let (mut underline, mut strike) = self
             .parent_composed(id)
             .map_or((false, false), |parent| self.text_decoration(parent));
@@ -5654,6 +5712,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// here, matching real-browser behavior for the properties we don't
     /// track.
     fn build_cascaded_maps(&self, id: NodeId) -> CascadedMaps {
+        let _timer = StyleTimer::start();
         type Winners = FxHashMap<String, CascadeWinner>;
         let index = self.style_index();
         let scope = self.tree_scope(id);
@@ -6034,6 +6093,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         } {
             return hit;
         }
+        let _timer = StyleTimer::start();
         let value = match self.resolve_custom_prop(id, name, &mut Vec::new()) {
             VarResult::Resolved(value) => Some(value),
             VarResult::Undefined | VarResult::Cycle => None,
@@ -7019,6 +7079,7 @@ impl Dom {
         if let Some(hit) = self.matched_cache.borrow().get(id, self.style_value_epoch) {
             return hit.clone();
         }
+        let _timer = StyleTimer::start();
         let index = self.style_index();
         let scope = self.tree_scope(id);
         let cached = || {

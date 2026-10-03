@@ -731,6 +731,7 @@ impl Dom {
     /// element in parallel. `viewport` and `base` are the layout's, so the
     /// typed records match what box-tree construction asks for.
     pub(crate) fn prepare_styles(&self, viewport: crate::layout2::Viewport, base: &url::Url) {
+        let _timer = StyleTimer::start();
         self.flush_style_invalidations();
         let stamp = (
             self.style_value_epoch,

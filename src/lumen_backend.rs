@@ -14535,7 +14535,7 @@ fn ensure_host_geometry(
         if let Some(measure_started) = measure_started {
             let cascade = crate::dom::take_casc_diag();
             eprintln!(
-                "DIAGGEOM reason={reason} nodes={} total={}ms cascade={}ms matched={}builds/{}candidates/{:.1}ms css_parse={}ms rules={} passes={} query_updates={} selector_reuse={} tree={}ms flow={}ms item_reuse={} intrinsic_reuse={} tree_reuse={} tree_build={} pmatch={} pstyle={}",
+                "DIAGGEOM reason={reason} nodes={} total={}ms cascade={}ms matched={}builds/{}candidates/{:.1}ms css_parse={}ms rules={} passes={} query_updates={} selector_reuse={} tree={}ms flow={}ms item_reuse={} intrinsic_reuse={} tree_reuse={} tree_build={} pmatch={} pstyle={} style={:.1}ms",
                 dom.node_count(),
                 measure_started.elapsed().as_millis(),
                 cascade.cascaded_us / 1000,
@@ -14555,6 +14555,7 @@ fn ensure_host_geometry(
                 measured.work.tree_builds,
                 cascade.parallel_summary(),
                 cascade.style_summary(),
+                cascade.style_us as f64 / 1000.0,
             );
         }
         cached.complete_geometry = measured.complete_geometry;
