@@ -306,12 +306,16 @@ current behavior and limits; consult the governing standards before changing it.
   `getContext("webgl")` return `null`. WebGL 2 and multisample antialiasing are
   unimplemented. Estimated buffer/image storage has a shared 256 MiB page budget
   and at most 16 contexts; driver overhead and CPU copies are additional.
-- Web Audio supports context lifecycle and a suspended graph of
-  `ScriptProcessorNode`/`AudioDestinationNode` objects with validated connections.
-  Contexts stay suspended with a stationary clock and no audio processing
-  callbacks; renderer acquisition errors asynchronously and `resume()` rejects
-  with `NotSupportedError`. Other processing nodes, audio buffers/decoding,
-  worklets, offline rendering, and playback are unimplemented.
+- Web Audio `AudioContext`s stay suspended with a stationary clock: there is no
+  output device, renderer acquisition errors asynchronously and `resume()`
+  rejects with `NotSupportedError`. `OfflineAudioContext` renders on the page's
+  DOM task queue (64 render quanta per task) with sample-accurate `AudioParam`
+  automation, speaker channel mixing, `OscillatorNode` (band-limited
+  `PeriodicWave` tables), `GainNode`, `DynamicsCompressorNode` (TRust's
+  documented knee/detector/envelope curves), `AudioBufferSourceNode` and
+  `AudioBuffer`. Keep its output deterministic; the compressor probe test pins
+  it. `ScriptProcessorNode` renders silence offline without `audioprocess`;
+  decoding, worklets, other node types, and playback are unimplemented.
 - Import maps cover static/dynamic imports, scopes, blocked specifiers, and
   integrity metadata. Navigation parses nested declarative Shadow DOM and
   shadow-scoped styles; ordinary `innerHTML` and `DOMParser` keep declarations

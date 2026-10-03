@@ -6473,35 +6473,88 @@
     // #AudioContext-constructors, #AudioContext-methods, #sample-rates.
     // Context construction is distinct from acquiring a renderer. Applications
     // can create a suspended context while assembling their interface. TRust
-    // has no audio graph renderer yet: acquisition fails asynchronously and
-    // resume rejects, without advancing the sample clock or reporting playback.
-    // The suspended graph supports ScriptProcessorNode and its destination.
+    // has no audio output device: acquisition fails asynchronously and resume
+    // rejects, without advancing the sample clock or reporting playback.
     // Web Audio #AudioContext-methods (suspend) forbids processing callbacks while
-    // suspended: connecting these nodes schedules no work and allocates no PCM.
-    // Decoding, other processing nodes, offline rendering and worklets remain
-    // unimplemented. This is not an audio renderer.
+    // suspended: connecting nodes schedules no work and allocates no PCM.
+    //
+    // #OfflineAudioContext renders without a device. Its rendering thread is
+    // this realm's DOM task queue: each task renders a bounded number of render
+    // quanta of the graph (#rendering-loop) into the AudioBuffer that
+    // startRendering() resolves. The implemented processing nodes are
+    // OscillatorNode (band-limited PeriodicWave tables, #waveform-generation),
+    // GainNode, DynamicsCompressorNode (#DynamicsCompressorOptions-processing),
+    // AudioBufferSourceNode (#playback-AudioBufferSourceNode) and the
+    // destination, with sample-accurate AudioParam automation
+    // (#computation-of-value) and speaker channel mixing
+    // (#channel-up-mixing-and-down-mixing). A ScriptProcessorNode renders
+    // silence and dispatches no audioprocess events; decoding, worklets and
+    // other node types remain unimplemented.
     function installAudioContexts() {
         const binding = g.__audio_context_binding;
         delete g.__audio_context_binding;
         const slots = binding("slots", new WeakMap()), token = {};
         const get = WeakMap.prototype.get.bind(slots), set = WeakMap.prototype.set.bind(slots);
         const PromiseCtor = Promise, Exception = DOMException;
-        const finite = Number.isFinite, fround = Math.fround;
-        const define = Object.defineProperty;
-        const apply = Reflect.apply;
+        const finite = Number.isFinite, fround = Math.fround, NumberCtor = Number;
+        const define = Object.defineProperty, freeze = Object.freeze, create = Object.create;
+        const apply = Reflect.apply, construct = Reflect.construct;
+        const F32 = Float32Array;
+        const floor = Math.floor, ceil = Math.ceil, abs = Math.abs, min = Math.min, max = Math.max;
+        const pow = Math.pow, exp = Math.exp, log10 = Math.log10, sin = Math.sin, cos = Math.cos;
+        const sqrt = Math.sqrt, PI = Math.PI, round = Math.round;
+        const iteratorSymbol = Symbol.iterator;
+        const transferBuffer = ArrayBuffer.prototype.transfer;
+        const typedArrayLength = Object.getOwnPropertyDescriptor(
+            Object.getPrototypeOf(F32.prototype), "length").get;
+        const typedArrayTag = Object.getOwnPropertyDescriptor(
+            Object.getPrototypeOf(F32.prototype), Symbol.toStringTag).get;
+        const MAX_FLOAT = 3.4028234663852886e38;
+        const MAX_CHANNELS = 32;
+        // Total samples one AudioBuffer may hold (512 MiB of float data).
+        // Larger buffers cannot be created ("internal data cannot be created").
+        const MAX_BUFFER_SAMPLES = 134217728;
+        const SQRT_HALF = sqrt(0.5);
+
+        // ---- brands, conversions and shared helpers ----
+        function contextRecord(context) {
+            const state = get(context);
+            if (!state || (state.kind !== "context" && state.kind !== "offline"))
+                throw new TypeError("Illegal BaseAudioContext invocation");
+            return state;
+        }
         function record(context) {
             const state = get(context);
             if (!state || state.kind !== "context") throw new TypeError("Illegal AudioContext invocation");
             return state;
         }
+        function offlineRecord(context) {
+            const state = get(context);
+            if (!state || state.kind !== "offline") throw new TypeError("Illegal OfflineAudioContext invocation");
+            return state;
+        }
         function nodeRecord(node, kind) {
             const state = get(node);
-            if (!state || (state.kind !== "processor" && state.kind !== "destination") ||
-                (kind && state.kind !== kind)) throw new TypeError("Illegal AudioNode invocation");
+            if (!state || !state.node || (kind && state.kind !== kind)) throw new TypeError("Illegal AudioNode invocation");
+            return state;
+        }
+        function paramRecord(param) {
+            const state = get(param);
+            if (!state || state.kind !== "param") throw new TypeError("Illegal AudioParam invocation");
+            return state;
+        }
+        function bufferRecord(buffer) {
+            const state = get(buffer);
+            if (!state || state.kind !== "buffer") throw new TypeError("Illegal AudioBuffer invocation");
+            return state;
+        }
+        function waveRecord(wave) {
+            const state = get(wave);
+            if (!state || state.kind !== "wave") throw new TypeError("Illegal PeriodicWave invocation");
             return state;
         }
         function eventTargetState(target, state) {
-            state.handlers = Object.create(null);
+            state.handlers = create(null);
             // Keep event registration in the target's Realm even when a setter
             // is borrowed from another same-Agent Window.
             state.add = (type, fn) => addL(target, type, fn, false);
@@ -6510,18 +6563,584 @@
         function checkPort(port, count) {
             if (port >= count) throw new Exception("Audio port index is out of range", "IndexSizeError");
         }
+        function enumValue(value, choices) {
+            const text = `${value}`;
+            if (!choices.includes(text)) throw new TypeError("Invalid Web Audio enumeration value");
+            return text;
+        }
+        // Web IDL #js-float / #js-double: restricted values reject non-finite.
+        function float(value, name) {
+            const number = fround(NumberCtor(value));
+            if (!finite(number)) throw new TypeError((name || "value") + " must be a finite float");
+            return number;
+        }
+        function double(value, name) {
+            const number = NumberCtor(value);
+            if (!finite(number)) throw new TypeError((name || "value") + " must be a finite double");
+            return number;
+        }
+        function unsignedLong(value) { return NumberCtor(value) >>> 0; }
+        function dictionary(value, name) {
+            if (value !== undefined && value !== null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeError(name + " must be a dictionary");
+            return value === undefined || value === null ? null : value;
+        }
+        function member(dict, name) { return dict === null ? undefined : dict[name]; }
+        function floatSequence(value) {
+            if (value === null || (typeof value !== "object" && typeof value !== "function"))
+                throw new TypeError("Expected a sequence of floats");
+            const method = value[iteratorSymbol];
+            if (typeof method !== "function") throw new TypeError("Expected an iterable sequence of floats");
+            const iterator = apply(method, value, []), next = iterator.next, result = [];
+            for (;;) {
+                const step = apply(next, iterator, []);
+                if (step === null || (typeof step !== "object" && typeof step !== "function"))
+                    throw new TypeError("Iterator result is not an object");
+                if (step.done) return result;
+                result.push(float(step.value));
+            }
+        }
+        function float32Array(value, name) {
+            let tag;
+            try { tag = apply(typedArrayTag, value, []); } catch (_) { tag = undefined; }
+            if (tag !== "Float32Array") throw new TypeError(name + " must be a Float32Array");
+            return value;
+        }
+        function requireActive(contextId) {
+            if (!binding("active", contextId))
+                throw new Exception("Document is not fully active", "InvalidStateError");
+        }
+        function requireOpen(context) {
+            const state = record(context);
+            requireActive(state.contextId);
+            if (state.closed) throw new Exception("AudioContext is closed", "InvalidStateError");
+            return state;
+        }
+        function queue(fn) { __queue_dom_task(fn); }
+        function rejected(error) { return apply(PromiseCtor.reject, PromiseCtor, [error]); }
+        function fire(target, type, init) {
+            dispatch(target, createTrustedEvent(Event, type, init || {}), false);
+        }
+        function linearToDecibels(value) { return value === 0 ? -1000 : 20 * log10(value); }
+        function decibelsToLinear(value) { return pow(10, value / 20); }
+
+        // ---- AudioContext construction options ----
+        function options(value) {
+            if (value != null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeError("AudioContext options must be a dictionary");
+            // Web IDL #js-to-dictionary: get and convert each member once, in
+            // lexicographic order, before executing constructor validation.
+            const latency = value == null ? undefined : value.latencyHint;
+            if (latency !== undefined) {
+                if (typeof latency === "number") {
+                    if (!finite(latency)) throw new TypeError("Latency must be finite");
+                } else enumValue(latency, ["balanced", "interactive", "playback"]);
+            }
+            const sizing = renderSize(value == null ? undefined : value.renderSizeHint);
+            let rate = value == null ? undefined : value.sampleRate;
+            if (rate === undefined) rate = 48000;
+            else {
+                rate = fround(+rate);
+                if (!finite(rate)) throw new TypeError("Sample rate must be a finite float");
+            }
+            const sink = value == null ? undefined : value.sinkId;
+            if (sink !== undefined) {
+                if (sink === null || typeof sink === "object" || typeof sink === "function") {
+                    const type = sink === null ? undefined : sink.type;
+                    if (type === undefined) throw new TypeError("Audio sink type is required");
+                    enumValue(type, ["none"]);
+                } else `${sink}`;
+            }
+            return {rate, quantum: sizing.quantum, hardware: sizing.hardware};
+        }
+        // (AudioContextRenderSizeCategory or unsigned long) renderSizeHint.
+        function renderSize(quantum) {
+            if (quantum === undefined) return {quantum: 128, hardware: false};
+            if (typeof quantum === "number") return {quantum: quantum >>> 0, hardware: false};
+            const hardware = enumValue(quantum, ["default", "hardware"]) === "hardware";
+            return {quantum: hardware ? 0 : 128, hardware};
+        }
+        function validateRateAndQuantum(state) {
+            if (state.rate < 3000 || state.rate > 768000)
+                throw new Exception("Unsupported sample rate", "NotSupportedError");
+            if ((!state.hardware && state.quantum < 1) || state.quantum > floor(6 * state.rate))
+                throw new Exception("Unsupported render quantum size", "NotSupportedError");
+        }
+
+        // ---- AudioParam (#AudioParam, #computation-of-value) ----
+        const SET = 0, LINEAR = 1, EXPONENTIAL = 2, TARGET = 3, CURVE = 4;
+        class AudioParam {
+            constructor() { throw new TypeError("Illegal constructor"); }
+            get value() { return paramRecord(this).current; }
+            set value(value) {
+                const state = paramRecord(this);
+                value = float(value, "AudioParam value");
+                state.current = value;
+                insertEvent(state, {type: SET, time: contextTime(state.context), value});
+            }
+            get automationRate() { return paramRecord(this).rate; }
+            set automationRate(value) {
+                const state = paramRecord(this);
+                value = `${value}`;
+                // Web IDL #js-attributes: an invalid enumeration value is ignored.
+                if (value !== "a-rate" && value !== "k-rate") return;
+                if (state.fixedRate && value !== state.fixedRate)
+                    throw new Exception("This AudioParam's automation rate is fixed", "InvalidStateError");
+                state.rate = value;
+            }
+            get defaultValue() { return paramRecord(this).defaultValue; }
+            get minValue() { return paramRecord(this).min; }
+            get maxValue() { return paramRecord(this).max; }
+            setValueAtTime(value, startTime) {
+                const state = paramRecord(this);
+                value = float(value); startTime = double(startTime, "startTime");
+                if (startTime < 0) throw new RangeError("startTime must not be negative");
+                insertEvent(state, {type: SET, time: max(startTime, contextTime(state.context)), value});
+                return this;
+            }
+            linearRampToValueAtTime(value, endTime) {
+                const state = paramRecord(this);
+                value = float(value); endTime = double(endTime, "endTime");
+                if (endTime < 0) throw new RangeError("endTime must not be negative");
+                insertRamp(state, LINEAR, value, max(endTime, contextTime(state.context)));
+                return this;
+            }
+            exponentialRampToValueAtTime(value, endTime) {
+                const state = paramRecord(this);
+                value = float(value); endTime = double(endTime, "endTime");
+                if (value === 0) throw new RangeError("An exponential ramp cannot reach zero");
+                if (endTime < 0) throw new RangeError("endTime must not be negative");
+                insertRamp(state, EXPONENTIAL, value, max(endTime, contextTime(state.context)));
+                return this;
+            }
+            setTargetAtTime(target, startTime, timeConstant) {
+                const state = paramRecord(this);
+                target = float(target); startTime = double(startTime, "startTime");
+                timeConstant = float(timeConstant, "timeConstant");
+                if (startTime < 0) throw new RangeError("startTime must not be negative");
+                if (timeConstant < 0) throw new RangeError("timeConstant must not be negative");
+                insertEvent(state, {type: TARGET, time: max(startTime, contextTime(state.context)),
+                    value: target, timeConstant});
+                return this;
+            }
+            setValueCurveAtTime(values, startTime, duration) {
+                const state = paramRecord(this);
+                values = floatSequence(values);
+                startTime = double(startTime, "startTime"); duration = double(duration, "duration");
+                if (values.length < 2) throw new Exception("A value curve needs at least two values", "InvalidStateError");
+                if (startTime < 0) throw new RangeError("startTime must not be negative");
+                if (duration <= 0) throw new RangeError("duration must be positive");
+                const time = max(startTime, contextTime(state.context));
+                for (const event of state.events) {
+                    if (event.time > time && event.time < time + duration)
+                        throw new Exception("A value curve overlaps another automation event", "NotSupportedError");
+                }
+                insertEvent(state, {type: CURVE, time, duration, values: new F32(values), cut: Infinity});
+                return this;
+            }
+            cancelScheduledValues(cancelTime) {
+                const state = paramRecord(this);
+                cancelTime = double(cancelTime, "cancelTime");
+                if (cancelTime < 0) throw new RangeError("cancelTime must not be negative");
+                cancelTime = max(cancelTime, contextTime(state.context));
+                state.base = state.current;
+                state.events = state.events.filter(event => event.time < cancelTime &&
+                    !(event.type === CURVE && cancelTime <= event.time + event.duration));
+                changed(state);
+                return this;
+            }
+            cancelAndHoldAtTime(cancelTime) {
+                const state = paramRecord(this);
+                cancelTime = double(cancelTime, "cancelTime");
+                if (cancelTime < 0) throw new RangeError("cancelTime must not be negative");
+                cancelAndHold(state, max(cancelTime, contextTime(state.context)));
+                return this;
+            }
+        }
+        function contextTime(context) {
+            const state = get(context);
+            return state && state.kind === "offline" ? state.frame / state.rate : 0;
+        }
+        function createParam(context, node, name, defaultValue, minValue, maxValue, rate, fixedRate, compound) {
+            const param = create(AudioParam.prototype);
+            const state = {kind: "param", context, node, name, defaultValue: fround(defaultValue),
+                min: fround(minValue), max: fround(maxValue), rate, fixedRate: fixedRate || null,
+                current: fround(defaultValue), base: fround(defaultValue), events: [], inputs: new Set(),
+                compound: !!compound};
+            set(param, state);
+            return param;
+        }
+        function changed(state) { for (const event of state.events) event.v0 = undefined; }
+        function curveOverlap(state, time) {
+            for (const event of state.events) {
+                if (event.type === CURVE && time >= event.time && time < event.time + event.duration)
+                    throw new Exception("An automation event lies inside a value curve", "NotSupportedError");
+            }
+        }
+        // #AudioParam: an event at the same time as existing events follows them.
+        function insertEvent(state, event) {
+            curveOverlap(state, event.time);
+            const events = state.events;
+            let index = events.length;
+            while (index > 0 && events[index - 1].time > event.time) index--;
+            events.splice(index, 0, event);
+            changed(state);
+            return index;
+        }
+        function insertRamp(state, type, value, time) {
+            curveOverlap(state, time);
+            const events = state.events, now = contextTime(state.context);
+            let index = events.length;
+            while (index > 0 && events[index - 1].time > time) index--;
+            const event = {type, time, value};
+            if (index === 0) {
+                // No preceding event: as if setValueAtTime(value, currentTime).
+                insertEvent(state, {type: SET, time: now, value: state.current});
+                index = insertEvent(state, event);
+                return;
+            }
+            const previous = events[index - 1];
+            if (previous.type === TARGET) {
+                // A ramp after SetTarget starts where that automation is now,
+                // or, when it has not started, just before it starts.
+                event.start = previous.time > now
+                    ? {time: previous.time, value: valueBefore(state, index - 1, previous.time)}
+                    : {time: now, value: valueAt(state, now)};
+            }
+            insertEvent(state, event);
+        }
+        // #dom-audioparam-cancelandholdattime
+        function cancelAndHold(state, time) {
+            const events = state.events;
+            let first = -1;
+            for (let i = 0; i < events.length; i++) if (events[i].time <= time) first = i;
+            const second = first + 1 < events.length ? events[first + 1] : null;
+            const held = valueAt(state, time);
+            if (second && (second.type === LINEAR || second.type === EXPONENTIAL)) {
+                second.time = time;
+                second.value = held;
+            } else if (first >= 0) {
+                const event = events[first];
+                if (event.type === TARGET) {
+                    events.splice(first + 1, 0, {type: SET, time, value: held});
+                } else if (event.type === CURVE && time <= event.time + event.duration) {
+                    event.cut = time;
+                    event.cutValue = held;
+                }
+            }
+            state.events = events.filter(event => event.time <= time);
+            changed(state);
+        }
+        function eventEnd(event) { return event.type === CURVE ? min(event.time + event.duration, event.cut) : event.time; }
+        function curveValue(event, time) {
+            if (time >= event.cut) return event.cutValue;
+            const values = event.values, count = values.length;
+            if (time >= event.time + event.duration) return values[count - 1];
+            const position = (count - 1) / event.duration * (time - event.time);
+            const k = floor(position);
+            if (k >= count - 1) return values[count - 1];
+            return values[k] + (values[k + 1] - values[k]) * (position - k);
+        }
+        // The value of the timeline formed by events[0..limit) at time.
+        function valueBefore(state, limit, time) {
+            return evaluate(state, state.events, limit, time);
+        }
+        function valueAt(state, time) { return evaluate(state, state.events, state.events.length, time); }
+        function endValue(state, events, index) {
+            const event = events[index];
+            switch (event.type) {
+                case CURVE: return curveValue(event, eventEnd(event));
+                case TARGET: {
+                    const next = index + 1 < events.length ? events[index + 1].time : event.time;
+                    return targetValue(state, events, index, next);
+                }
+                default: return event.value;
+            }
+        }
+        function targetValue(state, events, index, time) {
+            const event = events[index];
+            if (event.v0 === undefined) event.v0 = evaluate(state, events, index, event.time);
+            if (event.timeConstant === 0) return time >= event.time ? event.value : event.v0;
+            return event.value + (event.v0 - event.value) * exp(-(time - event.time) / event.timeConstant);
+        }
+        function evaluate(state, events, limit, time) {
+            if (!limit) return state.base;
+            let last = -1, low = 0, high = limit - 1;
+            while (low <= high) {
+                const mid = (low + high) >> 1;
+                if (events[mid].time <= time) { last = mid; low = mid + 1; } else high = mid - 1;
+            }
+            const next = last + 1 < limit ? events[last + 1] : null;
+            if (next && (next.type === LINEAR || next.type === EXPONENTIAL)) {
+                let t0, v0;
+                if (next.start) { t0 = next.start.time; v0 = next.start.value; }
+                else if (last >= 0) { t0 = eventEnd(events[last]); v0 = endValue(state, events, last); }
+                else { t0 = -Infinity; v0 = state.base; }
+                if (time >= t0) {
+                    const t1 = next.time, v1 = next.value;
+                    if (t1 <= t0) return v1;
+                    const fraction = (time - t0) / (t1 - t0);
+                    if (next.type === LINEAR) return v0 + (v1 - v0) * fraction;
+                    if (v0 === 0 || (v0 > 0) !== (v1 > 0)) return v0;
+                    return v0 * pow(v1 / v0, fraction);
+                }
+            }
+            if (last < 0) return state.base;
+            const event = events[last];
+            switch (event.type) {
+                case TARGET: return targetValue(state, events, last, time);
+                case CURVE: return curveValue(event, time);
+                default: return event.value;
+            }
+        }
+        // #computation-of-value for one render quantum: paramIntrinsicValue,
+        // [[current value]], the input AudioParam buffer, NaN replacement.
+        // Returns a Float32Array of frames values (one value for k-rate).
+        function paramBlock(state, quantum, render) {
+            const context = get(state.context), rate = context.rate, frame = context.frame;
+            const values = new F32(quantum);
+            const kRate = state.rate === "k-rate";
+            if (!state.events.length) values.fill(state.base);
+            else if (kRate) values.fill(valueAt(state, frame / rate));
+            else for (let i = 0; i < quantum; i++) values[i] = valueAt(state, (frame + i) / rate);
+            state.current = values[0];
+            if (state.inputs.size) {
+                const input = mixInputs(state.inputs, 1, "speakers", quantum, render)[0];
+                if (kRate) values.fill(values[0] + input[0]);
+                else for (let i = 0; i < quantum; i++) values[i] += input[i];
+            }
+            // NaN becomes the default value; a simple parameter is clamped to
+            // its nominal range, a compound one after it is combined.
+            const low = state.min, high = state.max, compound = state.compound;
+            for (let i = 0; i < quantum; i++) {
+                const value = values[i];
+                if (value !== value) values[i] = state.defaultValue;
+                else if (!compound && (value < low || value > high)) values[i] = value < low ? low : high;
+            }
+            return values;
+        }
+
+        // ---- AudioBuffer (#AudioBuffer) ----
+        class AudioBuffer {
+            constructor(options) {
+                if (arguments.length < 1) throw new TypeError("AudioBuffer requires options");
+                const dict = dictionary(options, "AudioBufferOptions");
+                const length = member(dict, "length");
+                if (length === undefined) throw new TypeError("AudioBufferOptions.length is required");
+                const channels = member(dict, "numberOfChannels");
+                const rate = member(dict, "sampleRate");
+                if (rate === undefined) throw new TypeError("AudioBufferOptions.sampleRate is required");
+                initializeBuffer(this, channels === undefined ? 1 : unsignedLong(channels),
+                    unsignedLong(length), float(rate, "sampleRate"));
+            }
+            get sampleRate() { return bufferRecord(this).rate; }
+            get length() { return bufferRecord(this).length; }
+            get duration() { const state = bufferRecord(this); return state.length / state.rate; }
+            get numberOfChannels() { return bufferRecord(this).channels.length; }
+            getChannelData(channel) {
+                const state = bufferRecord(this);
+                channel = unsignedLong(channel);
+                if (channel >= state.channels.length)
+                    throw new Exception("Channel index is out of range", "IndexSizeError");
+                return state.channels[channel];
+            }
+            copyFromChannel(destination, channelNumber, bufferOffset = 0) {
+                const state = bufferRecord(this);
+                destination = float32Array(destination, "destination");
+                channelNumber = unsignedLong(channelNumber); bufferOffset = unsignedLong(bufferOffset);
+                if (channelNumber >= state.channels.length)
+                    throw new Exception("Channel index is out of range", "IndexSizeError");
+                const source = state.channels[channelNumber];
+                const count = max(0, min(apply(typedArrayLength, source, []) - bufferOffset,
+                    apply(typedArrayLength, destination, [])));
+                for (let i = 0; i < count; i++) destination[i] = source[bufferOffset + i];
+            }
+            copyToChannel(source, channelNumber, bufferOffset = 0) {
+                const state = bufferRecord(this);
+                source = float32Array(source, "source");
+                channelNumber = unsignedLong(channelNumber); bufferOffset = unsignedLong(bufferOffset);
+                if (channelNumber >= state.channels.length)
+                    throw new Exception("Channel index is out of range", "IndexSizeError");
+                const target = state.channels[channelNumber];
+                const count = max(0, min(apply(typedArrayLength, target, []) - bufferOffset,
+                    apply(typedArrayLength, source, [])));
+                for (let i = 0; i < count; i++) target[bufferOffset + i] = source[i];
+            }
+        }
+        // #dom-audiobuffer-audiobuffer: values outside the nominal ranges of
+        // createBuffer() are NotSupportedError.
+        function initializeBuffer(buffer, channelCount, length, rate) {
+            if (channelCount < 1 || channelCount > MAX_CHANNELS)
+                throw new Exception("Unsupported number of channels", "NotSupportedError");
+            if (length < 1) throw new Exception("AudioBuffer length must be at least 1", "NotSupportedError");
+            if (rate < 3000 || rate > 768000) throw new Exception("Unsupported sample rate", "NotSupportedError");
+            if (length * channelCount > MAX_BUFFER_SAMPLES)
+                throw new Exception("The AudioBuffer is too large", "NotSupportedError");
+            const channels = [];
+            for (let i = 0; i < channelCount; i++) channels.push(new F32(length));
+            set(buffer, {kind: "buffer", length, rate, channels});
+            return buffer;
+        }
+        function createBuffer(channelCount, length, rate) {
+            return initializeBuffer(create(AudioBuffer.prototype), channelCount, length, rate);
+        }
+        // #acquire-the-content: detach the arrays handed to script and keep
+        // their data privately; later getChannelData() calls return copies.
+        function acquireContent(buffer) {
+            const state = bufferRecord(buffer);
+            const acquired = [];
+            for (const array of state.channels) {
+                if (array.buffer.byteLength === 0) return {rate: state.rate, length: 0, channels: []};
+            }
+            for (let i = 0; i < state.channels.length; i++) {
+                const array = state.channels[i];
+                const data = new F32(apply(transferBuffer, array.buffer, []));
+                acquired.push(data);
+                state.channels[i] = new F32(data);
+            }
+            return {rate: state.rate, length: state.length, channels: acquired};
+        }
+
+        // ---- PeriodicWave (#PeriodicWave, #waveform-generation) ----
+        // Waveforms are rendered from band-limited tables: for an oscillator
+        // frequency F only harmonics k with k|F| below the Nyquist frequency
+        // contribute. Each table holds TABLE_SIZE samples of one period,
+        // normalized by the wave's fixed factor (#waveform-normalization),
+        // and is read with linear interpolation.
+        const TABLE_SIZE = 4096, HARMONICS = TABLE_SIZE / 2;
+        class PeriodicWave {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "PeriodicWaveOptions");
+                const disable = !!member(dict, "disableNormalization");
+                const imagValue = member(dict, "imag");
+                const imag = imagValue === undefined ? undefined : floatSequence(imagValue);
+                const realValue = member(dict, "real");
+                const real = realValue === undefined ? undefined : floatSequence(realValue);
+                initializeWave(this, real, imag, disable);
+            }
+        }
+        // #dom-periodicwave-periodicwave
+        function initializeWave(wave, real, imag, disableNormalization) {
+            let a, b;
+            if (real && imag) {
+                if (real.length !== imag.length || real.length < 2)
+                    throw new Exception("PeriodicWave coefficient arrays are invalid", "IndexSizeError");
+                a = real.slice(); b = imag.slice();
+            } else if (real) {
+                if (real.length < 2) throw new Exception("PeriodicWave coefficient arrays are invalid", "IndexSizeError");
+                a = real.slice(); b = new Array(real.length).fill(0);
+            } else if (imag) {
+                if (imag.length < 2) throw new Exception("PeriodicWave coefficient arrays are invalid", "IndexSizeError");
+                b = imag.slice(); a = new Array(imag.length).fill(0);
+            } else { a = [0, 0]; b = [0, 1]; }
+            a[0] = 0; b[0] = 0;
+            set(wave, {kind: "wave", source: waveSource(a, b, !disableNormalization)});
+            return wave;
+        }
+        function waveSource(a, b, normalize) {
+            const count = min(a.length, HARMONICS);
+            const source = {a: new F32(count), b: new F32(count), normalize, factor: 1, tables: new Map()};
+            for (let k = 1; k < count; k++) { source.a[k] = a[k]; source.b[k] = b[k]; }
+            if (normalize) {
+                // f = max |x~(n)| over one period of the full series.
+                const full = synthesize(source, count - 1);
+                let peak = 0;
+                for (let n = 0; n < TABLE_SIZE; n++) peak = max(peak, abs(full[n]));
+                source.factor = peak > 0 ? peak : 1;
+            }
+            return source;
+        }
+        // #oscillator-coefficients for the built-in types.
+        const builtinWaves = create(null);
+        function builtinWave(type) {
+            if (builtinWaves[type]) return builtinWaves[type];
+            const a = new Array(HARMONICS).fill(0), b = new Array(HARMONICS).fill(0);
+            for (let n = 1; n < HARMONICS; n++) {
+                if (type === "sine") b[n] = n === 1 ? 1 : 0;
+                else if (type === "square") b[n] = 2 / (n * PI) * (1 - pow(-1, n));
+                else if (type === "sawtooth") b[n] = pow(-1, n + 1) * 2 / (n * PI);
+                else b[n] = 8 * sin(n * PI / 2) / (PI * n * PI * n);
+            }
+            return builtinWaves[type] = waveSource(a, b, true);
+        }
+        // x(n) = sum_k a[k] cos(2 pi k n / N) + b[k] sin(2 pi k n / N), k <= K,
+        // by an inverse FFT of size N.
+        function synthesize(source, harmonics) {
+            const re = new Float64Array(TABLE_SIZE), im = new Float64Array(TABLE_SIZE);
+            for (let k = 1; k <= harmonics && k < source.a.length; k++) { re[k] = source.a[k]; im[k] = -source.b[k]; }
+            fft(re, im);
+            return re;
+        }
+        function fft(re, im) {
+            const n = re.length;
+            for (let i = 1, j = 0; i < n; i++) {
+                let bit = n >> 1;
+                for (; j & bit; bit >>= 1) j ^= bit;
+                j ^= bit;
+                if (i < j) {
+                    let t = re[i]; re[i] = re[j]; re[j] = t;
+                    t = im[i]; im[i] = im[j]; im[j] = t;
+                }
+            }
+            for (let size = 2; size <= n; size <<= 1) {
+                const step = 2 * PI / size, half = size >> 1;
+                for (let start = 0; start < n; start += size) {
+                    for (let k = 0; k < half; k++) {
+                        const wr = cos(step * k), wi = sin(step * k);
+                        const i = start + k, j = i + half;
+                        const tr = re[j] * wr - im[j] * wi, ti = re[j] * wi + im[j] * wr;
+                        re[j] = re[i] - tr; im[j] = im[i] - ti;
+                        re[i] += tr; im[i] += ti;
+                    }
+                }
+            }
+        }
+        // Harmonic limits shared by tables: exact up to 32, then quarter-octave
+        // steps (rounded down, so no table contains aliased partials).
+        function harmonicLevel(limit, count) {
+            limit = min(limit, count - 1);
+            if (limit <= 32) return limit;
+            const level = floor(32 * pow(2, floor(4 * Math.log2(limit / 32)) / 4));
+            return min(level, count - 1);
+        }
+        function waveTable(source, frequency, nyquist) {
+            const magnitude = abs(frequency);
+            const limit = magnitude > 0 ? ceil(nyquist / magnitude) - 1 : source.a.length - 1;
+            const level = harmonicLevel(max(limit, 0), source.a.length);
+            let table = source.tables.get(level);
+            if (!table) {
+                const samples = synthesize(source, level);
+                table = new F32(TABLE_SIZE + 1);
+                for (let n = 0; n < TABLE_SIZE; n++) table[n] = samples[n] / source.factor;
+                table[TABLE_SIZE] = table[0];
+                source.tables.set(level, table);
+            }
+            return table;
+        }
+
+        // ---- AudioNode and its channel/connection model ----
         // Web Audio #AudioNode-methods: preserve actual connection identity,
         // including duplicate suppression and selective disconnect errors.
         // Both endpoints retain an edge, so a reachable destination retains
-        // its connected processors. Unreachable graphs remain WeakMap keys.
+        // its connected nodes. Unreachable graphs remain WeakMap keys.
+        const NODE_DEFAULTS = {
+            processor: {mode: "explicit"}, destination: {mode: "explicit"},
+            oscillator: {mode: "max", inputs: 0}, gain: {mode: "max"},
+            compressor: {mode: "clamped-max"}, "buffer-source": {mode: "max", inputs: 0},
+        };
         class AudioNode extends EventTarget {
             constructor(key, context, kind, channelCount) {
                 if (key !== token) throw new TypeError("Illegal constructor");
                 super();
-                const state = {kind, context, channelCount, mode: "explicit",
-                    interpretation: "speakers", inputs: 1, outputs: 1, edges: new Set()};
+                const defaults = NODE_DEFAULTS[kind];
+                const state = {node: true, kind, context, channelCount, mode: defaults.mode,
+                    interpretation: "speakers", inputs: defaults.inputs === undefined ? 1 : defaults.inputs,
+                    outputs: 1, edges: new Set(), params: []};
                 eventTargetState(this, state);
                 set(this, state);
+                const owner = get(context);
+                if (owner.kind === "offline" && kind !== "destination") owner.nodes.push(this);
             }
             get context() { return nodeRecord(this).context; }
             get numberOfInputs() { return nodeRecord(this).inputs; }
@@ -6533,26 +7152,57 @@
                 if (state.kind === "processor") {
                     if (value !== state.channelCount)
                         throw new Exception("ScriptProcessor channel count is fixed", "NotSupportedError");
-                } else if (value < 1 || value > 2) {
-                    throw new Exception("Destination channel count is out of range", "IndexSizeError");
+                } else if (state.kind === "destination") {
+                    if (get(state.context).kind === "offline") {
+                        if (value !== state.channelCount)
+                            throw new Exception("OfflineAudioContext destination channels are fixed", "InvalidStateError");
+                    } else if (value < 1 || value > state.maxChannels) {
+                        throw new Exception("Destination channel count is out of range", "IndexSizeError");
+                    }
+                } else if (value < 1 || value > MAX_CHANNELS ||
+                    (state.kind === "compressor" && value > 2)) {
+                    throw new Exception("Unsupported channel count", "NotSupportedError");
                 }
                 state.channelCount = value;
             }
             get channelCountMode() { return nodeRecord(this).mode; }
             set channelCountMode(value) {
                 const state = nodeRecord(this);
-                value = enumValue(value, ["max", "clamped-max", "explicit"]);
+                value = `${value}`;
+                // Web IDL #js-attributes: an invalid enumeration value is ignored.
+                if (value !== "max" && value !== "clamped-max" && value !== "explicit") return;
                 if (state.kind === "processor" && value !== "explicit")
                     throw new Exception("ScriptProcessor channel mode is explicit", "NotSupportedError");
+                if (state.kind === "compressor" && value === "max")
+                    throw new Exception("DynamicsCompressor channel mode cannot be max", "NotSupportedError");
+                if (state.kind === "destination" && get(state.context).kind === "offline" && value !== state.mode)
+                    throw new Exception("OfflineAudioContext destination mode is fixed", "InvalidStateError");
                 state.mode = value;
             }
             get channelInterpretation() { return nodeRecord(this).interpretation; }
             set channelInterpretation(value) {
                 const state = nodeRecord(this);
-                state.interpretation = enumValue(value, ["speakers", "discrete"]);
+                value = `${value}`;
+                if (value !== "speakers" && value !== "discrete") return;
+                state.interpretation = value;
             }
             connect(destination, output = 0, input = 0) {
-                const state = nodeRecord(this), other = nodeRecord(destination);
+                const state = nodeRecord(this);
+                const target = get(destination);
+                if (target && target.kind === "param") {
+                    // connect(AudioParam destinationParam, optional unsigned long output = 0)
+                    output = output >>> 0;
+                    if (state.context !== target.context)
+                        throw new Exception("Audio nodes belong to different contexts", "InvalidAccessError");
+                    checkPort(output, state.outputs);
+                    for (const edge of state.edges)
+                        if (edge.param === destination && edge.output === output) return undefined;
+                    const edge = {source: this, param: destination, output};
+                    state.edges.add(edge);
+                    target.inputs.add(edge);
+                    return undefined;
+                }
+                const other = nodeRecord(destination);
                 // Web IDL converts every argument before method validation.
                 output = output >>> 0;
                 input = input >>> 0;
@@ -6571,11 +7221,23 @@
             }
             disconnect(destination = undefined, output = undefined, input = undefined) {
                 const state = nodeRecord(this), count = Math.min(arguments.length, 3);
-                let other = null;
+                let other = null, param = null;
                 if (count) {
                     const candidate = get(destination);
-                    if (count > 1 || (candidate &&
-                        (candidate.kind === "processor" || candidate.kind === "destination"))) {
+                    if (candidate && candidate.kind === "param") {
+                        param = candidate;
+                        if (count > 1) { output = output >>> 0; checkPort(output, state.outputs); }
+                        let removed = false;
+                        for (const edge of state.edges) {
+                            if (edge.param !== destination || (count > 1 && edge.output !== output)) continue;
+                            state.edges.delete(edge);
+                            param.inputs.delete(edge);
+                            removed = true;
+                        }
+                        if (!removed) throw new Exception("Audio node is not connected to the AudioParam", "InvalidAccessError");
+                        return;
+                    }
+                    if (count > 1 || (candidate && candidate.node)) {
                         other = nodeRecord(destination);
                         if (count > 1) output = output >>> 0;
                         if (count > 2) input = input >>> 0;
@@ -6594,19 +7256,39 @@
                         (count && (!other || count > 1) && edge.output !== output) ||
                         (other && count > 2 && edge.input !== input)) continue;
                     state.edges.delete(edge);
-                    nodeRecord(edge.destination).edges.delete(edge);
+                    if (edge.param) get(edge.param).inputs.delete(edge);
+                    else nodeRecord(edge.destination).edges.delete(edge);
                     removed = true;
                 }
                 if (other && !removed)
                     throw new Exception("Audio nodes are not connected", "InvalidAccessError");
             }
         }
+        // #audionode-constructor-init: AudioNodeOptions, applied through the
+        // attribute setters (and their constraints) after the defaults.
+        function nodeOptions(dict) {
+            const count = member(dict, "channelCount");
+            const mode = member(dict, "channelCountMode");
+            const interpretation = member(dict, "channelInterpretation");
+            return {
+                channelCount: count === undefined ? undefined : unsignedLong(count),
+                channelCountMode: mode === undefined ? undefined
+                    : enumValue(mode, ["max", "clamped-max", "explicit"]),
+                channelInterpretation: interpretation === undefined ? undefined
+                    : enumValue(interpretation, ["speakers", "discrete"]),
+            };
+        }
+        function applyNodeOptions(node, converted) {
+            if (converted.channelCount !== undefined) node.channelCount = converted.channelCount;
+            if (converted.channelCountMode !== undefined) node.channelCountMode = converted.channelCountMode;
+            if (converted.channelInterpretation !== undefined) node.channelInterpretation = converted.channelInterpretation;
+        }
         class AudioDestinationNode extends AudioNode {
-            constructor(key, context) {
-                super(key, context, "destination", 2);
+            constructor(key, context, channels, maxChannels) {
+                super(key, context, "destination", channels);
+                nodeRecord(this).maxChannels = maxChannels;
             }
-            // Stereo graph capacity while device acquisition is unavailable.
-            get maxChannelCount() { nodeRecord(this, "destination"); return 2; }
+            get maxChannelCount() { return nodeRecord(this, "destination").maxChannels; }
         }
         class ScriptProcessorNode extends AudioNode {
             constructor(key, context, bufferSize, inputs, outputs) {
@@ -6617,69 +7299,518 @@
             }
             get bufferSize() { return nodeRecord(this, "processor").bufferSize; }
         }
-        function requireActive(contextId) {
-            if (!binding("active", contextId))
-                throw new Exception("Document is not fully active", "InvalidStateError");
-        }
-        function requireOpen(context) {
-            const state = record(context);
-            requireActive(state.contextId);
-            if (state.closed) throw new Exception("AudioContext is closed", "InvalidStateError");
-            return state;
-        }
-        function enumValue(value, choices) {
-            const text = `${value}`;
-            if (!choices.includes(text)) throw new TypeError("Invalid AudioContext option");
-            return text;
-        }
-        function options(value) {
-            if (value != null && typeof value !== "object" && typeof value !== "function")
-                throw new TypeError("AudioContext options must be a dictionary");
-            // Web IDL #js-to-dictionary: get and convert each member once, in
-            // lexicographic order, before executing constructor validation.
-            const latency = value == null ? undefined : value.latencyHint;
-            if (latency !== undefined) {
-                if (typeof latency === "number") {
-                    if (!finite(latency)) throw new TypeError("Latency must be finite");
-                } else enumValue(latency, ["balanced", "interactive", "playback"]);
+        class GainNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "GainOptions");
+                const converted = nodeOptions(dict);
+                const gain = member(dict, "gain");
+                const gainValue = gain === undefined ? undefined : float(gain, "gain");
+                super(token, context, "gain", 2);
+                const state = nodeRecord(this);
+                state.gain = createParam(context, this, "gain", 1, -MAX_FLOAT, MAX_FLOAT, "a-rate");
+                state.params.push(state.gain);
+                applyNodeOptions(this, converted);
+                if (gainValue !== undefined) state.gain.value = gainValue;
             }
-            let quantum = value == null ? undefined : value.renderSizeHint;
-            let hardware = false;
-            if (quantum === undefined) quantum = 128;
-            else if (typeof quantum === "number") quantum = quantum >>> 0;
-            else {
-                hardware = enumValue(quantum, ["default", "hardware"]) === "hardware";
-                quantum = hardware ? 0 : 128;
-            }
-            let rate = value == null ? undefined : value.sampleRate;
-            if (rate === undefined) rate = 48000;
-            else {
-                rate = fround(+rate);
-                if (!finite(rate)) throw new TypeError("Sample rate must be a finite float");
-            }
-            const sink = value == null ? undefined : value.sinkId;
-            if (sink !== undefined) {
-                if (sink === null || typeof sink === "object" || typeof sink === "function") {
-                    const type = sink === null ? undefined : sink.type;
-                    if (type === undefined) throw new TypeError("Audio sink type is required");
-                    enumValue(type, ["none"]);
-                } else `${sink}`;
-            }
-            return {rate, quantum, hardware};
+            get gain() { return nodeRecord(this, "gain").gain; }
         }
+        // #AudioScheduledSourceNode
+        class AudioScheduledSourceNode extends AudioNode {
+            constructor(key, context, kind) {
+                if (key !== token) throw new TypeError("Illegal constructor");
+                super(key, context, kind, 2);
+                const state = nodeRecord(this);
+                state.started = false;
+                state.startTime = Infinity;
+                state.stopTime = Infinity;
+                state.ended = false;
+            }
+            start(when = 0) {
+                const state = nodeRecord(this);
+                if (!state.source) throw new TypeError("Illegal AudioScheduledSourceNode invocation");
+                when = double(when, "when");
+                if (state.started) throw new Exception("The source has already been started", "InvalidStateError");
+                if (when < 0) throw new RangeError("when must not be negative");
+                state.started = true;
+                state.startTime = when;
+            }
+            stop(when = 0) {
+                const state = nodeRecord(this);
+                if (!state.source) throw new TypeError("Illegal AudioScheduledSourceNode invocation");
+                when = double(when, "when");
+                if (!state.started) throw new Exception("The source has not been started", "InvalidStateError");
+                if (when < 0) throw new RangeError("when must not be negative");
+                if (!state.ended) state.stopTime = when;
+            }
+        }
+        const OSCILLATOR_TYPES = ["sine", "square", "sawtooth", "triangle", "custom"];
+        class OscillatorNode extends AudioScheduledSourceNode {
+            constructor(context, options = undefined) {
+                const owner = contextRecord(context);
+                const dict = dictionary(options, "OscillatorOptions");
+                const converted = nodeOptions(dict);
+                const detune = member(dict, "detune");
+                const detuneValue = detune === undefined ? undefined : float(detune, "detune");
+                const frequency = member(dict, "frequency");
+                const frequencyValue = frequency === undefined ? undefined : float(frequency, "frequency");
+                const wave = member(dict, "periodicWave");
+                const waveState = wave === undefined ? undefined : waveRecord(wave);
+                const type = member(dict, "type");
+                const typeValue = type === undefined ? "sine" : enumValue(type, OSCILLATOR_TYPES);
+                if (typeValue === "custom" && !waveState)
+                    throw new Exception("A custom oscillator requires a PeriodicWave", "InvalidStateError");
+                super(token, context, "oscillator");
+                const state = nodeRecord(this);
+                state.source = true;
+                const nyquist = owner.rate / 2;
+                state.frequency = createParam(context, this, "frequency", 440, -nyquist, nyquist, "a-rate", null, true);
+                state.detune = createParam(context, this, "detune", 0, -1200 * Math.log2(MAX_FLOAT),
+                    1200 * Math.log2(MAX_FLOAT), "a-rate", null, true);
+                state.params.push(state.frequency, state.detune);
+                state.type = waveState ? "custom" : typeValue;
+                state.wave = waveState ? waveState.source : builtinWave(typeValue);
+                state.phase = 0;
+                state.playing = false;
+                applyNodeOptions(this, converted);
+                if (frequencyValue !== undefined) state.frequency.value = frequencyValue;
+                if (detuneValue !== undefined) state.detune.value = detuneValue;
+            }
+            get type() { return nodeRecord(this, "oscillator").type; }
+            set type(value) {
+                const state = nodeRecord(this, "oscillator");
+                value = `${value}`;
+                if (!OSCILLATOR_TYPES.includes(value)) return;
+                if (value === "custom")
+                    throw new Exception("Use setPeriodicWave() for a custom oscillator", "InvalidStateError");
+                state.type = value;
+                state.wave = builtinWave(value);
+            }
+            get frequency() { return nodeRecord(this, "oscillator").frequency; }
+            get detune() { return nodeRecord(this, "oscillator").detune; }
+            setPeriodicWave(periodicWave) {
+                const state = nodeRecord(this, "oscillator");
+                if (arguments.length < 1) throw new TypeError("setPeriodicWave requires a PeriodicWave");
+                state.wave = waveRecord(periodicWave).source;
+                state.type = "custom";
+            }
+        }
+        class DynamicsCompressorNode extends AudioNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "DynamicsCompressorOptions");
+                const converted = nodeOptions(dict);
+                const values = {};
+                for (const name of ["attack", "knee", "ratio", "release", "threshold"]) {
+                    const value = member(dict, name);
+                    if (value !== undefined) values[name] = float(value, name);
+                }
+                super(token, context, "compressor", 2);
+                const state = nodeRecord(this);
+                state.threshold = createParam(context, this, "threshold", -24, -100, 0, "k-rate", "k-rate");
+                state.knee = createParam(context, this, "knee", 30, 0, 40, "k-rate", "k-rate");
+                state.ratio = createParam(context, this, "ratio", 12, 1, 20, "k-rate", "k-rate");
+                state.attack = createParam(context, this, "attack", 0.003, 0, 1, "k-rate", "k-rate");
+                state.release = createParam(context, this, "release", 0.25, 0, 1, "k-rate", "k-rate");
+                state.params.push(state.threshold, state.knee, state.ratio, state.attack, state.release);
+                state.reduction = 0;
+                state.detectorAverage = 0;
+                state.compressorGain = 1;
+                state.delay = null;
+                applyNodeOptions(this, converted);
+                for (const name of ["attack", "knee", "ratio", "release", "threshold"])
+                    if (values[name] !== undefined) state[name].value = values[name];
+            }
+            get reduction() { return fround(nodeRecord(this, "compressor").reduction); }
+        }
+        for (const name of ["threshold", "knee", "ratio", "attack", "release"]) {
+            define(DynamicsCompressorNode.prototype, name, {configurable: true, enumerable: true,
+                get: {[name]() { return nodeRecord(this, "compressor")[name]; }}[name]});
+            define(Object.getOwnPropertyDescriptor(DynamicsCompressorNode.prototype, name).get,
+                "name", {value: "get " + name, configurable: true});
+        }
+        class AudioBufferSourceNode extends AudioScheduledSourceNode {
+            constructor(context, options = undefined) {
+                contextRecord(context);
+                const dict = dictionary(options, "AudioBufferSourceOptions");
+                const converted = nodeOptions(dict);
+                const bufferValue = member(dict, "buffer");
+                const buffer = bufferValue === undefined || bufferValue === null ? bufferValue : (bufferRecord(bufferValue), bufferValue);
+                const detune = member(dict, "detune");
+                const detuneValue = detune === undefined ? undefined : float(detune, "detune");
+                const loop = !!member(dict, "loop");
+                const loopEnd = member(dict, "loopEnd");
+                const loopEndValue = loopEnd === undefined ? 0 : double(loopEnd, "loopEnd");
+                const loopStart = member(dict, "loopStart");
+                const loopStartValue = loopStart === undefined ? 0 : double(loopStart, "loopStart");
+                const rate = member(dict, "playbackRate");
+                const rateValue = rate === undefined ? undefined : float(rate, "playbackRate");
+                super(token, context, "buffer-source");
+                const state = nodeRecord(this);
+                state.source = true;
+                state.buffer = null;
+                state.bufferSet = false;
+                state.content = null;
+                state.playbackRate = createParam(context, this, "playbackRate", 1, -MAX_FLOAT, MAX_FLOAT, "k-rate", "k-rate", true);
+                state.detune = createParam(context, this, "detune", 0, -MAX_FLOAT, MAX_FLOAT, "k-rate", "k-rate", true);
+                state.params.push(state.playbackRate, state.detune);
+                state.loop = loop;
+                state.loopStart = loopStartValue;
+                state.loopEnd = loopEndValue;
+                state.offset = 0;
+                state.duration = Infinity;
+                state.position = 0;
+                state.elapsed = 0;
+                state.begun = false;
+                state.enteredLoop = false;
+                applyNodeOptions(this, converted);
+                if (buffer) this.buffer = buffer;
+                if (detuneValue !== undefined) state.detune.value = detuneValue;
+                if (rateValue !== undefined) state.playbackRate.value = rateValue;
+            }
+            get buffer() { return nodeRecord(this, "buffer-source").buffer; }
+            set buffer(value) {
+                const state = nodeRecord(this, "buffer-source");
+                if (value !== null && value !== undefined) bufferRecord(value);
+                else value = null;
+                // #dom-audiobuffersourcenode-buffer
+                if (value !== null && state.bufferSet)
+                    throw new Exception("The buffer can only be set once", "InvalidStateError");
+                if (value !== null) state.bufferSet = true;
+                state.buffer = value;
+                if (state.started) state.content = value === null ? null : acquireContent(value);
+            }
+            get playbackRate() { return nodeRecord(this, "buffer-source").playbackRate; }
+            get detune() { return nodeRecord(this, "buffer-source").detune; }
+            get loop() { return nodeRecord(this, "buffer-source").loop; }
+            set loop(value) { nodeRecord(this, "buffer-source").loop = !!value; }
+            get loopStart() { return nodeRecord(this, "buffer-source").loopStart; }
+            set loopStart(value) { nodeRecord(this, "buffer-source").loopStart = double(value, "loopStart"); }
+            get loopEnd() { return nodeRecord(this, "buffer-source").loopEnd; }
+            set loopEnd(value) { nodeRecord(this, "buffer-source").loopEnd = double(value, "loopEnd"); }
+            start(when = 0, offset = undefined, duration = undefined) {
+                const state = nodeRecord(this, "buffer-source");
+                when = double(when, "when");
+                const offsetValue = offset === undefined ? 0 : double(offset, "offset");
+                const durationValue = duration === undefined ? undefined : double(duration, "duration");
+                if (state.started) throw new Exception("The source has already been started", "InvalidStateError");
+                if (when < 0) throw new RangeError("when must not be negative");
+                if (offsetValue < 0) throw new RangeError("offset must not be negative");
+                if (durationValue !== undefined && durationValue < 0) throw new RangeError("duration must not be negative");
+                state.started = true;
+                state.startTime = when;
+                state.offset = offsetValue;
+                if (durationValue !== undefined) state.duration = durationValue;
+                if (state.buffer) state.content = acquireContent(state.buffer);
+            }
+        }
+
+        // ---- graph rendering (#rendering-loop) ----
+        function silence(channels, quantum) {
+            const result = [];
+            for (let c = 0; c < channels; c++) result.push(new F32(quantum));
+            return result;
+        }
+        // #channel-up-mixing-and-down-mixing for one connection.
+        function mixInto(target, source, interpretation) {
+            const from = source.length, to = target.length, frames = target[0].length;
+            const add = (t, s, scale) => { for (let i = 0; i < frames; i++) t[i] += s[i] * scale; };
+            if (from === to) { for (let c = 0; c < to; c++) add(target[c], source[c], 1); return; }
+            if (interpretation === "speakers") {
+                if (from === 1 && to === 2) { add(target[0], source[0], 1); add(target[1], source[0], 1); return; }
+                if (from === 1 && to === 4) { add(target[0], source[0], 1); add(target[1], source[0], 1); return; }
+                if (from === 1 && to === 6) { add(target[2], source[0], 1); return; }
+                if ((from === 2 && (to === 4 || to === 6))) { add(target[0], source[0], 1); add(target[1], source[1], 1); return; }
+                if (from === 4 && to === 6) {
+                    add(target[0], source[0], 1); add(target[1], source[1], 1);
+                    add(target[4], source[2], 1); add(target[5], source[3], 1); return;
+                }
+                if (from === 2 && to === 1) { add(target[0], source[0], 0.5); add(target[0], source[1], 0.5); return; }
+                if (from === 4 && to === 1) { for (let c = 0; c < 4; c++) add(target[0], source[c], 0.25); return; }
+                if (from === 6 && to === 1) {
+                    add(target[0], source[0], SQRT_HALF); add(target[0], source[1], SQRT_HALF);
+                    add(target[0], source[2], 1); add(target[0], source[4], 0.5); add(target[0], source[5], 0.5); return;
+                }
+                if (from === 4 && to === 2) {
+                    add(target[0], source[0], 0.5); add(target[0], source[2], 0.5);
+                    add(target[1], source[1], 0.5); add(target[1], source[3], 0.5); return;
+                }
+                if (from === 6 && to === 2) {
+                    add(target[0], source[0], 1); add(target[0], source[2], SQRT_HALF); add(target[0], source[4], SQRT_HALF);
+                    add(target[1], source[1], 1); add(target[1], source[2], SQRT_HALF); add(target[1], source[5], SQRT_HALF); return;
+                }
+                if (from === 6 && to === 4) {
+                    add(target[0], source[0], 1); add(target[0], source[2], SQRT_HALF);
+                    add(target[1], source[1], 1); add(target[1], source[2], SQRT_HALF);
+                    add(target[2], source[4], 1); add(target[3], source[5], 1); return;
+                }
+            }
+            // "discrete": fill channels until they run out, drop the rest.
+            for (let c = 0; c < min(from, to); c++) add(target[c], source[c], 1);
+        }
+        function computedChannels(sources, mode, channelCount) {
+            let count = 1;
+            for (const source of sources) count = max(count, source.length);
+            if (mode === "explicit") return channelCount;
+            if (mode === "clamped-max") return min(count, channelCount);
+            return count;
+        }
+        function mixInputs(edges, channels, interpretation, quantum, render) {
+            const sources = [];
+            for (const edge of edges) {
+                const output = render(edge.source);
+                if (output) sources.push(output);
+            }
+            const target = silence(channels, quantum);
+            for (const source of sources) mixInto(target, source, interpretation);
+            return target;
+        }
+        function nodeInput(state, quantum, render) {
+            const edges = [];
+            for (const edge of state.edges) if (edge.destination && get(edge.destination) === state) edges.push(edge);
+            const sources = [];
+            for (const edge of edges) sources.push(render(edge.source));
+            const channels = computedChannels(sources, state.mode, state.channelCount);
+            const target = silence(max(channels, 1), quantum);
+            for (const source of sources) mixInto(target, source, state.interpretation);
+            return target;
+        }
+        // Render one quantum for every node of the context in dependency
+        // order; nodes in a cycle (there is no DelayNode) are muted.
+        function renderQuantum(context, quantum) {
+            const outputs = new Map(), visiting = new Set();
+            const render = node => {
+                if (outputs.has(node)) return outputs.get(node);
+                if (visiting.has(node)) return silence(1, quantum);
+                visiting.add(node);
+                const output = processNode(context, node, quantum, render);
+                visiting.delete(node);
+                outputs.set(node, output);
+                return output;
+            };
+            for (const node of context.nodes) render(node);
+            return render(context.destination);
+        }
+        function processNode(context, node, quantum, render) {
+            const state = get(node);
+            switch (state.kind) {
+                case "destination": return nodeInput(state, quantum, render);
+                case "gain": {
+                    const input = nodeInput(state, quantum, render);
+                    const gain = paramBlock(get(state.gain), quantum, render);
+                    for (const channel of input) for (let i = 0; i < quantum; i++) channel[i] *= gain[i];
+                    return input;
+                }
+                case "oscillator": return renderOscillator(context, node, state, quantum, render);
+                case "compressor": return renderCompressor(context, state, quantum, render);
+                case "buffer-source": return renderBufferSource(context, node, state, quantum, render);
+                default: {
+                    // ScriptProcessorNode: no audioprocess dispatch while
+                    // rendering offline; its output is silent.
+                    nodeInput(state, quantum, render);
+                    return silence(max(1, state.outputChannels || 1), quantum);
+                }
+            }
+        }
+        function scheduleEnded(context, node, state) {
+            if (state.ended) return;
+            state.ended = true;
+            queue(() => fire(node, "ended"));
+        }
+        function renderOscillator(context, node, state, quantum, render) {
+            const output = new F32(quantum);
+            const frequency = paramBlock(get(state.frequency), quantum, render);
+            const detune = paramBlock(get(state.detune), quantum, render);
+            const rate = context.rate, nyquist = rate / 2, frame = context.frame;
+            for (let i = 0; i < quantum; i++) {
+                const time = (frame + i) / rate;
+                if (!state.started || time < state.startTime || time >= state.stopTime) continue;
+                // computedOscFrequency, clamped to its nominal range.
+                const computed = min(nyquist, max(-nyquist, frequency[i] * pow(2, detune[i] / 1200)));
+                if (!state.playing) {
+                    // Phase zero at the node's exact start time.
+                    state.playing = true;
+                    state.phase = (time - state.startTime) * computed;
+                    state.phase -= floor(state.phase);
+                }
+                if (computed !== state.lastFrequency || state.wave !== state.lastWave) {
+                    state.lastTable = waveTable(state.wave, computed, nyquist);
+                    state.lastFrequency = computed;
+                    state.lastWave = state.wave;
+                }
+                const table = state.lastTable;
+                const position = state.phase * TABLE_SIZE, index = floor(position);
+                output[i] = table[index] + (table[index + 1] - table[index]) * (position - index);
+                state.phase += computed / rate;
+                state.phase -= floor(state.phase);
+            }
+            if (state.started && (frame + quantum) / rate >= state.stopTime) scheduleEnded(context, node, state);
+            return [output];
+        }
+        // #DynamicsCompressorOptions-processing. The user-agent-defined parts
+        // are: a soft knee that is quadratic in decibels between threshold and
+        // threshold + knee (continuous, with slope 1/ratio where it meets the
+        // ratio segment); a detector curve r(a) = d (1 + a) / 2 with a 1 ms
+        // smoothing coefficient d; an attack curve c_a (1 + x) / 2 on
+        // x = detector average / compressor gain in [0, 1]; and a release curve
+        // 1 + c_r * 2 / (1 + x) with c_r reaching +10 dB over the release time.
+        // The pre-delay is the 6 ms DelayNode of the internal graph.
+        function compressorCurve(xDb, threshold, knee, ratio) {
+            if (xDb <= threshold) return xDb;
+            if (knee > 0 && xDb < threshold + knee)
+                return xDb + (1 / ratio - 1) * (xDb - threshold) * (xDb - threshold) / (2 * knee);
+            return threshold + knee / 2 + knee / (2 * ratio) + (xDb - threshold - knee) / ratio;
+        }
+        function renderCompressor(context, state, quantum, render) {
+            const input = nodeInput(state, quantum, render);
+            const rate = context.rate;
+            const sample = name => paramBlock(get(state[name]), quantum, render)[0];
+            const threshold = sample("threshold"), knee = sample("knee"), ratio = sample("ratio");
+            const attack = sample("attack"), release = sample("release");
+            const channels = input.length;
+            const delayFrames = 0.006 * rate;
+            if (!state.delay || state.delay.length !== channels) {
+                const size = ceil(delayFrames) + quantum + 2;
+                const previous = state.delay;
+                state.delay = [];
+                for (let c = 0; c < channels; c++)
+                    state.delay.push(previous && previous[c] ? previous[c] : new F32(size));
+                state.delayWrite = state.delayWrite || 0;
+            }
+            const makeup = pow(1 / decibelsToLinear(compressorCurve(0, threshold, knee, ratio)), 0.6);
+            const detector = 1 - exp(-1 / max(1, 0.001 * rate));
+            const attackRate = 1 - exp(-1 / max(1, attack * rate));
+            const releaseStep = pow(10, 0.5 / max(1, release * rate)) - 1;
+            let detectorAverage = state.detectorAverage, compressorGain = state.compressorGain;
+            let reductionGain = compressorGain * makeup;
+            const output = silence(channels, quantum);
+            const size = state.delay[0].length;
+            for (let i = 0; i < quantum; i++) {
+                let level = 0;
+                for (let c = 0; c < channels; c++) level = max(level, abs(input[c][i]));
+                let attenuation = 1;
+                if (level >= 0.0001) {
+                    const shaped = decibelsToLinear(compressorCurve(linearToDecibels(level), threshold, knee, ratio));
+                    attenuation = shaped / level;
+                }
+                const releasing = attenuation > compressorGain;
+                detectorAverage += (attenuation - detectorAverage) * detector * (1 + attenuation) / 2;
+                detectorAverage = min(1, detectorAverage);
+                const x = compressorGain > 0 ? detectorAverage / compressorGain : 1;
+                if (releasing) compressorGain = min(1, compressorGain * (1 + releaseStep * 2 / (1 + max(0, x))));
+                else compressorGain += (detectorAverage - compressorGain) * attackRate * (1 + min(1, max(0, x))) / 2;
+                reductionGain = compressorGain * makeup;
+                // The pre-delayed signal, read with linear interpolation.
+                const write = state.delayWrite;
+                for (let c = 0; c < channels; c++) state.delay[c][write] = input[c][i];
+                let read = write - delayFrames;
+                while (read < 0) read += size;
+                const base = floor(read), fraction = read - base, next = base + 1 === size ? 0 : base + 1;
+                for (let c = 0; c < channels; c++) {
+                    const line = state.delay[c];
+                    output[c][i] = (line[base] + (line[next] - line[base]) * fraction) * reductionGain;
+                }
+                state.delayWrite = write + 1 === size ? 0 : write + 1;
+            }
+            state.detectorAverage = detectorAverage;
+            state.compressorGain = compressorGain;
+            state.reduction = linearToDecibels(reductionGain);
+            return output;
+        }
+        // #playback-AudioBufferSourceNode. The playhead is kept in buffer
+        // sample frames (position = playhead time x buffer sample rate) so
+        // that unit-rate playback addresses exact frames; between frames the
+        // playback signal is linearly interpolated.
+        function renderBufferSource(context, node, state, quantum, render) {
+            const playbackRate = paramBlock(get(state.playbackRate), quantum, render)[0];
+            const detune = paramBlock(get(state.detune), quantum, render)[0];
+            const content = state.content;
+            const channels = content && content.channels.length ? content.channels.length : 1;
+            const output = silence(channels, quantum);
+            const rate = context.rate, frame = context.frame;
+            const computedRate = playbackRate * pow(2, detune / 1200);
+            if (!state.started || !content || !content.length) {
+                if (state.started && frame / rate >= state.startTime) scheduleEnded(context, node, state);
+                return output;
+            }
+            const bufferRate = content.rate, frames = content.length, bufferDuration = frames / bufferRate;
+            let loopStart = 0, loopEnd = bufferDuration;
+            if (state.loop) {
+                if (state.loopStart >= 0 && state.loopEnd > 0 && state.loopStart < state.loopEnd) {
+                    loopStart = state.loopStart;
+                    loopEnd = min(state.loopEnd, bufferDuration);
+                }
+            } else state.enteredLoop = false;
+            const loopStartFrame = loopStart * bufferRate, loopEndFrame = loopEnd * bufferRate;
+            const step = computedRate * bufferRate / rate;
+            let finished = false;
+            for (let i = 0; i < quantum; i++) {
+                const time = (frame + i) / rate;
+                if (time < state.startTime) continue;
+                if (time >= state.stopTime || state.elapsed >= state.duration) { finished = true; continue; }
+                if (!state.begun) {
+                    let offset = min(state.offset, bufferDuration);
+                    if (state.loop && computedRate >= 0 && offset >= loopEnd) offset = loopEnd;
+                    if (computedRate < 0 && state.loop && offset < loopStart) offset = loopStart;
+                    state.offset = offset;
+                    state.position = offset * bufferRate;
+                    state.begun = true;
+                }
+                if (state.loop) {
+                    const offsetFrame = state.offset * bufferRate;
+                    if (!state.enteredLoop) {
+                        if (offsetFrame < loopEndFrame && state.position >= loopStartFrame) state.enteredLoop = true;
+                        if (offsetFrame >= loopEndFrame && state.position < loopEndFrame) state.enteredLoop = true;
+                    }
+                    if (state.enteredLoop && loopEndFrame > loopStartFrame &&
+                        (state.position >= loopEndFrame || state.position < loopStartFrame)) {
+                        // Wrap whole loop iterations (any number of them).
+                        const span = loopEndFrame - loopStartFrame;
+                        const wrapped = (state.position - loopStartFrame) % span;
+                        state.position = loopStartFrame + (wrapped < 0 ? wrapped + span : wrapped);
+                    }
+                }
+                const position = state.position;
+                if (position >= 0 && position < frames) {
+                    // Past the last frame of a loop, interpolation continues
+                    // with the frames that follow loopStart.
+                    const index = floor(position), fraction = position - index;
+                    let nextIndex = index + 1;
+                    if (nextIndex >= frames) nextIndex = state.loop && state.enteredLoop ? floor(loopStartFrame) : -1;
+                    for (let c = 0; c < channels; c++) {
+                        const data = content.channels[c];
+                        const next = nextIndex < 0 ? 0 : data[nextIndex];
+                        output[c][i] = fraction === 0 ? data[index] : data[index] + (next - data[index]) * fraction;
+                    }
+                } else if (!state.loop) finished = true;
+                state.position += step;
+                state.elapsed += computedRate / rate;
+            }
+            if (finished || (frame + quantum) / rate >= state.stopTime) scheduleEnded(context, node, state);
+            return output;
+        }
+
+        // ---- contexts ----
         class BaseAudioContext extends EventTarget {
             constructor(key, state) {
                 if (key !== token) throw new TypeError("Illegal constructor");
                 super();
                 set(this, state);
             }
-            get sampleRate() { return record(this).rate; }
-            get currentTime() { record(this); return 0; }
-            get state() { return record(this).closed ? "closed" : "suspended"; }
-            get renderQuantumSize() { return record(this).quantum; }
-            get destination() { return record(this).destination; }
+            get sampleRate() { return contextRecord(this).rate; }
+            get currentTime() {
+                const state = contextRecord(this);
+                return state.kind === "offline" ? state.frame / state.rate : 0;
+            }
+            get state() {
+                const state = contextRecord(this);
+                if (state.kind === "offline") return state.state;
+                return state.closed ? "closed" : "suspended";
+            }
+            get renderQuantumSize() { return contextRecord(this).quantum; }
+            get destination() { return contextRecord(this).destination; }
             createScriptProcessor(bufferSize = 0, numberOfInputChannels = 2, numberOfOutputChannels = 2) {
-                record(this);
+                contextRecord(this);
                 bufferSize = bufferSize >>> 0;
                 numberOfInputChannels = numberOfInputChannels >>> 0;
                 numberOfOutputChannels = numberOfOutputChannels >>> 0;
@@ -6696,21 +7827,37 @@
                 return new ScriptProcessorNode(token, this, bufferSize || 4096,
                     numberOfInputChannels, numberOfOutputChannels);
             }
+            createGain() { contextRecord(this); return new GainNode(this); }
+            createOscillator() { contextRecord(this); return new OscillatorNode(this); }
+            createDynamicsCompressor() { contextRecord(this); return new DynamicsCompressorNode(this); }
+            createBufferSource() { contextRecord(this); return new AudioBufferSourceNode(this); }
+            createBuffer(numberOfChannels, length, sampleRate) {
+                contextRecord(this);
+                if (arguments.length < 3) throw new TypeError("createBuffer requires three arguments");
+                return createBuffer(unsignedLong(numberOfChannels), unsignedLong(length), float(sampleRate, "sampleRate"));
+            }
+            createPeriodicWave(real, imag, constraints = undefined) {
+                contextRecord(this);
+                if (arguments.length < 2) throw new TypeError("createPeriodicWave requires real and imag");
+                const a = floatSequence(real), b = floatSequence(imag);
+                const dict = dictionary(constraints, "PeriodicWaveConstraints");
+                const disable = !!member(dict, "disableNormalization");
+                // #dom-baseaudiocontext-createperiodicwave: unequal lengths are
+                // an IndexSizeError, as for the constructor.
+                return initializeWave(create(PeriodicWave.prototype), a, b, disable);
+            }
         }
         class AudioContext extends BaseAudioContext {
             constructor(contextOptions = undefined) {
                 const state = options(contextOptions);
                 requireActive(storageContextId);
-                if (state.rate < 3000 || state.rate > 768000)
-                    throw new Exception("Unsupported sample rate", "NotSupportedError");
-                if ((!state.hardware && state.quantum < 1) || state.quantum > 6 * state.rate)
-                    throw new Exception("Unsupported render quantum size", "NotSupportedError");
+                validateRateAndQuantum(state);
                 state.closed = false;
                 state.kind = "context";
                 state.contextId = storageContextId;
                 super(token, state);
                 eventTargetState(this, state);
-                state.destination = new AudioDestinationNode(token, this);
+                state.destination = new AudioDestinationNode(token, this, 2, 2);
                 state.enqueue = fn => __queue_dom_task(fn);
                 state.fire = type => dispatch(this, createTrustedEvent(Event, type), false);
                 // Sending a control message to start processing: acquisition
@@ -6751,10 +7898,211 @@
                 });
             }
         }
+        // #OfflineAudioContext-constructors
+        function offlineOptions(args) {
+            if (args.length >= 3) {
+                // constructor(unsigned long numberOfChannels, unsigned long length, float sampleRate)
+                const channels = unsignedLong(args[0]), length = unsignedLong(args[1]);
+                const rate = float(args[2], "sampleRate");
+                return {channels, length, rate, quantum: 128, hardware: false};
+            }
+            if (args.length !== 1) throw new TypeError("OfflineAudioContext requires options or three arguments");
+            const dict = dictionary(args[0], "OfflineAudioContextOptions");
+            const lengthValue = member(dict, "length");
+            const length = lengthValue === undefined || lengthValue === null ? null : unsignedLong(lengthValue);
+            const channelValue = member(dict, "numberOfChannels");
+            const channels = channelValue === undefined ? 1 : unsignedLong(channelValue);
+            const sizing = renderSize(member(dict, "renderSizeHint"));
+            const rateValue = member(dict, "sampleRate");
+            if (rateValue === undefined) throw new TypeError("OfflineAudioContextOptions.sampleRate is required");
+            return {channels, length, rate: float(rateValue, "sampleRate"),
+                quantum: sizing.hardware ? 128 : sizing.quantum, hardware: false};
+        }
+        class OfflineAudioContext extends BaseAudioContext {
+            constructor(...args) {
+                const converted = offlineOptions(args);
+                requireActive(storageContextId);
+                validateRateAndQuantum(converted);
+                if (converted.channels < 1 || converted.channels > MAX_CHANNELS)
+                    throw new Exception("Unsupported number of channels", "NotSupportedError");
+                if (converted.length !== null && (converted.length < 1 ||
+                    converted.length * converted.channels > MAX_BUFFER_SAMPLES))
+                    throw new Exception("Unsupported OfflineAudioContext length", "NotSupportedError");
+                const state = {kind: "offline", rate: converted.rate, quantum: converted.quantum,
+                    channels: converted.channels, length: converted.length, contextId: storageContextId,
+                    state: "suspended", frame: 0, renderingStarted: false, committed: 0, rendered: 0,
+                    nodes: [], suspends: new Map(), jobs: [], closed: false};
+                super(token, state);
+                eventTargetState(this, state);
+                state.destination = new AudioDestinationNode(token, this, converted.channels, converted.channels);
+            }
+            get length() { return offlineRecord(this).length; }
+            startRendering(chunkSize = null) {
+                // #dom-offlineaudiocontext-startrendering
+                let state;
+                try {
+                    state = offlineRecord(this);
+                    chunkSize = chunkSize === null || chunkSize === undefined ? null : unsignedLong(chunkSize);
+                    requireActive(state.contextId);
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => {
+                    if (state.state === "closed" || state.closed)
+                        return reject(new Exception("The OfflineAudioContext is closed", "InvalidStateError"));
+                    if (state.length !== null && state.committed >= state.length)
+                        return reject(new Exception("Rendering has already completed", "InvalidStateError"));
+                    let length;
+                    if (state.length === null) length = chunkSize === null ? state.quantum : chunkSize;
+                    else if (chunkSize !== null && state.committed + chunkSize < state.length) length = chunkSize;
+                    else length = state.length - state.committed;
+                    // Chunks are whole render quanta. A definite-length context
+                    // never renders past its length, which Web Audio 1.0 and
+                    // every engine report as the final buffer's length.
+                    if (length % state.quantum) length += state.quantum - length % state.quantum;
+                    if (state.length !== null) length = min(length, state.length - state.committed);
+                    let buffer;
+                    try { buffer = createBuffer(state.channels, max(1, length), state.rate); }
+                    catch (error) { return reject(error); }
+                    state.renderingStarted = true;
+                    state.committed += length;
+                    state.jobs.push({buffer, written: 0, length, resolve, reject});
+                    if (state.state !== "running") {
+                        state.state = "running";
+                        queue(() => fire(this, "statechange"));
+                    }
+                    if (state.jobs.length === 1) queue(() => renderJob(this, state));
+                });
+            }
+            resume() {
+                let state;
+                try {
+                    state = offlineRecord(this);
+                    requireActive(state.contextId);
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => {
+                    if (state.state === "closed" || state.closed || !state.renderingStarted)
+                        return reject(new Exception("The OfflineAudioContext cannot be resumed", "InvalidStateError"));
+                    queue(() => {
+                        resolve(undefined);
+                        if (state.state !== "running") {
+                            state.state = "running";
+                            queue(() => fire(this, "statechange"));
+                        }
+                        if (state.jobs.length) queue(() => renderJob(this, state));
+                    });
+                });
+            }
+            suspend(suspendTime) {
+                let state;
+                try {
+                    state = offlineRecord(this);
+                    if (arguments.length < 1) throw new TypeError("suspend requires a time");
+                    suspendTime = double(suspendTime, "suspendTime");
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => {
+                    // The suspend frame is rounded up to a render quantum boundary.
+                    const frame = ceil(suspendTime * state.rate / state.quantum) * state.quantum;
+                    if (frame < 0 || frame <= state.frame || (state.length !== null && frame >= state.length) ||
+                        state.suspends.has(frame) || state.state === "closed")
+                        return reject(new Exception("Invalid suspend time", "InvalidStateError"));
+                    state.suspends.set(frame, resolve);
+                });
+            }
+            close() {
+                let state;
+                try {
+                    state = offlineRecord(this);
+                    requireActive(state.contextId);
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => {
+                    if (state.closed) return reject(new Exception("The OfflineAudioContext is closed", "InvalidStateError"));
+                    state.closed = true;
+                    // Closing stops rendering; buffers still being rendered are
+                    // never completed.
+                    for (const job of state.jobs.splice(0))
+                        queue(() => job.reject(new Exception("The OfflineAudioContext was closed", "InvalidStateError")));
+                    closeOffline(this, state, resolve);
+                });
+            }
+        }
+        function closeOffline(context, state, resolve) {
+            queue(() => {
+                if (resolve) resolve(undefined);
+                if (state.state !== "closed") {
+                    state.state = "closed";
+                    queue(() => fire(context, "statechange"));
+                }
+            });
+        }
+        // #begin-offline-rendering on this realm's task queue: at most 64
+        // render quanta per task, suspending at scheduled quantum boundaries.
+        function renderJob(context, state) {
+            const job = state.jobs[0];
+            if (!job || state.state !== "running" || state.closed) return;
+            if (!binding("active", state.contextId)) return;
+            for (let budget = 0; budget < 64 && job.written < job.length; budget++) {
+                const suspend = state.suspends.get(state.frame);
+                if (suspend) {
+                    state.suspends.delete(state.frame);
+                    state.state = "suspended";
+                    queue(() => {
+                        suspend(undefined);
+                        fire(context, "statechange");
+                    });
+                    return;
+                }
+                const block = renderQuantum(state, state.quantum);
+                const count = min(state.quantum, job.length - job.written);
+                const channels = bufferRecord(job.buffer).channels;
+                for (let c = 0; c < channels.length && c < block.length; c++)
+                    channels[c].set(count === state.quantum ? block[c] : block[c].subarray(0, count), job.written);
+                job.written += count;
+                state.frame += state.quantum;
+            }
+            if (job.written < job.length) { queue(() => renderJob(context, state)); return; }
+            state.jobs.shift();
+            state.rendered += job.length;
+            const complete = () => dispatch(context, createTrustedEvent(OfflineAudioCompletionEvent, "complete",
+                {renderedBuffer: job.buffer}), false);
+            queue(() => {
+                job.resolve(job.buffer);
+                if (state.length !== null) {
+                    if (state.rendered >= state.length && !state.closed) {
+                        state.closed = true;
+                        queue(complete);
+                        closeOffline(context, state, null);
+                    } else queue(complete);
+                }
+            });
+            if (state.jobs.length) queue(() => renderJob(context, state));
+        }
+        class OfflineAudioCompletionEvent extends Event {
+            constructor(type, init) {
+                if (arguments.length < 2) throw new TypeError("OfflineAudioCompletionEvent requires type and init");
+                if (init === undefined || init === null || (typeof init !== "object" && typeof init !== "function"))
+                    throw new TypeError("OfflineAudioCompletionEventInit requires renderedBuffer");
+                const base = {bubbles: !!init.bubbles, cancelable: !!init.cancelable, composed: !!init.composed};
+                const buffer = init.renderedBuffer;
+                if (buffer === undefined) throw new TypeError("renderedBuffer is required");
+                bufferRecord(buffer);
+                super(`${type}`, base);
+                set(this, {kind: "completion", buffer});
+            }
+            get renderedBuffer() {
+                const state = get(this);
+                if (!state || state.kind !== "completion") throw new TypeError("Illegal OfflineAudioCompletionEvent invocation");
+                return state.buffer;
+            }
+        }
         // HTML event handler activation preserves the listener's original
         // position when a non-null handler is replaced. Keep slots private.
-        for (const [proto, type, getState] of [[BaseAudioContext.prototype, "statechange", record],
+        for (const [proto, type, getState] of [[BaseAudioContext.prototype, "statechange", contextRecord],
             [AudioContext.prototype, "error", record],
+            [OfflineAudioContext.prototype, "complete", offlineRecord],
+            [AudioScheduledSourceNode.prototype, "ended", target => {
+                const state = nodeRecord(target);
+                if (!state.source) throw new TypeError("Illegal AudioScheduledSourceNode invocation");
+                return state;
+            }],
             [ScriptProcessorNode.prototype, "audioprocess", target => nodeRecord(target, "processor")]]) {
             define(proto, "on" + type, {
                 configurable: true, enumerable: true,
@@ -6779,7 +8127,9 @@
                 }
             });
         }
-        for (const ctor of [BaseAudioContext, AudioContext, AudioNode, AudioDestinationNode, ScriptProcessorNode]) {
+        for (const ctor of [BaseAudioContext, AudioContext, OfflineAudioContext, AudioNode, AudioDestinationNode,
+            ScriptProcessorNode, AudioScheduledSourceNode, OscillatorNode, GainNode, DynamicsCompressorNode,
+            AudioBufferSourceNode, AudioParam, AudioBuffer, PeriodicWave, OfflineAudioCompletionEvent]) {
             for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
                 if (name === "constructor") continue;
                 const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, name);
@@ -6789,6 +8139,12 @@
             define(ctor.prototype, Symbol.toStringTag, {value: ctor.name, configurable: true});
             define(g, ctor.name, {value: ctor, writable: true, configurable: true});
         }
+        // Interface objects report their required constructor arguments.
+        for (const [ctor, length] of [[AudioNode, 0], [AudioDestinationNode, 0], [ScriptProcessorNode, 0],
+            [AudioScheduledSourceNode, 0], [BaseAudioContext, 0], [OscillatorNode, 1], [GainNode, 1],
+            [DynamicsCompressorNode, 1], [AudioBufferSourceNode, 1], [PeriodicWave, 1], [AudioBuffer, 1],
+            [OfflineAudioContext, 1], [OfflineAudioCompletionEvent, 2]])
+            define(ctor, "length", {value: length, configurable: true});
     }
     for (const [name,value] of [["NETWORK_EMPTY",0],["NETWORK_IDLE",1],["NETWORK_LOADING",2],
         ["NETWORK_NO_SOURCE",3],["HAVE_NOTHING",0],["HAVE_METADATA",1],["HAVE_CURRENT_DATA",2],

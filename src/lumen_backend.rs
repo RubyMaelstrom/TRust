@@ -21363,6 +21363,83 @@ mod tests {
     }
 
     #[test]
+    fn offline_audio_context_renders_the_graph_deterministically() {
+        // Web Audio 1.1 (local WebAudio/web-audio-api@2047f16) #OfflineAudioContext,
+        // #rendering-loop, #computation-of-value, #waveform-generation,
+        // #DynamicsCompressorOptions-processing and #playback-AudioBufferSourceNode.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/offline_audio.mjs"),
+                "offline audio",
+            )
+            .unwrap();
+            assert_eq!(
+                settle_platform_result(&mut engine, "__trust", "offlineAudioResult"),
+                "offline-audio-ok",
+                "{tier:?}"
+            );
+            assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        }
+    }
+
+    #[test]
+    fn offline_audio_oscillator_compressor_graph_is_spec_shaped_and_stable() {
+        // The triangle -> DynamicsCompressorNode -> destination graph common in
+        // audio feature probes must render the same bounded, band-limited
+        // signal on every run and execution tier.
+        let probe = r#"
+            (async () => {
+                const context = new OfflineAudioContext(1, 5000, 44100);
+                const oscillator = context.createOscillator();
+                oscillator.type = 'triangle';
+                oscillator.frequency.value = 10000;
+                const compressor = context.createDynamicsCompressor();
+                compressor.threshold.value = -50;
+                compressor.knee.value = 40;
+                compressor.ratio.value = 12;
+                compressor.attack.value = 0;
+                compressor.release.value = 0.25;
+                oscillator.connect(compressor);
+                compressor.connect(context.destination);
+                oscillator.start(0);
+                const buffer = await context.startRendering();
+                const samples = buffer.getChannelData(0);
+                let sum = 0, peak = 0;
+                for (let i = 4500; i < 5000; i++) sum += Math.abs(samples[i]);
+                for (const value of samples) peak = Math.max(peak, Math.abs(value));
+                return [buffer.length, samples[0], peak <= 1, sum, compressor.reduction < 0].join('|');
+            })().then(value => globalThis.audioProbe = value,
+                error => globalThis.audioProbe = 'ERROR:' + error.message);
+        "#;
+        let mut results = Vec::new();
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, probe, "audio probe").unwrap();
+            results.push(settle_platform_result(&mut engine, "__trust", "audioProbe"));
+        }
+        assert!(
+            results.windows(2).all(|pair| pair[0] == pair[1]),
+            "{results:?}"
+        );
+        let fields: Vec<_> = results[0].split('|').collect();
+        assert_eq!(fields[..3], ["5000", "0", "true"], "{results:?}");
+        assert_eq!(
+            fields[4], "true",
+            "the compressor reports gain reduction: {results:?}"
+        );
+        // Regression pin for TRust's documented compressor curves. Allow only
+        // libm last-place differences between platforms.
+        let sum: f64 = fields[3].parse().unwrap();
+        assert!((sum - 189.434_536_896_733_33).abs() < 1e-9, "{results:?}");
+    }
+
+    #[test]
     fn audio_context_window_ownership_and_worker_exposure() {
         let mut engine = configured_engine(
             HostState::new(
