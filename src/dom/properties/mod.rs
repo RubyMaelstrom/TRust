@@ -15,9 +15,9 @@ pub(super) use resolution::{registry_bytes, substitute};
 
 use super::*;
 use cssparser::{Parser, ParserInput, Token};
-use std::rc::Rc;
+use std::sync::Arc;
 
-pub(super) type Registry = FxHashMap<String, Rc<Registration>>;
+pub(super) type Registry = FxHashMap<String, Arc<Registration>>;
 pub(super) type ParseResult<'i, T> = Result<T, cssparser::ParseError<'i, ()>>;
 const MAX_DEPTH: usize = 64;
 const MAX_COMPONENTS: usize = 4096;

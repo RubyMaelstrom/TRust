@@ -57,7 +57,7 @@ pub(super) enum Impact {
 /// uses its node Document's proof; adoption updates that identity atomically.
 #[derive(Default)]
 pub(super) struct SelectorDependencyIndex {
-    documents: FxHashMap<NodeId, std::rc::Rc<SelectorDependencies>>,
+    documents: FxHashMap<NodeId, std::sync::Arc<SelectorDependencies>>,
     empty: SelectorDependencies,
 }
 
@@ -74,7 +74,7 @@ impl SelectorDependencyIndex {
             }
         }
         let mut shared =
-            FxHashMap::<Vec<*const StyleRuleData>, std::rc::Rc<SelectorDependencies>>::default();
+            FxHashMap::<Vec<*const StyleRuleData>, std::sync::Arc<SelectorDependencies>>::default();
         for (document, mut rules) in documents {
             // Source order does not affect a dependency union. Identity is
             // safe here because the complete rule set remains Rc-owned by
@@ -94,7 +94,7 @@ impl SelectorDependencyIndex {
                     dependencies.record(rule);
                 }
                 dependencies.finish();
-                std::rc::Rc::new(dependencies)
+                std::sync::Arc::new(dependencies)
             });
             result.documents.insert(document, dependencies.clone());
         }
@@ -104,18 +104,18 @@ impl SelectorDependencyIndex {
     fn for_node(&self, dom: &Dom, node: NodeId) -> &SelectorDependencies {
         self.documents
             .get(&dom.nodes[node].owner_document)
-            .map(std::rc::Rc::as_ref)
+            .map(std::sync::Arc::as_ref)
             .unwrap_or(&self.empty)
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
         let mut seen = FxHashSet::default();
         self.documents.capacity()
-            * std::mem::size_of::<(NodeId, std::rc::Rc<SelectorDependencies>)>()
+            * std::mem::size_of::<(NodeId, std::sync::Arc<SelectorDependencies>)>()
             + self
                 .documents
                 .values()
-                .filter(|dependencies| seen.insert(std::rc::Rc::as_ptr(dependencies)))
+                .filter(|dependencies| seen.insert(std::sync::Arc::as_ptr(dependencies)))
                 .map(|dependencies| {
                     std::mem::size_of::<SelectorDependencies>() + dependencies.retained_bytes()
                 })
@@ -1962,7 +1962,7 @@ mod tests {
         );
         assert_eq!(index.selector_dependencies.documents.len(), 2);
         assert!(
-            std::rc::Rc::ptr_eq(
+            std::sync::Arc::ptr_eq(
                 &index.selector_dependencies.documents[&documents[0]],
                 &index.selector_dependencies.documents[&documents[1]],
             ),

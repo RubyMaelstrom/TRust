@@ -218,12 +218,12 @@ impl State {
 
 pub(in crate::dom) fn registry_bytes(registry: &Registry) -> usize {
     let mut seen = FxHashSet::default();
-    registry.capacity() * std::mem::size_of::<(String, Rc<Registration>)>()
+    registry.capacity() * std::mem::size_of::<(String, Arc<Registration>)>()
         + registry
             .iter()
             .map(|(name, reg)| {
                 name.capacity()
-                    + if seen.insert(Rc::as_ptr(reg)) {
+                    + if seen.insert(Arc::as_ptr(reg)) {
                         std::mem::size_of::<Registration>() + reg.retained_bytes()
                     } else {
                         0
@@ -275,7 +275,7 @@ impl Dom {
         &self,
         id: NodeId,
         name: &str,
-    ) -> Option<Rc<Registration>> {
+    ) -> Option<Arc<Registration>> {
         let document = self.registration_document(id);
         self.properties
             .javascript
@@ -376,7 +376,7 @@ impl Dom {
             .or_default()
             .insert(
                 name.to_owned(),
-                Rc::new(Registration {
+                Arc::new(Registration {
                     syntax_text: syntax.to_owned(),
                     syntax: parsed,
                     inherits,

@@ -194,22 +194,21 @@ impl Dom {
                     || index.font_sets.contains_key(&id)
                     || index.counter_styles.contains_key(&id)
                     || index.properties.contains_key(&id);
-                index.slot_assignments.borrow_mut().by_element.remove(&id);
             }
+            self.slot_assignments.get_mut().by_element.remove(&id);
             self.layout_cache.get_mut().invalidate(id);
             self.box_tree_cache.get_mut().invalidate(id);
         }
         self.invalidate_layout_paths(svg_consumers);
         if retired_scope {
             *self.style_cache.get_mut() = None;
+            *self.slot_assignments.get_mut() = SlotAssignments::default();
             self.matched_cache.get_mut().slots.clear();
             self.selector_cache.get_mut().slots.clear();
         } else if retired_slot {
             // Removing a slot changes flattened assignments. Its old-epoch per-element vectors
             // can contain the retired identity even when their light-DOM subjects remain old.
-            if let Some((_, index)) = self.style_cache.get_mut() {
-                *index.slot_assignments.borrow_mut() = SlotAssignments::default();
-            }
+            *self.slot_assignments.get_mut() = SlotAssignments::default();
         }
         if changed_popovers {
             self.popover_order.retain(|id| !dead.contains(id));
@@ -296,9 +295,7 @@ impl Dom {
             shrink_ref_map!(&mut generated.content);
             shrink_ref_map!(&mut generated.list_items);
         }
-        if let Some((_, index)) = self.style_cache.get_mut() {
-            shrink_ref_map!(&mut index.slot_assignments.borrow_mut().by_element);
-        }
+        shrink_ref_map!(&mut self.slot_assignments.get_mut().by_element);
         removed
     }
 
@@ -453,11 +450,12 @@ impl Dom {
                 // A removed document/shadow scope's parsed rules/font sets cannot be retained by
                 // the current style-index cache. Existing immutable snapshots own their own copy.
                 *self.style_cache.get_mut() = None;
+                *self.slot_assignments.get_mut() = SlotAssignments::default();
                 // Matching memos contain indices into a particular rebuilt rule array.
                 self.matched_cache.get_mut().slots.clear();
                 self.selector_cache.get_mut().slots.clear();
             } else {
-                let mut assignments = index.slot_assignments.borrow_mut();
+                let assignments = self.slot_assignments.get_mut();
                 assignments.by_element.retain(|&id, pairs| {
                     pairs.retain(|(scope, slot)| valid(*scope) && valid(*slot));
                     valid(id) && !pairs.is_empty()

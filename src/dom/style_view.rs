@@ -321,3 +321,8 @@ pub(super) enum ClassMemo<'a> {
     /// A worker-private cache, discarded after the pass.
     Local(&'a RefCell<FxHashMap<NodeId, class_tokens::ClassTokens>>),
 }
+
+const _: () = {
+    const fn sync<T: Sync>() {}
+    sync::<StyleIndex>();
+};

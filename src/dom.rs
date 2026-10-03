@@ -325,6 +325,9 @@ pub struct Dom {
     animations: animations::State,
     /// Lazily built visibility cascade, valid for one STYLE epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
+    /// DOM-epoch projection of flattened assignment to the slots of shadow
+    /// trees with `::slotted()` rules, independent of selector matching.
+    slot_assignments: RefCell<SlotAssignments>,
     parsed_sheets: RefCell<sheet_cache::Cache>,
     /// Layout-provided query-container content sizes, in untransformed CSS px.
     container_sizes: RefCell<FxHashMap<NodeId, [f32; 2]>>,
@@ -616,7 +619,7 @@ struct CascadedMaps {
     after: FxHashMap<String, String>,
     first_letter: FxHashMap<String, String>,
     marker: FxHashMap<String, String>,
-    custom_bases: FxHashMap<(Option<PseudoEl>, String), std::rc::Rc<url::Url>>,
+    custom_bases: FxHashMap<(Option<PseudoEl>, String), std::sync::Arc<url::Url>>,
 }
 
 impl CascadedMaps {
@@ -730,6 +733,7 @@ impl Dom {
             transitions,
             animations,
             style_cache,
+            slot_assignments,
             parsed_sheets,
             container_sizes,
             container_dependencies,
@@ -938,6 +942,19 @@ impl Dom {
             Err(_) => unavailable = unavailable.saturating_add(1),
         }
 
+        match slot_assignments.try_borrow() {
+            Ok(assignments) => {
+                bytes += assignments.by_element.capacity()
+                    * std::mem::size_of::<(NodeId, Vec<(NodeId, NodeId)>)>();
+                bytes += assignments
+                    .by_element
+                    .values()
+                    .map(|slots| slots.capacity() * std::mem::size_of::<(NodeId, NodeId)>())
+                    .sum::<usize>();
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+
         match parsed_sheets.try_borrow() {
             Ok(cache) => bytes = bytes.saturating_add(cache.retained_bytes()),
             Err(_) => unavailable += 1,
@@ -1087,7 +1104,7 @@ impl Dom {
                         }
                     }
                     bytes += value.custom_bases.capacity()
-                        * std::mem::size_of::<((Option<PseudoEl>, String), std::rc::Rc<url::Url>)>(
+                        * std::mem::size_of::<((Option<PseudoEl>, String), std::sync::Arc<url::Url>)>(
                         )
                         + value
                             .custom_bases
@@ -1210,6 +1227,7 @@ impl Dom {
             transitions: transitions::State::default(),
             animations: animations::State::default(),
             style_cache: RefCell::new(None),
+            slot_assignments: RefCell::new(SlotAssignments::default()),
             parsed_sheets: RefCell::new(sheet_cache::Cache::default()),
             container_sizes: RefCell::new(FxHashMap::default()),
             container_dependencies: RefCell::new(container_queries::Dependencies::default()),
@@ -6616,7 +6634,7 @@ impl Dom {
                 layer_regs.entry(scope).or_default(),
             );
             if let Some(base) = base {
-                let base = std::rc::Rc::new(base);
+                let base = std::sync::Arc::new(base);
                 for rule in &index.scopes[&scope][first..] {
                     if rule.decls.iter().any(|(name, _)| name.starts_with("--")) {
                         index.rule_bases.insert(rule.order, base.clone());
@@ -6663,7 +6681,7 @@ impl Dom {
                     layer_regs.entry(*scope).or_default(),
                 );
                 if let Some(base) = base {
-                    let base = std::rc::Rc::new(base);
+                    let base = std::sync::Arc::new(base);
                     for rule in &index.scopes[scope][first..] {
                         if rule.decls.iter().any(|(name, _)| name.starts_with("--")) {
                             index.rule_bases.insert(rule.order, base.clone());
@@ -15901,8 +15919,6 @@ struct StyleIndex {
     /// rules are consulted while cascading a light-DOM element assigned to a
     /// slot in the corresponding shadow tree.
     slotted_rules: Vec<(NodeId, u32)>,
-    /// DOM-epoch projection of flattened assignment, independent of selector matching.
-    slot_assignments: RefCell<SlotAssignments>,
     /// The last `@keyframes` rule for each case-sensitive name. Animation
     /// declarations do not participate in the ordinary cascade; values are
     /// retained by property and sorted offset so paint can sample supported
@@ -15910,7 +15926,7 @@ struct StyleIndex {
     keyframes: FxHashMap<String, KeyframesRule>,
     counter_styles: FxHashMap<NodeId, counter_styles::Styles>,
     properties: FxHashMap<NodeId, properties::Registry>,
-    rule_bases: FxHashMap<usize, std::rc::Rc<url::Url>>,
+    rule_bases: FxHashMap<usize, std::sync::Arc<url::Url>>,
     /// Whether any rule sets `opacity` at all — lets `paint_suppressed` skip
     /// the opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
@@ -16123,7 +16139,7 @@ impl StyleIndex {
         if self.slotted_rules.is_empty() {
             return Vec::new();
         }
-        let mut cache = self.slot_assignments.borrow_mut();
+        let mut cache = dom.slot_assignments.borrow_mut();
         if cache.epoch != Some(dom.epoch()) {
             cache.by_element.clear();
             // CSS Shadow 1 #slotted-pseudo: only flattened assignments to the
@@ -16164,7 +16180,6 @@ impl StyleIndex {
             scopes,
             buckets,
             slotted_rules,
-            slot_assignments,
             keyframes,
             counter_styles,
             properties,
@@ -16194,19 +16209,10 @@ impl StyleIndex {
             .values()
             .map(properties::registry_bytes)
             .sum::<usize>();
-        bytes += rule_bases.capacity() * std::mem::size_of::<(usize, std::rc::Rc<url::Url>)>();
-        if let Ok(assignments) = slot_assignments.try_borrow() {
-            bytes += assignments.by_element.capacity()
-                * std::mem::size_of::<(NodeId, Vec<(NodeId, NodeId)>)>();
-            bytes += assignments
-                .by_element
-                .values()
-                .map(|slots| slots.capacity() * std::mem::size_of::<(NodeId, NodeId)>())
-                .sum::<usize>();
-        }
+        bytes += rule_bases.capacity() * std::mem::size_of::<(usize, std::sync::Arc<url::Url>)>();
         let mut seen_bases = FxHashSet::default();
         for base in rule_bases.values() {
-            if seen_bases.insert(std::rc::Rc::as_ptr(base)) {
+            if seen_bases.insert(std::sync::Arc::as_ptr(base)) {
                 bytes += std::mem::size_of::<url::Url>() + base.as_str().len();
             }
         }
@@ -17401,7 +17407,7 @@ fn parse_sheet(
             if let Some((rule, tail)) = properties::consume_rule(after) {
                 if let Some(mut rule) = rule {
                     rule.registration.base = base.cloned();
-                    let registration = std::rc::Rc::new(rule.registration);
+                    let registration = std::sync::Arc::new(rule.registration);
                     for name in rule.names {
                         properties.insert(name, registration.clone());
                     }
