@@ -69,7 +69,7 @@ fn participants_for(remaining: Duration) -> usize {
 
 /// One tree scope's rules, borrowed from the style index for a pass.
 struct ScopeRules<'r> {
-    selectors: Vec<&'r Complex>,
+    rules: &'r [StyleRule],
     buckets: Option<&'r RuleBuckets>,
     shadow_host: Option<NodeId>,
 }
@@ -189,7 +189,7 @@ impl<'p, 'a, 'r> Participant<'p, 'a, 'r> {
                 chunk.candidates += self.view.match_rules(
                     id,
                     buckets,
-                    |ri| rules.selectors[ri as usize],
+                    |ri| &rules.rules[ri as usize].selector,
                     rules.shadow_host,
                     ClassMemo::Local(&self.classes),
                     |required| bloom.may_match(required),
@@ -355,6 +355,7 @@ impl Dom {
         min_elements: usize,
         element_cost: Duration,
     ) -> bool {
+        self.flush_style_invalidations();
         let started = Instant::now();
         let index = self.style_index();
         let epoch = self.selector_epoch;
@@ -363,7 +364,7 @@ impl Dom {
         // Every tree scope with rules gets a slot; slot 0 matches nothing.
         let mut slots: FxHashMap<NodeId, usize> = FxHashMap::default();
         let mut scopes = vec![ScopeRules {
-            selectors: Vec::new(),
+            rules: &[],
             buckets: None,
             shadow_host: None,
         }];
@@ -376,7 +377,7 @@ impl Dom {
             }
             slots.insert(scope, scopes.len());
             scopes.push(ScopeRules {
-                selectors: rules.iter().map(|rule| &rule.selector).collect(),
+                rules,
                 buckets: Some(buckets),
                 shadow_host: self.shadow_hosts.get(&scope).copied(),
             });

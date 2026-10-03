@@ -27,6 +27,11 @@ impl<'a> NodesRef<'a> {
         Self(nodes)
     }
 
+    #[inline]
+    pub(super) fn contains(self, id: NodeId) -> bool {
+        self.0.get(id).is_some()
+    }
+
     /// Tree parent (DOM parent, not composed). Panics for an unknown id.
     #[inline]
     pub(super) fn parent(self, id: NodeId) -> Option<NodeId> {
@@ -94,6 +99,18 @@ impl<'a> NodesRef<'a> {
             self.0[id].data,
             NodeData::Element { .. } | NodeData::Document | NodeData::Fragment
         )
+    }
+
+    /// The element's namespace URI, `None` for non-elements or no namespace.
+    #[inline]
+    pub(super) fn namespace_uri(self, id: NodeId) -> Option<&'a str> {
+        match &self.0.get(id)?.data {
+            NodeData::Element { name, .. } => {
+                let ns = &*name.ns;
+                (!ns.is_empty()).then_some(ns)
+            }
+            _ => None,
+        }
     }
 
     /// The character data of a Text node.
@@ -165,6 +182,8 @@ pub(super) struct ViewState<'a> {
     pub(super) focused_areas: &'a FxHashMap<NodeId, NodeId>,
     pub(super) input_values: &'a FxHashMap<NodeId, input::InputValue>,
     pub(super) render_live: bool,
+    pub(super) document_modes: &'a FxHashMap<NodeId, QuirksMode>,
+    pub(super) cssom_inline: &'a FxHashMap<NodeId, cssom::Declarations>,
 }
 
 const _: () = {
@@ -200,6 +219,8 @@ impl Dom {
                 focused_areas: &self.focused_areas,
                 input_values: &self.input_values,
                 render_live: self.render_live,
+                document_modes: &self.document_modes,
+                cssom_inline: &self.cssom_inline,
             },
         }
     }
