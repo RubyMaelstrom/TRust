@@ -517,6 +517,10 @@ struct HostState {
     screen_slots: Option<Value>,
     performance_slots: Option<Value>,
     element_slots: Option<Value>,
+    /// Platform-private, same-Agent WeakMaps created by the first bootstrap and shared by every
+    /// later Realm (see `host_platform_slots`). `controls` maps each Window or worker global to its
+    /// private control object; Rust reaches the platform only through it.
+    platform_controls: Option<Value>,
     live_ranges: live_range_host::Registry,
     geometry: geometry_host::Registry,
     pointer_event_slots: Option<Value>,
@@ -525,6 +529,20 @@ struct HostState {
     wasm_module_slots: Option<Value>,
     /// Child Window Realms share this Agent; dedicated workers inherit its cluster.
     agent_cluster: u64,
+    /// Unit-test instrumentation; zero-sized outside `cfg(test)`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    test_hooks: TestHooks,
+}
+
+#[derive(Default)]
+struct TestHooks {
+    /// Unit-test factories republish private platform internals; see
+    /// `expose_platform_internals_for_tests`.
+    #[cfg(test)]
+    internals: bool,
+    /// Native window named-property exports, observed by a unit test.
+    #[cfg(test)]
+    window_named_exports: usize,
 }
 
 impl HostState {
@@ -591,6 +609,7 @@ impl HostState {
             screen_slots: None,
             performance_slots: None,
             element_slots: None,
+            platform_controls: None,
             live_ranges: live_range_host::Registry::default(),
             geometry: geometry_host::Registry::default(),
             pointer_event_slots: None,
@@ -598,6 +617,7 @@ impl HostState {
             window_message_slots: None,
             wasm_module_slots: None,
             agent_cluster: NEXT_CLUSTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            test_hooks: TestHooks::default(),
         }
     }
 
@@ -786,6 +806,7 @@ impl RetainedMemory for HostState {
             screen_slots,
             performance_slots,
             element_slots,
+            platform_controls,
             live_ranges,
             geometry,
             pointer_event_slots,
@@ -793,6 +814,7 @@ impl RetainedMemory for HostState {
             window_message_slots,
             wasm_module_slots,
             agent_cluster: _,
+            test_hooks: _,
         } = self;
 
         let _ = (
@@ -1164,6 +1186,9 @@ impl RetainedMemory for HostState {
         live_ranges.scan_retained_memory(visitor);
         geometry.scan_retained_memory(visitor);
         if let Some(value) = element_slots {
+            visitor.value(value);
+        }
+        if let Some(value) = platform_controls {
             visitor.value(value);
         }
         if let Some(value) = pointer_event_slots {
@@ -1562,11 +1587,7 @@ fn engine_call_trust_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, EvalError> {
-    let global = engine.global_this();
-    let trust = engine
-        .ctx()
-        .member_get(&global, "__trust")
-        .map_err(EvalError::Throw)?;
+    let trust = platform_control(engine.ctx()).map_err(EvalError::Throw)?;
     let function = engine
         .ctx()
         .member_get(&trust, name)
@@ -1688,11 +1709,12 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     let prelude_started = Instant::now();
     eval_platform_prelude(&mut engine)?;
     let prelude_time = prelude_started.elapsed();
-    eval(
-        &mut engine,
-        "globalThis.__trust.oneShot = true;",
-        "one-shot event-loop setup",
-    )?;
+    let trust = platform_control(engine.ctx())
+        .map_err(|error| describe_throw(&mut engine, error, "one-shot event-loop setup"))?;
+    engine
+        .ctx()
+        .member_set(&trust, "oneShot", Value::Bool(true))
+        .map_err(|error| describe_throw(&mut engine, error, "one-shot event-loop setup"))?;
 
     let benchmark_started = Instant::now();
     eval(&mut engine, &source, "benchmark source")?;
@@ -1722,7 +1744,21 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
         }
     }
     let benchmark_time = benchmark_started.elapsed();
-    let logs_value = eval_value(&mut engine, "__trust.logs.join('\\n')", "benchmark logs")?;
+    let trust = platform_control(engine.ctx())
+        .map_err(|error| describe_throw(&mut engine, error, "benchmark logs"))?;
+    let logs_value = engine
+        .ctx()
+        .member_get(&trust, "logs")
+        .map_err(|error| describe_throw(&mut engine, error, "benchmark logs"))?;
+    let logs_value = engine
+        .ctx()
+        .member_get(&logs_value, "join")
+        .and_then(|join| {
+            engine
+                .ctx()
+                .invoke(join, logs_value, &[Value::from_string("\n".to_string())])
+        })
+        .map_err(|error| describe_throw(&mut engine, error, "benchmark logs"))?;
     let logs = value_string(&mut engine, &logs_value);
     let score = logs
         .lines()
@@ -1841,7 +1877,7 @@ mod desktop {
                 return (html.to_string(), outcome);
             }
         };
-        let _ = evaluate_task(&mut page, "__trust.oneShot = true;", "one-shot setup");
+        set_one_shot(&mut page);
         let mut lifecycle_complete = false;
         let mut tasks = ParserTasks::new(&mut host_rx, None, &mut page);
 
@@ -1861,11 +1897,7 @@ mod desktop {
                 && pending_resources(&mut page) == 0
                 && !trust_bool(&mut page, "hasInitialFramesPending")
             {
-                let _ = evaluate_task(
-                    &mut page,
-                    "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
-                    "load event",
-                );
+                let _ = call_trust(&mut page, "completeDocumentLoad", &[], "load event");
                 checkpoint(&mut page, "load event");
                 lifecycle_complete = true;
                 continue;
@@ -2108,11 +2140,7 @@ mod desktop {
         // the ordinary shell-before-load rendering opportunity below.
         if !has_resident_work(&mut page, has_interaction) {
             prepare_unbounded_task(&interrupt);
-            let _ = evaluate_task(
-                &mut page,
-                "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
-                "load event",
-            );
+            let _ = call_trust(&mut page, "completeDocumentLoad", &[], "load event");
             checkpoint(&mut page, "load event");
             lifecycle_complete = true;
             if let Some((url, replace)) = take_navigation(&mut page) {
@@ -2581,11 +2609,7 @@ mod desktop {
                 Wake::Lifecycle => {
                     lifecycle_complete = true;
                     prepare_unbounded_task(&interrupt);
-                    let _ = evaluate_task(
-                        &mut page,
-                        "__trust.setDocumentReadiness('complete'); __trust.fire(window, 'load', false);",
-                        "load event",
-                    );
+                    let _ = call_trust(&mut page, "completeDocumentLoad", &[], "load event");
                     checkpoint(&mut page, "load event");
                     // HTML §13.2.7 runs the readiness/load steps as their own task. It can
                     // produce a render, navigation, submission, or error, but `Settled` is
@@ -3173,22 +3197,14 @@ mod desktop {
             }
         }
         process_parser_links(&mut page, &mut parser_links, None);
-        let _ = evaluate_task(
-            &mut page,
-            "__trust.setDocumentReadiness('interactive');",
-            "parser EOF",
-        );
+        let _ = call_trust(&mut page, "parserFinished", &[], "parser EOF");
         checkpoint(&mut page, "parser EOF");
         for node in deferred {
             if !tasks.execute_when_ready(&mut page, node) {
                 return Err(page.outcome);
             }
         }
-        let _ = evaluate_task(
-            &mut page,
-            "__trust.queueInitialFrameNavigations(); __trust.fire(document, 'DOMContentLoaded', true);",
-            "DOMContentLoaded",
-        );
+        let _ = call_trust(&mut page, "fireDOMContentLoaded", &[], "DOMContentLoaded");
         checkpoint(&mut page, "DOMContentLoaded");
         Ok(page)
     }
@@ -3524,16 +3540,22 @@ mod desktop {
         }
     }
 
+    /// One-shot transforms settle every task source before serializing.
+    fn set_one_shot(page: &mut LumenPage) {
+        if let Ok(trust) = platform_control(page.engine.ctx()) {
+            let _ = page
+                .engine
+                .ctx()
+                .member_set(&trust, "oneShot", Value::Bool(true));
+        }
+    }
+
     fn engine_call_trust(
         engine: &mut lumen::Engine,
         name: &str,
         args: &[Value],
     ) -> Result<Value, EvalError> {
-        let global = engine.global_this();
-        let trust = engine
-            .ctx()
-            .member_get(&global, "__trust")
-            .map_err(EvalError::Throw)?;
+        let trust = platform_control(engine.ctx()).map_err(EvalError::Throw)?;
         let function = engine
             .ctx()
             .member_get(&trust, name)
@@ -3647,11 +3669,8 @@ mod desktop {
         }
         let error_start = page.outcome.errors.len();
         let console_start = page.outcome.console.len();
-        for (source, errors) in [
-            ("__trust.takeErrors()", true),
-            ("__trust.takeLogs()", false),
-        ] {
-            let Ok(Ok(value)) = page.engine.eval_value_interruptible(source) else {
+        for (method, errors) in [("takeErrors", true), ("takeLogs", false)] {
+            let Ok(value) = engine_call_trust(&mut page.engine, method, &[]) else {
                 continue;
             };
             let joined = value_string(&mut page.engine, &value);
@@ -5180,11 +5199,7 @@ mod desktop {
     }
 
     fn take_click_submit(page: &mut LumenPage) -> Option<(usize, usize, Option<FormSubmission>)> {
-        let value = evaluate_task(
-            page,
-            "(function(){var s=__trust.lastClickSubmit;__trust.lastClickSubmit=null;return (s && !s.prevented) ? (s.form + ',' + s.submitter) : '';})()",
-            "click submission",
-        )?;
+        let value = call_trust(page, "takeClickSubmit", &[], "click submission")?;
         let value = value_to_string(page, &value)?;
         let (form, submitter) = value.split_once(',')?;
         let form = form.trim().parse().ok()?;
@@ -8320,6 +8335,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_set_viewport", 2, host_set_viewport),
     ("__performance_binding", 1, host_performance_binding),
     ("__element_slots", 1, host_element_slots),
+    ("__platform_slots", 2, host_platform_slots),
     ("__dom_register_wrapper", 2, host_register_dom_wrapper),
     ("__dom_cached_wrapper", 1, host_cached_dom_wrapper),
     (
@@ -8647,6 +8663,47 @@ fn host_live_range_snapshot(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Res
     } else {
         ctx.make_array(ranges)
     })
+}
+
+/// Bootstrap-only rendezvous for platform-private, same-Agent WeakMaps. The first Realm's
+/// candidate becomes the Agent's map and later Realms reuse it, as for `__element_slots`. The
+/// prelude captures this function lexically and the bootstrap deletes the global before author
+/// code runs, so page script can neither obtain a map nor register a control object.
+fn host_platform_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let kind = host_arg_string(ctx, args, 0);
+    let candidate = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if !matches!(candidate, Value::Obj(_)) {
+        return Err(ctx.make_error("TypeError", "platform slots require a WeakMap"));
+    }
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
+    };
+    let slot = match kind.as_str() {
+        "controls" => &mut state.platform_controls,
+        _ => return Err(ctx.make_error("TypeError", "unknown platform slot")),
+    };
+    Ok(slot.get_or_insert(candidate).clone())
+}
+
+/// This Realm's private platform control object: the Window prelude's `trust` or the worker
+/// loop. Bootstraps register it in the host-rooted `controls` WeakMap keyed by their global, so
+/// it is never an author-visible property. Fails before the Realm's bootstrap has registered.
+fn platform_control(ctx: &mut Ctx) -> Result<Value, Value> {
+    let global = ctx.global_this();
+    platform_control_of(ctx, &global)
+}
+
+fn platform_control_of(ctx: &mut Ctx, global: &Value) -> Result<Value, Value> {
+    let map = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.platform_controls.clone());
+    match map.map(|map| ctx.weak_map_get(&map, global)).transpose()? {
+        Some(control @ Value::Obj(_)) => Ok(control),
+        _ => Err(ctx.make_error(
+            "InvalidStateError",
+            "this Realm has no platform control object",
+        )),
+    }
 }
 
 fn host_element_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -9591,16 +9648,10 @@ fn record_resource_timing_ref(ctx: &mut Ctx, report: &LumenResourceTiming) {
     // Resource Timing #marking-resource-timing creates the entry in the
     // initiating global, including WorkerGlobalScope (not its owner Window).
     let value = host_resource_timing_value(ctx, &data);
-    let worker = ctx
-        .host_mut::<HostState>()
-        .is_some_and(|state| state.worker_self.is_some());
-    let global = ctx.global_this();
-    let _ = ctx
-        .member_get(&global, if worker { "__wkr" } else { "__trust" })
-        .and_then(|host| {
-            let function = ctx.member_get(&host, "recordResourceTimingPacked")?;
-            ctx.invoke(function, host, &[value])
-        });
+    let _ = platform_control(ctx).and_then(|host| {
+        let function = ctx.member_get(&host, "recordResourceTimingPacked")?;
+        ctx.invoke(function, host, &[value])
+    });
 }
 
 /// XMLHttpRequest's synchronous flag uses HTML's pause semantics. The network future runs on the
@@ -10052,8 +10103,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 }
 
 fn host_trust(ctx: &mut Ctx) -> Result<Value, Value> {
-    let global = ctx.global_this();
-    ctx.member_get(&global, "__trust")
+    platform_control(ctx)
 }
 
 fn host_call_trust(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, Value> {
@@ -10083,7 +10133,9 @@ fn platform_prelude_snapshot() -> Result<&'static [u8], String> {
     // Web IDL platform functions use NativeFunction source syntax. The bootstrap
     // is implementation code, not an author script; do not expose its JS bodies.
     // This policy also follows nested functions created after initial bootstrap.
-    match SNAPSHOT.get_or_init(|| lumen::compile_host_snapshot(platform_prelude())) {
+    match SNAPSHOT.get_or_init(|| {
+        lumen::compile_host_snapshot(&crate::js::private_bootstrap(platform_prelude()))
+    }) {
         Ok(snapshot) => Ok(snapshot.as_slice()),
         Err(error) => Err(error.clone()),
     }
@@ -10091,7 +10143,82 @@ fn platform_prelude_snapshot() -> Result<&'static [u8], String> {
 
 fn eval_platform_prelude(engine: &mut lumen::Engine) -> Result<(), String> {
     let snapshot = platform_prelude_snapshot()?;
-    eval_bootstrap_snapshot(engine, snapshot, "TRust platform prelude")
+    #[cfg(test)]
+    let config = test_bootstrap_config(engine.ctx());
+    eval_bootstrap_snapshot(engine, snapshot, "TRust platform prelude")?;
+    #[cfg(test)]
+    expose_platform_internals_for_tests(engine.ctx(), false, config);
+    Ok(())
+}
+
+/// The configuration object a test fixture installed for the bootstrap to consume.
+#[cfg(test)]
+fn test_bootstrap_config(ctx: &mut Ctx) -> Value {
+    let global = ctx.global_this();
+    ctx.member_get(&global, "__trust_cfg")
+        .unwrap_or(Value::Undefined)
+}
+
+/// Host functions that unit tests call directly from their JavaScript fixtures.
+#[cfg(test)]
+const TEST_EXPOSED_HOST_FUNCTIONS: &[&str] = &[
+    "__dom_allocate_job_context",
+    "__dom_create_window_realm",
+    "__dom_load_frame",
+    "__dom_release_job_context",
+    "__dom_rendering_frames",
+    "__http_fetch",
+];
+
+/// Unit-test fixtures drive the platform through its private control object (`__trust`, or
+/// `__wkr` in a worker) and a few host functions. Production bootstraps never do this: only an
+/// engine whose test factory set `TestHooks::internals` republishes them, after the
+/// private bootstrap has removed the host boundary from the global.
+#[cfg(test)]
+fn expose_platform_internals_for_tests(ctx: &mut Ctx, worker: bool, config: Value) {
+    if !ctx
+        .host_mut::<HostState>()
+        .is_some_and(|state| state.test_hooks.internals)
+    {
+        return;
+    }
+    let Ok(control) = platform_control(ctx) else {
+        return;
+    };
+    let global = ctx.global_this();
+    let _ = ctx.member_set(&global, if worker { "__wkr" } else { "__trust" }, control);
+    if worker {
+        return;
+    }
+    if matches!(config, Value::Obj(_)) {
+        let _ = ctx.member_set(&global, "__trust_cfg", config);
+    }
+    for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+        if TEST_EXPOSED_HOST_FUNCTIONS.contains(&name) {
+            ctx.define_embed_global(name, len, host_fn);
+        }
+    }
+    ctx.define_embed_global("__window_named_exports", 0, |ctx, _, _| {
+        Ok(Value::Num(
+            ctx.host_mut::<HostState>()
+                .map_or(0, |state| state.test_hooks.window_named_exports) as f64,
+        ))
+    });
+}
+
+/// Evaluate a platform prelude source as the private bootstrap does, for tests that assemble
+/// their own Realm instead of using `eval_platform_prelude`.
+#[cfg(test)]
+fn eval_test_bootstrap(
+    engine: &mut lumen::Engine,
+    source: &str,
+    label: &str,
+    worker: bool,
+) -> Result<(), String> {
+    let config = test_bootstrap_config(engine.ctx());
+    eval(engine, &crate::js::private_bootstrap(source), label)?;
+    expose_platform_internals_for_tests(engine.ctx(), worker, config);
+    Ok(())
 }
 
 fn worker_prelude_snapshot() -> Result<&'static [u8], String> {
@@ -10099,11 +10226,11 @@ fn worker_prelude_snapshot() -> Result<&'static [u8], String> {
     match SNAPSHOT.get_or_init(|| {
         let override_source = std::env::var_os("TRUST_WORKER_PRELUDE_FILE")
             .and_then(|path| std::fs::read_to_string(path).ok());
-        lumen::compile_host_snapshot(
+        lumen::compile_host_snapshot(&crate::js::private_bootstrap(
             override_source
                 .as_deref()
                 .unwrap_or_else(|| crate::js::worker_prelude()),
-        )
+        ))
     }) {
         Ok(snapshot) => Ok(snapshot.as_slice()),
         Err(error) => Err(error.clone()),
@@ -10275,11 +10402,17 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         realm_ctx.member_set(&config, "topWindow", top_window.clone())?;
         realm_ctx.member_set(&config, "agentTimeOffset", Value::Num(agent_time_offset))?;
         let global = realm_ctx.global_this();
+        #[cfg(test)]
+        let config_for_tests = config.clone();
         realm_ctx.member_set(&global, "__trust_cfg", config)?;
 
         let bootstrap_result = realm_ctx.eval_classic_snapshot_interruptible(snapshot);
         match bootstrap_result {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(_)) => {
+                #[cfg(test)]
+                expose_platform_internals_for_tests(realm_ctx, false, config_for_tests);
+                Ok(())
+            }
             Ok(Err(EvalError::Throw(error))) => Err(error),
             Ok(Err(EvalError::Interrupted(reason))) => Err(realm_ctx.make_error(
                 "AbortError",
@@ -11463,6 +11596,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
     engine.define_global("__permissions_binding", 2, host_permissions_binding);
     engine.define_global("__navigator_binding", 1, host_navigator_binding);
     engine.define_global("__performance_binding", 1, host_performance_binding);
+    engine.define_global("__platform_slots", 2, host_platform_slots);
     // DedicatedWorkerGlobalScope is DOM-less. Install only the operations the
     // shared worker prelude can reach, including its independent per-agent
     // WebAssembly store.
@@ -11725,7 +11859,11 @@ fn eval_lumen_worker_platform_setup(engine: &mut lumen::Engine) -> Result<bool, 
         )),
         Ok(Err(EvalError::Throw(error))) => Err(describe_throw(engine, error, LABEL)),
         Ok(Err(EvalError::Interrupted(_))) => Ok(false),
-        Ok(Ok(_)) => Ok(true),
+        Ok(Ok(_)) => {
+            #[cfg(test)]
+            expose_platform_internals_for_tests(engine.ctx(), true, Value::Undefined);
+            Ok(true)
+        }
     }
 }
 
@@ -11811,11 +11949,7 @@ fn lumen_worker_internal_call(
     name: &str,
     args: &[Value],
 ) -> Result<Value, EvalError> {
-    let global = engine.global_this();
-    let worker = engine
-        .ctx()
-        .member_get(&global, "__wkr")
-        .map_err(EvalError::Throw)?;
+    let worker = platform_control(engine.ctx()).map_err(EvalError::Throw)?;
     let function = engine
         .ctx()
         .member_get(&worker, name)
@@ -12542,7 +12676,7 @@ fn run_injected_classic_task(
     name: &str,
     source: &str,
 ) -> Result<(), String> {
-    let trust = host_trust(engine.ctx()).map_err(|_| "read __trust".to_string())?;
+    let trust = host_trust(engine.ctx()).map_err(|_| "read the platform control".to_string())?;
     let document_base = state_base(engine.ctx());
     engine.set_import_base(name);
     let old_current = engine
@@ -13381,6 +13515,10 @@ fn host_form_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 }
 
 fn host_window_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    #[cfg(test)]
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state.test_hooks.window_named_exports += 1;
+    }
     let handle = host_dom(ctx);
     let dom = handle.borrow();
     let mut items = Vec::new();
@@ -17507,8 +17645,13 @@ mod tests {
     }
 
     fn worker_platform_engine() -> lumen::Engine {
+        worker_platform_engine_with(true)
+    }
+
+    fn worker_platform_engine_with(test_internals: bool) -> lumen::Engine {
         let clock = Rc::new(RealmClock::new());
         let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+        state.test_hooks.internals = test_internals;
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         state.worker_self = Some(LumenWorkerSelf {
             id: 1,
@@ -18914,7 +19057,13 @@ mod tests {
             "isolation",
         )
         .unwrap();
-        eval(&mut engine, crate::js::worker_prelude(), "worker prelude").unwrap();
+        eval_test_bootstrap(
+            &mut engine,
+            crate::js::worker_prelude(),
+            "worker prelude",
+            true,
+        )
+        .unwrap();
         assert_eq!(
             string_value(&mut engine, include_str!("fixtures/image_data.mjs")),
             "image-data-ok"
@@ -18931,7 +19080,7 @@ mod tests {
                 ),
                 DEFAULT_URL,
             );
-            eval(
+            eval_test_bootstrap(
                 &mut engine,
                 if worker {
                     crate::js::worker_prelude()
@@ -18939,6 +19088,7 @@ mod tests {
                     crate::js::PRELUDE
                 },
                 "Wasm clone prelude",
+                worker,
             )
             .unwrap();
             assert_eq!(
@@ -18949,7 +19099,7 @@ mod tests {
         let mut sender = platform_engine();
         let wire = string_value(
             &mut sender,
-            "__sc_serialize(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])))",
+            "__trust.messageCodec.serialize(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0])))",
         );
         let mut receiver = platform_engine();
         eval(
@@ -18964,7 +19114,7 @@ mod tests {
         assert_eq!(
             string_value(
                 &mut receiver,
-                "try { __sc_deserialize(wire); 'accepted'; } catch (error) { error.name; }"
+                "try { __trust.messageCodec.deserialize(wire); 'accepted'; } catch (error) { error.name; }"
             ),
             "DataCloneError"
         );
@@ -18980,7 +19130,7 @@ mod tests {
                 ),
                 DEFAULT_URL,
             );
-            eval(
+            eval_test_bootstrap(
                 &mut engine,
                 if worker {
                     crate::js::worker_prelude()
@@ -18988,6 +19138,7 @@ mod tests {
                     crate::js::PRELUDE
                 },
                 "URL prelude",
+                worker,
             )
             .unwrap();
             assert_eq!(
@@ -19084,7 +19235,7 @@ mod tests {
             } else {
                 crate::js::PRELUDE
             };
-            eval(&mut engine, prelude, "console prelude").unwrap();
+            eval_test_bootstrap(&mut engine, prelude, "console prelude", worker).unwrap();
             assert_eq!(
                 string_value(
                     &mut engine,
@@ -19150,6 +19301,7 @@ mod tests {
     }
 
     fn configured_engine_before_prelude(mut state: HostState, url: &str) -> lumen::Engine {
+        state.test_hooks.internals = true;
         state
             .window_request_urls
             .insert(0, url::Url::parse(url).unwrap());
@@ -19207,7 +19359,7 @@ mod tests {
                 "capture native language builtins",
             )
             .unwrap();
-            eval(&mut engine, crate::js::PRELUDE, "prelude").unwrap();
+            eval_test_bootstrap(&mut engine, crate::js::PRELUDE, "prelude", false).unwrap();
             assert_eq!(
                 string_value(
                     &mut engine,
@@ -19259,11 +19411,8 @@ mod tests {
     }
 
     fn call_trust_method(engine: &mut lumen::Engine, name: &str, args: &[Value]) -> Value {
-        let global = engine.global_this();
-        let trust = engine
-            .ctx()
-            .get_member(&global, "__trust")
-            .unwrap_or_else(|_| panic!("read __trust"));
+        let trust = platform_control(engine.ctx())
+            .unwrap_or_else(|_| panic!("read the platform control object"));
         let method = engine
             .ctx()
             .get_member(&trust, name)
@@ -19356,7 +19505,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 190, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 191, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -19367,7 +19516,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 190);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 191);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -19381,6 +19530,115 @@ mod tests {
             let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
         }
+    }
+
+    /// Every name the platform has ever kept on an author-visible global.
+    const FORMER_GLOBAL_INTERNALS: &[&str] = &[
+        "$262",
+        "__trust",
+        "__trust_cfg",
+        "__worker_cfg",
+        "__wkr",
+        "__trust_install_webgl",
+        "__sc_serialize",
+        "__sc_deserialize",
+        "__viewportRect",
+        "__wasm_make_func",
+        "__wasm_extern_intern",
+        "__wasm_extern_get",
+        "__wasm_invoke_import",
+        "__wasm_import_results",
+    ];
+
+    /// The `typeof` of each host binding and former internal global, as one string.
+    fn author_global_internals_probe() -> String {
+        let names: Vec<_> = crate::js::host_boundary_signatures()
+            .map(|(name, _)| name)
+            .chain(FORMER_GLOBAL_INTERNALS.iter().copied())
+            .collect();
+        format!(
+            r#"(names => {{
+                const leaked = [];
+                for (const key of Reflect.ownKeys(globalThis))
+                    if (typeof key === "string" && (key.startsWith("__") || key === "$262")) leaked.push(key);
+                for (const name of names)
+                    if (name in globalThis || (0, eval)("typeof " + name) !== "undefined") leaked.push(name);
+                return leaked.join() || "none";
+            }})({})"#,
+            serde_json::to_string(&names).unwrap()
+        )
+    }
+
+    #[test]
+    fn host_bindings_and_platform_internals_are_unreachable_from_author_globals() {
+        // HTML #origin and #windowproxy: author script receives only the Web-exposed global
+        // surface. The TRust host boundary, the platform's control object/configuration and
+        // the engine's Test262 host object stay private to the bootstrap and the native host,
+        // in the top-level Window, a child Window Realm and a dedicated worker.
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .test_hooks
+            .internals = false;
+        eval_platform_prelude(&mut engine).unwrap();
+        let probe = author_global_internals_probe();
+        assert_eq!(
+            string_value(&mut engine, &probe),
+            "none",
+            "top-level Window"
+        );
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            globalThis.frame = document.createElement('iframe');
+            frame.srcdoc = '<p id=child>child</p>';
+            body.appendChild(frame);
+            "#,
+            "child Window setup",
+        )
+        .unwrap();
+        call_trust_method(&mut engine, "hydrateFrames", &[]);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                &format!(
+                    "frame.contentWindow.eval({})",
+                    serde_json::to_string(&probe).unwrap()
+                )
+            ),
+            "none",
+            "child Window Realm"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "frame.contentDocument.getElementById('child').textContent"
+            ),
+            "child",
+            "the private platform still serves same-origin author code"
+        );
+        // The native host keeps its retained handle to each Realm's control object.
+        assert!(matches!(platform_control(engine.ctx()), Ok(Value::Obj(_))));
+
+        let mut worker = worker_platform_engine_with(false);
+        assert_eq!(
+            string_value(&mut worker, &probe),
+            "none",
+            "dedicated worker"
+        );
+        // WorkerGlobalScope has no print(); the engine's Test262 hook is removed too.
+        assert_eq!(string_value(&mut worker, "typeof print"), "undefined");
+        assert!(matches!(platform_control(worker.ctx()), Ok(Value::Obj(_))));
     }
 
     #[test]
@@ -19525,18 +19783,15 @@ mod tests {
                         !('childOnly' in window) && !('grandchild' in window), 'element eligibility and document boundaries');
                     assert(child.childOnly === child.document.body.firstElementChild && child.length === 1,
                         'child names use its own document');
-                    const nativeNames = __dom_window_named_items;
-                    let exports = 0;
-                    __dom_window_named_items = function (id) { exports++; return nativeNames(id); };
-                    try {
-                        for (const value of ['t', 'ty', 'typing']) {
-                            input.value = value; body.style.color = value === 't' ? 'red' : 'blue';
-                            input.className = value; input.title = value;
-                            assert(window.named === first && first.length === 2 && window.entry === input,
-                                'unrelated mutations preserve live named values');
-                        }
-                        assert(exports === 0, 'typing and styling do not re-export the named candidate tree');
-                    } finally { __dom_window_named_items = nativeNames; }
+                    const exports = __window_named_exports();
+                    for (const value of ['t', 'ty', 'typing']) {
+                        input.value = value; body.style.color = value === 't' ? 'red' : 'blue';
+                        input.className = value; input.title = value;
+                        assert(window.named === first && first.length === 2 && window.entry === input,
+                            'unrelated mutations preserve live named values');
+                    }
+                    assert(__window_named_exports() === exports,
+                        'typing and styling do not re-export the named candidate tree');
                     body.insertBefore(image, form);
                     assert(first[0] === image && first[1] === form, 'saved collection follows reordering');
                     image.name = 'renamed'; image.removeAttribute('id');
@@ -20142,7 +20397,13 @@ mod tests {
             ),
             DEFAULT_URL,
         );
-        eval(&mut worker, crate::js::worker_prelude(), "worker prelude").unwrap();
+        eval_test_bootstrap(
+            &mut worker,
+            crate::js::worker_prelude(),
+            "worker prelude",
+            true,
+        )
+        .unwrap();
         assert_eq!(
             string_value(
                 &mut worker,
@@ -23297,7 +23558,9 @@ mod tests {
             for worker in [false, true] {
                 let mut engine = if worker {
                     let clock = Rc::new(RealmClock::new());
-                    let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+                    let mut state =
+                        HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+                    state.test_hooks.internals = true;
                     let mut engine = lumen::Engine::new();
                     engine.set_wall_clock(move || clock.now_ms());
                     engine
@@ -23428,7 +23691,8 @@ mod tests {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let clock = Rc::new(RealmClock::new());
             let origin = clock.origin_ms;
-            let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+            let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+            state.test_hooks.internals = true;
             let mut engine = lumen::Engine::new();
             engine.set_wall_clock(move || clock.now_ms());
             engine
@@ -27394,10 +27658,11 @@ mod tests {
                         "worker User-Agent",
                     )
                     .unwrap();
-                    eval(
+                    eval_test_bootstrap(
                         &mut engine,
                         crate::js::worker_prelude(),
                         "worker environment",
+                        true,
                     )
                     .unwrap();
                 } else {
@@ -27441,7 +27706,7 @@ mod tests {
                 } else {
                     crate::js::PRELUDE
                 };
-                eval(&mut engine, prelude, "Navigator environment").unwrap();
+                eval_test_bootstrap(&mut engine, prelude, "Navigator environment", worker).unwrap();
                 let value = eval_value(
                     &mut engine,
                     include_str!("fixtures/navigator_interfaces.mjs"),
@@ -27493,7 +27758,8 @@ mod tests {
                 } else {
                     crate::js::PRELUDE
                 };
-                eval(&mut engine, prelude, "permission environment").unwrap();
+                eval_test_bootstrap(&mut engine, prelude, "permission environment", worker)
+                    .unwrap();
                 eval(
                     &mut engine,
                     include_str!("fixtures/permissions_unsupported.mjs"),
@@ -28094,10 +28360,11 @@ mod tests {
             "isolation",
         )
         .unwrap();
-        eval(
+        eval_test_bootstrap(
             &mut engine,
             crate::js::worker_prelude(),
             "AES-GCM worker prelude",
+            true,
         )
         .unwrap();
         eval(&mut engine, r#"

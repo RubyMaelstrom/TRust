@@ -574,14 +574,17 @@ fn numeric_wasm_to_js(ctx: &Ctx, value: &wasmi::Val) -> Result<Value, Value> {
     }
 }
 
-fn call_global(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, Value> {
-    let global = ctx.global_this();
-    let function = ctx.member_get(&global, name)?;
+/// Call one of the active Realm's private JS-side bridge operations. The WebAssembly bootstrap
+/// installs them on the Realm's platform control object; none is reachable from author code.
+fn call_bridge(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, Value> {
+    let control = super::platform_control(ctx)?;
+    let bridge = ctx.member_get(&control, "wasm")?;
+    let function = ctx.member_get(&bridge, name)?;
     ctx.invoke(function, Value::Undefined, args)
 }
 
 fn extern_intern(ctx: &mut Ctx, value: &Value) -> Result<usize, Value> {
-    call_global(ctx, "__wasm_extern_intern", std::slice::from_ref(value)).map(|id| {
+    call_bridge(ctx, "externIntern", std::slice::from_ref(value)).map(|id| {
         id.as_num_opt()
             .filter(|number| *number >= 0.0)
             .unwrap_or(0.0) as usize
@@ -589,11 +592,11 @@ fn extern_intern(ctx: &mut Ctx, value: &Value) -> Result<usize, Value> {
 }
 
 fn extern_get(ctx: &mut Ctx, id: usize) -> Result<Value, Value> {
-    call_global(ctx, "__wasm_extern_get", &[Value::Num(id as f64)])
+    call_bridge(ctx, "externGet", &[Value::Num(id as f64)])
 }
 
 fn make_exported_func(ctx: &mut Ctx, id: usize) -> Result<Value, Value> {
-    call_global(ctx, "__wasm_make_func", &[Value::Num(id as f64)])
+    call_bridge(ctx, "makeFunc", &[Value::Num(id as f64)])
 }
 
 #[derive(Clone, Copy)]
@@ -609,8 +612,9 @@ fn prepare_ref(ctx: &mut Ctx, value: &Value, ty: wasmi::ValType) -> Result<RefAr
     }
     match ty {
         wasmi::ValType::FuncRef => {
-            let id = ctx
-                .member_get(value, "__wasmFunc")?
+            // [[FunctionAddress]] is a private slot of an Exported Function, never a property
+            // an author object could forge (WebAssembly JS API §5.6).
+            let id = call_bridge(ctx, "funcId", std::slice::from_ref(value))?
                 .as_num_opt()
                 .filter(|number| *number >= 0.0)
                 .map(|number| number as usize);
@@ -1070,7 +1074,7 @@ fn import_results(
             Ok(())
         }
         _ => {
-            let values = call_global(ctx, "__wasm_import_results", &[returned])?;
+            let values = call_bridge(ctx, "importResults", &[returned])?;
             let length = ctx
                 .member_get(&values, "length")?
                 .as_num_opt()
@@ -1149,9 +1153,9 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
                 }
             }
         }
-        let result = call_global(
+        let result = call_bridge(
             ctx,
-            "__wasm_invoke_import",
+            "invokeImport",
             &[
                 Value::Num(f64::from(token)),
                 Value::Num(f64::from(index)),

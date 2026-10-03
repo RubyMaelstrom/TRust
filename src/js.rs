@@ -700,6 +700,29 @@ pub fn spawn_page(
     crate::lumen_backend::spawn_page(html, env)
 }
 
+/// Wrap a platform bootstrap (Window or worker prelude) so that it owns the host boundary
+/// privately. Every TRust host binding is captured into a lexical binding of one enclosing
+/// function before the bootstrap runs; after it returns, every `__`-prefixed global property
+/// (host bindings, the configuration object and the bootstrap's own rendezvous values) and the
+/// engine's Test262 `$262` host object are deleted. No author script can run before this
+/// completes, so page and worker code never observe the host boundary: the global surface is
+/// the standard one, and only the platform's closures and the native host retain capabilities.
+/// Native code reaches each Realm's control object through the host-rooted `controls` slot.
+pub(crate) fn private_bootstrap(source: &str) -> String {
+    let names: Vec<&str> = host_boundary_signatures().map(|(name, _)| name).collect();
+    format!(
+        "(function () {{\n\
+         const {{ {captures} }} = globalThis;\n\
+         {source}\n\
+         ;for (const name of Object.getOwnPropertyNames(globalThis))\n\
+         \x20   if (name.slice(0, 2) === \"__\") delete globalThis[name];\n\
+         delete globalThis.$262;\n\
+         }})();\n",
+        captures = names.join(", "),
+    )
+}
+
+/// The worker platform bootstrap source, before [`private_bootstrap`] encloses it.
 pub(crate) fn worker_prelude() -> &'static str {
     static PRELUDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PRELUDE
@@ -722,7 +745,11 @@ pub(crate) fn worker_prelude() -> &'static str {
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\
                  delete globalThis.__bitmap_api; delete globalThis.__sc_bitmap_codec;\n\
-                 __wkr.installPorts(__port_api); delete globalThis.__port_api;\n{performance}"
+                 (function (control) {{\n\
+                 \x20   control.installPorts(__port_api);\n\
+                 \x20   control.messageCodec = {{ serialize: __sc_serialize, deserialize: __sc_deserialize }};\n\
+                 }})(Reflect.apply(WeakMap.prototype.get, __platform_slots(\"controls\", new WeakMap()), [globalThis]));\n\
+                 delete globalThis.__port_api;\n{performance}"
             )
         })
         .as_str()

@@ -9,7 +9,7 @@
     }
 
     // --- the real-time event-loop core (driven by the Rust worker thread) ---
-    var WK = g.__wkr = {
+    var WK = {
         timers: [], ids: new Set(), nextId: 1, nowMs: 0, activeNesting: 0, errors: [],
         now: function () { return this.nowMs; },
         advanceClock: function (now) { this.nowMs = Math.max(this.nowMs, now); },
@@ -57,6 +57,12 @@
         runPortTask: function () { return portAPI.runTask(); },
         takeErrors: function () { var e = this.errors; this.errors = []; return e.join("\u001e"); }
     };
+    // The worker loop's control object stays private: the native host and the
+    // shared platform blocks reach it through the host-rooted WeakMap keyed by
+    // this WorkerGlobalScope, never through a global property.
+    Reflect.apply(WeakMap.prototype.set, __platform_slots("controls", new WeakMap()), [g, WK]);
+    // WorkerGlobalScope has no print(); remove the engine's Test262 hook.
+    delete g.print;
     // HTML Timers "timer initialization steps" apply to both Window and
     // WorkerGlobalScope: TimerHandler accepts a Function or a DOMString. Convert
     // string handlers when scheduled, then compile their classic script in the

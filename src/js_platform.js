@@ -70,13 +70,21 @@
     const agentTimeOffset = Number.isFinite(configuredAgentTimeOffset) &&
         configuredAgentTimeOffset >= 0 ? configuredAgentTimeOffset : 0;
     const trust = { errors: [], logs: [], readyState: "loading" };
-    g.__trust = trust;
+    // The control object is private to the platform. The native host and the
+    // bootstraps of same-Agent Window Realms reach it through one host-rooted
+    // WeakMap keyed by each Realm's global object, never an author-visible
+    // property (HTML #origin: a page must not reach another origin's Realm).
+    const platformControls = __platform_slots("controls", new WeakMap());
+    messageApply(messageWeakSet, platformControls, [g, trust]);
+    function trustOf(window) {
+        return messageApply(messageWeakGet, platformControls, [window]);
+    }
     const childWindowTrusts = new Set();
     const childActivationWindows = new Set();
     const childRenderingFrames = new Map();
     let renderingChildrenEpoch = -1, renderingChildrenCache = [];
     trust.attachChildWindow = function (childWindow, frame) {
-        const childTrust = childWindow && childWindow.__trust;
+        const childTrust = childWindow && trustOf(childWindow);
         if (childTrust && childTrust !== trust) {
             childTrust.oneShot = trust.oneShot;
             childWindowTrusts.add(childTrust);
@@ -87,7 +95,7 @@
         }
     };
     trust.detachChildWindow = function (childWindow) {
-        const childTrust = childWindow && childWindow.__trust;
+        const childTrust = childWindow && trustOf(childWindow);
         if (childTrust) {
             childWindowTrusts.delete(childTrust);
             childActivationWindows.delete(childWindow);
@@ -144,6 +152,12 @@
             if (childErrors) errors.push(childErrors);
         }
         return errors.join("\u0000");
+    };
+    // A native activation's pending implicit form submission, consumed once.
+    trust.takeClickSubmit = function () {
+        const s = trust.lastClickSubmit;
+        trust.lastClickSubmit = null;
+        return (s && !s.prevented) ? (s.form + "," + s.submitter) : "";
     };
     trust.takeLogs = function () {
         const logs = trust.logs.splice(0);
@@ -619,7 +633,7 @@
             return topNavigableName;
         }
         if (frame === realmRootFrame && cfg.parentWindow)
-            return cfg.parentWindow.__trust.frameTargetName(frame.__id, value, write);
+            return trustOf(cfg.parentWindow).frameTargetName(frame.__id, value, write);
         if (!frameNavigableNames.has(frame))
             frameNavigableNames.set(frame, __dom_get_attr(frame.__id, "name") || "");
         if (write) { frameNavigableNames.set(frame, value); navigableNamesRevision++; }
@@ -786,12 +800,12 @@
         const childFrame = nativeInputChildFrame(id);
         if (focusedChildFrame && focusedChildFrame !== childFrame) {
             const childWindow = focusedChildFrame.__contentRealmWindow;
-            if (childWindow) childWindow.__trust.focusPage(null);
+            if (childWindow) trustOf(childWindow).focusPage(null);
         }
         focusedChildFrame = childFrame;
         if (childFrame) {
             focusElement(childFrame, { preventScroll: true });
-            childFrame.__contentRealmWindow.__trust.focusPage(id);
+            trustOf(childFrame.__contentRealmWindow).focusPage(id);
             return;
         }
         let target = id === null || id === undefined ? null : wrap(id);
@@ -810,7 +824,7 @@
         // HTML #currently-focused-area-of-a-top-level-browsing-context:
         // the native editor follows the innermost focused navigable.
         if (focusedArea?.__contentRealmWindow)
-            return focusedArea.__contentRealmWindow.__trust.focusedNode();
+            return trustOf(focusedArea.__contentRealmWindow).focusedNode();
         return focusedArea ? elementIdentity(focusedArea) : null;
     };
     function baseHref() {
@@ -2343,7 +2357,7 @@
             // load task has run, so the intervening event-loop checkpoint is
             // observable. Logical single-Realm frames use the local queue;
             // real child Realms route the element task to their owner Realm.
-            const ownerTrust = realmRootFrame && cfg.parentWindow && cfg.parentWindow.__trust;
+            const ownerTrust = realmRootFrame && cfg.parentWindow && trustOf(cfg.parentWindow);
             if (ownerTrust && ownerTrust !== trust)
                 ownerTrust.queueFrameElementLoad(frame.__id, generation);
             else queueFrameElementLoad(frame, generation);
@@ -2385,7 +2399,7 @@
         } catch (e) {
             trust.errors.push("Window Realm: " + ((e && e.message) || e));
         }
-        if (!childWindow || !childWindow.__trust) return null;
+        if (!childWindow || !trustOf(childWindow)) return null;
         const blobOrigin = frameBlobOrigins.get(frame);
         if (blobOrigin && blobOrigin.url === frameUrl) {
             const child = windowMessageState(childWindow);
@@ -2440,7 +2454,7 @@
         ftrace("loadFrameMarkup url=" + frameUrl + " markup=" + String(markup == null ? "" : markup).length);
         const initialWindow = frame.__trustInitialAboutBlank
             ? frame.__contentRealmWindow : null;
-        const reuseInitialWindow = !!(initialWindow && initialWindow.__trust &&
+        const reuseInitialWindow = !!(initialWindow && trustOf(initialWindow) &&
             frameSameOrigin(frameUrl, frame));
         if (initialWindow) framesWithNonInitialDocuments.add(frame);
         if (!reuseInitialWindow) resetFrameWindowState(frame);
@@ -2465,10 +2479,10 @@
         // cross-document navigations create a fresh Window and Realm.
         if (reuseInitialWindow) {
             try {
-                if (initialWindow.__trust.replaceInitialDocument(frame.__id, frameUrl, referrer, contentType, navigationTiming, frameAboutBaseURLs.get(frame) || null)) {
+                if (trustOf(initialWindow).replaceInitialDocument(frame.__id, frameUrl, referrer, contentType, navigationTiming, frameAboutBaseURLs.get(frame) || null)) {
                     frame.__contentRealmWindow = initialWindow;
                     frame.__contentDoc = initialWindow.document;
-                    initialWindow.__trust.finishParsedFrameLoad(frame.__id, generation);
+                    trustOf(initialWindow).finishParsedFrameLoad(frame.__id, generation);
                     return;
                 }
             } catch (e) {
@@ -2484,7 +2498,7 @@
         // fallback below.
         const childWindow = createFrameWindowRealm(frame, frameUrl, contentType, navigationTiming);
         if (childWindow) {
-            childWindow.__trust.finishParsedFrameLoad(frame.__id, generation);
+            trustOf(childWindow).finishParsedFrameLoad(frame.__id, generation);
             return;
         }
         finishParsedFrameLoad(frame, generation);
@@ -2841,6 +2855,19 @@
     trust.queueInitialFrameNavigations = function () {
         ftrace("queueInitialFrameNavigations");
         queueFrameNavigationsIn(g.document);
+    };
+    // HTML #the-end: the native page actor runs each of these steps as one
+    // task through the private control object (never an author script).
+    trust.parserFinished = function () {
+        trust.setDocumentReadiness("interactive");
+    };
+    trust.fireDOMContentLoaded = function () {
+        trust.queueInitialFrameNavigations();
+        trust.fire(g.document, "DOMContentLoaded", true);
+    };
+    trust.completeDocumentLoad = function () {
+        trust.setDocumentReadiness("complete");
+        trust.fire(g.window, "load", false);
     };
     // Lazy realization when a script reads a frame's contentDocument before the
     // load sweep (or for a frame inserted after load). The de-dup guards keep a
@@ -3302,7 +3329,7 @@
             ? focusedArea || viewportFocusAnchor(g.document) : wrap(id);
         if (!t) return false;
         if ((id === null || id === undefined) && t.__contentRealmWindow) {
-            const childTrust = t.__contentRealmWindow.__trust;
+            const childTrust = trustOf(t.__contentRealmWindow);
             const prevented = childTrust.key(null, key, code, repeat, composing,
                 shift, ctrl, alt, meta, released, location);
             trust.lastClickSubmit = childTrust.lastClickSubmit;
@@ -3697,7 +3724,7 @@
         const childFrame = nativeInputChildFrame(id);
         if (childFrame) {
             const rect = frameContentClientRect(childFrame);
-            const canceled = childFrame.__contentRealmWindow.__trust.pointerButton(id, pressed,
+            const canceled = trustOf(childFrame.__contentRealmWindow).pointerButton(id, pressed,
                 x - rect.left, y - rect.top, screenX, screenY, button, modifiers, true);
             if (pressed && !canceled) trust.focusPage(id);
             if (!pressed && !pointerInput.buttons) trust.hover(hit,x,y,screenX,screenY,modifiers,false,false);
@@ -3816,7 +3843,7 @@
             const child = frame.__contentRealmWindow;
             if (!child) return;
             const rect = frameContentClientRect(frame);
-            child.__trust.hover(target, x - rect.left, y - rect.top, screenX, screenY, modifiers, true, motion);
+            trustOf(child).hover(target, x - rect.left, y - rect.top, screenX, screenY, modifiers, true, motion);
         }
         if (hoveredChildFrame && hoveredChildFrame !== childFrame) childHover(hoveredChildFrame, null);
         hoveredChildFrame = childFrame;
@@ -4132,7 +4159,7 @@
     trust.editableState = function () {
         activeElementFor(g.document);
         if (focusedArea?.__contentRealmWindow)
-            return focusedArea.__contentRealmWindow.__trust.editableState();
+            return trustOf(focusedArea.__contentRealmWindow).editableState();
         const host = editingHostOf(focusedArea);
         if (!host || !host.isConnected) return "null";
         const model = editableModel(host);
@@ -4286,7 +4313,7 @@
         if (ctrl || alt || meta) return false;
         const target = id == null ? focusedArea : wrap(id);
         if (id == null && target?.__contentRealmWindow)
-            return target.__contentRealmWindow.__trust.editableKeyDefault(null,key,shift,ctrl,alt,meta);
+            return trustOf(target.__contentRealmWindow).editableKeyDefault(null,key,shift,ctrl,alt,meta);
         const host = editingHostOf(target);
         if (!host || !host.isConnected) return false;
         const movement = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
@@ -4306,7 +4333,7 @@
     // or selection after script changes, cancellation, or a previous input.
     trust.formEditingState = function (id) {
         const frame = nativeInputChildFrame(id);
-        if (frame) return frame.__contentRealmWindow.__trust.formEditingState(id);
+        if (frame) return trustOf(frame.__contentRealmWindow).formEditingState(id);
         const el = wrap(id), tag = el && htmlElementName(el);
         if (tag !== "input" && tag !== "textarea") return "null";
         const selection = controlSelection(el, false);
@@ -4318,7 +4345,7 @@
     };
     trust.formInsertText = function (id, text) {
         const frame = nativeInputChildFrame(id);
-        if (frame) return frame.__contentRealmWindow.__trust.formInsertText(id,text);
+        if (frame) return trustOf(frame.__contentRealmWindow).formInsertText(id,text);
         const el = wrap(id), selection = el && controlSelection(el, false);
         if (!selection || !__dom_is_connected(id)) return null;
         const value = el.localName === "textarea"
@@ -4330,7 +4357,7 @@
     };
     trust.formSet = function (id, value, checked, inputType, data, start, end, direction, composing = false) {
         const frame = nativeInputChildFrame(id);
-        if (frame) return frame.__contentRealmWindow.__trust.formSet(id,value,checked,inputType,data,start,end,direction,composing);
+        if (frame) return trustOf(frame.__contentRealmWindow).formSet(id,value,checked,inputType,data,start,end,direction,composing);
         const el = wrap(id);
         if (!el) return false;
         value = value === null || value === undefined ? "" : String(value);
@@ -8353,9 +8380,9 @@
             // the resize steps through that Window when present; the
             // runInFrame path remains for the legacy single-Realm backend.
             const childWindow = frame.__contentRealmWindow;
-            if (childWindow && childWindow !== g && childWindow.__trust &&
-                typeof childWindow.__trust.setViewport === "function") {
-                try { childWindow.__trust.setViewport(width, height); }
+            if (childWindow && childWindow !== g && trustOf(childWindow) &&
+                typeof trustOf(childWindow).setViewport === "function") {
+                try { trustOf(childWindow).setViewport(width, height); }
                 catch (e) { trust.errors.push("frame resize handler: " + ((e && e.message) || e)); }
             } else {
                 runInFrame(frame, function () {
@@ -9575,7 +9602,7 @@
             document: g.document,
             location: Object.getOwnPropertyDescriptor(g, "location"),
             parent: g.parent, top: g.top, frames: g.frames, frameElement: frameElementState,
-            cfgUrl: g.__trust_cfg && g.__trust_cfg.url,
+            cfgUrl: cfg.url,
             innerWidth: windowViewportWidth, innerHeight: windowViewportHeight,
             pageXOffset: g.pageXOffset, pageYOffset: g.pageYOffset,
             scrollX: g.scrollX, scrollY: g.scrollY, base: baseHrefCache,
@@ -9586,7 +9613,7 @@
         if (state.location) Object.defineProperty(g, "location", state.location);
         g.parent = state.parent; g.top = state.top; g.frames = state.frames;
         frameElementState = state.frameElement;
-        if (g.__trust_cfg) g.__trust_cfg.url = state.cfgUrl;
+        cfg.url = state.cfgUrl;
         windowViewportWidth = state.innerWidth; windowViewportHeight = state.innerHeight;
         g.pageXOffset = state.pageXOffset; g.pageYOffset = state.pageYOffset;
         g.scrollX = state.scrollX; g.scrollY = state.scrollY;
@@ -9648,7 +9675,7 @@
         frame.__trustParentWindow = parent;
         g.parent = parent; g.top = topWindow; g.frames = sameOrigin ? g : parent;
         frameElementState = frame;
-        if (g.__trust_cfg) g.__trust_cfg.url = url;
+        cfg.url = url;
         windowViewportWidth = frameWidth; windowViewportHeight = frameHeight;
         restoreAnimationFrameMethods(frame);
         baseHrefCache = null;
@@ -9725,7 +9752,7 @@
         // resource state, not temporarily replace the parent's globals.
         const childWindow = frame && frame.__contentRealmWindow;
         if (childWindow && childWindow !== g) {
-            childWindow.__trust.loadOwnFrameStyles(done);
+            trustOf(childWindow).loadOwnFrameStyles(done);
             return;
         }
         runInFrame(frame, function () {
@@ -12082,7 +12109,7 @@
         g.document = realmRootFrame.__contentDoc;
         documentReferrers.set(g.document, referrer);
         documentContentTypes.set(g.document, contentType);
-        if (g.__trust_cfg) g.__trust_cfg.url = String(url);
+        cfg.url = String(url);
         cfg.aboutBaseURL = aboutBaseURL;
         updateLoc(url);
         if (trust.replaceNavigationTiming) trust.replaceNavigationTiming(navigationTiming);
@@ -12984,6 +13011,9 @@
     };
     g.CSS = CSS;
     g.alert = () => {}; g.confirm = () => false; g.prompt = () => null;
+    // HTML #dom-print: this user agent cannot print, so the printing steps
+    // end without a dialog. This replaces the engine's Test262 `print` hook.
+    g.print = { print() {} }.print;
     // CSSOM View #dom-window-scroll / #dom-window-scrollby. The actor owns
     // the CSS-pixel offset; the frontends receive the latest requested offset.
     // Scroll events are coalesced at the rendering update, before rAF.
@@ -13360,7 +13390,7 @@
     // Reset the loop guard at the start of each fresh compute window so a
     // pathological burst in one dispatch can't permanently mute a later one.
     function moResetGuard() { moChain = 0; moDisabled = false; }
-    g.__trust.moResetGuard = moResetGuard;
+    trust.moResetGuard = moResetGuard;
 
     function moEnqueue() {
         if (moQueued || moDisabled) return;
@@ -13614,10 +13644,6 @@
             moRecomputeKinds();
         }
         takeRecords() { const r = this.__records; this.__records = []; return r; }
-    };
-    g.__viewportRect = () => {
-        const vw = windowViewportDimension("width"), vh = windowViewportDimension("height");
-        return { x: 0, y: 0, left: 0, top: 0, right: vw, bottom: vh, width: vw, height: vh };
     };
     // IntersectionObserver — HONEST viewport intersection (W3C Intersection
     // Observer + CSSOM View). The terminal now threads the real scroll position
@@ -17480,7 +17506,7 @@
     function __idbIndexKeys(index, serialized) {
         let value, extracted, key;
         try {
-            value = g.__sc_deserialize(serialized);
+            value = messageDeserialize(serialized);
             extracted = __idbExtractPath(value, index.keyPath);
             if (extracted === undefined) return [];
             key = index.multiEntry ? __idbMultiEntryKey(extracted) : __idbKey(extracted);
@@ -17542,7 +17568,7 @@
         let key;
         if (store.keyPath !== null) {
             if (keyGiven) throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
-            const value = g.__sc_deserialize(serialized);
+            const value = messageDeserialize(serialized);
             const extracted = __idbExtractPath(value, store.keyPath);
             if (extracted !== undefined) key = __idbKey(extracted);
             else if (!store.autoIncrement) throw __idbException("DataError", "The inline key path produced no key.");
@@ -17550,7 +17576,7 @@
                 key = { t: "n", v: store.nextKey };
                 if (!__idbInjectPath(value, store.keyPath, key))
                     throw __idbException("DataError", "The generated key could not be injected into the value.");
-                serialized = g.__sc_serialize(value, true);
+                serialized = messageSerialize(value, true);
             }
         } else if (keyGiven) key = __idbKey(suppliedKey);
         else if (store.autoIncrement) key = { t: "n", v: store.nextKey };
@@ -17593,7 +17619,7 @@
             const transaction = this.transaction; __idbRequireActive(transaction);
             if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
             // Clone during the method call, before the request is returned.
-            const serialized = g.__sc_serialize(value, true);
+            const serialized = messageSerialize(value, true);
             const initialStore = __idbStoreForHandle(this);
             if (initialStore.keyPath !== null && keyGiven)
                 throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
@@ -17638,7 +17664,7 @@
             return __idbQueueRequest(this, () => {
                 const record = __idbRecordList(__idbStoreForHandle(this), range, "next")[0];
                 if (!record) return undefined;
-                return keyOnly ? __idbKeyValue(record.key) : g.__sc_deserialize(record.value);
+                return keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value);
             });
         }
         getAll(query, count) { return this.__all(query, count, false, arguments.length > 0); }
@@ -17649,7 +17675,7 @@
             return __idbQueueRequest(this, () => {
                 let records = __idbRecordList(__idbStoreForHandle(this), range, "next");
                 if (limit !== undefined && limit !== 0) records = records.slice(0, limit);
-                return records.map((record) => keyOnly ? __idbKeyValue(record.key) : g.__sc_deserialize(record.value));
+                return records.map((record) => keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value));
             });
         }
         count(query) {
@@ -17751,7 +17777,7 @@
             return __idbQueueRequest(this, () => {
                 const record = __idbIndexRecordList(this, range, "next")[0];
                 if (!record) return undefined;
-                return keyOnly ? __idbKeyValue(record.primaryKey) : g.__sc_deserialize(record.value);
+                return keyOnly ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value);
             });
         }
         getAll(query, count) { return this.__all(query, count, false, arguments.length > 0); }
@@ -17774,7 +17800,7 @@
                 let records = __idbIndexRecordList(this, range, direction);
                 if (bounded !== undefined && bounded !== 0) records = records.slice(0, bounded);
                 return records.map((record) => keyOnly
-                    ? __idbKeyValue(record.primaryKey) : g.__sc_deserialize(record.value));
+                    ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value));
             });
         }
         count(query) {
@@ -17836,7 +17862,7 @@
             const record = this.__records[next];
             this.__key = __idbKeyValue(record.key);
             this.__primaryKey = __idbKeyValue(record.primaryKey || record.key);
-            this.__value = g.__sc_deserialize(record.value); this.__gotValue = true;
+            this.__value = messageDeserialize(record.value); this.__gotValue = true;
             return this;
         }
         continue(key) {
@@ -19172,6 +19198,8 @@
     messageSerialize = g.__sc_serialize;
     messageDeserialize = g.__sc_deserialize;
     portAPI.setCodec(messageSerialize, messageDeserialize);
+    // The structured-clone wire codec, for native diagnostics and tests only.
+    trust.messageCodec = { serialize: messageSerialize, deserialize: messageDeserialize };
     canvasImageConstructor = g.ImageData;
     canvasImageGetters = {};
     for (const key of ["width","height","data","colorSpace","pixelFormat"])
@@ -19879,13 +19907,22 @@
         Object.defineProperty(f, "length", {
             value: Number.isFinite(arity) ? arity : 0, configurable: true
         });
-        Object.defineProperty(f, "__wasmFunc", { value: funcId });
-        return functionCache(funcId, f);
+        f = functionCache(funcId, f);
+        apply(weakSet, exportedFunctionIds, [f, funcId]);
+        return f;
+    }
+    // Exported Function [[FunctionAddress]] is an internal slot, not a
+    // property: author code can neither observe nor forge another function's
+    // address (JS API §5.6). The native bridge reads it through funcId.
+    const exportedFunctionIds = new WeakMap();
+    function exportedFunctionId(value) {
+        const id = isObject(value) ? apply(weakGet, exportedFunctionIds, [value]) : undefined;
+        return typeof id === "number" ? id : -1;
     }
     // Rust calls this to wrap a funcref read back from a Table/Global.
-    g.__wasm_make_func = function (funcId) {
+    function makeFunc(funcId) {
         return exportedFunction(funcId);
-    };
+    }
 
     // The externref intern map: a wasm externref carries an integer id; the JS
     // value it wraps lives here (JS-land), so reading it back returns the SAME
@@ -19897,7 +19934,7 @@
     const externRefs = [undefined];
     const externRefIds = new Map([[undefined, 0]]);
     const negativeZeroKey = {};
-    g.__wasm_extern_intern = function (value) {
+    function externIntern(value) {
         const key = value === 0 && 1 / value === -Infinity ? negativeZeroKey : value;
         const previous = externRefIds.get(key);
         if (previous !== undefined) return previous;
@@ -19905,10 +19942,10 @@
         const id = externRefs.length - 1;
         externRefIds.set(key, id);
         return id;
-    };
-    g.__wasm_extern_get = function (id) {
+    }
+    function externGet(id) {
         return externRefs[id];
-    };
+    }
 
     // WebAssembly JS API §5.6 AddressValueToU64 for the currently-supported
     // i32 address type. This is Web IDL [EnforceRange] unsigned long: NaN
@@ -20089,7 +20126,7 @@
     // host func forwards each call here. (token, index) is all Rust carries.
     let nextImportToken = 1;
     const wasmImports = Object.create(null);
-    g.__wasm_invoke_import = function (token, index, args) {
+    function invokeImport(token, index, args) {
         const fns = wasmImports[token];
         if (!fns) throw new TypeError("WebAssembly import token " + token + " is missing");
         if (typeof fns[index] !== "function") {
@@ -20099,9 +20136,9 @@
         }
         // JS API §5.6 Call(func, undefined, args) never reads func.apply.
         return apply(fns[index], undefined, args);
-    };
+    }
 
-    g.__wasm_import_results = function (returned) {
+    function importResults(returned) {
         // JS API §5.6 and ECMA-262 IteratorToList: require an iterator, get
         // next once, fully exhaust it before arity checking/value conversion,
         // and do not call return on an abrupt IteratorStepValue completion.
@@ -20119,7 +20156,7 @@
                 value: step.value, writable: true, enumerable: true, configurable: true
             });
         }
-    };
+    }
 
     // js-api "read the imports": for each module import, resolve
     // importObject[module][name], validate its kind, and collect the binding.
@@ -20152,8 +20189,8 @@
                             "import '" + imp.module + "." + imp.name + "' is not a function"
                         );
                     }
-                    if (typeof value.__wasmFunc === "number") {
-                        descriptor.push(["fr", value.__wasmFunc]);
+                    if (exportedFunctionId(value) >= 0) {
+                        descriptor.push(["fr", exportedFunctionId(value)]);
                     } else {
                         descriptor.push(["f", funcs.length]);
                         funcs.push(value);
@@ -20305,6 +20342,16 @@
         configurable: true,
     });
     g.WebAssembly = WebAssembly;
+    // The native Wasm bridge reaches these operations through this Realm's
+    // private control object (Window or worker), never through the global.
+    const bridge = Object.create(null);
+    bridge.makeFunc = makeFunc;
+    bridge.funcId = exportedFunctionId;
+    bridge.externIntern = externIntern;
+    bridge.externGet = externGet;
+    bridge.invokeImport = invokeImport;
+    bridge.importResults = importResults;
+    apply(weakGet, __platform_slots("controls", new WeakMap()), [g]).wasm = bridge;
 })(typeof globalThis !== "undefined" ? globalThis : this);
 /*__WASM_END__*/
     g.__performance_adapter = {
@@ -20344,7 +20391,9 @@
     // before subtracting the origin, as native Resource Timing does. Rounding
     // the relative duration instead can put a completed fetch ahead of now().
     const clockTimestamp = time => floor((time + clockOrigin) * 10) / 10 - owner.timeOrigin;
-    const worker = typeof g.document === 'undefined', host = worker ? g.__wkr : g.__trust;
+    // The Window or worker control object, registered privately by its bootstrap.
+    const worker = typeof g.document === 'undefined';
+    const host = apply(WeakMap.prototype.get, __platform_slots('controls', new WeakMap()), [g]);
     const timingNames = ['navigationStart','unloadEventStart','unloadEventEnd','redirectStart','redirectEnd',
         'fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart',
         'requestStart','responseStart','responseEnd','domLoading','domInteractive',
@@ -20920,7 +20969,7 @@
         trust[name] = function (...args) {
             const frame = nativeInputChildFrame(args[0]);
             if (!frame) return Reflect.apply(local, trust, args);
-            const child = frame.__contentRealmWindow.__trust;
+            const child = trustOf(frame.__contentRealmWindow);
             const result = Reflect.apply(child[name], child, args);
             if (name === "click" || name === "key") {
                 trust.lastClickSubmit = child.lastClickSubmit;
