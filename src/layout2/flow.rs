@@ -1358,35 +1358,15 @@ impl Flow<'_> {
                             // via §10.3.3 auto margins in `horizontal` (its band ==
                             // `h.content_w` == the width, so this is a no-op there).
                             let lead = self.table_lead(b.node, cols.table_w, h.content_w);
-                            let cap_x = content_x + lead;
-                            let cap_w = cols.table_w.max(1.0);
-                            // A table establishes an independent formatting context; its
-                            // captions' floats stay contained here.
-                            let mut tfc = FloatCtx::new();
-                            // Top captions (§17.4), then the grid, then bottom captions
-                            // — each a block box at the table's used width.
-                            for cap in &tb.top_captions {
-                                children.push(
-                                    self.block(cap, cap_x, cap_w, ifc_cb_h, cur, &inl, &mut tfc),
-                                );
-                            }
-                            let grid_top = cur.flush();
-                            let (frags, gh) = self.table_grid(
+                            self.table_contents(
                                 tb,
                                 &cols,
-                                cap_x,
-                                grid_top,
+                                (content_x + lead, s.border),
                                 ifc_cb_h,
+                                cur,
                                 &inl,
-                                &mut cur.anchors,
+                                &mut children,
                             );
-                            children.extend(frags);
-                            cur.y = grid_top + gh;
-                            for cap in &tb.bottom_captions {
-                                children.push(
-                                    self.block(cap, cap_x, cap_w, ifc_cb_h, cur, &inl, &mut tfc),
-                                );
-                            }
                             // Enclose the (possibly shrunk + shifted) table.
                             x_border += lead;
                             h.content_w = cols.table_w;
@@ -1660,6 +1640,64 @@ impl Flow<'_> {
             cur,
             a0,
         )
+    }
+
+    /// Lay a table's contents down from `cur` (CSS 2.2 §17.4): its top
+    /// captions, the grid at `grid_x` (the content-box left edge of a table
+    /// whose used border widths are `border`), then its bottom captions. A
+    /// table establishes an independent formatting context, so its
+    /// captions' floats stay contained here. Each caption is a block box at
+    /// the table's used width. CSS Tables 3
+    /// #drawing-table-backgrounds-and-borders puts captions outside the
+    /// grid's border: a collapsed table's borders straddle its outer grid
+    /// lines (CSS 2.2 §17.6.2), so there a caption spans the border box and
+    /// the grid's half border lies between it and the grid. Separated tables
+    /// keep their captions inside the border.
+    #[allow(clippy::too_many_arguments)]
+    fn table_contents(
+        &self,
+        tb: &super::tree::TableBox,
+        cols: &super::table::TableCols,
+        (grid_x, border): (f32, [f32; 4]),
+        cb_h: Option<f32>,
+        cur: &mut Cursor,
+        inl: &InlineStyle,
+        children: &mut Vec<Frag>,
+    ) {
+        let edges = if tb.collapsed.is_some() {
+            border
+        } else {
+            [0.0; 4]
+        };
+        let cap_x = grid_x - edges[LEFT];
+        let cap_w = (cols.table_w + edges[LEFT] + edges[RIGHT]).max(1.0);
+        let mut tfc = FloatCtx::new();
+        let top = if tb.top_captions.is_empty() {
+            0.0
+        } else {
+            edges[TOP]
+        };
+        cur.y -= top;
+        for cap in &tb.top_captions {
+            children.push(self.block(cap, cap_x, cap_w, cb_h, cur, inl, &mut tfc));
+        }
+        let grid_top = cur.flush() + top;
+        let (frags, gh) = self.table_grid(tb, cols, grid_x, grid_top, cb_h, inl, &mut cur.anchors);
+        children.extend(frags);
+        cur.y = grid_top + gh;
+        let bottom = if tb.bottom_captions.is_empty() {
+            0.0
+        } else {
+            edges[BOTTOM]
+        };
+        cur.y += bottom;
+        for cap in &tb.bottom_captions {
+            children.push(self.block(cap, cap_x, cap_w, cb_h, cur, inl, &mut tfc));
+        }
+        if bottom > 0.0 {
+            // The table's bottom border edge is below its last caption.
+            cur.y = cur.flush() - bottom;
+        }
     }
 
     /// Finish a block-level box's fragment: record its used geometry and
@@ -3857,20 +3895,15 @@ impl Flow<'_> {
                 } else {
                     0.0
                 };
-                let cap_x = bp_l + lead;
-                let cap_w = cols.table_w.max(1.0);
-                let mut tfc = FloatCtx::new();
-                for cap in &tb.top_captions {
-                    children.push(self.block(cap, cap_x, cap_w, def_h, &mut cur, &inl, &mut tfc));
-                }
-                let grid_top = cur.flush();
-                let (frags, gh) =
-                    self.table_grid(tb, &cols, cap_x, grid_top, def_h, &inl, &mut cur.anchors);
-                children.extend(frags);
-                cur.y = grid_top + gh;
-                for cap in &tb.bottom_captions {
-                    children.push(self.block(cap, cap_x, cap_w, def_h, &mut cur, &inl, &mut tfc));
-                }
+                self.table_contents(
+                    tb,
+                    &cols,
+                    (bp_l + lead, s.border),
+                    def_h,
+                    &mut cur,
+                    &inl,
+                    &mut children,
+                );
             }
         }
         // As in `block_compute`: content with no line box gives the marker a
