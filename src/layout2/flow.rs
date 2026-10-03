@@ -1064,8 +1064,12 @@ impl Flow<'_> {
                             // child's through an empty anonymous block holding
                             // only floats, so the box's content edge, where those
                             // floats are placed, lies below that child's margin
-                            // too (as in Gecko and Blink).
-                            let lookahead = (y_border.is_none() && float_only_run(k))
+                            // too (as in Gecko and Blink). Once an earlier child
+                            // has resolved that top, a float-only run instead
+                            // sits where it would with a non-zero bottom border,
+                            // above the next child's margin.
+                            let unresolved = y_border.is_none() && cur.flush_log.len() == log;
+                            let lookahead = (unresolved && float_only_run(k))
                                 .then(|| {
                                     kids[index + 1..].iter().find(|next| !float_only_run(next))
                                 })

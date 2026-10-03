@@ -5026,13 +5026,14 @@ mod tests {
         // child's through the empty anonymous block holding preceding floats,
         // so the parent's content edge, and those floats, lie below the
         // child's margin. A border or a formatting-context root separates
-        // them, as does earlier content. Values match Blink.
+        // them, as does earlier content. Values match Blink and Gecko.
         let html = r#"<!doctype html><style>body{margin:0;font:16px/20px sans-serif}
             .f{float:left;width:50px;height:30px}p{margin:16px 0}section{width:400px;margin-bottom:60px}</style>
             <section id=s1><div class=f id=f1></div><p id=p1>plain parent</p></section>
             <section id=s2 style="border-top:2px solid"><div class=f id=f2></div><p id=p2>bordered</p></section>
             <section id=s3 style="overflow:hidden"><div class=f id=f3></div><p id=p3>bfc</p></section>
-            <section id=s4><p>first</p><div class=f id=f4></div><p id=p4>after content</p></section>"#;
+            <section id=s4><p>first</p><div class=f id=f4></div><p id=p4>after content</p></section>
+            <section id=s5><div style="height:10px"></div><div class=f id=f5></div><p id=p5 style="margin-top:30px">after a box</p></section>"#;
         let dom = Dom::parse_document(html);
         let layout = lay_graphical(html, 800.0, &HashMap::new());
         let top = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].top;
@@ -5041,6 +5042,9 @@ mod tests {
             ("s2", "f2", "p2", (96.0, 2.0, 18.0)),
             ("s3", "f3", "p3", (194.0, 0.0, 16.0)),
             ("s4", "f4", "p4", (306.0, 36.0, 36.0)),
+            // After earlier content, the float-only box sits where it would
+            // with a non-zero bottom border: above the next child's margin.
+            ("s5", "f5", "p5", (422.0, 10.0, 40.0)),
         ] {
             let base = top(section);
             assert_eq!(
