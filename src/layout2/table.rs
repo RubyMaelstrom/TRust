@@ -831,22 +831,24 @@ impl CollapsedBorders {
         border
     }
 
-    /// The table's used border widths, CSS 2.2 §17.6.2: the left and right
-    /// are half the first row's collapsed left and right borders (wider
-    /// borders of later rows spill into the table's margin); the top and
-    /// bottom are half the widest collapsed border along each.
+    /// The table's used border widths. CSS Tables 3
+    /// #conflict-resolution-for-collapsed-borders harmonizes each table-root
+    /// border with every cell forming that border of the table and sets the
+    /// border width to "half the maximum width found": the widest collapsed
+    /// edge down each side and across the first and last rows. This
+    /// supersedes CSS 2.2 §17.6.2's first-row rule for the left and right
+    /// borders, and matches Chromium and Gecko.
     pub(super) fn table_border(&self) -> [f32; 4] {
-        let width = |edge: Option<&CollapsedEdge>| edge.map_or(0.0, |e| e.width) / 2.0;
-        let widest = |row: usize| {
-            (0..self.ncols)
-                .map(|c| width(self.horizontal(row, c)))
-                .fold(0.0f32, f32::max)
+        let widest = |edges: &mut dyn Iterator<Item = Option<&CollapsedEdge>>| {
+            edges.fold(0.0f32, |widest, edge| {
+                widest.max(edge.map_or(0.0, |e| e.width))
+            }) / 2.0
         };
         let mut border = [0.0; 4];
-        border[TOP] = widest(0);
-        border[BOTTOM] = widest(self.nrows);
-        border[LEFT] = width(self.vertical(0, 0));
-        border[RIGHT] = width(self.vertical(0, self.ncols));
+        border[TOP] = widest(&mut (0..self.ncols).map(|c| self.horizontal(0, c)));
+        border[BOTTOM] = widest(&mut (0..self.ncols).map(|c| self.horizontal(self.nrows, c)));
+        border[LEFT] = widest(&mut (0..self.nrows).map(|r| self.vertical(r, 0)));
+        border[RIGHT] = widest(&mut (0..self.nrows).map(|r| self.vertical(r, self.ncols)));
         border
     }
 

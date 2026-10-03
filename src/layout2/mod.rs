@@ -11629,25 +11629,51 @@ b</xmp></body>"#;
     }
 
     #[test]
-    fn collapsed_table_borders_follow_the_first_row_and_hidden_suppresses() {
-        // CSS 2.2 §17.6.2: the table's left and right border widths are half
-        // the first row's collapsed left and right borders; a wider border
-        // further down spills into the margin instead of moving the grid.
-        // §17.6.2.1 rule 1: `hidden` removes the edge for both cells.
+    fn collapsed_table_borders_take_the_widest_outer_edges() {
+        // CSS Tables 3 #conflict-resolution-for-collapsed-borders: each table
+        // border is half the widest collapsed edge along that side of the
+        // table, so the second row's 9px left border widens the table's left
+        // border to 4.5px and moves the grid, as in Chromium and Gecko
+        // (cells at x=12.5), rather than spilling into the margin from the
+        // first row's 3px as CSS 2.2 §17.6.2 described.
         let (dom, boxes) = collapsed_fixture(
-            r#"<style>table{border-collapse:collapse;border:2px solid}
-            td{padding:0;width:10px;height:10px;border:2px solid}</style>
-            <table id=t><tr><td id=a style="border-right:hidden"></td><td id=b></td></tr>
-            <tr><td id=c style="border-left:8px solid"></td><td id=d></td></tr></table>"#,
+            r#"<style>body{margin:8px}table{border-collapse:collapse;border:3px solid black}
+            td{padding:0;width:10px;height:10px}</style>
+            <table id=t><tr><td id=a style="border:1px solid red"></td>
+            <td id=b style="border:4px solid blue"></td></tr>
+            <tr><td id=c style="border-left:9px solid green"></td><td id=d></td></tr></table>"#,
         );
         let table = *rect(&dom, &boxes, "t");
-        let left = |id: &str| rect(&dom, &boxes, id).left - table.left;
-        // Columns: max(1 + 10 + 0, 4 + 10 + 1) and max(0 + 10 + 1, 1 + 10 + 1).
-        assert_eq!(table.width, 1. + 15. + 12. + 1.);
-        assert_eq!((left("a"), left("c")), (1., 1.));
-        assert_eq!((left("b"), left("d")), (16., 16.));
-        // Rows: 1 + 10 + 1 each, the table's top and bottom borders 1px.
-        assert_eq!(table.height, 1. + 12. + 12. + 1.);
+        let at = |id: &str| {
+            let cell = rect(&dom, &boxes, id);
+            (cell.left, cell.top)
+        };
+        assert_eq!((table.left, table.top), (8., 8.));
+        assert_eq!((at("a"), at("c")), ((12.5, 10.), (12.5, 24.)));
+        // Columns: max(1.5 + 10 + 2, 4.5 + 10 + 0), max(2 + 10 + 2, 0 + 10 + 1.5).
+        assert_eq!((at("b"), at("d")), ((27., 10.), (27., 24.)));
+        // Left 9/2 and right 4/2; top 4/2 and bottom 3/2.
+        assert_eq!(table.width, 4.5 + 14.5 + 14. + 2.);
+        assert_eq!(table.height, 2. + 14. + 13.5 + 1.5);
+    }
+
+    #[test]
+    fn collapsed_hidden_borders_suppress_both_sides_of_an_edge() {
+        // CSS 2.2 §17.6.2.1 rule 1: `hidden` on one cell's right border
+        // removes the shared edge, so its neighbor's left border is gone too;
+        // the next row's edge keeps its 2px border, 1px in each cell.
+        let (dom, boxes) = collapsed_fixture(
+            r#"<style>table{border-collapse:collapse}
+            td{padding:0;width:10px;height:10px;border:2px solid;vertical-align:top}
+            td div{height:1px}</style>
+            <table id=t><tr><td id=a style="border-right:hidden"></td><td id=b><div id=bi></div></td></tr>
+            <tr><td id=c></td><td id=d><div id=di></div></td></tr></table>"#,
+        );
+        let inset =
+            |id: &str| rect(&dom, &boxes, &format!("{id}i")).left - rect(&dom, &boxes, id).left;
+        assert_eq!((inset("b"), inset("d")), (0., 1.));
+        let (a, b) = (rect(&dom, &boxes, "a"), rect(&dom, &boxes, "b"));
+        assert_eq!(b.left, a.left + a.width);
     }
 
     #[test]
