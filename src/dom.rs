@@ -8777,9 +8777,12 @@ impl Dom {
         })
     }
 
-    /// A paintable inline SVG: not hidden, and carrying real vector geometry
+    /// A paintable inline SVG: not hidden, and carrying a graphics element
     /// that resvg can render on its own (not just a `<use>` sprite reference,
     /// whose target lives in another element we don't serialize with it).
+    /// SVG 2 struct.html#TermGraphicsElement lists the shapes, `text` (with
+    /// its `tspan`/`textPath` content), `image`, and `foreignObject`, which
+    /// the static renderer does not draw.
     fn svg_is_renderable(&self, id: NodeId) -> bool {
         if self.is_hidden(id) {
             return false;
@@ -8787,7 +8790,17 @@ impl Dom {
         self.descendants(id).into_iter().any(|d| {
             matches!(
                 self.tag_name(d),
-                Some("path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon")
+                Some(
+                    "path"
+                        | "rect"
+                        | "circle"
+                        | "ellipse"
+                        | "line"
+                        | "polyline"
+                        | "polygon"
+                        | "text"
+                        | "image"
+                )
             ) && !self.in_svg_non_render(d)
         })
     }
@@ -20030,6 +20043,30 @@ mod tests {
         assert!(
             !dom.descendants(DOCUMENT)
                 .any(|n| matches!(dom.tag_name(n), Some("svg" | "use")))
+        );
+    }
+
+    /// SVG 2 struct.html#TermGraphicsElement: `text` and `image` draw on
+    /// their own, so an inline SVG made only of them is painted; graphics
+    /// inside a never-rendered container such as `defs` still are not.
+    #[test]
+    fn inline_svg_of_only_text_or_images_is_painted() {
+        let dom = Dom::parse_document(
+            r#"<svg id=text width=40 height=20><text y=15>label</text></svg>
+               <svg id=image width=4 height=4><image href="data:image/png;base64,AAAA"/></svg>
+               <svg id=defs width=4 height=4><defs><text id=t>x</text></defs></svg>"#,
+        );
+        assert!(
+            dom.svg_image_data(dom.get_by_id("text").unwrap(), None)
+                .is_some()
+        );
+        assert!(
+            dom.svg_image_data(dom.get_by_id("image").unwrap(), None)
+                .is_some()
+        );
+        assert!(
+            dom.svg_image_data(dom.get_by_id("defs").unwrap(), None)
+                .is_none()
         );
     }
 
