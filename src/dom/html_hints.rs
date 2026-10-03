@@ -9,6 +9,7 @@ use super::{Dom, NodeId, StyleView};
 
 /// Where a presentational hint's URL resolves (HTML #the-page: against the
 /// node document's base URL).
+#[derive(Clone)]
 pub(super) enum DocumentBase {
     Url(url::Url),
     /// No document URL: the reference stays relative, like author CSS.

@@ -482,6 +482,15 @@ impl State {
             .map(|(_, value)| value.clone())
     }
 
+    /// Elements with animation-origin values or private rows.
+    pub(super) fn origin_elements(&self) -> FxHashSet<NodeId> {
+        self.values
+            .keys()
+            .chain(self.private.iter())
+            .copied()
+            .collect()
+    }
+
     /// Whether `id` must compute an unshared style row: its animated values
     /// change independently of elements with an equal cascade.
     pub(super) fn private_row(&self, id: NodeId) -> bool {

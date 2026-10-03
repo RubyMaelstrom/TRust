@@ -37,6 +37,7 @@ mod input;
 mod invalidation;
 mod media;
 mod parallel_match;
+mod parallel_style;
 mod properties;
 mod style_pool;
 mod style_records;
@@ -166,6 +167,17 @@ pub struct CascDiag {
     pub parallel_collect_us: u64,
     pub parallel_merge_us: u64,
     pub parallel_busy_us: u64,
+    /// Parallel style computation passes (`parallel_style`): elements
+    /// computed, the most participants of one pass, the passes' wall time,
+    /// the page thread's time walking the tree and adopting results, and
+    /// every participant's summed time.
+    pub style_passes: u64,
+    pub style_elements: u64,
+    pub style_threads: u64,
+    pub style_wall_us: u64,
+    pub style_walk_us: u64,
+    pub style_adopt_us: u64,
+    pub style_busy_us: u64,
 }
 
 impl CascDiag {
@@ -189,6 +201,24 @@ impl CascDiag {
         )
     }
 
+    /// The parallel style computation passes: `passes/elements/participants`,
+    /// then milliseconds of pass wall time, of the page thread walking and
+    /// adopting results (both overlap computation), and of all participants'
+    /// work.
+    pub fn style_summary(&self) -> String {
+        let ms = |us: u64| us as f64 / 1000.0;
+        format!(
+            "{}/{}el/{}thr/wall:{:.2}/walk:{:.2}/adopt:{:.2}/busy:{:.2}ms",
+            self.style_passes,
+            self.style_elements,
+            self.style_threads,
+            ms(self.style_wall_us),
+            ms(self.style_walk_us),
+            ms(self.style_adopt_us),
+            ms(self.style_busy_us),
+        )
+    }
+
     const ZERO: Self = CascDiag {
         style_index_us: 0,
         style_index_builds: 0,
@@ -207,6 +237,13 @@ impl CascDiag {
         parallel_collect_us: 0,
         parallel_merge_us: 0,
         parallel_busy_us: 0,
+        style_passes: 0,
+        style_elements: 0,
+        style_threads: 0,
+        style_wall_us: 0,
+        style_walk_us: 0,
+        style_adopt_us: 0,
+        style_busy_us: 0,
     };
 }
 
@@ -361,6 +398,8 @@ pub struct Dom {
     selector_epoch: u64,
     /// When to fill `selector_cache` with a parallel pass.
     parallel_match: parallel_match::Trigger,
+    /// When to compute stale styles with a parallel pass.
+    parallel_style: parallel_style::Trigger,
     /// Long class lists parsed once per attribute value, not once per restyle.
     /// Explicit class-attribute invalidation owns freshness (stamp is zero).
     class_cache: RefCell<NodeCache<class_tokens::ClassTokens>>,
@@ -625,6 +664,20 @@ struct CascadedMaps {
 }
 
 impl CascadedMaps {
+    /// Equal winners for every box, and equal custom-property bases.
+    fn same_declarations(&self, other: &Self) -> bool {
+        self.elem == other.elem
+            && self.before == other.before
+            && self.after == other.after
+            && self.first_letter == other.first_letter
+            && self.marker == other.marker
+            && self.custom_bases.len() == other.custom_bases.len()
+            && self
+                .custom_bases
+                .iter()
+                .all(|(key, base)| other.custom_bases.get(key) == Some(base))
+    }
+
     fn pseudo(&self, which: PseudoEl) -> &FxHashMap<String, String> {
         match which {
             PseudoEl::Before => &self.before,
@@ -748,6 +801,7 @@ impl Dom {
             selector_cache,
             selector_epoch,
             parallel_match: _, // Counters only; no owned allocation.
+            parallel_style: _, // Counters only; no owned allocation.
             class_cache,
             child_lists,
             cascaded_cache,
@@ -1242,6 +1296,7 @@ impl Dom {
             selector_cache: RefCell::new(NodeCache::default()),
             selector_epoch: 0,
             parallel_match: Default::default(),
+            parallel_style: Default::default(),
             class_cache: RefCell::new(NodeCache::default()),
             child_lists: RefCell::new(child_collections::State::default()),
             cascaded_cache: RefCell::new(NodeCache::default()),

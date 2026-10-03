@@ -44,7 +44,7 @@ impl Animated {
     }
 }
 
-const PROPERTIES: [&str; 20] = [
+pub(super) const PROPERTIES: [&str; 20] = [
     "width",
     "height",
     "min-width",
@@ -451,6 +451,10 @@ impl State {
     pub(super) fn invalidate_all(&self) {
         self.all_invalid.set(true);
         self.invalid.borrow_mut().clear();
+    }
+    /// No transition is running or holds a transition-origin value.
+    pub(super) fn idle(&self) -> bool {
+        self.running.is_empty() && self.values.is_empty()
     }
     pub(super) fn affects_computation(&self, name: &str) -> bool {
         !self.values.is_empty() && PROPERTIES.contains(&name)
