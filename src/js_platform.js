@@ -20016,6 +20016,613 @@
         }
     })();
     /*__FEATURES_END__*/
+    // --- Window-only capability APIs ---------------------------------------
+    // Credential Management, Clipboard, Media Capture and Web Speech Synthesis.
+    // Each reports what TRust can actually provide: no credential types, no
+    // capture devices or display sources, no speech voices, and clipboard
+    // writes only through the frontend's real system-clipboard plumbing.
+    (function () {
+        "use strict";
+        const apply = Reflect.apply, construct = Reflect.construct;
+        const define = Object.defineProperty, freeze = Object.freeze, create = Object.create;
+        const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+        const PromiseCtor = Promise, promiseReject = Promise.reject, promiseResolve = Promise.resolve;
+        const promiseThen = Promise.prototype.then;
+        const TypeErrorCtor = TypeError, iteratorSymbol = Symbol.iterator;
+        const arrayPush = Array.prototype.push, arrayIncludes = Array.prototype.includes;
+        const fround = Math.fround, isFinite = Number.isFinite, NumberCtor = Number;
+        const BlobCtor = g.Blob, TextEncoderCtor = g.TextEncoder, TextDecoderCtor = g.TextDecoder;
+        const navigatorSlots = __navigator_binding(new WeakMap());
+        const NavigatorPrototype = Object.getPrototypeOf(g.navigator);
+        const slots = internalSlots;
+        const read = object => slots.get(object);
+        function brand(object, kind, name) {
+            const state = read(object);
+            if (!state || state.kind !== kind) throw new TypeErrorCtor("Illegal " + name + " invocation");
+            return state;
+        }
+        function named(fn, name) { define(fn, "name", {value: name, configurable: true}); return fn; }
+        function rejected(error) { return apply(promiseReject, PromiseCtor, [error]); }
+        function exception(message, name) { return new DOMException(message, name); }
+        function fullyActive() { return __permissions_binding("active", storageContextId); }
+        function dictionary(value, name) {
+            if (value !== undefined && value !== null && typeof value !== "object" && typeof value !== "function")
+                throw new TypeErrorCtor(name + " must be a dictionary");
+            return value === undefined || value === null ? null : value;
+        }
+        function enumeration(value, values, name) {
+            const text = `${value}`;
+            if (!apply(arrayIncludes, values, [text])) throw new TypeErrorCtor("Invalid " + name + " value");
+            return text;
+        }
+        function sequence(value, convert) {
+            if (value === null || (typeof value !== "object" && typeof value !== "function"))
+                throw new TypeErrorCtor("Expected a sequence");
+            const method = value[iteratorSymbol];
+            if (typeof method !== "function") throw new TypeErrorCtor("Expected an iterable sequence");
+            const iterator = apply(method, value, []), next = iterator.next, result = [];
+            for (;;) {
+                const step = apply(next, iterator, []);
+                if (step === null || (typeof step !== "object" && typeof step !== "function"))
+                    throw new TypeErrorCtor("Iterator result is not an object");
+                if (step.done) return result;
+                apply(arrayPush, result, [convert(step.value)]);
+            }
+        }
+        function abortSignal(value) {
+            if (!(value instanceof AbortSignal)) throw new TypeErrorCtor("Expected an AbortSignal");
+            return value;
+        }
+        // HTML #event-handler-attributes, keeping a replaced handler's position.
+        function eventHandlers(prototype, kind, name, types) {
+            for (const type of types) {
+                define(prototype, "on" + type, {configurable: true, enumerable: true,
+                    get: named({get() {
+                        const handler = brand(this, kind, name).handlers[type];
+                        return handler ? handler.value : null;
+                    }}.get, "get on" + type),
+                    set: named({set(value) {
+                        const handlers = brand(this, kind, name).handlers;
+                        value = typeof value === "function" || (value !== null && typeof value === "object") ? value : null;
+                        let handler = handlers[type];
+                        if (value === null) {
+                            if (handler) removeL(this, type, handler.listener, false);
+                            delete handlers[type];
+                        } else if (handler) handler.value = value;
+                        else {
+                            const target = this;
+                            handler = handlers[type] = {value, listener(event) {
+                                const callback = handler.value;
+                                if (typeof callback === "function" && apply(callback, target, [event]) === false)
+                                    event.preventDefault();
+                            }};
+                            addL(this, type, handler.listener, false);
+                        }
+                    }}.set, "set on" + type)});
+            }
+        }
+        // Web IDL #js-interfaces: members are enumerable, interface objects
+        // are non-enumerable global properties.
+        function finishInterface(constructor, name, exposed) {
+            for (const target of [constructor, constructor.prototype]) {
+                for (const key of Reflect.ownKeys(target)) {
+                    if (typeof key === "symbol" || key === "constructor" || key === "prototype" ||
+                        key === "length" || key === "name") continue;
+                    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+                    if (!descriptor.configurable) continue;
+                    descriptor.enumerable = true;
+                    define(target, key, descriptor);
+                }
+            }
+            define(constructor.prototype, Symbol.toStringTag, {value: name, configurable: true});
+            if (exposed) define(g, name, {value: constructor, writable: true, configurable: true});
+        }
+        function navigatorAttribute(name, value) {
+            internalsFor(g.navigator)[name] = value;
+            define(NavigatorPrototype, name, {configurable: true, enumerable: true,
+                get: named({get() {
+                    const own = apply(weakGet, navigatorSlots, [this]) && read(this);
+                    if (!own || !own[name]) throw new TypeErrorCtor("Illegal Navigator invocation");
+                    return own[name];
+                }}.get, "get " + name)});
+        }
+        // HTML #consume-user-activation for this Window: transient activation
+        // ends while sticky activation (hasBeenActive) remains.
+        function consumeUserActivation() {
+            if (topWindowState.lastActivation !== Infinity) topWindowState.lastActivation = -Infinity;
+        }
+        function platformInstance(Base, Interface, state) {
+            const object = construct(Base, [], Interface);
+            slots.set(object, state);
+            return object;
+        }
+
+        // --- Credential Management Level 1 (local w3c/webappsec-credential-management@0a74859) ---
+        // TRust registers no credential type: no password, federated, public
+        // key, identity or OTP credentials, and no credential store. Requests
+        // therefore have no relevant credential interface objects.
+        const MEDIATION = freeze(["silent", "optional", "conditional", "required"]);
+        class Credential {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get id() { brand(this, "credential", "Credential"); return ""; }
+            get type() { brand(this, "credential", "Credential"); return ""; }
+            // #dom-credential-isconditionalmediationavailable (default steps).
+            static isConditionalMediationAvailable() { return apply(promiseResolve, PromiseCtor, [false]); }
+        }
+        function credentialOptions(value, request) {
+            const options = dictionary(value, request ? "CredentialRequestOptions" : "CredentialCreationOptions");
+            const mediation = options === null ? undefined : options.mediation;
+            if (mediation !== undefined) enumeration(mediation, MEDIATION, "CredentialMediationRequirement");
+            const signal = options === null ? undefined : options.signal;
+            const converted = {signal: signal === undefined ? null : abortSignal(signal)};
+            if (request) {
+                const uiMode = options === null ? undefined : options.uiMode;
+                if (uiMode !== undefined) `${uiMode}`;
+            }
+            return converted;
+        }
+        class CredentialsContainer {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get(options = undefined) {
+                // #algorithm-request
+                try {
+                    brand(this, "credentials-container", "CredentialsContainer");
+                    const converted = credentialOptions(options, true);
+                    if (!fullyActive()) throw exception("Document is not fully active", "InvalidStateError");
+                    if (converted.signal && converted.signal.aborted) return rejected(converted.signal.reason);
+                    // |interfaces| is empty: no credential type is supported.
+                    throw exception("No supported credential type was requested", "NotSupportedError");
+                } catch (error) { return rejected(error); }
+            }
+            store(credential) {
+                // Web IDL rejects a value that is not a Credential platform
+                // object; TRust creates no Credential objects.
+                try {
+                    brand(this, "credentials-container", "CredentialsContainer");
+                    if (arguments.length < 1) throw new TypeErrorCtor("store requires a Credential");
+                    brand(credential, "credential", "Credential");
+                    throw exception("Credential type is not supported", "NotSupportedError");
+                } catch (error) { return rejected(error); }
+            }
+            create(options = undefined) {
+                // #algorithm-create
+                try {
+                    brand(this, "credentials-container", "CredentialsContainer");
+                    const converted = credentialOptions(options, false);
+                    if (!fullyActive()) throw exception("Document is not fully active", "InvalidStateError");
+                    // No relevant credential interface object can create a credential.
+                    throw exception("No supported credential type was requested", "NotSupportedError");
+                } catch (error) { return rejected(error); }
+            }
+            preventSilentAccess() {
+                // #abstract-opdef-prevent-silent-access. Without a credential
+                // store nothing can be handed over silently; the flag holds.
+                try {
+                    brand(this, "credentials-container", "CredentialsContainer");
+                    if (!fullyActive()) throw exception("Document is not fully active", "InvalidStateError");
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor(resolve => __queue_dom_task(() => resolve(undefined)));
+            }
+        }
+        finishInterface(Credential, "Credential", secureContext);
+        finishInterface(CredentialsContainer, "CredentialsContainer", secureContext);
+        if (secureContext) {
+            const credentials = create(CredentialsContainer.prototype);
+            slots.set(credentials, {kind: "credentials-container"});
+            navigatorAttribute("credentials", credentials);
+        }
+
+        // --- Clipboard API and events (local w3c/clipboard-apis@6201fd1) ------
+        // #async-clipboard-api. Reading needs interaction with a user-agent
+        // "Paste" control, which TRust does not have, so read() and readText()
+        // are never permitted. With transient activation, a write requests the
+        // "clipboard-write" permission, which TRust grants on behalf of that
+        // user interaction when its frontend has a system clipboard.
+        const PRESENTATION_STYLES = freeze(["unspecified", "inline", "attachment"]);
+        const MANDATORY_DATA_TYPES = freeze(["text/plain", "text/html", "image/png"]);
+        // WHATWG MIME Sniffing #parse-a-mime-type and #serialize-a-mime-type
+        // (the shared parser used by XMLHttpRequest), or null on failure.
+        function clipboardMimeType(input) {
+            const mime = parseMimeType(`${input}`);
+            return mime ? serializeMimeType(mime) : null;
+        }
+        function mimeEssence(serialized) { return serialized.split(";")[0]; }
+        function supportedClipboardType(type) {
+            // #dom-clipboarditem-supports: mandatory or optional data types.
+            return apply(arrayIncludes, MANDATORY_DATA_TYPES, [type]);
+        }
+        class ClipboardItem {
+            constructor(items, options = undefined) {
+                // Web IDL record<DOMString, ClipboardItemData> conversion.
+                if (arguments.length < 1) throw new TypeErrorCtor("ClipboardItem requires items");
+                if (items === null || (typeof items !== "object" && typeof items !== "function"))
+                    throw new TypeErrorCtor("ClipboardItem items must be a record");
+                const entries = [];
+                for (const key of Reflect.ownKeys(items)) {
+                    if (typeof key === "symbol") continue;
+                    const descriptor = Reflect.getOwnPropertyDescriptor(items, key);
+                    if (!descriptor || !descriptor.enumerable) continue;
+                    // ClipboardItemData is Promise<(DOMString or Blob)>.
+                    entries.push([key, apply(promiseResolve, PromiseCtor, [items[key]])]);
+                }
+                const dict = dictionary(options, "ClipboardItemOptions");
+                const style = dict === null ? undefined : dict.presentationStyle;
+                const presentationStyle = style === undefined ? "unspecified"
+                    : enumeration(style, PRESENTATION_STYLES, "PresentationStyle");
+                // #dom-clipboarditem-clipboarditem
+                if (!entries.length) throw new TypeErrorCtor("ClipboardItem requires at least one representation");
+                const representations = [], types = [];
+                for (let [key, data] of entries) {
+                    let isCustom = false;
+                    if (key.startsWith("web ")) { key = key.slice(4); isCustom = true; }
+                    const mimeType = clipboardMimeType(key);
+                    if (mimeType === null) throw new TypeErrorCtor("Invalid clipboard MIME type");
+                    for (const existing of representations)
+                        if (existing.mimeType === mimeType && existing.isCustom === isCustom)
+                            throw new TypeErrorCtor("Duplicate clipboard representation");
+                    representations.push({mimeType, isCustom, data});
+                    types.push((isCustom ? "web " : "") + mimeType);
+                }
+                slots.set(this, {kind: "clipboard-item", presentationStyle, representations, types: freeze(types)});
+            }
+            get presentationStyle() { return brand(this, "clipboard-item", "ClipboardItem").presentationStyle; }
+            get types() { return brand(this, "clipboard-item", "ClipboardItem").types; }
+            getType(type) {
+                // #dom-clipboarditem-gettype
+                try {
+                    const state = brand(this, "clipboard-item", "ClipboardItem");
+                    if (arguments.length < 1) throw new TypeErrorCtor("getType requires a type");
+                    type = `${type}`;
+                    let isCustom = false;
+                    if (type.startsWith("web ")) { type = type.slice(4); isCustom = true; }
+                    const mimeType = clipboardMimeType(type);
+                    if (mimeType === null) throw new TypeErrorCtor("Invalid clipboard MIME type");
+                    for (const representation of state.representations) {
+                        if (representation.mimeType !== mimeType || representation.isCustom !== isCustom) continue;
+                        return new PromiseCtor((resolve, reject) => apply(promiseThen, representation.data, [value => {
+                            if (value instanceof BlobCtor) resolve(value);
+                            else resolve(new BlobCtor([new TextEncoderCtor().encode(`${value}`)], {type: mimeType}));
+                        }, () => reject(exception("Clipboard data is unavailable", "NotFoundError"))]));
+                    }
+                    throw exception("The clipboard item has no such type", "NotFoundError");
+                } catch (error) { return rejected(error); }
+            }
+            static supports(type) {
+                if (arguments.length < 1) throw new TypeErrorCtor("supports requires a type");
+                return supportedClipboardType(`${type}`);
+            }
+        }
+        // #check-clipboard-write-permission without a "clipboard-write"
+        // grant that survives the gesture: transient activation is required.
+        function clipboardWriteAllowed() { return hasTransientActivation(); }
+        function clipboardDenied(reject) {
+            __queue_dom_task(() => reject(exception("Clipboard access is not allowed", "NotAllowedError")));
+        }
+        // Write blobs and option to the clipboard through the frontend. Only
+        // text representations reach TRust's system clipboard plumbing.
+        function writeClipboardText(text, resolve, reject) {
+            __clipboard_write(text, ok => __queue_dom_task(() => {
+                if (ok) resolve(undefined);
+                else reject(exception("The system clipboard is unavailable", "NotAllowedError"));
+            }));
+        }
+        function blobText(blob) {
+            return new TextDecoderCtor().decode(__latin1ToBytes(__blobBytes(blob)));
+        }
+        class Clipboard extends EventTarget {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            read(formats = undefined) {
+                try {
+                    brand(this, "clipboard", "Clipboard");
+                    const dict = dictionary(formats, "ClipboardUnsanitizedFormats");
+                    const unsanitized = dict === null ? undefined : dict.unsanitized;
+                    if (unsanitized !== undefined) {
+                        // #dom-clipboard-read step 3: only text/html may be unsanitized.
+                        for (const format of sequence(unsanitized, value => `${value}`))
+                            if (format !== "text/html") throw exception("Format cannot be read unsanitized", "NotAllowedError");
+                    }
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => clipboardDenied(reject));
+            }
+            readText() {
+                try { brand(this, "clipboard", "Clipboard"); } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => clipboardDenied(reject));
+            }
+            write(data) {
+                let items;
+                try {
+                    brand(this, "clipboard", "Clipboard");
+                    if (arguments.length < 1) throw new TypeErrorCtor("write requires ClipboardItems");
+                    items = sequence(data, item => brand(item, "clipboard-item", "ClipboardItem"));
+                } catch (error) { return rejected(error); }
+                const allowed = clipboardWriteAllowed();
+                return new PromiseCtor((resolve, reject) => {
+                    if (!allowed) return clipboardDenied(reject);
+                    __queue_dom_task(() => {
+                        // #dom-clipboard-write: one native clipboard item, the first.
+                        const item = items[0];
+                        if (!item) { resolve(undefined); return; }
+                        const pending = item.representations.map(representation =>
+                            new PromiseCtor((settle, fail) => apply(promiseThen, representation.data, [value => {
+                                settle(value instanceof BlobCtor ? value
+                                    : new BlobCtor([new TextEncoderCtor().encode(`${value}`)], {type: representation.mimeType}));
+                            }, fail])));
+                        apply(promiseThen, PromiseCtor.all(pending), [blobs => {
+                            let text = null;
+                            for (const blob of blobs) {
+                                const type = clipboardMimeType(blob.type);
+                                if (type === null || !supportedClipboardType(mimeEssence(type)))
+                                    return reject(exception("Clipboard type is not allowed", "NotAllowedError"));
+                                if (mimeEssence(type) === "text/plain") text = blobText(blob);
+                            }
+                            // TRust's frontends place text on the system
+                            // clipboard; other types cannot be written.
+                            if (text === null) return reject(exception("Clipboard type cannot be written", "NotAllowedError"));
+                            writeClipboardText(text, resolve, reject);
+                        }, () => reject(exception("Clipboard data is unavailable", "NotAllowedError"))]);
+                    });
+                });
+            }
+            writeText(data) {
+                try {
+                    brand(this, "clipboard", "Clipboard");
+                    if (arguments.length < 1) throw new TypeErrorCtor("writeText requires data");
+                    data = `${data}`;
+                } catch (error) { return rejected(error); }
+                const allowed = clipboardWriteAllowed();
+                return new PromiseCtor((resolve, reject) => {
+                    if (!allowed) return clipboardDenied(reject);
+                    __queue_dom_task(() => writeClipboardText(data, resolve, reject));
+                });
+            }
+        }
+        finishInterface(ClipboardItem, "ClipboardItem", secureContext);
+        finishInterface(Clipboard, "Clipboard", secureContext);
+        if (secureContext) {
+            navigatorAttribute("clipboard", platformInstance(EventTarget, Clipboard, {kind: "clipboard"}));
+        }
+
+        // --- Media Capture and Streams (local w3c/mediacapture-main@e0bde22) and
+        // Screen Capture (local w3c/mediacapture-screen-share@6c933dd) ----------
+        // TRust has no camera, microphone or display-capture source: the stored
+        // device list is empty, every request reaches NotFound Failure, and no
+        // constrainable property is supported.
+        function mediaConstraint(value) {
+            // (boolean or MediaTrackConstraints): undefined/null and objects
+            // convert to the dictionary; other values to boolean.
+            if (value === undefined || value === null) return {};
+            if (typeof value === "object" || typeof value === "function") {
+                const advanced = value.advanced;
+                if (advanced !== undefined) sequence(advanced, set => dictionary(set, "MediaTrackConstraintSet"));
+                return value;
+            }
+            return !!value;
+        }
+        function mediaRequest(value, videoDefault) {
+            const options = dictionary(value, "MediaStreamConstraints");
+            const audio = options === null ? undefined : options.audio;
+            const video = options === null ? undefined : options.video;
+            return {
+                audio: audio === undefined ? false : mediaConstraint(audio),
+                video: video === undefined ? videoDefault : mediaConstraint(video),
+            };
+        }
+        const requested = value => value === true || (value !== null && typeof value === "object");
+        class MediaDevices extends EventTarget {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            enumerateDevices() {
+                try { brand(this, "media-devices", "MediaDevices"); } catch (error) { return rejected(error); }
+                // #dom-mediadevices-enumeratedevices with an empty [[storedDeviceList]].
+                return new PromiseCtor(resolve => __queue_dom_task(() => resolve([])));
+            }
+            getSupportedConstraints() {
+                brand(this, "media-devices", "MediaDevices");
+                return {};
+            }
+            getUserMedia(constraints = undefined) {
+                // #dom-mediadevices-getusermedia
+                let request;
+                try {
+                    brand(this, "media-devices", "MediaDevices");
+                    request = mediaRequest(constraints, false);
+                    if (!requested(request.audio) && !requested(request.video))
+                        throw new TypeErrorCtor("At least one of audio and video must be requested");
+                    if (!fullyActive()) throw exception("Document is not fully active", "InvalidStateError");
+                } catch (error) { return rejected(error); }
+                // Each requested kind has an empty candidate set: NotFound
+                // Failure, as getUserMedia specific failure is allowed while
+                // "camera"/"microphone" are not denied.
+                return new PromiseCtor((resolve, reject) => __queue_dom_task(() =>
+                    reject(exception("Requested device not found", "NotFoundError"))));
+            }
+            getDisplayMedia(options = undefined) {
+                // Screen Capture #dom-mediadevices-getdisplaymedia
+                let request;
+                try {
+                    brand(this, "media-devices", "MediaDevices");
+                    request = mediaRequest(options, true);
+                    if (!hasTransientActivation())
+                        throw exception("getDisplayMedia requires transient activation", "InvalidStateError");
+                    if (request.video === false) throw new TypeErrorCtor("Display capture requires video");
+                    for (const value of [request.audio, request.video]) {
+                        if (value === null || typeof value !== "object") continue;
+                        if (value.advanced !== undefined) throw new TypeErrorCtor("advanced constraints are not allowed");
+                    }
+                    if (!fullyActive() || !g.document.hasFocus())
+                        throw exception("Document is not fully active and focused", "InvalidStateError");
+                    consumeUserActivation();
+                } catch (error) { return rejected(error); }
+                return new PromiseCtor((resolve, reject) => __queue_dom_task(() =>
+                    reject(exception("No display surface is available", "NotFoundError"))));
+            }
+        }
+        eventHandlers(MediaDevices.prototype, "media-devices", "MediaDevices", ["devicechange"]);
+        finishInterface(MediaDevices, "MediaDevices", secureContext);
+        if (secureContext) {
+            navigatorAttribute("mediaDevices", platformInstance(EventTarget, MediaDevices,
+                {kind: "media-devices", handlers: create(null)}));
+        }
+
+        // --- Web Speech API, speech synthesis (local WebAudio/web-speech-api@bcdfb7f) ---
+        // TRust has no speech synthesis engine and no voices. The queue model
+        // is kept: an utterance that reaches the front of an unpaused queue
+        // cannot begin and fails with "synthesis-unavailable"; cancel() fails
+        // queued utterances with "canceled". Nothing is ever speaking.
+        const SPEECH_ERRORS = freeze(["canceled", "interrupted", "audio-busy", "audio-hardware", "network",
+            "synthesis-unavailable", "synthesis-failed", "language-unavailable", "voice-unavailable",
+            "text-too-long", "invalid-argument", "not-allowed"]);
+        function restrictedFloat(value, name) {
+            const number = fround(NumberCtor(value));
+            if (!isFinite(number)) throw new TypeErrorCtor(name + " must be a finite number");
+            return number;
+        }
+        class SpeechSynthesisUtterance extends EventTarget {
+            constructor(text = undefined) {
+                text = text === undefined ? "" : `${text}`;
+                super();
+                slots.set(this, {kind: "speech-utterance", handlers: create(null), text, lang: "", voice: null,
+                    volume: 1, rate: 1, pitch: 1, owner: null});
+            }
+            get text() { return brand(this, "speech-utterance", "SpeechSynthesisUtterance").text; }
+            set text(value) { brand(this, "speech-utterance", "SpeechSynthesisUtterance").text = `${value}`; }
+            get lang() { return brand(this, "speech-utterance", "SpeechSynthesisUtterance").lang; }
+            set lang(value) { brand(this, "speech-utterance", "SpeechSynthesisUtterance").lang = `${value}`; }
+            get voice() { return brand(this, "speech-utterance", "SpeechSynthesisUtterance").voice; }
+            set voice(value) {
+                const state = brand(this, "speech-utterance", "SpeechSynthesisUtterance");
+                // SpeechSynthesisVoice?: getVoices() returns no voice objects.
+                if (value !== null && value !== undefined) brand(value, "speech-voice", "SpeechSynthesisVoice");
+                state.voice = value === undefined ? null : value;
+            }
+        }
+        for (const name of ["volume", "rate", "pitch"]) {
+            define(SpeechSynthesisUtterance.prototype, name, {configurable: true, enumerable: true,
+                get: named({get() { return brand(this, "speech-utterance", "SpeechSynthesisUtterance")[name]; }}.get, "get " + name),
+                set: named({set(value) {
+                    const state = brand(this, "speech-utterance", "SpeechSynthesisUtterance");
+                    state[name] = restrictedFloat(value, name);
+                }}.set, "set " + name)});
+        }
+        eventHandlers(SpeechSynthesisUtterance.prototype, "speech-utterance", "SpeechSynthesisUtterance",
+            ["start", "end", "error", "pause", "resume", "mark", "boundary"]);
+        class SpeechSynthesisVoice {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+        }
+        for (const name of ["voiceURI", "name", "lang", "localService", "default"]) {
+            define(SpeechSynthesisVoice.prototype, name, {configurable: true, enumerable: true,
+                get: named({get() { return brand(this, "speech-voice", "SpeechSynthesisVoice")[name]; }}.get, "get " + name)});
+        }
+        const speechEvents = new WeakMap();
+        function speechEventState(event, name) {
+            const state = apply(weakGet, speechEvents, [event]);
+            if (!state || (name === "SpeechSynthesisErrorEvent" && !state.error))
+                throw new TypeErrorCtor("Illegal " + name + " invocation");
+            return state;
+        }
+        // SpeechSynthesisEventInit (and its error subclass), converted in Web
+        // IDL order: inherited EventInit members, then own members.
+        function speechEventInit(type, init, error) {
+            if (init === undefined || init === null || (typeof init !== "object" && typeof init !== "function"))
+                throw new TypeErrorCtor("SpeechSynthesisEventInit requires an utterance");
+            const base = {bubbles: !!init.bubbles, cancelable: !!init.cancelable, composed: !!init.composed};
+            const state = {};
+            const charIndex = init.charIndex;
+            state.charIndex = charIndex === undefined ? 0 : NumberCtor(charIndex) >>> 0;
+            const charLength = init.charLength;
+            state.charLength = charLength === undefined ? 0 : NumberCtor(charLength) >>> 0;
+            const elapsedTime = init.elapsedTime;
+            state.elapsedTime = elapsedTime === undefined ? 0 : restrictedFloat(elapsedTime, "elapsedTime");
+            const name = init.name;
+            state.name = name === undefined ? "" : `${name}`;
+            const utterance = init.utterance;
+            if (utterance === undefined) throw new TypeErrorCtor("SpeechSynthesisEventInit.utterance is required");
+            brand(utterance, "speech-utterance", "SpeechSynthesisUtterance");
+            state.utterance = utterance;
+            if (error) {
+                const code = init.error;
+                if (code === undefined) throw new TypeErrorCtor("SpeechSynthesisErrorEventInit.error is required");
+                state.error = enumeration(code, SPEECH_ERRORS, "SpeechSynthesisErrorCode");
+            }
+            return {base, state, type: `${type}`};
+        }
+        class SpeechSynthesisEvent extends Event {
+            constructor(type, init) {
+                if (arguments.length < 2) throw new TypeErrorCtor("SpeechSynthesisEvent requires type and init");
+                const converted = speechEventInit(type, init, new.target === SpeechSynthesisErrorEvent ||
+                    Object.prototype.isPrototypeOf.call(SpeechSynthesisErrorEvent.prototype, new.target.prototype));
+                super(converted.type, converted.base);
+                apply(weakSet, speechEvents, [this, converted.state]);
+            }
+        }
+        for (const name of ["utterance", "charIndex", "charLength", "elapsedTime", "name"]) {
+            define(SpeechSynthesisEvent.prototype, name, {configurable: true, enumerable: true,
+                get: named({get() { return speechEventState(this, "SpeechSynthesisEvent")[name]; }}.get, "get " + name)});
+        }
+        class SpeechSynthesisErrorEvent extends SpeechSynthesisEvent {
+            constructor(type, init) {
+                if (arguments.length < 2) throw new TypeErrorCtor("SpeechSynthesisErrorEvent requires type and init");
+                super(type, init);
+            }
+            get error() { return speechEventState(this, "SpeechSynthesisErrorEvent").error; }
+        }
+        function fireSpeechError(utterance, code) {
+            dispatch(utterance, createTrustedEvent(SpeechSynthesisErrorEvent, "error", {utterance, error: code}), false);
+        }
+        class SpeechSynthesis extends EventTarget {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+            get pending() { return brand(this, "speech-synthesis", "SpeechSynthesis").queue.length > 0; }
+            get speaking() { brand(this, "speech-synthesis", "SpeechSynthesis"); return false; }
+            get paused() { return brand(this, "speech-synthesis", "SpeechSynthesis").paused; }
+            speak(utterance) {
+                const state = brand(this, "speech-synthesis", "SpeechSynthesis");
+                if (arguments.length < 1) throw new TypeErrorCtor("speak requires an utterance");
+                const owned = brand(utterance, "speech-utterance", "SpeechSynthesisUtterance");
+                // The SpeechSynthesis object takes exclusive ownership.
+                if (owned.owner !== null && owned.owner !== this)
+                    throw exception("The utterance belongs to another SpeechSynthesis", "InvalidStateError");
+                owned.owner = this;
+                state.queue.push(utterance);
+                processSpeechQueue(state);
+            }
+            cancel() {
+                const state = brand(this, "speech-synthesis", "SpeechSynthesis");
+                const removed = state.queue.splice(0);
+                for (const utterance of removed) __queue_dom_task(() => fireSpeechError(utterance, "canceled"));
+            }
+            pause() { brand(this, "speech-synthesis", "SpeechSynthesis").paused = true; }
+            resume() {
+                const state = brand(this, "speech-synthesis", "SpeechSynthesis");
+                state.paused = false;
+                processSpeechQueue(state);
+            }
+            getVoices() { brand(this, "speech-synthesis", "SpeechSynthesis"); return []; }
+        }
+        // The front utterance would begin now; without a synthesis engine it
+        // fails, leaves the queue, and the next one is attempted.
+        function processSpeechQueue(state) {
+            if (state.paused || !state.queue.length || state.attempting) return;
+            const utterance = state.queue[0];
+            state.attempting = true;
+            __queue_dom_task(() => {
+                state.attempting = false;
+                if (state.queue[0] !== utterance || state.paused) { processSpeechQueue(state); return; }
+                state.queue.shift();
+                fireSpeechError(utterance, "synthesis-unavailable");
+                processSpeechQueue(state);
+            });
+        }
+        eventHandlers(SpeechSynthesis.prototype, "speech-synthesis", "SpeechSynthesis", ["voiceschanged"]);
+        finishInterface(SpeechSynthesis, "SpeechSynthesis", true);
+        finishInterface(SpeechSynthesisUtterance, "SpeechSynthesisUtterance", true);
+        finishInterface(SpeechSynthesisVoice, "SpeechSynthesisVoice", true);
+        finishInterface(SpeechSynthesisEvent, "SpeechSynthesisEvent", true);
+        finishInterface(SpeechSynthesisErrorEvent, "SpeechSynthesisErrorEvent", true);
+        const speechSynthesis = platformInstance(EventTarget, SpeechSynthesis,
+            {kind: "speech-synthesis", handlers: create(null), queue: [], paused: false, attempting: false});
+        // partial interface Window { [SameObject] readonly attribute SpeechSynthesis speechSynthesis; }
+        define(g, "speechSynthesis", {configurable: true, enumerable: true,
+            get: named({get() { return speechSynthesis; }}.get, "get speechSynthesis")});
+    })();
     canvasImageConstructor = g.ImageData;
     canvasImageGetters = {};
     for (const key of ["width","height","data","colorSpace","pixelFormat"])

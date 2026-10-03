@@ -311,6 +311,12 @@ pub enum PageCmd {
         request: u64,
         error: Option<String>,
     },
+    /// The frontend's answer to `PageEvt::ClipboardWrite`: whether the text reached its system
+    /// clipboard. A frontend without one answers `false`.
+    ClipboardResult {
+        request: u64,
+        ok: bool,
+    },
     /// Unconditional native release (Escape, focus loss, or retired window).
     ReleasePointerLock,
     InputModifiers(crate::core::Modifiers),
@@ -419,6 +425,7 @@ impl PageCmd {
                 | Self::NavigateFragment { .. }
                 | Self::TraverseHistory { .. }
                 | Self::PointerLockResult { .. }
+                | Self::ClipboardResult { .. }
                 | Self::ReleasePointerLock
                 | Self::InputModifiers(_)
                 | Self::PointerMotion { .. }
@@ -519,6 +526,12 @@ pub enum PageEvt {
         request: u64,
         node: Option<usize>,
         unadjusted: bool,
+    },
+    /// Clipboard API #dom-clipboard-writetext after its permission check: place `text` on the
+    /// frontend's system clipboard and answer with `PageCmd::ClipboardResult`.
+    ClipboardWrite {
+        request: u64,
+        text: String,
     },
     Trouble(Vec<String>),
     Settled,

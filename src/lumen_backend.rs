@@ -525,6 +525,11 @@ struct HostState {
     /// Realms and the page's dedicated workers share it; TRust has no permission UI, so entries
     /// only record decisions made during this page's lifetime.
     permission_store: PermissionStore,
+    /// Clipboard API writes that passed their permission check, awaiting delivery to the
+    /// frontend, and the platform callbacks that settle each request's promise.
+    clipboard_requests: Vec<(u64, String)>,
+    clipboard_settlers: HashMap<u64, Value>,
+    next_clipboard_request: u64,
     audio_context_slots: Option<Value>,
     history_slots: Option<Value>,
     history_traversals: Vec<(u64, i32)>,
@@ -624,6 +629,9 @@ impl HostState {
             import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
             permission_store: Default::default(),
+            clipboard_requests: Vec::new(),
+            clipboard_settlers: HashMap::new(),
+            next_clipboard_request: 1,
             audio_context_slots: None,
             history_slots: None,
             history_traversals: Vec::new(),
@@ -831,6 +839,9 @@ impl RetainedMemory for HostState {
             import_maps,
             permission_slots,
             permission_store,
+            clipboard_requests,
+            clipboard_settlers,
+            next_clipboard_request: _,
             audio_context_slots,
             history_slots,
             history_traversals,
@@ -1192,6 +1203,20 @@ impl RetainedMemory for HostState {
         }
         if let Some(value) = permission_slots {
             visitor.value(value);
+        }
+        for value in clipboard_settlers.values() {
+            visitor.value(value);
+        }
+        let clipboard_bytes: usize = clipboard_requests
+            .iter()
+            .map(|(_, text)| text.capacity())
+            .sum();
+        if clipboard_bytes != 0 {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.clipboard-requests",
+                clipboard_requests.as_ptr() as usize,
+                clipboard_bytes,
+            ));
         }
         let permission_entries = permission_store
             .lock()
@@ -4242,6 +4267,15 @@ mod desktop {
                 checkpoint(page, "pointer lock result");
                 finish_task_with_ack(page, events, false)
             }
+            PageCmd::ClipboardResult { request, ok } => {
+                prepare_interaction(page, interrupt);
+                if let Err(error) = settle_clipboard_request(page.engine.ctx(), request, ok) {
+                    let message = describe_throw(&mut page.engine, error, "clipboard result");
+                    page.outcome.errors.push(message);
+                }
+                checkpoint(page, "clipboard result");
+                finish_task_with_ack(page, events, false)
+            }
             PageCmd::ReleasePointerLock => {
                 prepare_interaction(page, interrupt);
                 let _ = call_trust(
@@ -4983,6 +5017,20 @@ mod desktop {
                     node,
                     unadjusted,
                 })
+                .is_err()
+            {
+                return false;
+            }
+        }
+        let clipboard_writes = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| std::mem::take(&mut state.clipboard_requests))
+            .unwrap_or_default();
+        for (request, text) in clipboard_writes {
+            if events
+                .blocking_send(PageEvt::ClipboardWrite { request, text })
                 .is_err()
             {
                 return false;
@@ -8554,6 +8602,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__storage_key", 2, host_storage_key),
     ("__storage_len", 1, host_storage_len),
     ("__storage_manager", 2, host_storage_manager),
+    ("__clipboard_write", 2, host_clipboard_write),
     ("__blob_mirror", 3, host_blob_mirror),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
     ("__crypto_digest", 2, host_crypto_digest),
@@ -15937,6 +15986,36 @@ fn host_storage_len(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     Ok(Value::Num(len as f64))
 }
 
+/// Clipboard API #dom-clipboard-writetext / #dom-clipboard-write, after the prelude's permission
+/// check: queue `text` for the frontend's system clipboard. `settle` is called with the
+/// frontend's answer and settles the operation's promise in its own Realm.
+fn host_clipboard_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let text = host_arg_string(ctx, args, 0);
+    let settle = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if !settle.is_callable() {
+        return Err(ctx.make_error("TypeError", "clipboard writes require a settle callback"));
+    }
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
+    };
+    let request = state.next_clipboard_request;
+    state.next_clipboard_request = request.wrapping_add(1);
+    state.clipboard_requests.push((request, text));
+    state.clipboard_settlers.insert(request, settle);
+    Ok(Value::Undefined)
+}
+
+/// Deliver a frontend's answer to a clipboard write request.
+fn settle_clipboard_request(ctx: &mut Ctx, request: u64, ok: bool) -> Result<(), Value> {
+    let settle = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.clipboard_settlers.remove(&request));
+    if let Some(settle) = settle {
+        ctx.invoke(settle, Value::Undefined, &[Value::Bool(ok)])?;
+    }
+    Ok(())
+}
+
 /// Indexed Database and Cache Storage quotas enforced by the platform prelude (`__idbQuota`,
 /// `__cacheQuota`), measured in UTF-16 code units of their serialized records.
 const INDEXED_DATABASE_QUOTA: usize = 64 * 1024 * 1024;
@@ -20002,7 +20081,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 192, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 193, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -20013,7 +20092,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 192);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 193);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -28834,6 +28913,133 @@ mod tests {
         assert_eq!(
             settle_platform_result(&mut worker, "__wkr", "insecureResult"),
             "false|denied|denied|error|false|false|undefined|undefined"
+        );
+    }
+
+    #[test]
+    fn window_capabilities_report_no_credentials_devices_voices_or_clipboard_reads() {
+        // Credential Management #algorithm-request/#algorithm-create, Clipboard
+        // API #async-clipboard-api, Media Capture #dom-mediadevices-getusermedia,
+        // Screen Capture #dom-mediadevices-getdisplaymedia and Web Speech
+        // #tts-section, each without an implemented device, voice or store.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/window_capabilities.mjs"),
+                "window capabilities",
+            )
+            .unwrap();
+            assert_eq!(
+                settle_platform_result(&mut engine, "__trust", "capabilityResult"),
+                "window-capabilities-ok",
+                "{tier:?}"
+            );
+            assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
+        }
+        let mut insecure = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::new())),
+                Rc::new(RealmClock::new()),
+            ),
+            "http://example.com/",
+        );
+        assert_eq!(
+            string_value(
+                &mut insecure,
+                "['credentials','clipboard','mediaDevices'].map(key => key in navigator).join() + '|' + \
+                 [typeof Credential, typeof CredentialsContainer, typeof Clipboard, typeof ClipboardItem, \
+                  typeof MediaDevices, typeof SpeechSynthesis, typeof speechSynthesis].join()"
+            ),
+            "false,false,false|undefined,undefined,undefined,undefined,undefined,function,object"
+        );
+        let mut worker = worker_engine_with_secure_context(true);
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "[typeof Credential, typeof Clipboard, typeof MediaDevices, typeof SpeechSynthesis, \
+                  typeof speechSynthesis, 'clipboard' in navigator, 'mediaDevices' in navigator].join()"
+            ),
+            "undefined,undefined,undefined,undefined,undefined,false,false"
+        );
+    }
+
+    #[test]
+    fn clipboard_writes_need_transient_activation_and_a_frontend_clipboard() {
+        // Clipboard API #check-clipboard-write-permission: with transient
+        // activation the write reaches the frontend, whose answer settles it.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.append(html); html.append(body);
+            globalThis.clipButton = document.createElement('button'); body.append(clipButton);
+            globalThis.activate = () => {
+                __trust.pointerButton(clipButton.__id, true, 5, 6);
+                __trust.pointerButton(clipButton.__id, false, 5, 6);
+            };
+            globalThis.clipResults = [];
+            globalThis.record = promise => promise.then(() => clipResults.push('ok'),
+                error => clipResults.push(error.name));
+            activate();
+            record(navigator.clipboard.writeText('copied'));
+            record(navigator.clipboard.writeText('refused'));
+            record(navigator.clipboard.write([new ClipboardItem({'text/html': '<b>x</b>',
+                'text/plain': Promise.resolve('item text')})]));
+            record(navigator.clipboard.write([new ClipboardItem({'image/png': new Blob(['x'], {type: 'image/png'})})]));
+            "#,
+            "clipboard writes",
+        )
+        .unwrap();
+        for _ in 0..20 {
+            run_microtask_checkpoint(&mut engine);
+            if string_value(&mut engine, "__trust.hasPlatformTask()") != "true" {
+                break;
+            }
+            eval(&mut engine, "__trust.runPlatformTask()", "clipboard task").unwrap();
+        }
+        let requests = std::mem::take(
+            &mut engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .clipboard_requests,
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["copied", "refused", "item text"]
+        );
+        assert_eq!(
+            string_value(&mut engine, "clipResults.join()"),
+            "NotAllowedError"
+        );
+        for ((request, _), ok) in requests.into_iter().zip([true, false, true]) {
+            assert!(settle_clipboard_request(engine.ctx(), request, ok).is_ok());
+        }
+        for _ in 0..20 {
+            run_microtask_checkpoint(&mut engine);
+            if string_value(&mut engine, "__trust.hasPlatformTask()") != "true" {
+                break;
+            }
+            eval(&mut engine, "__trust.runPlatformTask()", "clipboard result").unwrap();
+        }
+        assert_eq!(
+            string_value(&mut engine, "clipResults.join()"),
+            "NotAllowedError,ok,NotAllowedError,ok"
+        );
+        assert!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .clipboard_settlers
+                .is_empty()
         );
     }
 
