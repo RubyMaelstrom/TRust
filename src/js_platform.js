@@ -2416,7 +2416,8 @@
                 frameUrl,
                 cfg,
                 g,
-                g.top || g,
+                // The raw top-level Window; g.top may be this Realm's cross-origin view.
+                cfg.topWindow || g,
                 frame,
                 trust.now ? trust.now() : performance.now(),
                 frameReferrers.get(frame) || "",
@@ -2434,6 +2435,9 @@
             if (child) {
                 child.origin = blobOrigin.origin;
                 child.originKey = blobOrigin.originKey;
+                // Author script has not run in the child yet: re-derive its
+                // same-origin access to its ancestors from the Blob's origin.
+                trustOf(childWindow).refreshAncestorWindows();
             }
         }
         internalsFor(frame).contentRealmWindow = childWindow;
@@ -8443,12 +8447,30 @@
     // iframe.contentWindow.document` reads them unconditionally, and srcdoc/
     // document.write content renders inline. A cross-origin nested document
     // renders but isn't script-accessible (contentDocument → null).
+    // HTML #concept-bcc-content-document: the content navigable's active
+    // Document is exposed only when its origin is same origin-domain with the
+    // current settings object. A child Window Realm's own origin (sandboxed
+    // and opaque origins included) is authoritative; before one exists, the
+    // frame URL decides.
+    function frameContentSameOrigin(frame) {
+        const child = internalsOf(frame).contentRealmWindow;
+        const state = child && windowMessageState(child), own = windowMessageState(g);
+        if (state && own) return state.originKey === own.originKey;
+        const url = internalsOf(frame).frameUrl;
+        return !url || frameSameOrigin(url, frame);
+    }
+    // This Realm's own WindowProxy facades for cross-origin child navigables.
+    // Pristine intrinsics: a raw Window of another origin must never reach a
+    // method that author code could have replaced.
+    const ownWindowFacades = new WeakSet();
+    const weakSetAdd = WeakSet.prototype.add, weakSetHas = WeakSet.prototype.has;
+    const ProxyConstructor = Proxy, createObject = Object.create;
     function installFrameSurface(Cls) {
         Object.defineProperty(Cls.prototype, "contentDocument", { configurable: true, enumerable: false,
             get() {
                 if (!this.isConnected) return null;
                 ensureFrameProcessed(this); // load src/srcdoc if a script reads us early
-                if (internalsOf(this).frameUrl && !frameSameOrigin(internalsOf(this).frameUrl, this)) return null;
+                if (!frameContentSameOrigin(this)) return null;
                 if (internalsOf(this).contentRealmWindow) return internalsOf(this).contentRealmWindow.document;
                 return frameDocument(this);
             } });
@@ -8456,8 +8478,7 @@
             get() {
                 if (!this.isConnected) return null;
                 ensureFrameProcessed(this);
-                if (internalsOf(this).contentRealmWindow &&
-                    (!internalsOf(this).frameUrl || frameSameOrigin(internalsOf(this).frameUrl, this))) {
+                if (internalsOf(this).contentRealmWindow && frameContentSameOrigin(this)) {
                     return internalsOf(this).contentRealmWindow;
                 }
                 if (!internalsOf(this).contentWin) {
@@ -8517,6 +8538,7 @@
                     // must keep the child's Document, Location, and scoped
                     // scheduling APIs active for the whole call.
                     const facade = internalsOf(this).contentWin;
+                    messageApply(weakSetAdd, ownWindowFacades, [facade]);
                     messageApply(messageWeakSet, windowMessageSlots, [facade, {
                         resolve() { return windowMessageState(internalsOf(frame).contentRealmWindow); }
                     }]);
@@ -8554,6 +8576,7 @@
                     });
                     proxy.self = proxy;
                     proxy.window = proxy;
+                    messageApply(weakSetAdd, ownWindowFacades, [proxy]);
                     messageApply(messageWeakSet, windowMessageSlots, [proxy, {
                         resolve() { return windowMessageState(internalsOf(frame).contentRealmWindow); }
                     }]);
@@ -10977,7 +11000,13 @@
     // scratch storage by the frame scheduler.
     Object.defineProperty(Window.prototype, "frameElement", {
         configurable: true, enumerable: false,
-        get() { return frameElementState; },
+        // HTML #dom-frameelement: null when the container's node document is
+        // not same origin-domain with the current settings object.
+        get() {
+            if (frameElementState && frameElementState === realmRootFrame && cfg.parentWindow &&
+                !sameOriginWindow(cfg.parentWindow)) return null;
+            return frameElementState;
+        },
     });
     class CDATASection extends Text {
         get nodeType() { return 4; }
@@ -14636,11 +14665,23 @@
             }
         },
         apiBaseURL() { return documentBaseURL(realmRootFrame); },
+        // The WindowProxy of a document-tree child navigable with this target
+        // name, as this Window's named property getter would return it.
+        namedChild(name) {
+            refreshWindowNames();
+            const frame = namedFrames.get(name);
+            return frame ? frame.contentWindow : undefined;
+        },
         documentURL() { return g.document.URL; },
         frameId: realmRootFrame ? nodeIds.get(realmRootFrame) : 0,
-        origin: inheritedMessageState ? inheritedMessageState.origin : messageOrigin,
-        originKey: inheritedMessageState ? inheritedMessageState.originKey
+        // HTML #sandboxed-origin-browsing-context-flag: without allow-same-origin
+        // a sandboxed navigable's Document has a fresh opaque origin.
+        origin: cfg.cookieOpaque ? "null"
+            : inheritedMessageState ? inheritedMessageState.origin : messageOrigin,
+        originKey: cfg.cookieOpaque ? Symbol()
+            : inheritedMessageState ? inheritedMessageState.originKey
             : messageOrigin === "null" ? Symbol() : messageOrigin,
+        postMessage: messaging[1],
         sourceFor(receiver) {
             // HTML #window-post-message-steps exposes the sender's WindowProxy
             // for sibling recipients too, preserving identity with the
@@ -14665,11 +14706,13 @@
                 catch (_) {
                     if (traceChallengeMessage) traceChallengeMessage("messageerror", wire, origin,
                         messageWindowState.origin, sourceFrameId, messageWindowState.frameId);
-                    dispatch(g, createTrustedEvent(MessageEvent, "messageerror", { origin, source }), false);
+                    dispatch(g, createTrustedEvent(MessageEvent, "messageerror",
+                        { origin, source: windowForRealm(source) }), false);
                     return;
                 }
                 const event = createTrustedEvent(MessageEvent, "message", {
-                    data: packet.data, origin, source, ports: Object.freeze(packet.ports)
+                    data: packet.data, origin, source: windowForRealm(source),
+                    ports: Object.freeze(packet.ports)
                 });
                 event.__windowTargetSet = true; event.__frameTarget = frame;
                 if (traceChallengeMessage) traceChallengeMessage("dispatch", wire, origin,
@@ -14681,6 +14724,157 @@
         }
     };
     messageApply(messageWeakSet, windowMessageSlots, [g, messageWindowState]);
+    // HTML #cross-origin-objects: another origin's Window is reachable only
+    // through its cross-origin WindowProxy surface. CrossOriginProperties are
+    // window, self, location, close, closed, focus, blur, frames, length, top,
+    // opener, parent and postMessage; CrossOriginPropertyFallback answers then,
+    // %Symbol.toStringTag%, %Symbol.hasInstance% and
+    // %Symbol.isConcatSpreadable% with undefined; anything else throws a
+    // "SecurityError" DOMException. Each Realm keeps one view per Window.
+    const crossOriginWindowNames = ["window", "self", "location", "close", "closed", "focus",
+        "blur", "frames", "length", "top", "opener", "parent", "postMessage"];
+    const crossOriginWindowNameTable = Object.create(null);
+    for (const name of crossOriginWindowNames) crossOriginWindowNameTable[name] = true;
+    function isCrossOriginWindowName(key) {
+        return typeof key === "string" && crossOriginWindowNameTable[key] === true;
+    }
+    const crossOriginViews = new WeakMap();
+    function crossOriginSecurityError() {
+        return new DOMException("Blocked access to a cross-origin object", "SecurityError");
+    }
+    // IsPlatformObjectSameOrigin with this Realm as the current settings object.
+    function sameOriginWindow(window) {
+        if (window === g) return true;
+        const other = windowMessageState(window);
+        return !!other && other.originKey === messageWindowState.originKey;
+    }
+    // What this Realm may hold for a Window global: itself when same origin,
+    // otherwise its cross-origin view. Facades and non-Windows pass through.
+    function windowForRealm(window) {
+        const state = window ? windowMessageState(window) : null;
+        if (!state || messageApply(weakSetHas, ownWindowFacades, [window])) return window;
+        // Another Realm's facade stands for its child's Window; resolve it, so
+        // this Realm never holds a forwarder into a Window of another origin.
+        const real = state.window;
+        return sameOriginWindow(real) ? real : crossOriginWindowView(real);
+    }
+    function crossOriginFallback(key) {
+        if (key === "then" || key === Symbol.toStringTag || key === Symbol.hasInstance ||
+            key === Symbol.isConcatSpreadable) return undefined;
+        throw crossOriginSecurityError();
+    }
+    function crossOriginLocationView(target) {
+        const methods = {
+            replace(url) { windowMessageState(target).window.location.replace(`${url}`); },
+        };
+        return new ProxyConstructor(createObject(null), {
+            get(_, key) {
+                if (key === "replace") return methods.replace;
+                return crossOriginFallback(key);
+            },
+            set(_, key, value) {
+                if (key !== "href") throw crossOriginSecurityError();
+                windowMessageState(target).window.location.href = `${value}`;
+                return true;
+            },
+            has(_, key) {
+                if (key === "href" || key === "replace") return true;
+                throw crossOriginSecurityError();
+            },
+            getOwnPropertyDescriptor(_, key) {
+                if (key === "replace") return { value: methods.replace, writable: false, enumerable: false, configurable: true };
+                if (key === "href") return { get: undefined, set(value) { windowMessageState(target).window.location.href = `${value}`; }, enumerable: false, configurable: true };
+                crossOriginFallback(key);
+                return undefined;
+            },
+            defineProperty() { throw crossOriginSecurityError(); },
+            deleteProperty() { throw crossOriginSecurityError(); },
+            ownKeys() { return ["href", "replace"]; },
+            getPrototypeOf() { return null; },
+            setPrototypeOf(_, prototype) { return prototype === null; },
+            isExtensible() { return true; },
+            preventExtensions() { return false; },
+        });
+    }
+    function crossOriginWindowView(target) {
+        let view = messageApply(messageWeakGet, crossOriginViews, [target]);
+        if (view) return view;
+        const state = () => windowMessageState(target);
+        const methods = {
+            close() {},
+            focus() {},
+            blur() {},
+            postMessage(message, options, transfer) {
+                return messageApply(state().postMessage, target, arguments);
+            },
+        };
+        let location;
+        function value(key) {
+            if (typeof key === "string" && !isCrossOriginWindowName(key)) {
+                // HTML #windowproxy-getownproperty: a cross-origin Window still
+                // exposes its document-tree child navigable target names.
+                const child = state().namedChild(key);
+                if (child) return windowForRealm(child);
+            }
+            switch (key) {
+                case "window": case "self": case "frames": return view;
+                case "location": return location || (location = crossOriginLocationView(target));
+                case "closed": return false;
+                case "opener": return null;
+                case "length": return target.length >>> 0;
+                case "parent": {
+                    const parent = state().parent();
+                    return parent ? windowForRealm(parent.window) : view;
+                }
+                case "top": {
+                    let current = state();
+                    for (let next = current.parent(); next; next = next.parent()) current = next;
+                    return windowForRealm(current.window);
+                }
+                case "close": case "focus": case "blur": case "postMessage": return methods[key];
+            }
+            return crossOriginFallback(key);
+        }
+        view = new ProxyConstructor(createObject(null), {
+            get(_, key) { return value(key); },
+            set(_, key, newValue) {
+                if (key !== "location") throw crossOriginSecurityError();
+                windowMessageState(target).window.location.href = `${newValue}`;
+                return true;
+            },
+            has(_, key) {
+                if (isCrossOriginWindowName(key) ||
+                    (typeof key === "string" && state().namedChild(key))) return true;
+                throw crossOriginSecurityError();
+            },
+            getOwnPropertyDescriptor(_, key) {
+                if (isCrossOriginWindowName(key) ||
+                    (typeof key === "string" && state().namedChild(key))) {
+                    return { value: value(key), writable: false, enumerable: false, configurable: true };
+                }
+                crossOriginFallback(key);
+                return undefined;
+            },
+            defineProperty() { throw crossOriginSecurityError(); },
+            deleteProperty() { throw crossOriginSecurityError(); },
+            ownKeys() {
+                const keys = [];
+                for (let i = 0; i < crossOriginWindowNames.length; i++) keys[i] = crossOriginWindowNames[i];
+                return keys;
+            },
+            getPrototypeOf() { return null; },
+            setPrototypeOf(_, prototype) { return prototype === null; },
+            isExtensible() { return true; },
+            preventExtensions() { return false; },
+        });
+        messageApply(messageWeakSet, crossOriginViews, [target, view]);
+        return view;
+    }
+    trust.refreshAncestorWindows = function () {
+        if (cfg.parentWindow) g.parent = windowForRealm(cfg.parentWindow);
+        if (cfg.topWindow) g.top = windowForRealm(cfg.topWindow);
+    };
+    trust.refreshAncestorWindows();
     // `on<event>` IDL attributes (window.onload = fn). Standard semantics:
     // the attribute is backed by an event listener, so the existing
     // dispatch loop fires it — get returns the handler, set swaps the
