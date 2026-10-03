@@ -136,7 +136,7 @@ enum UaContext {
     Ordinary,
     Link(bool),
     List(&'static str),
-    Input(bool),
+    Input(bool, Option<&'static str>),
     Summary(Option<bool>),
     Align(Option<&'static str>),
 }
@@ -147,7 +147,7 @@ impl UaContext {
             "a" | "area" => Self::Link(dom.attr(id, "href").is_some()),
             "ul" | "menu" | "dir" => Self::List(dom.ul_marker_default(id)),
             "ol" => Self::List(dom.ol_marker_default(id)),
-            "input" => Self::Input(dom.ua_input_border_box(id)),
+            "input" => Self::Input(dom.ua_input_border_box(id), dom.ua_control_color(id, tag)),
             "summary" => Self::Summary(
                 dom.is_details_summary(id)
                     .then(|| dom.attr(dom.nodes[id].parent.unwrap(), "open").is_some()),
