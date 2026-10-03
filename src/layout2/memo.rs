@@ -742,6 +742,19 @@ pub(super) mod tests {
         // A parallel page-load test must not change page fonts or document
         // SVG inputs between the warm paint and its cold reconstruction.
         let _inputs = crate::layout2::stable_global_layout_inputs();
+        assert_cold_unguarded(dom, base, viewport, forms, controls, images)
+    }
+
+    /// `assert_cold` for a caller already holding the stable-inputs guard
+    /// (a std RwLock read must not be taken twice on one thread).
+    fn assert_cold_unguarded(
+        dom: &mut Dom,
+        base: &Url,
+        viewport: Viewport,
+        forms: &[Form],
+        controls: &ControlMap,
+        images: &ImageSizes,
+    ) -> (usize, usize) {
         let warm = measure_retained_layout(dom, base, viewport, forms, controls, images);
         let hits = (warm.work.item_hits, warm.work.intrinsic_hits);
         let painted = paint_retained_layout(
@@ -1153,6 +1166,8 @@ pub(super) mod tests {
         let shape = dom.get_by_id("shape").unwrap();
         let parent = dom.node(definition).parent.unwrap();
         for step in 0..8 {
+            // The warm-up must see the same global inputs as the check.
+            let _inputs = crate::layout2::stable_global_layout_inputs();
             measure_retained_layout(&dom, &base, vp, &[], &controls, &images);
             match step {
                 0 => dom.append(header, probe),
@@ -1164,7 +1179,7 @@ pub(super) mod tests {
                 6 => dom.append(parent, definition),
                 _ => dom.append(shape, path),
             }
-            let hits = assert_cold(&mut dom, &base, vp, &[], &controls, &images);
+            let hits = assert_cold_unguarded(&mut dom, &base, vp, &[], &controls, &images);
             assert!(
                 hits.0 + hits.1 > 0,
                 "independent HTML layout expired at step {step}"
