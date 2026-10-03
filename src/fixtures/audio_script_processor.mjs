@@ -62,7 +62,8 @@ processor.channelCount = 0;
 processor.channelCountMode = 'explicit';
 throwsAudio('NotSupportedError', () => { processor.channelCount = 1; });
 throwsAudio('NotSupportedError', () => { processor.channelCountMode = 'max'; });
-throwsAudio('TypeError', () => { processor.channelCountMode = 'invalid'; });
+processor.channelCountMode = 'invalid'; // Web IDL #js-attributes ignores an invalid enumeration value.
+checkAudio(processor.channelCountMode === 'explicit', 'invalid enumeration assignment ignored');
 throwsAudio('TypeError', () => { processor.channelInterpretation = Symbol(); });
 processor.channelInterpretation = 'discrete';
 checkAudio(processor.channelInterpretation === 'discrete', 'channel interpretation setter');
