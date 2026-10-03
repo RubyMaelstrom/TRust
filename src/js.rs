@@ -709,17 +709,20 @@ pub fn spawn_page(
 /// hooks, which author script must not reach. No author script can run before this
 /// completes, so page and worker code never observe the host boundary: the global surface is
 /// the standard one, and only the platform's closures and the native host retain capabilities.
+/// The enclosed code is strict, so author callbacks cannot walk `Function.prototype.caller`
+/// or `arguments` into platform frames (ECMA-262 #sec-forbidden-extensions).
 /// Native code reaches each Realm's control object through the host-rooted `controls` slot.
 pub(crate) fn private_bootstrap(source: &str) -> String {
     let names: Vec<&str> = host_boundary_signatures().map(|(name, _)| name).collect();
     format!(
         "(function () {{\n\
+         \"use strict\";\n\
          const {{ {captures} }} = globalThis;\n\
          {source}\n\
          ;for (const name of Object.getOwnPropertyNames(globalThis))\n\
-         \x20   if (name.slice(0, 2) === \"__\") delete globalThis[name];\n\
-         delete globalThis.$262;\n\
-         delete globalThis.ShadowRealm;\n\
+         \x20   if (name.slice(0, 2) === \"__\") Reflect.deleteProperty(globalThis, name);\n\
+         Reflect.deleteProperty(globalThis, \"$262\");\n\
+         Reflect.deleteProperty(globalThis, \"ShadowRealm\");\n\
          }})();\n",
         captures = names.join(", "),
     )
