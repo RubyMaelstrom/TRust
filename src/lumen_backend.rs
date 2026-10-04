@@ -36163,6 +36163,43 @@ mod tests {
         );
     }
 
+    /// HTML §7.5.1 reuses the initial about:blank Window for the first same-origin navigation
+    /// but installs a new Document. A missing-global lookup in that Window first consults the
+    /// named properties object (Web IDL #named-properties-object), whose supported-name cache
+    /// records the Document it indexed; that cache must not keep the replaced Document alive.
+    #[test]
+    fn dom_gc_window_named_properties_release_a_replaced_initial_document() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"(() => {
+            const html=document.createElement('html'), body=document.createElement('body');
+            document.append(html); html.append(body);
+            const frame=document.createElement('iframe'); body.append(frame);
+            globalThis.initialDocumentWeak=new WeakRef(frame.contentDocument);
+            globalThis.initialWindow=frame.contentWindow;
+            // An unresolvable name reaches WindowProperties in the initial Window.
+            globalThis.missingName=frame.contentWindow.eval('typeof NoSuchGlobalForNamedAccess');
+            frame.srcdoc='<body>replacement</body>'; __trust.hydrateFrames();
+            globalThis.reusedWindow=frame.contentWindow===initialWindow;
+        })()"#,
+            "named properties across Window reuse",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        for _ in 0..3 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[missingName,reusedWindow,initialDocumentWeak.deref()===undefined].join(':')"
+            ),
+            "undefined:true:true"
+        );
+    }
+
     #[test]
     fn dom_gc_nursery_late_wrappers_for_old_nodes_and_young_detached_peers() {
         let mut engine = platform_engine();
