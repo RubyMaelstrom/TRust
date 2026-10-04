@@ -11062,9 +11062,13 @@ impl<'a> StyleView<'a> {
             }
             StatePseudo::ReadWrite => self.read_write(id, tag),
             StatePseudo::ReadOnly => !self.read_write(id, tag),
+            // HTML #selector-placeholder-shown: the control's placeholder
+            // attribute value is being presented, which requires the
+            // attribute to apply to its type (#attr-input-placeholder).
             StatePseudo::PlaceholderShown => match tag {
                 "input" => {
                     self.attr(id, "placeholder").is_some()
+                        && placeholder_input_type(&self.input_type(id))
                         && self.input_value(id).is_empty()
                         && self.input_editing_value(id).is_none()
                 }
@@ -13084,6 +13088,15 @@ fn pseudo_element_state_compound(text: &str, pseudo_tree: bool) -> Option<(bool,
         specificity += s;
     }
     Some((matches, specificity))
+}
+
+/// HTML #the-input-element's attribute table: `placeholder` applies to the
+/// Text, Search, Telephone, URL, Email, Password and Number states only.
+pub(crate) fn placeholder_input_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "text" | "search" | "tel" | "url" | "email" | "password" | "number"
+    )
 }
 
 /// Pseudo-elements defined by CSS Pseudo 4, Shadow Parts, Highlight API,
@@ -23833,6 +23846,32 @@ mod tests {
             "li::marker()",
         ] {
             assert!(!selector_parses(selector), "{selector}");
+        }
+    }
+
+    #[test]
+    fn placeholder_shown_requires_a_type_the_attribute_applies_to() {
+        // HTML #selector-placeholder-shown and #attr-input-placeholder: only
+        // the Text, Search, Telephone, URL, Email, Password and Number states
+        // (and textareas) present a placeholder.
+        let dom = Dom::parse_document(
+            "<style>:placeholder-shown { letter-spacing: 6px }</style>\
+             <input id=text placeholder=x><input id=search type=search placeholder=x>\
+             <input id=number type=number placeholder=x><input id=pw type=password placeholder=x>\
+             <input id=hidden type=hidden placeholder=x><input id=check type=checkbox placeholder=x>\
+             <input id=date type=date placeholder=x><input id=range type=range placeholder=x>\
+             <textarea id=area placeholder=x></textarea><input id=value placeholder=x value=v>",
+        );
+        let shown = |id: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "letter-spacing")
+                .as_deref()
+                == Some("6px")
+        };
+        for id in ["text", "search", "number", "pw", "area"] {
+            assert!(shown(id), "{id}");
+        }
+        for id in ["hidden", "check", "date", "range", "value"] {
+            assert!(!shown(id), "{id}");
         }
     }
 

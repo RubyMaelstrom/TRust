@@ -242,6 +242,17 @@ impl Field {
         }
         self.value = value;
     }
+    /// HTML #attr-input-placeholder and #attr-textarea-placeholder: an
+    /// editable field presents its placeholder hint, carried in `label`,
+    /// while its value is empty.
+    pub fn shows_placeholder(&self) -> bool {
+        matches!(
+            self.kind,
+            FieldKind::Text | FieldKind::Number | FieldKind::Password | FieldKind::Textarea
+        ) && self.editing_value().is_empty()
+            && !self.label.is_empty()
+    }
+
     /// Text painted by a graphical user agent inside the control.
     ///
     /// HTML leaves the exact native-control appearance to the user agent, but
