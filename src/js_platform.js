@@ -19318,73 +19318,420 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
     // ECMA-402: Intl and Number/Date locale methods are provided by Lumen.
-    const dec = (s) => { try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch { return String(s); } };
-    // The application/x-www-form-urlencoded byte serializer (URL Standard §"urlencoded
-    // serializing"): 0x20→"+", keep only `* - . _ 0-9 A-Z a-z`, percent-encode
-    // (UTF-8) everything else. NOT encodeURIComponent, which emits "%20" for space
-    // and leaves `! ' ( ) ~` unescaped — both wrong for a query string.
-    const fenc = (s) => encodeURIComponent(String(s)).replace(/[!'()~]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()).replace(/%20/g, "+");
-    function searchParamsNotify() { if (internalsFor(this).url) urlSetSearchFromParams.call(internalsFor(this).url, this.toString()); }
-    function searchParamsSetList(query) {
-        internalsFor(this).p = [];
-        for (const kv of String(query).replace(/^\?/, "").split("&")) {
-            if (!kv) continue;
-            const i = kv.indexOf("=");
-            internalsFor(this).p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
-        }
+    /*__URL_BEGIN__*/
+    // URL Standard §6 "API" (local whatwg/url@55d6699): the URL and
+    // URLSearchParams interfaces, shared verbatim by Window and Worker realms
+    // (worker_prelude() splices this block into the worker scope). Parsing and
+    // the component setters are the `url` crate's WHATWG algorithms behind
+    // __url_parse/__url_set, whose tuple is [href, protocol, host, hostname,
+    // port, pathname, search, hash, origin, username, password]. Only those
+    // host operations, __text_decode_utf8, __platform_slots and intrinsics
+    // captured here are referenced. File API's createObjectURL and
+    // revokeObjectURL are attached by each realm. A faithful implementation
+    // also matters beyond correctness: core-js feature-tests URLSearchParams
+    // and URL setters and replaces both with a polyfill when a check fails.
+    (function (g) {
+    const internalSlots = __platform_slots("internals", new WeakMap());
+    const apply = Reflect.apply, ownKeys = Reflect.ownKeys, getOwn = Reflect.getOwnPropertyDescriptor;
+    const define = Object.defineProperty, objectCreate = Object.create, getPrototypeOf = Object.getPrototypeOf;
+    const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set, arraySort = Array.prototype.sort;
+    const toWellFormed = String.prototype.toWellFormed, charCodeAt = String.prototype.charCodeAt;
+    const stringSlice = String.prototype.slice, stringIndexOf = String.prototype.indexOf;
+    const fromCharCode = String.fromCharCode, TypeErrorCtor = TypeError, Bytes = Uint8Array;
+    const iteratorSymbol = Symbol.iterator, toStringTag = Symbol.toStringTag;
+    const iteratorPrototype = getPrototypeOf(getPrototypeOf([][iteratorSymbol]()));
+    const decodeUtf8 = __text_decode_utf8, parseURL = __url_parse, setURLComponent = __url_set;
+    const paramsBrand = objectCreate(null), urlBrand = objectCreate(null), iteratorBrand = objectCreate(null);
+    function slotsOf(object) { return apply(weakGet, internalSlots, [object]); }
+    function newSlots(object) {
+        const slots = objectCreate(null);
+        apply(weakSet, internalSlots, [object, slots]);
+        return slots;
     }
-    class URLSearchParams {
-        // WHATWG: init may be a string ("?"-prefixed query), another
-        // URLSearchParams (copy its list), a sequence of [name,value] pairs, or
-        // a record object. Getting all four right matters beyond correctness:
-        // core-js feature-tests `new URLSearchParams(new URLSearchParams("a=b"))`
-        // (and URL.username, live forEach) and REPLACES our whole URL/USP with
-        // its own polyfill if any check fails — and that polyfill then misbehaves
-        // on later pages (Twitch's app threw on it). Passing the battery keeps our
-        // native, url-crate-backed implementation in play.
-        constructor(init) {
-            internalsFor(this).p = [];
-            if (init === undefined || init === null) return;
-            if (init instanceof URLSearchParams) {
-                for (const p of internalsFor(init).p) internalsFor(this).p.push([p[0], p[1]]);
-            } else if (typeof init === "string") {
-                for (const kv of init.replace(/^\?/, "").split("&")) {
-                    if (!kv) continue;
-                    const i = kv.indexOf("=");
-                    internalsFor(this).p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
+    function branded(object, brand) {
+        const slots = slotsOf(object);
+        if (slots === undefined || slots.brand !== brand) throw new TypeErrorCtor("Illegal invocation");
+        return slots;
+    }
+    function required(count, needed, operation) {
+        if (count < needed)
+            throw new TypeErrorCtor(`${operation}: ${needed} argument${needed === 1 ? "" : "s"} required, but only ${count} present`);
+    }
+    // Web IDL #es-USVString: ToString, then replace lone surrogates with U+FFFD.
+    function usv(value) { return apply(toWellFormed, `${value}`, []); }
+    function append(list, item) { list[list.length] = item; }
+    function hexValue(code) {
+        if (code >= 0x30 && code <= 0x39) return code - 0x30;
+        code |= 0x20;
+        return code >= 0x61 && code <= 0x66 ? code - 0x57 : -1;
+    }
+    function appendUtf8(bytes, string, index) {
+        // UTF-8 encode the scalar value at index of a well-formed string;
+        // returns the number of code units consumed.
+        let code = apply(charCodeAt, string, [index]), used = 1;
+        if (code >= 0xd800 && code <= 0xdbff && index + 1 < string.length) {
+            code = 0x10000 + ((code - 0xd800) << 10) + (apply(charCodeAt, string, [index + 1]) - 0xdc00);
+            used = 2;
+        }
+        if (code < 0x80) append(bytes, code);
+        else if (code < 0x800) { append(bytes, 0xc0 | (code >> 6)); append(bytes, 0x80 | (code & 63)); }
+        else if (code < 0x10000) {
+            append(bytes, 0xe0 | (code >> 12)); append(bytes, 0x80 | ((code >> 6) & 63)); append(bytes, 0x80 | (code & 63));
+        } else {
+            append(bytes, 0xf0 | (code >> 18)); append(bytes, 0x80 | ((code >> 12) & 63));
+            append(bytes, 0x80 | ((code >> 6) & 63)); append(bytes, 0x80 | (code & 63));
+        }
+        return used;
+    }
+    // #concept-urlencoded-parser steps 3.4–3.5 for one name or value: replace
+    // 0x2B (+) with 0x20, percent-decode the UTF-8 bytes, then UTF-8 decode
+    // without BOM (the host decoder replaces each maximal invalid subpart).
+    function decodeFormComponent(string) {
+        if (apply(stringIndexOf, string, ["%"]) < 0 && apply(stringIndexOf, string, ["+"]) < 0) return string;
+        const bytes = [];
+        let ascii = true;
+        for (let i = 0; i < string.length;) {
+            const code = apply(charCodeAt, string, [i]);
+            if (code === 0x2b) { append(bytes, 0x20); i++; continue; }
+            if (code === 0x25 && i + 2 < string.length) {
+                const high = hexValue(apply(charCodeAt, string, [i + 1]));
+                const low = hexValue(apply(charCodeAt, string, [i + 2]));
+                if (high >= 0 && low >= 0) {
+                    const byte = high * 16 + low;
+                    if (byte >= 0x80) ascii = false;
+                    append(bytes, byte); i += 3; continue;
                 }
-            } else if (typeof init[Symbol.iterator] === "function") {
-                for (const pair of init) {
-                    const a = Array.from(pair);
-                    internalsFor(this).p.push([String(a[0]), String(a[1])]);
-                }
-            } else if (typeof init === "object") {
-                for (const k of Object.keys(init)) internalsFor(this).p.push([String(k), String(init[k])]);
+            }
+            if (code >= 0x80) ascii = false;
+            i += appendUtf8(bytes, string, i);
+        }
+        if (ascii) {
+            let out = "";
+            for (let i = 0; i < bytes.length; i++) out += fromCharCode(bytes[i]);
+            return out;
+        }
+        return decodeUtf8(new Bytes(bytes), false, false);
+    }
+    // #concept-urlencoded-string-parser over a scalar value string. Splitting
+    // the string on "&" and "=" equals splitting its UTF-8 bytes on 0x26/0x3D.
+    function parseFormUrlencoded(input) {
+        const output = [];
+        for (let start = 0; start <= input.length;) {
+            let end = apply(stringIndexOf, input, ["&", start]);
+            if (end < 0) end = input.length;
+            if (end > start) {
+                const bytes = apply(stringSlice, input, [start, end]);
+                const equals = apply(stringIndexOf, bytes, ["="]);
+                append(output, equals < 0
+                    ? [decodeFormComponent(bytes), ""]
+                    : [decodeFormComponent(apply(stringSlice, bytes, [0, equals])),
+                        decodeFormComponent(apply(stringSlice, bytes, [equals + 1]))]);
+            }
+            start = end + 1;
+        }
+        return output;
+    }
+    // #concept-urlencoded-serializer: the application/x-www-form-urlencoded
+    // percent-encode set leaves only ASCII alphanumerics and *-._ unencoded,
+    // and U+0020 becomes "+".
+    const hexDigits = "0123456789ABCDEF";
+    function encodeFormComponent(string) {
+        let out = "";
+        for (let i = 0; i < string.length;) {
+            const code = apply(charCodeAt, string, [i]), folded = code | 0x20;
+            if ((code >= 0x30 && code <= 0x39) || (folded >= 0x61 && folded <= 0x7a) ||
+                code === 0x2a || code === 0x2d || code === 0x2e || code === 0x5f) {
+                out += fromCharCode(code); i++;
+            } else if (code === 0x20) { out += "+"; i++; }
+            else {
+                const bytes = [];
+                i += appendUtf8(bytes, string, i);
+                for (let j = 0; j < bytes.length; j++)
+                    out += "%" + hexDigits[bytes[j] >> 4] + hexDigits[bytes[j] & 15];
             }
         }
-        get(k) { const e = internalsFor(this).p.find((p) => p[0] === String(k)); return e ? e[1] : null; }
-        getAll(k) { return internalsFor(this).p.filter((p) => p[0] === String(k)).map((p) => p[1]); }
-        has(k) { return internalsFor(this).p.some((p) => p[0] === String(k)); }
-        set(k, v) { internalsFor(this).p = internalsFor(this).p.filter((p) => p[0] !== String(k)); internalsFor(this).p.push([String(k), String(v)]); searchParamsNotify.call(this); }
-        append(k, v) { internalsFor(this).p.push([String(k), String(v)]); searchParamsNotify.call(this); }
-        delete(k) { internalsFor(this).p = internalsFor(this).p.filter((p) => p[0] !== String(k)); searchParamsNotify.call(this); }
-        get size() { return internalsFor(this).p.length; }
-        sort() { internalsFor(this).p.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); searchParamsNotify.call(this); }
-        // Live binding to an owning URL (set by URL.searchParams). WHATWG makes
-        // url.searchParams the URL's "query object": mutating it reflows the
-        // URL's query. Undefined for a standalone URLSearchParams (no-op).
-        // Rebuild the list from a query string (called by the owning URL when its
-        // .search/.href is set, so the shared object stays in sync both ways).
-        // Live iteration (WebIDL maplike forEach): re-read length/index each step,
-        // so deleting/appending during the callback affects what's visited — what
-        // core-js's `r.delete("b")`-inside-forEach probe asserts ("a1c3").
-        forEach(fn, thisArg) { for (let i = 0; i < internalsFor(this).p.length; i++) { const e = internalsFor(this).p[i]; fn.call(thisArg, e[1], e[0], this); } }
-        keys() { return internalsFor(this).p.map((p) => p[0])[Symbol.iterator](); }
-        values() { return internalsFor(this).p.map((p) => p[1])[Symbol.iterator](); }
-        entries() { return internalsFor(this).p.slice()[Symbol.iterator](); }
-        [Symbol.iterator]() { return this.entries(); }
-        toString() { return internalsFor(this).p.map(([k, v]) => fenc(k) + "=" + fenc(v)).join("&"); }
+        return out;
     }
+    function serializeFormUrlencoded(list) {
+        let output = "";
+        for (let i = 0; i < list.length; i++)
+            output += (i ? "&" : "") + encodeFormComponent(list[i][0]) + "=" + encodeFormComponent(list[i][1]);
+        return output;
+    }
+    // #concept-urlsearchparams-update: an empty serialization sets the query
+    // to null (the `url` crate's search setter does so for "").
+    function updateParams(slots) {
+        const url = slots.urlObject;
+        if (url === null) return;
+        const urlSlots = slotsOf(url);
+        const parts = setURLComponent(urlSlots.url[0], "search", serializeFormUrlencoded(slots.list));
+        if (parts) urlSlots.url = parts;
+    }
+    // Web IDL #create-sequence-from-iterable with an already-fetched method.
+    function iterableToList(iterable, method, convert) {
+        const iterator = apply(method, iterable, []);
+        if (iterator === null || (typeof iterator !== "object" && typeof iterator !== "function"))
+            throw new TypeErrorCtor("Result of the Symbol.iterator method is not an object");
+        const next = iterator.next, list = [];
+        for (;;) {
+            const result = apply(next, iterator, []);
+            if (result === null || (typeof result !== "object" && typeof result !== "function"))
+                throw new TypeErrorCtor("Iterator result is not an object");
+            if (result.done) return list;
+            append(list, convert(result.value));
+        }
+    }
+    function usvSequence(value) {
+        if (value === null || (typeof value !== "object" && typeof value !== "function"))
+            throw new TypeErrorCtor("URLSearchParams: each init pair must be an iterable object");
+        const method = value[iteratorSymbol];
+        if (typeof method !== "function")
+            throw new TypeErrorCtor("URLSearchParams: each init pair must be an iterable object");
+        return iterableToList(value, method, usv);
+    }
+    class URLSearchParams {
+        // #dom-urlsearchparams-urlsearchparams with Web IDL's union conversion
+        // for (sequence<sequence<USVString>> or record<USVString, USVString>
+        // or USVString): an object with @@iterator is a sequence, any other
+        // object a record, everything else a string.
+        constructor(init = "") {
+            const slots = newSlots(this);
+            slots.brand = paramsBrand; slots.list = []; slots.urlObject = null;
+            if (init !== null && (typeof init === "object" || typeof init === "function")) {
+                const method = init[iteratorSymbol];
+                if (method !== undefined && method !== null) {
+                    if (typeof method !== "function")
+                        throw new TypeErrorCtor("URLSearchParams: init's Symbol.iterator is not callable");
+                    const pairs = iterableToList(init, method, usvSequence);
+                    for (let i = 0; i < pairs.length; i++) {
+                        if (pairs[i].length !== 2)
+                            throw new TypeErrorCtor("URLSearchParams: each init pair must have exactly two items");
+                        append(slots.list, [pairs[i][0], pairs[i][1]]);
+                    }
+                } else {
+                    // Web IDL #es-record: enumerable own keys in
+                    // [[OwnPropertyKeys]] order; a repeated converted key
+                    // keeps its first position and takes the later value.
+                    const keys = ownKeys(init), positions = objectCreate(null);
+                    for (let i = 0; i < keys.length; i++) {
+                        const descriptor = getOwn(init, keys[i]);
+                        if (descriptor === undefined || !descriptor.enumerable) continue;
+                        const name = usv(keys[i]), value = usv(init[keys[i]]);
+                        if (positions[name] !== undefined) slots.list[positions[name]][1] = value;
+                        else { positions[name] = slots.list.length; append(slots.list, [name, value]); }
+                    }
+                }
+            } else {
+                let string = usv(init);
+                if (apply(charCodeAt, string, [0]) === 0x3f) string = apply(stringSlice, string, [1]);
+                slots.list = parseFormUrlencoded(string);
+            }
+        }
+        get size() { return branded(this, paramsBrand).list.length; }
+        append(name, value) {
+            const slots = branded(this, paramsBrand);
+            required(arguments.length, 2, "URLSearchParams.append");
+            append(slots.list, [usv(name), usv(value)]);
+            updateParams(slots);
+        }
+        delete(name, value = undefined) {
+            const slots = branded(this, paramsBrand);
+            required(arguments.length, 1, "URLSearchParams.delete");
+            name = usv(name);
+            const matchValue = value !== undefined, wanted = matchValue ? usv(value) : "";
+            const kept = [];
+            for (let i = 0; i < slots.list.length; i++) {
+                const tuple = slots.list[i];
+                if (tuple[0] !== name || (matchValue && tuple[1] !== wanted)) append(kept, tuple);
+            }
+            slots.list = kept;
+            updateParams(slots);
+        }
+        get(name) {
+            const slots = branded(this, paramsBrand);
+            required(arguments.length, 1, "URLSearchParams.get");
+            name = usv(name);
+            for (let i = 0; i < slots.list.length; i++) if (slots.list[i][0] === name) return slots.list[i][1];
+            return null;
+        }
+        getAll(name) {
+            const slots = branded(this, paramsBrand);
+            required(arguments.length, 1, "URLSearchParams.getAll");
+            name = usv(name);
+            const values = [];
+            for (let i = 0; i < slots.list.length; i++) if (slots.list[i][0] === name) append(values, slots.list[i][1]);
+            return values;
+        }
+        has(name, value = undefined) {
+            const slots = branded(this, paramsBrand);
+            required(arguments.length, 1, "URLSearchParams.has");
+            name = usv(name);
+            const matchValue = value !== undefined, wanted = matchValue ? usv(value) : "";
+            for (let i = 0; i < slots.list.length; i++)
+                if (slots.list[i][0] === name && (!matchValue || slots.list[i][1] === wanted)) return true;
+            return false;
+        }
+        set(name, value) {
+            const slots = branded(this, paramsBrand);
+            required(arguments.length, 2, "URLSearchParams.set");
+            name = usv(name); value = usv(value);
+            const kept = [];
+            let found = false;
+            for (let i = 0; i < slots.list.length; i++) {
+                const tuple = slots.list[i];
+                if (tuple[0] !== name) append(kept, tuple);
+                else if (!found) { found = true; tuple[1] = value; append(kept, tuple); }
+            }
+            if (!found) append(kept, [name, value]);
+            slots.list = kept;
+            updateParams(slots);
+        }
+        sort() {
+            const slots = branded(this, paramsBrand);
+            // A stable sort by code units of the names.
+            apply(arraySort, slots.list, [(a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)]);
+            updateParams(slots);
+        }
+        // Web IDL #es-forEach for a pair iterator: the list is reread after
+        // each callback, which may change it.
+        forEach(callback, thisArg = undefined) {
+            const slots = branded(this, paramsBrand);
+            required(arguments.length, 1, "URLSearchParams.forEach");
+            if (typeof callback !== "function") throw new TypeErrorCtor("URLSearchParams.forEach: callback is not a function");
+            for (let i = 0; i < slots.list.length; i++) {
+                const tuple = slots.list[i];
+                apply(callback, thisArg, [tuple[1], tuple[0], this]);
+            }
+        }
+        entries() { branded(this, paramsBrand); return paramsIterator(this, "key+value"); }
+        keys() { branded(this, paramsBrand); return paramsIterator(this, "key"); }
+        values() { branded(this, paramsBrand); return paramsIterator(this, "value"); }
+        toString() { return serializeFormUrlencoded(branded(this, paramsBrand).list); }
+    }
+    // Web IDL #es-default-iterator-object: an index into the live list.
+    const paramsIteratorPrototype = objectCreate(iteratorPrototype);
+    function paramsIterator(target, kind) {
+        const iterator = objectCreate(paramsIteratorPrototype), slots = newSlots(iterator);
+        slots.brand = iteratorBrand; slots.target = target; slots.kind = kind; slots.index = 0;
+        return iterator;
+    }
+    define(paramsIteratorPrototype, "next", { enumerable: true, writable: true, configurable: true, value: {
+        next() {
+            const slots = branded(this, iteratorBrand), list = slotsOf(slots.target).list;
+            if (slots.index >= list.length) return { value: undefined, done: true };
+            const tuple = list[slots.index++];
+            return { value: slots.kind === "key" ? tuple[0] : slots.kind === "value" ? tuple[1] : [tuple[0], tuple[1]], done: false };
+        } }.next });
+    define(paramsIteratorPrototype, toStringTag, { value: "URLSearchParams Iterator", configurable: true });
+    define(URLSearchParams.prototype, iteratorSymbol, { value: URLSearchParams.prototype.entries, writable: true, configurable: true });
+
+    function initializeURL(object, parts) {
+        const slots = newSlots(object);
+        slots.brand = urlBrand; slots.url = parts; slots.query = null;
+        return object;
+    }
+    // #dom-url-searchparams is [SameObject]; it is created on first access
+    // with the query's list, which is observably the same as at construction.
+    function queryObject(url, slots) {
+        if (slots.query === null) {
+            const params = new URLSearchParams();
+            const paramsSlots = slotsOf(params);
+            paramsSlots.list = parseFormUrlencoded(apply(stringSlice, slots.url[6], [1]));
+            paramsSlots.urlObject = url;
+            slots.query = params;
+        }
+        return slots.query;
+    }
+    function setComponent(url, component, value) {
+        const slots = branded(url, urlBrand);
+        value = usv(value);
+        const parts = setURLComponent(slots.url[0], component, value);
+        if (parts) slots.url = parts;
+        return slots;
+    }
+    class URL {
+        // #dom-url-url and #api-url-parser: a given base that fails to parse
+        // is a failure as well.
+        constructor(url, base = undefined) {
+            required(arguments.length, 1, "URL constructor");
+            url = usv(url);
+            const parts = parseURL(url, base === undefined ? null : usv(base));
+            if (!parts) throw new TypeErrorCtor(`Invalid URL: ${url}`);
+            initializeURL(this, parts);
+        }
+        static parse(url, base = undefined) {
+            required(arguments.length, 1, "URL.parse");
+            const parts = parseURL(usv(url), base === undefined ? null : usv(base));
+            return parts ? initializeURL(objectCreate(URL.prototype), parts) : null;
+        }
+        static canParse(url, base = undefined) {
+            required(arguments.length, 1, "URL.canParse");
+            return parseURL(usv(url), base === undefined ? null : usv(base)) !== null;
+        }
+        get href() { return branded(this, urlBrand).url[0]; }
+        // #dom-url-href: parse without a base, throw on failure, then reset
+        // the query object's list from the new query.
+        set href(value) {
+            const slots = branded(this, urlBrand);
+            value = usv(value);
+            const parts = parseURL(value, null);
+            if (!parts) throw new TypeErrorCtor(`Invalid URL: ${value}`);
+            slots.url = parts;
+            if (slots.query !== null) slotsOf(slots.query).list = parseFormUrlencoded(apply(stringSlice, parts[6], [1]));
+        }
+        get origin() { return branded(this, urlBrand).url[8]; }
+        get protocol() { return branded(this, urlBrand).url[1]; }
+        set protocol(value) { setComponent(this, "protocol", value); }
+        get username() { return branded(this, urlBrand).url[9]; }
+        set username(value) { setComponent(this, "username", value); }
+        get password() { return branded(this, urlBrand).url[10]; }
+        set password(value) { setComponent(this, "password", value); }
+        get host() { return branded(this, urlBrand).url[2]; }
+        set host(value) { setComponent(this, "host", value); }
+        get hostname() { return branded(this, urlBrand).url[3]; }
+        set hostname(value) { setComponent(this, "hostname", value); }
+        get port() { return branded(this, urlBrand).url[4]; }
+        set port(value) { setComponent(this, "port", value); }
+        get pathname() { return branded(this, urlBrand).url[5]; }
+        set pathname(value) { setComponent(this, "pathname", value); }
+        get search() { return branded(this, urlBrand).url[6]; }
+        // #dom-url-search: the query object's list is parsed from the given
+        // value without its leading "?".
+        set search(value) {
+            const slots = setComponent(this, "search", value);
+            if (slots.query !== null) {
+                let input = usv(value);
+                if (apply(charCodeAt, input, [0]) === 0x3f) input = apply(stringSlice, input, [1]);
+                slotsOf(slots.query).list = parseFormUrlencoded(input);
+            }
+        }
+        get searchParams() { return queryObject(this, branded(this, urlBrand)); }
+        get hash() { return branded(this, urlBrand).url[7]; }
+        set hash(value) { setComponent(this, "hash", value); }
+        toJSON() { return branded(this, urlBrand).url[0]; }
+        toString() { return branded(this, urlBrand).url[0]; }
+    }
+    // Web IDL #es-interfaces: operations and attributes are enumerable,
+    // interface objects are non-enumerable global properties, and an
+    // interface prototype names itself with @@toStringTag.
+    for (const [C, name] of [[URLSearchParams, "URLSearchParams"], [URL, "URL"]]) {
+        for (const target of [C, C.prototype]) {
+            for (const key of ownKeys(target)) {
+                if (key === "constructor" || key === "prototype" || key === "length" || key === "name" ||
+                    key === iteratorSymbol) continue;
+                const descriptor = getOwn(target, key);
+                descriptor.enumerable = true;
+                define(target, key, descriptor);
+            }
+        }
+        define(C.prototype, toStringTag, { value: name, configurable: true });
+        define(g, name, { value: C, writable: true, configurable: true });
+    }
+    })(globalThis);
+    /*__URL_END__*/
+    // Platform code below keeps the pristine interfaces, whatever author
+    // script later assigns to the global properties.
+    const URLSearchParams = g.URLSearchParams, URL = g.URL;
     // --- Blob URL store (File API §"Creating and Revoking a blob URL") ---
     // RAM-only, page-lifetime, per-realm: a map from a minted `blob:` URL string
     // to its Blob object and private creator origin, kept in this realm — zero I/O, like the rest
@@ -19433,66 +19780,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return { bytes: Array.isArray(internalsFor(obj).parts) ? __blobBytes(obj) : "", type: obj.type || "",
             origin: entry.origin, originKey: entry.originKey };
     }
-    const urlWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
-    function urlSet(which, v) { const r = __url_set(internalsFor(this).p[0], which, String(v)); if (r) internalsFor(this).p = r; }
-    function urlSyncSearchParams() { if (internalsFor(this).sp) searchParamsSetList.call(internalsFor(this).sp, internalsFor(this).p[6]); }
-    function urlSetSearchFromParams(qs) { const r = __url_set(internalsFor(this).p[0], "search", qs); if (r) internalsFor(this).p = r; }
-    class URL {
-        // URL Standard #dom-url-parse / #dom-url-canparse (local snapshot
-        // 55d66993). Conversion errors propagate; only parser failure is null.
-        static parse(url, base = undefined) {
-            if (!arguments.length) throw new TypeError("URL.parse requires a URL");
-            const parts = __url_parse(urlWellFormed(domString(url)), base === undefined ? null : urlWellFormed(domString(base)));
-            if (!parts) return null;
-            const result = Object.create(URL.prototype);
-            internalsFor(result).p = parts;
-            internalsFor(result).sp = null;
-            return result;
-        }
-        static canParse(url, base = undefined) {
-            if (!arguments.length) throw new TypeError("URL.canParse requires a URL");
-            return __url_parse(urlWellFormed(domString(url)), base === undefined ? null : urlWellFormed(domString(base))) !== null;
-        }
-        // A WHATWG URL is a LIVE object: assigning any component re-serializes
-        // href (and every other component). We keep the parsed parts in `__p`
-        // (the 11-tuple __url_parse returns) and expose each field as an
-        // accessor; a component setter runs the `__url_set` syscall (the url
-        // crate's WHATWG setter algorithms) and swaps in the new parts. This is
-        // load-bearing beyond correctness: the webcomponents/core-js URL
-        // polyfills feature-test `u.pathname="c%20d"; u.href==="…/c%20d"` and, if
-        // the native URL doesn't reflow, force-replace it with a searchParams-less
-        // polyfill — which then throws "cannot convert undefined to object" the
-        // moment a page reads `new URL(x).searchParams` (archive.org's item pages).
-        constructor(href, base) {
-            const r = __url_parse(String(href), base === undefined || base === null ? null : String(base));
-            if (!r) throw new TypeError("Invalid URL: " + href);
-            internalsFor(this).p = r;      // [href, protocol, host, hostname, port, pathname, search, hash, origin, username, password]
-            internalsFor(this).sp = null;  // lazily-created bound URLSearchParams (the "query object")
-        }
-        get href() { return internalsFor(this).p[0]; }
-        // The href setter re-parses from scratch (no base) and throws on failure.
-        set href(v) { const r = __url_parse(String(v), null); if (!r) throw new TypeError("Invalid URL: " + v); internalsFor(this).p = r; urlSyncSearchParams.call(this); }
-        get protocol() { return internalsFor(this).p[1]; } set protocol(v) { urlSet.call(this, "protocol", v); }
-        get host() { return internalsFor(this).p[2]; } set host(v) { urlSet.call(this, "host", v); }
-        get hostname() { return internalsFor(this).p[3]; } set hostname(v) { urlSet.call(this, "hostname", v); }
-        get port() { return internalsFor(this).p[4]; } set port(v) { urlSet.call(this, "port", v); }
-        get pathname() { return internalsFor(this).p[5]; } set pathname(v) { urlSet.call(this, "pathname", v); }
-        get search() { return internalsFor(this).p[6]; } set search(v) { urlSet.call(this, "search", v); urlSyncSearchParams.call(this); }
-        get hash() { return internalsFor(this).p[7]; } set hash(v) { urlSet.call(this, "hash", v); }
-        get origin() { return internalsFor(this).p[8]; }
-        get username() { return internalsFor(this).p[9]; } set username(v) { urlSet.call(this, "username", v); }
-        get password() { return internalsFor(this).p[10]; } set password(v) { urlSet.call(this, "password", v); }
-        // Apply a component setter; a spec no-op (invalid value) returns the
-        // unchanged parts, so href only moves when the assignment is valid.
-        // Refresh the bound query object after .search/.href changes (one-way,
-        // URL→params; the reverse, params→URL, is urlSetSearchFromParams).
-        // Called BY the bound searchParams when it is mutated: reflow the query.
-        get searchParams() { if (!internalsFor(this).sp) { internalsFor(this).sp = new URLSearchParams(internalsFor(this).p[6]); internalsFor(internalsFor(this).sp).url = this; } return internalsFor(this).sp; }
-        toString() { return internalsFor(this).p[0]; }
-        toJSON() { return internalsFor(this).p[0]; }
-        // createObjectURL/revokeObjectURL (File API). The minted URL is
-        // `blob:<origin>/<uuid>`; the store is RAM-only (above).
-        static createObjectURL(obj) {
+    // File API #creating-revoking (partial interface URL): static operations,
+    // enumerable like every Web IDL operation. The minted URL is
+    // `blob:<origin>/<uuid>`; the store is RAM-only (above).
+    const urlStatics = {
+        createObjectURL(obj) {
             if (obj === null || typeof obj !== "object") throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
             // File API #unicodeBlobURL uses the settings object's origin,
             // not Location.origin (about:srcdoc/blank URLs are opaque).
@@ -19508,16 +19800,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 try { __blob_mirror(u, __blobBytes(obj), obj.type || ""); } catch (e) {}
             }
             return u;
-        }
-        static revokeObjectURL(u) {
+        },
+        revokeObjectURL(u) {
             u = String(u);
             const h = u.indexOf("#"); if (h >= 0) u = u.slice(0, h);
             if (u.slice(0, 5) !== "blob:") return;
             delete __blobURLStore[u];
-        }
-    }
-    g.URLSearchParams = URLSearchParams;
-    g.URL = URL;
+        },
+    };
+    for (const name of ["createObjectURL", "revokeObjectURL"])
+        Object.defineProperty(URL, name, { value: urlStatics[name], writable: true, enumerable: true, configurable: true });
+    // URL Standard: [LegacyWindowAlias=webkitURL] on Window only.
+    Object.defineProperty(g, "webkitURL", { value: URL, writable: true, configurable: true });
 
     // --- URLPattern (URL Pattern Standard, https://urlpattern.spec.whatwg.org/) ---
     // A spec-aligned implementation of the common syntax: literal text, named
