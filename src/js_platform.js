@@ -9696,6 +9696,52 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             select() {
                 if (controlSelection(this,false) !== null) setControlSelection(this,0,0xffffffff,0);
             },
+            // HTML #dom-textarea/input-setrangetext (local whatwg/html@e5071a2):
+            // setRangeText(replacement) or (replacement, start, end,
+            // selectionMode = "preserve"); there is no two-argument overload.
+            setRangeText(replacement, start = undefined, end = undefined, selectionMode = undefined) {
+                if (arguments.length === 0 || arguments.length === 2)
+                    throw new TypeError("setRangeText requires 1, 3 or 4 arguments");
+                replacement = domString(replacement);
+                const explicit = arguments.length > 2;
+                let mode = "preserve";
+                if (explicit) {
+                    start = +start >>> 0; end = +end >>> 0;
+                    if (selectionMode !== undefined) {
+                        mode = domString(selectionMode);
+                        if (mode !== "select" && mode !== "start" && mode !== "end" && mode !== "preserve")
+                            throw new TypeError("Invalid SelectionMode");
+                    }
+                }
+                // InvalidStateError where the selection APIs do not apply.
+                const selection = controlSelection(this,true);
+                if (!explicit) { start = selection[0]; end = selection[1]; }
+                if (start > end) throw new DOMException("setRangeText start is after end", "IndexSizeError");
+                const value = this.value;
+                start = Math.min(start, value.length); end = Math.min(end, value.length);
+                let selectionStart = selection[0], selectionEnd = selection[1];
+                const newLength = replacement.length, newEnd = start + newLength;
+                if (mode === "select") { selectionStart = start; selectionEnd = newEnd; }
+                else if (mode === "start") selectionStart = selectionEnd = start;
+                else if (mode === "end") selectionStart = selectionEnd = newEnd;
+                else {
+                    const delta = newLength - (end - start);
+                    if (selectionStart > end) selectionStart += delta;
+                    else if (selectionStart > start) selectionStart = start;
+                    if (selectionEnd > end) selectionEnd += delta;
+                    else if (selectionEnd > start) selectionEnd = newEnd;
+                }
+                // Setting the value also sets the dirty value flag.
+                this.value = value.slice(0, start) + replacement + value.slice(end);
+                // #set-the-selection-range: direction "none"; select fires when
+                // the selection's extent or direction changed.
+                setControlSelection(this,selectionStart,selectionEnd,0,false);
+                const after = controlSelection(this,true);
+                if (after[0] !== selection[0] || after[1] !== selection[1] || after[2] !== selection[2])
+                    controlSelectionTasks.push({frame:trust.__activeFrame || null,fn: () => {
+                        dispatch(this, createTrustedEvent(Event,"select",{bubbles:true}), false);
+                    }});
+            },
         };
         for (const name of Object.keys(operations)) Object.defineProperty(C.prototype,name,{
             value:operations[name],configurable:true,writable:true,enumerable:true,
