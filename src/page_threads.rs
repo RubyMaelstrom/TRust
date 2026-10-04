@@ -15,6 +15,7 @@ struct State {
 struct PageThread {
     thread: JoinHandle<()>,
     interrupt: Arc<lumen::RuntimeInterrupt>,
+    /// A spare page engine has no document yet; its claim attaches one.
     cache: Weak<crate::http::PageCache>,
 }
 
@@ -26,7 +27,7 @@ impl PageThreads {
         &self,
         builder: Builder,
         interrupt: Arc<lumen::RuntimeInterrupt>,
-        cache: &Arc<crate::http::PageCache>,
+        cache: Option<&Arc<crate::http::PageCache>>,
         task: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<()> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -50,9 +51,28 @@ impl PageThreads {
         state.threads.push(PageThread {
             thread,
             interrupt,
-            cache: Arc::downgrade(cache),
+            cache: cache.map_or_else(Weak::new, Arc::downgrade),
         });
         Ok(())
+    }
+
+    /// Give the thread that owns `interrupt` the page cache that shutdown
+    /// must cancel alongside it.
+    fn attach_cache(
+        &self,
+        interrupt: &Arc<lumen::RuntimeInterrupt>,
+        cache: &Arc<crate::http::PageCache>,
+    ) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state
+            .threads
+            .iter_mut()
+            .find(|entry| Arc::ptr_eq(&entry.interrupt, interrupt))
+        {
+            entry.cache = Arc::downgrade(cache);
+        }
+        // A claim racing shutdown finds its entry already taken; shutdown
+        // has cancelled the shared interrupt, so the actor exits regardless.
     }
 
     fn shutdown(&self) {
@@ -83,10 +103,17 @@ static THREADS: PageThreads = PageThreads(Mutex::new(State {
 pub(crate) fn spawn(
     builder: Builder,
     interrupt: Arc<lumen::RuntimeInterrupt>,
-    cache: &Arc<crate::http::PageCache>,
+    cache: Option<&Arc<crate::http::PageCache>>,
     task: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()> {
     THREADS.spawn(builder, interrupt, cache, task)
+}
+
+pub(crate) fn attach_cache(
+    interrupt: &Arc<lumen::RuntimeInterrupt>,
+    cache: &Arc<crate::http::PageCache>,
+) {
+    THREADS.attach_cache(interrupt, cache);
 }
 
 pub(crate) fn shutdown() {
@@ -115,7 +142,7 @@ mod tests {
         let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
         let (release, wait) = mpsc::channel();
         threads
-            .spawn(Builder::new(), interrupt.clone(), &cache, move || {
+            .spawn(Builder::new(), interrupt.clone(), Some(&cache), move || {
                 let _cleanup = cleanup;
                 let _ = wait.recv();
             })
@@ -137,11 +164,35 @@ mod tests {
         );
         assert_eq!(
             threads
-                .spawn(Builder::new(), interrupt, &cache, || panic!("late actor"))
+                .spawn(Builder::new(), interrupt, Some(&cache), || panic!(
+                    "late actor"
+                ))
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::Interrupted
         );
+        threads.shutdown();
+    }
+
+    #[test]
+    fn a_spare_thread_receives_its_documents_cache_when_claimed() {
+        let threads = PageThreads::default();
+        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+        let (release, wait) = mpsc::channel::<()>();
+        threads
+            .spawn(Builder::new(), interrupt.clone(), None, move || {
+                let _ = wait.recv();
+            })
+            .unwrap();
+        let cached = |threads: &PageThreads| {
+            let state = threads.0.lock().unwrap();
+            state.threads[0].cache.upgrade()
+        };
+        assert!(cached(&threads).is_none());
+        let cache = Arc::new(crate::http::PageCache::default());
+        threads.attach_cache(&interrupt, &cache);
+        assert!(cached(&threads).is_some_and(|attached| Arc::ptr_eq(&attached, &cache)));
+        drop(release);
         threads.shutdown();
     }
 }

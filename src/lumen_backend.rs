@@ -2197,7 +2197,7 @@ mod desktop {
                 .name(String::from("trust-page-lumen"))
                 .stack_size(PAGE_STACK),
             interrupt.clone(),
-            &cache,
+            Some(&cache),
             move || {
                 page_actor(
                     html,
