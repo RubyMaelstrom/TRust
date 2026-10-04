@@ -456,8 +456,7 @@ fn file_mime(url: &GopherUrl, header: &[u8]) -> &'static str {
 
 fn file_is_renderable(mime: &str) -> bool {
     if mime.starts_with("image/") {
-        mime == "image/svg+xml"
-            || image::ImageFormat::from_mime_type(mime).is_some_and(|f| f.reading_enabled())
+        mime == "image/svg+xml" || crate::img::raster_mime_supported(mime)
     } else {
         crate::download::mime_is_renderable(mime, false)
     }
@@ -1106,6 +1105,7 @@ pub(crate) mod file_tests {
             assert_eq!(server.await.unwrap(), url.request().unwrap());
         }
         assert!(file_is_renderable("image/webp"));
+        assert!(file_is_renderable("image/avif"));
         assert!(
             !file_is_renderable("image/tiff"),
             "uncompiled decoders need a download"

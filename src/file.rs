@@ -245,6 +245,7 @@ fn mime_type_for_path(path: &Path) -> Option<&'static str> {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "avif" => "image/avif",
         "ico" => "image/x-icon",
         "bmp" => "image/bmp",
         "pdf" => "application/pdf",

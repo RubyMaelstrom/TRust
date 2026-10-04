@@ -617,6 +617,9 @@ fn strip_css_comments(input: &str) -> String {
     out
 }
 
+/// HTML #update-the-source-set (local snapshot e5071a2): a `source` whose
+/// `type` is an unknown or unsupported MIME type is skipped. These are the
+/// image formats `img` decodes, AVIF included.
 fn supported_image_mime(input: &str) -> bool {
     let essence = input
         .trim_matches(|ch: char| matches!(ch, ' ' | '\t' | '\n' | '\r'))
@@ -627,7 +630,7 @@ fn supported_image_mime(input: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         essence.as_str(),
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/svg+xml"
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/svg+xml"
     )
 }
 
@@ -789,7 +792,7 @@ mod tests {
     #[test]
     fn picture_uses_first_matching_supported_source_and_dimensions() {
         let html = r#"<picture>
-            <source media="(max-width: 700px)" type="image/avif" srcset="unsupported.avif 1x">
+            <source media="(max-width: 700px)" type="image/jxl" srcset="unsupported.jxl 1x">
             <source media="(max-width: 700px)" type="image/webp; codecs=vp8" srcset="narrow.webp 1x" width="320" height="200">
             <source srcset="wide.webp 1x">
             <img src="fallback.jpg" width="900" height="600">
@@ -810,6 +813,33 @@ mod tests {
         .unwrap();
         assert_eq!(selected.source, "https://example.test/narrow.webp");
         assert_eq!(dom.tag_name(selected.dimension_source), Some("source"));
+    }
+
+    #[test]
+    fn picture_prefers_a_listed_avif_source() {
+        // The common progressive-enhancement order: AVIF, then WebP, then a
+        // JPEG fallback. TRust decodes AVIF, so the first source wins.
+        let html = r#"<picture>
+            <source type="image/avif" srcset="photo.avif">
+            <source type="image/webp" srcset="photo.webp">
+            <img src="photo.jpg">
+        </picture>"#;
+        let mut dom = dom(html);
+        dom.set_viewport_px(600.0, 600.0);
+        let img = dom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&id| dom.tag_name(id) == Some("img"))
+            .unwrap();
+        let selected = select(
+            &dom,
+            img,
+            &Url::parse("https://example.test/").unwrap(),
+            Viewport::new(600.0, 600.0),
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(selected.source, "https://example.test/photo.avif");
+        assert!(supported_image_mime(" IMAGE/AVIF ; codecs=av01.0.04M.08"));
     }
 
     #[test]
