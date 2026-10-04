@@ -10609,6 +10609,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (!u) return;
                 const updated = __url_set(u[0], [
                     "", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin",
+                    "username", "password",
                 ][i], String(value));
                 if (updated) this.setAttribute("href", updated[0]);
             };
@@ -10624,6 +10625,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         Object.defineProperty(Cls.prototype, "search", urlPartDesc(6, false));
         Object.defineProperty(Cls.prototype, "hash", urlPartDesc(7, false));
         Object.defineProperty(Cls.prototype, "origin", urlPartDesc(8, true));
+        // HTML "API for hyperlink elements" (local whatwg/html@e5071a2):
+        // HyperlinkElementUtils also exposes the URL's username and password.
+        Object.defineProperty(Cls.prototype, "username", urlPartDesc(9, false));
+        Object.defineProperty(Cls.prototype, "password", urlPartDesc(10, false));
     }
     installUrlParts(HTMLAnchorElement);
     installUrlParts(HTMLAreaElement);
