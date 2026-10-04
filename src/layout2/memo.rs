@@ -16,7 +16,7 @@ use super::value::{Len, Node, Vp};
 use super::{ControlMap, Dom, Form, ImageSizes, NodeId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use url::Url;
 
 // One foreground page owns this cache. Large galleries exceed the former
@@ -287,6 +287,7 @@ pub(crate) struct LayoutCache {
 
 impl LayoutCache {
     pub(crate) fn clear(&mut self) {
+        self.shared_bytes = SharedBytes::default();
         self.entries.clear();
         self.recency.clear();
         self.inputs.clear_retained();
@@ -320,6 +321,7 @@ impl LayoutCache {
             + self.environment_bytes
             + self.recency.retained_bytes()
             + self.inputs.retained_bytes()
+            + self.shared_bytes.retained_bytes()
     }
 
     pub(super) fn prepare(
@@ -333,7 +335,7 @@ impl LayoutCache {
     ) -> bool {
         self.item_hits = 0;
         self.intrinsic_hits = 0;
-        self.end_pass();
+        self.shared_bytes.prune();
         #[cfg(test)]
         if self.cold {
             self.clear();
@@ -463,12 +465,6 @@ impl LayoutCache {
             }
         }
         true
-    }
-
-    /// Release the payloads counted during a layout pass. The next pass
-    /// builds new boxes, so their addresses are not comparable.
-    pub(super) fn end_pass(&mut self) {
-        self.shared_bytes = SharedBytes::default();
     }
 
     pub(super) fn replay_inputs(&mut self, inputs: &Inputs) {
@@ -683,43 +679,76 @@ impl LayoutCache {
     }
 }
 
-/// Retained-byte totals of the Arc-shared payloads in fragments being stored,
-/// valid for one layout pass. Every ancestor store measures its complete
-/// subtree again, and an out-of-flow placeholder's box can hold a whole child
-/// Document. Shared payloads never change in place (`Arc::make_mut` copies a
-/// shared one), and holding each counted Arc keeps its address from naming a
-/// different payload, so a total is computed once and reused unchanged.
+/// Retained-byte totals of the Arc-shared payloads in stored fragments. Every
+/// ancestor store measures its complete subtree again, every layout, and an
+/// out-of-flow placeholder's box can hold a whole child Document; lines and
+/// boxes reused from earlier layouts are the same allocations.
+///
+/// An entry is keyed by its payload's address and holds a `Weak`. While the
+/// payload is alive, that address names it and no other allocation (the weak
+/// count keeps the allocation from being freed). A payload is never changed in
+/// place once measured: `Arc::make_mut` copies one that is shared, and moves
+/// one with only weak references to a new allocation, leaving this entry dead.
+/// So a live entry's total is exactly what measuring again would produce.
 #[derive(Default)]
 struct SharedBytes {
-    lines: FxHashMap<usize, (Arc<LineFrag>, usize)>,
-    boxes: FxHashMap<usize, (SharedBox, usize)>,
+    lines: FxHashMap<usize, (Weak<LineFrag>, usize)>,
+    boxes: FxHashMap<usize, (Weak<BoxNode>, usize)>,
 }
 
 impl SharedBytes {
     fn line(&mut self, line: &Arc<LineFrag>) -> usize {
-        self.lines
-            .entry(Arc::as_ptr(line) as usize)
-            .or_insert_with(|| {
-                let bytes = size_of::<LineFrag>()
-                    + 2 * size_of::<usize>()
-                    + (line.pieces.capacity() + line.atom_boxes.capacity())
-                        * size_of::<super::inline::Piece>()
-                    + line
-                        .pieces
-                        .iter()
-                        .chain(&line.atom_boxes)
-                        .map(super::inline::Piece::retained_bytes)
-                        .sum::<usize>();
-                (line.clone(), bytes)
-            })
-            .1
+        let key = Arc::as_ptr(line) as usize;
+        if let Some((payload, bytes)) = self.lines.get(&key)
+            && payload.strong_count() > 0
+        {
+            return *bytes;
+        }
+        let bytes = size_of::<LineFrag>()
+            + 2 * size_of::<usize>()
+            + (line.pieces.capacity() + line.atom_boxes.capacity())
+                * size_of::<super::inline::Piece>()
+            + line
+                .pieces
+                .iter()
+                .chain(&line.atom_boxes)
+                .map(super::inline::Piece::retained_bytes)
+                .sum::<usize>();
+        self.lines.insert(key, (Arc::downgrade(line), bytes));
+        bytes
     }
 
+    /// `tree_cache::box_bytes`, reusing the totals of shared descendant boxes
+    /// that an earlier layout already measured.
     fn boxed(&mut self, b: &SharedBox) -> usize {
+        let key = Arc::as_ptr(b) as usize;
+        if let Some((payload, bytes)) = self.boxes.get(&key)
+            && payload.strong_count() > 0
+        {
+            return *bytes;
+        }
+        let bytes = super::tree_cache::box_bytes_with(b, &mut |child| self.boxed(child));
+        self.boxes.insert(key, (Arc::downgrade(b), bytes));
+        bytes
+    }
+
+    /// Forget payloads that no longer exist, releasing their allocations.
+    fn prune(&mut self) {
+        self.lines
+            .retain(|_, (payload, _)| payload.strong_count() > 0);
         self.boxes
-            .entry(Arc::as_ptr(b) as usize)
-            .or_insert_with(|| (b.clone(), super::tree_cache::box_bytes(b)))
-            .1
+            .retain(|_, (payload, _)| payload.strong_count() > 0);
+        if self.lines.capacity() > self.lines.len().saturating_mul(4).max(64) {
+            self.lines.shrink_to(self.lines.len().saturating_mul(2));
+        }
+        if self.boxes.capacity() > self.boxes.len().saturating_mul(4).max(64) {
+            self.boxes.shrink_to(self.boxes.len().saturating_mul(2));
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.lines.capacity() * size_of::<(usize, (Weak<LineFrag>, usize))>()
+            + self.boxes.capacity() * size_of::<(usize, (Weak<BoxNode>, usize))>()
     }
 }
 
@@ -1641,16 +1670,23 @@ pub(super) mod tests {
             &ImageSizes::new(),
         );
         fn kinds(fragment: &Frag, lines: &mut usize, boxes: &mut usize) {
-            match fragment.kind {
+            match &fragment.kind {
                 FragKind::Line(_) => *lines += 1,
-                FragKind::Oof(..) => *boxes += 1,
+                FragKind::Oof(b, _) => {
+                    *boxes += 1;
+                    // Memoized descendant totals sum to the full recursion.
+                    assert_eq!(
+                        SharedBytes::default().boxed(b),
+                        super::super::tree_cache::box_bytes(b)
+                    );
+                }
                 _ => {}
             }
             for child in &fragment.children {
                 kinds(child, lines, boxes);
             }
         }
-        let cache = dom.layout_cache.borrow();
+        let mut cache = dom.layout_cache.borrow_mut();
         let mut shared = SharedBytes::default();
         let (mut lines, mut boxes, mut items) = (0, 0, 0);
         for entry in cache.entries.values().flatten() {
@@ -1671,8 +1707,38 @@ pub(super) mod tests {
             "{items} {lines} {boxes}"
         );
         assert!(!shared.lines.is_empty() && !shared.boxes.is_empty());
-        // The completed transaction holds no counted payload.
-        assert!(cache.shared_bytes.lines.is_empty() && cache.shared_bytes.boxes.is_empty());
+        // Totals measured by the cache's own stores agree as well, and they
+        // pin no payload: a dropped line leaves only a dead entry to prune.
+        let mut cached = std::mem::take(&mut cache.shared_bytes);
+        for entry in cache.entries.values().flatten() {
+            if let Value::Item(item) = &entry.value {
+                assert_eq!(
+                    fragment_bytes(&item.fragment, &mut cached),
+                    fragment_bytes(&item.fragment, &mut SharedBytes::default())
+                );
+            }
+        }
+        fn first_line(fragment: &Frag) -> Option<&Arc<LineFrag>> {
+            match &fragment.kind {
+                FragKind::Line(line) => Some(line),
+                _ => fragment.children.iter().find_map(first_line),
+            }
+        }
+        let line = cache
+            .entries
+            .values()
+            .flatten()
+            .find_map(|entry| match &entry.value {
+                Value::Item(item) => first_line(&item.fragment),
+                _ => None,
+            })
+            .map(|line| Arc::new(LineFrag::clone(line)))
+            .unwrap();
+        cached.line(&line);
+        drop(line);
+        let live = cached.lines.len() - 1;
+        cached.prune();
+        assert_eq!(cached.lines.len(), live);
     }
 
     #[test]
