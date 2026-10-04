@@ -116,17 +116,39 @@ struct Route {
     steps: Vec<Step>,
 }
 
+/// HTML #selector-focus and Selectors 4 #the-focus-within-pseudo: element
+/// states that change through the focus update steps, never through an
+/// attribute. Their routes start at an element whose state changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::dom) enum FocusState {
+    Focus,
+    FocusWithin,
+}
+
 /// Overflow expires optional caches; it NEVER truncates selector matching or
 /// document content. Deduplication keeps repeated utility rules cheap.
 #[derive(Default)]
 pub(super) struct Dependencies {
     attributes: FxHashMap<String, FxHashSet<Route>>,
     classes: FxHashMap<String, FxHashSet<Route>>,
+    /// Indexed by `FocusState`; kept apart from `attributes` so that no
+    /// author attribute name can alias a state.
+    focus: [FxHashSet<Route>; 2],
     broad: FxHashSet<String>,
+    /// A focus state inside `:host()`/`::slotted()` needs a scope-bearing
+    /// route, which these paths do not express.
+    broad_focus: bool,
     overflow: bool,
     routes: usize,
     steps: usize,
     direction: bool,
+}
+
+/// Where a dependency path starts: an attribute (or class token) name, or a
+/// focus state.
+enum Source<'a> {
+    Attribute(&'a str, bool),
+    Focus(FocusState),
 }
 
 impl Dependencies {
@@ -135,9 +157,19 @@ impl Dependencies {
     }
 
     fn add(&mut self, name: &str, class: bool, tag: &Option<String>, path: &[Step], broad: bool) {
-        let name = name.to_ascii_lowercase();
+        self.add_source(Source::Attribute(name, class), tag, path, broad);
+    }
+
+    fn add_source(&mut self, source: Source, tag: &Option<String>, path: &[Step], broad: bool) {
         if broad {
-            self.broad.insert(if class { "class".into() } else { name });
+            match source {
+                Source::Attribute(_, true) => self.broad.insert("class".into()),
+                Source::Attribute(name, false) => self.broad.insert(name.to_ascii_lowercase()),
+                Source::Focus(_) => {
+                    self.broad_focus = true;
+                    true
+                }
+            };
             return;
         }
         if self.overflow {
@@ -149,18 +181,24 @@ impl Dependencies {
             self.overflow = true;
             self.attributes.clear();
             self.classes.clear();
+            self.focus = Default::default();
             return;
         }
         let route = Route {
             source_tag: tag.as_ref().filter(|tag| tag.as_str() != "*").cloned(),
             steps: path.to_vec(),
         };
-        let map = if class {
-            &mut self.classes
-        } else {
-            &mut self.attributes
+        let routes = match source {
+            Source::Attribute(name, true) => {
+                self.classes.entry(name.to_ascii_lowercase()).or_default()
+            }
+            Source::Attribute(name, false) => self
+                .attributes
+                .entry(name.to_ascii_lowercase())
+                .or_default(),
+            Source::Focus(state) => &mut self.focus[state as usize],
         };
-        if map.entry(name).or_default().insert(route) {
+        if routes.insert(route) {
             self.routes += 1;
             self.steps += path.len();
         }
@@ -260,10 +298,22 @@ impl Dependencies {
         }
         for state in states {
             let (names, inherited): (&[&str], bool) = match state {
+                // The focus update steps name every element whose state
+                // changes, its flat-tree ancestors included for
+                // :focus-within (`Dom::set_focused_area`).
+                StatePseudo::Focus | StatePseudo::FocusWithin => {
+                    let state = if matches!(state, StatePseudo::Focus) {
+                        FocusState::Focus
+                    } else {
+                        FocusState::FocusWithin
+                    };
+                    self.add_source(Source::Focus(state), tag, path, broad);
+                    continue;
+                }
                 // Modal state changes only through `set_dialog_modal`, which
                 // invalidates every style; the `open` attribute alone does not
                 // change it (HTML dialog attribute change steps).
-                StatePseudo::Focus | StatePseudo::FocusWithin | StatePseudo::Modal => (&[], false),
+                StatePseudo::Modal => (&[], false),
                 StatePseudo::AnyLink => (&["href"], false),
                 StatePseudo::Checked => {
                     // HTML #selector-checked. Radio-group state writers must
@@ -354,10 +404,51 @@ impl Dependencies {
             }
         }
         let mut result = FxHashSet::default();
-        let changed = node;
         // A budget limits optimization work, not CSS semantics. On an
         // adversarial route graph, full invalidation is cheaper and correct.
         let mut budget = dom.node_count().saturating_mul(16).max(4096);
+        Self::walk(dom, node, &name, routes, &mut budget, &mut result)?;
+        Some(result.into_iter().collect())
+    }
+
+    /// Whether any selector can observe a focus state. Overflow discarded the
+    /// routes that would answer, so it conservatively says yes.
+    pub(super) fn observes_focus(&self) -> bool {
+        self.overflow || self.broad_focus || self.focus.iter().any(|routes| !routes.is_empty())
+    }
+
+    /// The selector subjects whose match can change when `node` gains or
+    /// loses `state`. None means a complete cache invalidation, never
+    /// incomplete results.
+    pub(super) fn focus_subjects(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        state: FocusState,
+    ) -> Option<Vec<NodeId>> {
+        if self.overflow || self.broad_focus {
+            return None;
+        }
+        let mut result = FxHashSet::default();
+        let mut budget = dom.node_count().saturating_mul(16).max(4096);
+        // No attribute changed, so every guard tests a current value: the
+        // empty name exempts none (attribute names are never empty).
+        let routes = &self.focus[state as usize];
+        Self::walk(dom, node, "", routes, &mut budget, &mut result)?;
+        Some(result.into_iter().collect())
+    }
+
+    /// Follows each route from `changed`, adding the elements it reaches.
+    /// `name` is the changed attribute, whose guard on `changed` is exempt.
+    fn walk<'a>(
+        dom: &Dom,
+        changed: NodeId,
+        name: &str,
+        routes: impl IntoIterator<Item = &'a Route>,
+        budget: &mut usize,
+        result: &mut FxHashSet<NodeId>,
+    ) -> Option<()> {
+        let node = changed;
         for route in routes {
             if route
                 .source_tag
@@ -371,8 +462,8 @@ impl Dependencies {
                 let mut next = FxHashSet::default();
                 for node in current {
                     let mut visit = |id| {
-                        budget = budget.checked_sub(1)?;
-                        if step.matches(dom, id, changed, &name) {
+                        *budget = budget.checked_sub(1)?;
+                        if step.matches(dom, id, changed, name) {
                             next.insert(id);
                         }
                         Some(())
@@ -442,35 +533,32 @@ impl Dependencies {
             }
             result.extend(current);
         }
-        Some(result.into_iter().collect())
+        Some(())
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
+        fn routes_bytes(routes: &FxHashSet<Route>) -> usize {
+            routes.capacity() * std::mem::size_of::<Route>()
+                + routes
+                    .iter()
+                    .map(|route| {
+                        route.source_tag.as_ref().map_or(0, String::capacity)
+                            + route.steps.capacity() * std::mem::size_of::<Step>()
+                            + route.steps.iter().map(Step::retained_bytes).sum::<usize>()
+                    })
+                    .sum::<usize>()
+        }
         [&self.attributes, &self.classes]
             .into_iter()
             .map(|map| {
                 map.capacity() * std::mem::size_of::<(String, FxHashSet<Route>)>()
                     + map
                         .iter()
-                        .map(|(name, routes)| {
-                            name.capacity()
-                                + routes.capacity() * std::mem::size_of::<Route>()
-                                + routes
-                                    .iter()
-                                    .map(|route| {
-                                        route.source_tag.as_ref().map_or(0, String::capacity)
-                                            + route.steps.capacity() * std::mem::size_of::<Step>()
-                                            + route
-                                                .steps
-                                                .iter()
-                                                .map(Step::retained_bytes)
-                                                .sum::<usize>()
-                                    })
-                                    .sum::<usize>()
-                        })
+                        .map(|(name, routes)| name.capacity() + routes_bytes(routes))
                         .sum::<usize>()
             })
             .sum::<usize>()
+            + self.focus.iter().map(routes_bytes).sum::<usize>()
             + self.broad.capacity() * std::mem::size_of::<String>()
             + self.broad.iter().map(String::capacity).sum::<usize>()
     }
