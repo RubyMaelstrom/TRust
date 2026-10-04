@@ -1,3 +1,5 @@
+// The engine's own (ECMAScript) globals, before any platform interface.
+globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 (function () {
     var g = globalThis;
     var portAPI;

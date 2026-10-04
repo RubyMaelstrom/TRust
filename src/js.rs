@@ -765,6 +765,8 @@ pub(crate) fn worker_prelude() -> &'static str {
             let navigator = platform_block("/*__NAVIGATOR_BEGIN__*/", "/*__NAVIGATOR_END__*/");
             let performance = platform_block("/*__PERFORMANCE_BEGIN__*/", "/*__PERFORMANCE_END__*/");
             let geometry = wrapped_platform_block("/*__GEOMETRY_BEGIN__*/", "/*__GEOMETRY_END__*/");
+            let class_strings =
+                platform_block("/*__CLASS_STRINGS_BEGIN__*/", "/*__CLASS_STRINGS_END__*/");
             format!(
                 "{WORKER_SCOPE}\n{geometry}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{bitmap}\n{headers}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
@@ -774,7 +776,7 @@ pub(crate) fn worker_prelude() -> &'static str {
                  \x20   control.installPorts(__port_api);\n\
                  \x20   control.messageCodec = {{ serialize: __sc_serialize, deserialize: __sc_deserialize }};\n\
                  }})(Reflect.apply(WeakMap.prototype.get, __platform_slots(\"controls\", new WeakMap()), [globalThis]));\n\
-                 delete globalThis.__port_api;\n{performance}"
+                 delete globalThis.__port_api;\n{performance}\n{class_strings}"
             )
         })
         .as_str()
