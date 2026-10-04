@@ -18901,6 +18901,34 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_worker_global_is_a_dedicated_worker_global_scope() {
+        // HTML #dedicated-workers-and-the-dedicatedworkerglobalscope-interface
+        // (local whatwg/html@e5071a2): the global of a dedicated worker is a
+        // DedicatedWorkerGlobalScope inheriting WorkerGlobalScope and
+        // EventTarget. testharness.js selects its worker environment with
+        // `self instanceof DedicatedWorkerGlobalScope`.
+        let mut worker = worker_platform_engine();
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "const results = [self instanceof DedicatedWorkerGlobalScope,\n\
+                   self instanceof WorkerGlobalScope, self instanceof EventTarget,\n\
+                   Object.prototype.toString.call(self), DedicatedWorkerGlobalScope.name,\n\
+                   Object.getPrototypeOf(DedicatedWorkerGlobalScope) === WorkerGlobalScope,\n\
+                   typeof SharedWorkerGlobalScope, typeof postMessage,\n\
+                   Object.getOwnPropertyDescriptor(self, 'DedicatedWorkerGlobalScope').enumerable];\n\
+                 for (const C of [WorkerGlobalScope, DedicatedWorkerGlobalScope]) {\n\
+                   try { new C(); results.push('constructed'); }\n\
+                   catch (error) { results.push(error instanceof TypeError); }\n\
+                 }\n\
+                 results.join()"
+            ),
+            "true,true,true,[object DedicatedWorkerGlobalScope],DedicatedWorkerGlobalScope,\
+             true,undefined,function,false,true,true"
+        );
+    }
+
+    #[test]
     fn declarative_shadow_wrappers_hydration_and_closed_roots() {
         let mut engine = configured_engine(
             HostState::new(
