@@ -306,6 +306,7 @@ pub(super) fn with_layout<R>(
             let mut cache = dom.layout_cache.borrow_mut();
             work.item_hits += std::mem::take(&mut cache.item_hits);
             work.intrinsic_hits += std::mem::take(&mut cache.intrinsic_hits);
+            cache.end_pass();
         }
         work.passes += 1;
         #[cfg(test)]
