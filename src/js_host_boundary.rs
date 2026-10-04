@@ -46,6 +46,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_document_quirks", 1),
     ("__dom_pi_target", 1),
     ("__dom_create_comment", 2),
+    ("__dom_create_processing_instruction", 3),
     ("__dom_create_doctype", 4),
     ("__dom_doctype", 1),
     ("__dom_append", 2),

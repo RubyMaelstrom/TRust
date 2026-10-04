@@ -8495,6 +8495,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_document_quirks", 1, host_document_quirks),
     ("__dom_pi_target", 1, guarded_pi_target),
     ("__dom_create_comment", 2, guarded_create_comment),
+    (
+        "__dom_create_processing_instruction",
+        3,
+        guarded_create_processing_instruction,
+    ),
     ("__dom_create_doctype", 4, guarded_create_doctype),
     ("__dom_doctype", 1, guarded_doctype),
     ("__dom_append", 2, guarded_append),
@@ -9228,6 +9233,7 @@ node_access_guards! {
     guarded_create_element_ns = host_create_element_ns, [3], Throw;
     guarded_create_text = host_create_text, [1], Throw;
     guarded_create_comment = host_create_comment, [1], Throw;
+    guarded_create_processing_instruction = host_create_processing_instruction, [2], Throw;
     guarded_create_doctype = host_create_doctype, [3], Throw;
     guarded_doctype = host_doctype, [0], Invalidate;
     guarded_create_fragment = host_create_fragment, [0], Throw;
@@ -14016,6 +14022,23 @@ fn host_create_comment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     let mut dom = dom.borrow_mut();
     let document = host_creation_document(&dom, args, 1);
     let id = dom.create_comment(&text);
+    dom.initialize_node_document(id, document);
+    Ok(host_id_value(Some(id)))
+}
+
+/// DOM #dom-document-createprocessinginstruction; the prelude validates the
+/// target and data first.
+fn host_create_processing_instruction(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let target = host_arg_string(ctx, args, 0);
+    let data = host_arg_string(ctx, args, 1);
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 2);
+    let id = dom.create_processing_instruction(&target, &data);
     dom.initialize_node_document(id, document);
     Ok(host_id_value(Some(id)))
 }
@@ -28626,6 +28649,36 @@ mod tests {
             ),
             "2|b\u{a0}c|true|a b\u{a0}c c|false|false|SyntaxError|InvalidCharacterError|InvalidCharacterError|\
              SyntaxError|InvalidCharacterError|true|a b a c|true|a b|false|p q|true"
+        );
+    }
+
+    #[test]
+    fn documents_create_processing_instructions() {
+        // DOM #dom-document-createprocessinginstruction and
+        // #concept-pi-initialize (local whatwg/dom@a2331a4).
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                const pi = document.createProcessingInstruction('xml-stylesheet', 'href="a.css"');
+                const results = [pi instanceof ProcessingInstruction, pi instanceof CharacterData,
+                    pi.nodeType, pi.target, pi.nodeName, pi.data, pi.ownerDocument === document];
+                const comment = document.createComment('c');
+                comment.appendChild ? results.push('can-append') : 0;
+                const host = document.createElement('div');
+                host.appendChild(pi);
+                pi.data = 'x';
+                results.push(host.firstChild === pi, pi.textContent, pi.cloneNode().target);
+                for (const [target, data] of [['1x', ''], ['a b', ''], ['', ''], ['x', '?>'], ['·x', '']])
+                    try { document.createProcessingInstruction(target, data); results.push('ok'); }
+                    catch (e) { results.push(e.name); }
+                results.push(document.createProcessingInstruction('\u{10000}-.·', '?').target.length);
+                return results.join('|');
+            })()"#
+            ),
+            "true|true|7|xml-stylesheet|xml-stylesheet|href=\"a.css\"|true|can-append|true|x|xml-stylesheet|\
+             InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|5"
         );
     }
 
