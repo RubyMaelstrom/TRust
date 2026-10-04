@@ -15608,6 +15608,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // returns the inherited / UA-defaulted value for tracked properties and
     // the inline value for the rest, falling back to the element's own inline
     // style on a miss. Was inline-only (it just handed back el.style).
+    const computedStyleObjectMembers = new Set(["__proto__", "toString", "toLocaleString", "valueOf",
+        "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable"]);
     function computedStyleFor(el, id, pseudo = null) {
         const source = JSON.stringify([id, pseudo]);
         const names = () => cssOp("computed-names", source) || [];
@@ -15619,9 +15621,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         const readonly = () => { throw new DOMException("Computed style is read-only", "NoModificationAllowedError"); };
         return new Proxy(Object.create(CSSStyleDeclaration.prototype), {
-            get(_, p) {
+            get(target, p, receiver) {
                 if (p === Symbol.iterator) return function* () { yield* names(); };
-                if (typeof p !== "string") return undefined;
+                // Symbols and the Object.prototype members are not CSS
+                // properties: @@toStringTag still names the interface
+                // ("[object CSSStyleDeclaration]") and toString() works.
+                if (typeof p !== "string" || computedStyleObjectMembers.has(p))
+                    return Reflect.get(target, p, receiver);
                 if (p === "getPropertyValue") return (k) => lookup(k);
                 if (p === "getPropertyPriority") return () => "";
                 if (p === "setProperty" || p === "removeProperty") return readonly;
@@ -15634,7 +15640,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return lookup(p.startsWith("--") ? p : kebab(p));
             },
             set: readonly,
-            has(_, p) { return typeof p === "string"; },
+            has(target, p) { return typeof p === "string" || Reflect.has(target, p); },
             ownKeys() { return names().map((_, i) => String(i)); },
             getOwnPropertyDescriptor(_, p) {
                 if (/^(0|[1-9][0-9]*)$/.test(String(p)) && Number(p) < names().length)

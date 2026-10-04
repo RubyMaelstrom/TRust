@@ -18564,6 +18564,30 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_declarations_report_their_class_string() {
+        // CSSOM #dom-window-getcomputedstyle: the resolved declaration is a
+        // CSSStyleDeclaration ("[object CSSStyleDeclaration]", as in
+        // Chromium); symbols and Object.prototype members are not properties.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<p>x"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const style = getComputedStyle(document.documentElement);\n\
+                 [Object.prototype.toString.call(style), String(style), Symbol.toStringTag in style,\n\
+                  typeof style.hasOwnProperty, style instanceof CSSStyleDeclaration,\n\
+                  typeof style.getPropertyValue('display')].join('|')"
+            ),
+            "[object CSSStyleDeclaration]|[object CSSStyleDeclaration]|true|function|true|string"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or
