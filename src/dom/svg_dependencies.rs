@@ -265,13 +265,27 @@ impl Dom {
                         ) && css_may_reference_resource(&attribute.value)
                     }) || {
                         let maps = self.cascaded_maps(node);
-                        maps.elem
+                        let uncertain = |value: &String| {
+                            super::pending_shorthand(value).is_some()
+                                || css_may_reference_resource(value)
+                        };
+                        maps.before
                             .values()
-                            .chain(maps.before.values())
                             .chain(maps.after.values())
-                            .any(|value| {
-                                super::pending_shorthand(value).is_some()
-                                    || css_may_reference_resource(value)
+                            .any(uncertain)
+                            || (maps.elem.values().any(uncertain) && {
+                                // The element's own winners reach the resource
+                                // only as the declarations the serializer
+                                // bakes, after css-values-5 #substitution.
+                                // Judge those resolved values: a `var()` that
+                                // substitutes a color names no resource, and a
+                                // later custom-property change restyles this
+                                // node, which reaches the consumer through its
+                                // source ancestry like any other style edit
+                                // inside the subtree.
+                                let mut emitted = self.baked_element_style(node, false);
+                                emitted.push_str(&self.svg_resource_style(node));
+                                resolved_css_may_reference_resource(&emitted)
                             })
                     });
                 if uncertain_css {
@@ -475,6 +489,117 @@ fn css_may_reference_resource(value: &str) -> bool {
         }
     }
     false
+}
+
+/// Functional notations whose grammars accept no `<url>`, `<image>` or
+/// string-as-URL argument: CSS Color 4 colors, CSS Values 4 math, CSS
+/// Transforms 1/2, CSS Easing 1 and the Filter Effects 1 filter functions
+/// (`drop-shadow()` takes only lengths and a color). Their arguments are still
+/// tokenized, so a nested `url()` remains a resource reference.
+const RESOURCE_FREE_FUNCTIONS: &[&str] = &[
+    "rgb",
+    "rgba",
+    "hsl",
+    "hsla",
+    "hwb",
+    "lab",
+    "lch",
+    "oklab",
+    "oklch",
+    "color",
+    "color-mix",
+    "calc",
+    "min",
+    "max",
+    "clamp",
+    "round",
+    "mod",
+    "rem",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "pow",
+    "sqrt",
+    "hypot",
+    "log",
+    "exp",
+    "abs",
+    "sign",
+    "matrix",
+    "matrix3d",
+    "translate",
+    "translatex",
+    "translatey",
+    "translatez",
+    "translate3d",
+    "scale",
+    "scalex",
+    "scaley",
+    "scalez",
+    "scale3d",
+    "rotate",
+    "rotatex",
+    "rotatey",
+    "rotatez",
+    "rotate3d",
+    "skew",
+    "skewx",
+    "skewy",
+    "perspective",
+    "cubic-bezier",
+    "steps",
+    "linear",
+    "blur",
+    "brightness",
+    "contrast",
+    "drop-shadow",
+    "grayscale",
+    "hue-rotate",
+    "invert",
+    "opacity",
+    "saturate",
+    "sepia",
+];
+
+/// `css_may_reference_resource` for values already past `var()` substitution.
+/// SVG 2 painting #SpecifyingPaint: a `<paint>` names a paint server only
+/// through `<url>`; a color function cannot. Any other function, including an
+/// unresolved substitution function, remains a possible reference.
+fn resolved_css_may_reference_resource(value: &str) -> bool {
+    fn block(parser: &mut cssparser::Parser<'_, '_>) -> bool {
+        loop {
+            let resource_free = match parser.next_including_whitespace_and_comments() {
+                Err(_) => return false,
+                Ok(cssparser::Token::UnquotedUrl(_) | cssparser::Token::BadUrl(_)) => {
+                    return true;
+                }
+                Ok(cssparser::Token::Function(name)) => RESOURCE_FREE_FUNCTIONS
+                    .iter()
+                    .any(|function| name.eq_ignore_ascii_case(function)),
+                Ok(
+                    cssparser::Token::ParenthesisBlock
+                    | cssparser::Token::SquareBracketBlock
+                    | cssparser::Token::CurlyBracketBlock,
+                ) => true,
+                Ok(_) => continue,
+            };
+            if !resource_free
+                || parser
+                    .parse_nested_block(|nested| {
+                        Ok::<_, cssparser::ParseError<'_, ()>>(block(nested))
+                    })
+                    .unwrap_or(true)
+            {
+                return true;
+            }
+        }
+    }
+    let mut input = cssparser::ParserInput::new(value);
+    block(&mut cssparser::Parser::new(&mut input))
 }
 
 #[cfg(test)]
@@ -931,6 +1056,101 @@ mod tests {
         assert!(css_may_reference_resource("var(--paint)"));
         assert!(css_may_reference_resource("image-set(url(a.svg) 1x)"));
         assert!(!css_may_reference_resource("#123456"));
+    }
+
+    #[test]
+    fn svg_dependency_substituted_values_name_resources_only_through_urls() {
+        for certain in [
+            "fill:#123456;",
+            "fill:rgb(230, 230, 230);stroke:hsl(0 0% 50% / .5);",
+            "fill:color-mix(in srgb, red 40%, oklch(0.6 0.1 30));",
+            "transform:translate(calc(8px * -1)) rotate(-35deg);",
+            "transition:fill .3s cubic-bezier(.4, 0, .2, 1);",
+            "opacity:0.5;font-family:\"Icons\";",
+        ] {
+            assert!(!resolved_css_may_reference_resource(certain), "{certain}");
+        }
+        for uncertain in [
+            "fill:url(#paint);",
+            r"fill:u\72l(#paint) red;",
+            "fill:url('#paint');",
+            "fill:var(--unresolved);",
+            "fill:rgb(url(#paint));",
+            "filter:blur(2px) url(#filter);",
+            "mask-image:image-set(url(a.svg) 1x);",
+            "background-image:linear-gradient(red, blue);",
+            "fill:attr(data-paint);",
+            "fill:(url(#paint));",
+        ] {
+            assert!(
+                resolved_css_may_reference_resource(uncertain),
+                "{uncertain}"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_dependency_substituted_colors_do_not_watch_the_document() {
+        let mut dom = Dom::parse_document(
+            r##"<style>
+            :root { --icon: #e6e6e6; --move: all .3s ease }
+            svg path { fill: var(--icon); transition: var(--move) }
+            .painted path { fill: var(--paint) }
+            .painted { --paint: url(#gradient) }
+            .changed { color: red }
+            </style><main><section id="icons"><svg id="plain" width="10" height="10">
+            <path d="M0 0h7v8z"/></svg></section>
+            <section><svg id="painted" class="painted" width="10" height="10">
+            <path d="M0 0h7v8z"/></svg></section>
+            <svg width="0" height="0"><linearGradient id="gradient">
+            <stop offset="0" stop-color="red"/></linearGradient></svg>
+            <p id="other">unrelated</p></main>"##,
+        );
+        let plain = dom.get_by_id("plain").unwrap();
+        let painted = dom.get_by_id("painted").unwrap();
+        assert!(markup(&dom, "plain").contains("fill:#e6e6e6"));
+        assert!(markup(&dom, "painted").contains("url(#gradient)"));
+        {
+            let state = dom.svg_dependencies.borrow();
+            assert!(state.consumers[&plain].conservative.is_empty());
+            // A substituted paint-server reference keeps its document watch.
+            assert!(
+                state.consumers[&painted]
+                    .conservative
+                    .contains(&super::super::DOCUMENT)
+            );
+        }
+        let other = dom.get_by_id("other").unwrap();
+        let users = dom.svg_dirty_consumers(&[other], false);
+        assert!(!users.contains(&plain));
+        assert!(users.contains(&painted));
+        // An unrelated style edit keeps the substituted-color icon's formatting
+        // path; the gradient user is still rebuilt.
+        warm_parent_cache(&dom);
+        let icons = dom.get_by_id("icons").unwrap();
+        assert!(dom.layout_cache.borrow().retains(icons));
+        dom.set_attr(other, "class", "changed");
+        assert!(dom.layout_cache.borrow().retains(icons));
+        warm_matches_cold(&mut dom);
+        // The custom property itself is a style input of the icon's subtree.
+        let html = dom.document_element().unwrap();
+        dom.set_attr(html, "style", "--icon: #102030");
+        assert!(markup(&dom, "plain").contains("fill:#102030"));
+        warm_matches_cold(&mut dom);
+        assert!(
+            dom.svg_dependencies.borrow().consumers[&plain]
+                .conservative
+                .is_empty()
+        );
+        // Substituting a paint server installs the conservative watch again.
+        dom.set_attr(html, "style", "--icon: url(#gradient)");
+        assert!(markup(&dom, "plain").contains("url(#gradient)"));
+        assert!(
+            dom.svg_dependencies.borrow().consumers[&plain]
+                .conservative
+                .contains(&super::super::DOCUMENT)
+        );
+        warm_matches_cold(&mut dom);
     }
 
     #[test]
