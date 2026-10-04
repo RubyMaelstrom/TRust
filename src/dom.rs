@@ -78,11 +78,21 @@ fn attribute_name_matches(name: &QualName, qualified: &str) -> bool {
     }
 }
 
+/// DOM #concept-doctype: a document type node's name, public ID and system
+/// ID (empty strings when absent).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocumentTypeInfo {
+    pub name: String,
+    pub public_id: String,
+    pub system_id: String,
+}
+
 pub enum NodeData {
     Document,
     /// A document fragment: template contents, fragment-parse roots.
     Fragment,
-    Doctype,
+    /// Boxed so the rare doctype does not widen every node.
+    Doctype(Box<DocumentTypeInfo>),
     Comment(String),
     ProcessingInstruction {
         target: String,
@@ -957,7 +967,7 @@ impl Dom {
                         }
                     }
                 }
-                NodeData::Document | NodeData::Fragment | NodeData::Doctype => {}
+                NodeData::Document | NodeData::Fragment | NodeData::Doctype(_) => {}
             }
         }
 
@@ -3034,6 +3044,24 @@ impl Dom {
 
     pub fn create_comment(&mut self, text: &str) -> NodeId {
         self.new_node(NodeData::Comment(text.to_string()))
+    }
+
+    /// DOM #concept-doctype (HTML #insert-a-doctype, DOM
+    /// #dom-domimplementation-createdocumenttype).
+    pub fn create_doctype(&mut self, name: &str, public_id: &str, system_id: &str) -> NodeId {
+        self.new_node(NodeData::Doctype(Box::new(DocumentTypeInfo {
+            name: name.to_owned(),
+            public_id: public_id.to_owned(),
+            system_id: system_id.to_owned(),
+        })))
+    }
+
+    /// The name, public ID and system ID of a document type node.
+    pub fn doctype_info(&self, id: NodeId) -> Option<&DocumentTypeInfo> {
+        match &self.nodes.get(id)?.data {
+            NodeData::Doctype(info) => Some(info),
+            _ => None,
+        }
     }
 
     pub fn create_document(&mut self, content_type: &str) -> NodeId {
@@ -8155,7 +8183,7 @@ impl Dom {
         let parent = self.nodes[id].parent;
         let was_empty = parent.is_some_and(|parent| self.is_element_empty(parent));
         match &mut self.nodes[id].data {
-            NodeData::Document | NodeData::Doctype => (),
+            NodeData::Document | NodeData::Doctype(_) => (),
             NodeData::Comment(_) => self.set_comment_text(id, text),
             NodeData::CData(data) | NodeData::ProcessingInstruction { data, .. } => {
                 if data != text {
@@ -8213,7 +8241,7 @@ impl Dom {
         let data = match &self.nodes[id].data {
             NodeData::Document => NodeData::Document,
             NodeData::Fragment => NodeData::Fragment,
-            NodeData::Doctype => NodeData::Doctype,
+            NodeData::Doctype(info) => NodeData::Doctype(info.clone()),
             NodeData::Comment(t) => NodeData::Comment(t.clone()),
             NodeData::CData(t) => NodeData::CData(t.clone()),
             NodeData::ProcessingInstruction { target, data } => NodeData::ProcessingInstruction {
@@ -8362,7 +8390,7 @@ impl Dom {
     fn transplant(&mut self, other: &Dom, id: NodeId) -> NodeId {
         let data = match &other.nodes[id].data {
             NodeData::Document | NodeData::Fragment => NodeData::Fragment,
-            NodeData::Doctype => NodeData::Doctype,
+            NodeData::Doctype(info) => NodeData::Doctype(info.clone()),
             NodeData::Comment(t) => NodeData::Comment(t.clone()),
             NodeData::CData(t) => NodeData::CData(t.clone()),
             NodeData::ProcessingInstruction { target, data } => NodeData::ProcessingInstruction {
@@ -8780,7 +8808,7 @@ impl Dom {
                     self.serialize_svg_node_for_image(child, host, out, images);
                 }
             }
-            NodeData::Doctype => {}
+            NodeData::Doctype(_) => {}
             NodeData::CData(text) => {
                 out.push_str("<![CDATA[");
                 out.push_str(text);
@@ -9219,7 +9247,7 @@ impl Dom {
                     self.serialize_node_inner(c, host, js_serialization, out);
                 }
             }
-            NodeData::Doctype => {}
+            NodeData::Doctype(_) => {}
             NodeData::CData(text) => {
                 out.push_str("<![CDATA[");
                 out.push_str(text);
@@ -9948,7 +9976,7 @@ impl Dom {
                     kids(c, out);
                 }
             }
-            NodeData::Doctype => {}
+            NodeData::Doctype(_) => {}
             NodeData::CData(text) => {
                 out.push_str("<![CDATA[");
                 out.push_str(text);
@@ -19323,12 +19351,12 @@ impl TreeSink for Sink {
 
     fn append_doctype_to_document(
         &self,
-        _name: StrTendril,
-        _public_id: StrTendril,
-        _system_id: StrTendril,
+        name: StrTendril,
+        public_id: StrTendril,
+        system_id: StrTendril,
     ) {
         let mut dom = self.dom.borrow_mut();
-        let dt = dom.new_node(NodeData::Doctype);
+        let dt = dom.create_doctype(&name, &public_id, &system_id);
         dom.parser_append(DOCUMENT, dt);
     }
 
