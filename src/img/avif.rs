@@ -82,11 +82,16 @@ pub(crate) fn sniff(bytes: &[u8]) -> bool {
         return false;
     }
     let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    if size < 16 || size % 4 != 0 || bytes.len() < size {
+    if size < 16 || !size.is_multiple_of(4) || bytes.len() < size {
         return false;
     }
     let is_avif_brand = |brand: &[u8]| brand == b"avif" || brand == b"avis";
-    is_avif_brand(&bytes[8..12]) || bytes[16..size].chunks_exact(4).any(is_avif_brand)
+    is_avif_brand(&bytes[8..12])
+        || bytes[16..size]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|brand| is_avif_brand(brand))
 }
 
 /// Decode the primary image of an AVIF file to straight-alpha RGBA.
@@ -387,7 +392,7 @@ fn clean_aperture_rect(
     image_height: u32,
 ) -> Option<(u32, u32, u32, u32)> {
     fn axis(size_n: u32, size_d: u32, off_n: i32, off_d: u32, image: u32) -> Option<(u32, u32)> {
-        if size_d == 0 || off_d == 0 || size_n % size_d != 0 {
+        if size_d == 0 || off_d == 0 || !size_n.is_multiple_of(size_d) {
             return None;
         }
         let size = i128::from(size_n / size_d);
@@ -400,7 +405,7 @@ fn clean_aperture_rect(
         }
         let start = numerator / denominator;
         (size > 0 && start >= 0 && start + size <= i128::from(image))
-            .then(|| (start as u32, size as u32))
+            .then_some((start as u32, size as u32))
     }
     let (x, width) = axis(
         clap.width_n,
