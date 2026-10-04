@@ -414,6 +414,7 @@ pub(crate) fn minimized_mime_type(value: &str) -> String {
                 | "image/jpeg"
                 | "image/gif"
                 | "image/webp"
+                | "image/avif"
                 | "image/x-icon"
                 | "image/vnd.microsoft.icon"
                 | "font/woff"
@@ -1157,6 +1158,18 @@ mod tests {
         let mislabeled = response("text/plain", b"ID3\0\0\0music", vec![]);
         assert_eq!(computed_mime_type(&mislabeled), "application/octet-stream");
         assert!(response_needs_download(&mislabeled, true));
+    }
+
+    #[test]
+    fn unlabelled_avif_is_sniffed_and_minimized_as_a_supported_image() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/img/fixtures/avif/opaque-420-8bit.avif"
+        ))
+        .unwrap();
+        let unlabelled = response("", &bytes, vec![]);
+        assert_eq!(computed_mime_type(&unlabelled), "image/avif");
+        assert_eq!(minimized_mime_type("image/avif; codecs=av01"), "image/avif");
     }
 
     #[test]
