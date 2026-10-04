@@ -6692,7 +6692,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // it got `undefined.toLowerCase()` and threw, killing the whole bundle.
         get lang() { return this.getAttribute("lang") || ""; }
         set lang(v) { this.setAttribute("lang", String(v)); }
-        get dir() { return this.getAttribute("dir") || ""; }
+        // HTML #dom-dir: reflects dir limited to only known values.
+        get dir() { return knownDirection(this.getAttribute("dir")); }
         set dir(v) { this.setAttribute("dir", String(v)); }
         get title() { return this.getAttribute("title") || ""; }
         set title(v) { this.setAttribute("title", String(v)); }
@@ -11055,6 +11056,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function asciiLower(value) {
         return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
     }
+    // HTML #the-dir-attribute: the ltr, rtl and auto keywords (ASCII
+    // case-insensitive); a missing or invalid value has no state and an
+    // attribute limited to only known values reflects it as "".
+    function knownDirection(value) {
+        if (value === null) return "";
+        const keyword = asciiLower(value);
+        return keyword === "ltr" || keyword === "rtl" || keyword === "auto" ? keyword : "";
+    }
 
     const DOM_IMPLEMENTATION_TOKEN = {};
     const documentImplementations = new WeakMap();
@@ -14615,6 +14624,35 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (lower === "inherit") this.removeAttribute("contenteditable");
             else if (lower === "true" || lower === "false" || lower === "plaintext-only") this.setAttribute("contenteditable", lower);
             else throw new DOMException("contentEditable must be true, false, plaintext-only or inherit", "SyntaxError");
+        },
+        enumerable: true, configurable: true,
+    });
+    // HTML #dom-accesskey and #dom-fe-autofocus (local whatwg/html@e5071a2):
+    // HTMLElement reflects accesskey as a DOMString, and the
+    // HTMLOrSVGOrMathMLElement mixin reflects the autofocus boolean.
+    Object.defineProperty(g.HTMLElement.prototype, "accessKey", {
+        get() { return this.getAttribute("accesskey") ?? ""; },
+        set(value) { this.setAttribute("accesskey", `${value}`); },
+        enumerable: true, configurable: true,
+    });
+    for (const C of [g.HTMLElement, g.SVGElement, g.MathMLElement]) {
+        Object.defineProperty(C.prototype, "autofocus", {
+            get() { return this.hasAttribute("autofocus"); },
+            set(value) { if (value) this.setAttribute("autofocus", ""); else this.removeAttribute("autofocus"); },
+            enumerable: true, configurable: true,
+        });
+    }
+    // HTML #dom-document-dir: the html element's dir, limited to only known
+    // values; without one it is "" and setting does nothing.
+    Object.defineProperty(g.Document.prototype, "dir", {
+        get() {
+            const root = this.documentElement;
+            return root && root.namespaceURI === HTML_NS && root.localName === "html"
+                ? knownDirection(root.getAttribute("dir")) : "";
+        },
+        set(value) {
+            const root = this.documentElement;
+            if (root && root.namespaceURI === HTML_NS && root.localName === "html") root.setAttribute("dir", `${value}`);
         },
         enumerable: true, configurable: true,
     });
