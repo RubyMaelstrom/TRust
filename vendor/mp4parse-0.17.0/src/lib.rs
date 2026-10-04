@@ -203,6 +203,9 @@ pub enum Status {
     EsdsDecSpecificIntoTagQuantity,
     FtypBadSize,
     FtypNotFirst,
+    GridBadDescriptor,
+    GridBadTileCount,
+    GridTileType,
     HdlrNameNoNul,
     HdlrNameNotUtf8,
     HdlrNotFirst,
@@ -299,13 +302,15 @@ impl Feature {
             Self::Auxc
             | Self::Av1c
             | Self::Avis
+            | Self::Clap
             | Self::Colr
+            | Self::Grid
             | Self::Imir
             | Self::Irot
             | Self::Ispe
             | Self::Pasp
             | Self::Pixi => true,
-            Self::A1lx | Self::A1op | Self::Clap | Self::Grid | Self::Ipro | Self::Lsel => false,
+            Self::A1lx | Self::A1op | Self::Ipro | Self::Lsel => false,
         }
     }
 }
@@ -318,7 +323,7 @@ impl TryFrom<&ItemProperty> for Feature {
             ItemProperty::AuxiliaryType(_) => Self::Auxc,
             ItemProperty::AV1Config(_) => Self::Av1c,
             ItemProperty::Channels(_) => Self::Pixi,
-            ItemProperty::CleanAperture => Self::Clap,
+            ItemProperty::CleanAperture(_) => Self::Clap,
             ItemProperty::Colour(_) => Self::Colr,
             ItemProperty::ImageSpatialExtents(_) => Self::Ispe,
             ItemProperty::LayeredImageIndexing => Self::A1lx,
@@ -523,6 +528,20 @@ impl From<Status> for &str {
             Status::FtypNotFirst => {
                 "The FileTypeBox shall be placed as early as possible in the file \
                  per ISOBMFF (ISO 14496-12:2020) § 4.3.1"
+            }
+            Status::GridBadDescriptor => {
+                "ImageGrid version shall be 0, its fields shall be complete and \
+                 its output shall be covered by the tiles without a whole tile \
+                 outside it per HEIF (ISO/IEC 23008-12:2022) § 6.6.2.3"
+            }
+            Status::GridBadTileCount => {
+                "A grid derived image item shall have rows * columns 'dimg' \
+                 references per HEIF (ISO/IEC 23008-12:2022) § 6.6.2.3.1"
+            }
+            Status::GridTileType => {
+                "Every input image of an AVIF grid shall be an 'av01' item \
+                 with an AV1ItemConfigurationProperty and without unsupported \
+                 essential properties"
             }
             Status::HdlrNameNoNul => {
                 "The HandlerBox 'name' field shall be null-terminated \
@@ -1579,6 +1598,12 @@ pub struct AvifContext {
     primary_item: Option<AvifItem>,
     /// Associated alpha channel for the primary item, if any
     alpha_item: Option<AvifItem>,
+    /// The ordered 'dimg' inputs when `primary_item` is a grid derived image
+    primary_grid_tiles: Option<TryVec<ItemId>>,
+    /// The ordered 'dimg' inputs when `alpha_item` is a grid derived image
+    alpha_grid_tiles: Option<TryVec<ItemId>>,
+    /// The coded input images of the grids above
+    tile_items: TryHashMap<ItemId, AvifItem>,
     /// If true, divide RGB values by the alpha value.
     /// See `prem` in MIAF (ISO 23000-22:2019) § 7.3.5.2
     pub premultiplied_alpha: bool,
@@ -1598,10 +1623,25 @@ impl AvifContext {
         self.primary_item.is_some()
     }
 
+    /// The AV1 Image Item Data of an `av01` primary item. `None` when the
+    /// primary item is a grid; see [`Self::primary_item_grid`].
     pub fn primary_item_coded_data(&self) -> Option<&[u8]> {
         self.primary_item
             .as_ref()
+            .filter(|_| self.primary_grid_tiles.is_none())
             .map(|item| self.item_as_slice(item))
+    }
+
+    /// Whether the primary item is a grid derived image item.
+    pub fn primary_item_is_grid(&self) -> bool {
+        self.primary_item.is_some() && self.primary_grid_tiles.is_some()
+    }
+
+    /// The reconstruction parameters and coded tiles of a grid primary item.
+    pub fn primary_item_grid(&self) -> Option<Result<AvifGrid<'_>>> {
+        let item = self.primary_item.as_ref()?;
+        let tiles = self.primary_grid_tiles.as_ref()?;
+        Some(self.grid(item, tiles))
     }
 
     pub fn primary_item_bits_per_channel(&self) -> Option<Result<&[u8]>> {
@@ -1614,10 +1654,174 @@ impl AvifContext {
         self.alpha_item.is_some()
     }
 
+    /// The AV1 Image Item Data of an `av01` alpha item. `None` when the alpha
+    /// item is a grid; see [`Self::alpha_item_grid`].
     pub fn alpha_item_coded_data(&self) -> Option<&[u8]> {
         self.alpha_item
             .as_ref()
+            .filter(|_| self.alpha_grid_tiles.is_none())
             .map(|item| self.item_as_slice(item))
+    }
+
+    /// Whether the alpha item is a grid derived image item.
+    pub fn alpha_item_is_grid(&self) -> bool {
+        self.alpha_item.is_some() && self.alpha_grid_tiles.is_some()
+    }
+
+    /// The reconstruction parameters and coded tiles of a grid alpha item.
+    pub fn alpha_item_grid(&self) -> Option<Result<AvifGrid<'_>>> {
+        let item = self.alpha_item.as_ref()?;
+        let tiles = self.alpha_grid_tiles.as_ref()?;
+        Some(self.grid(item, tiles))
+    }
+
+    /// The primary item's 'ispe', if associated.
+    pub fn spatial_extents(&self) -> Result<Option<&ImageSpatialExtentsProperty>> {
+        let Some(primary_item) = &self.primary_item else {
+            return Ok(None);
+        };
+        match self
+            .item_properties
+            .get(primary_item.id, BoxType::ImageSpatialExtentsProperty)?
+        {
+            Some(ItemProperty::ImageSpatialExtents(ispe)) => Ok(Some(ispe)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The primary item's first 'nclx' colour information, if associated.
+    pub fn nclx_colour_information(&self) -> Option<Result<&NclxColourInformation>> {
+        let primary_item = self.primary_item.as_ref()?;
+        match self.item_properties.get_multiple(primary_item.id, |prop| {
+            matches!(prop, ItemProperty::Colour(ColourInformation::Nclx(_)))
+        }) {
+            Ok(nclx_colr_boxes) => nclx_colr_boxes.first().and_then(|property| match property {
+                ItemProperty::Colour(ColourInformation::Nclx(nclx)) => Some(Ok(nclx)),
+                _ => None,
+            }),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// The primary item's 'imir', if associated.
+    pub fn image_mirror(&self) -> Result<Option<&ImageMirror>> {
+        let Some(primary_item) = &self.primary_item else {
+            return Ok(None);
+        };
+        match self
+            .item_properties
+            .get(primary_item.id, BoxType::ImageMirror)?
+        {
+            Some(ItemProperty::Mirroring(imir)) => Ok(Some(imir)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The primary item's 'clap', if associated.
+    pub fn clean_aperture(&self) -> Result<Option<&CleanAperture>> {
+        let Some(primary_item) = &self.primary_item else {
+            return Ok(None);
+        };
+        match self
+            .item_properties
+            .get(primary_item.id, BoxType::CleanApertureBox)?
+        {
+            Some(ItemProperty::CleanAperture(clap)) => Ok(Some(clap)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Parse a grid item's ImageGrid and collect its coded inputs.
+    ///
+    /// See HEIF (ISO/IEC 23008-12:2022) § 6.6.2.3
+    fn grid<'a>(&'a self, item: &'a AvifItem, tile_ids: &[ItemId]) -> Result<AvifGrid<'a>> {
+        // aligned(8) class ImageGrid {
+        //     unsigned int(8) version = 0;
+        //     unsigned int(8) flags;
+        //     FieldLength = ((flags & 1) + 1) * 16;
+        //     unsigned int(8) rows_minus_one;
+        //     unsigned int(8) columns_minus_one;
+        //     unsigned int(FieldLength) output_width;
+        //     unsigned int(FieldLength) output_height;
+        // }
+        let data = self.item_as_slice(item);
+        let Some((&[version, flags, rows_minus_one, columns_minus_one], fields)) =
+            data.split_first_chunk::<4>()
+        else {
+            return Status::GridBadDescriptor.into();
+        };
+        if version != 0 {
+            return Err(Error::Unsupported("ImageGrid version"));
+        }
+        let field_len = if flags & 1 == 0 { 2 } else { 4 };
+        if fields.len() < field_len * 2 {
+            return Status::GridBadDescriptor.into();
+        }
+        if fields.len() > field_len * 2 {
+            fail_with_status_if(
+                self.strictness == ParseStrictness::Strict,
+                Status::GridBadDescriptor,
+            )?;
+        }
+        let read_field = |bytes: &[u8]| {
+            bytes[..field_len]
+                .iter()
+                .fold(0u32, |value, &byte| (value << 8) | u32::from(byte))
+        };
+        let output_width = read_field(fields);
+        let output_height = read_field(&fields[field_len..]);
+        let rows = u32::from(rows_minus_one) + 1;
+        let columns = u32::from(columns_minus_one) + 1;
+        if output_width == 0 || output_height == 0 {
+            return Status::GridBadDescriptor.into();
+        }
+        if tile_ids.len() != (rows * columns).to_usize() {
+            return Status::GridBadTileCount.into();
+        }
+
+        let mut tiles = TryVec::with_capacity(tile_ids.len())?;
+        let mut tile_size = None;
+        for &tile_id in tile_ids {
+            let tile = self
+                .tile_items
+                .get(&tile_id)
+                .ok_or_else(|| Error::from(Status::IlocNotFound))?;
+            tiles.push(self.item_as_slice(tile))?;
+            // Every input image has the same width and height
+            // (HEIF (ISO/IEC 23008-12:2022) § 6.6.2.3.3).
+            if let Some(ItemProperty::ImageSpatialExtents(ispe)) = self
+                .item_properties
+                .get(tile_id, BoxType::ImageSpatialExtentsProperty)?
+            {
+                let size = (ispe.image_width, ispe.image_height);
+                if *tile_size.get_or_insert(size) != size {
+                    return Status::GridBadDescriptor.into();
+                }
+            }
+        }
+
+        // The tiles cover the output, and no whole row or column of tiles
+        // lies outside it (HEIF (ISO/IEC 23008-12:2022) § 6.6.2.3.3).
+        if let Some((tile_width, tile_height)) = tile_size {
+            let covers = |tile: u32, count: u32, output: u32| {
+                u64::from(tile) * u64::from(count) >= u64::from(output)
+                    && u64::from(tile) * u64::from(count - 1) < u64::from(output)
+            };
+            if !covers(tile_width, columns, output_width)
+                || !covers(tile_height, rows, output_height)
+            {
+                return Status::GridBadDescriptor.into();
+            }
+        }
+
+        Ok(AvifGrid {
+            rows,
+            columns,
+            output_width,
+            output_height,
+            tile_size,
+            tiles,
+        })
     }
 
     pub fn alpha_item_bits_per_channel(&self) -> Option<Result<&[u8]>> {
@@ -1772,6 +1976,21 @@ impl AvifContext {
             IsobmffItem::Data(data) => data.as_slice(),
         }
     }
+}
+
+/// A grid derived image item: its reconstructed output size and its coded
+/// AV1 input images in row-major order.
+///
+/// See HEIF (ISO/IEC 23008-12:2022) § 6.6.2.3
+#[derive(Debug)]
+pub struct AvifGrid<'a> {
+    pub rows: u32,
+    pub columns: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    /// The common 'ispe' of the input images, when they declare one.
+    pub tile_size: Option<(u32, u32)>,
+    pub tiles: TryVec<&'a [u8]>,
 }
 
 struct AvifMeta {
@@ -2266,11 +2485,11 @@ struct BoxIter<'a, T: 'a> {
 }
 
 impl<'a, T: Read> BoxIter<'a, T> {
-    fn new(src: &mut T) -> BoxIter<T> {
+    fn new(src: &mut T) -> BoxIter<'_, T> {
         BoxIter { src }
     }
 
-    fn next_box(&mut self) -> Result<Option<BMFFBox<T>>> {
+    fn next_box(&mut self) -> Result<Option<BMFFBox<'_, T>>> {
         let r = read_box_header(self.src);
         match r {
             Ok(h) => Ok(Some(BMFFBox {
@@ -2310,7 +2529,7 @@ impl<'a, T: Read> BMFFBox<'a, T> {
         &self.head
     }
 
-    fn box_iter<'b>(&'b mut self) -> BoxIter<BMFFBox<'a, T>> {
+    fn box_iter(&mut self) -> BoxIter<'_, BMFFBox<'a, T>> {
         BoxIter::new(self)
     }
 }
@@ -2629,12 +2848,52 @@ pub fn read_avif<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<Avif
     let mut primary_item = None;
     let mut alpha_item = None;
 
+    // HEIF (ISO/IEC 23008-12:2022) § 6.6.2.3.1: the input images of a grid
+    // derived image item are its 'dimg' references, in reference order, which
+    // is the row-major order of the tiles.
+    let item_type_of = |item_id: ItemId| {
+        item_infos
+            .iter()
+            .find(|item_info| item_info.item_id == item_id)
+            .map(|item_info| item_info.item_type.to_be_bytes())
+    };
+    let grid_input_ids = |item_id: Option<ItemId>| -> Result<Option<TryVec<ItemId>>> {
+        let Some(item_id) = item_id.filter(|&id| item_type_of(id) == Some(*b"grid")) else {
+            return Ok(None);
+        };
+        let mut inputs = TryVec::new();
+        for iref in item_references
+            .iter()
+            .filter(|iref| iref.from_item_id == item_id && iref.item_type == b"dimg")
+        {
+            inputs.push(iref.to_item_id)?;
+        }
+        Ok(Some(inputs))
+    };
+    let primary_grid_tiles = grid_input_ids(primary_item_id)?;
+    let alpha_grid_tiles = grid_input_ids(alpha_item_id)?;
+    let mut wanted_tiles = TryHashMap::with_capacity(
+        primary_grid_tiles.as_ref().map_or(0, |tiles| tiles.len())
+            + alpha_grid_tiles.as_ref().map_or(0, |tiles| tiles.len()),
+    )?;
+    for &tile_id in primary_grid_tiles
+        .iter()
+        .chain(alpha_grid_tiles.iter())
+        .flat_map(|tiles| tiles.iter())
+    {
+        wanted_tiles.insert(tile_id, ())?;
+    }
+    let mut tile_items = TryHashMap::with_capacity(wanted_tiles.len())?;
+
     // store data or record location of relevant items
     for (item_id, loc) in iloc_items {
+        let mut tile = None;
         let item = if Some(item_id) == primary_item_id {
             &mut primary_item
         } else if Some(item_id) == alpha_item_id {
             &mut alpha_item
+        } else if wanted_tiles.get(&item_id).is_some() {
+            &mut tile
         } else {
             continue;
         };
@@ -2721,6 +2980,9 @@ pub fn read_avif<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<Avif
         }
 
         assert!(item.is_some());
+        if let Some(tile) = tile {
+            tile_items.insert(item_id, tile)?;
+        }
     }
 
     if (primary_item_id.is_some() && primary_item.is_none())
@@ -2758,7 +3020,9 @@ pub fn read_avif<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<Avif
     };
 
     // Generalize the property checks so we can apply them to primary and alpha items
-    let mut check_image_item = |item: &mut Option<AvifItem>| -> Result<()> {
+    let check_image_item = |item: &mut Option<AvifItem>,
+                            grid_tiles: Option<&TryVec<ItemId>>|
+     -> Result<()> {
         let item_id = item.as_ref().map(|item| item.id);
         let item_type = item_id.and_then(|item_id| {
             item_infos
@@ -2799,9 +3063,33 @@ pub fn read_avif<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<Avif
                 }
             }
             Some(b"grid") => {
-                // TODO: https://github.com/mozilla/mp4parse-rust/issues/198
-                unsupported_features.insert(Feature::Grid);
-                *item = None;
+                // A derived image item has an 'ispe' like any image item
+                // (HEIF (ISO/IEC 23008-12:2022) § 6.5.3.1); its coded inputs
+                // must be AV1 image items that this parser can process.
+                if missing_property_for(item_id, BoxType::ImageSpatialExtentsProperty) {
+                    fail_with_status_if(
+                        strictness != ParseStrictness::Permissive,
+                        Status::IspeMissing,
+                    )?;
+                }
+                for &tile_id in grid_tiles.into_iter().flat_map(|tiles| tiles.iter()) {
+                    let tile_type = item_infos
+                        .iter()
+                        .find(|item_info| item_info.item_id == tile_id)
+                        .map(|item_info| item_info.item_type.to_be_bytes());
+                    if tile_type != Some(*b"av01")
+                        || item_properties.forbidden_items.contains(&tile_id)
+                        || missing_property_for(Some(tile_id), BoxType::AV1CodecConfigurationBox)
+                    {
+                        return Status::GridTileType.into();
+                    }
+                    if missing_property_for(Some(tile_id), BoxType::ImageSpatialExtentsProperty) {
+                        fail_with_status_if(
+                            strictness != ParseStrictness::Permissive,
+                            Status::IspeMissing,
+                        )?;
+                    }
+                }
             }
             Some(_other_type) => return Status::ImageItemType.into(),
             None => {
@@ -2821,8 +3109,8 @@ pub fn read_avif<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<Avif
         Ok(())
     };
 
-    check_image_item(&mut primary_item)?;
-    check_image_item(&mut alpha_item)?;
+    check_image_item(&mut primary_item, primary_grid_tiles.as_ref())?;
+    check_image_item(&mut alpha_item, alpha_grid_tiles.as_ref())?;
 
     Ok(AvifContext {
         strictness,
@@ -2830,6 +3118,9 @@ pub fn read_avif<T: Read>(f: &mut T, strictness: ParseStrictness) -> Result<Avif
         item_data_box,
         primary_item,
         alpha_item,
+        primary_grid_tiles,
+        alpha_grid_tiles,
+        tile_items,
         premultiplied_alpha,
         item_properties,
         major_brand,
@@ -3214,7 +3505,7 @@ fn read_iprp<T: Read>(
                     // Check additional requirements on specific properties
                     match property {
                         ItemProperty::AV1Config(_)
-                        | ItemProperty::CleanAperture
+                        | ItemProperty::CleanAperture(_)
                         | ItemProperty::Mirroring(_)
                         | ItemProperty::Rotation(_) => {
                             if !a.essential {
@@ -3355,7 +3646,7 @@ pub enum ItemProperty {
     AuxiliaryType(AuxiliaryTypeProperty),
     AV1Config(AV1ConfigBox),
     Channels(PixelInformation),
-    CleanAperture,
+    CleanAperture(CleanAperture),
     Colour(ColourInformation),
     ImageSpatialExtents(ImageSpatialExtentsProperty),
     LayeredImageIndexing,
@@ -3373,7 +3664,7 @@ impl From<&ItemProperty> for BoxType {
         match item_property {
             ItemProperty::AuxiliaryType(_) => BoxType::AuxiliaryTypeProperty,
             ItemProperty::AV1Config(_) => BoxType::AV1CodecConfigurationBox,
-            ItemProperty::CleanAperture => BoxType::CleanApertureBox,
+            ItemProperty::CleanAperture(_) => BoxType::CleanApertureBox,
             ItemProperty::Colour(_) => BoxType::ColourInformationBox,
             ItemProperty::LayeredImageIndexing => BoxType::AV1LayeredImageIndexingProperty,
             ItemProperty::LayerSelection => BoxType::LayerSelectorProperty,
@@ -3735,6 +4026,7 @@ fn read_ipco<T: Read>(
         let property = match b.head.name {
             BoxType::AuxiliaryTypeProperty => ItemProperty::AuxiliaryType(read_auxc(&mut b)?),
             BoxType::AV1CodecConfigurationBox => ItemProperty::AV1Config(read_av1c(&mut b)?),
+            BoxType::CleanApertureBox => ItemProperty::CleanAperture(read_clap(&mut b)?),
             BoxType::ColourInformationBox => ItemProperty::Colour(read_colr(&mut b, strictness)?),
             BoxType::ImageMirror => ItemProperty::Mirroring(read_imir(&mut b)?),
             BoxType::ImageRotation => ItemProperty::Rotation(read_irot(&mut b)?),
@@ -3750,7 +4042,6 @@ fn read_ipco<T: Read>(
                 skip_box_remain(&mut b)?;
                 let item_property = match other_box_type {
                     BoxType::AV1LayeredImageIndexingProperty => ItemProperty::LayeredImageIndexing,
-                    BoxType::CleanApertureBox => ItemProperty::CleanAperture,
                     BoxType::LayerSelectorProperty => ItemProperty::LayerSelection,
                     BoxType::OperatingPointSelectorProperty => ItemProperty::OperatingPointSelector,
                     _ => {
@@ -3784,6 +4075,16 @@ pub struct ImageSpatialExtentsProperty {
     image_height: u32,
 }
 
+impl ImageSpatialExtentsProperty {
+    pub fn width(&self) -> u32 {
+        self.image_width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.image_height
+    }
+}
+
 /// Parse image spatial extents property
 ///
 /// See HEIF (ISO 23008-12:2017) § 6.5.3.1
@@ -3798,6 +4099,51 @@ fn read_ispe<T: Read>(src: &mut BMFFBox<T>) -> Result<ImageSpatialExtentsPropert
     Ok(ImageSpatialExtentsProperty {
         image_width,
         image_height,
+    })
+}
+
+/// A clean aperture as rational numbers. The offsets are signed even though
+/// the syntax declares every field `unsigned int(32)`, because 12.1.4.3 says
+/// their numerators "may be positive or negative".
+///
+/// See ISOBMFF (ISO 14496-12:2020) § 12.1.4
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanAperture {
+    pub width_n: u32,
+    pub width_d: u32,
+    pub height_n: u32,
+    pub height_d: u32,
+    pub horiz_off_n: i32,
+    pub horiz_off_d: u32,
+    pub vert_off_n: i32,
+    pub vert_off_d: u32,
+}
+
+/// Parse clean aperture property
+///
+/// See HEIF (ISO 23008-12:2017) § 6.5.9
+/// See ISOBMFF (ISO 14496-12:2020) § 12.1.4.2
+fn read_clap<T: Read>(src: &mut BMFFBox<T>) -> Result<CleanAperture> {
+    let width_n = be_u32(src)?;
+    let width_d = be_u32(src)?;
+    let height_n = be_u32(src)?;
+    let height_d = be_u32(src)?;
+    let horiz_off_n = be_u32(src)? as i32;
+    let horiz_off_d = be_u32(src)?;
+    let vert_off_n = be_u32(src)? as i32;
+    let vert_off_d = be_u32(src)?;
+    // Like libavif, tolerate trailing bytes after the eight fields.
+    skip_box_remain(src)?;
+
+    Ok(CleanAperture {
+        width_n,
+        width_d,
+        height_n,
+        height_d,
+        horiz_off_n,
+        horiz_off_d,
+        vert_off_n,
+        vert_off_d,
     })
 }
 
@@ -3861,6 +4207,24 @@ pub struct NclxColourInformation {
     transfer_characteristics: u8,
     matrix_coefficients: u8,
     full_range_flag: bool,
+}
+
+impl NclxColourInformation {
+    pub fn colour_primaries(&self) -> u8 {
+        self.colour_primaries
+    }
+
+    pub fn transfer_characteristics(&self) -> u8 {
+        self.transfer_characteristics
+    }
+
+    pub fn matrix_coefficients(&self) -> u8 {
+        self.matrix_coefficients
+    }
+
+    pub fn full_range_flag(&self) -> bool {
+        self.full_range_flag
+    }
 }
 
 /// The raw bytes of the ICC profile
