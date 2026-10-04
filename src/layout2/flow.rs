@@ -4192,9 +4192,11 @@ impl Flow<'_> {
     /// NOT clipped in place: their overflow rides the scroll axis into a buffer
     /// (a vertical Region) or strip (a horizontal Carousel), handled by the
     /// paint-time scroller extraction — so only `hidden`/`clip` land here.
-    /// Mirrors the old single overflow authority: the `overflow-x`/`-y`
-    /// longhand wins, else the `overflow` shorthand (one value = both axes).
-    fn overflow_clips(&self, id: NodeId) -> (bool, bool) {
+    /// `axes` are the element's resolved `overflow-x`/`-y` (`Dom::overflow_axes`).
+    /// CSS Overflow 3 #overflow-control only turns `visible` into `auto` and
+    /// keeps `clip`, so an axis clips exactly when its longhand is `hidden` or
+    /// `clip`.
+    fn overflow_clips(&self, id: NodeId, axes: [super::overflow::Overflow; 2]) -> (bool, bool) {
         if id == NO_NODE {
             return (false, false);
         }
@@ -4205,32 +4207,26 @@ impl Flow<'_> {
         if matches!(self.dom.tag_name(id), Some("iframe" | "frame")) {
             return (true, true);
         }
-        let clips =
-            |v: Option<String>| matches!(v.as_deref().map(str::trim), Some("hidden" | "clip"));
-        let (sx, sy) = match self.dom.computed_value_resolved(id, "overflow") {
-            Some(sh) => {
-                let mut t = sh.split_whitespace();
-                let x = t.next().map(str::to_string);
-                let y = t.next().map(str::to_string).or_else(|| x.clone());
-                (x, y)
-            }
-            None => (None, None),
+        let clips = |axis| {
+            matches!(
+                axis,
+                super::overflow::Overflow::Hidden | super::overflow::Overflow::Clip
+            )
         };
-        let ox = self.dom.computed_value_resolved(id, "overflow-x").or(sx);
-        let oy = self.dom.computed_value_resolved(id, "overflow-y").or(sy);
-        (clips(ox), clips(oy))
+        (clips(axes[0]), clips(axes[1]))
     }
 
     /// The clip rectangle a fragment ESTABLISHES for its descendants: its
     /// padding box on each clipped axis (CSS Overflow L3 §2 — the scrollport
     /// is the padding box), ±∞ on an unclipped axis. `None` when it clips
-    /// neither axis.
-    fn clip_box(&self, f: &Frag) -> Option<Clip> {
+    /// neither axis. `axes` are the fragment element's resolved overflow axes.
+    fn clip_box(&self, f: &Frag, axes: Option<[super::overflow::Overflow; 2]>) -> Option<Clip> {
         // Anonymous/line frags never clip. (Guarded first: `tag_name` indexes
         // the arena, so it must not see `NO_NODE`.)
         if f.node == NO_NODE {
             return None;
         }
+        let axes = axes?;
         // The ROOT element's overflow propagates to the VIEWPORT (CSS Overflow
         // L3 §3.1) — it never clips the document to a sub-box. paint applies the
         // viewport clip (columns + document height) and page scroll handles the
@@ -4239,7 +4235,7 @@ impl Flow<'_> {
         if matches!(self.dom.tag_name(f.node), Some("html" | "body")) {
             return None;
         }
-        let (cx, cy) = self.overflow_clips(f.node);
+        let (cx, cy) = self.overflow_clips(f.node, axes);
         if !cx && !cy {
             return None;
         }
@@ -4310,9 +4306,11 @@ impl Flow<'_> {
         // away tail is never in the buffer and the strip "cuts off" mid-band no
         // matter how far you scroll. Gated on the cheap scroll-container reads
         // so the common non-scrolling fragment is untouched.
+        // Both the exemption below and the fragment's own clip read its
+        // resolved overflow axes; read the two longhands once per fragment.
+        let axes = (f.node != NO_NODE).then(|| self.dom.overflow_axes(f.node));
         let own_clip = if own_clip.is_some_and(|c| c.x0 < c.x1 && c.y0 < c.y1)
-            && f.node != NO_NODE
-            && (self.dom.is_scroll_container(f.node) || self.dom.is_hscroll_container(f.node))
+            && axes.is_some_and(|axes| axes.iter().any(|axis| axis.user_scrollable()))
         {
             None
         } else {
@@ -4347,7 +4345,7 @@ impl Flow<'_> {
             f.flow.hidden = true;
         }
         f.clip = own_clip;
-        let content_clip = Clip::intersect(own_clip, self.clip_box(f));
+        let content_clip = Clip::intersect(own_clip, self.clip_box(f, axes));
         // CSS Overflow 3 §3 clips an abspos descendant through its containing-
         // block chain, not through intervening static ancestors. An iframe is
         // different: its nested viewport establishes the initial containing

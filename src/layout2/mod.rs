@@ -1653,6 +1653,72 @@ mod tests {
     use super::*;
     use crate::layout2::{Item, ItemKind, display_width};
 
+    #[test]
+    fn overflow_clip_axes_match_shorthand_and_longhand_reads() {
+        // CSS Overflow 3 #overflow-control: the positioned pass reads each
+        // fragment's resolved axes once. They must classify pure clips and
+        // scroll containers exactly as reading the `overflow` serialization
+        // and then each longhand did.
+        let values = [
+            None,
+            Some("visible"),
+            Some("hidden"),
+            Some("clip"),
+            Some("auto"),
+            Some("scroll"),
+            Some("overlay"),
+        ];
+        let mut styles = Vec::new();
+        for x in values {
+            for y in values {
+                styles.push(
+                    x.map(|x| format!("overflow-x:{x};")).unwrap_or_default()
+                        + &y.map(|y| format!("overflow-y:{y};")).unwrap_or_default(),
+                );
+            }
+        }
+        styles.extend(
+            [
+                "overflow:hidden",
+                "overflow:clip auto",
+                "overflow:auto visible",
+            ]
+            .map(String::from),
+        );
+        let html: String = styles
+            .iter()
+            .enumerate()
+            .map(|(index, style)| format!("<div id=d{index} style='{style}'></div>"))
+            .collect();
+        let dom = Dom::parse_document(&html);
+        for (index, style) in styles.iter().enumerate() {
+            let node = dom.get_by_id(&format!("d{index}")).unwrap();
+            let clips =
+                |v: Option<String>| matches!(v.as_deref().map(str::trim), Some("hidden" | "clip"));
+            let (sx, sy) = match dom.computed_value_resolved(node, "overflow") {
+                Some(shorthand) => {
+                    let mut tokens = shorthand.split_whitespace();
+                    let x = tokens.next().map(str::to_string);
+                    let y = tokens.next().map(str::to_string).or_else(|| x.clone());
+                    (x, y)
+                }
+                None => (None, None),
+            };
+            let read = (
+                clips(dom.computed_value_resolved(node, "overflow-x").or(sx)),
+                clips(dom.computed_value_resolved(node, "overflow-y").or(sy)),
+            );
+            let axes = dom.overflow_axes(node);
+            let pure_clip = |axis| matches!(axis, Overflow::Hidden | Overflow::Clip);
+            assert_eq!(read, (pure_clip(axes[0]), pure_clip(axes[1])), "{style}");
+            assert_eq!(
+                dom.is_scroll_container(node) || dom.is_hscroll_container(node),
+                axes.iter().any(|axis| axis.user_scrollable()),
+                "{style}"
+            );
+        }
+    }
+
     fn lay(html: &str, cols: usize) -> Output {
         lay_images(html, cols, &HashMap::new())
     }
