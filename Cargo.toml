@@ -106,6 +106,11 @@ libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 # Lumen is the JavaScript engine in every browser and test configuration.
 lumen = { path = "../Lumen/crates/lumen", features = ["embed"] }
 mimalloc = { version = "0.1", optional = true }
+# ISOBMFF/HEIF parsing for AVIF images (and, later, MP4 demuxing). Firefox's
+# parser; TRust patches grid and clean-aperture support into the 0.17.0
+# release, see vendor/mp4parse-0.17.0/README.trust.txt. As in Firefox, a
+# missing `pixi` is tolerated (MPEGGroup/MIAF#9).
+mp4parse = { version = "0.17.0", features = ["missing-pixi-permitted"] }
 # Unicode shaping, font discovery/fallback, bidi, cluster mapping, and line
 # metrics for the canonical CSS-pixel inline formatting context. TRust owns the
 # surrounding CSS and retained-paint contracts; Parley is the font machinery.
@@ -257,6 +262,9 @@ crossterm = { path = "vendor/crossterm-0.29.0" }
 # stride when disposal is followed by an opaque subframe. Carry upstream
 # image-rs/image-webp#178 until its fix ships in a crates.io release.
 image-webp = { path = "vendor/image-webp-0.2.4" }
+# AVIF grid derived images and clean apertures, absent from both the 0.17.0
+# release and mozilla/mp4parse-rust master (upstream issue #198).
+mp4parse = { path = "vendor/mp4parse-0.17.0" }
 # Vello Hybrid 0.2 is the current release, but upstream still pins wgpu 29.
 # TRust's fork uses wgpu 30's panic-safe SurfaceTexture teardown
 # (gfx-rs/wgpu#9678) and implements the color-matrix filter shared below.
