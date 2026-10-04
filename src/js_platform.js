@@ -302,9 +302,746 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     Object.defineProperty(DOMRectReadOnly.prototype, "toJSON", {enumerable:true});
     Object.defineProperty(g, 'DOMRectReadOnly', {value:DOMRectReadOnly, writable:true, configurable:true});
     Object.defineProperty(g, 'DOMRect', {value:DOMRect, writable:true, configurable:true});
+    // Geometry Interfaces 1 §2 DOMPoint, §5 DOMQuad and §6 DOMMatrix (CSSWG
+    // snapshot 81c27f686901, 2026-09-06). Coordinates, corner points and
+    // matrix elements are internal slots shared by the Agent's Realms; a
+    // matrix keeps its column-major m11..m44 and its "is 2D" flag.
+    const geometryApply = Reflect.apply, geometryDefine = Object.defineProperty;
+    const geometryOwn = Object.getOwnPropertyDescriptor, geometryKeys = Object.getOwnPropertyNames;
+    const geometryCreate = Object.create, geometryIs = Object.is;
+    const geometryWeakGet = WeakMap.prototype.get, geometryWeakSet = WeakMap.prototype.set;
+    const geometrySlotMap = __platform_slots("internals", new WeakMap());
+    const GeometryFloat32 = Float32Array, GeometryFloat64 = Float64Array;
+    const geometryIterator = Symbol.iterator;
+    const geometryTypedName = geometryOwn(Object.getPrototypeOf(GeometryFloat32.prototype), Symbol.toStringTag).get;
+    const geometryTypedBuffer = geometryOwn(Object.getPrototypeOf(GeometryFloat32.prototype), "buffer").get;
+    const geometryTypedLength = geometryOwn(Object.getPrototypeOf(GeometryFloat32.prototype), "length").get;
+    const geometryBufferLength = geometryOwn(ArrayBuffer.prototype, "byteLength").get;
+    const geometrySin = Math.sin, geometryCos = Math.cos, geometryTan = Math.tan;
+    const geometryAtan2 = Math.atan2, geometrySqrt = Math.sqrt, geometryPI = Math.PI;
+    const geometryFinite = Number.isFinite;
+    // Only a Window Realm parses CSS transform lists and stringifies matrices
+    // ([Exposed=Window] stringifier and setMatrixValue()).
+    const parseTransformList = typeof __geometry_parse_matrix === "function" ? __geometry_parse_matrix : null;
+    const geometryWindow = parseTransformList !== null;
+    function geometrySlots(object, create) {
+        if ((typeof object !== "object" || object === null) && typeof object !== "function") return undefined;
+        let record = geometryApply(geometryWeakGet, geometrySlotMap, [object]);
+        if (record === undefined && create) {
+            record = geometryCreate(null);
+            geometryApply(geometryWeakSet, geometrySlotMap, [object, record]);
+        }
+        return record;
+    }
+    function geometryDictionary(value, name) {
+        // Web IDL #js-to-dictionary: undefined and null are an empty dictionary.
+        if (value === undefined || value === null) return null;
+        if (typeof value !== "object" && typeof value !== "function")
+            throw new TypeError(name + " must be an object");
+        return value;
+    }
+    function geometryDOMException(message, name) {
+        // Only reached in a Window Realm, whose DOMException exists by then.
+        return new DOMException(message, name);
+    }
+
+    // §2: a point's x, y, z coordinates and w perspective.
+    function pointState(value, writable) {
+        const record = geometrySlots(value, false);
+        const state = record && record.domPoint;
+        if (!state || (writable && !state.writable))
+            throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function initPoint(object, x, y, z, w, writable) {
+        geometrySlots(object, true).domPoint = { x, y, z, w, writable };
+        return object;
+    }
+    function pointInit(value) {
+        // DOMPointInit members in lexicographic order, each defaulted.
+        const other = geometryDictionary(value, "DOMPointInit");
+        if (other === null) return [0, 0, 0, 1];
+        const w = other.w, wv = w === undefined ? 1 : +w;
+        const x = other.x, xv = x === undefined ? 0 : +x;
+        const y = other.y, yv = y === undefined ? 0 : +y;
+        const z = other.z, zv = z === undefined ? 0 : +z;
+        return [xv, yv, zv, wv];
+    }
+    class DOMPointReadOnly {
+        constructor(x = 0, y = 0, z = 0, w = 1) {
+            initPoint(this, +x, +y, +z, +w, false);
+        }
+        static fromPoint(other = {}) {
+            const p = pointInit(other);
+            return initPoint(geometryCreate(pointReadOnlyPrototype), p[0], p[1], p[2], p[3], false);
+        }
+        get x() { return pointState(this, false).x; }
+        get y() { return pointState(this, false).y; }
+        get z() { return pointState(this, false).z; }
+        get w() { return pointState(this, false).w; }
+        matrixTransform(matrix = {}) {
+            const point = pointState(this, false);
+            return transformPoint(matrixFromInit(matrix), point.x, point.y, point.z, point.w);
+        }
+        toJSON() {
+            const point = pointState(this, false);
+            return { x: point.x, y: point.y, z: point.z, w: point.w };
+        }
+    }
+    class DOMPoint {
+        constructor(x = 0, y = 0, z = 0, w = 1) {
+            initPoint(this, +x, +y, +z, +w, true);
+        }
+        static fromPoint(other = {}) {
+            const p = pointInit(other);
+            return createPoint(p[0], p[1], p[2], p[3]);
+        }
+        get x() { return pointState(this, false).x; }
+        set x(value) { const point = pointState(this, true); point.x = +value; }
+        get y() { return pointState(this, false).y; }
+        set y(value) { const point = pointState(this, true); point.y = +value; }
+        get z() { return pointState(this, false).z; }
+        set z(value) { const point = pointState(this, true); point.z = +value; }
+        get w() { return pointState(this, false).w; }
+        set w(value) { const point = pointState(this, true); point.w = +value; }
+    }
+    const pointReadOnlyPrototype = DOMPointReadOnly.prototype, pointPrototype = DOMPoint.prototype;
+    Object.setPrototypeOf(DOMPoint, DOMPointReadOnly);
+    Object.setPrototypeOf(pointPrototype, pointReadOnlyPrototype);
+    function createPoint(x, y, z, w) {
+        return initPoint(geometryCreate(pointPrototype), x, y, z, w, true);
+    }
+
+    // §5: a quadrilateral's four DOMPoint corners, which authors may mutate.
+    function quadPoints(value) {
+        const record = geometrySlots(value, false);
+        const points = record && record.domQuad;
+        if (!points) throw new TypeError("Illegal invocation");
+        return points;
+    }
+    function initQuad(object, p1, p2, p3, p4) {
+        geometrySlots(object, true).domQuad = [p1, p2, p3, p4];
+        return object;
+    }
+    function nanSafe(values, maximum) {
+        // Geometry 1 #conventions: NaN-safe minimum and maximum.
+        let result = values[0];
+        for (let i = 0; i < 4; i++) {
+            const value = values[i];
+            if (value !== value) return NaN;
+            if (maximum ? value > result : value < result) result = value;
+        }
+        return result;
+    }
+    class DOMQuad {
+        constructor(p1 = {}, p2 = {}, p3 = {}, p4 = {}) {
+            const a = pointInit(p1), b = pointInit(p2), c = pointInit(p3), d = pointInit(p4);
+            initQuad(this, createPoint(a[0], a[1], a[2], a[3]), createPoint(b[0], b[1], b[2], b[3]),
+                createPoint(c[0], c[1], c[2], c[3]), createPoint(d[0], d[1], d[2], d[3]));
+        }
+        static fromRect(other = {}) {
+            const r = rectInit(other), x = r[0], y = r[1], width = r[2], height = r[3];
+            return initQuad(geometryCreate(quadPrototype), createPoint(x, y, 0, 1),
+                createPoint(x + width, y, 0, 1), createPoint(x + width, y + height, 0, 1),
+                createPoint(x, y + height, 0, 1));
+        }
+        static fromQuad(other = {}) {
+            // DOMQuadInit members p1..p4 are optional DOMPointInit dictionaries.
+            const init = geometryDictionary(other, "DOMQuadInit");
+            const member = key => {
+                const value = init === null ? undefined : init[key];
+                return pointInit(value === undefined ? null : value);
+            };
+            const a = member("p1"), b = member("p2"), c = member("p3"), d = member("p4");
+            return initQuad(geometryCreate(quadPrototype), createPoint(a[0], a[1], a[2], a[3]),
+                createPoint(b[0], b[1], b[2], b[3]), createPoint(c[0], c[1], c[2], c[3]),
+                createPoint(d[0], d[1], d[2], d[3]));
+        }
+        get p1() { return quadPoints(this)[0]; }
+        get p2() { return quadPoints(this)[1]; }
+        get p3() { return quadPoints(this)[2]; }
+        get p4() { return quadPoints(this)[3]; }
+        getBounds() {
+            const points = quadPoints(this), xs = [], ys = [];
+            for (let i = 0; i < 4; i++) {
+                const point = pointState(points[i], false);
+                xs[i] = point.x; ys[i] = point.y;
+            }
+            const left = nanSafe(xs, false), top = nanSafe(ys, false);
+            return createDOMRect(left, top, nanSafe(xs, true) - left, nanSafe(ys, true) - top);
+        }
+        toJSON() {
+            const points = quadPoints(this);
+            return { p1: points[0], p2: points[1], p3: points[2], p4: points[3] };
+        }
+    }
+    const quadPrototype = DOMQuad.prototype;
+
+    // §6: m[column * 4 + row], so m11 m12 m13 m14 m21 ... m44 in order.
+    const MATRIX_ELEMENTS = ["m11", "m12", "m13", "m14", "m21", "m22", "m23", "m24",
+        "m31", "m32", "m33", "m34", "m41", "m42", "m43", "m44"];
+    const MATRIX_ALIASES = [["a", 0], ["b", 1], ["c", 4], ["d", 5], ["e", 12], ["f", 13]];
+    function matrixState(value, writable) {
+        const record = geometrySlots(value, false);
+        const state = record && record.domMatrix;
+        if (!state || (writable && !state.writable))
+            throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function initMatrix(object, elements, is2D, writable) {
+        const m = new GeometryFloat64(16);
+        for (let i = 0; i < 16; i++) m[i] = elements[i];
+        geometrySlots(object, true).domMatrix = { m, is2D, writable };
+        return object;
+    }
+    function createMatrix(elements, is2D, writable = true) {
+        return initMatrix(geometryCreate(writable ? matrixPrototype : matrixReadOnlyPrototype),
+            elements, is2D, writable);
+    }
+    // #create-a-2d-matrix and #create-a-3d-matrix.
+    function elements2D(a, b, c, d, e, f) {
+        return [a, b, 0, 0, c, d, 0, 0, 0, 0, 1, 0, e, f, 0, 1];
+    }
+    function sinCosDegrees(degrees) {
+        // Exact at quarter turns, as CSS rotations of 90deg are expected to be.
+        const turn = degrees % 360;
+        if (turn % 90 === 0) {
+            const quadrant = ((turn / 90) % 4 + 4) % 4;
+            return quadrant === 0 ? [0, 1] : quadrant === 1 ? [1, 0] : quadrant === 2 ? [0, -1] : [-1, 0];
+        }
+        const radians = degrees * geometryPI / 180;
+        return [geometrySin(radians), geometryCos(radians)];
+    }
+    // Post-multiply: m = m · b.
+    function postMultiply(m, b) {
+        const a = new GeometryFloat64(16);
+        for (let i = 0; i < 16; i++) a[i] = m[i];
+        for (let column = 0; column < 4; column++)
+            for (let row = 0; row < 4; row++)
+                m[column * 4 + row] = a[row] * b[column * 4] + a[4 + row] * b[column * 4 + 1] +
+                    a[8 + row] * b[column * 4 + 2] + a[12 + row] * b[column * 4 + 3];
+    }
+    // Pre-multiply: m = b · m.
+    function preMultiply(m, b) {
+        const a = new GeometryFloat64(16);
+        for (let i = 0; i < 16; i++) a[i] = m[i];
+        for (let column = 0; column < 4; column++)
+            for (let row = 0; row < 4; row++)
+                m[column * 4 + row] = b[row] * a[column * 4] + b[4 + row] * a[column * 4 + 1] +
+                    b[8 + row] * a[column * 4 + 2] + b[12 + row] * a[column * 4 + 3];
+    }
+    // CSS Transforms 2 #Translate3dDefined, post-multiplied.
+    function translateElements(m, tx, ty, tz) {
+        for (let row = 0; row < 4; row++)
+            m[12 + row] = m[row] * tx + m[4 + row] * ty + m[8 + row] * tz + m[12 + row];
+    }
+    // CSS Transforms 2 #Scale3dDefined, post-multiplied.
+    function scaleElements(m, sx, sy, sz) {
+        for (let row = 0; row < 4; row++) {
+            m[row] *= sx; m[4 + row] *= sy; m[8 + row] *= sz;
+        }
+    }
+    // CSS Transforms 2 #Rotate3dDefined about the normalized [x, y, z],
+    // post-multiplied. A vector that cannot be normalized applies nothing.
+    function rotateElements(m, x, y, z, degrees) {
+        const length = geometrySqrt(x * x + y * y + z * z);
+        if (length === 0 || !geometryFinite(length) || degrees === 0) return;
+        x /= length; y /= length; z /= length;
+        const sc = sinCosDegrees(degrees), s = sc[0], c = sc[1], t = 1 - c;
+        // Rotations about a coordinate axis keep that axis's elements exact.
+        if (x === 0 && y === 0)
+            postMultiply(m, [c, z * s, 0, 0, -z * s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+        else if (y === 0 && z === 0)
+            postMultiply(m, [1, 0, 0, 0, 0, c, x * s, 0, 0, -x * s, c, 0, 0, 0, 0, 1]);
+        else if (x === 0 && z === 0)
+            postMultiply(m, [c, 0, -y * s, 0, 0, 1, 0, 0, y * s, 0, c, 0, 0, 0, 0, 1]);
+        else
+            postMultiply(m, [x * x * t + c, x * y * t + z * s, x * z * t - y * s, 0,
+                x * y * t - z * s, y * y * t + c, y * z * t + x * s, 0,
+                x * z * t + y * s, y * z * t - x * s, z * z * t + c, 0, 0, 0, 0, 1]);
+    }
+    function invertElements(state) {
+        const m = state.m;
+        if (state.is2D) {
+            const a = m[0], b = m[1], c = m[4], d = m[5], e = m[12], f = m[13];
+            const det = a * d - b * c;
+            if (det !== 0 && geometryFinite(det)) {
+                m[0] = d / det; m[1] = -b / det; m[4] = -c / det; m[5] = a / det;
+                m[12] = (c * f - d * e) / det; m[13] = (b * e - a * f) / det;
+                return;
+            }
+        } else {
+            const inv = new GeometryFloat64(16);
+            inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+            inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+            inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+            inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+            inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+            inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+            inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+            inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+            inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+            inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+            inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+            inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+            inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+            inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+            inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+            inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+            const det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+            if (det !== 0 && geometryFinite(det)) {
+                for (let i = 0; i < 16; i++) m[i] = inv[i] / det;
+                return;
+            }
+        }
+        // #dom-dommatrix-invertself: a singular matrix becomes all NaN and 3D.
+        for (let i = 0; i < 16; i++) m[i] = NaN;
+        state.is2D = false;
+    }
+    // #transform-a-point-with-a-matrix: the point vector pre-multiplied by
+    // the matrix. A 2D matrix maps a planar point (z = ±0, w = 1) in 2D.
+    function transformPoint(matrix, x, y, z, w) {
+        const state = matrixState(matrix, false), m = state.m;
+        if (state.is2D && z === 0 && w === 1)
+            return createPoint(x * m[0] + y * m[4] + m[12], x * m[1] + y * m[5] + m[13], 0, 1);
+        return createPoint(m[0] * x + m[4] * y + m[8] * z + m[12] * w,
+            m[1] * x + m[5] * y + m[9] * z + m[13] * w,
+            m[2] * x + m[6] * y + m[10] * z + m[14] * w,
+            m[3] * x + m[7] * y + m[11] * z + m[15] * w);
+    }
+    // #matrix-validate-and-fixup-2d / #matrix-validate-and-fixup on a
+    // converted DOMMatrix2DInit or DOMMatrixInit; returns [elements, is2D].
+    function matrixInit(value, threeD) {
+        const other = geometryDictionary(value, threeD ? "DOMMatrixInit" : "DOMMatrix2DInit");
+        const get = key => {
+            if (other === null) return undefined;
+            const member = other[key];
+            return member === undefined ? undefined : +member;
+        };
+        // DOMMatrix2DInit's members first, then DOMMatrixInit's, each in
+        // lexicographic order (Web IDL #js-to-dictionary).
+        const a = get("a"), b = get("b"), c = get("c"), d = get("d"), e = get("e"), f = get("f");
+        let m11 = get("m11"), m12 = get("m12"), m21 = get("m21"), m22 = get("m22");
+        let m41 = get("m41"), m42 = get("m42");
+        let is2D;
+        const fallback = (value, identity) => value === undefined ? identity : value;
+        let m13 = 0, m14 = 0, m23 = 0, m24 = 0, m31 = 0, m32 = 0, m33 = 1, m34 = 0, m43 = 0, m44 = 1;
+        if (threeD) {
+            const flag = other === null ? undefined : other.is2D;
+            is2D = flag === undefined ? undefined : !!flag;
+            m13 = fallback(get("m13"), 0); m14 = fallback(get("m14"), 0);
+            m23 = fallback(get("m23"), 0); m24 = fallback(get("m24"), 0);
+            m31 = fallback(get("m31"), 0); m32 = fallback(get("m32"), 0);
+            m33 = fallback(get("m33"), 1); m34 = fallback(get("m34"), 0);
+            m43 = fallback(get("m43"), 0); m44 = fallback(get("m44"), 1);
+        }
+        const conflict = (short, long) => short !== undefined && long !== undefined &&
+            !(geometryIs(short, long) || short === long);
+        if (conflict(a, m11) || conflict(b, m12) || conflict(c, m21) || conflict(d, m22) ||
+            conflict(e, m41) || conflict(f, m42))
+            throw new TypeError("Conflicting DOMMatrix init members");
+        if (m11 === undefined) m11 = a === undefined ? 1 : a;
+        if (m12 === undefined) m12 = b === undefined ? 0 : b;
+        if (m21 === undefined) m21 = c === undefined ? 0 : c;
+        if (m22 === undefined) m22 = d === undefined ? 1 : d;
+        if (m41 === undefined) m41 = e === undefined ? 0 : e;
+        if (m42 === undefined) m42 = f === undefined ? 0 : f;
+        if (!threeD) return [elements2D(m11, m12, m21, m22, m41, m42), true];
+        const flat = m13 === 0 && m14 === 0 && m23 === 0 && m24 === 0 && m31 === 0 &&
+            m32 === 0 && m34 === 0 && m43 === 0 && m33 === 1 && m44 === 1;
+        if (is2D === true && !flat) throw new TypeError("A 2D DOMMatrixInit has 3D members");
+        if (is2D === undefined) is2D = flat;
+        if (is2D) return [elements2D(m11, m12, m21, m22, m41, m42), true];
+        return [[m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42, m43, m44], false];
+    }
+    // #create-a-dommatrix-from-the-dictionary.
+    function matrixFromInit(value, writable = true) {
+        const init = matrixInit(value, true);
+        return createMatrix(init[0], init[1], writable);
+    }
+    function matrixFromArray(array, name, writable) {
+        // Web IDL #js-buffer-source-types: exactly that typed array type,
+        // not backed by a SharedArrayBuffer.
+        if (geometryApply(geometryTypedName, array, []) !== name)
+            throw new TypeError("Expected a " + name);
+        geometryApply(geometryBufferLength, geometryApply(geometryTypedBuffer, array, []), []);
+        const length = geometryApply(geometryTypedLength, array, []), values = [];
+        for (let i = 0; i < length; i++) values[i] = array[i];
+        if (length === 6) return createMatrix(elements2D(values[0], values[1], values[2], values[3], values[4], values[5]), true, writable);
+        if (length === 16) return createMatrix(values, false, writable);
+        throw new TypeError(name + " must have 6 or 16 elements");
+    }
+    // The DOMMatrixReadOnly(init) and DOMMatrix(init) constructor steps.
+    function constructMatrix(object, init, writable) {
+        if (init === undefined) return initMatrix(object, elements2D(1, 0, 0, 1, 0, 0), true, writable);
+        // Web IDL #es-union: an iterable object is the sequence, anything
+        // else (including another matrix) is converted to a DOMString.
+        if ((typeof init === "object" && init !== null) || typeof init === "function") {
+            const method = init[geometryIterator];
+            if (method !== undefined && method !== null) {
+                if (typeof method !== "function") throw new TypeError("@@iterator is not callable");
+                const iterator = geometryApply(method, init, []);
+                if ((typeof iterator !== "object" || iterator === null) && typeof iterator !== "function")
+                    throw new TypeError("Iterator result is not an object");
+                const next = iterator.next, values = [];
+                for (;;) {
+                    const step = geometryApply(next, iterator, []);
+                    if ((typeof step !== "object" || step === null) && typeof step !== "function")
+                        throw new TypeError("Iterator result is not an object");
+                    if (step.done) break;
+                    values[values.length] = +step.value;
+                }
+                if (values.length === 6)
+                    return initMatrix(object, elements2D(values[0], values[1], values[2], values[3], values[4], values[5]), true, writable);
+                if (values.length === 16) return initMatrix(object, values, false, writable);
+                throw new TypeError("DOMMatrix sequences have 6 or 16 elements");
+            }
+        }
+        const text = `${init}`;
+        if (!geometryWindow) throw new TypeError("DOMMatrix strings are parsed only in a Window");
+        const parsed = parseTransformList(text);
+        if (parsed === null)
+            throw geometryDOMException("Failed to parse '" + text + "'.", "SyntaxError");
+        const values = [];
+        for (let i = 0; i < 16; i++) values[i] = parsed[i + 1];
+        return initMatrix(object, values, parsed[0], writable);
+    }
+    function isIdentityMatrix(m) {
+        return m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 0 && m[4] === 0 &&
+            m[5] === 1 && m[6] === 0 && m[7] === 0 && m[8] === 0 && m[9] === 0 &&
+            m[10] === 1 && m[11] === 0 && m[12] === 0 && m[13] === 0 && m[14] === 0 && m[15] === 1;
+    }
+    function copyMatrix(value) {
+        const state = matrixState(value, false);
+        return createMatrix(state.m, state.is2D, true);
+    }
+    function idlNumber(value, fallback) { return value === undefined ? fallback : +value; }
+    // The mutable transformation methods, shared by the immutable ones.
+    function translateSelf(state, tx, ty, tz) {
+        translateElements(state.m, tx, ty, tz);
+        if (tz !== 0) state.is2D = false;
+    }
+    function scaleSelf(state, sx, sy, sz, ox, oy, oz) {
+        translateSelf(state, ox, oy, oz);
+        scaleElements(state.m, sx, sy === undefined ? sx : sy, sz);
+        translateSelf(state, -ox, -oy, -oz);
+        if (sz !== 1) state.is2D = false;
+    }
+    function scale3dSelf(state, scale, ox, oy, oz) {
+        translateSelf(state, ox, oy, oz);
+        scaleElements(state.m, scale, scale, scale);
+        translateSelf(state, -ox, -oy, -oz);
+        if (scale !== 1) state.is2D = false;
+    }
+    function rotateSelf(state, rx, ry, rz) {
+        if (ry === undefined && rz === undefined) { rz = rx; rx = 0; ry = 0; }
+        if (ry === undefined) ry = 0;
+        if (rz === undefined) rz = 0;
+        if (rx !== 0 || ry !== 0) state.is2D = false;
+        rotateElements(state.m, 0, 0, 1, rz);
+        rotateElements(state.m, 0, 1, 0, ry);
+        rotateElements(state.m, 1, 0, 0, rx);
+    }
+    function rotateFromVectorSelf(state, x, y) {
+        // The clockwise angle from (1, 0) to (x, y); 0 for a zero vector.
+        rotateElements(state.m, 0, 0, 1, x === 0 && y === 0 ? 0 : geometryAtan2(y, x) * 180 / geometryPI);
+    }
+    function rotateAxisAngleSelf(state, x, y, z, angle) {
+        rotateElements(state.m, x, y, z, angle);
+        if (x !== 0 || y !== 0) state.is2D = false;
+    }
+    function skewSelf(state, degrees, vertical) {
+        const m = state.m, t = geometryTan(degrees * geometryPI / 180);
+        if (t === 0) return;
+        for (let row = 0; row < 4; row++) {
+            if (vertical) m[row] = m[row] + m[4 + row] * t;
+            else m[4 + row] = m[row] * t + m[4 + row];
+        }
+    }
+    // #dom-dommatrix-multiplyself / #dom-dommatrix-premultiplyself, given
+    // the other matrix's converted [elements, is2D].
+    function multiplySelf(state, init, pre) {
+        if (pre) preMultiply(state.m, init[0]);
+        else postMultiply(state.m, init[0]);
+        if (!init[1]) state.is2D = false;
+    }
+    function flipSelf(state, column) {
+        const m = state.m;
+        for (let row = 0; row < 4; row++) m[column * 4 + row] *= -1;
+    }
+    function setMatrixValue(state, transformList) {
+        const text = `${transformList}`;
+        const parsed = parseTransformList(text);
+        if (parsed === null)
+            throw geometryDOMException("Failed to parse '" + text + "'.", "SyntaxError");
+        state.is2D = parsed[0];
+        for (let i = 0; i < 16; i++) state.m[i] = parsed[i + 1];
+    }
+    class DOMMatrixReadOnly {
+        constructor(init = undefined) { constructMatrix(this, init, false); }
+        static fromMatrix(other = {}) { return matrixFromInit(other, false); }
+        static fromFloat32Array(array32) { return matrixFromArray(array32, "Float32Array", false); }
+        static fromFloat64Array(array64) { return matrixFromArray(array64, "Float64Array", false); }
+        get is2D() { return matrixState(this, false).is2D; }
+        get isIdentity() { return isIdentityMatrix(matrixState(this, false).m); }
+        translate(tx = 0, ty = 0, tz = 0) {
+            matrixState(this, false);
+            const x = +tx, y = +ty, z = +tz, result = copyMatrix(this);
+            translateSelf(matrixState(result, true), x, y, z);
+            return result;
+        }
+        scale(scaleX = 1, scaleY = undefined, scaleZ = 1, originX = 0, originY = 0, originZ = 0) {
+            matrixState(this, false);
+            const sx = +scaleX, sy = idlNumber(scaleY, sx), sz = +scaleZ;
+            const ox = +originX, oy = +originY, oz = +originZ, result = copyMatrix(this);
+            scaleSelf(matrixState(result, true), sx, sy, sz, ox, oy, oz);
+            return result;
+        }
+        scaleNonUniform(scaleX = 1, scaleY = 1) {
+            matrixState(this, false);
+            const sx = +scaleX, sy = +scaleY, result = copyMatrix(this);
+            scaleSelf(matrixState(result, true), sx, sy, 1, 0, 0, 0);
+            return result;
+        }
+        scale3d(scale = 1, originX = 0, originY = 0, originZ = 0) {
+            matrixState(this, false);
+            const s = +scale, ox = +originX, oy = +originY, oz = +originZ, result = copyMatrix(this);
+            scale3dSelf(matrixState(result, true), s, ox, oy, oz);
+            return result;
+        }
+        rotate(rotX = 0, rotY = undefined, rotZ = undefined) {
+            matrixState(this, false);
+            const x = +rotX, y = idlNumber(rotY), z = idlNumber(rotZ), result = copyMatrix(this);
+            rotateSelf(matrixState(result, true), x, y, z);
+            return result;
+        }
+        rotateFromVector(x = 0, y = 0) {
+            matrixState(this, false);
+            const vx = +x, vy = +y, result = copyMatrix(this);
+            rotateFromVectorSelf(matrixState(result, true), vx, vy);
+            return result;
+        }
+        rotateAxisAngle(x = 0, y = 0, z = 0, angle = 0) {
+            matrixState(this, false);
+            const vx = +x, vy = +y, vz = +z, a = +angle, result = copyMatrix(this);
+            rotateAxisAngleSelf(matrixState(result, true), vx, vy, vz, a);
+            return result;
+        }
+        skewX(sx = 0) {
+            matrixState(this, false);
+            const degrees = +sx, result = copyMatrix(this);
+            skewSelf(matrixState(result, true), degrees, false);
+            return result;
+        }
+        skewY(sy = 0) {
+            matrixState(this, false);
+            const degrees = +sy, result = copyMatrix(this);
+            skewSelf(matrixState(result, true), degrees, true);
+            return result;
+        }
+        multiply(other = {}) {
+            matrixState(this, false);
+            const init = matrixInit(other, true), result = copyMatrix(this);
+            multiplySelf(matrixState(result, true), init, false);
+            return result;
+        }
+        flipX() {
+            const result = copyMatrix(this);
+            flipSelf(matrixState(result, true), 0);
+            return result;
+        }
+        flipY() {
+            const result = copyMatrix(this);
+            flipSelf(matrixState(result, true), 1);
+            return result;
+        }
+        inverse() {
+            const result = copyMatrix(this);
+            invertElements(matrixState(result, true));
+            return result;
+        }
+        transformPoint(point = {}) {
+            matrixState(this, false);
+            const p = pointInit(point);
+            return transformPoint(this, p[0], p[1], p[2], p[3]);
+        }
+        toFloat32Array() { return new GeometryFloat32(matrixState(this, false).m); }
+        toFloat64Array() { return new GeometryFloat64(matrixState(this, false).m); }
+        toJSON() {
+            // [Default] toJSON: the attributes' values as own data properties.
+            const state = matrixState(this, false), m = state.m;
+            return { a: m[0], b: m[1], c: m[4], d: m[5], e: m[12], f: m[13],
+                m11: m[0], m12: m[1], m13: m[2], m14: m[3], m21: m[4], m22: m[5], m23: m[6], m24: m[7],
+                m31: m[8], m32: m[9], m33: m[10], m34: m[11], m41: m[12], m42: m[13], m43: m[14], m44: m[15],
+                is2D: state.is2D, isIdentity: isIdentityMatrix(m) };
+        }
+        toString() {
+            // #dommatrixreadonly-stringification-behavior.
+            const state = matrixState(this, false), m = state.m;
+            for (let i = 0; i < 16; i++)
+                if (!geometryFinite(m[i]))
+                    throw geometryDOMException("Cannot stringify a matrix with non-finite elements.", "InvalidStateError");
+            const values = state.is2D ? [m[0], m[1], m[4], m[5], m[12], m[13]] : m;
+            let text = state.is2D ? "matrix(" : "matrix3d(";
+            for (let i = 0; i < values.length; i++) text += (i ? ", " : "") + values[i];
+            return text + ")";
+        }
+    }
+    class DOMMatrix {
+        constructor(init = undefined) { constructMatrix(this, init, true); }
+        static fromMatrix(other = {}) { return matrixFromInit(other, true); }
+        static fromFloat32Array(array32) { return matrixFromArray(array32, "Float32Array", true); }
+        static fromFloat64Array(array64) { return matrixFromArray(array64, "Float64Array", true); }
+        multiplySelf(other = {}) {
+            const state = matrixState(this, true);
+            multiplySelf(state, matrixInit(other, true), false);
+            return this;
+        }
+        preMultiplySelf(other = {}) {
+            const state = matrixState(this, true);
+            multiplySelf(state, matrixInit(other, true), true);
+            return this;
+        }
+        translateSelf(tx = 0, ty = 0, tz = 0) {
+            const state = matrixState(this, true), x = +tx, y = +ty, z = +tz;
+            translateSelf(state, x, y, z);
+            return this;
+        }
+        scaleSelf(scaleX = 1, scaleY = undefined, scaleZ = 1, originX = 0, originY = 0, originZ = 0) {
+            const state = matrixState(this, true), sx = +scaleX, sy = idlNumber(scaleY, sx), sz = +scaleZ;
+            const ox = +originX, oy = +originY, oz = +originZ;
+            scaleSelf(state, sx, sy, sz, ox, oy, oz);
+            return this;
+        }
+        scale3dSelf(scale = 1, originX = 0, originY = 0, originZ = 0) {
+            const state = matrixState(this, true), s = +scale, ox = +originX, oy = +originY, oz = +originZ;
+            scale3dSelf(state, s, ox, oy, oz);
+            return this;
+        }
+        rotateSelf(rotX = 0, rotY = undefined, rotZ = undefined) {
+            const state = matrixState(this, true), x = +rotX, y = idlNumber(rotY), z = idlNumber(rotZ);
+            rotateSelf(state, x, y, z);
+            return this;
+        }
+        rotateFromVectorSelf(x = 0, y = 0) {
+            const state = matrixState(this, true), vx = +x, vy = +y;
+            rotateFromVectorSelf(state, vx, vy);
+            return this;
+        }
+        rotateAxisAngleSelf(x = 0, y = 0, z = 0, angle = 0) {
+            const state = matrixState(this, true), vx = +x, vy = +y, vz = +z, a = +angle;
+            rotateAxisAngleSelf(state, vx, vy, vz, a);
+            return this;
+        }
+        skewXSelf(sx = 0) {
+            const state = matrixState(this, true), degrees = +sx;
+            skewSelf(state, degrees, false);
+            return this;
+        }
+        skewYSelf(sy = 0) {
+            const state = matrixState(this, true), degrees = +sy;
+            skewSelf(state, degrees, true);
+            return this;
+        }
+        invertSelf() { invertElements(matrixState(this, true)); return this; }
+        setMatrixValue(transformList) {
+            const state = matrixState(this, true);
+            if (arguments.length < 1) throw new TypeError("setMatrixValue requires 1 argument");
+            setMatrixValue(state, transformList);
+            return this;
+        }
+    }
+    const matrixReadOnlyPrototype = DOMMatrixReadOnly.prototype, matrixPrototype = DOMMatrix.prototype;
+    // The class bodies' members, re-appended after the element attributes so
+    // each prototype lists its attributes before its operations (IDL order).
+    const matrixMembers = [[matrixReadOnlyPrototype, geometryKeys(matrixReadOnlyPrototype)],
+        [matrixPrototype, geometryKeys(matrixPrototype)]];
+    Object.setPrototypeOf(DOMMatrix, DOMMatrixReadOnly);
+    Object.setPrototypeOf(matrixPrototype, matrixReadOnlyPrototype);
+    // The 16 elements and their 2D aliases, in IDL order (a..f, m11..m44).
+    // Setting a 3D element to anything but its identity value makes the
+    // matrix 3D (#dom-dommatrix-m13 and friends).
+    for (const [name, index] of [...MATRIX_ALIASES, ...MATRIX_ELEMENTS.map((name, index) => [name, index])]) {
+        const identityValue = index === 10 || index === 15 ? 1 : 0;
+        const planar = index === 0 || index === 1 || index === 4 || index === 5 || index === 12 || index === 13;
+        const readonly = { get [name]() { return matrixState(this, false).m[index]; } };
+        const writable = {
+            get [name]() { return matrixState(this, false).m[index]; },
+            set [name](value) {
+                const state = matrixState(this, true), number = +value;
+                state.m[index] = number;
+                if (!planar && number !== identityValue) state.is2D = false;
+            },
+        };
+        geometryDefine(matrixReadOnlyPrototype, name, { get: geometryOwn(readonly, name).get, enumerable: true, configurable: true });
+        const descriptor = geometryOwn(writable, name);
+        geometryDefine(matrixPrototype, name, { get: descriptor.get, set: descriptor.set, enumerable: true, configurable: true });
+    }
+    for (const [target, names] of matrixMembers) {
+        for (const name of names) {
+            if (name === "constructor") continue;
+            const descriptor = geometryOwn(target, name);
+            delete target[name];
+            geometryDefine(target, name, descriptor);
+        }
+    }
+    if (!geometryWindow) {
+        // [Exposed=Window] stringifier and setMatrixValue().
+        delete matrixReadOnlyPrototype.toString;
+        delete matrixPrototype.setMatrixValue;
+    }
+    // Web IDL #interface-prototype-object: operations and attributes are
+    // enumerable, as are static operations.
+    for (const C of [DOMPointReadOnly, DOMPoint, DOMQuad, DOMMatrixReadOnly, DOMMatrix]) {
+        for (const target of [C.prototype, C]) {
+            for (const name of geometryKeys(target)) {
+                if (name === "constructor" || name === "prototype" || name === "length" || name === "name") continue;
+                const descriptor = geometryOwn(target, name);
+                descriptor.enumerable = true;
+                geometryDefine(target, name, descriptor);
+            }
+        }
+        geometryDefine(g, C.name, { value: C, writable: true, configurable: true });
+    }
+    // HTML #dom-context-2d-gettransform: a new 2D DOMMatrix.
+    function createDOMMatrix2D(a, b, c, d, e, f) {
+        return createMatrix(elements2D(a, b, c, d, e, f), true, true);
+    }
+    // Geometry 1 #structured-serialization for the shared codec, read from
+    // internal slots alone. A 2D matrix serializes only its six 2D elements.
+    g.__geometry_codec[3] = {
+        state(value) {
+            const record = geometrySlots(value, false);
+            if (!record) return null;
+            const point = record.domPoint, quad = record.domQuad, matrix = record.domMatrix;
+            if (point) return [point.writable ? "DP" : "DPO", point.x, point.y, point.z, point.w];
+            if (quad) return ["DQ", quad[0], quad[1], quad[2], quad[3]];
+            if (!matrix) return null;
+            const m = matrix.m, tag = matrix.writable ? "DM" : "DMO";
+            if (matrix.is2D) return [tag, true, m[0], m[1], m[4], m[5], m[12], m[13]];
+            const node = [tag, false];
+            for (let i = 0; i < 16; i++) node[i + 2] = m[i];
+            return node;
+        },
+        point(x, y, z, w, writable) {
+            return initPoint(geometryCreate(writable ? pointPrototype : pointReadOnlyPrototype), x, y, z, w, writable);
+        },
+        quad(p1, p2, p3, p4) {
+            pointState(p1, true); pointState(p2, true); pointState(p3, true); pointState(p4, true);
+            return initQuad(geometryCreate(quadPrototype), p1, p2, p3, p4);
+        },
+        matrix(values, is2D, writable) {
+            return createMatrix(is2D ? elements2D(values[0], values[1], values[2], values[3], values[4], values[5])
+                : values, !!is2D, writable);
+        },
+    };
     /*__GEOMETRY_END__*/
-    // LegacyWindowAlias does not expose SVGRect in a Worker.
-    Object.defineProperty(g, 'SVGRect', {value:DOMRect, writable:true, configurable:true});
+    // LegacyWindowAlias (Geometry 1 §3, §2, §6) exposes SVGRect, SVGPoint,
+    // SVGMatrix and WebKitCSSMatrix only in a Window: the same interface
+    // objects as DOMRect, DOMPoint and DOMMatrix.
+    for (const [alias, constructor] of [["SVGRect", DOMRect], ["SVGPoint", DOMPoint],
+            ["SVGMatrix", DOMMatrix], ["WebKitCSSMatrix", DOMMatrix]])
+        Object.defineProperty(g, alias, {value:constructor, writable:true, configurable:true});
 
     // --- node wrappers, identity-cached so wrap(id) === wrap(id) ---
     // Web IDL converts an interface value back to the JavaScript object that
@@ -8410,6 +9147,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             canvasOwner(this);
             if (arguments.length > 1) { canvasCall(this,"setTransform",canvasNumbers(arguments,6)); return; }
             canvasCall(this,"setTransform",canvasMatrix(a));
+        }
+        // HTML #dom-context-2d-gettransform: a new DOMMatrix copying the
+        // current transformation matrix.
+        getTransform() {
+            const t = canvasCall(this,"getTransform");
+            return createDOMMatrix2D(t[0], t[1], t[2], t[3], t[4], t[5]);
         }
         resetTransform() { canvasCall(this,"setTransform",[1,0,0,1,0,0]); }
         arcTo(x1,y1,x2,y2,radius) {
@@ -20633,7 +21376,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const rectangleCodec = G.__geometry_codec;
         delete G.__geometry_codec;
         const rectangleState = rectangleCodec[0], cloneMutableRect = rectangleCodec[1];
-        const cloneReadonlyRect = rectangleCodec[2];
+        const cloneReadonlyRect = rectangleCodec[2], geometryCodec = rectangleCodec[3];
         G.__sc_bitmap_codec = api => { bitmapCodec = api; };
         const messagePortBrand = G.__message_port_brand;
         delete G.__message_port_brand;
@@ -20780,6 +21523,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (rectangle) return [rectangle[0] ? "DR" : "DRO",
                 enc(rectangle[1], heap, seen, forStorage), enc(rectangle[2], heap, seen, forStorage),
                 enc(rectangle[3], heap, seen, forStorage), enc(rectangle[4], heap, seen, forStorage)];
+            // DOMPoint(ReadOnly), DOMQuad (sub-serializing its points) and
+            // DOMMatrix(ReadOnly); a matrix's is 2D flag stays a boolean.
+            const geometry = geometryCodec.state(v);
+            if (geometry) {
+                const node = [geometry[0]];
+                for (let i = 1; i < geometry.length; i++)
+                    node.push(typeof geometry[i] === "boolean" ? geometry[i] : enc(geometry[i], heap, seen, forStorage));
+                return node;
+            }
             if (messagePortBrand && messagePortBrand(v)) throw dce("An untransferred MessagePort");
             if (wasmClone) {
                 const module = wasmClone.serialize(v, forStorage);
@@ -20869,6 +21621,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 case "DR": case "DRO":
                     return (node[0] === "DR" ? cloneMutableRect : cloneReadonlyRect)(
                         decRef(node[1]), decRef(node[2]), decRef(node[3]), decRef(node[4]));
+                case "DP": case "DPO":
+                    return geometryCodec.point(decRef(node[1]), decRef(node[2]), decRef(node[3]),
+                        decRef(node[4]), node[0] === "DP");
+                case "DM": case "DMO": {
+                    const values = [];
+                    for (let i = 2; i < node.length; i++) values.push(decRef(node[i]));
+                    return geometryCodec.matrix(values, node[1], node[0] === "DM");
+                }
                 case "R": return new RegExp(node[1], node[2]);
                 case "M": return new Map();
                 case "S": return new Set();
@@ -20922,9 +21682,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 else if (n[0] === "DV") built[i] = new DataView(decRef(n[1], built), n[2], n[3]);
             }
             // ImageData's typed-array referent now exists, including shared graph identity.
+            // A DOMQuad's sub-deserialized points were built in pass 1.
             for (i = 0; i < heap.length; i++) {
                 const n = heap[i];
-                if (n[0] === "ID") built[i] = new ImageData(decRef(n[1], built), n[2], n[3], { colorSpace: n[4], pixelFormat: n[5] });
+                if (n[0] === "DQ") built[i] = geometryCodec.quad(decRef(n[1], built), decRef(n[2], built),
+                    decRef(n[3], built), decRef(n[4], built));
+                else if (n[0] === "ID") built[i] = new ImageData(decRef(n[1], built), n[2], n[3], { colorSpace: n[4], pixelFormat: n[5] });
                 else if (n[0] === "IB") {
                     const record = Object.create(null);
                     record[0] = n[2]; record[1] = n[3]; record[2] = decRef(n[1], built);

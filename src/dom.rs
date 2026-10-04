@@ -48,6 +48,12 @@ pub(crate) use style_records::BoxContext;
 pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
     properties::transform_number(text, angle, percentage)
 }
+
+/// Geometry 1 #dommatrix-parse: a `transform` value as column-major m11..m44
+/// and whether it is two-dimensional.
+pub(crate) fn css_transform_list_matrix(text: &str) -> Option<([f64; 16], bool)> {
+    properties::transform_list_matrix(text)
+}
 mod animations;
 mod rule_index;
 pub(crate) mod shadow;

@@ -8596,6 +8596,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__match_media", 3, host_match_media),
     ("__dom_rect", 1, guarded_rect),
     ("__geometry_bind", 2, geometry_host::bind),
+    ("__geometry_parse_matrix", 1, geometry_host::parse_matrix),
     ("__dom_elements_from_point", 5, guarded_elements_from_point),
     ("__dom_scroll_get", 2, guarded_scroll_get),
     ("__dom_scroll_set", 3, guarded_scroll_set),
@@ -18343,6 +18344,67 @@ mod tests {
     }
 
     #[test]
+    fn geometry_points_quads_and_matrices_follow_their_idl() {
+        // Geometry Interfaces 1 §2, §5, §6: internal-slot state, the 2D/3D
+        // matrix model, the transform methods, CSS transform-list parsing in
+        // a Window only, the stringifier and structured serialization.
+        // Values match Chromium's, except that the spec (unlike Chromium)
+        // makes rotateZ() three-dimensional and treats an undefined scaleY
+        // as missing.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const m = new DOMMatrix('scale(2) translateX(5px) translateY(calc(2 * 2.5px))');\n\
+                 const q = new DOMQuad({x: 40, y: 25}, {x: 180, y: 8}, {x: 210, y: 150}, {x: 10, y: 180});\n\
+                 const b = q.getBounds();\n\
+                 const errors = [() => new DOMMatrix('translateX(5em)'), () => new DOMMatrix([1, 2, 3]),\n\
+                   () => String(new DOMMatrix([NaN, 0, 0, 1, 0, 0])), () => new DOMMatrix().multiply({a: 1, m11: 2}),\n\
+                   () => DOMMatrix.prototype.translateSelf.call(new DOMMatrixReadOnly())]\n\
+                   .map(f => { try { f(); return 'none'; } catch (e) { return e.name; } });\n\
+                 const c = structuredClone([new DOMMatrixReadOnly([1, 2, 3, 4, 5, 6]), q, new DOMPoint(1, 2, 3, 4)]);\n\
+                 [String(m), m.is2D, m.isIdentity, new DOMMatrix('rotateZ(90deg)').is2D,\n\
+                  String(new DOMMatrix().rotate(90)), String(new DOMMatrix([1, 2, 3, 4, 5, 6]).inverse()),\n\
+                  String(new DOMMatrix().scale(2, undefined, 3, 1, 2, 3)),\n\
+                  new DOMMatrix().translate(1, 2, 3).is2D, String(new DOMMatrix().scale3d(2)),\n\
+                  String(DOMMatrix.fromFloat32Array(new Float32Array([1, 0, 0, 1, 7, 8]))),\n\
+                  new DOMMatrix().invertSelf().isIdentity, new DOMMatrix([0, 0, 0, 0, 0, 0]).inverse().is2D,\n\
+                  new DOMPoint(1, 2).matrixTransform({e: 3, f: 4}).x, m.transformPoint({x: 1, y: 1}).y,\n\
+                  b.x, b.y, b.width, b.height, tag(b), q.p1 === q.p1, JSON.stringify(DOMQuad.fromRect({width: 2}).p2),\n\
+                  Object.keys(new DOMMatrix().toJSON()).length, errors.join(' '),\n\
+                  tag(new DOMPointReadOnly()), tag(new DOMMatrix()), WebKitCSSMatrix === DOMMatrix,\n\
+                  SVGMatrix === DOMMatrix, SVGPoint === DOMPoint, tag(DOMMatrixReadOnly.fromMatrix()),\n\
+                  c.map(tag).join(' '), c[0].f, c[1].p3.x, c[2].w,\n\
+                  new DOMMatrix().setMatrixValue('perspective(none)').is2D, DOMMatrix.length,\n\
+                  Object.getOwnPropertyDescriptor(DOMMatrix.prototype, 'a').enumerable].join('|')"
+            ),
+            "matrix(2, 0, 0, 2, 10, 10)|true|false|false|matrix(0, 1, -1, 0, 0, 0)|\
+             matrix(-2, 1, 1.5, -0.5, 1, -2)|\
+             matrix3d(2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 3, 0, -1, -2, -6, 1)|false|\
+             matrix3d(2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1)|matrix(1, 0, 0, 1, 7, 8)|true|false|\
+             4|12|10|8|200|172|DOMRect|true|{\"x\":2,\"y\":0,\"z\":0,\"w\":1}|24|\
+             SyntaxError TypeError InvalidStateError TypeError TypeError|\
+             DOMPointReadOnly|DOMMatrix|true|true|true|DOMMatrixReadOnly|\
+             DOMMatrixReadOnly DOMQuad DOMPoint|6|210|4|false|0|true"
+        );
+        // [Exposed=Window] stringifier and setMatrixValue(); only a Window
+        // parses CSS transform lists.
+        let mut worker = worker_platform_engine();
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 let thrown; try { new DOMMatrix('matrix(1, 0, 0, 1, 0, 0)'); } catch (e) { thrown = e.name; }\n\
+                 [thrown, String(new DOMMatrix()), 'setMatrixValue' in DOMMatrix.prototype,\n\
+                  typeof WebKitCSSMatrix, typeof SVGPoint, tag(new DOMQuad()),\n\
+                  new DOMMatrix([1, 2, 3, 4, 5, 6]).translate(1, 2).e].join('|')"
+            ),
+            "TypeError|[object DOMMatrix]|false|undefined|undefined|DOMQuad|12"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or
@@ -20233,7 +20295,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 193, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 194, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -20244,7 +20306,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 193);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 194);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
