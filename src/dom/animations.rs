@@ -1548,7 +1548,7 @@ impl Dom {
             self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
             self.invalidate_transition_layout(&layout);
             self.hidden_cache.get_mut().slots.clear();
-            self.geometry_dirty_attributed = false;
+            self.unattributed_geometry_change();
             self.dirty_attributed = false;
             self.animations.layout_pending = true;
         }

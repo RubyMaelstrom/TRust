@@ -949,7 +949,7 @@ impl Dom {
                 .collect::<FxHashSet<_>>();
             self.invalidate_transition_layout(&changed.into_iter().collect::<Vec<_>>());
             self.hidden_cache.get_mut().slots.clear();
-            self.geometry_dirty_attributed = false;
+            self.unattributed_geometry_change();
             self.dirty_attributed = false;
             self.dirty = true;
         }
