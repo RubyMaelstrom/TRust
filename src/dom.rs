@@ -2289,9 +2289,17 @@ impl Dom {
     /// dirties the epoch but records no target and does NOT force a full relayout.
     /// `changed` names the inserted/removed nodes (empty when unknown).
     fn touch_content(&mut self, id: Option<NodeId>, changed: &[NodeId]) {
-        // Conservatively includes text-only changes; every element-tree
-        // insertion, removal, replacement and adoption passes this boundary.
-        self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
+        // Every element-tree insertion, removal, replacement and adoption
+        // passes this boundary. HTML #dom-window-nameditem's supported names
+        // and their tree order change only when an inserted or removed subtree
+        // holds a candidate element; unknown changes stay conservative.
+        if changed.is_empty()
+            || changed
+                .iter()
+                .any(|&node| self.subtree_has_window_name(node))
+        {
+            self.window_names_epoch = self.window_names_epoch.wrapping_add(1);
+        }
         if let Some(parent) = id {
             if self.tag_name(parent) == Some("style") {
                 self.reset_cssom_sheet(parent);
@@ -6751,19 +6759,33 @@ impl Dom {
         document: NodeId,
     ) -> impl Iterator<Item = (NodeId, bool, &str, &str)> {
         self.descendants(document).filter_map(move |node| {
-            let tag = self.tag_name(node)?;
-            let html = self.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml");
-            let frame = html && matches!(tag, "iframe" | "frame");
-            let id = self.attr(node, "id").unwrap_or("");
-            let name = if html && matches!(tag, "embed" | "form" | "img" | "object") {
-                self.attr(node, "name").unwrap_or("")
-            } else {
-                ""
-            };
-            (frame || !id.is_empty() || !name.is_empty())
-                .then_some((node, frame, id, name))
+            self.window_name_candidate(node)
                 .filter(|_| self.tree_scope(node) == document)
         })
+    }
+
+    /// `node` as a `window_named_items` record when it is an element that
+    /// can supply a name: a navigable container, an id, or a legacy name.
+    fn window_name_candidate(&self, node: NodeId) -> Option<(NodeId, bool, &str, &str)> {
+        let tag = self.tag_name(node)?;
+        let html = self.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml");
+        let frame = html && matches!(tag, "iframe" | "frame");
+        let id = self.attr(node, "id").unwrap_or("");
+        let name = if html && matches!(tag, "embed" | "form" | "img" | "object") {
+            self.attr(node, "name").unwrap_or("")
+        } else {
+            ""
+        };
+        (frame || !id.is_empty() || !name.is_empty()).then_some((node, frame, id, name))
+    }
+
+    /// Whether `root` or a node below it in any tree reachable through child
+    /// links can be a `window_named_items` record.
+    fn subtree_has_window_name(&self, root: NodeId) -> bool {
+        self.is_valid(root)
+            && std::iter::once(root)
+                .chain(self.descendants(root))
+                .any(|node| self.window_name_candidate(node).is_some())
     }
 }
 
