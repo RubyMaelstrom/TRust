@@ -28351,6 +28351,46 @@ mod tests {
     }
 
     #[test]
+    fn html_global_attributes_reflect_access_key_autofocus_and_dir() {
+        // HTML #dom-accesskey, #dom-fe-autofocus, #dom-dir and
+        // #dom-document-dir (local whatwg/html@e5071a2): DOMString, boolean
+        // and limited-to-only-known-values enumerated reflection.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                const div = document.createElement('div');
+                const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                const results = [JSON.stringify(div.accessKey), div.autofocus, svg.autofocus, JSON.stringify(div.dir)];
+                div.accessKey = null; div.autofocus = 1; svg.autofocus = true;
+                results.push(div.getAttribute('accesskey'), div.getAttribute('autofocus') === '',
+                    svg.hasAttribute('autofocus'));
+                div.autofocus = 0;
+                results.push(div.hasAttribute('autofocus'));
+                for (const value of ['LTR', 'rtl', 'Auto', 'foo', '', 'ltr ']) {
+                    div.setAttribute('dir', value);
+                    results.push(JSON.stringify(div.dir));
+                }
+                div.dir = 'RTL';
+                results.push(div.getAttribute('dir'));
+                if (document.documentElement) document.documentElement.remove();
+                document.dir = 'rtl';
+                results.push(JSON.stringify(document.dir));
+                document.appendChild(document.createElement('html')).setAttribute('dir', 'RTL');
+                results.push(document.dir);
+                document.dir = 'bogus';
+                results.push(JSON.stringify(document.dir), document.documentElement.getAttribute('dir'));
+                const enumerable = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'accessKey').enumerable;
+                results.push(enumerable, 'autofocus' in HTMLElement.prototype && 'autofocus' in SVGElement.prototype);
+                return results.join('|');
+            })()"#
+            ),
+            "\"\"|false|false|\"\"|null|true|true|false|\"ltr\"|\"rtl\"|\"auto\"|\"\"|\"\"|\"\"|RTL|\"\"|rtl|\"\"|bogus|true|true"
+        );
+    }
+
+    #[test]
     fn aria_string_attributes_reflect_nullable_values_on_all_elements() {
         // WAI-ARIA snapshot 2f5c69b0 #ARIAMixin / #idl-reflection-attribute-values;
         // HTML #reflect and Web IDL nullable DOMString conversion.
