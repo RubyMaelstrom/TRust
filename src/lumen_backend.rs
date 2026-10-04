@@ -18505,6 +18505,45 @@ mod tests {
     }
 
     #[test]
+    fn match_media_lists_are_event_targets_reporting_changes() {
+        // CSSOM View #the-mediaquerylist-interface: matchMedia() returns a
+        // MediaQueryList (an EventTarget) whose addListener/removeListener
+        // alias change listeners, with an onchange handler; "evaluate media
+        // queries and report changes" fires MediaQueryListEvent at the lists
+        // whose matches state changed when the viewport resizes.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 globalThis.mediaLog = [];\n\
+                 globalThis.narrow = matchMedia('(max-width: 400px)');\n\
+                 const listener = e => mediaLog.push('listener:' + e.matches + ':' + tag(e) + ':' + e.isTrusted);\n\
+                 narrow.addListener(listener); narrow.addListener(listener);\n\
+                 narrow.onchange = e => mediaLog.push('handler:' + e.media);\n\
+                 let constructed; try { new MediaQueryList(); } catch (e) { constructed = e.name; }\n\
+                 const event = new MediaQueryListEvent('change', {media: 'x', matches: true});\n\
+                 [tag(narrow), narrow instanceof EventTarget, narrow.media, narrow.matches,\n\
+                  typeof narrow.onchange, constructed, event.media, event.matches, MediaQueryListEvent.length,\n\
+                  matchMedia('screen,  print').media].join('|')"
+            ),
+            "MediaQueryList|true|(max-width: 400px)|false|function|TypeError|x|true|1|screen, print"
+        );
+        assert!(
+            engine_call_trust_method(
+                &mut engine,
+                "setViewport",
+                &[Value::Num(300.0), Value::Num(200.0)]
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            string_value(&mut engine, "[narrow.matches, ...mediaLog].join('|')"),
+            "true|listener:true:MediaQueryListEvent:true|handler:(max-width: 400px)"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or
