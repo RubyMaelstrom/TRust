@@ -18303,6 +18303,46 @@ mod tests {
     }
 
     #[test]
+    fn platform_objects_report_their_interface_class_strings() {
+        // Web IDL #interface-prototype-object / #namespace-object: a
+        // @@toStringTag data property names each interface prototype and
+        // namespace; ECMAScript objects keep the engine's tags. Values match
+        // Chromium's.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const d = Object.getOwnPropertyDescriptor(HTMLDivElement.prototype, Symbol.toStringTag);\n\
+                 [tag(HTMLDivElement.prototype), tag(document.createElement('div')),\n\
+                  tag(document.createElementNS('http://www.w3.org/2000/svg', 'svg')),\n\
+                  tag(document.createElementNS('urn:x', 'x')), tag(Element.prototype),\n\
+                  tag(new Blob([])), tag(new Event('x')), tag(new AbortController().signal),\n\
+                  tag(new URLSearchParams()), tag(new TextEncoder()), tag(console), tag(CSS),\n\
+                  tag(Image.prototype), tag(Array.prototype), tag(Error.prototype), tag(Promise.prototype),\n\
+                  d.writable, d.enumerable, d.configurable, typeof d.get].join()"
+            ),
+            "HTMLDivElement,HTMLDivElement,SVGSVGElement,Element,Element,Blob,Event,AbortSignal,\
+             URLSearchParams,TextEncoder,console,CSS,HTMLImageElement,Array,Object,Promise,\
+             false,false,true,undefined"
+        );
+        assert_eq!(
+            string_value(&mut engine, "typeof __engine_global_names"),
+            "undefined"
+        );
+        let mut worker = worker_platform_engine();
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 [tag(new Blob([])), tag(new TextDecoder()), tag(navigator), tag(new Event('x')),\n\
+                  typeof __engine_global_names].join()"
+            ),
+            "Blob,TextDecoder,WorkerNavigator,Event,undefined"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or

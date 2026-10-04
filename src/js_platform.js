@@ -1,3 +1,5 @@
+// The engine's own (ECMAScript) globals, before any platform interface.
+globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 (function () {
     "use strict";
     const g = globalThis;
@@ -5669,12 +5671,6 @@
             const slots = internalsFor(this);
             if (slots.trustNS === undefined) cacheElementName(this);
             return slots.trustNS;
-        }
-        get [Symbol.toStringTag]() {
-            return this.namespaceURI === HTML_NS ? htmlInterfaceName(this.localName)
-                : this.namespaceURI === SVG_NS ? svgInterfaceName(this.localName)
-                : this.namespaceURI === MATHML_NS ? "MathMLElement"
-                : "Element";
         }
         // NOTE: type-SPECIFIC IDL surfaces (HTMLMediaElement media state on
         // <video>/<audio>, the <canvas> 2d context, HTMLSelectElement options,
@@ -24095,6 +24091,39 @@
             return result;
         };
     }
+    /*__CLASS_STRINGS_BEGIN__*/
+    // Web IDL #interface-prototype-object and #namespace-object: every
+    // interface prototype object and namespace object has a @@toStringTag
+    // data property naming it, so Object.prototype.toString reports
+    // "[object HTMLDivElement]", "[object Blob]" or "[object console]".
+    // ECMAScript constructors keep the engine's own tags; legacy factory
+    // functions and aliases (Image, WebKitCSSMatrix) share another
+    // interface's prototype and are skipped. Each element wrapper is an
+    // instance of its own interface class, so it inherits that name.
+    (function (engineNames) {
+        const toStringTag = Symbol.toStringTag;
+        const define = Object.defineProperty, own = Object.getOwnPropertyDescriptor;
+        for (const name of Object.getOwnPropertyNames(globalThis)) {
+            if (engineNames.has(name) || !/^[A-Z]/.test(name)) continue;
+            const binding = own(globalThis, name);
+            const C = binding && binding.value;
+            if (typeof C !== "function") continue;
+            const prototype = own(C, "prototype");
+            const proto = prototype && prototype.value;
+            if (!proto || typeof proto !== "object") continue;
+            const constructor = own(proto, "constructor");
+            if (!constructor || constructor.value !== C || own(proto, toStringTag)) continue;
+            define(proto, toStringTag, {value: name, configurable: true});
+        }
+        for (const name of ["console", "CSS"]) {
+            const binding = own(globalThis, name);
+            const namespace = binding && binding.value;
+            if (namespace && typeof namespace === "object" && !own(namespace, toStringTag))
+                define(namespace, toStringTag, {value: name, configurable: true});
+        }
+    })(new Set(globalThis.__engine_global_names));
+    delete globalThis.__engine_global_names;
+    /*__CLASS_STRINGS_END__*/
     // All platform globals have now been installed. New logical Windows clone
     // this pristine descriptor surface before author script can patch it.
     initializeScopedWindowGlobals();
