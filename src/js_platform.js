@@ -5857,6 +5857,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         replaceChild(n, old) {
             if (nodeIds.get(this) === undefined) rejectAttrParent(this);
+            if (n && n.nodeType === 11 && !internalsFor(n).host) return replaceWithFragment(this, n, old);
             const prev = old.previousSibling, next = old.nextSibling;
             const oldParent = rangeParent(n), oldIndex = oldParent ? rangeIndex(n) : 0;
             // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
@@ -16925,6 +16926,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     });
     const MO_EMPTY = Object.freeze([]); // shared empty addedNodes/removedNodes (frozen ⇒ safe to share)
     let moHasChildList = false;
+    // DOM's "suppress observers flag": a compound mutation (replacing a child
+    // with a DocumentFragment) queues its own records instead of one per step.
+    let moSuppressed = 0;
     let moHasAttributes = false;
     let moHasCharacterData = false;
     let moQueued = false;        // a delivery microtask is already scheduled
@@ -16999,6 +17003,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // "childList" | "attributes" | "characterData"; oldValue is nulled per
     // observer unless one of its matching registrations asked for it (spec).
     function moNotify(rec) {
+        if (moSuppressed) return;
         // DOM #queue-a-mutation-record visits inclusive ancestors, then each
         // node's registrations. Creation order of observers is not delivery
         // order. Snapshot IDs without materializing ancestor wrappers.
@@ -17073,6 +17078,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     // Emission helpers used by the mutation wrappers. Each bails on the
     // zero-observer fast path before touching the DOM for siblings/oldValue.
+    // DOM #concept-node-replace with a DocumentFragment: the old child is
+    // removed and the fragment's children take its place. The fragment, then
+    // the parent, each get one childList record (the steps run with the
+    // suppress observers flag). The arena would otherwise insert the fragment
+    // node itself, leaving its children connected but outside the parent.
+    function replaceWithFragment(parent, fragment, old) {
+        for (let ancestor = parent; ancestor; ancestor = rangeParent(ancestor))
+            if (ancestor === fragment) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+        if (!old || !rangeSame(rangeParent(old), parent))
+            throw new DOMException("The node to be replaced is not a child of this node.", "NotFoundError");
+        const nodes = Array.from(fragment.childNodes);
+        const previous = old.previousSibling, reference = old.nextSibling;
+        moSuppressed++;
+        try {
+            parent.removeChild(old);
+            for (const node of nodes) parent.insertBefore(node, reference);
+        } finally {
+            moSuppressed--;
+        }
+        if (MO.length && moHasChildList) {
+            if (nodes.length) moNotify({ type: "childList", target: fragment, removedNodes: nodes,
+                previousSibling: null, nextSibling: null });
+            moNotify({ type: "childList", target: parent, addedNodes: nodes, removedNodes: [old],
+                previousSibling: previous, nextSibling: reference });
+        } else moEnqueue();
+        return old;
+    }
     function moChildInsert(parent, node) {        // call AFTER the insert
         if (!MO.length || !moHasChildList) { moEnqueue(); return; }
         // `__sib: node` defers prev/next-sibling capture into moNotify (resolved

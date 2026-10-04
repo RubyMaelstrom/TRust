@@ -20205,6 +20205,54 @@ mod tests {
     }
 
     #[test]
+    fn replace_child_with_a_fragment_inserts_its_children() {
+        // DOM #concept-node-replace: a DocumentFragment's children take the
+        // old child's place; with the suppress observers flag the fragment
+        // and the parent each get one childList record. CreepJS swaps every
+        // result section in this way (`replaceChild(importNode(template
+        // .content))`), and TRust inserted the fragment node itself.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const host = document.createElement('section');
+                host.innerHTML = '<i id=a></i><i id=old></i><i id=z></i>';
+                const template = document.createElement('template');
+                template.innerHTML = ' <b>1</b><u>2</u>';
+                const fragment = document.importNode(template.content, true);
+                const observer = new MutationObserver(() => {});
+                observer.observe(host, {childList: true});
+                observer.observe(fragment, {childList: true});
+                const old = host.querySelector('#old');
+                const returned = host.replaceChild(fragment, old);
+                const records = observer.takeRecords();
+                const error = callback => { try { callback(); return 'none'; } catch (e) { return e.name; } };
+                const inner = document.createDocumentFragment(), div = document.createElement('div');
+                inner.appendChild(div); div.appendChild(document.createElement('p'));
+                [returned === old, old.parentNode === null, fragment.childNodes.length,
+                 [...host.childNodes].map(n => n.nodeName).join(','),
+                 host.querySelector('b').parentNode === host, host.children.length, records.length,
+                 records[0].target === fragment && records[0].removedNodes.length === 3,
+                 records[1].target === host && records[1].addedNodes.length === 3,
+                 records[1].removedNodes[0] === old, records[1].previousSibling.id, records[1].nextSibling.id,
+                 error(() => div.replaceChild(inner, div.firstChild)),
+                 error(() => host.replaceChild(document.createDocumentFragment(), div)),
+                 error(() => host.replaceChild(document.createDocumentFragment(), host.firstChild)),
+                 host.childNodes.length].join('|')
+            "#
+                ),
+                "true|true|0|I,#text,B,U,I|true|4|2|true|true|true|a|z|\
+                 HierarchyRequestError|NotFoundError|none|4",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn live_range_registry_releases_retired_realms_and_keeps_borrowed_ranges_live() {
         // DOM #concept-live-range / live range pre-remove steps, and HTML
         // #discard-a-document: a borrowed Range stays live after destruction,
