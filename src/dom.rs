@@ -8637,20 +8637,60 @@ impl Dom {
         };
         let root = document.root_element();
         let color = self.svg_used_color(id);
+        let inherited = self.svg_inherited_paint_style(id, &color);
         let (range, style) = root
             .attributes()
             .find(|attr| attr.name() == "style")
-            .map(|attr| (attr.range(), format!("{};color:{color};", attr.value())))
+            .map(|attr| {
+                (
+                    attr.range(),
+                    format!("{};{inherited}color:{color};", attr.value()),
+                )
+            })
             .unwrap_or_else(|| {
                 (
                     root.range().start + 4..root.range().start + 4,
-                    format!("color:{color};"),
+                    format!("{inherited}color:{color};"),
                 )
             });
         let replacement = format!(" style=\"{}\"", escape_attr(&style));
         drop(document);
         svg.replace_range(range, &replacement);
         svg
+    }
+
+    /// The inherited SVG paint properties an outer `<svg>` receives from its
+    /// HTML ancestors. `fill`, `stroke` and the other properties below are
+    /// inherited (SVG 2 §13.2 and §13.5 property tables), and icon sets
+    /// commonly set `fill: currentColor` on a wrapping HTML element. The
+    /// serialized resource stands alone, so carry each inherited value the
+    /// root does not declare itself, with `currentColor` resolved as for its
+    /// descendants. Values no ancestor sets keep the renderer's initial ones.
+    fn svg_inherited_paint_style(&self, id: NodeId, color: &str) -> String {
+        let mut out = String::new();
+        for &property in SVG_INHERITED_PRESENTATION_PROPERTIES {
+            if self.cascaded(id, property).is_some() {
+                continue;
+            }
+            let set_by_ancestor =
+                std::iter::successors(self.style_parent(id), |&node| self.style_parent(node))
+                    .any(|node| self.cascaded(node, property).is_some());
+            if !set_by_ancestor {
+                continue;
+            }
+            let Some(value) = self.computed_value_resolved(id, property) else {
+                continue;
+            };
+            let value = replace_css_current_color(&value, color);
+            if value.trim().is_empty() || value.contains([';', '"']) {
+                continue;
+            }
+            out.push_str(property);
+            out.push(':');
+            out.push_str(value.trim());
+            out.push(';');
+        }
+        out
     }
 
     /// Resolve the used `color` value for an SVG element. CSS Color 4 §15.5
@@ -11135,6 +11175,25 @@ const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
     "shape-rendering",
     "stop-color",
     "stop-opacity",
+];
+
+/// The inherited members of `SVG_PRESENTATION_PROPERTIES` (SVG 2 property
+/// tables): `vector-effect`, `stop-color` and `stop-opacity` do not inherit.
+const SVG_INHERITED_PRESENTATION_PROPERTIES: &[&str] = &[
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-opacity",
+    "stroke-width",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "clip-rule",
+    "paint-order",
+    "shape-rendering",
 ];
 
 fn escape_attr(s: &str) -> Cow<'_, str> {
@@ -20457,6 +20516,40 @@ mod tests {
         assert!(
             rgba.pixels()
                 .any(|p| p[0] == 0x12 && p[1] == 0x34 && p[2] == 0x56)
+        );
+    }
+
+    #[test]
+    fn inline_svg_inherits_paint_properties_from_html_ancestors() {
+        // CSS inheritance carries `fill` and `stroke` from an HTML wrapper
+        // into the SVG (SVG 2 §13.2/§13.5): YouTube's icons set
+        // `fill: currentcolor` on a <div> around each <svg>. Chromium paints
+        // the first square white and the second as a red outline.
+        let dom = Dom::parse_document(
+            r#"<body style="color:#fff">
+               <div style="fill:currentcolor"><svg id="filled" viewBox="0 0 4 4"><path d="M0 0h4v4H0z"/></svg></div>
+               <div style="stroke:#f00;stroke-width:1px;fill:none"><svg id="outlined" viewBox="0 0 4 4"><path d="M1 1h2v2H1z"/></svg></div>
+               <svg id="plain" viewBox="0 0 4 4"><path d="M0 0h4v4H0z"/></svg></body>"#,
+        );
+        let markup = |id: &str| {
+            let (source, _) = dom
+                .svg_image_data(dom.get_by_id(id).unwrap(), None)
+                .expect("paintable SVG");
+            String::from_utf8(crate::img::decode_data_url(&source).unwrap()).unwrap()
+        };
+        let filled = markup("filled");
+        assert!(filled.contains("fill:#ffffff;"), "{filled}");
+        let outlined = markup("outlined");
+        assert!(outlined.contains("fill:none;"), "{outlined}");
+        assert!(outlined.contains("stroke:"), "{outlined}");
+        assert!(outlined.contains("stroke-width:"), "{outlined}");
+        let plain = markup("plain");
+        assert!(!plain.contains("fill:"), "no ancestor sets fill: {plain}");
+        let (image, _) = crate::img::decode(filled.as_bytes()).expect("inherited fill rasterizes");
+        let rgba = image.to_rgba8();
+        assert!(
+            rgba.pixels()
+                .any(|p| p[0] > 240 && p[1] > 240 && p[2] > 240 && p[3] > 200)
         );
     }
 
