@@ -272,6 +272,14 @@ fn main() {
 /// One page, dumped: returns whether the text is a complete picture of the page
 /// as opposed to whatever it looked like when `--timeout` expired.
 fn try_run(options: Options) -> Result<bool, Box<dyn Error>> {
+    // Warm the page engine while the runtime starts and the document is
+    // fetched. Only a click can lead this single-document dump to another
+    // navigation, so only then does a navigation warm a further spare.
+    if trust::js::enable_spare_page_engine(!options.clicks.is_empty())
+        && trust::js::start_address_may_use_page_engine(&options.address)
+    {
+        trust::js::prewarm_page_engine();
+    }
     // Multi-thread like the desktop frontend: the controller spawns fetch,
     // image, and resident-actor work on this handle and reports back over its
     // channel, so the pump loop must let those tasks advance.
