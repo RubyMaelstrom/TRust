@@ -2169,19 +2169,14 @@ impl DesktopApp {
             || self.downloads_in_flight > 0
     }
 
-    fn schedule_chrome_tick(&mut self, fast: bool) {
+    fn schedule_chrome_tick(&mut self, delay: Duration) {
         if self.chrome_tick_scheduled {
             return;
         }
         self.chrome_tick_scheduled = true;
         let proxy = self.event_proxy.clone();
         self.runtime.spawn(async move {
-            tokio::time::sleep(if fast {
-                CSS_ANIMATION_FRAME_DELAY
-            } else {
-                Duration::from_millis(120)
-            })
-            .await;
+            tokio::time::sleep(delay).await;
             let _ = proxy.send_event(DesktopEvent::ChromeTick);
         });
     }
@@ -3544,7 +3539,17 @@ impl DesktopApp {
         }
         let css_animations_active = self.css_animations_active();
         if self.chrome_loading(&snapshot) || self.heart_glide.is_some() || css_animations_active {
-            self.schedule_chrome_tick(self.heart_glide.is_some() || css_animations_active);
+            // Glides and CSS animations need every frame. The loading heart
+            // needs every frame only while it beats; between beats a slower
+            // tick still keeps the other loading chrome current.
+            let delay = if self.heart_glide.is_some() || css_animations_active {
+                CSS_ANIMATION_FRAME_DELAY
+            } else {
+                self.loading_started.map_or(LOADING_TICK_DELAY, |started| {
+                    heartbeat_tick_delay(started.elapsed())
+                })
+            };
+            self.schedule_chrome_tick(delay);
         }
         if !self.chrome_tick_scheduled
             && self.window_focused
@@ -8411,12 +8416,34 @@ fn command_target(target: &str, port: Option<u16>) -> String {
 
 /// Two restrained jewel-like impulses with a long quiet tail. Sampling stops
 /// entirely when loading does, so idle chrome has no animation clock.
+/// One heartbeat: a "lub" pulse centred at 0.10 s, a "dub" at 0.32 s, and a
+/// rest until the next beat. The pulses end by `HEARTBEAT_ACTIVE` seconds.
+const HEARTBEAT_PERIOD: f32 = 1.35;
+const HEARTBEAT_ACTIVE: f32 = 0.40;
+/// Chrome refresh while loading with nothing else animating.
+const LOADING_TICK_DELAY: Duration = Duration::from_millis(120);
+
 fn heartbeat_energy(elapsed: Duration) -> f32 {
     fn pulse(phase: f32, center: f32, half_width: f32) -> f32 {
         (1.0 - (phase - center).abs() / half_width).clamp(0.0, 1.0)
     }
-    let phase = elapsed.as_secs_f32() % 1.35;
+    let phase = elapsed.as_secs_f32() % HEARTBEAT_PERIOD;
     pulse(phase, 0.10, 0.09).max(pulse(phase, 0.32, 0.075))
+}
+
+/// When the loading heart next needs a frame. Each pulse lasts under 200 ms,
+/// so the slow loading tick alone samples one or both of them only at their
+/// edges and the double beat reads as a single flash. Draw every frame while
+/// the beat runs, and sleep until the next beat (at most the loading tick)
+/// during the rest.
+fn heartbeat_tick_delay(elapsed: Duration) -> Duration {
+    let phase = elapsed.as_secs_f32() % HEARTBEAT_PERIOD;
+    if phase < HEARTBEAT_ACTIVE {
+        CSS_ANIMATION_FRAME_DELAY
+    } else {
+        Duration::from_secs_f32(HEARTBEAT_PERIOD - phase)
+            .clamp(CSS_ANIMATION_FRAME_DELAY, LOADING_TICK_DELAY)
+    }
 }
 
 fn heart_glide_position(from: f32, to: f32, elapsed: Duration) -> (f32, bool) {
@@ -9896,6 +9923,36 @@ mod tests {
             assert!((0.0..=1.0).contains(&energy));
         }
         assert_eq!(heartbeat_energy(Duration::from_millis(800)), 0.0);
+    }
+
+    #[test]
+    fn loading_ticks_show_both_heartbeat_pulses() {
+        // Follow the scheduled ticks (plus a few ms of frame work) for three
+        // cycles: each "lub" and "dub" must be drawn near full energy, and
+        // the rest must use the slow tick.
+        let mut elapsed = Duration::ZERO;
+        let mut peaks = [[0.0f32; 2]; 3];
+        let mut frames = 0;
+        while elapsed < Duration::from_secs_f32(3.0 * HEARTBEAT_PERIOD) {
+            let phase = elapsed.as_secs_f32() % HEARTBEAT_PERIOD;
+            let cycle = (elapsed.as_secs_f32() / HEARTBEAT_PERIOD) as usize;
+            let pulse = usize::from(phase > 0.21);
+            if phase < HEARTBEAT_ACTIVE {
+                let peak = &mut peaks[cycle][pulse];
+                *peak = peak.max(heartbeat_energy(elapsed));
+            }
+            frames += 1;
+            elapsed += heartbeat_tick_delay(elapsed) + Duration::from_millis(3);
+        }
+        for cycle in peaks {
+            assert!(cycle[0] > 0.85 && cycle[1] > 0.85, "{cycle:?}");
+        }
+        // About 20 frames per beat and about 8 per rest.
+        assert!(frames < 3 * 35, "{frames} frames");
+        assert_eq!(
+            heartbeat_tick_delay(Duration::from_millis(800)),
+            LOADING_TICK_DELAY
+        );
     }
 
     #[test]
