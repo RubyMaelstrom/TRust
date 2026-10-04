@@ -10325,6 +10325,9 @@ mod tests {
         // Fetching and decoding that resource is asynchronous, so the
         // terminal adapter must retain the same activation target before and
         // after intrinsic dimensions become available.
+        // The SVG resource source carries the process-wide document-SVG
+        // navigation counter; hold it steady across both renders.
+        let _stable = crate::layout2::stable_global_layout_inputs();
         let base = Url::parse("https://example.test/").unwrap();
         let mut dom = crate::dom::Dom::parse_document(
             r##"<body><button id="close" aria-label="Close" style="width:34px;height:34px">
