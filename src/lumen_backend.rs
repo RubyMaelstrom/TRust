@@ -18429,6 +18429,43 @@ mod tests {
     }
 
     #[test]
+    fn location_is_a_location_with_unforgeable_members() {
+        // HTML #the-location-interface: every member is [LegacyUnforgeable]
+        // (own, non-configurable properties), creation adds own valueOf and
+        // @@toPrimitive, Location.prototype has no members, and a top-level
+        // document's ancestorOrigins is an empty DOMStringList. Values match
+        // Chromium's.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const href = Object.getOwnPropertyDescriptor(location, 'href');\n\
+                 const assign = Object.getOwnPropertyDescriptor(location, 'assign');\n\
+                 const primitive = Object.getOwnPropertyDescriptor(location, Symbol.toPrimitive);\n\
+                 let illegal; try { href.get.call({}); } catch (e) { illegal = e.name; }\n\
+                 let constructed; try { new Location(); } catch (e) { constructed = e.name; }\n\
+                 const origins = location.ancestorOrigins;\n\
+                 [tag(location), Object.getPrototypeOf(location) === Location.prototype,\n\
+                  Object.getOwnPropertyNames(Location.prototype).join(), href.configurable, href.enumerable,\n\
+                  href.get.name, assign.writable, assign.configurable, assign.value.length,\n\
+                  location.valueOf === Object.prototype.valueOf, primitive.value, primitive.configurable,\n\
+                  String(location) === location.href, illegal, constructed, tag(origins), origins.length,\n\
+                  origins === location.ancestorOrigins, origins.item(0), origins.contains(''),\n\
+                  Object.getOwnPropertyNames(DOMStringList.prototype).join()].join('|')"
+            ),
+            "Location|true|constructor|false|true|get href|false|false|1|true||false|true|\
+             TypeError|TypeError|DOMStringList|0|true||false|constructor,length,item,contains"
+        );
+        // DOMStringList is [Exposed=(Window,Worker)].
+        let mut worker = worker_platform_engine();
+        assert_eq!(
+            string_value(&mut worker, "typeof DOMStringList"),
+            "function"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or
