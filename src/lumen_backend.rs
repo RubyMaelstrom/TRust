@@ -13165,9 +13165,11 @@ fn run_lumen_worker(
                 pending.store(false, std::sync::atomic::Ordering::Release);
                 Ok(Value::Undefined)
             }
-            WorkerTask::Command(LumenWorkerCtl::Message(message)) => {
-                lumen_worker_internal_call(&mut engine, "message", &[Value::from_engine_text(message)])
-            }
+            WorkerTask::Command(LumenWorkerCtl::Message(message)) => lumen_worker_internal_call(
+                &mut engine,
+                "message",
+                &[Value::from_engine_text(message)],
+            ),
             WorkerTask::Command(LumenWorkerCtl::HostTask(task)) => {
                 if let Err(error) = dispatch_host_task(&mut engine, *task) {
                     send_lumen_worker_error(&events, launch.id, error);
@@ -15613,14 +15615,18 @@ fn sync_css_transitions(ctx: &mut Ctx) {
 fn host_transition_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     sync_css_transitions(ctx);
     let events = host_dom(ctx).borrow_mut().take_css_transition_events();
-    Ok(Value::from_engine_text(serde_json::to_string(&events).unwrap()))
+    Ok(Value::from_engine_text(
+        serde_json::to_string(&events).unwrap(),
+    ))
 }
 
 /// CSS Animations 2 #event-dispatch for this rendering update's sample.
 fn host_animation_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     sync_css_transitions(ctx);
     let events = host_dom(ctx).borrow_mut().take_css_animation_events();
-    Ok(Value::from_engine_text(serde_json::to_string(&events).unwrap()))
+    Ok(Value::from_engine_text(
+        serde_json::to_string(&events).unwrap(),
+    ))
 }
 
 fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<LumenGeomCache>> {

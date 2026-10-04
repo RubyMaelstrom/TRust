@@ -133,19 +133,16 @@ pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
     let mut changed = false;
     while let Some(c) = chars.next() {
         let high = c as u32;
-        if HIGH.contains(&high) {
-            if let Some(&next) = chars.peek() {
-                let low = next as u32;
-                if LOW.contains(&low) {
-                    let point = 0x10000 + ((high - 0x10F800) << 10) + (low - 0x10FC00);
-                    if let Some(character) = char::from_u32(point) {
-                        chars.next();
-                        out.push(character);
-                        changed = true;
-                        continue;
-                    }
-                }
-            }
+        if HIGH.contains(&high)
+            && let Some(&next) = chars.peek()
+            && LOW.contains(&(next as u32))
+            && let Some(character) =
+                char::from_u32(0x10000 + ((high - 0x10F800) << 10) + (next as u32 - 0x10FC00))
+        {
+            chars.next();
+            out.push(character);
+            changed = true;
+            continue;
         }
         out.push(c);
     }
@@ -20126,7 +20123,10 @@ mod tests {
         assert_eq!(display_text(&stored), "a\u{10FFFD}b\u{10F800}");
         // A lone surrogate (one scalar) and plain text stay as they are.
         assert_eq!(display_text("x\u{10F800}y"), "x\u{10F800}y");
-        assert!(matches!(display_text("plain é"), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            display_text("plain é"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
