@@ -724,6 +724,13 @@ struct TextSystem {
     color_layouts: LayoutContext<Option<[u8; 3]>>,
     page_font_epoch: u64,
     active_font_set: u64,
+    /// Contexts of recently active font sets other than `active_font_set`.
+    /// Text from different tree scopes (a page and its frame's Document, or a
+    /// shadow tree with its own `@font-face` rules) alternates between font
+    /// sets; reactivating a parked context avoids cloning a whole collection
+    /// on every switch. A set's collection never changes, and the installed
+    /// one changes only with the page font epoch, which clears these.
+    parked_fonts: Vec<(u64, FontContext)>,
     /// Shaping is pure for a fixed system-font collection and CSS text style.
     /// Inline layout asks for the same spaces, words, labels, and intrinsic
     /// probes many times; retaining those results avoids repeating font
@@ -745,6 +752,7 @@ struct TextSystem {
 // that normal working set resident so a JS geometry pass followed by a native
 // relayout does not turn FIFO eviction into a full sequential cache miss. The
 // independent byte ceiling remains the authoritative memory bound.
+const MAX_PARKED_FONT_SETS: usize = 4;
 const MAX_SHAPE_CACHE_ENTRIES: usize = 8_192;
 const MAX_SHAPE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -816,6 +824,7 @@ impl TextSystem {
             color_layouts: LayoutContext::new(),
             page_font_epoch: crate::font_system::page_font_epoch(),
             active_font_set: 0,
+            parked_fonts: Vec::new(),
             shape_cache: HashMap::new(),
             shape_order: VecDeque::new(),
             shape_cache_bytes: 0,
@@ -1129,13 +1138,22 @@ impl TextSystem {
         self.emoji_families.clear();
         self.page_font_epoch = epoch;
         self.active_font_set = 0;
+        self.parked_fonts.clear();
     }
 
     fn select_fonts(&mut self, fonts: Option<&Arc<FontSet>>) {
         self.refresh_page_fonts();
         let id = fonts.map_or(0, |fonts| fonts.id());
         if self.active_font_set != id {
-            self.fonts = fonts.map_or_else(crate::font_system::font_context, |f| f.context());
+            let next = match self.parked_fonts.iter().position(|(set, _)| *set == id) {
+                Some(index) => self.parked_fonts.remove(index).1,
+                None => fonts.map_or_else(crate::font_system::font_context, |f| f.context()),
+            };
+            let previous = std::mem::replace(&mut self.fonts, next);
+            if self.parked_fonts.len() >= MAX_PARKED_FONT_SETS {
+                self.parked_fonts.remove(0);
+            }
+            self.parked_fonts.push((self.active_font_set, previous));
             self.active_font_set = id;
         }
     }
@@ -1670,6 +1688,48 @@ mod tests {
         assert_eq!(first.runs[0].font, child.runs[0].font);
         let fresh = TextSystem::new().shape("retained", &style);
         assert_eq!(first.runs[0].font, fresh.runs[0].font);
+    }
+
+    #[test]
+    fn alternating_font_sets_park_contexts_without_changing_shaping() {
+        // Installing page fonts would legitimately discard parked contexts.
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fonts/dejavu/DejaVuSerif.ttf"
+        ))
+        .unwrap();
+        let fonts = FontSet::new(
+            vec![crate::font_system::PageFont {
+                family: "Web".into(),
+                bytes,
+            }],
+            None,
+            false,
+        );
+        let installed = TextStyle {
+            family: "Web, serif".into(),
+            ..TextStyle::default()
+        };
+        let scoped = TextStyle {
+            font_set: Some(fonts.clone()),
+            ..installed.clone()
+        };
+        let mut system = TextSystem::new();
+        for round in 0..4 {
+            for style in [&installed, &scoped] {
+                // Distinct text misses the shape cache and is shaped by the
+                // reactivated context, exactly as by a freshly cloned one.
+                let text = format!("round {round}");
+                assert_eq!(
+                    system.shape(&text, style),
+                    TextSystem::new().shape(&text, style)
+                );
+            }
+            assert_eq!(system.active_font_set, fonts.id());
+            let parked: Vec<_> = system.parked_fonts.iter().map(|(set, _)| *set).collect();
+            assert_eq!(parked, [0]);
+        }
     }
 
     #[test]
