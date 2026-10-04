@@ -657,20 +657,89 @@ impl Canvas {
         let Some(bitmap) = self.bitmap.as_mut() else {
             return;
         };
-        let Some(mut layer) = sk::Pixmap::new(self.width, self.height) else {
-            return;
-        };
         crate::canvas_shadow::paint(bitmap, &self.state, |layer, shift| {
             Self::text_source(layer, &self.state, text, n, stroke, shift);
         });
-        Self::text_source(&mut layer, &self.state, text, n, stroke, Affine::IDENTITY);
-        composite_full(
-            bitmap,
-            &layer,
-            blend(&self.state.composite).unwrap_or_default(),
-            self.state.clip.as_deref(),
-        );
+        let mode = blend(&self.state.composite).unwrap_or_default();
+        // Operators that discard the destination outside the source composite
+        // a full transparent source. Under every other operator a transparent
+        // source leaves the destination unchanged, so only pixels the text's
+        // ink can reach are rasterized and composited.
+        let region = if needs_full_source(mode) {
+            Some((0, 0, self.width, self.height))
+        } else {
+            Self::text_region(&self.state, text, n, stroke, self.width, self.height)
+        };
+        if let Some((left, top, width, height)) = region {
+            let Some(mut layer) = sk::Pixmap::new(width, height) else {
+                return;
+            };
+            let shift = Affine::translate((-f64::from(left), -f64::from(top)));
+            Self::text_source(&mut layer, &self.state, text, n, stroke, shift);
+            composite_region(bitmap, &layer, left, top, mode, self.state.clip.as_deref());
+        }
         self.changed();
+    }
+
+    /// The current transform and the text's glyph-to-device transform.
+    fn text_transforms(
+        state: &State,
+        text: &crate::canvas_text::PreparedText,
+        n: &[f64],
+        shift: Affine,
+    ) -> (Affine, Affine) {
+        let ctm = shift * state.transform;
+        let scale = n
+            .get(2)
+            .filter(|width| **width < f64::from(text.shaped.advance))
+            .map_or(1., |width| *width / f64::from(text.shaped.advance));
+        let transform = ctm
+            * Affine::translate((n[0] - text.anchor_x * scale, n[1] + text.baseline_y))
+            * Affine::scale_non_uniform(scale, 1.);
+        (ctm, transform)
+    }
+
+    /// The canvas pixels the text's ink can cover, as (left, top, width,
+    /// height), or None when it covers none.
+    fn text_region(
+        state: &State,
+        text: &crate::canvas_text::PreparedText,
+        n: &[f64],
+        stroke: bool,
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let (ctm, transform) = Self::text_transforms(state, text, n, Affine::IDENTITY);
+        let mut rect = transform.transform_rect_bbox(text.ink_bounds()?);
+        if stroke {
+            // The pen is applied under the current transform. Miter joins
+            // reach miterLimit half-widths from the outline; square caps reach
+            // a diagonal half-width.
+            let pen = &state.stroke;
+            let reach = f64::from(pen.width)
+                * 0.5
+                * if matches!(pen.line_join, sk::LineJoin::Miter | sk::LineJoin::MiterClip) {
+                    f64::from(pen.miter_limit).max(std::f64::consts::SQRT_2)
+                } else {
+                    std::f64::consts::SQRT_2
+                };
+            let [a, b, c, d, _, _] = ctm.as_coeffs();
+            rect = rect.inflate(reach * a.hypot(c), reach * b.hypot(d));
+        }
+        // Antialiased coverage reaches past the geometric edge.
+        let rect = rect.inflate(2., 2.);
+        let left = rect.x0.floor().max(0.);
+        let top = rect.y0.floor().max(0.);
+        let right = rect.x1.ceil().min(f64::from(width));
+        let bottom = rect.y1.ceil().min(f64::from(height));
+        (right > left && bottom > top).then(|| {
+            (
+                left as u32,
+                top as u32,
+                (right - left) as u32,
+                (bottom - top) as u32,
+            )
+        })
     }
 
     fn text_source(
@@ -684,14 +753,7 @@ impl Canvas {
         use vello_cpu::kurbo::{Cap, Diagonal2, Join, Stroke};
         use vello_cpu::{RenderContext, Resources};
         let (width, height) = (layer.width(), layer.height());
-        let ctm = shift * state.transform;
-        let scale = n
-            .get(2)
-            .filter(|width| **width < f64::from(text.shaped.advance))
-            .map_or(1., |width| *width / f64::from(text.shaped.advance));
-        let transform = ctm
-            * Affine::translate((n[0] - text.anchor_x * scale, n[1] + text.baseline_y))
-            * Affine::scale_non_uniform(scale, 1.);
+        let (ctm, transform) = Self::text_transforms(state, text, n, shift);
         let color = if stroke {
             state.stroke_color
         } else {
@@ -1344,4 +1406,154 @@ pub(crate) fn blend(name: &str) -> Option<sk::BlendMode> {
         "luminosity" => Luminosity,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The full-canvas text layer that bounded layers replace.
+    fn draw_text_full_layer(
+        canvas: &mut Canvas,
+        text: &crate::canvas_text::PreparedText,
+        n: &[f64],
+        stroke: bool,
+    ) {
+        let mut layer = sk::Pixmap::new(canvas.width, canvas.height).unwrap();
+        Canvas::text_source(&mut layer, &canvas.state, text, n, stroke, Affine::IDENTITY);
+        let mode = blend(&canvas.state.composite).unwrap_or_default();
+        let clip = canvas.state.clip.clone();
+        composite_full(
+            canvas.bitmap.as_mut().unwrap(),
+            &layer,
+            mode,
+            clip.as_deref(),
+        );
+    }
+
+    #[test]
+    fn bounded_text_layers_paint_exactly_what_full_canvas_layers_paint() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            font: &'static str,
+            text: &'static str,
+            transform: Affine,
+            n: &'static [f64],
+            stroke: Option<(f32, sk::LineJoin, f32)>,
+            align: &'static str,
+            alpha: f32,
+            composite: &'static str,
+            clip: bool,
+        }
+        let base = Case {
+            font: "24px sans-serif",
+            text: "Ag Wy\u{fc}\u{301}",
+            transform: Affine::IDENTITY,
+            n: &[20., 60.],
+            stroke: None,
+            align: "start",
+            alpha: 1.,
+            composite: "source-over",
+            clip: false,
+        };
+        let cases = [
+            Case { ..base },
+            Case {
+                font: "italic bold 30px serif",
+                transform: Affine::rotate(0.7),
+                n: &[60., 10.],
+                ..base
+            },
+            Case {
+                transform: Affine::skew(0.6, 0.2) * Affine::scale(1.7),
+                n: &[5., 30.],
+                ..base
+            },
+            Case {
+                n: &[20., 60., 40.],
+                align: "center",
+                ..base
+            },
+            Case {
+                stroke: Some((9., sk::LineJoin::Miter, 10.)),
+                font: "40px serif",
+                text: "VAMW",
+                ..base
+            },
+            Case {
+                stroke: Some((6., sk::LineJoin::Round, 4.)),
+                transform: Affine::scale_non_uniform(2., 0.5),
+                ..base
+            },
+            Case {
+                n: &[30., 10.],
+                align: "right",
+                ..base
+            },
+            Case {
+                n: &[150., 125.],
+                ..base
+            },
+            Case {
+                alpha: 0.5,
+                composite: "multiply",
+                ..base
+            },
+            Case {
+                composite: "xor",
+                clip: true,
+                ..base
+            },
+            Case {
+                composite: "source-in",
+                ..base
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let mut bounded = Canvas::new(160, 120, true).unwrap();
+            let mut full = Canvas::new(160, 120, true).unwrap();
+            let mut untouched = Canvas::new(160, 120, true).unwrap();
+            for canvas in [&mut bounded, &mut full, &mut untouched] {
+                canvas
+                    .state
+                    .text
+                    .set_font(case.font, crate::layout2::Units::default(), 400.);
+                canvas.state.text.align = case.align.into();
+                canvas.state.transform = case.transform;
+                canvas.state.alpha = case.alpha;
+                canvas.state.composite = case.composite.into();
+                canvas.state.fill = [0.1, 0.4, 0.8, 0.9];
+                canvas.state.stroke_color = [0.7, 0.2, 0.1, 1.];
+                if let Some((width, join, miter)) = case.stroke {
+                    canvas.state.stroke.width = width;
+                    canvas.state.stroke.line_join = join;
+                    canvas.state.stroke.miter_limit = miter;
+                }
+                if case.clip {
+                    let mut mask = sk::Mask::new(160, 120).unwrap();
+                    mask.fill_path(
+                        &sk::PathBuilder::from_circle(70., 55., 40.).unwrap(),
+                        sk::FillRule::Winding,
+                        true,
+                        sk::Transform::identity(),
+                    );
+                    canvas.state.clip = Some(Arc::new(mask));
+                }
+                canvas
+                    .bitmap
+                    .as_mut()
+                    .unwrap()
+                    .fill(sk::Color::from_rgba8(200, 180, 40, 160));
+            }
+            let text = bounded.state.text.prepare(case.text, false, None);
+            bounded.draw_text(&text, case.n, case.stroke.is_some());
+            draw_text_full_layer(&mut full, &text, case.n, case.stroke.is_some());
+            let (bounded, full) = (bounded.bitmap.unwrap(), full.bitmap.unwrap());
+            assert!(
+                full.data() != untouched.bitmap.unwrap().data(),
+                "case {index} painted nothing"
+            );
+            assert!(bounded.data() == full.data(), "case {index} differs");
+        }
+    }
 }
