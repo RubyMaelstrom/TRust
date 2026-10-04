@@ -121,7 +121,6 @@ pub(crate) fn begin_document_svg_navigation() {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn document_svg_navigation() -> u64 {
     NAVIGATION.load(Ordering::Acquire)
 }

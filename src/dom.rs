@@ -66,6 +66,34 @@ pub type NodeId = usize;
 
 type SerializationCache = (u64, FxHashMap<(NodeId, u8), String>);
 
+/// The presentation inputs an inline SVG image resource is derived from: the
+/// DOM and style revisions, animation/transition sample revisions, page fonts,
+/// the shared sprite table, the navigation's document images, the viewport
+/// and the resource base URL.
+#[derive(Clone, PartialEq)]
+struct SvgImageKey {
+    revisions: [u64; 9],
+    viewport: (u32, u32),
+    device_pixel_ratio: u32,
+    base: Option<String>,
+}
+
+/// `svg_image_data` results for one `SvgImageKey`. Box-tree construction and
+/// image collection serialize the same SVGs in every rendering update; any
+/// change of key (or a container-query style re-evaluation) drops the map.
+#[derive(Default)]
+struct SvgImageMemo {
+    key: Option<SvgImageKey>,
+    entries: FxHashMap<NodeId, Option<(String, String)>>,
+}
+
+impl SvgImageMemo {
+    fn clear(&mut self) {
+        self.key = None;
+        self.entries = FxHashMap::default();
+    }
+}
+
 fn attribute_name_matches(name: &QualName, qualified: &str) -> bool {
     match name.prefix.as_deref() {
         Some(prefix) => {
@@ -511,6 +539,8 @@ pub struct Dom {
     /// current DOM epoch; the next tree/attribute/text mutation drops the map
     /// wholesale, so old page-sized strings are not retained forever.
     serialization_cache: RefCell<SerializationCache>,
+    /// Inline SVG image sources for the current presentation inputs.
+    svg_image_memo: RefCell<SvgImageMemo>,
     /// HTML #document-base-url uses the first base[href] in the node
     /// Document's tree. Image selection asks this repeatedly within one
     /// immutable layout/paint transaction. Retain one search result (including
@@ -885,6 +915,7 @@ impl Dom {
             font_units_cache,
             decoration_cache,
             serialization_cache,
+            svg_image_memo,
             resource_base_element_cache: _, // Inline IDs/revision only; no owned allocation.
             viewport_px,
             device_pixel_ratio,
@@ -1273,6 +1304,20 @@ impl Dom {
             }
             Err(_) => unavailable = unavailable.saturating_add(1),
         }
+        match svg_image_memo.try_borrow() {
+            Ok(memo) => {
+                if let Some(base) = memo.key.as_ref().and_then(|key| key.base.as_ref()) {
+                    bytes = bytes.saturating_add(base.capacity());
+                }
+                fixed_map!(memo.entries, (NodeId, Option<(String, String)>));
+                for (source, name) in memo.entries.values().flatten() {
+                    bytes = bytes
+                        .saturating_add(source.capacity())
+                        .saturating_add(name.capacity());
+                }
+            }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
 
         fixed_map!(scroll_state, (NodeId, ScrollBox));
         bytes = bytes.saturating_add(
@@ -1380,6 +1425,7 @@ impl Dom {
             font_units_cache: RefCell::new(NodeCache::default()),
             decoration_cache: RefCell::new(NodeCache::default()),
             serialization_cache: RefCell::new((u64::MAX, FxHashMap::default())),
+            svg_image_memo: RefCell::new(SvgImageMemo::default()),
             resource_base_element_cache: Cell::new(None),
             viewport_px: (0.0, 0.0),
             device_pixel_ratio: 1.0,
@@ -8645,11 +8691,63 @@ impl Dom {
         if self.tag_name(id) != Some("svg") || self.ancestor_is_svg(id) || self.is_hidden(id) {
             return None;
         }
-        let (svg, images) = self.svg_render_resource(id, base)?;
-        Some((
-            self.svg_document_source(id, self.resolve_svg_current_color(id, svg), &images),
-            self.svg_accessible_name(id),
-        ))
+        let key = self.svg_image_key(base);
+        let memoized = {
+            let memo = self.svg_image_memo.borrow();
+            (memo.key.as_ref() == Some(&key))
+                .then(|| memo.entries.get(&id).cloned())
+                .flatten()
+        };
+        if let Some(result) = memoized {
+            // The resource's dependency proof is part of producing it: a
+            // collection or an earlier invalidation may have retired the
+            // proof published by the memoized serialization.
+            self.publish_svg_resource_proof(id);
+            return result;
+        }
+        let result = self.svg_render_resource(id, base).map(|(svg, images)| {
+            (
+                self.svg_document_source(id, self.resolve_svg_current_color(id, svg), &images),
+                self.svg_accessible_name(id),
+            )
+        });
+        let mut memo = self.svg_image_memo.borrow_mut();
+        if memo.key.as_ref() != Some(&key) {
+            memo.clear();
+            memo.key = Some(key);
+        }
+        memo.entries.insert(id, result.clone());
+        result
+    }
+
+    fn svg_image_key(&self, base: Option<&url::Url>) -> SvgImageKey {
+        SvgImageKey {
+            revisions: [
+                self.epoch,
+                self.style_value_epoch,
+                self.layout_presentation_epoch,
+                self.layout_paint_epoch,
+                crate::font_system::page_font_epoch(),
+                crate::font_system::page_svg_font_environment(),
+                svg_sprite_revision(),
+                crate::img::document_svg_revision(),
+                crate::img::document_svg_navigation(),
+            ],
+            viewport: (self.viewport_px.0.to_bits(), self.viewport_px.1.to_bits()),
+            device_pixel_ratio: self.device_pixel_ratio.to_bits(),
+            base: base.map(|base| base.as_str().to_owned()),
+        }
+    }
+
+    /// Publish the SVG2 dependency proof of `id`'s image resource, as every
+    /// resolution of the resource does before it is serialized.
+    fn publish_svg_resource_proof(&self, id: NodeId) -> Option<NodeId> {
+        let local_target = self.local_svg_use_target(id);
+        let proof = self.svg_input_dependencies(id, local_target, true);
+        // Publish negative/unresolved lookups too: a parent box may cache the
+        // absence of an image until a later ID insertion makes it renderable.
+        self.svg_dependencies.borrow_mut().publish(id, proof);
+        local_target
     }
 
     /// The image source for an inline SVG resource, marked with its host
@@ -8778,11 +8876,7 @@ impl Dom {
         id: NodeId,
         base: Option<&url::Url>,
     ) -> Option<(String, Vec<String>)> {
-        let local_target = self.local_svg_use_target(id);
-        let proof = self.svg_input_dependencies(id, local_target, true);
-        // Publish negative/unresolved lookups too: a parent box may cache the
-        // absence of an image until a later ID insertion makes it renderable.
-        self.svg_dependencies.borrow_mut().publish(id, proof);
+        let local_target = self.publish_svg_resource_proof(id);
         let external = self.svg_sprite_ref(id);
         let mut images = SvgImageRefs {
             page: base,

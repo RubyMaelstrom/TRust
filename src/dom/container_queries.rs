@@ -542,6 +542,7 @@ impl Dom {
             }
             self.properties.invalidate_values();
             self.serialization_cache.borrow_mut().1.clear();
+            self.svg_image_memo.borrow_mut().clear();
             return true;
         }
         // Every dependent value is about to expire. Start a fresh observed
@@ -569,6 +570,7 @@ impl Dom {
         self.box_tree_cache.borrow_mut().clear();
         *self.generated_cache.borrow_mut() = None;
         self.serialization_cache.borrow_mut().1.clear();
+        self.svg_image_memo.borrow_mut().clear();
         true
     }
 }
