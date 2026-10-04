@@ -18012,6 +18012,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     };
     messageApply(messageWeakSet, windowMessageSlots, [g, messageWindowState]);
+    // HTML #dom-origin and Web IDL #Replaceable: the serialization of the
+    // Window's environment origin (opaque when sandboxed, inherited by
+    // about:blank and srcdoc documents), unlike location.origin's URL origin.
+    (() => {
+        const define = Object.defineProperty, TypeErrorCtor = TypeError;
+        function receiver(value) {
+            if (value === undefined || value === null) value = g;
+            const state = windowMessageState(value);
+            if (!state) throw new TypeErrorCtor("Illegal Window invocation");
+            if (state.originKey !== messageWindowState.originKey)
+                throw new DOMException("Cross-origin Window access", "SecurityError");
+            return value;
+        }
+        const descriptor = {
+            configurable: true, enumerable: true,
+            get() { return windowMessageState(receiver(this)).origin; },
+            set(value) {
+                define(receiver(this), "origin", {
+                    value, writable: true, enumerable: true, configurable: true,
+                });
+            },
+        };
+        define(descriptor.get, "name", {value: "get origin", configurable: true});
+        define(descriptor.set, "name", {value: "set origin", configurable: true});
+        define(g, "origin", descriptor);
+    })();
     // HTML #cross-origin-objects: another origin's Window is reachable only
     // through its cross-origin WindowProxy surface. CrossOriginProperties are
     // window, self, location, close, closed, focus, blur, frames, length, top,

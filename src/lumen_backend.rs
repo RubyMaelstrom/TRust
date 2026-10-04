@@ -32892,6 +32892,79 @@ mod tests {
     }
 
     #[test]
+    fn self_origin_is_the_replaceable_environment_origin() {
+        // HTML #dom-origin: the relevant settings object's origin, which an
+        // initial about:blank document inherits although its URL's origin
+        // (location.origin) is opaque. Web IDL #Replaceable lets a script
+        // shadow it with an own data property.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r##"(() => {
+                const html = document.createElement("html"), body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement("iframe");
+                body.appendChild(frame);
+                const child = frame.contentWindow;
+                const d = Object.getOwnPropertyDescriptor(window, "origin");
+                const own = [origin === location.origin, origin !== "null", typeof d.get, typeof d.set,
+                    d.enumerable, d.configurable, d.get.name, d.set.name].join();
+                const inherited = [child.origin === origin, child.location.origin].join();
+                let illegal = "";
+                try { d.get.call({}); } catch (e) { illegal = e.name; }
+                window.origin = 5;
+                const replaced = [origin, Object.getOwnPropertyDescriptor(window, "origin").value,
+                    child.origin === location.origin].join();
+                return [own, inherited, illegal, replaced].join("|");
+            })()"##
+            ),
+            "true,true,function,function,true,true,get origin,set origin|true,null|TypeError|5,5,true"
+        );
+    }
+
+    #[test]
+    fn worker_self_origin_follows_its_script_url() {
+        // HTML #run-a-worker: opaque for a data: URL, otherwise the owner's
+        // origin, which a same-origin or blob: script URL carries.
+        for (url, expected) in [
+            ("https://example.org/worker.js", "https://example.org"),
+            (
+                "blob:https://example.org/0f6a2f8e-1c39-4c55-9a6e-6c51f3d1e7aa",
+                "https://example.org",
+            ),
+            ("data:text/javascript,0", "null"),
+        ] {
+            let clock = Rc::new(RealmClock::new());
+            let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+            let mut engine = lumen::Engine::new();
+            engine.set_wall_clock(move || clock.now_ms());
+            engine
+                .ctx()
+                .op_state()
+                .put_retained_memory_with_external_memory(state);
+            install_lumen_worker_boundary(&mut engine);
+            eval(
+                &mut engine,
+                &format!("globalThis.__worker_cfg={{url:{url:?}}}"),
+                "worker config",
+            )
+            .unwrap();
+            assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "(() => { const d = Object.getOwnPropertyDescriptor(self, 'origin'); \
+                     const before = self.origin; self.origin = 1; \
+                     return [before, d.enumerable, d.configurable, typeof d.set, self.origin].join(); })()"
+                ),
+                format!("{expected},true,true,function,1"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn iframe_initial_about_blank_has_a_realm_and_reuses_its_window_once() {
         // HTML §7.3.2.1 creates the child browsing context's Realm, Window,
         // environment settings object, and populated initial about:blank
