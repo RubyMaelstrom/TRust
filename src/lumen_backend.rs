@@ -18405,6 +18405,30 @@ mod tests {
     }
 
     #[test]
+    fn dom_rect_lists_are_static_indexed_lists_of_rects() {
+        // Geometry 1 #DOMRectList and CSSOM View #dom-element-getclientrects:
+        // not an Array, with item(), length, a readonly indexed getter and
+        // %Array.prototype.values% as @@iterator; not serializable. Values
+        // match Chromium's.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const list = document.createElement('div').getClientRects();\n\
+                 const range = document.createRange().getClientRects();\n\
+                 let cloned; try { structuredClone(list); cloned = 'cloned'; } catch (e) { cloned = e.name; }\n\
+                 let constructed; try { new DOMRectList(); } catch (e) { constructed = e.name; }\n\
+                 [tag(list), Array.isArray(list), list.length, list.item(0), tag(range), range.length,\n\
+                  tag(range[0]), range.item(0) === range[0], range[1], Object.keys(range).join(),\n\
+                  DOMRectList.prototype[Symbol.iterator] === Array.prototype.values, [...range].length,\n\
+                  cloned, constructed].join('|')"
+            ),
+            "DOMRectList|false|0||DOMRectList|1|DOMRect|true||0|true|1|DataCloneError|TypeError"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or

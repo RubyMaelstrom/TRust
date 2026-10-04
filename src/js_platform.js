@@ -1036,6 +1036,39 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
     };
     /*__GEOMETRY_END__*/
+    // Geometry 1 #DOMRectList ([Exposed=Window]): a static list of DOMRect
+    // objects, not an Array. Its indexed getter makes it iterable with
+    // %Array.prototype.values% (Web IDL #es-iterator).
+    class DOMRectList {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() { return rectListItems(this).length; }
+        item(index) {
+            const items = rectListItems(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            index = index >>> 0;
+            return index < items.length ? items[index] : null;
+        }
+    }
+    function rectListItems(list) {
+        const items = internalsOf(list).rectListItems;
+        if (!items) throw new TypeError("Illegal invocation");
+        return items;
+    }
+    function rectListIndexedGetter(index) { return internalsOf(this).rectListItems[index]; }
+    function createDOMRectList(rects) {
+        const list = Object.create(DOMRectList.prototype);
+        internalsFor(list).rectListItems = rects;
+        if (!__dom_install_readonly_indexed(list, rects.length, rectListIndexedGetter)) {
+            for (let i = 0; i < rects.length; i++)
+                Object.defineProperty(list, i, {value: rects[i], enumerable: true, configurable: true});
+        }
+        return list;
+    }
+    for (const name of ["length", "item"])
+        Object.defineProperty(DOMRectList.prototype, name, {enumerable: true});
+    Object.defineProperty(DOMRectList.prototype, Symbol.iterator,
+        {value: Array.prototype.values, writable: true, configurable: true});
+    Object.defineProperty(g, "DOMRectList", {value: DOMRectList, writable: true, configurable: true});
     // LegacyWindowAlias (Geometry 1 §3, §2, §6) exposes SVGRect, SVGPoint,
     // SVGMatrix and WebKitCSSMatrix only in a Window: the same interface
     // objects as DOMRect, DOMPoint and DOMMatrix.
@@ -7007,7 +7040,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         getBoundingClientRect() {
             return clientBoxRect(this) || createDOMRect();
         }
-        getClientRects() { const r = clientBoxRect(this); return r ? [r] : []; }
+        getClientRects() { const r = clientBoxRect(this); return createDOMRectList(r ? [r] : []); }
         get offsetWidth() { const r = offsetBoxRect(this); return r ? Math.round(r[2]) : 0; }
         get offsetHeight() { const r = offsetBoxRect(this); return r ? Math.round(r[3]) : 0; }
         get offsetTop() { return cssomOffsetCoordinate(this, "top"); }
@@ -15718,7 +15751,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         surroundContents(node) { this.insertNode(node); }
         createContextualFragment(html) { const tpl = g.document.createElement("template"); tpl.innerHTML = String(html); return tpl.content; }
         getBoundingClientRect() { return new DOMRect(0, 0, windowViewportDimension("width"), windowViewportDimension("height")); }
-        getClientRects() { return [this.getBoundingClientRect()]; }
+        getClientRects() { return createDOMRectList([this.getBoundingClientRect()]); }
         detach() {}
         toString() {
             if (this.collapsed) return "";
@@ -21533,6 +21566,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 return node;
             }
             if (messagePortBrand && messagePortBrand(v)) throw dce("An untransferred MessagePort");
+            // HTML #structuredserializeinternal: other platform objects are not
+            // serializable (DOMRectList, DOMStringList, TimeRanges, …).
+            const platformSlots = apply(weakGet, codecSlotsMap, [v]);
+            if (platformSlots && (platformSlots.rectListItems || platformSlots.domStringList ||
+                    platformSlots.timeRanges || platformSlots.mediaQueryList ||
+                    platformSlots.mediaQueryListEvent || platformSlots.locationObject))
+                throw dce("A platform object");
             if (wasmClone) {
                 const module = wasmClone.serialize(v, forStorage);
                 if (module) return module;
