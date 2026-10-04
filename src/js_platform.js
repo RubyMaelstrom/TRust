@@ -15813,7 +15813,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // GPC's readonly mixin applies in both environments; Pointer Events
         // maxTouchPoints and WebDriver's automation flag are Window-only.
         // Preserve the existing real preference/device/automation values.
-        if(!worker)names.push('vendor','vendorSub','productSub','cookieEnabled','maxTouchPoints','webdriver');
+        if(!worker)names.push('vendor','vendorSub','productSub','cookieEnabled','maxTouchPoints','webdriver','doNotTrack');
         for(const name of names) {
             values[name]=nav[name];delete nav[name];
             readonly(Constructor.prototype,name,interfaceName,state=>state.values[name]);
@@ -15834,7 +15834,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         if(worker) {
             // NavigatorID's Window-only partial members are not exposed here.
-            for(const name of ['vendor','vendorSub','productSub','maxTouchPoints','webdriver'])delete nav[name];
+            for(const name of ['vendor','vendorSub','productSub','maxTouchPoints','webdriver','doNotTrack','sendBeacon'])delete nav[name];
+        } else {
+            // Beacon #sendbeacon-method is a Window-only Navigator operation,
+            // like every other member on the interface prototype object.
+            const sendBeacon=nav.sendBeacon;
+            delete nav.sendBeacon;
+            operation(Constructor.prototype,'sendBeacon',{sendBeacon(url,data=null){
+                requireKind(this,interfaceName);
+                if(arguments.length<1)throw new TypeErrorCtor('1 argument required');
+                return apply(sendBeacon,this,[url,data]);
+            }}.sendBeacon);
         }
         function associatedNavigator(receiver) {
             if(receiver==null)receiver=g;
