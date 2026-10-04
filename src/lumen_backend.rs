@@ -8488,6 +8488,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_document_quirks", 1, host_document_quirks),
     ("__dom_pi_target", 1, guarded_pi_target),
     ("__dom_create_comment", 2, guarded_create_comment),
+    ("__dom_create_doctype", 4, guarded_create_doctype),
+    ("__dom_doctype", 1, guarded_doctype),
     ("__dom_append", 2, guarded_append),
     ("__dom_insert_before", 3, guarded_insert_before),
     ("__dom_detach", 1, guarded_detach),
@@ -9217,6 +9219,8 @@ node_access_guards! {
     guarded_create_element_ns = host_create_element_ns, [3], Throw;
     guarded_create_text = host_create_text, [1], Throw;
     guarded_create_comment = host_create_comment, [1], Throw;
+    guarded_create_doctype = host_create_doctype, [3], Throw;
+    guarded_doctype = host_doctype, [0], Invalidate;
     guarded_create_fragment = host_create_fragment, [0], Throw;
     guarded_elements_from_point = host_elements_from_point, [0], Throw;
     guarded_append = host_append, [0, 1], Invalidate;
@@ -13951,6 +13955,41 @@ fn host_creation_document(dom: &Dom, args: &[Value], index: usize) -> usize {
         .unwrap_or(DOCUMENT)
 }
 
+/// DOM #dom-domimplementation-createdocumenttype: a new doctype whose node
+/// document is the creation document (argument 3).
+fn host_create_doctype(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = host_arg_string(ctx, args, 0);
+    let public_id = host_arg_string(ctx, args, 1);
+    let system_id = host_arg_string(ctx, args, 2);
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 3);
+    let id = dom.create_doctype(&name, &public_id, &system_id);
+    dom.initialize_node_document(id, document);
+    Ok(host_id_value(Some(id)))
+}
+
+/// DOM #dom-documenttype-name, #dom-documenttype-publicid and
+/// #dom-documenttype-systemid: `[name, publicId, systemId]`, or `null` for
+/// any other node.
+fn host_doctype(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let info = {
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)
+            .and_then(|id| dom.doctype_info(id))
+            .cloned()
+    };
+    Ok(match info {
+        Some(info) => ctx.make_array(vec![
+            Value::Str(info.name.into()),
+            Value::Str(info.public_id.into()),
+            Value::Str(info.system_id.into()),
+        ]),
+        None => Value::Null,
+    })
+}
+
 fn host_create_comment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let text = host_arg_string(ctx, args, 0);
     let dom = host_dom(ctx);
@@ -14367,7 +14406,7 @@ fn host_node_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         Some(NodeData::ProcessingInstruction { .. }) => 7,
         Some(NodeData::Comment(_)) => 8,
         Some(NodeData::Document) => 9,
-        Some(NodeData::Doctype) => 10,
+        Some(NodeData::Doctype(_)) => 10,
         Some(NodeData::Fragment) => 11,
         None => 0,
     };
@@ -18635,6 +18674,51 @@ mod tests {
     }
 
     #[test]
+    fn doctypes_and_created_documents_follow_dom() {
+        // DOM #interface-documenttype, #dom-document-doctype and
+        // #dom-domimplementation-createdocumenttype / -createdocument: the
+        // parser keeps the doctype's name and identifiers, nodeName is the
+        // name, and createDocument() makes an XMLDocument whose content type
+        // follows its namespace. HTML keeps HTMLDocument an alias of Document.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \
+                     \"http://www.w3.org/TR/html4/strict.dtd\"><p>x",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 const d = document.doctype;\n\
+                 const type = document.implementation.createDocumentType('svg', '-//W3C//DTD SVG 1.1//EN', 'x');\n\
+                 const created = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg', type);\n\
+                 const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'HTMLDocument');\n\
+                 [tag(d), d.name, d.publicId, d.systemId, d.nodeName, d.nodeValue, document.firstChild === d,\n\
+                  err(() => new DocumentType()), tag(type), type.ownerDocument === created,\n\
+                  err(() => document.implementation.createDocumentType('a b', '', '')),\n\
+                  tag(created), created.contentType, created.doctype === type,\n\
+                  created.documentElement.namespaceURI, created.URL,\n\
+                  document.implementation.createDocument(null, '').contentType,\n\
+                  document.implementation.createDocument('http://www.w3.org/1999/xhtml', 'html').contentType,\n\
+                  document.implementation.createDocument(null, null).documentElement,\n\
+                  err(() => document.implementation.createDocument(null, 'x', {})),\n\
+                  document.implementation.createHTMLDocument('').doctype.name,\n\
+                  HTMLDocument === Document, descriptor.enumerable, descriptor.writable].join('|')"
+            ),
+            "DocumentType|html|-//W3C//DTD HTML 4.01//EN|http://www.w3.org/TR/html4/strict.dtd|html||true|\
+             TypeError|DocumentType|true|InvalidCharacterError|XMLDocument|image/svg+xml|true|\
+             http://www.w3.org/2000/svg|about:blank|application/xml|application/xhtml+xml||TypeError|\
+             html|true|false|true"
+        );
+    }
+
+    #[test]
     fn document_scripts_images_and_links_are_live_collections() {
         // HTML #dom-document-scripts, #dom-document-images and
         // #dom-document-links: [SameObject] live HTMLCollections.
@@ -20637,7 +20721,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 194, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 196, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -20648,7 +20732,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 194);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 196);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

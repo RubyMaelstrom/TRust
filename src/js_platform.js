@@ -1324,12 +1324,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 : t === 4 ? new CDATASection(id)
                 : t === 7 ? new ProcessingInstruction(id)
                 : t === 8 ? new Comment(id)
+                : t === 10 ? new DocumentType(id, DOCUMENT_TYPE_TOKEN)
                 : new Node(id);
         }
         return rememberWrapper(id, w, knownConnected);
     }
     function wrap(id) {
         return wrapKnown(id, undefined);
+    }
+    const DOCUMENT_TYPE_TOKEN = {};
+    function doctypeInfo(node) {
+        const info = __dom_doctype(nodeIds.get(node));
+        if (!info) throw new TypeError("Illegal invocation");
+        return info;
     }
     function relativeNode(node, edge) {
         const value = nativeDomRelative(node, edge);
@@ -5558,7 +5565,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const t = __dom_tag(nodeIds.get(this));
             if (t) return t.toUpperCase();
             const n = this.nodeType;
-            // DOM #dom-node-nodename: an Attr's nodeName is its qualified name.
+            // DOM #dom-node-nodename: a doctype's nodeName is its name and
+            // an Attr's its qualified name.
+            if (n === 10) return doctypeInfo(this)[0];
             if (n === 2) return attrState(this).qualifiedName;
             return n === 3 ? "#text" : n === 9 ? "#document" : n === 8 ? "#comment" : n === 11 ? "#document-fragment" : "#node";
         }
@@ -5790,7 +5799,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             } else if (t === 3 || t === 8) {
                 if (this.nodeValue !== o.nodeValue) return false;
             } else if (t === 10) {
-                if (this.nodeName !== o.nodeName) return false;
+                if (this.nodeName !== o.nodeName || this.publicId !== o.publicId || this.systemId !== o.systemId) return false;
             } else if (t === 2) {
                 return this.namespaceURI === o.namespaceURI && this.localName === o.localName && this.value === o.value;
             }
@@ -11056,6 +11065,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!implementationDocuments.has(this)) throw new TypeError("Illegal invocation");
             return true;
         }
+        // DOM #dom-domimplementation-createdocumenttype.
+        createDocumentType(qualifiedName, publicId, systemId) {
+            const owner = implementationDocuments.get(this);
+            if (!owner) throw new TypeError("Illegal invocation");
+            if (arguments.length < 3) throw new TypeError("createDocumentType requires 3 arguments");
+            qualifiedName = domString(qualifiedName); publicId = domString(publicId); systemId = domString(systemId);
+            if (/[\t\n\f\r \0>]/.test(qualifiedName))
+                throw new DOMException("The qualified name is not a valid doctype name.", "InvalidCharacterError");
+            return wrap(__dom_create_doctype(qualifiedName, publicId, systemId, nodeIds.get(owner)));
+        }
+        // DOM #dom-domimplementation-createdocument: a new XMLDocument with an
+        // optional doctype and document element, sharing this document's
+        // origin, whose content type follows the namespace.
+        createDocument(namespace, qualifiedName, doctype = null) {
+            const owner = implementationDocuments.get(this);
+            if (!owner) throw new TypeError("Illegal invocation");
+            if (arguments.length < 2) throw new TypeError("createDocument requires 2 arguments");
+            namespace = namespace === null || namespace === undefined ? null : domString(namespace);
+            qualifiedName = qualifiedName === null ? "" : domString(qualifiedName);
+            if (doctype !== null && doctype !== undefined && !(doctype instanceof DocumentType))
+                throw new TypeError("Failed to execute 'createDocument': parameter 3 is not of type 'DocumentType'");
+            const contentType = namespace === HTML_NS ? "application/xhtml+xml"
+                : namespace === SVG_NS ? "image/svg+xml" : "application/xml";
+            const document = wrap(__dom_create_document(contentType));
+            documentURLs.set(document, "about:blank");
+            const element = qualifiedName === "" ? null
+                : Document.prototype.createElementNS.call(document, namespace, qualifiedName);
+            if (doctype !== null && doctype !== undefined) Node.prototype.appendChild.call(document, doctype);
+            if (element !== null) Node.prototype.appendChild.call(document, element);
+            return document;
+        }
         createHTMLDocument(title) {
             if (!implementationDocuments.has(this)) throw new TypeError("Illegal invocation");
             if (title !== undefined) {
@@ -11140,6 +11180,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // scopes to its OWN subtree instead — `__dom_doc_element` only knows the
         // live tree's root.
         get documentElement() { return nodeIds.get(this) === 0 ? wrap(__dom_doc_element()) : this.firstElementChild; }
+        // DOM #dom-document-doctype: the child of the document that is a doctype.
+        get doctype() {
+            const children = __dom_children(nodeIds.get(this));
+            for (let i = 0; i < children.length; i++)
+                if (__dom_node_type(children[i]) === 10) return wrap(children[i]);
+            return null;
+        }
         // The element that scrolls the viewport (CSSOM View). Standards mode ⇒
         // the document element; its scrollTop/scrollHeight/clientHeight mirror
         // the page scroll, so `document.scrollingElement.scrollTop` reads the
@@ -13396,7 +13443,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get nodeName() { return this.target; }
         get [Symbol.toStringTag]() { return "ProcessingInstruction"; }
     }
-    class DocumentType extends Node {}
+    // DOM #interface-documenttype: a doctype's name, public ID and system ID
+    // live in the arena node; wrappers are created only by wrap().
+    class DocumentType extends Node {
+        constructor(id, token) {
+            if (token !== DOCUMENT_TYPE_TOKEN) throw new TypeError("Illegal constructor");
+            super(id);
+        }
+        get name() { return doctypeInfo(this)[0]; }
+        get publicId() { return doctypeInfo(this)[1]; }
+        get systemId() { return doctypeInfo(this)[2]; }
+    }
+    for (const name of ["name", "publicId", "systemId"])
+        Object.defineProperty(DocumentType.prototype, name, {enumerable: true});
     // DOM §4.9.2 #interface-attr. The arena keeps an element's attributes as
     // name/value pairs, so an Attr is a platform object over one pair: while
     // owned it reads its element's attribute and changes it through the same
@@ -14198,7 +14257,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.CDATASection = CDATASection; g.ProcessingInstruction = ProcessingInstruction;
     g.DocumentType = DocumentType; g.Attr = Attr;
     g.Node = Node; g.Element = Element; g.HTMLElement = HTMLElement;
-    g.Text = Text; g.Document = Document; g.HTMLDocument = Document;
+    g.Text = Text; g.Document = Document;
+    // HTML (the Window object, "for historical reasons"): a writable, configurable,
+    // non-enumerable HTMLDocument property whose value is Document itself.
+    Object.defineProperty(g, "HTMLDocument", {value: Document, writable: true, enumerable: false, configurable: true});
     g.XMLDocument = XMLDocument; g.DOMImplementation = DOMImplementation;
     g.DocumentFragment = DocumentFragment; g.Comment = Comment;
     g.Event = Event; g.CustomEvent = CustomEvent;
