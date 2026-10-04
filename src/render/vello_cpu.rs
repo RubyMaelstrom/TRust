@@ -182,6 +182,7 @@ impl VelloCpuRenderer {
         ));
         self.context.set_transform(device);
         let mut layer_filters = Vec::new();
+        let mut filter_clip_layers = Vec::new();
         let mut skip_until = 0;
         for (index, command) in scene.primitives.iter().enumerate() {
             if index < skip_until {
@@ -285,6 +286,37 @@ impl VelloCpuRenderer {
                         continue;
                     }
                     apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
+                    // CSS Filter Effects 1 §4: a filter's output, including a
+                    // blur spreading past the content, is clipped by ancestor
+                    // overflow clips. Vello crops a filter layer's composite
+                    // only to enclosing clip *layers*, not to the clip-path
+                    // stack, so repeat the active clips as layers around it.
+                    let mut clip_layers = 0;
+                    // Only an isolated source-over group composites the same
+                    // inside an extra layer; masks and blend modes need the
+                    // real backdrop.
+                    if !layer.filters.is_empty()
+                        && layer.compose == CompositeOperator::SourceOver
+                        && layer.blend == BlendMode::Normal
+                    {
+                        for (shape, at) in clips.active() {
+                            self.context.set_transform(at);
+                            self.context.set_fill_rule(shape_fill(shape));
+                            self.context.push_layer(
+                                Some(&shape_path(shape)),
+                                None,
+                                None,
+                                None,
+                                None,
+                            );
+                            clip_layers += 1;
+                        }
+                        if clip_layers > 0 {
+                            self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+                            self.context.set_transform(*transforms.last().unwrap());
+                        }
+                    }
+                    filter_clip_layers.push(clip_layers);
                     self.context.push_layer(
                         layer.clip.map(rect_path).as_ref(),
                         Some(vello_blend(layer.blend, layer.compose)),
@@ -310,6 +342,9 @@ impl VelloCpuRenderer {
                         self.context.pop_layer();
                     }
                     self.context.pop_layer();
+                    for _ in 0..filter_clip_layers.pop().unwrap_or(0) {
+                        self.context.pop_layer();
+                    }
                 }
                 DisplayCommand::BeginSticky(_)
                 | DisplayCommand::EndSticky
@@ -1455,6 +1490,11 @@ impl<'a> RasterClips<'a> {
         } else {
             false
         }
+    }
+
+    /// Every active clip, outermost first, with its device transform.
+    pub(super) fn active(&self) -> impl Iterator<Item = (&'a PaintShape, Affine)> + '_ {
+        self.entries.iter().map(|clip| (clip.shape, clip.transform))
     }
 
     /// Apply the pending suffix in order, before paint or a compositing layer.

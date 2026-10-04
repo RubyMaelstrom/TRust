@@ -746,6 +746,7 @@ impl VelloHybridRenderer {
         ));
         target.set_transform(device_transform);
         let mut layer_filters = Vec::new();
+        let mut filter_clip_layers = Vec::new();
 
         let mut skip_until = 0;
         for (index, command) in scene.primitives.iter().enumerate() {
@@ -830,6 +831,27 @@ impl VelloHybridRenderer {
                         continue;
                     }
                     apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
+                    // Clip filter output to ancestor clips; see the CPU backend.
+                    let mut clip_layers = 0;
+                    // Only an isolated source-over group composites the same
+                    // inside an extra layer; masks and blend modes need the
+                    // real backdrop.
+                    if !layer.filters.is_empty()
+                        && layer.compose == super::CompositeOperator::SourceOver
+                        && layer.blend == super::BlendMode::Normal
+                    {
+                        for (shape, at) in clips.active() {
+                            target.set_transform(at);
+                            target.set_fill_rule(shape_fill(shape));
+                            target.push_layer(Some(&shape_path(shape)), None, None, None, None);
+                            clip_layers += 1;
+                        }
+                        if clip_layers > 0 {
+                            target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+                            target.set_transform(*transforms.last().unwrap());
+                        }
+                    }
+                    filter_clip_layers.push(clip_layers);
                     target.push_layer(
                         layer.clip.map(rect_path).as_ref(),
                         Some(vello_blend(layer.blend, layer.compose)),
@@ -847,6 +869,9 @@ impl VelloHybridRenderer {
                         target.pop_layer();
                     }
                     target.pop_layer();
+                    for _ in 0..filter_clip_layers.pop().unwrap_or(0) {
+                        target.pop_layer();
+                    }
                 }
                 DisplayCommand::BeginSticky(_)
                 | DisplayCommand::EndSticky

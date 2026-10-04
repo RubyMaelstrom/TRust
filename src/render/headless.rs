@@ -448,6 +448,44 @@ mod tests {
     }
 
     #[test]
+    fn blurred_content_stays_inside_rounded_overflow_clips_on_both_backends() {
+        // CSS Filter Effects 1 §4 and CSS Overflow 3: an element's filter
+        // output, including blur that spreads past its content, is clipped
+        // by an ancestor's rounded overflow clip. YouTube's buttons wash a
+        // blurred light inside such a clip; Chromium shows nothing outside.
+        let html = r#"<!doctype html><style>
+            body{margin:0;background:black}
+            .btn{position:absolute;left:20px;top:20px;width:80px;height:40px;border-radius:20px}
+            .light{position:absolute;inset:0;border-radius:inherit;overflow:hidden}
+            .wash{position:absolute;inset:0;background:white;filter:blur(8px)}
+        </style><div class=btn><div class=light><div class=wash></div></div></div>"#;
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(html);
+        let scene = scene_for_dom(
+            &dom,
+            &base,
+            CssSize::new(120., 80.),
+            &[],
+            &Default::default(),
+            &ImageSizes::new(),
+            ImageStore::default(),
+        );
+        let check = |frame: &OwnedRgbaFrame| {
+            let at = |x: usize, y: usize| frame.pixels[(y * 120 + x) * 4..][..3].to_vec();
+            assert!(at(60, 40)[0] > 150, "the wash inside: {:?}", at(60, 40));
+            assert_eq!(at(14, 40), [0, 0, 0], "no glow left of the clip");
+            assert_eq!(at(60, 14), [0, 0, 0], "no glow above the clip");
+            assert_eq!(at(22, 22), [0, 0, 0], "the rounded corner clips the blur");
+        };
+        check(&VelloCpuRenderer::new().render_rgba(&scene).unwrap());
+        if let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) {
+            check(&hybrid.render_rgba(&scene).unwrap());
+        }
+    }
+
+    #[test]
     fn legacy_html_colors_reach_desktop_pixels_without_a_stylesheet() {
         // HTML #the-page / #phrasing-content-3: these hints must reach the
         // same cascade and canvas painting path as authored CSS.
