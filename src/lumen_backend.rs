@@ -28315,6 +28315,15 @@ mod tests {
             const area = document.createElement("area");
             area.href = "https://example.test/old";
             area.pathname = "/new";
+            // HTML "API for hyperlink elements": username and password.
+            const credentials = document.createElement("a");
+            credentials.href = "https://user:secret@example.test/";
+            const credentialsBefore = credentials.username + ":" + credentials.password;
+            credentials.username = "me";
+            credentials.password = "";
+            const mail = document.createElement("a");
+            mail.href = "mailto:you@example.net";
+            mail.username = "me";
             globalThis.hyperlinkSetterResult = [
                 a.href,
                 a.getAttribute("href"),
@@ -28323,7 +28332,11 @@ mod tests {
                 a.hash,
                 area.href,
                 absent.hasAttribute("href"),
-                absent.protocol
+                absent.protocol,
+                credentialsBefore,
+                credentials.href,
+                mail.href,
+                absent.username === "" && absent.password === ""
             ].join("|");
             "##,
             "hyperlink URL component setters",
@@ -28332,7 +28345,8 @@ mod tests {
 
         assert_eq!(
             string_value(&mut engine, "hyperlinkSetterResult"),
-            "https://example.com/player?hostBridge=1#destination|https://example.com/player?hostBridge=1#destination|/player|?hostBridge=1|#destination|https://example.test/new|false|:"
+            "https://example.com/player?hostBridge=1#destination|https://example.com/player?hostBridge=1#destination|/player|?hostBridge=1|#destination|https://example.test/new|false|:|\
+             user:secret|https://me@example.test/|mailto:you@example.net|true"
         );
     }
 
