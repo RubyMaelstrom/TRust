@@ -19131,6 +19131,57 @@ mod tests {
     }
 
     #[test]
+    fn text_controls_set_range_text_with_each_selection_mode() {
+        // HTML #dom-textarea/input-setrangetext (local whatwg/html@e5071a2).
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><input id=q value=foobar><input id=box type=checkbox><textarea id=area>foobar</textarea>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const results = [];
+            for (const element of [document.getElementById('q'), document.getElementById('area')]) {
+                element.value = 'foobar'; element.setSelectionRange(0, 3);
+                element.setRangeText('foobar2');
+                results.push(element.value, element.selectionStart, element.selectionEnd);
+                element.value = 'foobar'; element.setSelectionRange(0, 5);
+                element.setRangeText('', 3, 6);
+                results.push(element.value, element.selectionStart, element.selectionEnd);
+                for (const mode of ['select', 'start', 'end']) {
+                    element.value = 'foobar';
+                    element.setRangeText('xy', 2, 4, mode);
+                    results.push(element.value + ':' + element.selectionStart + '-' + element.selectionEnd);
+                }
+                element.value = 'foo';
+                element.setRangeText('Z', 10, 20, 'select');
+                results.push(element.value + ':' + element.selectionStart + '-' + element.selectionEnd);
+                const errors = [];
+                for (const args of [[], ['a', 1], ['a', 2, 1], ['a', 0, 0, 'bogus']]) {
+                    try { element.setRangeText(...args); errors.push('none'); } catch (e) { errors.push(e.name); }
+                }
+                results.push(errors.join('/'));
+            }
+            let invalid = null;
+            try { document.getElementById('box').setRangeText('x'); } catch (e) { invalid = e.name; }
+            results.push(invalid, HTMLInputElement.prototype.setRangeText.length);
+            return results.join('|');
+        })()"#
+            ),
+            "foobar2bar|0|7|foo|0|3|foxyar:2-4|foxyar:2-2|foxyar:4-4|fooZ:3-4|\
+             TypeError/TypeError/IndexSizeError/TypeError|\
+             foobar2bar|0|7|foo|0|3|foxyar:2-4|foxyar:2-2|foxyar:4-4|fooZ:3-4|\
+             TypeError/TypeError/IndexSizeError/TypeError|InvalidStateError|1"
+        );
+    }
+
+    #[test]
     fn first_script_media_queries_and_geometry_use_the_configured_environment() {
         for (width, density, expected) in [
             (1920, 1.0, "1920,1,true,false,600,10"),
