@@ -56,21 +56,24 @@
     body.appendChild(frame);
     const child = frame.contentWindow, childScreen = child.screen;
     check(child.Screen !== Screen && childScreen !== actual && childScreen instanceof child.Screen, 'per-Realm Screen');
-    check(child.innerWidth === 300 && child.innerHeight === 200 && childScreen.width === 300 && childScreen.height === 200, 'nested viewport area');
-    check(child.matchMedia('(device-width: 300px)').matches && child.matchMedia('(width: 300px)').matches, 'consistent nested media queries');
+    // The child's viewport is its own; its web-exposed screen is the window's.
+    check(child.innerWidth === 300 && child.innerHeight === 200 && childScreen.width === 640 && childScreen.height === 384, 'nested viewport and screen area');
+    check(child.matchMedia('(device-width: 640px)').matches && child.matchMedia('(device-height: 384px)').matches &&
+        child.matchMedia('(width: 300px)').matches && child.matchMedia('(device-width > 600px)').matches &&
+        !child.matchMedia('(device-width: 300px)').matches, 'consistent nested media queries');
     const screenWidth = Object.getOwnPropertyDescriptor(Screen.prototype, 'width').get;
     const foreignWidth = Object.getOwnPropertyDescriptor(child.Screen.prototype, 'width').get;
-    check(screenWidth.call(childScreen) === 300 && foreignWidth.call(actual) === 640, 'cross-Realm Screen getters');
+    check(screenWidth.call(childScreen) === 640 && foreignWidth.call(actual) === 640, 'cross-Realm Screen getters');
     throws('TypeError', () => screenWidth.call(child));
     throws('TypeError', () => foreignWidth.call({}), child.TypeError);
     check(descriptors.screen.get.call(child) === childScreen && descriptors.innerWidth.get.call(child) === 300, 'WindowProxy getter receiver');
     const foreignInner = Object.getOwnPropertyDescriptor(child, 'innerWidth');
     check(foreignInner.get.call(window) === 640, 'borrowed Window getter reads receiver');
     Object.setPrototypeOf(childScreen, null);
-    check(screenWidth.call(childScreen) === 300, 'brand survives prototype replacement');
+    check(screenWidth.call(childScreen) === 640, 'brand survives prototype replacement');
     Object.setPrototypeOf(childScreen, child.Screen.prototype);
     frame.style.width = '351px';
-    check(child.innerWidth === 351 && childScreen.width === 351, 'nested geometry is live before resize event');
+    check(child.innerWidth === 351 && childScreen.width === 640, 'nested geometry is live before resize event');
     __trust.updateFrameResizes();
     const replacement = {valueOf() { throw Error('replacement was converted'); }};
     for (const name of Object.keys(descriptors)) {
@@ -84,6 +87,7 @@
     check(resized === 1 && innerWidth === replacement && screen === replacement, 'resize preserves author replacements');
     check(descriptors.innerWidth.get.call(window) === 812 && descriptors.innerHeight.get.call(window) === 456, 'saved accessors read live viewport');
     check(actual.width === 812 && actual.height === 456 && descriptors.screen.get.call(window) === actual, 'SameObject screen remains live');
+    check(childScreen.width === 812 && childScreen.height === 456 && child.matchMedia('(device-width: 812px)').matches, 'child screen follows the window');
     check(document.documentElement.clientWidth === 812 && document.documentElement.clientHeight === 456, 'DOM geometry ignores replaced Window properties');
     check(matchMedia('(width: 812px)').matches && matchMedia('(device-width: 812px)').matches, 'media queries ignore replaced Window properties');
     __trust.setViewport(812, 456);
@@ -97,7 +101,7 @@
     foreignInner.set.call(child, replacement);
     frame.style.width = '389px';
     __trust.updateFrameResizes();
-    check(child.innerWidth === replacement && foreignInner.get.call(child) === 389 && childScreen.width === 389, 'child replacement and live geometry coexist');
+    check(child.innerWidth === replacement && foreignInner.get.call(child) === 389 && childScreen.width === 812, 'child replacement and live geometry coexist');
     const opaque = document.createElement('iframe');
     opaque.src = 'data:text/html,<p>opaque</p>'; body.appendChild(opaque);
     __trust.hydrateFrames();
@@ -107,7 +111,7 @@
     }
     throws('SecurityError', () => screenWidth.call(opaque.contentWindow), DOMException);
     frame.style.display = 'none';
-    check(foreignInner.get.call(child) === 0 && childScreen.width === 0 && childScreen.height === 0, 'hidden viewport is zero');
+    check(foreignInner.get.call(child) === 0 && childScreen.width === 812 && childScreen.height === 456, 'hidden viewport is zero; the screen is not');
     check(typeof globalThis.__screen_binding === 'undefined', 'private binding consumed');
     return 'screen-interfaces-ok';
 })();

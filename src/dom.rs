@@ -2761,6 +2761,22 @@ impl Dom {
         self.media_matches_at_density(query, width, height, self.device_pixel_ratio)
     }
 
+    /// Evaluate for a child navigable, whose viewport is not the screen.
+    pub fn media_matches_on_screen(
+        &self,
+        query: &str,
+        viewport: (f32, f32),
+        screen: (f32, f32),
+    ) -> bool {
+        let clamp = |(width, height): (f32, f32)| (width.max(0.0), height.max(0.0));
+        media_query_matches_on_screen(
+            query,
+            clamp(viewport),
+            clamp(screen),
+            self.device_pixel_ratio,
+        )
+    }
+
     pub fn media_matches_at_density(
         &self,
         query: &str,
@@ -19138,6 +19154,19 @@ fn media_query_matches(query: &str, vp: (f32, f32)) -> bool {
 }
 
 fn media_query_matches_with_density(query: &str, vp: (f32, f32), density: f32) -> bool {
+    media_query_matches_on_screen(query, vp, vp, density)
+}
+
+/// Evaluate a media query list whose Document's viewport differs from the
+/// web-exposed screen area (CSSOM View #web-exposed-screen-area): a child
+/// navigable's `width`/`height` are its own viewport, while the deprecated
+/// `device-*` features describe the screen shared with its traversable.
+fn media_query_matches_on_screen(
+    query: &str,
+    vp: (f32, f32),
+    screen: (f32, f32),
+    density: f32,
+) -> bool {
     let density = if density.is_finite() && density > 0.0 {
         density
     } else {
@@ -19145,13 +19174,13 @@ fn media_query_matches_with_density(query: &str, vp: (f32, f32), density: f32) -
     };
     query
         .split(',')
-        .any(|q| media_query_one(&q.trim().to_ascii_lowercase(), vp, density))
+        .any(|q| media_query_one(&q.trim().to_ascii_lowercase(), vp, screen, density))
 }
 
 /// One comma-separated media query (already lowercased). A leading
 /// `not`/`only` is a prefix on the whole query (not an `and`-joined part);
 /// the rest is a media type and/or `and`-joined `(feature: value)` conditions.
-fn media_query_one(q: &str, vp: (f32, f32), density: f32) -> bool {
+fn media_query_one(q: &str, vp: (f32, f32), screen: (f32, f32), density: f32) -> bool {
     let mut q = q.trim();
     let mut negate = false;
     if let Some(rest) = q.strip_prefix("not ") {
@@ -19170,7 +19199,7 @@ fn media_query_one(q: &str, vp: (f32, f32), density: f32) -> bool {
             continue;
         }
         if let Some(inner) = part.strip_prefix('(') {
-            if !media_feature_matches(inner.trim_end_matches(')'), vp, density) {
+            if !media_feature_matches(inner.trim_end_matches(')'), vp, screen, density) {
                 matches = false;
             }
         } else {
@@ -19199,18 +19228,21 @@ fn media_query_one(q: &str, vp: (f32, f32), density: f32) -> bool {
 /// 1dppx`). The preferences: `prefers-reduced-motion` (see
 /// [`set_prefers_reduced_motion`]) and `prefers-color-scheme: dark` (the
 /// terminal aesthetic).
-fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
+fn media_feature_matches(inner: &str, vp: (f32, f32), screen: (f32, f32), density: f32) -> bool {
     let (vw, vh) = vp;
+    let (sw, sh) = screen;
     let Some((name, value)) = inner.split_once(':') else {
         // No colon: the L4 range syntax when a comparison operator is
         // present, else the boolean-context form (MQ4 §2.4.1: false when
         // the feature's value would be zero/none).
         if inner.contains(['<', '>', '=']) {
-            return media_range_matches(inner, vp);
+            return media_range_matches(inner, vp, screen);
         }
         return match inner.trim() {
             "width" => vw != 0.0,
             "height" => vh != 0.0,
+            "device-width" => sw != 0.0,
+            "device-height" => sh != 0.0,
             "aspect-ratio" | "orientation" => vw != 0.0 && vh != 0.0,
             "color" | "color-gamut" | "hover" | "any-hover" | "pointer" | "any-pointer"
             | "update" | "scripting" | "resolution" | "grid" => true,
@@ -19233,14 +19265,14 @@ fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
         "min-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh >= n),
         "max-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh <= n),
         "height" => vh != 0.0 && media_px(value).is_some_and(|n| vh == n),
-        // `device-*` (deprecated in MQ4 but still served): the terminal IS
-        // the screen, so they equal the viewport.
-        "min-device-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw >= n),
-        "max-device-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw <= n),
-        "device-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw == n),
-        "min-device-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh >= n),
-        "max-device-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh <= n),
-        "device-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh == n),
+        // `device-*` (deprecated in MQ4 but still served) describe the
+        // web-exposed screen area, which is the top-level viewport.
+        "min-device-width" => sw != 0.0 && media_px(value).is_some_and(|n| sw >= n),
+        "max-device-width" => sw != 0.0 && media_px(value).is_some_and(|n| sw <= n),
+        "device-width" => sw != 0.0 && media_px(value).is_some_and(|n| sw == n),
+        "min-device-height" => sh != 0.0 && media_px(value).is_some_and(|n| sh >= n),
+        "max-device-height" => sh != 0.0 && media_px(value).is_some_and(|n| sh <= n),
+        "device-height" => sh != 0.0 && media_px(value).is_some_and(|n| sh == n),
         "orientation" if vw != 0.0 && vh != 0.0 => match value {
             "portrait" => vh >= vw,
             "landscape" => vw > vh,
@@ -19330,10 +19362,10 @@ fn media_dppx(value: &str) -> Option<f32> {
 
 /// The Media Queries L4 range syntax: `width >= 40em`, `width < 900px`,
 /// `400px <= width <= 900px` (Tailwind v4 and modern sheets emit these).
-/// Only `width`/`height` are evaluated; an unknown feature name, an unknown
-/// viewport (0), or an unparsable form doesn't match — the same
-/// conservative default as the colon form.
-fn media_range_matches(inner: &str, vp: (f32, f32)) -> bool {
+/// Only `width`/`height` and their `device-*` forms are evaluated; an unknown
+/// feature name, an unknown viewport (0), or an unparsable form doesn't
+/// match — the same conservative default as the colon form.
+fn media_range_matches(inner: &str, vp: (f32, f32), screen: (f32, f32)) -> bool {
     // Split into operands and comparison operators. Operators are ASCII, so
     // the byte positions sliced at are always char boundaries.
     let bytes = inner.as_bytes();
@@ -19364,6 +19396,8 @@ fn media_range_matches(inner: &str, vp: (f32, f32)) -> bool {
         let v = match name {
             "width" => vp.0,
             "height" => vp.1,
+            "device-width" => screen.0,
+            "device-height" => screen.1,
             _ => return None,
         };
         (v != 0.0).then_some(v)
@@ -23410,6 +23444,19 @@ mod tests {
             Some("3px"),
             "mutation invalidates the matched-rules memo"
         );
+    }
+
+    #[test]
+    fn device_media_features_describe_the_screen_not_a_frame_viewport() {
+        // CSSOM View #web-exposed-screen-area: a child navigable's `device-*`
+        // features match its screen, not its own viewport.
+        let (frame, screen) = ((300.0, 200.0), (1280.0, 720.0));
+        let matches = |query| media_query_matches_on_screen(query, frame, screen, 1.0);
+        assert!(matches("(width: 300px) and (device-width: 1280px)"));
+        assert!(matches("(device-height >= 700px) and (height < 300px)"));
+        assert!(!matches("(max-device-width: 400px)"));
+        assert!(matches("(device-width)"));
+        assert!(media_query_matches("(device-width: 800px)", (800.0, 600.0)));
     }
 
     #[test]

@@ -16019,20 +16019,25 @@ fn host_offset_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 }
 
 /// CSSOM View §4.1: parse and evaluate the media query list against the document environment.
+/// `__match_media(query, width?, height?, screenWidth?, screenHeight?)`:
+/// a child navigable passes its own viewport and the web-exposed screen area.
 fn host_match_media(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let query = host_arg_string(ctx, args, 0);
-    let viewport = args
-        .get(1)
-        .and_then(Value::as_num_opt)
-        .zip(args.get(2).and_then(Value::as_num_opt))
-        .filter(|(width, height)| {
-            width.is_finite() && *width >= 0.0 && height.is_finite() && *height >= 0.0
-        });
+    let size = |index: usize| {
+        args.get(index)
+            .and_then(Value::as_num_opt)
+            .zip(args.get(index + 1).and_then(Value::as_num_opt))
+            .filter(|(width, height)| {
+                width.is_finite() && *width >= 0.0 && height.is_finite() && *height >= 0.0
+            })
+            .map(|(width, height)| (width as f32, height as f32))
+    };
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    let matches = match viewport {
-        Some((width, height)) => dom.media_matches_at(&query, width as f32, height as f32),
-        None => dom.media_matches(&query),
+    let matches = match (size(1), size(3)) {
+        (Some(viewport), Some(screen)) => dom.media_matches_on_screen(&query, viewport, screen),
+        (Some((width, height)), None) => dom.media_matches_at(&query, width, height),
+        (None, _) => dom.media_matches(&query),
     };
     Ok(Value::Bool(matches))
 }

@@ -10873,6 +10873,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         try { content = __dom_rect(nodeIds.get(frame), true); } catch (_) {}
         return content ? (axis === "width" ? content[2] : content[3]) : 0;
     }
+    function screenDimension(axis) {
+        const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
+        if (parent && parent.screenDimension) return parent.screenDimension(axis);
+        return axis === "width" ? windowViewportWidth : windowViewportHeight;
+    }
+    trust.screenDimension = screenDimension;
     function windowViewportDimension(axis) {
         const frame = trust.__activeFrame || realmRootFrame;
         return frame ? frameViewportDimension(frame, axis) :
@@ -10996,7 +11002,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function mediaQueryMatches(state) {
         const size = state.viewport();
-        return !!__match_media(state.query, size[0], size[1]);
+        // Media Queries 4 `device-*` features describe the web-exposed
+        // screen, which is the top-level viewport in every navigable.
+        return !!__match_media(state.query, size[0], size[1],
+            screenDimension("width"), screenDimension("height"));
     }
     function mediaQueryListForViewport(query, viewport) {
         const q = String(query);
@@ -16066,20 +16075,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         define(Screen.prototype, Symbol.toStringTag, {value: "Screen", configurable: true});
         const screen = Object.create(Screen.prototype);
-        // Use CSSOM View's permitted viewport-sized screen area, consistently
-        // with TRust's device-width/device-height media features. This remains
-        // live for both top-level and nested viewports; RGB depth is 24 bits.
-        apply(set, slots, [screen, {screen: true, dimension: windowViewportDimension}]);
+        // CSSOM View #web-exposed-screen-area permits the viewport instead of
+        // the output device. The screen is the window's, so every navigable
+        // reports the top-level viewport (live), matching device-width and
+        // device-height media features; RGB depth is 24 bits.
+        apply(set, slots, [screen, {screen: true, dimension: screenDimension}]);
+        const screenState = receiver => {
+            const state = read(receiver);
+            if (!state || state.screen !== true) {
+                const window = windowMessageState(receiver);
+                if (window && window.originKey !== windowMessageState(g).originKey)
+                    throw new DOMException("Cross-origin Window access", "SecurityError");
+                throw new TypeErrorCtor("Illegal Screen invocation");
+            }
+            return state;
+        };
         for (const name of ["availWidth", "availHeight", "width", "height", "colorDepth", "pixelDepth"]) {
             define(Screen.prototype, name, {configurable: true, enumerable: true,
                 get: named({get() {
-                    const state = read(this);
-                    if (!state || state.screen !== true) {
-                        const window = windowMessageState(this);
-                        if (window && window.originKey !== windowMessageState(g).originKey)
-                            throw new DOMException("Cross-origin Window access", "SecurityError");
-                        throw new TypeErrorCtor("Illegal Screen invocation");
-                    }
+                    const state = screenState(this);
                     return name === "colorDepth" || name === "pixelDepth" ? 24 :
                         round(state.dimension(name === "width" || name === "availWidth" ? "width" : "height"));
                 }}.get, "get " + name)});
