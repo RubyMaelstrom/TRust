@@ -16885,8 +16885,7 @@ fn host_text_encoding_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 }
 
 /// Encoding #dom-textdecoder-decode for every encoding except UTF-8:
-/// (name, bytes, stream, fatal, ignoreBOM, handle) → [text, handle, failed],
-/// where text is a string or, for the characters noted below, UTF-16 code units.
+/// (name, bytes, stream, fatal, ignoreBOM, handle) → [text, handle, failed].
 fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let name = host_arg_string(ctx, args, 0);
     let bytes = args
@@ -16904,21 +16903,10 @@ fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         .text_decoders
         .decode(&name, &bytes, flag(2), flag(3), flag(4), handle)
         .ok_or_else(|| ctx.make_error("RangeError", "The encoding is not supported"))?;
-    // Lumen's string representation reserves U+10F800..=U+10FFFF for lone
-    // surrogates, and `Value::from_string` reads a real scalar there as one.
-    // Such text (possible from UTF-16 and gb18030) crosses as code units.
-    let text = if decoded.text.chars().any(|c| c >= '\u{10f800}') {
-        let units = decoded
-            .text
-            .encode_utf16()
-            .map(|unit| Value::Num(f64::from(unit)))
-            .collect();
-        ctx.make_array(units)
-    } else {
-        Value::from_string(decoded.text)
-    };
+    // Decoded text is Rust text: `Value::from_string` keeps U+10F800..=U+10FFFF
+    // characters (possible from UTF-16 and gb18030) as characters.
     Ok(ctx.make_array(vec![
-        text,
+        Value::from_string(decoded.text),
         Value::Num(f64::from(decoded.handle)),
         Value::Bool(decoded.failed),
     ]))

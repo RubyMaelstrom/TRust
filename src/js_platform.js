@@ -19067,7 +19067,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
     const charCodeAt = String.prototype.charCodeAt, stringSlice = String.prototype.slice;
     const toWellFormed = String.prototype.toWellFormed;
-    const fromCharCode = String.fromCharCode, arraySlice = Array.prototype.slice;
     const TypeErrorCtor = TypeError, RangeErrorCtor = RangeError, Bytes = Uint8Array;
     const isView = ArrayBuffer.isView, toStringTag = Symbol.toStringTag;
     const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
@@ -19110,14 +19109,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (typeof dictionary !== "object" && typeof dictionary !== "function")
             throw new TypeErrorCtor("Options must be a dictionary");
         return dictionary[name];
-    }
-    // UTF-16 code units from __text_decode, for text the host cannot pass
-    // as a string (see host_text_decode).
-    function unitsToString(units) {
-        let out = "";
-        for (let i = 0; i < units.length; i += 4096)
-            out += apply(fromCharCode, null, apply(arraySlice, units, [i, i + 4096]));
-        return out;
     }
     function isBufferWith(getter, value) {
         if (getter === null) return false;
@@ -19215,7 +19206,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const result = decodeNative(slots.encoding, bytes, stream, slots.fatal, slots.ignoreBOM, slots.handle);
                 slots.handle = result[1];
                 if (result[2]) throw new TypeErrorCtor("The encoded data was not valid");
-                return typeof result[0] === "string" ? result[0] : unitsToString(result[0]);
+                return result[0];
             }
             let queued = bytes;
             if (slots.pendingBytes.length) {
