@@ -1021,6 +1021,337 @@ fn compress_four(v: &[&str]) -> String {
     v[..len].join(" ")
 }
 
+/// CSSOM #serialize-a-css-component-value, `<number>`: base ten in the
+/// shortest form, rounded to at most six decimals, without scientific
+/// notation, preceded by `-` when negative. Non-finite values keep CSS
+/// Values 4's `infinity`/`NaN` spellings.
+pub(crate) fn css_number(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "infinity" } else { "-infinity" }.into();
+    }
+    let mut text = format!("{value:.6}");
+    if text.contains('.') {
+        let trimmed = text.trim_end_matches('0').trim_end_matches('.').len();
+        text.truncate(trimmed);
+    }
+    if text == "-0" {
+        text = "0".into();
+    }
+    text
+}
+
+/// A CSS `<length>` in px, its number serialized as by [`css_number`]. The
+/// f32 is widened through its shortest decimal form, so a specified
+/// `20.7px` does not read back with single-precision noise as `20.700001px`.
+pub(crate) fn css_px(px: f32) -> String {
+    let widened = px.to_string().parse::<f64>().unwrap_or(f64::from(px));
+    format!("{}px", css_number(widened))
+}
+
+/// A complete `<number>` token: digits with an optional sign, fraction and
+/// exponent. Rust's float parser would also accept `inf` and `NaN`, which
+/// are not numbers in CSS.
+fn number_token(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let numeric = !text.is_empty()
+        && text.bytes().any(|b| b.is_ascii_digit())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'));
+    numeric
+        .then(|| text.parse::<f64>().ok())
+        .flatten()
+        .filter(|v| v.is_finite())
+}
+
+/// CSSOM #resolved-values for the properties whose computed value is a
+/// `<number>` (or `<integer>`): the number serialized per CSSOM, so
+/// `opacity: .5` reads back as `0.5` and `z-index: 03` as `3`. CSS Color 4
+/// #transparency (and the SVG, Masking and Shapes `<opacity-value>`
+/// properties that share its definition): a percentage computes to the
+/// equivalent number, clamped to [0, 1] like any other value. `None` leaves
+/// keywords and unresolved values to the caller.
+pub(crate) fn resolved_number(name: &str, value: &str) -> Option<String> {
+    let alpha = matches!(
+        name,
+        "opacity"
+            | "fill-opacity"
+            | "stroke-opacity"
+            | "stop-opacity"
+            | "flood-opacity"
+            | "shape-image-threshold"
+    );
+    if alpha {
+        let value = value.trim();
+        let number = match value.strip_suffix('%') {
+            Some(percent) => number_token(percent)? / 100.0,
+            None => number_token(value)?,
+        };
+        return Some(css_number(number.clamp(0.0, 1.0)));
+    }
+    matches!(
+        name,
+        "flex-grow"
+            | "flex-shrink"
+            | "order"
+            | "z-index"
+            | "orphans"
+            | "widows"
+            | "column-count"
+            | "-webkit-line-clamp"
+            | "tab-size"
+            | "stroke-miterlimit"
+            | "font-size-adjust"
+            | "-webkit-box-flex"
+            | "-webkit-box-ordinal-group"
+    )
+    .then(|| number_token(value).map(css_number))
+    .flatten()
+}
+
+/// CSSOM #dom-cssstyledeclaration-getpropertyvalue on a computed style
+/// declaration block (CSSOM #dom-window-getcomputedstyle), which holds only
+/// longhands: a shorthand serializes from its longhands' resolved values
+/// (CSSOM #serialize-a-css-value), in the shortest form that represents
+/// them exactly, or as the empty string when it cannot represent them.
+/// `longhand` reads a longhand's resolved value. `None` for the properties
+/// this does not treat as shorthands.
+pub(crate) fn resolved_shorthand(
+    name: &str,
+    longhand: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    resolved_shorthand_of(name, &longhand)
+}
+
+fn resolved_shorthand_of(name: &str, longhand: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let sides = |pattern: &dyn Fn(&str) -> String| -> Option<Vec<String>> {
+        ["top", "right", "bottom", "left"]
+            .into_iter()
+            .map(|side| longhand(&pattern(side)))
+            .collect()
+    };
+    let four = |values: Option<Vec<String>>| {
+        values.map_or_else(String::new, |values| {
+            compress_four(&values.iter().map(String::as_str).collect::<Vec<_>>())
+        })
+    };
+    let all =
+        |names: &[&str]| -> Option<Vec<String>> { names.iter().map(|n| longhand(n)).collect() };
+    let pair = |values: Option<Vec<String>>| match values {
+        Some(values) if values[0] == values[1] => values[0].clone(),
+        Some(values) => values.join(" "),
+        None => String::new(),
+    };
+    Some(match name {
+        "margin" | "padding" => four(sides(&|side| format!("{name}-{side}"))),
+        "inset" => four(sides(&|side| side.to_string())),
+        "border-width" | "border-style" | "border-color" => {
+            let kind = &name["border-".len()..];
+            four(sides(&|side| format!("border-{side}-{kind}")))
+        }
+        // CSS Backgrounds 3 #border-radius: horizontal radii, then the
+        // vertical ones after a slash when they differ.
+        "border-radius" => {
+            let Some(corners) = all(&[
+                "border-top-left-radius",
+                "border-top-right-radius",
+                "border-bottom-right-radius",
+                "border-bottom-left-radius",
+            ]) else {
+                return Some(String::new());
+            };
+            let pairs: Vec<Vec<&str>> = corners.iter().map(|c| split_top_level_ws(c)).collect();
+            if pairs.iter().any(|pair| pair.is_empty() || pair.len() > 2) {
+                return Some(String::new());
+            }
+            let x: Vec<&str> = pairs.iter().map(|pair| pair[0]).collect();
+            let y: Vec<&str> = pairs.iter().map(|pair| *pair.last().unwrap()).collect();
+            let (x, y) = (compress_four(&x), compress_four(&y));
+            if x == y { x } else { format!("{x} / {y}") }
+        }
+        // CSS Backgrounds 3 #border-shorthands: width, style and color, each
+        // of which the computed value always states.
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let side = &name["border-".len()..];
+            all(&[
+                &format!("border-{side}-width"),
+                &format!("border-{side}-style"),
+                &format!("border-{side}-color"),
+            ])
+            .map_or_else(String::new, |parts| parts.join(" "))
+        }
+        // #propdef-border: all four sides alike, and border-image at its
+        // initial value, which the shorthand can only reset.
+        "border" => {
+            let sides: Option<Vec<String>> = ["top", "right", "bottom", "left"]
+                .into_iter()
+                .map(|side| {
+                    resolved_shorthand_of(&format!("border-{side}"), longhand)
+                        .filter(|side| !side.is_empty())
+                })
+                .collect();
+            let image_initial = BORDER_IMAGE_LONGHANDS.iter().all(|(name, initial)| {
+                longhand(name).is_none_or(|value| {
+                    value == *initial
+                        || (*name == "border-image-slice" && value == "100%")
+                        || (*name == "border-image-width" && value == "1")
+                        || (*name == "border-image-outset" && value == "0")
+                        || (*name == "border-image-repeat" && value == "stretch")
+                })
+            });
+            match sides {
+                Some(sides) if image_initial && sides.iter().all(|side| *side == sides[0]) => {
+                    sides[0].clone()
+                }
+                _ => String::new(),
+            }
+        }
+        // CSS Logical 1 #logical-shorthands: the start value, then the end
+        // value when it differs.
+        "margin-block"
+        | "margin-inline"
+        | "padding-block"
+        | "padding-inline"
+        | "inset-block"
+        | "inset-inline"
+        | "border-block-width"
+        | "border-inline-width"
+        | "border-block-style"
+        | "border-inline-style"
+        | "border-block-color"
+        | "border-inline-color" => {
+            let (prefix, suffix) = match name.split_once("-block") {
+                Some((prefix, suffix)) => (format!("{prefix}-block"), suffix),
+                None => {
+                    let (prefix, suffix) = name.split_once("-inline").unwrap();
+                    (format!("{prefix}-inline"), suffix)
+                }
+            };
+            pair(all(&[
+                &format!("{prefix}-start{suffix}"),
+                &format!("{prefix}-end{suffix}"),
+            ]))
+        }
+        // CSS Logical 1 #border-shorthands: like `border`, both sides alike.
+        "border-block" | "border-inline" => {
+            let sides: Option<Vec<String>> = ["start", "end"]
+                .into_iter()
+                .map(|side| {
+                    resolved_shorthand_of(&format!("{name}-{side}"), longhand)
+                        .filter(|side| !side.is_empty())
+                })
+                .collect();
+            match sides {
+                Some(sides) if sides[0] == sides[1] => sides[0].clone(),
+                _ => String::new(),
+            }
+        }
+        "border-block-start" | "border-block-end" | "border-inline-start" | "border-inline-end" => {
+            all(&[
+                &format!("{name}-width"),
+                &format!("{name}-style"),
+                &format!("{name}-color"),
+            ])
+            .map_or_else(String::new, |parts| parts.join(" "))
+        }
+        // CSS UI 4 #outline: `<'outline-color'> || <'outline-style'> ||
+        // <'outline-width'>`, each stated like the border shorthands'.
+        "outline" => all(&["outline-color", "outline-style", "outline-width"])
+            .map_or_else(String::new, |parts| parts.join(" ")),
+        // CSS Align 3 #gap-shorthand and #place-content / #place-self: the
+        // first value, then the second when it differs.
+        "gap" => pair(all(&["row-gap", "column-gap"])),
+        "place-content" => pair(all(&["align-content", "justify-content"])),
+        "place-self" => pair(all(&["align-self", "justify-self"])),
+        // CSS Overscroll 1 #overscroll-behavior-properties.
+        "overscroll-behavior" => pair(all(&["overscroll-behavior-x", "overscroll-behavior-y"])),
+        // CSS Flexbox 1 #flex-property: the computed value states all three
+        // components (`flex: none` reads back as `0 0 auto`).
+        "flex" => all(&["flex-grow", "flex-shrink", "flex-basis"])
+            .map_or_else(String::new, |parts| parts.join(" ")),
+        "flex-flow" => {
+            all(&["flex-direction", "flex-wrap"]).map_or_else(String::new, |parts| parts.join(" "))
+        }
+        "font" => resolved_font(longhand).unwrap_or_default(),
+        "background" => resolved_background(longhand).unwrap_or_default(),
+        _ => return None,
+    })
+}
+
+/// CSS Fonts 4 #font-prop: `[style] [small-caps] [weight] [stretch] size
+/// [/ line-height] family`, omitting the components at their initial value.
+/// Values the shorthand cannot express make it unrepresentable.
+fn resolved_font(longhand: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let style = longhand("font-style")?;
+    let weight = longhand("font-weight")?;
+    let size = longhand("font-size")?;
+    let line_height = longhand("line-height")?;
+    let family = longhand("font-family")?;
+    let variant = longhand("font-variant").unwrap_or_else(|| "normal".into());
+    let stretch = longhand("font-stretch").unwrap_or_else(|| "100%".into());
+    let stretch = match stretch.as_str() {
+        "normal" | "100%" => None,
+        "50%" | "ultra-condensed" => Some("ultra-condensed"),
+        "62.5%" | "extra-condensed" => Some("extra-condensed"),
+        "75%" | "condensed" => Some("condensed"),
+        "87.5%" | "semi-condensed" => Some("semi-condensed"),
+        "112.5%" | "semi-expanded" => Some("semi-expanded"),
+        "125%" | "expanded" => Some("expanded"),
+        "150%" | "extra-expanded" => Some("extra-expanded"),
+        "200%" | "ultra-expanded" => Some("ultra-expanded"),
+        _ => return None,
+    };
+    let mut parts = Vec::new();
+    if style != "normal" {
+        parts.push(style);
+    }
+    match variant.as_str() {
+        "normal" => {}
+        "small-caps" => parts.push(variant),
+        _ => return None,
+    }
+    if !matches!(weight.as_str(), "normal" | "400") {
+        parts.push(weight);
+    }
+    if let Some(stretch) = stretch {
+        parts.push(stretch.into());
+    }
+    parts.push(size);
+    if line_height != "normal" {
+        parts.push("/".into());
+        parts.push(line_height);
+    }
+    parts.push(family);
+    Some(parts.join(" "))
+}
+
+/// CSS Backgrounds 3 #background, from resolved longhands: the shortest
+/// serialization of each layer (`background_value`), whose final layer omits
+/// a fully transparent color.
+fn resolved_background(longhand: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let mut values = [
+        "background-color",
+        "background-image",
+        "background-repeat",
+        "background-position",
+        "background-size",
+        "background-origin",
+        "background-clip",
+        "background-attachment",
+    ]
+    .into_iter()
+    .map(longhand)
+    .collect::<Option<Vec<_>>>()?;
+    if crate::render::PaintColor::parse_css(&values[0]).is_some_and(|c| c.is_transparent()) {
+        values[0] = "transparent".into();
+    }
+    let value = background_value(&values.iter().map(String::as_str).collect::<Vec<_>>());
+    (!value.is_empty()).then_some(value)
+}
+
 pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
     match op {
         "string" => json!(properties::string_text(text)),
@@ -1062,6 +1393,126 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_numbers_serialize_in_the_shortest_form() {
+        // CSSOM #serialize-a-css-component-value: base ten, at most six
+        // decimals, no exponent, no negative zero.
+        for (value, text) in [
+            (0.5, "0.5"),
+            (100.0, "100"),
+            (1.0 / 3.0, "0.333333"),
+            (-0.0, "0"),
+            (-2.25, "-2.25"),
+            (1e21, "1000000000000000000000"),
+            (0.0000004, "0"),
+            (f64::INFINITY, "infinity"),
+        ] {
+            assert_eq!(css_number(value), text, "{value}");
+        }
+        for (name, value, text) in [
+            ("opacity", ".5", Some("0.5")),
+            ("opacity", "50%", Some("0.5")),
+            ("opacity", "1.5", Some("1")),
+            ("opacity", "-1", Some("0")),
+            ("fill-opacity", "+.25", Some("0.25")),
+            ("flex-grow", "1e2", Some("100")),
+            ("z-index", "03", Some("3")),
+            ("order", "-0", Some("0")),
+            ("z-index", "auto", None),
+            ("opacity", "inf", None),
+            ("opacity", "calc(1 / 2)", None),
+            ("width", "5", None),
+        ] {
+            assert_eq!(
+                resolved_number(name, value).as_deref(),
+                text,
+                "{name}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn computed_style_serializes_numbers_radii_and_shorthands() {
+        // CSSOM #resolved-values and #serialize-a-css-value: computed numbers
+        // in their shortest form, corner radii without a repeated vertical
+        // radius, and shorthands (absent from a computed declaration block)
+        // serialized from their longhands, or "" when they cannot represent
+        // them. Values verified against headless Chromium 140 except where
+        // noted.
+        let dom = Dom::parse_document(
+            "<!doctype html><style>\
+             #a { border-radius: 20px; border-top-left-radius: 7px; opacity: .5; \
+                  flex: .5 1e2 0; z-index: 03; order: -0 }\
+             #b { border-radius: 10px 20% / 5px; font: italic bold 12px/1.5 serif; \
+                  margin: 1px 2px; padding: 3px; position: relative; inset: 1px 2px 3px 4px; \
+                  border: 2px solid red; gap: 3px 4px; opacity: 150%; flex-flow: column wrap }\
+             #c { border-width: 1px 2px; border-style: solid dashed; border-color: red blue; \
+                  opacity: 50%; background: url(x.png) red no-repeat; font-size: 10px; \
+                  line-height: 1.15; border-bottom-left-radius: calc(-1.5em + 10px) 2.5em }\
+             #d { opacity: 0.333333333; border-image: url(y.png) 30 }\
+             </style><div id=a></div><div id=b></div><div id=c></div><div id=d></div>\
+             <div id=e></div>",
+        );
+        let value = |id: &str, property: &str| {
+            dom.cssom_resolved_value(dom.get_by_id(id).unwrap(), property)
+                .unwrap_or_default()
+        };
+        for (id, property, expected) in [
+            ("a", "border-top-left-radius", "7px"),
+            ("a", "border-top-right-radius", "20px"),
+            ("a", "border-radius", "7px 20px 20px"),
+            ("a", "opacity", "0.5"),
+            ("a", "flex-grow", "0.5"),
+            ("a", "flex", "0.5 100 0px"),
+            ("a", "z-index", "3"),
+            ("a", "order", "0"),
+            ("b", "border-top-left-radius", "10px 5px"),
+            ("b", "border-top-right-radius", "20% 5px"),
+            ("b", "border-radius", "10px 20% / 5px"),
+            ("b", "opacity", "1"),
+            ("b", "font", "italic 700 12px / 18px serif"),
+            ("b", "margin", "1px 2px"),
+            ("b", "padding", "3px"),
+            ("b", "padding-inline", "3px"),
+            ("b", "margin-block", "1px"),
+            ("b", "inset", "1px 2px 3px 4px"),
+            ("b", "border", "2px solid rgb(255, 0, 0)"),
+            ("b", "border-top", "2px solid rgb(255, 0, 0)"),
+            ("b", "border-width", "2px"),
+            ("b", "gap", "3px 4px"),
+            ("b", "flex-flow", "column wrap"),
+            ("c", "border-width", "1px 2px"),
+            ("c", "border-style", "solid dashed"),
+            ("c", "border-color", "rgb(255, 0, 0) rgb(0, 0, 255)"),
+            ("c", "border-block", "1px solid rgb(255, 0, 0)"),
+            ("c", "border-inline", "2px dashed rgb(0, 0, 255)"),
+            ("c", "border", ""),
+            ("c", "opacity", "0.5"),
+            ("c", "line-height", "11.5px"),
+            ("c", "font", "10px / 11.5px sans-serif"),
+            ("c", "border-bottom-left-radius", "0px 25px"),
+            // CSSOM #serialize-a-css-value prefers the shortest form; Blink
+            // instead lists every background longhand.
+            ("c", "background", "url(x.png) no-repeat rgb(255, 0, 0)"),
+            ("d", "opacity", "0.333333"),
+            // The border shorthand also resets border-image, so it cannot
+            // represent a non-initial one (Blink ignores border-image here).
+            ("d", "border", ""),
+            ("e", "border", "0px none rgb(0, 0, 0)"),
+            ("e", "border-radius", "0px"),
+            ("e", "margin", "0px"),
+            ("e", "inset", "auto"),
+            ("e", "gap", "normal"),
+            ("e", "flex", "0 1 auto"),
+            ("e", "background", "none"),
+            ("e", "outline", "rgb(0, 0, 0) none 3px"),
+            ("e", "overflow", "visible"),
+            ("e", "font", "16px sans-serif"),
+        ] {
+            assert_eq!(value(id, property), expected, "#{id} {property}");
+        }
+    }
 
     #[test]
     fn all_shorthand_cssom_accepts_resets_and_roundtrips_exceptions() {
