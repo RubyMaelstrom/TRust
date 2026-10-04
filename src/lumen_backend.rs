@@ -10930,7 +10930,11 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         let config_for_tests = config.clone();
         realm_ctx.member_set(&global, "__trust_cfg", config)?;
 
-        let bootstrap_result = realm_ctx.eval_classic_snapshot_interruptible(snapshot);
+        // HTML §7.2.2/§7.5.1 create-a-new-browsing-context runs the platform bootstrap as a
+        // fresh ScriptEvaluation in the new Realm. The engine shares the decoded program and
+        // its compiled code with the page's other Window Realms; every object it creates
+        // belongs to this Realm alone.
+        let bootstrap_result = realm_ctx.eval_shared_classic_snapshot_interruptible(snapshot);
         match bootstrap_result {
             Ok(Ok(_)) => {
                 #[cfg(test)]
@@ -16639,12 +16643,15 @@ fn main_page_diagnostic_reporter(engine: &mut lumen::Engine) -> Value {
     )
 }
 
+/// Evaluate a static Window bootstrap through the engine's shared program table: the first
+/// Realm of the page decodes it, and every nested Window Realm reuses that program and the code
+/// compiled for its functions instead of decoding and compiling the prelude again.
 fn eval_bootstrap_snapshot(
     engine: &mut lumen::Engine,
-    snapshot: &[u8],
+    snapshot: &'static [u8],
     label: &str,
 ) -> Result<(), String> {
-    match engine.eval_snapshot_value_interruptible(snapshot) {
+    match engine.eval_shared_snapshot_value_interruptible(snapshot) {
         Err(error) => Err(format!(
             "{label} parse error at line {}: {}",
             error.line, error.message
@@ -31938,6 +31945,79 @@ mod tests {
             string_value(&mut engine, "initialAboutBlankRealmResult"),
             "true|true|1|true|true|true|true|true|true|preserved"
         );
+    }
+
+    #[test]
+    fn iframe_window_realms_share_platform_code_but_not_platform_objects() {
+        // HTML §7.2.2 / §7.3.2.1: every child navigable gets a new Window Realm whose
+        // intrinsics, global object and platform interface objects are its own. The engine
+        // evaluates the platform prelude for each of them from one shared program (and the
+        // code compiled for it), so check that nothing created by that code crosses Realms.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            eval(
+                &mut engine,
+                r##"
+                const html = document.createElement("html");
+                const body = document.createElement("body");
+                document.appendChild(html); html.appendChild(body);
+                const frames = [];
+                for (let i = 0; i < 4; i++) {
+                    const frame = document.createElement("iframe");
+                    body.appendChild(frame);
+                    frames.push(frame.contentWindow);
+                }
+                const checks = [];
+                const windows = [window, ...frames];
+                for (let i = 0; i < windows.length; i++) {
+                    const w = windows[i];
+                    const d = w.document;
+                    const element = d.createElement("div");
+                    w.marker = "w" + i;
+                    checks.push(
+                        element instanceof w.HTMLDivElement,
+                        element instanceof w.Node,
+                        Object.getPrototypeOf(element) === w.HTMLDivElement.prototype,
+                        Object.getPrototypeOf(w.HTMLElement) === w.Element,
+                        Object.getPrototypeOf(w.Node) === w.EventTarget,
+                        Object.getPrototypeOf(w.EventTarget) === w.Function.prototype,
+                        Object.getPrototypeOf(w.Node.prototype.appendChild) === w.Function.prototype,
+                        w.Object.prototype.toString.call(element) === "[object HTMLDivElement]",
+                        Object.getPrototypeOf(d.querySelectorAll("div")) === w.NodeList.prototype,
+                        Object.getPrototypeOf(w.navigator) === w.Navigator.prototype,
+                        new w.Event("x") instanceof w.Event,
+                        w.eval("[]") instanceof w.Array,
+                        w.eval("marker") === "w" + i
+                    );
+                    try { d.createElement("bad name"); checks.push(false); }
+                    catch (error) { checks.push(error instanceof w.DOMException, error.constructor === w.DOMException); }
+                    for (let j = 0; j < i; j++) {
+                        const other = windows[j];
+                        checks.push(
+                            w.HTMLElement !== other.HTMLElement,
+                            w.Node.prototype !== other.Node.prototype,
+                            w.Node.prototype.appendChild !== other.Node.prototype.appendChild,
+                            w.Array !== other.Array,
+                            w.document !== other.document,
+                            !(element instanceof other.HTMLElement),
+                            w.navigator !== other.navigator
+                        );
+                    }
+                }
+                globalThis.sharedPlatformRealmResult = checks.every(Boolean)
+                    ? "ok"
+                    : "failed at " + checks.findIndex(value => !value);
+            "##,
+                "iframe Window Realms share platform code",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "sharedPlatformRealmResult"),
+                "ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]
