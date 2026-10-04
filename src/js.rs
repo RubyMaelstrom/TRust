@@ -908,7 +908,11 @@ pub(crate) fn clickable_set_for_dom(
     for node in candidates.iter().chain(&anchors) {
         let mut current = dom.parent_composed(*node);
         while let Some(parent) = current {
-            containers.insert(parent);
+            // Every recorded container's composed ancestors were recorded
+            // along with it; the rest of this chain is already present.
+            if !containers.insert(parent) {
+                break;
+            }
             current = dom.parent_composed(parent);
         }
     }
