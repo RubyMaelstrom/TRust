@@ -20205,6 +20205,48 @@ mod tests {
     }
 
     #[test]
+    fn node_constructors_create_nodes_and_windows_index_child_navigables() {
+        // DOM #dom-text-text, #dom-comment-comment and
+        // #dom-documentfragment-documentfragment create nodes in the current
+        // global's associated Document; HTML #windowproxy-getownproperty
+        // exposes child navigables by index. CreepJS finds its probe iframe
+        // as `self[self.length]` after appending a `new DocumentFragment()`.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const error = callback => { try { callback(); return 'none'; } catch (e) { return e.name; } };
+                const text = new Text('hi'), comment = new Comment('c'), fragment = new DocumentFragment();
+                class Custom extends Text {}
+                const custom = new Custom('s');
+                const before = self.length, div = document.createElement('div');
+                fragment.appendChild(div);
+                div.innerHTML = '<div><iframe></iframe></div>';
+                body.append(text, comment, fragment);
+                __trust.hydrateFrames();
+                const frame = document.querySelector('iframe');
+                const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Window.prototype), '0');
+                [text.data, text.ownerDocument === document, text.parentNode === body, body.childNodes[0] === text,
+                 comment.nodeType, comment.data, new Text().data, Text.length, DocumentFragment.length,
+                 custom instanceof Custom, custom.data, fragment.childNodes.length,
+                 error(() => new Text(Symbol())), error(() => new CDATASection()), error(() => new ShadowRoot()),
+                 before, self.length, self[0] === frame.contentWindow, frames[0] === self[0], 0 in window,
+                 self[1], descriptor.writable, descriptor.enumerable, self['01'], self[-0]  === self[0]].join('|')
+            "#
+                ),
+                "hi|true|true|true|8|c||0|0|true|s|0|TypeError|TypeError|TypeError|0|1|true|true|true||false|false||true",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn replace_child_with_a_fragment_inserts_its_children() {
         // DOM #concept-node-replace: a DocumentFragment's children take the
         // old child's place; with the suppress observers flag the fragment
