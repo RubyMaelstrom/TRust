@@ -33,6 +33,8 @@ mod live_range_host;
 mod lumen_wasm;
 #[path = "message_port_host.rs"]
 mod message_port_host;
+#[path = "page_spare.rs"]
+mod page_spare;
 #[path = "text_decoder_host.rs"]
 mod text_decoder_host;
 #[path = "webgl_host.rs"]
@@ -2003,7 +2005,15 @@ mod desktop {
             scripted_frames: env.scripted_frames,
             last_modified: env.last_modified,
         };
-        let mut page = match load_page(html, env, host_tx, &mut host_rx, None, interrupt.clone()) {
+        let mut page = match load_page(
+            html,
+            env,
+            host_tx,
+            &mut host_rx,
+            None,
+            interrupt.clone(),
+            None,
+        ) {
             Ok(page) => page,
             Err(mut outcome) => {
                 outcome.elapsed = Duration::ZERO;
@@ -2174,14 +2184,34 @@ mod desktop {
         Maintenance,
     }
 
+    /// The inputs a resident page actor consumes: its document, environment,
+    /// and the actor ends of the frontend's channels. A cold actor and a
+    /// claimed spare engine receive exactly the same values.
+    pub(super) struct PageStart {
+        pub(super) html: String,
+        pub(super) env: PageEnv,
+        pub(super) cmds: tokio::sync::mpsc::Receiver<PageCmd>,
+        pub(super) interactions: tokio::sync::mpsc::Receiver<PageCmd>,
+        pub(super) hover: tokio::sync::watch::Receiver<PageHover>,
+        pub(super) events: tokio::sync::mpsc::Sender<PageEvt>,
+    }
+
     /// Spawn the production Lumen resident realm behind the actor contract
-    /// shared by the terminal and desktop frontends.
+    /// shared by the terminal and desktop frontends. A waiting spare engine,
+    /// when one exists, takes the document instead of a new cold actor.
     pub(crate) fn spawn_page(
         html: String,
         env: PageEnv,
     ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
+        spawn_page_with(super::page_spare::take(), html, env)
+    }
+
+    pub(super) fn spawn_page_with(
+        spare: Option<super::page_spare::SpareEngine>,
+        html: String,
+        env: PageEnv,
+    ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
         let cache = env.cache.clone();
-        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(16);
         let (hover_tx, hover_rx) = tokio::sync::watch::channel(PageHover {
@@ -2191,23 +2221,41 @@ mod desktop {
             metadata: crate::js::PointerMetadata::default(),
         });
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let mut start = PageStart {
+            html,
+            env,
+            cmds: cmd_rx,
+            interactions: interaction_rx,
+            hover: hover_rx,
+            events: event_tx,
+        };
+        if let Some(spare) = spare {
+            match spare.claim(start, &cache) {
+                Ok(interrupt) => {
+                    return (
+                        PageHandle::from_lumen_parts(
+                            cmd_tx,
+                            interaction_tx,
+                            hover_tx,
+                            cache,
+                            interrupt,
+                        ),
+                        event_rx,
+                    );
+                }
+                // The spare's thread is gone (it can only have failed); the
+                // document takes the ordinary cold path.
+                Err(returned) => start = *returned,
+            }
+        }
+        let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
         let actor_interrupt = interrupt.clone();
         let spawned = crate::page_threads::spawn(
-            std::thread::Builder::new()
-                .name(String::from("trust-page-lumen"))
-                .stack_size(PAGE_STACK),
+            page_thread_builder(),
             interrupt.clone(),
             Some(&cache),
             move || {
-                page_actor(
-                    html,
-                    env,
-                    cmd_rx,
-                    interaction_rx,
-                    hover_rx,
-                    event_tx,
-                    actor_interrupt,
-                );
+                page_actor(start, actor_interrupt, None);
                 crate::release_allocator_memory();
             },
         );
@@ -2221,15 +2269,28 @@ mod desktop {
         )
     }
 
-    fn page_actor(
-        html: String,
-        env: PageEnv,
-        mut cmds: tokio::sync::mpsc::Receiver<PageCmd>,
-        mut interactions: tokio::sync::mpsc::Receiver<PageCmd>,
-        mut hover: tokio::sync::watch::Receiver<PageHover>,
-        events: tokio::sync::mpsc::Sender<PageEvt>,
+    /// Every resident page actor, cold or spare, runs on a thread like this.
+    pub(super) fn page_thread_builder() -> std::thread::Builder {
+        std::thread::Builder::new()
+            .name(String::from("trust-page-lumen"))
+            .stack_size(PAGE_STACK)
+    }
+
+    /// Run one document's resident actor. `warm` is a claimed spare engine
+    /// (see `page_spare`); `None` creates the engine cold.
+    pub(super) fn page_actor(
+        start: PageStart,
         interrupt: Arc<lumen::RuntimeInterrupt>,
+        warm: Option<lumen::Engine>,
     ) {
+        let PageStart {
+            html,
+            env,
+            mut cmds,
+            mut interactions,
+            mut hover,
+            events,
+        } = start;
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
         // A no-network realm does not retain the sender in HostState. Keep the
         // lane open anyway: a closed `recv()` is immediately ready and would
@@ -2242,6 +2303,7 @@ mod desktop {
             &mut host_rx,
             Some(&events),
             interrupt.clone(),
+            warm,
         ) {
             Ok(page) => page,
             Err(outcome) => {
@@ -3004,6 +3066,7 @@ mod desktop {
         host_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
         events: Option<&tokio::sync::mpsc::Sender<PageEvt>>,
         interrupt: Arc<lumen::RuntimeInterrupt>,
+        warm: Option<lumen::Engine>,
     ) -> Result<LumenPage, Outcome> {
         let mut outcome = Outcome::default();
         let viewport = crate::layout2::Viewport::new(
@@ -3078,7 +3141,15 @@ mod desktop {
         // every function on its first call is useful for a hot synthetic loop but makes framework
         // startup pay native-code generation for large numbers of one-shot functions. Lumen's
         // LUMEN_TIER and LUMEN_TIER_THRESHOLD diagnostics remain available through Engine::new.
-        let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+        // A claimed spare engine was built from this same interrupt on this thread; its default
+        // Realm is still untouched, and everything below is applied to it exactly as to a new one.
+        let mut engine = match warm {
+            Some(engine) => {
+                debug_assert!(Arc::ptr_eq(&engine.interrupt_handle(), &interrupt));
+                engine
+            }
+            None => lumen::Engine::new_with_interrupt(interrupt),
+        };
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
         state.configure_module_loading(&mut engine);
@@ -3101,23 +3172,10 @@ mod desktop {
         // SPA shells commonly serve the same markup at every route and select
         // the route from location.pathname, so seeding the realm with `base`
         // collapses every such navigation to the base path.
-        let config = format!(
-            "globalThis.__trust_cfg = {{ url: {}, ua: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {} }};",
-            json_string(response_url.as_str()),
-            json_string(crate::http::user_agent()),
-            json_string(crate::locale::LANGUAGE),
-            json_string(crate::locale::LANGUAGES[0]),
-            json_string(crate::locale::LANGUAGES[1]),
-            viewport.width,
-            viewport.height,
+        let config = main_window_config(
+            &response_url,
+            viewport,
             env.device_pixel_ratio,
-            std::thread::available_parallelism()
-                .map(|parallelism| parallelism.get())
-                .unwrap_or(8),
-            crate::http::GLOBAL_PRIVACY_CONTROL,
-            lumen_potentially_trustworthy(&response_url),
-            std::env::var_os("TRUST_TRACE_FRAMES").is_some(),
-            std::env::var_os("TRUST_TRACE_CHALLENGE_MESSAGES").is_some(),
             env.navigation_timing
                 .as_ref()
                 .map_or(serde_json::Value::Null, |timing| {
@@ -3125,8 +3183,8 @@ mod desktop {
                     data["legacy:domLoading"] = serde_json::json!(document_creation_time.floor());
                     data
                 }),
-            env.last_modified
-                .map_or_else(|| String::from("null"), |time| time.to_string()),
+            env.last_modified,
+            MainWindowTraces::from_environment(),
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
             outcome.errors.push(error);
@@ -3562,10 +3620,6 @@ mod desktop {
                 self.prefer_page_task = true;
             }
         }
-    }
-
-    fn json_string(value: &str) -> String {
-        serde_json::to_string(value).unwrap_or_else(|_| String::from("\"\""))
     }
 
     fn pending_resources(page: &mut LumenPage) -> usize {
@@ -7056,6 +7110,7 @@ mod desktop {
                 &mut host_rx,
                 None,
                 interrupt.clone(),
+                None,
             )
             .unwrap_or_else(|outcome| panic!("fixture load failed: {outcome:?}"));
             let (_, rendered, _) = render_with_observers(&mut page);
@@ -7241,6 +7296,7 @@ mod desktop {
                 &mut host_rx,
                 None,
                 interrupt,
+                None,
             )
             .unwrap_or_else(|outcome| panic!("fixture load failed: {outcome:?}"));
             let (initial, rendered, _) = render_with_observers(&mut page);
@@ -8461,6 +8517,10 @@ mod desktop {
 
 pub(crate) use desktop::spawn_page;
 pub(crate) use desktop::transform;
+pub(crate) use page_spare::{
+    prewarm as prewarm_spare_engine, refill as refill_spare_engine,
+    set_enabled as set_spare_engine_enabled, shutdown as shutdown_spare_engine,
+};
 
 /// Lumen's implemented subset of the canonical TRust host boundary. Keep this declarative: tests
 /// compare every entry with `js_host_boundary::HOST_BOUNDARY_SIGNATURES`, while the table remains
@@ -8717,13 +8777,19 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
 ];
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
+    install_agent_host_hooks(engine);
+    for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
+        engine.define_global(name, len, host_fn);
+    }
+}
+
+/// The Agent-wide half of the host boundary: HostState tracing and the
+/// settings-object job hooks. It installs nothing in any Realm.
+fn install_agent_host_hooks(engine: &mut lumen::Engine) {
     engine.ctx().op_state().register_gc::<HostState>();
     debug_assert!(lumen_registry_matches_canonical_boundary());
     engine.set_host_job_context_hooks(host_enter_job_context, host_leave_job_context);
     engine.set_job_callback_script_caller_capture(true);
-    for &(name, len, host_fn) in LUMEN_HOST_FUNCTIONS {
-        engine.define_global(name, len, host_fn);
-    }
 }
 
 fn host_image_data_slots(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -10789,6 +10855,57 @@ fn host_allocate_job_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Re
     }
     state.next_window_context = context.saturating_add(1);
     Ok(Value::Num(context as f64))
+}
+
+/// Developer traces a main Window's platform bootstrap reads from `__trust_cfg`.
+#[derive(Clone, Copy, Default)]
+struct MainWindowTraces {
+    frames: bool,
+    challenge_messages: bool,
+}
+
+impl MainWindowTraces {
+    fn from_environment() -> Self {
+        Self {
+            frames: std::env::var_os("TRUST_TRACE_FRAMES").is_some(),
+            challenge_messages: std::env::var_os("TRUST_TRACE_CHALLENGE_MESSAGES").is_some(),
+        }
+    }
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| String::from("\"\""))
+}
+
+/// The `__trust_cfg` script a top-level Window Realm's platform bootstrap consumes.
+fn main_window_config(
+    response_url: &url::Url,
+    viewport: crate::layout2::Viewport,
+    device_pixel_ratio: f32,
+    navigation_timing: serde_json::Value,
+    last_modified: Option<f64>,
+    traces: MainWindowTraces,
+) -> String {
+    format!(
+        "globalThis.__trust_cfg = {{ url: {}, ua: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {} }};",
+        json_string(response_url.as_str()),
+        json_string(crate::http::user_agent()),
+        json_string(crate::locale::LANGUAGE),
+        json_string(crate::locale::LANGUAGES[0]),
+        json_string(crate::locale::LANGUAGES[1]),
+        viewport.width,
+        viewport.height,
+        device_pixel_ratio,
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(8),
+        crate::http::GLOBAL_PRIVACY_CONTROL,
+        lumen_potentially_trustworthy(response_url),
+        traces.frames,
+        traces.challenge_messages,
+        navigation_timing,
+        last_modified.map_or_else(|| String::from("null"), |time| time.to_string()),
+    )
 }
 
 fn platform_prelude_snapshot() -> Result<&'static [u8], String> {

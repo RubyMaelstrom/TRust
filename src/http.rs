@@ -5478,6 +5478,9 @@ async fn execute_js_with_presentation(
             trace_ms()
         );
     }
+    // This navigation has its first rendering; warm the next one's engine
+    // off the critical path (a no-op unless the frontend enabled spares).
+    crate::js::refill_spare_page_engine();
     let (out, rendered, outcome, live) = match first {
         Ok(Some(crate::js::PageEvt::Static { html, mut outcome })) => {
             let Some(rendered) = outcome.rendered.take() else {
