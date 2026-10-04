@@ -103,6 +103,12 @@ impl State {
         self.global_conservative
     }
 
+    /// Whether `consumer`'s dependencies are tracked: by its own proof, or by
+    /// the conservative fallback that invalidates everything.
+    pub(super) fn tracks(&self, consumer: NodeId) -> bool {
+        self.global_conservative || self.consumers.contains_key(&consumer)
+    }
+
     pub(super) fn publish(&mut self, consumer: NodeId, mut proof: Proof) {
         if self.global_conservative {
             return;
