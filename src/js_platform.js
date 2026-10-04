@@ -16175,6 +16175,92 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 define(this === null || this === undefined ? g : this, "visualViewport",
                     {value, writable: true, enumerable: true, configurable: true});
             }}.set, "set visualViewport")});
+        // Screen Orientation #screenorientation-interface. The web-exposed
+        // screen is the viewport, so this follows the specification's
+        // anti-fingerprinting mitigations: the natural orientation is the
+        // top-level traversable's [[initialType]], the type is only
+        // portrait-primary or landscape-primary by aspect ratio, and the
+        // angle is 0 for the initial type and 90 otherwise. A desktop window
+        // cannot lock the screen orientation.
+        class ScreenOrientation extends EventTarget {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+        }
+        const orientationState = receiver => {
+            const state = read(receiver);
+            if (!state || state.screenOrientation !== true)
+                throw new TypeErrorCtor("Illegal ScreenOrientation invocation");
+            return state;
+        };
+        const currentOrientationType = () =>
+            screenDimension("width") >= screenDimension("height") ? "landscape-primary" : "portrait-primary";
+        const ORIENTATION_LOCK_TYPES = ["any", "natural", "landscape", "portrait",
+            "portrait-primary", "portrait-secondary", "landscape-primary", "landscape-secondary"];
+        const PromiseCtor = Promise, rejectPromise = Promise.reject, includes = Array.prototype.includes;
+        define(ScreenOrientation.prototype, "lock", {configurable: true, enumerable: true, writable: true,
+            value: named({lock(orientation) {
+                // Web IDL #js-operations: a Promise-returning operation
+                // rejects for receiver and argument conversion errors too.
+                try {
+                    orientationState(this);
+                    if (arguments.length < 1) throw new TypeErrorCtor("1 argument required");
+                    if (!apply(includes, ORIENTATION_LOCK_TYPES, [`${orientation}`]))
+                        throw new TypeErrorCtor("Invalid OrientationLockType");
+                    throw new DOMException("Screen orientation locking is not supported", "NotSupportedError");
+                } catch (e) {
+                    return apply(rejectPromise, PromiseCtor, [e]);
+                }
+            }}.lock, "lock")});
+        // #dom-screenorientation-unlock: there is never an active lock.
+        define(ScreenOrientation.prototype, "unlock", {configurable: true, enumerable: true, writable: true,
+            value: named({unlock() { orientationState(this); }}.unlock, "unlock")});
+        for (const name of ["type", "angle"]) {
+            define(ScreenOrientation.prototype, name, {configurable: true, enumerable: true,
+                get: named({get() { return orientationState(this)[name]; }}.get, "get " + name)});
+        }
+        define(ScreenOrientation.prototype, "onchange", {configurable: true, enumerable: true,
+            get: named({get() { return orientationState(this).handlers.change || null; }}.get, "get onchange"),
+            set: named({set(handler) {
+                const handlers = orientationState(this).handlers;
+                if (handlers.change) this.removeEventListener("change", handlers.change);
+                handlers.change = typeof handler === "function" ? handler : null;
+                if (handlers.change) this.addEventListener("change", handlers.change);
+            }}.set, "set onchange")});
+        define(ScreenOrientation.prototype, Symbol.toStringTag, {value: "ScreenOrientation", configurable: true});
+        define(g, "ScreenOrientation", {value: ScreenOrientation, writable: true, configurable: true});
+        const parentTrust = cfg.parentWindow && trustOf(cfg.parentWindow);
+        const initialType = parentTrust && parentTrust.initialOrientationType ?
+            parentTrust.initialOrientationType : currentOrientationType();
+        trust.initialOrientationType = initialType;
+        const orientation = Reflect.construct(EventTarget, [], ScreenOrientation);
+        const orientationSlots = {screenOrientation: true, handlers: Object.create(null),
+            type: currentOrientationType(), angle: 0, initialType};
+        orientationSlots.angle = orientationSlots.type === initialType ? 0 : 90;
+        apply(set, slots, [orientation, orientationSlots]);
+        screenState(screen).orientation = orientation;
+        define(Screen.prototype, "orientation", {configurable: true, enumerable: true,
+            get: named({get() { return screenState(this).orientation; }}.get, "get orientation")});
+        // #dfn-screen-orientation-change-steps, run for the top-level
+        // Document when its screen changes and then for each descendant
+        // Document. The slots change in a queued task, before `change`.
+        trust.screenOrientationChange = function () {
+            const type = currentOrientationType(), angle = type === initialType ? 0 : 90;
+            if (type !== orientationSlots.type || angle !== orientationSlots.angle) {
+                __queue_dom_task(() => {
+                    orientationSlots.type = type; orientationSlots.angle = angle;
+                    dispatch(orientation, new Event("change"), false);
+                });
+            }
+            let frames = [];
+            try { frames = g.document.querySelectorAll("iframe, frame"); } catch (_) { return; }
+            for (let i = 0; i < frames.length; i++) {
+                const child = internalsOf(frames[i]).contentRealmWindow;
+                const childTrust = child && child !== g && trustOf(child);
+                if (childTrust && typeof childTrust.screenOrientationChange === "function") {
+                    try { childTrust.screenOrientationChange(); }
+                    catch (e) { trust.errors.push("screen orientation change: " + ((e && e.message) || e)); }
+                }
+            }
+        };
     })();
     // CSSOM View #dom-window-screenx/#dom-window-screeny and Web IDL
     // #Replaceable: these are live, replaceable Window attributes, not mouse
@@ -17416,6 +17502,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             try { dispatch(visualViewportObject, new Event("resize"), false); }
             catch (e) { trust.errors.push("visualViewport resize handler: " + ((e && e.message) || e)); }
         }
+        // The web-exposed screen is the top-level viewport, so its resize can
+        // change the screen orientation of every Document in the traversable.
+        if (!cfg.parentWindow && trust.screenOrientationChange) trust.screenOrientationChange();
         // HTML #update-the-rendering runs "evaluate media queries and report
         // changes" after the resize and scroll steps.
         reportMediaQueryChanges();
