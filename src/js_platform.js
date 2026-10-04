@@ -16099,8 +16099,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }}.get, "get " + name)});
         }
         g.Screen = Screen;
-        apply(set, slots, [g, {screen, dimension: windowViewportDimension,
-            outerWidth: cfg.width, outerHeight: cfg.height}]);
+        // CSSOM View #dom-window-outerwidth: the client window is the one
+        // holding the top-level traversable, so every navigable reports the
+        // same live size. Exposing the viewport as the screen, the client
+        // window cannot be larger than it: it is the top-level viewport.
+        apply(set, slots, [g, {screen, dimension: windowViewportDimension, outer: screenDimension}]);
         function windowRecord(receiver) {
             if (receiver === null || receiver === undefined) receiver = g;
             if (receiver === g) return read(g);
@@ -16119,8 +16122,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 get: named({get() {
                     const record = windowRecord(this);
                     if (name === "screen") return record.screen;
+                    const axis = name === "innerWidth" || name === "outerWidth" ? "width" : "height";
                     return round(name === "innerWidth" || name === "innerHeight" ?
-                        record.dimension(name === "innerWidth" ? "width" : "height") : record[name]);
+                        record.dimension(axis) : record.outer(axis));
                 }}.get, "get " + name),
                 set: named({set(value) {
                     windowRecord(this);
