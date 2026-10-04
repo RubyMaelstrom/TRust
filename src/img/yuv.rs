@@ -229,9 +229,9 @@ impl Planes<'_> {
             let out = &mut canvas.rgba[out_start..out_start + columns * 4];
 
             let Some((u, v)) = chroma else {
-                for (pixel, &sample) in out.chunks_exact_mut(4).zip(luma_row) {
+                for (pixel, &sample) in out.as_chunks_mut::<4>().0.iter_mut().zip(luma_row) {
                     let value = to_u8(lookup(luma_table, sample));
-                    pixel.copy_from_slice(&[value, value, value, 255]);
+                    *pixel = [value, value, value, 255];
                 }
                 continue;
             };
@@ -256,7 +256,13 @@ impl Planes<'_> {
                     + (1.0 - near_weight) * lookup(chroma_table, v[f]);
             }
 
-            for (column, (pixel, &sample)) in out.chunks_exact_mut(4).zip(luma_row).enumerate() {
+            for (column, (pixel, &sample)) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(luma_row)
+                .enumerate()
+            {
                 let (cb, cr) = if shift_x == 1 {
                     let near = (column >> 1).min(chroma_width - 1);
                     let far = if column & 1 == 0 {
@@ -290,7 +296,7 @@ impl Planes<'_> {
                         luma + cb_to_b * cb,
                     ),
                 };
-                pixel.copy_from_slice(&[to_u8(r), to_u8(g), to_u8(b), 255]);
+                *pixel = [to_u8(r), to_u8(g), to_u8(b), 255];
             }
         }
     }
@@ -321,7 +327,9 @@ fn write_alpha_plane<T: Sample>(
         let out_start = ((y + row) * canvas.width + x) * 4;
         let out = &mut canvas.rgba[out_start..out_start + columns * 4];
         for (pixel, &sample) in out
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .zip(&alpha[row * width..row * width + columns])
         {
             pixel[3] = to_u8(table.get(sample.index()).copied().unwrap_or(1.0));
@@ -332,7 +340,7 @@ fn write_alpha_plane<T: Sample>(
 /// Convert colour that was premultiplied by alpha (MIAF `prem` reference) to
 /// the straight alpha TRust's image resources use.
 pub(crate) fn unpremultiply(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         match alpha {
             255 => {}
