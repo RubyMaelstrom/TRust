@@ -16,9 +16,10 @@ use crate::render::{
     Affine2d, BlendMode, CompositeOperator, CompositingLayer, CornerRadii, CssAnimationPoint,
     CssAnimationScope, CssPaintAnimation, CssRect, CssTransformFrame, DecorationStyle,
     DisplayCommand, GradientInterpolation, GradientStop, HitRegion, ImageFit, ImageHandle,
-    ImageRequest, ImageSampling, LineJoin, MarqueeBehavior, MarqueeDirection, MarqueeScope,
-    PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer,
-    StickyConstraint, StrokeStyle, TextDecorationPaint, TextShadowPaint, TopLayerEntry,
+    ImageRequest, ImageSampling, LineCap, LineJoin, MarqueeBehavior, MarqueeDirection,
+    MarqueeScope, PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement,
+    ScrollContainer, StickyConstraint, StrokeStyle, TextDecorationPaint, TextShadowPaint,
+    TopLayerEntry,
 };
 
 use super::ImageSizes;
@@ -1888,6 +1889,16 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     )
                 });
             }
+            // HTML Rendering #the-input-element-as-a-checkbox-and-radio-button-widgets:
+            // the widget is the control's whole content. It fills the content
+            // box, so CSS `width`/`height` size it; `appearance: none` leaves
+            // only the CSS box. The label clip below does not apply to it.
+            let checkable = piece_rect
+                .filter(|_| piece.item.pseudo.is_none())
+                .and_then(|rect| Some((checkable_control(builder.dom, style_node)?, rect)));
+            if let Some((Some(widget), rect)) = checkable {
+                paint_checkable_widget(builder, node, style_node, widget, rect, clip);
+            }
             if piece_rect.is_some() {
                 // A control's label is clipped to its content paint rectangle,
                 // not merely to the outer border box. This is the same box
@@ -1918,7 +1929,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 }
                 clip = intersect_css_rects(clip, label_rect);
             }
-            if let Some(label) = &piece.shaped {
+            if let Some(label) = piece.shaped.as_ref().filter(|_| checkable.is_none()) {
                 let content_origin = CssPoint::new(
                     fragment.x + piece.x + piece.paint_x,
                     fragment.y + piece.y + piece.paint_y,
@@ -2549,6 +2560,208 @@ fn paint_native_control_surface(fragment: &Frag, radii: CornerRadii, builder: &m
             style: StrokeStyle::solid(edge_width),
         });
     }
+}
+
+/// The native widget of a checkbox or radio button input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckableWidget {
+    Checkbox,
+    Radio,
+}
+
+/// `Some(widget)` for a checkbox/radio input with its native appearance,
+/// `Some(None)` when CSS UI 4 #appearance-switching turned it off, and
+/// `None` for any other element.
+fn checkable_control(dom: &Dom, node: NodeId) -> Option<Option<CheckableWidget>> {
+    if dom.tag_name(node) != Some("input") {
+        return None;
+    }
+    let widget = match dom.input_type(node).as_str() {
+        "checkbox" => CheckableWidget::Checkbox,
+        "radio" => CheckableWidget::Radio,
+        _ => return None,
+    };
+    let disabled = |property| {
+        dom.computed_value_resolved(node, property)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+    };
+    Some((!disabled("appearance") && !disabled("-webkit-appearance")).then_some(widget))
+}
+
+/// Paint a checkbox or radio widget as the largest square centered in the
+/// control's content box, like Gecko and Blink. Colors follow the element's
+/// color scheme; a checked widget uses its accent color (CSS UI 4
+/// #widget-accent) with a contrasting mark. Checkedness is the state that
+/// `:checked` matches.
+fn paint_checkable_widget(
+    builder: &mut Builder<'_>,
+    node: NodeId,
+    style_node: NodeId,
+    widget: CheckableWidget,
+    border_box: CssRect,
+    clip: Option<CssRect>,
+) {
+    let dom = builder.dom;
+    let style = super::style::BoxStyle::of(
+        dom,
+        style_node,
+        Vp {
+            w: builder.viewport_w,
+            h: builder.viewport_h,
+        },
+    );
+    let edge = |side: usize| {
+        style.border[side]
+            + style.padding[side]
+                .resolve(Some(border_box.width))
+                .unwrap_or(0.0)
+    };
+    let (top, right, bottom, left) = (edge(0), edge(1), edge(2), edge(3));
+    let width = border_box.width - left - right;
+    let height = border_box.height - top - bottom;
+    let side = width.min(height);
+    if side <= 0.0 {
+        return;
+    }
+    let square = CssRect::new(
+        border_box.x + left + (width - side) / 2.0,
+        border_box.y + top + (height - side) / 2.0,
+        side,
+        side,
+    );
+    let scheme = dom.color_scheme(style_node);
+    let checked = dom.attr(style_node, "checked").is_some();
+    let disabled = dom.actually_disabled(style_node, "input");
+    let accent = dom
+        .computed_value_resolved(style_node, "accent-color")
+        .filter(|value| !value.trim().eq_ignore_ascii_case("auto"))
+        .and_then(|value| resolve_color_for_style(dom, PaintStyle::Element(style_node), &value))
+        .unwrap_or_else(|| scheme_color(scheme, "accentcolor"));
+    let faded = |color: PaintColor| match color {
+        PaintColor::Rgba(r, g, b, a) if disabled => PaintColor::Rgba(r, g, b, a / 2),
+        other => other,
+    };
+    let field = faded(scheme_color(scheme, "field"));
+    let border = faded(if checked {
+        accent
+    } else {
+        scheme_color(scheme, "buttonborder")
+    });
+    // A 13px widget, the HTML Rendering default size, has a 1px edge.
+    let unit = side / 13.0;
+    let stroke = unit.max(1.0);
+    let inset = |rect: CssRect, by: f32| {
+        CssRect::new(
+            rect.x + by,
+            rect.y + by,
+            (rect.width - 2.0 * by).max(0.0),
+            (rect.height - 2.0 * by).max(0.0),
+        )
+    };
+    let mut commands = Vec::new();
+    match widget {
+        CheckableWidget::Checkbox => {
+            let radius = 2.0 * unit;
+            let radii = CornerRadii {
+                corners: [(radius, radius); 4],
+            };
+            commands.push(DisplayCommand::Fill {
+                shape: rounded_shape(square, radii),
+                brush: PaintBrush::Solid(if checked { faded(accent) } else { field }),
+            });
+            let half = stroke / 2.0;
+            commands.push(DisplayCommand::Stroke {
+                shape: rounded_shape(inset(square, half), radii),
+                brush: PaintBrush::Solid(border),
+                style: StrokeStyle::solid(stroke),
+            });
+            if checked {
+                let point =
+                    |x: f32, y: f32| CssPoint::new(square.x + x * side, square.y + y * side);
+                let mut mark = StrokeStyle::solid((1.8 * unit).max(1.5));
+                mark.cap = LineCap::Round;
+                mark.join = LineJoin::Round;
+                commands.push(DisplayCommand::Stroke {
+                    shape: PaintShape::Path(vec![
+                        PathElement::MoveTo(point(0.24, 0.52)),
+                        PathElement::LineTo(point(0.42, 0.70)),
+                        PathElement::LineTo(point(0.77, 0.31)),
+                    ]),
+                    brush: PaintBrush::Solid(faded(contrasting_mark(accent))),
+                    style: mark,
+                });
+            }
+        }
+        CheckableWidget::Radio => {
+            let half = stroke / 2.0;
+            commands.push(DisplayCommand::Fill {
+                shape: circle_shape(square),
+                brush: PaintBrush::Solid(field),
+            });
+            commands.push(DisplayCommand::Stroke {
+                shape: circle_shape(inset(square, half)),
+                brush: PaintBrush::Solid(border),
+                style: StrokeStyle::solid(stroke),
+            });
+            if checked {
+                commands.push(DisplayCommand::Fill {
+                    shape: circle_shape(inset(square, side * 0.25)),
+                    brush: PaintBrush::Solid(faded(accent)),
+                });
+            }
+        }
+    }
+    if let Some(clip) = clip {
+        builder.push_marquee_content(node, DisplayCommand::PushClip(PaintShape::Rect(clip)));
+    }
+    for command in commands {
+        builder.push_marquee_content(node, command);
+    }
+    if clip.is_some() {
+        builder.push_marquee_content(node, DisplayCommand::PopClip);
+    }
+}
+
+/// The mark drawn on an accent-colored widget: white, as in Gecko, unless
+/// its WCAG 2 contrast ratio with `background` falls below 3:1, the AA
+/// large-text floor that CSS Color 5 #contrast-color asks contrasting
+/// colors to meet; black then contrasts more.
+fn contrasting_mark(background: PaintColor) -> PaintColor {
+    let PaintColor::Rgba(r, g, b, _) = background else {
+        return PaintColor::Rgba(255, 255, 255, 255);
+    };
+    let linear = |channel: u8| {
+        let c = f32::from(channel) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+    if 1.05 / (luminance + 0.05) >= 3.0 {
+        PaintColor::Rgba(255, 255, 255, 255)
+    } else {
+        PaintColor::Rgba(0, 0, 0, 255)
+    }
+}
+
+/// The ellipse inscribed in `rect`, as four cubic Bézier quarter arcs.
+fn circle_shape(rect: CssRect) -> PaintShape {
+    // The control-point distance that best approximates a quarter circle.
+    const KAPPA: f32 = 0.552_284_8;
+    let (rx, ry) = (rect.width / 2.0, rect.height / 2.0);
+    let (cx, cy) = (rect.x + rx, rect.y + ry);
+    let (kx, ky) = (rx * KAPPA, ry * KAPPA);
+    let p = CssPoint::new;
+    PaintShape::Path(vec![
+        PathElement::MoveTo(p(cx + rx, cy)),
+        PathElement::CurveTo(p(cx + rx, cy + ky), p(cx + kx, cy + ry), p(cx, cy + ry)),
+        PathElement::CurveTo(p(cx - kx, cy + ry), p(cx - rx, cy + ky), p(cx - rx, cy)),
+        PathElement::CurveTo(p(cx - rx, cy - ky), p(cx - kx, cy - ry), p(cx, cy - ry)),
+        PathElement::CurveTo(p(cx + kx, cy - ry), p(cx + rx, cy - ky), p(cx + rx, cy)),
+        PathElement::Close,
+    ])
 }
 
 /// HTML Rendering §15.5.6 leaves the exact number-control UI to the user
@@ -7786,6 +7999,28 @@ mod tests {
         }
     }
 
+    /// Like `render_pixels`, with the document's form controls extracted.
+    fn render_form_pixels(html: &str) -> impl Fn(usize, usize) -> [u8; 3] {
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.test/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(800., 600.),
+            &forms,
+            &controls,
+            &Default::default(),
+        );
+        let pixels = crate::render::headless::render_paint(&layout.paint, CssSize::new(800., 600.))
+            .unwrap()
+            .pixels;
+        move |x, y| {
+            let at = (y * 800 + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2]]
+        }
+    }
+
     /// The runs of pixels matching `ink` along a row or column, as
     /// half-open ranges.
     fn ink_runs(points: impl Iterator<Item = (usize, bool)>) -> Vec<(usize, usize)> {
@@ -7805,6 +8040,56 @@ mod tests {
             runs.push((start, usize::MAX));
         }
         runs
+    }
+
+    #[test]
+    fn checkbox_and_radio_widgets_fill_their_content_box() {
+        // HTML Rendering #the-input-element-as-a-checkbox-and-radio-button-widgets
+        // and CSS UI 4 #widget-accent / #appearance-switching: authored
+        // width and height size the widget (beyond the line height that
+        // clips a text label), a checked widget paints its accent color, and
+        // `appearance: none` leaves only the CSS box.
+        let pixel = render_form_pixels(
+            r#"<!doctype html><body style="margin:0;background:white">
+            <div style="padding:10px"><input type=checkbox
+            style="margin:0 22px 0 0;width:28px;height:28px;vertical-align:top"><input type=checkbox checked
+            style="margin:0 22px 0 0;width:28px;height:28px;vertical-align:top;accent-color:#00a000"><input
+            type=radio checked style="margin:0 22px 0 0;width:28px;height:28px;vertical-align:top"><input
+            type=checkbox style="margin:0;width:28px;height:28px;vertical-align:top;appearance:none"></div>"#,
+        );
+        let white = |x, y| pixel(x, y).iter().all(|&c| c > 240);
+        let gray = |x, y| {
+            let [r, g, b] = pixel(x, y);
+            r < 200 && r.abs_diff(g) < 12 && g.abs_diff(b) < 12
+        };
+        // The unchecked box's 2px (28 / 13) edge sits on its content box.
+        let edges = ink_runs((0..50).map(|x| (x, gray(x, 24))));
+        assert_eq!(edges.len(), 2, "{edges:?}");
+        assert!(
+            edges[0].0.abs_diff(10) <= 1 && edges[1].1.abs_diff(38) <= 1,
+            "{edges:?}"
+        );
+        assert!(
+            white(24, 24) && white(24, 13),
+            "an unchecked box is field-colored"
+        );
+        // The checked box fills with its accent and draws a contrasting mark.
+        let [r, g, b] = pixel(64, 14);
+        assert!(g > 120 && r < 60 && b < 60, "accent fill {:?}", [r, g, b]);
+        assert!((60..88).any(|x| white(x, 27)), "white check mark");
+        // The checked radio: accent ring, field gap, accent dot.
+        let blue = |x, y| {
+            let [r, g, b] = pixel(x, y);
+            b > 150 && r < 60 && g < 160
+        };
+        assert!(
+            blue(124, 24) && white(114, 24) && blue(111, 24),
+            "radio ring and dot"
+        );
+        assert!(white(124, 11) || blue(124, 11), "the radio is round");
+        assert!(white(111, 11), "outside the radio's circle");
+        // appearance: none paints nothing for the widget.
+        assert!((160..188).all(|x| white(x, 24)), "no native widget");
     }
 
     #[test]
