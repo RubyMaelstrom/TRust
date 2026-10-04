@@ -19767,6 +19767,28 @@ mod tests {
     }
 
     #[test]
+    fn screen_orientation_follows_the_screen_and_cannot_lock() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/screen_orientation.mjs")),
+                "screen-orientation-ok",
+                "{tier:?}"
+            );
+            // Web IDL #js-operations: every failure of a Promise-returning
+            // operation, including argument conversion, is a rejection.
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "orientationLockResults.join('|')"),
+                "NotSupportedError:dom|TypeError|TypeError|TypeError|TypeError",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn window_screen_coordinates_are_live_replaceable_and_shared_with_frames() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
