@@ -93,6 +93,15 @@ impl Dom {
             return;
         }
         let text = serialize(&declarations, false);
+        // CSSOM #update-style-attribute-for: an unchanged declaration block
+        // serializes to the attribute value it already has. Neither the
+        // cascade's declarations nor the attribute change, so nothing is
+        // invalidated (as for an idempotent setAttribute).
+        if self.cssom_inline.get(&id) == Some(&declarations)
+            && self.get_attribute(id, "style") == Some(text.as_str())
+        {
+            return;
+        }
         self.set_attr(id, "style", &text);
         self.cssom_inline.insert(id, declarations);
         self.touch_attr(id, "style");
@@ -1097,6 +1106,41 @@ mod tests {
         assert_eq!(
             dom.computed_value_resolved(node, "margin-right").as_deref(),
             Some("3px")
+        );
+    }
+
+    #[test]
+    fn unchanged_cssom_inline_writes_invalidate_nothing() {
+        let mut dom =
+            Dom::parse_document("<style>p{width:var(--w)}</style><div id=root><p id=p>x</p></div>");
+        let root = dom.get_by_id("root").unwrap();
+        let p = dom.get_by_id("p").unwrap();
+        dom.set_cssom_inline(root, parse("--w:40px;color:red"));
+        assert_eq!(
+            dom.computed_value_resolved(p, "width").as_deref(),
+            Some("40px")
+        );
+        let (epoch, styles) = (dom.epoch(), dom.style_value_epoch);
+        dom.take_dirty();
+        dom.set_cssom_inline(root, parse("--w:40px;color:red"));
+        assert_eq!((dom.epoch(), dom.style_value_epoch), (epoch, styles));
+        assert!(!dom.take_dirty());
+        dom.set_cssom_inline(root, parse("--w:50px;color:red"));
+        assert_ne!(dom.epoch(), epoch);
+        assert_eq!(
+            dom.computed_value_resolved(p, "width").as_deref(),
+            Some("50px")
+        );
+        // A direct attribute write replaces the CSSOM declarations even when
+        // its text matches, so the next CSSOM write applies again.
+        let text = dom.get_attribute(root, "style").unwrap().to_string();
+        dom.set_attr(root, "style", &text);
+        let epoch = dom.epoch();
+        dom.set_cssom_inline(root, parse("--w:50px;color:red"));
+        assert_ne!(dom.epoch(), epoch);
+        assert_eq!(
+            dom.computed_value_resolved(p, "width").as_deref(),
+            Some("50px")
         );
     }
 
