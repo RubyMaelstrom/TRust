@@ -4982,6 +4982,11 @@ impl Dom {
         if name == "display" {
             return self.effective_display(id);
         }
+        if let Some(value) =
+            cssom::resolved_shorthand(name, |longhand| self.cssom_resolved_value(id, longhand))
+        {
+            return Some(value);
+        }
         if name == "text-decoration" {
             // CSSOM #dom-cssstyledeclaration-getpropertyvalue: reconstruct
             // the shorthand from its current longhands after cascade, rather
@@ -5004,7 +5009,7 @@ impl Dom {
         // CSSOM: percentages and font-relative units have already composed
         // numerically with inheritance in `font_px`.
         if name == "font-size" {
-            return Some(format!("{}px", self.font_px(id)));
+            return Some(cssom::css_px(self.font_px(id)));
         }
         if name == "font-weight" {
             return Some(
@@ -5024,7 +5029,7 @@ impl Dom {
             return Some(
                 value
                     .parse::<f32>()
-                    .map_or(value.clone(), |n| format!("{}px", n * self.font_px(id))),
+                    .map_or(value.clone(), |n| cssom::css_px(n * self.font_px(id))),
             );
         }
         // CSS Text 4 #white-space-property: the shorthand of the
@@ -5083,9 +5088,30 @@ impl Dom {
                 .unwrap_or_else(|| "medium".into());
             return Some(self.cssom_line_width(id, &width));
         }
+        // CSS Backgrounds 3 #border-radius: each corner's computed value is
+        // a pair of absolute lengths or percentages. CSSOM #serialize-a-css-
+        // value omits the vertical radius when it repeats the horizontal one.
+        if matches!(
+            name,
+            "border-top-left-radius"
+                | "border-top-right-radius"
+                | "border-bottom-right-radius"
+                | "border-bottom-left-radius"
+        ) {
+            let value = self
+                .computed_value_resolved(id, name)
+                .unwrap_or_else(|| "0px".into());
+            return Some(self.cssom_corner_radius(id, &value));
+        }
         let value = self
             .computed_value_resolved(id, name)
             .or_else(|| cssom_initial_value(name).map(str::to_string));
+        if let Some(number) = value
+            .as_deref()
+            .and_then(|value| cssom::resolved_number(name, value))
+        {
+            return Some(number);
+        }
         // CSSOM #resolved-values: a color property's resolved value is its
         // used color, so `currentcolor` takes the element's color.
         if (is_color_property(name) || matches!(name, "column-rule-color" | "caret-color"))
@@ -5102,6 +5128,8 @@ impl Dom {
         // JS measuring a text area's line count must receive `16px`, not
         // `calc(.25rem * 4)`. Percentage/auto edges still need used geometry;
         // do not guess their containing-block basis from the element width.
+        // CSS Flexbox 1 #flex-basis-property likewise computes lengths to
+        // absolute ones (`flex: 1 1 0` reads back as `1 1 0px`).
         if matches!(
             name,
             "padding-top"
@@ -5112,13 +5140,43 @@ impl Dom {
                 | "margin-right"
                 | "margin-bottom"
                 | "margin-left"
+                | "flex-basis"
         ) && let Some(px) = value
             .as_deref()
             .and_then(|v| crate::layout2::absolute_css_length(self, id, v))
         {
-            return Some(format!("{px}px"));
+            return Some(cssom::css_px(px));
         }
         value
+    }
+
+    /// A corner's computed radius pair: each component an absolute length
+    /// (clamped to zero, CSS Backgrounds 3 #border-radius: negative values
+    /// are invalid, and calc() clamps to the allowed range) or a percentage,
+    /// with a repeated vertical radius omitted. Unresolvable components
+    /// (calc() mixing lengths and percentages) keep their text.
+    fn cssom_corner_radius(&self, id: NodeId, value: &str) -> String {
+        if wide_keyword(value).is_some() {
+            return "0px".into();
+        }
+        let parts: Vec<String> = split_top_level_ws(value)
+            .into_iter()
+            .map(|part| {
+                if let Some(percent) = part.strip_suffix('%')
+                    && let Ok(percent) = percent.trim().parse::<f64>()
+                {
+                    return format!("{}%", cssom::css_number(percent.max(0.0)));
+                }
+                crate::layout2::absolute_css_length(self, id, part)
+                    .map_or_else(|| part.to_string(), |px| cssom::css_px(px.max(0.0)))
+            })
+            .collect();
+        match parts.as_slice() {
+            [] => "0px".into(),
+            [one] => one.clone(),
+            [h, v] if h == v => h.clone(),
+            parts => parts.join(" "),
+        }
     }
 
     /// A `<line-width>` computed value: its keyword's or length's px,
@@ -5133,8 +5191,10 @@ impl Dom {
                 None => return width.to_string(),
             },
         };
-        let px = crate::layout2::snap_line_width(px, self.device_pixel_ratio);
-        format!("{px}px")
+        // CSS Values 4 #calc-range: a calc() line width clamps to the
+        // property's non-negative range.
+        let px = crate::layout2::snap_line_width(px.max(0.0), self.device_pixel_ratio);
+        cssom::css_px(px)
     }
 
     /// The resolved value of color property `name` whose computed value is
