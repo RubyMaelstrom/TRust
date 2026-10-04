@@ -12190,6 +12190,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             host_compression_encode as NativeFn,
         ),
         ("__text_encode", 1, host_text_encode as NativeFn),
+        ("__text_decode_utf8", 3, host_text_decode_utf8 as NativeFn),
         ("__body_buffer", 1, host_body_buffer as NativeFn),
         ("__base64_convert", 2, host_base64_convert as NativeFn),
         ("__wasm_validate", 1, lumen_wasm::host_validate as NativeFn),
@@ -15082,34 +15083,52 @@ fn host_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 }
 
 fn host_url_parts(ctx: &Ctx, url: &url::Url) -> Value {
-    let host = match (url.host_str(), url.port()) {
-        (Some(host), Some(port)) => format!("{host}:{port}"),
-        (Some(host), None) => host.to_owned(),
-        _ => String::new(),
-    };
+    // URL Standard #urlutils-members (local whatwg/url@55d6699), through the
+    // `url` crate's WHATWG API getters: search and hash are empty for an empty
+    // query or fragment, and host carries a non-default port.
+    use url::quirks;
     let parts = [
-        url.as_str().to_string(),
-        format!("{}:", url.scheme()),
-        host,
-        url.host_str().unwrap_or("").to_string(),
-        url.port().map(|port| port.to_string()).unwrap_or_default(),
-        url.path().to_string(),
-        url.query()
-            .map(|query| format!("?{query}"))
-            .unwrap_or_default(),
-        url.fragment()
-            .map(|fragment| format!("#{fragment}"))
-            .unwrap_or_default(),
-        url.origin().ascii_serialization(),
-        url.username().to_string(),
-        url.password().unwrap_or("").to_string(),
+        quirks::href(url),
+        quirks::protocol(url),
+        quirks::host(url),
+        quirks::hostname(url),
+        quirks::port(url),
+        quirks::pathname(url),
+        quirks::search(url),
+        quirks::hash(url),
+        &url_origin_serialization(url),
+        quirks::username(url),
+        quirks::password(url),
     ];
-    ctx.make_array(parts.into_iter().map(Value::from_string).collect())
+    ctx.make_array(
+        parts
+            .into_iter()
+            .map(|part| Value::from_string(part.to_string()))
+            .collect(),
+    )
 }
 
-/// WHATWG URL component-setter algorithms. Setter validation failures are silent no-ops; only an
-/// invalid starting URL or an unknown internal component name returns null.
+/// URL Standard #concept-url-origin: a `blob:` URL takes its path URL's origin
+/// only when that URL is http(s) or file (file being opaque here). The `url`
+/// crate instead recurses through nested `blob:` URLs.
+fn url_origin_serialization(url: &url::Url) -> String {
+    if url.scheme() == "blob" {
+        return match url::Url::parse(url.path()) {
+            Ok(path) if matches!(path.scheme(), "http" | "https") => {
+                path.origin().ascii_serialization()
+            }
+            _ => "null".to_string(),
+        };
+    }
+    url.origin().ascii_serialization()
+}
+
+/// URL Standard #urlutils-members setters, through the `url` crate's WHATWG
+/// API (`url::quirks`), which runs each component's state-override parse.
+/// Setter validation failures are silent no-ops; only an invalid starting URL
+/// or an unknown internal component name returns null.
 fn host_url_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use url::quirks;
     let href = host_arg_string(ctx, args, 0);
     let component = host_arg_string(ctx, args, 1);
     let value = host_arg_string(ctx, args, 2);
@@ -15118,63 +15137,46 @@ fn host_url_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     };
     match component.as_str() {
         "protocol" => {
-            let _ = url.set_scheme(value.strip_suffix(':').unwrap_or(&value));
+            let _ = quirks::set_protocol(&mut url, &value);
         }
         "username" => {
-            let _ = url.set_username(&value);
+            let _ = quirks::set_username(&mut url, &value);
         }
         "password" => {
-            let _ = url.set_password((!value.is_empty()).then_some(value.as_str()));
+            let _ = quirks::set_password(&mut url, &value);
         }
         "host" => {
-            if value.is_empty() {
-                let _ = url.set_host(None);
-            } else {
-                let bare = lumen_host_without_port(&value);
-                let _ = url.set_host(Some(bare));
-                if bare.len() < value.len()
-                    && let Ok(port) = value[bare.len() + 1..].parse::<u16>()
-                {
-                    let _ = url.set_port(Some(port));
-                }
-            }
+            let _ = quirks::set_host(&mut url, &value);
         }
         "hostname" => {
-            let bare = lumen_host_without_port(&value);
-            let _ = url.set_host((!bare.is_empty()).then_some(bare));
+            let _ = quirks::set_hostname(&mut url, &value);
         }
         "port" => {
-            if value.is_empty() {
-                let _ = url.set_port(None);
-            } else if let Ok(port) = value.parse::<u16>() {
-                let _ = url.set_port(Some(port));
+            // #dom-url-port: the empty string removes the port; otherwise the
+            // port state parses the leading digits.
+            let _ = quirks::set_port(&mut url, &value);
+        }
+        "pathname" => {
+            // #path-start-state with a state override appends an empty
+            // segment only when the host is null. url 2.5.8's quirks setter
+            // also does so for the empty host of a non-special URL with an
+            // authority (`foo:///x`), so erase that path directly.
+            let special = matches!(
+                url.scheme(),
+                "ftp" | "file" | "http" | "https" | "ws" | "wss"
+            );
+            let authority = url.as_str()[url.scheme().len() + 1..].starts_with("//");
+            if value.is_empty() && !special && authority && !url.cannot_be_a_base() {
+                url.set_path("");
+            } else {
+                quirks::set_pathname(&mut url, &value);
             }
         }
-        "pathname" => url.set_path(&value),
-        "search" => {
-            let query = value.strip_prefix('?').unwrap_or(&value);
-            url.set_query((!query.is_empty()).then_some(query));
-        }
-        "hash" => {
-            let fragment = value.strip_prefix('#').unwrap_or(&value);
-            url.set_fragment((!fragment.is_empty()).then_some(fragment));
-        }
+        "search" => quirks::set_search(&mut url, &value),
+        "hash" => quirks::set_hash(&mut url, &value),
         _ => return Ok(Value::Null),
     }
     Ok(host_url_parts(ctx, &url))
-}
-
-fn lumen_host_without_port(host: &str) -> &str {
-    if let Some(rest) = host.strip_prefix('[') {
-        return match rest.find(']') {
-            Some(index) => &host[..index + 2],
-            None => host,
-        };
-    }
-    match host.rfind(':') {
-        Some(index) => &host[..index],
-        None => host,
-    }
 }
 
 fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport, f32) {
@@ -20427,6 +20429,117 @@ mod tests {
             })()"#
                 ),
                 "url-static-ok",
+                "worker={worker}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_search_params_and_setters_follow_url_standard_in_windows_and_workers() {
+        // URL Standard §5 (urlencoded parsing/serializing) and §6 (URL and
+        // URLSearchParams, local whatwg/url@55d6699), with Web IDL's union,
+        // record, iterable and interface-object rules. Window and Worker
+        // realms share one implementation.
+        for worker in [false, true] {
+            let mut engine = configured_engine_before_prelude(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::new())),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            eval_test_bootstrap(
+                &mut engine,
+                if worker {
+                    crate::js::worker_prelude()
+                } else {
+                    crate::js::PRELUDE
+                },
+                "URL prelude",
+                worker,
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const check = (v, message) => { if (!v) throw Error(message); };
+                const throwsType = (f, message) => {
+                    let threw = false;
+                    try { f(); } catch (e) { threw = e instanceof TypeError; }
+                    check(threw, message);
+                };
+                // Parsing: "+" before percent-decoding, bytes kept for
+                // invalid escapes, U+FFFD for invalid UTF-8.
+                const parsed = new URLSearchParams('?b=%2sf%2a&c=%C2x&d=a+b%2B&%FE%FF');
+                check(parsed.get('b') === '%2sf*' && parsed.get('c') === '�x', 'percent-decoding');
+                check(parsed.get('d') === 'a b+' && parsed.has('��'), 'plus and invalid UTF-8');
+                check(parsed.toString() === 'b=%252sf*&c=%EF%BF%BDx&d=a+b%2B&%EF%BF%BD%EF%BF%BD=', 'serializer');
+                check(new URLSearchParams('a=~!\'() é').toString() === 'a=%7E%21%27%28%29+%C3%A9', 'encode set');
+                // set() keeps the first tuple's position; two-argument has/delete.
+                const params = new URLSearchParams('a=b&c=d&a=e');
+                params.set('a', 'B');
+                check(params.toString() === 'a=B&c=d', 'set in place');
+                params.append('c', 'x');
+                check(params.has('c', 'x') && !params.has('c', 'y') && params.has('c', undefined), 'has(name, value)');
+                params.delete('c', 'd');
+                check(params.toString() === 'a=B&c=x', 'delete(name, value)');
+                params.delete('c', undefined);
+                check(params.toString() === 'a=B' && params.size === 1, 'delete(name)');
+                // Union conversion: sequences, records, strings.
+                throwsType(() => new URLSearchParams([['a']]), 'pair length');
+                throwsType(() => new URLSearchParams([1]), 'pair must be iterable');
+                check(new URLSearchParams(null).toString() === 'null=', 'null is a string');
+                const record = new URLSearchParams({'\uD835x': '1', xx: '2', '\uD83Dx': '3'});
+                check([...record].join(';') === '�x,3;xx,2', 'record keys');
+                const custom = new URLSearchParams('z=1');
+                custom[Symbol.iterator] = function* () { yield ['a', 'b']; };
+                check(new URLSearchParams(custom).get('a') === 'b', 'custom iterator');
+                const constants = new URLSearchParams(Object.assign(function () {}, {k: 'v'}));
+                check(constants.get('k') === 'v', 'a function is a record');
+                throwsType(() => params.append('a'), 'required arguments');
+                throwsType(() => URLSearchParams.prototype.get.call({}, 'a'), 'brand check');
+                // Live iteration over the URL's query object.
+                const url = new URL('http://a.b/c?a=1&b=2&c=3');
+                const seen = [];
+                for (const pair of url.searchParams) { url.search = 'x=1&y=2&z=3'; seen.push(pair.join('=')); }
+                check(seen.join() === 'a=1,y=2,z=3', 'live iterator: ' + seen.join());
+                const iterator = url.searchParams.keys();
+                check(Object.prototype.toString.call(iterator) === '[object URLSearchParams Iterator]', 'iterator tag');
+                check(iterator.next().value === 'x' && [...url.searchParams.values()].join() === '1,2,3', 'keys/values');
+                url.searchParams.delete('x');
+                url.searchParams.delete('y');
+                url.searchParams.delete('z');
+                check(url.href === 'http://a.b/c', 'empty query becomes null');
+                // URL setters run each component's state override.
+                const u = new URL('http://example.net/path?q#h');
+                u.protocol = 'https:foo : bar';
+                u.port = '8080stuff';
+                u.username = 'me';
+                check(u.href === 'https://me@example.net:8080/path?q#h', 'setters: ' + u.href);
+                u.search = '?'; u.hash = '#';
+                check(u.search === '' && u.hash === '' && u.href === 'https://me@example.net:8080/path?#', 'empty query and fragment');
+                const file = new URL('file:///home/you');
+                file.username = 'me'; file.port = '1';
+                check(file.href === 'file:///home/you', 'file URLs have no credentials or port');
+                const erased = new URL('foo:///some/path');
+                erased.pathname = '';
+                check(erased.href === 'foo://' && erased.pathname === '', 'empty host path erased: ' + erased.href);
+                check(new URL('blob:blob:https://example.org/').origin === 'null', 'blob origin');
+                check(new URL('blob:https://example.org/x').origin === 'https://example.org', 'blob tuple origin');
+                // Web IDL interface shape.
+                const global = Object.getOwnPropertyDescriptor(globalThis, 'URLSearchParams');
+                check(!global.enumerable && global.writable && global.configurable, 'interface object');
+                check(URL.length === 1 && URLSearchParams.length === 0, 'constructor lengths');
+                check(Object.getOwnPropertyDescriptor(URLSearchParams.prototype, 'append').enumerable &&
+                    Object.getOwnPropertyDescriptor(URL.prototype, 'href').enumerable &&
+                    Object.getOwnPropertyDescriptor(URL, 'canParse').enumerable, 'enumerable members');
+                check(URLSearchParams.prototype[Symbol.iterator] === URLSearchParams.prototype.entries, '@@iterator');
+                check((typeof webkitURL === 'undefined') === (typeof document === 'undefined'), 'webkitURL on Window only');
+                return 'url-search-params-ok';
+            })()"#
+                ),
+                "url-search-params-ok",
                 "worker={worker}"
             );
         }
