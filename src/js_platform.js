@@ -18887,36 +18887,101 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (result === null) throw new base64DOMException("The string is not correctly encoded", "InvalidCharacterError");
         return result;
     }}).atob;
-    g.TextEncoder = class TextEncoder {
-        get encoding() { return "utf-8"; }
-        encode(s) {
-            return __text_encode(String(s === undefined ? "" : s));
+    /*__TEXT_CODEC_BEGIN__*/
+    // Encoding Standard §7 API (local whatwg/encoding@a985b62): TextEncoder
+    // and TextDecoder, shared verbatim by Window and Worker realms
+    // (worker_prelude() splices this block into the worker scope). UTF-8
+    // decodes through __text_decode_utf8; every other encoding of the
+    // standard decodes natively through __text_decode (encoding_rs), whose
+    // streaming decoder state is held under a handle in an internal slot.
+    (function (g) {
+    const internalSlots = __platform_slots("internals", new WeakMap());
+    const apply = Reflect.apply, ownKeys = Reflect.ownKeys, getOwn = Reflect.getOwnPropertyDescriptor;
+    const define = Object.defineProperty, objectCreate = Object.create;
+    const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+    const charCodeAt = String.prototype.charCodeAt, stringSlice = String.prototype.slice;
+    const toWellFormed = String.prototype.toWellFormed;
+    const TypeErrorCtor = TypeError, RangeErrorCtor = RangeError, Bytes = Uint8Array;
+    const isView = ArrayBuffer.isView, toStringTag = Symbol.toStringTag;
+    const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
+    const sharedByteLength = typeof SharedArrayBuffer === "function"
+        ? getOwn(SharedArrayBuffer.prototype, "byteLength").get : null;
+    const viewBuffer = getOwn(Object.getPrototypeOf(Bytes.prototype), "buffer").get;
+    const viewOffset = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteOffset").get;
+    const viewLength = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteLength").get;
+    const dataViewBuffer = getOwn(DataView.prototype, "buffer").get;
+    const dataViewOffset = getOwn(DataView.prototype, "byteOffset").get;
+    const dataViewLength = getOwn(DataView.prototype, "byteLength").get;
+    const encodeUtf8 = __text_encode, decodeUtf8 = __text_decode_utf8;
+    const encodingName = __text_encoding_name, decodeNative = __text_decode;
+    const encoderBrand = objectCreate(null), decoderBrand = objectCreate(null);
+    function branded(object, brand) {
+        const slots = apply(weakGet, internalSlots, [object]);
+        if (slots === undefined || slots.brand !== brand) throw new TypeErrorCtor("Illegal invocation");
+        return slots;
+    }
+    function newSlots(object, brand) {
+        const slots = objectCreate(null);
+        slots.brand = brand;
+        apply(weakSet, internalSlots, [object, slots]);
+        return slots;
+    }
+    // Web IDL #es-dictionary: undefined and null are an empty dictionary;
+    // any other non-object is a TypeError.
+    function dictionaryMember(dictionary, name) {
+        if (dictionary === undefined || dictionary === null) return undefined;
+        if (typeof dictionary !== "object" && typeof dictionary !== "function")
+            throw new TypeErrorCtor("Options must be a dictionary");
+        return dictionary[name];
+    }
+    function isBufferWith(getter, value) {
+        if (getter === null) return false;
+        try { apply(getter, value, []); return true; } catch (_) { return false; }
+    }
+    // Web IDL AllowSharedBufferSource: a view of an (optionally shared)
+    // ArrayBuffer, or such a buffer itself, as a byte view.
+    function bufferSourceBytes(input) {
+        if (isView(input)) {
+            let isDataView = true;
+            try { apply(dataViewBuffer, input, []); } catch (_) { isDataView = false; }
+            return isDataView
+                ? new Bytes(apply(dataViewBuffer, input, []), apply(dataViewOffset, input, []), apply(dataViewLength, input, []))
+                : new Bytes(apply(viewBuffer, input, []), apply(viewOffset, input, []), apply(viewLength, input, []));
         }
-        encodeInto(s, destination) {
-            s = String(s === undefined ? "" : s);
-            if (!(destination instanceof Uint8Array)) {
-                throw new TypeError("TextEncoder.encodeInto destination must be a Uint8Array");
-            }
+        if (isBufferWith(bufferByteLength, input) || isBufferWith(sharedByteLength, input)) return new Bytes(input);
+        throw new TypeErrorCtor("The provided value is not an ArrayBuffer, a SharedArrayBuffer or an ArrayBufferView");
+    }
+    class TextEncoder {
+        constructor() { newSlots(this, encoderBrand); }
+        get encoding() { branded(this, encoderBrand); return "utf-8"; }
+        // #dom-textencoder-encode: USVString in, UTF-8 out.
+        encode(input = "") {
+            branded(this, encoderBrand);
+            return encodeUtf8(apply(toWellFormed, `${input}`, []));
+        }
+        // #dom-textencoder-encodeinto: whole scalar values only; a lone
+        // surrogate is encoded as U+FFFD.
+        encodeInto(source, destination) {
+            branded(this, encoderBrand);
+            if (arguments.length < 2) throw new TypeErrorCtor("TextEncoder.encodeInto: 2 arguments required");
+            source = `${source}`;
+            if (!(destination instanceof Bytes)) throw new TypeErrorCtor("TextEncoder.encodeInto destination must be a Uint8Array");
             let read = 0, written = 0;
-            while (read < s.length) {
-                const first = s.charCodeAt(read);
+            const capacity = apply(viewLength, destination, []);
+            while (read < source.length) {
+                const first = apply(charCodeAt, source, [read]);
                 let codePoint = first, units = 1;
                 if (first >= 0xd800 && first <= 0xdbff) {
-                    const second = read + 1 < s.length ? s.charCodeAt(read + 1) : 0;
+                    const second = read + 1 < source.length ? apply(charCodeAt, source, [read + 1]) : 0;
                     if (second >= 0xdc00 && second <= 0xdfff) {
                         codePoint = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
                         units = 2;
-                    } else {
-                        codePoint = 0xfffd;
-                    }
-                } else if (first >= 0xdc00 && first <= 0xdfff) {
-                    codePoint = 0xfffd;
-                }
+                    } else codePoint = 0xfffd;
+                } else if (first >= 0xdc00 && first <= 0xdfff) codePoint = 0xfffd;
                 const needed = codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
-                if (written + needed > destination.byteLength) break;
-                if (needed === 1) {
-                    destination[written++] = codePoint;
-                } else if (needed === 2) {
+                if (written + needed > capacity) break;
+                if (needed === 1) destination[written++] = codePoint;
+                else if (needed === 2) {
                     destination[written++] = 0xc0 | (codePoint >> 6);
                     destination[written++] = 0x80 | (codePoint & 0x3f);
                 } else if (needed === 3) {
@@ -18933,115 +18998,77 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return { read, written };
         }
-    };
-    g.TextDecoder = class TextDecoder {
-        // Encoding §4.2 and §7.2: labels are ASCII-case-insensitive and the
-        // UTF-16 labels select the corresponding endian decoder. UTF-16 has
-        // no encoder in the standard, but its decoder is required by deployed
-        // web content (including .NET's WebAssembly bootstrap).
-        constructor(label, options) {
-            const l = (label === undefined ? "utf-8" : `${label}`).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "").toLowerCase();
-            const utf8 = ["unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "utf-8", "utf8", "x-unicode20utf8"];
-            if (utf8.indexOf(l) >= 0) internalsFor(this).encoding = "utf-8";
-            else if (l === "unicodefffe" || l === "utf-16be") internalsFor(this).encoding = "utf-16be";
-            else if (["csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le"].indexOf(l) >= 0) internalsFor(this).encoding = "utf-16le";
-            // Encoding §4.2: Latin-1/ASCII labels select windows-1252 on
-            // the web, including its non-Latin-1 mappings at 0x80–0x9f.
-            else if (["ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819", "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "l1", "latin1", "us-ascii", "windows-1252", "x-cp1252"].indexOf(l) >= 0) internalsFor(this).encoding = "windows-1252";
-            else throw new RangeError("The encoding label is invalid");
-            internalsFor(this).fatal = !!(options && options.fatal);
-            internalsFor(this).ignoreBOM = !!(options && options.ignoreBOM);
-            internalsFor(this).doNotFlush = false;
-            internalsFor(this).pendingBytes = [];
-            internalsFor(this).pendingHigh = null;
-            internalsFor(this).bomSeen = false;
+    }
+    class TextDecoder {
+        // #dom-textdecoder: getting an encoding from the label; failure and
+        // the replacement encoding are RangeErrors.
+        constructor(label = "utf-8", options = undefined) {
+            label = `${label}`;
+            const fatal = !!dictionaryMember(options, "fatal");
+            const ignoreBOM = !!dictionaryMember(options, "ignoreBOM");
+            const encoding = encodingName(label);
+            if (encoding === null) throw new RangeErrorCtor(`The encoding label provided ('${label}') is invalid`);
+            const slots = newSlots(this, decoderBrand);
+            slots.encoding = encoding; slots.fatal = fatal; slots.ignoreBOM = ignoreBOM;
+            slots.doNotFlush = false; slots.pendingBytes = []; slots.bomSeen = false; slots.handle = 0;
         }
-        get encoding() { return internalsFor(this).encoding; }
-        get fatal() { return internalsFor(this).fatal; }
-        get ignoreBOM() { return internalsFor(this).ignoreBOM; }
-        decode(input, options) {
-            const stream = !!(options && options.stream);
-            if (!internalsFor(this).doNotFlush) {
-                internalsFor(this).pendingBytes = [];
-                internalsFor(this).pendingHigh = null;
-                internalsFor(this).bomSeen = false;
+        get encoding() { return branded(this, decoderBrand).encoding; }
+        get fatal() { return branded(this, decoderBrand).fatal; }
+        get ignoreBOM() { return branded(this, decoderBrand).ignoreBOM; }
+        // #dom-textdecoder-decode
+        decode(input = undefined, options = undefined) {
+            const slots = branded(this, decoderBrand);
+            const bytes = input === undefined ? new Bytes(0) : bufferSourceBytes(input);
+            const stream = !!dictionaryMember(options, "stream");
+            if (!slots.doNotFlush) {
+                // A new decoder; release any stream a previous call left open.
+                if (slots.handle !== 0) decodeNative(slots.encoding, new Bytes(0), false, false, true, slots.handle);
+                slots.pendingBytes = []; slots.bomSeen = false; slots.handle = 0;
             }
-            internalsFor(this).doNotFlush = stream;
-            let b;
-            if (input === undefined) b = new Uint8Array(0);
-            else if (input instanceof ArrayBuffer) b = new Uint8Array(input);
-            else if (ArrayBuffer.isView(input)) b = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-            else b = new Uint8Array(input);
-            if (internalsFor(this).pendingBytes.length) {
-                const joined = new Uint8Array(internalsFor(this).pendingBytes.length + b.length);
-                joined.set(internalsFor(this).pendingBytes); joined.set(b, internalsFor(this).pendingBytes.length); b = joined;
-                internalsFor(this).pendingBytes = [];
+            slots.doNotFlush = stream;
+            if (slots.encoding !== "utf-8") {
+                const result = decodeNative(slots.encoding, bytes, stream, slots.fatal, slots.ignoreBOM, slots.handle);
+                slots.handle = result[1];
+                if (result[2]) throw new TypeErrorCtor("The encoded data was not valid");
+                return result[0];
             }
-            if (internalsFor(this).encoding === "windows-1252") {
-                const special = [0x20ac,0x81,0x201a,0x192,0x201e,0x2026,0x2020,0x2021,0x2c6,0x2030,0x160,0x2039,0x152,0x8d,0x17d,0x8f,0x90,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,0x2dc,0x2122,0x161,0x203a,0x153,0x9d,0x17e,0x178];
-                let out = "";
-                for (let i = 0; i < b.length; i++) {
-                    const byte = b[i];
-                    out += String.fromCharCode(byte >= 0x80 && byte <= 0x9f ? special[byte - 0x80] : byte);
-                }
-                return out;
+            let queued = bytes;
+            if (slots.pendingBytes.length) {
+                queued = new Bytes(slots.pendingBytes.length + bytes.length);
+                queued.set(slots.pendingBytes); queued.set(bytes, slots.pendingBytes.length);
+                slots.pendingBytes = [];
             }
-            if (internalsFor(this).encoding === "utf-8") {
-                const decoded = __text_decode_utf8(b, stream, internalsFor(this).fatal);
-                let out;
-                if (typeof decoded === "string") out = decoded;
-                else {
-                    internalsFor(this).pendingBytes = decoded[1];
-                    if (decoded[2]) throw new TypeError("The encoded data was not valid");
-                    out = decoded[0];
-                }
-                // Encoding #concept-td-serialize: empty chunks do not consume
-                // the BOM, and a fatal call never serializes its partial output.
-                if (!internalsFor(this).ignoreBOM && !internalsFor(this).bomSeen && out.length) {
-                    internalsFor(this).bomSeen = true;
-                    if (out.charCodeAt(0) === 0xfeff) out = out.slice(1);
-                }
-                return out;
+            const decoded = decodeUtf8(queued, stream, slots.fatal);
+            let out;
+            if (typeof decoded === "string") out = decoded;
+            else {
+                slots.pendingBytes = decoded[1];
+                if (decoded[2]) throw new TypeErrorCtor("The encoded data was not valid");
+                out = decoded[0];
             }
-
-            let orderLE = internalsFor(this).encoding === "utf-16le", offset = 0;
-            if (!internalsFor(this).bomSeen && b.length >= 2) {
-                if (b[0] === 0xfe && b[1] === 0xff) orderLE = false;
-                else if (b[0] === 0xff && b[1] === 0xfe) orderLE = true;
-                if (!internalsFor(this).ignoreBOM && ((orderLE && b[0] === 0xff && b[1] === 0xfe) || (!orderLE && b[0] === 0xfe && b[1] === 0xff))) offset = 2;
-                internalsFor(this).bomSeen = true;
+            // #concept-td-serialize: the first scalar value of the stream is
+            // a BOM to skip unless ignoreBOM; empty chunks do not consume it.
+            if (!slots.ignoreBOM && !slots.bomSeen && out.length) {
+                slots.bomSeen = true;
+                if (apply(charCodeAt, out, [0]) === 0xfeff) out = apply(stringSlice, out, [1]);
             }
-            let danglingByte = false;
-            if (((b.length - offset) & 1) !== 0) {
-                if (stream) {
-                    internalsFor(this).pendingBytes = [b[b.length - 1]];
-                    b = b.slice(0, b.length - 1);
-                } else {
-                    if (internalsFor(this).fatal) throw new TypeError("The encoded data was not valid");
-                    danglingByte = true;
-                    b = b.slice(0, b.length - 1);
-                }
-            }
-            let out = "", high = internalsFor(this).pendingHigh;
-            const error = () => { if (internalsFor(this).fatal) throw new TypeError("The encoded data was not valid"); out += "�"; };
-            if (danglingByte) error();
-            for (let i = offset; i < b.length; i += 2) {
-                const u = orderLE ? b[i] | (b[i + 1] << 8) : (b[i] << 8) | b[i + 1];
-                if (high !== null) {
-                    if (u >= 0xdc00 && u <= 0xdfff) { out += String.fromCodePoint(0x10000 + ((high - 0xd800) << 10) + u - 0xdc00); high = null; continue; }
-                    error(); high = null;
-                }
-                if (u >= 0xd800 && u <= 0xdbff) high = u;
-                else if (u >= 0xdc00 && u <= 0xdfff) error();
-                else out += String.fromCharCode(u);
-            }
-            if (high !== null) {
-                if (stream) internalsFor(this).pendingHigh = high;
-                else { error(); internalsFor(this).pendingHigh = null; }
-            } else internalsFor(this).pendingHigh = null;
             return out;
         }
-    };
+    }
+    // Web IDL #es-interfaces: enumerable members, a non-enumerable interface
+    // object, and @@toStringTag on the interface prototype.
+    for (const [C, name] of [[TextEncoder, "TextEncoder"], [TextDecoder, "TextDecoder"]]) {
+        for (const key of ownKeys(C.prototype)) {
+            if (key === "constructor") continue;
+            const descriptor = getOwn(C.prototype, key);
+            descriptor.enumerable = true;
+            define(C.prototype, key, descriptor);
+        }
+        define(C.prototype, toStringTag, { value: name, configurable: true });
+        define(g, name, { value: C, writable: true, configurable: true });
+    }
+    })(globalThis);
+    /*__TEXT_CODEC_END__*/
     /*__STREAMS_BEGIN__*/
     // --- WHATWG Streams (in-memory). Real constructors so streaming code
     // both LOADS and RUNS: Open WebUI's chat/SSE pipeline does

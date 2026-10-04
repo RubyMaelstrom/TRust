@@ -33,6 +33,8 @@ mod live_range_host;
 mod lumen_wasm;
 #[path = "message_port_host.rs"]
 mod message_port_host;
+#[path = "text_decoder_host.rs"]
+mod text_decoder_host;
 #[path = "webgl_host.rs"]
 mod webgl_host;
 
@@ -554,6 +556,8 @@ struct HostState {
     platform_internals: Option<Value>,
     live_ranges: live_range_host::Registry,
     geometry: geometry_host::Registry,
+    /// Streaming TextDecoder state for non-UTF-8 encodings.
+    text_decoders: text_decoder_host::Registry,
     pointer_event_slots: Option<Value>,
     image_element_slots: Option<Value>,
     window_message_slots: Option<Value>,
@@ -651,6 +655,7 @@ impl HostState {
             platform_internals: None,
             live_ranges: live_range_host::Registry::default(),
             geometry: geometry_host::Registry::default(),
+            text_decoders: Default::default(),
             pointer_event_slots: None,
             image_element_slots: None,
             window_message_slots: None,
@@ -862,6 +867,7 @@ impl RetainedMemory for HostState {
             platform_internals,
             live_ranges,
             geometry,
+            text_decoders,
             pointer_event_slots,
             image_element_slots,
             window_message_slots,
@@ -1262,6 +1268,7 @@ impl RetainedMemory for HostState {
         }
         live_ranges.scan_retained_memory(visitor);
         geometry.scan_retained_memory(visitor);
+        text_decoders.scan_retained_memory(visitor);
         if let Some(value) = element_slots {
             visitor.value(value);
         }
@@ -8626,6 +8633,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
     ("__text_decode_utf8", 3, host_text_decode_utf8),
+    ("__text_encoding_name", 1, host_text_encoding_name),
+    ("__text_decode", 6, host_text_decode),
     ("__body_buffer", 1, host_body_buffer),
     ("__base64_convert", 2, host_base64_convert),
     ("__dom_popover", 2, guarded_popover),
@@ -12191,6 +12200,12 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ),
         ("__text_encode", 1, host_text_encode as NativeFn),
         ("__text_decode_utf8", 3, host_text_decode_utf8 as NativeFn),
+        (
+            "__text_encoding_name",
+            1,
+            host_text_encoding_name as NativeFn,
+        ),
+        ("__text_decode", 6, host_text_decode as NativeFn),
         ("__body_buffer", 1, host_body_buffer as NativeFn),
         ("__base64_convert", 2, host_base64_convert as NativeFn),
         ("__wasm_validate", 1, lumen_wasm::host_validate as NativeFn),
@@ -16437,6 +16452,41 @@ fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// consume that prefix and restore the non-continuation byte, or retain an
 /// incomplete sequence until the stream ends. Bulk validation avoids a JS
 /// property read and string allocation for every response byte.
+/// Encoding #dom-textdecoder step 1-2: the lowercased name of a label's
+/// encoding, or null for failure and replacement.
+fn host_text_encoding_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let label = host_arg_string(ctx, args, 0);
+    Ok(text_decoder_host::encoding_name(&label)
+        .map(Value::from_string)
+        .unwrap_or(Value::Null))
+}
+
+/// Encoding #dom-textdecoder-decode for every encoding except UTF-8:
+/// (name, bytes, stream, fatal, ignoreBOM, handle) → [text, handle, failed].
+fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = host_arg_string(ctx, args, 0);
+    let bytes = args
+        .get(1)
+        .and_then(|value| ctx.buffer_source_bytes(value, true))
+        .ok_or_else(|| ctx.make_error("TypeError", "Text is not an attached BufferSource"))?;
+    let flag = |index: usize| matches!(args.get(index), Some(Value::Bool(true)));
+    let handle = match args.get(5) {
+        Some(Value::Num(number)) if *number >= 0.0 && *number <= u32::MAX as f64 => *number as u32,
+        _ => 0,
+    };
+    let decoded = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed before any Lumen host call")
+        .text_decoders
+        .decode(&name, &bytes, flag(2), flag(3), flag(4), handle)
+        .ok_or_else(|| ctx.make_error("RangeError", "The encoding is not supported"))?;
+    Ok(ctx.make_array(vec![
+        Value::from_string(decoded.text),
+        Value::Num(f64::from(decoded.handle)),
+        Value::Bool(decoded.failed),
+    ]))
+}
+
 fn host_text_decode_utf8(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let bytes = args
         .first()
@@ -20540,6 +20590,89 @@ mod tests {
             })()"#
                 ),
                 "url-search-params-ok",
+                "worker={worker}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_decoder_supports_every_encoding_in_windows_and_workers() {
+        // Encoding Standard §4.2 labels and §7.2 TextDecoder (local
+        // whatwg/encoding@a985b62): legacy single- and multi-byte decoders,
+        // streaming state, fatal mode, BOM handling and Web IDL conversions,
+        // in both realm kinds.
+        for worker in [false, true] {
+            let mut engine = configured_engine_before_prelude(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::new())),
+                    Rc::new(RealmClock::new()),
+                ),
+                DEFAULT_URL,
+            );
+            eval_test_bootstrap(
+                &mut engine,
+                if worker {
+                    crate::js::worker_prelude()
+                } else {
+                    crate::js::PRELUDE
+                },
+                "text codec prelude",
+                worker,
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const check = (v, message) => { if (!v) throw Error(message); };
+                const throwsType = (f, message) => {
+                    let threw = false;
+                    try { f(); } catch (e) { threw = e instanceof TypeError; }
+                    check(threw, message);
+                };
+                const bytes = (...values) => new Uint8Array(values);
+                check(new TextDecoder(' Shift_JIS ').encoding === 'shift_jis', 'label lookup');
+                check(new TextDecoder('latin1').encoding === 'windows-1252', 'latin1 is windows-1252');
+                for (const label of ['iso-2022-kr', 'utf-7', 'bogus']) {
+                    let threw = false;
+                    try { new TextDecoder(label); } catch (e) { threw = e instanceof RangeError; }
+                    check(threw, 'invalid label ' + label);
+                }
+                check(new TextDecoder('shift_jis').decode(bytes(0x82, 0xa0, 0x41)) === 'あA', 'shift_jis');
+                check(new TextDecoder('euc-kr').decode(bytes(0xb0, 0xa1)) === '가', 'euc-kr');
+                check(new TextDecoder('gbk').decode(bytes(0xc4, 0xe3)) === '你', 'gbk');
+                check(new TextDecoder('big5').decode(bytes(0xa4, 0x40)) === '一', 'big5');
+                check(new TextDecoder('koi8-r').decode(bytes(0xc1)) === 'а', 'koi8-r');
+                check(new TextDecoder('windows-1252').decode(bytes(0x80, 0xe9)) === '€é', 'windows-1252');
+                // Streaming keeps decoder state, including ISO-2022-JP's mode.
+                const jis = new TextDecoder('iso-2022-jp');
+                check(jis.decode(bytes(0x1b, 0x28, 0x49), {stream: true}) === '', 'escape sequence');
+                check(jis.decode(bytes(0x31)) === 'ｱ', 'katakana mode persists');
+                const sjis = new TextDecoder('shift_jis');
+                check(sjis.decode(bytes(0x82), {stream: true}) + sjis.decode(bytes(0xa0)) === 'あ', 'split lead byte');
+                check(new TextDecoder('shift_jis').decode(bytes(0x82)) === '�', 'truncated at end-of-queue');
+                throwsType(() => new TextDecoder('shift_jis', {fatal: true}).decode(bytes(0x82)), 'fatal');
+                // UTF-16: only a BOM of the decoder's own byte order is removed.
+                check(new TextDecoder('utf-16le').decode(bytes(0xff, 0xfe, 0x41, 0)) === 'A', 'utf-16le BOM');
+                check(new TextDecoder('utf-16le').decode(bytes(0xfe, 0xff, 0x41, 0)) === '￾A', 'no byte-order switch');
+                check(new TextDecoder('utf-16be', {ignoreBOM: true}).decode(bytes(0xfe, 0xff, 0, 0x41)) === '﻿A', 'ignoreBOM');
+                const utf8 = new TextDecoder();
+                check(utf8.decode(bytes(0xef, 0xbb), {stream: true}) === '' && utf8.decode(bytes(0xbf, 0x41)) === 'A', 'UTF-8 BOM split');
+                check(new TextDecoder().decode(new DataView(bytes(0x61, 0x62).buffer, 1)) === 'b', 'DataView input');
+                throwsType(() => new TextDecoder().decode([0x61]), 'arrays are not buffer sources');
+                throwsType(() => new TextDecoder('utf-8', 1), 'options must be a dictionary');
+                throwsType(() => TextDecoder.prototype.decode.call({}), 'brand check');
+                const encoder = new TextEncoder();
+                check(encoder.encode('\ud800').join() === '239,191,189', 'USVString encode');
+                const into = encoder.encodeInto('aé', new Uint8Array(2));
+                check(into.read === 1 && into.written === 1, 'encodeInto stops before a partial scalar value');
+                const global = Object.getOwnPropertyDescriptor(globalThis, 'TextDecoder');
+                check(!global.enumerable && Object.getOwnPropertyDescriptor(TextDecoder.prototype, 'decode').enumerable,
+                    'Web IDL shape');
+                return 'text-codec-ok';
+            })()"#
+                ),
+                "text-codec-ok",
                 "worker={worker}"
             );
         }
