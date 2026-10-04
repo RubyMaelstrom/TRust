@@ -371,9 +371,11 @@ struct SvgCatalog {
     fallback_families: Vec<String>,
 }
 
+/// The font source of a specified `font-family` list, keyed by its text.
+/// `None` records that the list needs no change.
 #[derive(Default)]
 struct ExpansionCache {
-    values: HashMap<String, String>,
+    values: HashMap<String, Option<String>>,
     order: VecDeque<String>,
 }
 
@@ -722,56 +724,75 @@ fn family_has_color_tables(context: &mut FontContext, name: &str) -> bool {
 /// computed value. This is only needed on platforms using our catalog; native
 /// Fontique backends perform platform aliases internally.
 pub(crate) fn css_family_source(family: &str) -> Cow<'_, str> {
-    let with_fallback = add_default_generic(family);
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        let trimmed = with_fallback.trim();
-        if !is_quoted_css_family(trimmed)
-            && let Some(generic) = GenericFamily::parse(&trimmed.to_ascii_lowercase())
-        {
-            let canonical = generic.to_string();
-            return if trimmed == canonical {
-                with_fallback
-            } else {
-                Cow::Owned(canonical)
-            };
-        }
-        let catalog = catalog();
-        let key = with_fallback.as_ref();
+        catalog_family_source(family, catalog())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        add_default_generic(family)
+    }
+}
+
+/// The source depends only on the list's text and the catalog, which never
+/// changes after it is built. Text layout asks once per run, so memoize every
+/// list, including those that need no change: expanding one case-folds each
+/// of its family names.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn catalog_family_source<'a>(family: &'a str, catalog: &Catalog) -> Cow<'a, str> {
+    {
         if let Some(hit) = catalog
             .family_expansions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values
-            .get(key)
-            .cloned()
+            .get(family)
         {
-            return Cow::Owned(hit);
+            return hit
+                .as_ref()
+                .map_or(Cow::Borrowed(family), |source| Cow::Owned(source.clone()));
         }
-        let expanded = expand_css_family_list(key, catalog);
-        if expanded == key {
-            return with_fallback;
-        }
+        let source = expand_css_family_source(family, catalog);
         let mut cache = catalog
             .family_expansions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let owned_key = key.to_string();
-        if !cache.values.contains_key(&owned_key) {
+        if !cache.values.contains_key(family) {
             while cache.values.len() >= MAX_FAMILY_EXPANSIONS {
                 let Some(oldest) = cache.order.pop_front() else {
                     break;
                 };
                 cache.values.remove(&oldest);
             }
-            cache.order.push_back(owned_key.clone());
-            cache.values.insert(owned_key, expanded.clone());
+            cache.order.push_back(family.to_string());
+            cache.values.insert(
+                family.to_string(),
+                (source != family).then(|| source.clone().into_owned()),
+            );
         }
-        Cow::Owned(expanded)
+        source
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn expand_css_family_source<'a>(family: &'a str, catalog: &Catalog) -> Cow<'a, str> {
+    let with_fallback = add_default_generic(family);
+    let trimmed = with_fallback.trim();
+    if !is_quoted_css_family(trimmed)
+        && let Some(generic) = GenericFamily::parse(&trimmed.to_ascii_lowercase())
     {
+        let canonical = generic.to_string();
+        return if trimmed == canonical {
+            with_fallback
+        } else {
+            Cow::Owned(canonical)
+        };
+    }
+    let expanded = expand_css_family_list(&with_fallback, catalog);
+    if expanded == with_fallback.as_ref() {
         with_fallback
+    } else {
+        Cow::Owned(expanded)
     }
 }
 
@@ -2402,6 +2423,55 @@ mod tests {
         assert_eq!(
             expand_css_family_list("Arial, serif", &catalog),
             r#""Liberation Sans", serif"#
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn family_sources_are_memoized_whether_or_not_they_change() {
+        let collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        let catalog = Catalog {
+            alias_candidates: HashMap::from([(
+                "arial".to_string(),
+                vec!["Liberation Sans".to_string()],
+            )]),
+            paths: Vec::new(),
+            embedded_fallback: false,
+            text_collection: Mutex::new(collection.clone()),
+            base_text_collection: collection,
+            installed_names: HashMap::from([(
+                fold("Liberation Sans"),
+                "Liberation Sans".to_string(),
+            )]),
+            generic_names: HashMap::new(),
+            family_expansions: Mutex::default(),
+        };
+        let cases = [
+            ("\"Liberation Sans\", serif", "\"Liberation Sans\", serif"),
+            ("Arial, serif", "\"Liberation Sans\", serif"),
+            ("Liberation Sans", "Liberation Sans, sans-serif"),
+            (" Serif ", "serif"),
+            ("monospace", "monospace"),
+        ];
+        for _ in 0..2 {
+            for (family, expected) in cases {
+                assert_eq!(
+                    catalog_family_source(family, &catalog),
+                    expected,
+                    "{family}"
+                );
+            }
+        }
+        let cache = catalog.family_expansions.lock().unwrap();
+        assert_eq!(cache.values.len(), cases.len());
+        assert_eq!(cache.values["\"Liberation Sans\", serif"], None);
+        assert_eq!(cache.values["monospace"], None);
+        assert_eq!(
+            cache.values["Arial, serif"].as_deref(),
+            Some("\"Liberation Sans\", serif")
         );
     }
 
