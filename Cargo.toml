@@ -49,6 +49,10 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 lumen-spike = []
 # Opt-in operation/lifetime accounting; never use this build for acceptance timing.
 architecture-diagnostics = ["lumen/architecture-diagnostics"]
+# rav1d's hand-written x86-64/ARM assembly for AV1 decoding. Off by default:
+# it needs nasm (x86) or a C assembler driver at build time, whereas the
+# default build decodes AV1 with rav1d's portable Rust code paths only.
+asm = ["rav1d/asm", "rav1d/asm_arm64_dotprod", "rav1d/asm_arm64_i8mm", "rav1d/asm_arm64_sve2"]
 
 [dependencies]
 accesskit = "0.24.1"
@@ -128,6 +132,15 @@ glifo = { version = "0.3.0", features = ["png"] }
 # backgrounds consume the same shaped glyph IDs and variation coordinates.
 skrifa = "0.44.0"
 ratatui = "0.30.2"
+# AV1 decoding (the Rust port of dav1d) behind `src/av1.rs`. Default features
+# are off so no assembly is built; the TRust `asm` feature opts back in.
+# Pinned to a memorysafety/rav1d main revision rather than the 1.1.0 release:
+# 1.1.0 offers only dav1d's `extern "C"` API, where any internal panic (such
+# as its `unwrap` on a frame header without a sequence header) aborts the whole
+# browser. This revision adds a safe Rust API whose panics unwind into
+# `av1::Decoder`'s containment, plus later Rust-path optimizations and a
+# T.35 metadata underflow fix. Move to a crates.io release that has the Rust API.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "d3d1cd67059f47803919be8276650e5870c9fd02", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 # FxHash for the DOM's hot maps (per-epoch caches, rule buckets, winner
 # maps). Pure Rust; SipHash's HashDoS
