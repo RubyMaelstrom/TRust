@@ -170,6 +170,39 @@ pub(super) fn single_border_box(
     found
 }
 
+/// HTML Rendering #the-page: a child Document's viewport is its container's
+/// content box. This is the `frame_viewports` entry `project` records for
+/// `frame`: its last block fragment in the in-flow tree, then the fixed and
+/// top layers, which take precedence. A rectangle request for a node inside
+/// that Document needs only this origin, not the complete projection.
+pub(super) fn frame_viewport(
+    dom: &Dom,
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+    frame: NodeId,
+) -> Option<CssRect> {
+    if !matches!(dom.tag_name(frame), Some("iframe" | "frame")) {
+        return None;
+    }
+    fn visit(f: &Frag, frame: NodeId, found: &mut Option<CssRect>) {
+        if f.node == frame && matches!(f.kind, FragKind::Block | FragKind::TableCell(_)) {
+            *found = Some(f.content_box());
+        }
+        for child in &f.children {
+            visit(child, frame, found);
+        }
+    }
+    let mut found = None;
+    for root in std::iter::once(root)
+        .chain(fixed)
+        .chain(top_layer.iter().map(|top| &top.fragment))
+    {
+        visit(root, frame, &mut found);
+    }
+    found
+}
+
 /// Canonical fragment rectangle in CSS pixels. CSSOM View geometry is read
 /// before any terminal adaptation or device-pixel presentation.
 #[derive(Copy, Clone)]
