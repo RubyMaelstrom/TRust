@@ -561,8 +561,14 @@ pub(crate) fn render_arena_with_layout(
     let forms_elapsed = started.map(|started| started.elapsed());
     let layout = layout(&forms, &controls);
     let layout_elapsed = started.map(|started| started.elapsed());
-    let resources =
-        collect_image_urls_for_boxes(dom, base, viewport, device_pixel_ratio, Some(&layout.boxes));
+    let painted_svgs = painted_svg_sources(dom, &layout.paint);
+    let resources = collect_image_urls_for_boxes(
+        dom,
+        base,
+        viewport,
+        device_pixel_ratio,
+        Some((&layout.boxes, &painted_svgs)),
+    );
     let resources_elapsed = started.map(|started| started.elapsed());
     let deferred_images = resources
         .lazy_nodes
@@ -7676,15 +7682,73 @@ pub(crate) fn collect_image_urls(
     collect_image_urls_for_boxes(dom, base, viewport, device_pixel_ratio, None)
 }
 
+/// The image source each painted inline SVG's box carries in `paint`. Box
+/// construction derived it (or retained it with a reused box), so it is the
+/// exact source this rendering paints.
+fn painted_svg_sources<'a>(
+    dom: &crate::dom::Dom,
+    paint: &'a crate::render::PagePaint,
+) -> rustc_hash::FxHashMap<crate::dom::NodeId, &'a str> {
+    let sources: rustc_hash::FxHashMap<_, _> = paint
+        .image_requests
+        .iter()
+        .map(|request| (request.handle, request.source.as_str()))
+        .collect();
+    paint
+        .primitives
+        .iter()
+        .chain(&paint.fixed_under_primitives)
+        .chain(&paint.fixed_primitives)
+        .chain(paint.top_layer.iter().flat_map(|entry| &entry.primitives))
+        .filter_map(|command| match command {
+            crate::render::DisplayCommand::Image { node, handle, .. }
+                if dom.tag_name(*node) == Some("svg") =>
+            {
+                Some((*node, *sources.get(handle)?))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Distinct strings in first-insertion order with constant-time membership:
+/// a page can hold hundreds of long inline-SVG `data:` URLs.
+#[derive(Default)]
+struct OrderedStrings {
+    order: Vec<String>,
+    seen: rustc_hash::FxHashSet<String>,
+}
+
+impl OrderedStrings {
+    fn contains(&self, value: &str) -> bool {
+        self.seen.contains(value)
+    }
+
+    fn push(&mut self, value: String) {
+        if !self.seen.contains(&value) {
+            self.seen.insert(value.clone());
+            self.order.push(value);
+        }
+    }
+}
+
+/// Laid-out boxes, and the sources their painted inline SVGs used.
+type RenderedBoxes<'a> = (
+    &'a std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+    &'a rustc_hash::FxHashMap<crate::dom::NodeId, &'a str>,
+);
+
 fn collect_image_urls_for_boxes(
     dom: &crate::dom::Dom,
     base: &Url,
     viewport: crate::layout2::Viewport,
     device_pixel_ratio: f32,
-    boxes: Option<&std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>>,
+    rendered: Option<RenderedBoxes<'_>>,
 ) -> CollectedImages {
-    let mut urls = Vec::new();
-    let mut eager = Vec::new();
+    let boxes = rendered.map(|(boxes, _)| boxes);
+    let painted_svgs = rendered.map(|(_, svgs)| svgs);
+    let mut urls = OrderedStrings::default();
+    let mut eager = OrderedStrings::default();
     let mut cookie_restricted = std::collections::HashSet::new();
     let mut lazy_handles = std::collections::HashSet::new();
     let mut lazy_nodes = Vec::new();
@@ -7696,9 +7760,11 @@ fn collect_image_urls_for_boxes(
             .flatten()
             .filter(crate::responsive_image::loadable_source);
         let svg = (dom.tag_name(id) == Some("svg"))
-            .then(|| dom.svg_image_data(id, Some(base)))
-            .flatten()
-            .map(|(source, _)| source);
+            .then(|| match painted_svgs.and_then(|svgs| svgs.get(&id)) {
+                Some(source) => Some(dom.painted_svg_source(id, source).to_owned()),
+                None => dom.svg_image_data(id, Some(base)).map(|(source, _)| source),
+            })
+            .flatten();
         let poster = (dom.tag_name(id) == Some("video"))
             .then(|| dom.attr(id, "poster"))
             .flatten()
@@ -7746,24 +7812,16 @@ fn collect_image_urls_for_boxes(
             if restricted {
                 cookie_restricted.insert(request.clone());
             }
-            if !urls.contains(&request) {
-                urls.push(request.clone());
-            }
-            if !eager.contains(&request) {
-                eager.push(request);
-            }
+            urls.push(request.clone());
+            eager.push(request);
         }
-        if !urls.contains(&u) {
-            urls.push(u.clone());
-        }
+        urls.push(u.clone());
         if is_lazy && !eager.contains(&u) {
             lazy_handles.insert(handle);
             lazy_nodes.push((id, u));
         } else {
             lazy_handles.remove(&handle);
-            if !eager.contains(&u) {
-                eager.push(u);
-            }
+            eager.push(u);
         }
     }
     // CSS image-valued properties participate in the same fetch/discovery
@@ -7797,12 +7855,8 @@ fn collect_image_urls_for_boxes(
                 if dom.resource_cookies_restricted(id) {
                     cookie_restricted.insert(url.clone());
                 }
-                if !urls.contains(&url) {
-                    urls.push(url.clone());
-                }
-                if !eager.contains(&url) {
-                    eager.push(url);
-                }
+                urls.push(url.clone());
+                eager.push(url);
             }
         }
         // CSS 2 #content: generated images participate in resource discovery
@@ -7832,12 +7886,8 @@ fn collect_image_urls_for_boxes(
                 if dom.resource_cookies_restricted(id) {
                     cookie_restricted.insert(url.clone());
                 }
-                if !urls.contains(&url) {
-                    urls.push(url.clone());
-                }
-                if !eager.contains(&url) {
-                    eager.push(url);
-                }
+                urls.push(url.clone());
+                eager.push(url);
             }
         }
     }
@@ -7879,8 +7929,8 @@ fn collect_image_urls_for_boxes(
         urls.push(preview);
     }
     CollectedImages {
-        all: urls,
-        eager,
+        all: urls.order,
+        eager: eager.order,
         cookie_restricted,
         lazy_handles,
         lazy_nodes,
@@ -10304,6 +10354,53 @@ mod tests {
             ),
             presentation,
         ));
+    }
+
+    #[test]
+    fn rendered_resources_collect_exactly_the_painted_inline_svg_sources() {
+        // Resource collection reuses each painted inline SVG's source from
+        // this rendering's boxes. An unrelated mutation keeps it; a change to
+        // the SVG itself replaces it in both the paint and the collection.
+        let _stable = crate::layout2::stable_global_layout_inputs();
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            "<body><p id=p>text</p><svg width=24 height=24 viewBox='0 0 24 24'>\
+             <path id=shape fill=red d='M1 1h22v22H1z'/></svg></body>",
+        );
+        let render = |dom: &crate::dom::Dom| {
+            let rendered = render_arena(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(640.0, 480.0),
+                1.0,
+                None,
+                &Default::default(),
+            );
+            let painted: Vec<String> = rendered
+                .layout
+                .paint
+                .image_requests
+                .iter()
+                .map(|request| request.source.clone())
+                .filter(|source| source.starts_with("data:image/svg+xml"))
+                .collect();
+            assert_eq!(painted.len(), 1);
+            let collected: Vec<String> = rendered
+                .image_urls
+                .iter()
+                .filter(|source| source.starts_with("data:image/svg+xml"))
+                .cloned()
+                .collect();
+            assert_eq!(collected, painted);
+            painted.into_iter().next().unwrap()
+        };
+        let first = render(&dom);
+        let p = dom.get_by_id("p").unwrap();
+        dom.set_attr(p, "class", "changed");
+        assert_eq!(render(&dom), first);
+        let shape = dom.get_by_id("shape").unwrap();
+        dom.set_attr(shape, "fill", "blue");
+        assert_ne!(render(&dom), first);
     }
 
     #[test]

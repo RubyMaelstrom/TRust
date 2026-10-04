@@ -9057,6 +9057,17 @@ impl Dom {
         }
     }
 
+    /// The image source of inline SVG `id` as this rendering's box tree used
+    /// it, rebuilt or retained with its box. Resource collection uses it
+    /// instead of serializing the SVG again; the dependency proof that a
+    /// resolution publishes is restored if a collection retired it.
+    pub(crate) fn painted_svg_source<'a>(&self, id: NodeId, source: &'a str) -> &'a str {
+        if !self.svg_dependencies.borrow().tracks(id) {
+            self.publish_svg_resource_proof(id);
+        }
+        source
+    }
+
     /// Publish the SVG2 dependency proof of `id`'s image resource, as every
     /// resolution of the resource does before it is serialized.
     fn publish_svg_resource_proof(&self, id: NodeId) -> Option<NodeId> {
