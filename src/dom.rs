@@ -10708,7 +10708,7 @@ impl Dom {
         self.style_view().input_type(id)
     }
 
-    fn actually_disabled(&self, id: NodeId, tag: &str) -> bool {
+    pub(crate) fn actually_disabled(&self, id: NodeId, tag: &str) -> bool {
         self.style_view().actually_disabled(id, tag)
     }
 
@@ -13637,6 +13637,8 @@ const PROPS: &[PropDef] = &[
     prop("-webkit-text-stroke-color", true, true),
     prop("-webkit-text-stroke-width", true, true),
     prop("caret-color", true, true),
+    // CSS UI 4 #widget-accent: inherited, used only to paint native widgets.
+    prop("accent-color", true, false),
     // SVG 2 §6.6 presentation attributes participate in the CSS cascade.
     // These paint properties are consumed when an inline SVG is serialized
     // into the desktop image pipeline; they are not layout snapshot fields.
@@ -13923,7 +13925,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
     match name {
         "text-decoration-line" => Some("none"),
         "text-decoration-style" => Some("solid"),
-        "text-decoration-thickness" | "text-underline-offset" => Some("auto"),
+        "text-decoration-thickness" | "text-underline-offset" | "accent-color" => Some("auto"),
         "text-decoration-color" => Some("currentcolor"),
         "-webkit-text-fill-color" | "-webkit-text-stroke-color" => Some("currentcolor"),
         "-webkit-text-stroke-width" => Some("0px"),

@@ -7053,7 +7053,7 @@ b</xmp></body>"#;
     #[test]
     fn checkbox_and_radio_have_one_native_appearance() {
         // WHATWG HTML Rendering §15.5.10: each checkable input is a single
-        // widget. The graphical glyph is its native appearance; a generic
+        // widget, drawn as the largest square in its content box. A generic
         // text-control fill/stroke must not be painted around it.
         let dom = Dom::parse_document(
             r#"<body style="margin:0"><form>
@@ -7076,36 +7076,50 @@ b</xmp></body>"#;
             | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
             crate::render::PaintShape::Path(_) | crate::render::PaintShape::Polygon { .. } => None,
         };
-        let checkable_has_surface = |node| {
-            let origin = layout
+        // The rectangles filled or stroked over the control's border box.
+        let surfaces = |node| {
+            let control = layout
                 .paint
                 .primitives
                 .iter()
                 .find_map(|command| match command {
-                    crate::render::DisplayCommand::GlyphRun {
-                        node: glyph_node,
-                        origin,
-                        ..
-                    } if *glyph_node == node => Some(*origin),
+                    crate::render::DisplayCommand::HitRegion(hit) if hit.node == node => {
+                        Some(hit.rect)
+                    }
                     _ => None,
-                });
-            let origin = origin.expect("native checkable glyph");
-            layout.paint.primitives.iter().any(|command| {
-                let rect = match command {
+                })
+                .expect("checkable control box");
+            let rects: Vec<_> = layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
                     crate::render::DisplayCommand::Fill { shape, .. }
                     | crate::render::DisplayCommand::Stroke { shape, .. } => shape_rect(shape),
                     _ => None,
-                };
-                rect.is_some_and(|rect| {
-                    origin.x >= rect.x
-                        && origin.x < rect.x + rect.width
-                        && origin.y >= rect.y
-                        && origin.y < rect.y + rect.height
                 })
-            })
+                .filter(|rect| {
+                    rect.x < control.x + control.width
+                        && control.x < rect.x + rect.width
+                        && rect.y < control.y + control.height
+                        && control.y < rect.y + rect.height
+                })
+                .collect();
+            (control, rects)
         };
-        assert!(!checkable_has_surface(dom.get_by_id("c").unwrap()));
-        assert!(!checkable_has_surface(dom.get_by_id("r").unwrap()));
+        // The checkbox's own rounded square fill and stroke, nothing wider.
+        let (control, rects) = surfaces(dom.get_by_id("c").unwrap());
+        let side = control.width.min(control.height);
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        assert!(
+            rects
+                .iter()
+                .all(|rect| rect.width <= side && rect.height <= side),
+            "{control:?} {rects:?}"
+        );
+        // A radio button's widget is circular paths only.
+        let (_, rects) = surfaces(dom.get_by_id("r").unwrap());
+        assert!(rects.is_empty(), "{rects:?}");
         assert!(layout.paint.primitives.iter().any(|command| matches!(
             command,
             crate::render::DisplayCommand::Fill {
@@ -13890,20 +13904,36 @@ b</xmp></body>"#;
             &controls,
             &HashMap::new(),
         );
-        let hidden = dom.get_by_id("hidden").unwrap();
+        // The checkbox widget is painted, inside the zero-area clip.
+        use crate::render::{DisplayCommand, PaintShape};
+        let mut clips: Vec<Option<crate::render::CssRect>> = Vec::new();
+        let mut widget_clips = Vec::new();
         for command in &layout.paint.primitives {
             match command {
-                crate::render::DisplayCommand::GlyphRun { node, clip, .. } if *node == hidden => {
-                    assert!(
-                        clip.is_some_and(|clip| clip.width == 0.0 && clip.height == 0.0),
-                        "hidden control escaped clip: {clip:?}"
-                    );
-                    return;
+                DisplayCommand::PushClip(shape) => clips.push(match shape {
+                    PaintShape::Rect(rect) => Some(*rect),
+                    _ => None,
+                }),
+                DisplayCommand::PopClip => {
+                    clips.pop();
                 }
+                DisplayCommand::Fill {
+                    shape: PaintShape::RoundedRect { .. },
+                    ..
+                } => widget_clips.push(clips.last().copied().flatten()),
                 _ => {}
             }
         }
-        panic!("expected the clipped control's retained native glyph");
+        assert!(
+            !widget_clips.is_empty(),
+            "expected the clipped control's widget"
+        );
+        assert!(
+            widget_clips
+                .iter()
+                .all(|clip| clip.is_some_and(|clip| clip.width == 0.0 && clip.height == 0.0)),
+            "hidden control escaped clip: {widget_clips:?}"
+        );
     }
 
     #[test]
