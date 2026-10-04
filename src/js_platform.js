@@ -19018,8 +19018,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const TypeErrorCtor = TypeError, RangeErrorCtor = RangeError, Bytes = Uint8Array;
     const isView = ArrayBuffer.isView, toStringTag = Symbol.toStringTag;
     const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
-    const sharedByteLength = typeof SharedArrayBuffer === "function"
-        ? getOwn(SharedArrayBuffer.prototype, "byteLength").get : null;
+    // SharedArrayBuffer's brand check is looked up on first use: a realm that
+    // is not cross-origin isolated deletes the global during its bootstrap,
+    // and capturing its intrinsics here keeps that Realm alive in Lumen.
+    let sharedByteLength;
+    function isSharedBuffer(value) {
+        if (sharedByteLength === undefined) {
+            const SharedBuffer = g.SharedArrayBuffer;
+            sharedByteLength = typeof SharedBuffer === "function"
+                ? getOwn(SharedBuffer.prototype, "byteLength").get : null;
+        }
+        return isBufferWith(sharedByteLength, value);
+    }
     const viewBuffer = getOwn(Object.getPrototypeOf(Bytes.prototype), "buffer").get;
     const viewOffset = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteOffset").get;
     const viewLength = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteLength").get;
@@ -19070,7 +19080,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 ? new Bytes(apply(dataViewBuffer, input, []), apply(dataViewOffset, input, []), apply(dataViewLength, input, []))
                 : new Bytes(apply(viewBuffer, input, []), apply(viewOffset, input, []), apply(viewLength, input, []));
         }
-        if (isBufferWith(bufferByteLength, input) || isBufferWith(sharedByteLength, input)) return new Bytes(input);
+        if (isBufferWith(bufferByteLength, input) || isSharedBuffer(input)) return new Bytes(input);
         throw new TypeErrorCtor("The provided value is not an ArrayBuffer, a SharedArrayBuffer or an ArrayBufferView");
     }
     class TextEncoder {
