@@ -205,6 +205,33 @@ pub(crate) struct PreparedText {
 
 impl PreparedText {
     pub fn metrics(&self) -> [f64; 12] {
+        let (left, right, top, bottom) = self.ink_bounds().map_or((0., 0., 0., 0.), |r| {
+            (
+                self.anchor_x - r.x0,
+                r.x1 - self.anchor_x,
+                -r.y0 - self.baseline_y,
+                r.y1 + self.baseline_y,
+            )
+        });
+        [
+            f64::from(self.shaped.advance),
+            left,
+            right,
+            self.ascent - self.baseline_y,
+            self.descent + self.baseline_y,
+            top,
+            bottom,
+            self.em_ascent - self.baseline_y,
+            self.em_descent + self.baseline_y,
+            self.hanging - self.baseline_y,
+            -self.baseline_y,
+            -self.descent - self.baseline_y,
+        ]
+    }
+
+    /// The union of the glyphs' ink in the coordinates the painters place
+    /// glyphs in, before the text transform (TextMetrics' actual bounds).
+    pub fn ink_bounds(&self) -> Option<Rect> {
         let mut bounds = GlyphBounds::default();
         let mut cache = glifo::GlyphPrepCache::default();
         for run in &self.shaped.runs {
@@ -236,28 +263,7 @@ impl PreparedText {
                 y: glyph.y - self.shaped.baseline,
             }));
         }
-        let (left, right, top, bottom) = bounds.bounds.map_or((0., 0., 0., 0.), |r| {
-            (
-                self.anchor_x - r.x0,
-                r.x1 - self.anchor_x,
-                -r.y0 - self.baseline_y,
-                r.y1 + self.baseline_y,
-            )
-        });
-        [
-            f64::from(self.shaped.advance),
-            left,
-            right,
-            self.ascent - self.baseline_y,
-            self.descent + self.baseline_y,
-            top,
-            bottom,
-            self.em_ascent - self.baseline_y,
-            self.em_descent + self.baseline_y,
-            self.hanging - self.baseline_y,
-            -self.baseline_y,
-            -self.descent - self.baseline_y,
-        ]
+        bounds.bounds
     }
 }
 
