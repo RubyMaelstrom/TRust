@@ -708,7 +708,42 @@ impl Drop for PageHandle {
 /// and event receivers. Keep the network runtime alive to service cancellation.
 /// Further page actors are rejected; ordinary navigation remains asynchronous.
 pub fn shutdown_page_threads() {
+    crate::lumen_backend::shutdown_spare_engine();
     crate::page_threads::shutdown();
+}
+
+/// Let navigations in this process claim a pre-warmed spare page engine
+/// instead of building a cold one. Browsing frontends call this once at
+/// startup. With `refill`, each navigation that renders starts warming the
+/// next spare; without it, only [`prewarm_page_engine`] creates one. Returns
+/// false when `TRUST_NO_SPARE_ENGINE` keeps every navigation cold. Library
+/// users and tests never get a spare implicitly.
+pub fn enable_spare_page_engine(refill: bool) -> bool {
+    crate::lumen_backend::set_spare_engine_enabled(true, refill)
+}
+
+/// Start warming a spare page engine now, if enabled and none is waiting,
+/// so that it can serve the next (typically the first) navigation.
+pub fn prewarm_page_engine() {
+    crate::lumen_backend::prewarm_spare_engine();
+}
+
+/// Whether a frontend's start address can lead to a scripted HTML document,
+/// so that warming a spare page engine at startup may serve it. A syntactic
+/// guess: `http`, `https`, `file` and scheme-less addresses (bare hosts and
+/// paths) qualify; other protocols never use a page engine. A wrong guess
+/// costs only an idle spare.
+pub fn start_address_may_use_page_engine(address: &str) -> bool {
+    address.split_once("://").is_none_or(|(scheme, _)| {
+        ["http", "https", "file"]
+            .iter()
+            .any(|web| scheme.eq_ignore_ascii_case(web))
+    })
+}
+
+/// A navigation's document rendered: warm the next navigation's engine.
+pub(crate) fn refill_spare_page_engine() {
+    crate::lumen_backend::refill_spare_engine();
 }
 
 pub fn spawn_page(
