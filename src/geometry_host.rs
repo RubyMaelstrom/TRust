@@ -454,3 +454,17 @@ pub(super) fn bind(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Val
         ),
     ]))
 }
+
+/// Geometry 1 #dommatrix-parse for a Window Realm's DOMMatrix(ReadOnly)
+/// constructor and setMatrixValue(): `null` for failure, otherwise
+/// `[is2D, m11, m12, …, m44]` in column-major order.
+pub(super) fn parse_matrix(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
+    let text = super::host_arg_string(ctx, args, 0);
+    let Some((matrix, two_dimensional)) = crate::dom::css_transform_list_matrix(&text) else {
+        return Ok(Value::Null);
+    };
+    let mut values = Vec::with_capacity(17);
+    values.push(Value::Bool(two_dimensional));
+    values.extend(matrix.into_iter().map(Value::Num));
+    Ok(ctx.make_array(values))
+}

@@ -8,8 +8,10 @@
 //! names. Its multi-name CSSOM issue (#14227) is still unresolved.
 mod gradients;
 mod math;
+mod matrix;
 mod resolution;
 mod values;
+pub(super) use matrix::transform_list_matrix;
 pub(super) use resolution::State;
 pub(super) use resolution::{registry_bytes, substitute};
 
