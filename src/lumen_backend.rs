@@ -28591,6 +28591,45 @@ mod tests {
     }
 
     #[test]
+    fn dom_token_list_uses_an_ordered_set_and_validates_tokens() {
+        // DOM #interface-domtokenlist (local whatwg/dom@a2331a4): the token
+        // set parses as an ordered set on ASCII whitespace, mutations validate
+        // tokens and run the update steps, and classList is [PutForwards=value].
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                const el = document.createElement('div');
+                const list = el.classList, results = [];
+                el.className = '   a  a b c ';
+                results.push(list.length, list.item(1), list.contains('b c'));
+                list.add('c');
+                results.push(el.className);
+                const bare = document.createElement('div');
+                bare.classList.remove('a');
+                bare.classList.toggle('x', false);
+                results.push(bare.hasAttribute('class'));
+                bare.classList.add();
+                results.push(bare.hasAttribute('class'));
+                for (const f of [() => list.add(''), () => list.remove('a b'), () => list.toggle('\t'),
+                                 () => list.replace('a', ''), () => list.replace('a', 'x y')]) {
+                    try { f(); results.push('none'); } catch (e) { results.push(e.name); }
+                }
+                el.className = 'a b a c';
+                results.push(list.toggle('a', true), el.className);
+                results.push(list.replace('c', 'b'), el.className, list.replace('zz', 'q'));
+                el.classList = 'p q';
+                results.push(el.className, list === el.classList);
+                return results.join('|');
+            })()"#
+            ),
+            "2|b\u{a0}c|true|a b\u{a0}c c|false|false|SyntaxError|InvalidCharacterError|InvalidCharacterError|\
+             SyntaxError|InvalidCharacterError|true|a b a c|true|a b|false|p q|true"
+        );
+    }
+
+    #[test]
     fn aria_string_attributes_reflect_nullable_values_on_all_elements() {
         // WAI-ARIA snapshot 2f5c69b0 #ARIAMixin / #idl-reflection-attribute-values;
         // HTML #reflect and Web IDL nullable DOMString conversion.
