@@ -5552,11 +5552,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             nodeIds.set(this, id);
         }
-        get nodeType() { return __dom_node_type(nodeIds.get(this)); }
+        // An Attr has no arena node (DOM #interface-attr): nodeType 2.
+        get nodeType() { return __dom_node_type(nodeIds.get(this)) || (internalsOf(this).attrNode ? 2 : 0); }
         get nodeName() {
             const t = __dom_tag(nodeIds.get(this));
             if (t) return t.toUpperCase();
             const n = this.nodeType;
+            // DOM #dom-node-nodename: an Attr's nodeName is its qualified name.
+            if (n === 2) return attrState(this).qualifiedName;
             return n === 3 ? "#text" : n === 9 ? "#document" : n === 8 ? "#comment" : n === 11 ? "#document-fragment" : "#node";
         }
         // DOM §4.4 Node.baseURI: every node reports the serialized document
@@ -5584,11 +5587,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get previousElementSibling() { if (nativeDomTraversal) return relativeNode(this, 9); let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
         get textContent() {
             const t = this.nodeType;
+            if (t === 2) return attrValue(attrState(this));
             return t === 9 || t === 10 ? null : __dom_text(nodeIds.get(this));
         }
         set textContent(v) {
             v = v === null || v === undefined ? "" : String(v);
             const t = this.nodeType;
+            if (t === 2) { setAttrValue(attrState(this), v); return; }
             if (rangeCharacterData(this)) { this.data = v; return; }
             if (t !== 1 && t !== 11) return;
             rangesReplaceChildren(this);
@@ -5615,9 +5620,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             moChildBulk(this, removed, Array.from(this.childNodes));
             slotQueueCheck(this);
         }
-        get nodeValue() { const t = this.nodeType; return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(nodeIds.get(this)) : null; }
+        get nodeValue() {
+            const t = this.nodeType;
+            if (t === 2) return attrValue(attrState(this));
+            return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(nodeIds.get(this)) : null;
+        }
         set nodeValue(v) {
-            if (rangeCharacterData(this)) this.data = v == null ? "" : String(v);
+            if (internalsOf(this).attrNode) setAttrValue(attrState(this), v == null ? "" : String(v));
+            else if (rangeCharacterData(this)) this.data = v == null ? "" : String(v);
         }
         // NOTE: `data` is deliberately NOT here. Per the DOM spec it is a
         // CharacterData-only IDL attribute (Text/Comment/ProcessingInstruction),
@@ -5635,6 +5645,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // indistinguishable from a no-op.
         get ownerDocument() {
             const document = __dom_owner_document(this);
+            if (document === null && internalsOf(this).attrNode) return internalsOf(this).attrNode.document;
             return document && typeof document === "object" ? document : wrap(document);
         }
         get isConnected() {
@@ -5649,6 +5660,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Document.adoptNode is defined on Document, below.  Keeping the
         // operation there preserves the DOM's target-document semantics.
         appendChild(c) {
+            if (nodeIds.get(this) === undefined) rejectAttrParent(this);
             if (c && c.nodeType === 11 && !internalsFor(c).host) { for (const k of Array.from(c.childNodes)) this.appendChild(k); return c; }
             // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
             // (returns false, unmutated) when `c` is an inclusive ancestor.
@@ -5667,6 +5679,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return c;
         }
         insertBefore(c, ref) {
+            if (nodeIds.get(this) === undefined) rejectAttrParent(this);
             if (c && c.nodeType === 11 && !internalsFor(c).host) { for (const k of Array.from(c.childNodes)) this.insertBefore(k, ref); return c; }
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
             const insertion = __dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null);
@@ -5699,6 +5712,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return c;
         }
         replaceChild(n, old) {
+            if (nodeIds.get(this) === undefined) rejectAttrParent(this);
             const prev = old.previousSibling, next = old.nextSibling;
             const oldParent = rangeParent(n), oldIndex = oldParent ? rangeIndex(n) : 0;
             // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
@@ -5744,6 +5758,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         replaceWith(...ns) { this.before(...ns); this.remove(); }
         replaceChildren(...ns) { let c; while ((c = this.firstChild)) this.removeChild(c); this.append(...ns); }
         cloneNode(deep) {
+            const attr = internalsOf(this).attrNode;
+            if (attr) return createAttrNode(attr.document, null, attr.namespace, attr.prefix, attr.localName, attrValue(attr));
             const clone = wrap(__dom_clone(nodeIds.get(this), !!deep));
             // Cloning creates a fresh script element rather than a
             // parser-inserted one, so its force-async flag starts true.
@@ -5775,6 +5791,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (this.nodeValue !== o.nodeValue) return false;
             } else if (t === 10) {
                 if (this.nodeName !== o.nodeName) return false;
+            } else if (t === 2) {
+                return this.namespaceURI === o.namespaceURI && this.localName === o.localName && this.value === o.value;
             }
             const ac = this.childNodes, bc = o.childNodes;
             if (ac.length !== bc.length) return false;
@@ -5793,6 +5811,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         compareDocumentPosition(other) {
             if (!(other instanceof Node)) throw new TypeError("Failed to execute 'compareDocumentPosition': parameter 1 is not of type 'Node'");
             if (other === this) return 0;
+            const attrThis = internalsOf(this).attrNode, attrOther = internalsOf(other).attrNode;
+            if (attrThis || attrOther) return compareAttrPosition(this, other, attrThis, attrOther);
             const chain = (n) => { const c = [n]; let p = n.parentNode; while (p) { c.push(p); p = p.parentNode; } return c; };
             const a = chain(this), b = chain(other);
             if (a[a.length - 1] !== b[b.length - 1]) {
@@ -6576,7 +6596,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // `const attrs = el.attributes` observes this write immediately,
             // including while it is iterating the map.
             internalsFor(this).attrMapStale = true;
-            if (internalsFor(this).attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, v);
             moAttr(this, n, old);
@@ -6595,14 +6614,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             n = String(n);
             const lower = n.toLowerCase();
             const old = (internalsFor(this).ceUpgraded || MO.length) ? this.getAttribute(n) : null;
+            // The removed attribute's Attr node keeps its value, detached.
+            detachAttrNode(this, n);
             __dom_remove_attr(nodeIds.get(this), n);
             internalsFor(this).ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             // DOM §4.9.1 requires the same live-list behavior for removals.
             // FAST's standards-based template compiler removes marker Attrs
-            // while walking `element.attributes`, so deferring this refresh
-            // leaves the remaining bindings unprocessed.
+            // while walking `element.attributes`, so the list refreshes at once.
             internalsFor(this).attrMapStale = true;
-            if (internalsFor(this).attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, null);
             moAttr(this, n, old);
@@ -6615,85 +6634,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         getAttributeNames() { return __dom_attr_names(nodeIds.get(this)); }
         hasAttributes() { return __dom_attr_names(nodeIds.get(this)).length > 0; }
         // Attr-node accessors (DOM §4.9.2). React DOM's property commit reads
-        // getAttributeNode then removeAttributeNode; without them it threw
-        // "undefined is not a callable (reading 'removeAttributeNode')". An Attr
-        // here is the SAME plain object the `attributes` NamedNodeMap yields
-        // (name/value/ownerElement/…) — we keep no GC-wrapped Attr node.
-        getAttributeNode(n) { return this.attributes.getNamedItem(n); }
-        getAttributeNodeNS(_ns, n) { return this.attributes.getNamedItem(n); }
+        // getAttributeNode then removeAttributeNode.
+        getAttributeNode(n) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return attributeNodeByName(this, domString(n));
+        }
+        getAttributeNodeNS(namespace, localName) {
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            return attributeNodeByNamespace(this, namespace == null || namespace === "" ? null : domString(namespace),
+                domString(localName));
+        }
         setAttributeNode(attr) {
-            const old = this.getAttributeNode(attr.name);
-            this.setAttribute(attr.name, attr.value == null ? "" : attr.value);
-            attr.ownerElement = this;
-            return old;
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return setAttributeNode(this, attr);
         }
-        setAttributeNodeNS(attr) { return this.setAttributeNode(attr); }
+        setAttributeNodeNS(attr) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return setAttributeNode(this, attr);
+        }
         removeAttributeNode(attr) {
-            // Spec returns the removed Attr; be lenient on a stale/foreign node
-            // (fail-open, like the rest of the platform surface) and remove by name.
-            const removed = this.getAttributeNode(attr.name) || attr;
-            this.removeAttribute(attr.name);
-            return removed;
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return removeAttributeNode(this, attr);
         }
-        // NamedNodeMap, array-like enough for Array.from/iteration/indexing
-        // (Alpine's DOM morph does `Array.from(el.attributes)` — undefined
-        // here threw ToObject and aborted danbooru's whole render).
-        // [SameObject] per spec: ONE map per element, identity-stable across
-        // accesses; its contents refresh in place after every attribute write
-        // (`__attrMapStale` rides the same set/removeAttribute funnels that
-        // drop the `getAttribute` read cache), preserving live-list behavior
-        // for existing references as required by the DOM Standard.
+        // DOM #dom-element-attributes: the [SameObject] live NamedNodeMap.
         get attributes() {
-            // Rebuild attribute values in place so existing list references stay live.
-            let list = internalsFor(this).attrMap;
-            if (list && !internalsFor(this).attrMapStale) return list;
-            if (!list) {
-                list = [];
-                internalsFor(list).owner = this;
-                list.item = function (i) { return this[i] || null; };
-                list.getNamedItem = function (nm) {
-                    for (var j = 0; j < this.length; j++) if (this[j].name === String(nm)) return this[j];
-                    return null;
-                };
-                // setNamedItem/removeNamedItem round out the map (DOM §4.9.1);
-                // they route through the owner's set/removeAttribute funnels.
-                list.setNamedItem = function (attr) { return internalsFor(this).owner.setAttributeNode(attr); };
-                list.setNamedItemNS = function (attr) { return internalsFor(this).owner.setAttributeNode(attr); };
-                list.removeNamedItem = function (nm) {
-                    const old = this.getNamedItem(nm);
-                    if (!old) throw new (g.DOMException || TypeError)("No attribute named " + nm, "NotFoundError");
-                    internalsFor(this).owner.removeAttribute(String(nm));
-                    return old;
-                };
-                internalsFor(this).attrMap = list;
-            } else {
-                // Rebuild in place (identity must survive): drop the named
-                // props of the OLD entries, then the entries themselves.
-                for (let j = 0; j < list.length; j++) {
-                    const old = list[j].name;
-                    if (old !== "length" && old !== "item" && old !== "getNamedItem") delete list[old];
-                }
-                list.length = 0;
-            }
-            const names = __dom_attr_names(nodeIds.get(this)) || [];
-            for (let i = 0; i < names.length; i++) {
-                const n = names[i];
-                const v = __dom_get_attr(nodeIds.get(this), n);
-                const attr = {
-                    name: n, localName: n, nodeName: n, namespaceURI: null,
-                    prefix: null, specified: true, ownerElement: this,
-                    value: v, nodeValue: v,
-                };
-                list.push(attr);
-                // NamedNodeMap named-property access: `attributes[name]` returns
-                // the Attr (WebIDL named getter). jQuery's event-support probe
-                // reads `div.attributes["onsubmit"].expando`; without this it
-                // was undefined → ToObject throw that aborted jQuery's boot.
-                // Skip names that would clobber the array length / methods.
-                if (n !== "length" && n !== "item" && n !== "getNamedItem") list[n] = attr;
-            }
-            internalsFor(this).attrMapStale = false;
-            return list;
+            const record = internalsFor(this);
+            return record.attrMap || (record.attrMap = createNamedNodeMap(this));
         }
         // Lit's ?attr= boolean bindings commit through this.
         toggleAttribute(name, force) {
@@ -11041,7 +11007,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function validNamespacePrefix(value) {
         return value.length > 0 && !/[\0\t\n\f\r\u0020\/>]/.test(value);
     }
-    function validateAndExtractElementName(namespace, qualifiedName) {
+    // DOM #valid-attribute-local-name.
+    const VALID_ATTRIBUTE_LOCAL_NAME = /^[^\t\n\f\r \0\/=>]+$/;
+    function validateAndExtractElementName(namespace, qualifiedName, context = "element") {
         if (namespace === "") namespace = null;
         let prefix = null;
         let localName = qualifiedName;
@@ -11053,8 +11021,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new DOMException("The qualified name has an invalid namespace prefix.", "InvalidCharacterError");
             }
         }
-        if (!VALID_ELEMENT_LOCAL_NAME.test(localName)) {
-            throw new DOMException("The qualified name has an invalid element local name.", "InvalidCharacterError");
+        if (context === "attribute" ? !VALID_ATTRIBUTE_LOCAL_NAME.test(localName) : !VALID_ELEMENT_LOCAL_NAME.test(localName)) {
+            throw new DOMException("The qualified name has an invalid " + context + " local name.", "InvalidCharacterError");
         }
         if (prefix !== null && namespace === null) {
             throw new DOMException("A namespace prefix requires a namespace.", "NamespaceError");
@@ -11340,13 +11308,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         createComment(s) {
             return wrap(__dom_create_comment(s === undefined ? "" : String(s), nodeIds.get(this)));
         }
-        // A detached Attr (DOM §4.9.2): a plain object matching what the
-        // `attributes` NamedNodeMap yields, so setAttributeNode can consume it.
-        createAttribute(n) {
-            n = String(n).toLowerCase();
-            return { name: n, localName: n, nodeName: n, namespaceURI: null, prefix: null, specified: true, ownerElement: null, value: "", nodeValue: "" };
+        // DOM #dom-document-createattribute: a detached Attr of this document.
+        createAttribute(localName) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            localName = domString(localName);
+            if (!VALID_ATTRIBUTE_LOCAL_NAME.test(localName))
+                throw new DOMException("The name is not a valid attribute local name.", "InvalidCharacterError");
+            if (this.contentType === "text/html") localName = asciiLower(localName);
+            return createAttrNode(this, null, null, null, localName, "");
         }
-        createAttributeNS(_ns, n) { const a = this.createAttribute(String(n)); return a; }
+        // DOM #dom-document-createattributens.
+        createAttributeNS(namespace, qualifiedName) {
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            const extracted = validateAndExtractElementName(namespace == null ? null : domString(namespace),
+                domString(qualifiedName), "attribute");
+            return createAttrNode(this, null, extracted[0], extracted[1], extracted[2], "");
+        }
         // DOM §4.5 `importNode`: clone into THIS document and use its custom
         // element registry as the fallback registry. Template contents belong
         // to an inert template document, so this is observably different from
@@ -11514,8 +11491,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         createTextNode(s) { return Document.prototype.createTextNode.apply(this, arguments); }
         createComment(s) { return Document.prototype.createComment.apply(this, arguments); }
-        createAttribute(n) { return wrap(0).createAttribute(n); }
-        createAttributeNS(ns, n) { return wrap(0).createAttributeNS(ns, n); }
+        createAttribute(n) { return Document.prototype.createAttribute.apply(this, arguments); }
+        createAttributeNS(ns, n) { return Document.prototype.createAttributeNS.apply(this, arguments); }
         createDocumentFragment() { return Document.prototype.createDocumentFragment.call(this); }
         // DOM §4.5: clone into this Document, preserving the requested
         // subtree and applying this realm's fallback custom-element registry.
@@ -13420,7 +13397,177 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get [Symbol.toStringTag]() { return "ProcessingInstruction"; }
     }
     class DocumentType extends Node {}
-    class Attr extends Node {}
+    // DOM §4.9.2 #interface-attr. The arena keeps an element's attributes as
+    // name/value pairs, so an Attr is a platform object over one pair: while
+    // owned it reads its element's attribute and changes it through the same
+    // setAttribute funnel as every other write; created detached or removed,
+    // it keeps its own value. An element reuses one Attr per attribute while
+    // that attribute exists. TRust attributes have no namespace or prefix.
+    class Attr extends Node {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get namespaceURI() { return attrState(this).namespace; }
+        get prefix() { return attrState(this).prefix; }
+        get localName() { return attrState(this).localName; }
+        get name() { return attrState(this).qualifiedName; }
+        get value() { return attrValue(attrState(this)); }
+        set value(value) { setAttrValue(attrState(this), domString(value)); }
+        get ownerElement() { const state = attrState(this); attrValue(state); return state.element; }
+        get specified() { attrState(this); return true; }
+    }
+    for (const name of ["namespaceURI", "prefix", "localName", "name", "value", "ownerElement", "specified"])
+        Object.defineProperty(Attr.prototype, name, {enumerable: true});
+    const elementSetAttribute = Element.prototype.setAttribute;
+    const elementRemoveAttribute = Element.prototype.removeAttribute;
+    function attrState(attr) {
+        const state = internalsOf(attr).attrNode;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function createAttrNode(document, element, namespace, prefix, localName, value) {
+        const attr = Object.create(Attr.prototype);
+        internalsFor(attr).attrNode = {document, element, namespace, prefix, localName,
+            qualifiedName: prefix === null ? localName : prefix + ":" + localName, value};
+        return attr;
+    }
+    // An owned Attr's value is its element's; an attribute removed by other
+    // means leaves its last value with the then detached Attr.
+    function attrValue(state) {
+        if (state.element) {
+            const value = __dom_get_attr(nodeIds.get(state.element), state.qualifiedName);
+            if (value === null) detachAttrNode(state.element, state.qualifiedName);
+            else state.value = value;
+        }
+        return state.value;
+    }
+    function setAttrValue(state, value) {
+        // DOM #set-an-existing-attribute-value: change the element's
+        // attribute, or set a detached Attr's own value.
+        attrValue(state);
+        if (state.element) Reflect.apply(elementSetAttribute, state.element, [state.qualifiedName, value]);
+        else state.value = value;
+    }
+    // The element's attribute qualified names, refreshed after any write.
+    function elementAttributeNames(element) {
+        const record = internalsFor(element), epoch = __dom_epoch();
+        if (record.attrNames === undefined || record.attrNamesEpoch !== epoch || record.attrMapStale) {
+            record.attrNames = __dom_attr_names(nodeIds.get(element)) || [];
+            record.attrNamesEpoch = epoch;
+            record.attrMapStale = false;
+        }
+        return record.attrNames;
+    }
+    // The element's Attr for its existing attribute `name` (as stored).
+    function elementAttrNode(element, name) {
+        const record = internalsFor(element);
+        const cache = record.attrNodes || (record.attrNodes = new Map());
+        let attr = cache.get(name);
+        if (!attr) {
+            const value = __dom_get_attr(nodeIds.get(element), name);
+            attr = createAttrNode(element.ownerDocument, element, null, null, name, value === null ? "" : value);
+            cache.set(name, attr);
+        }
+        return attr;
+    }
+    // DOM #concept-element-attributes-remove: the removed attribute's Attr
+    // keeps the value it had. The arena matches names ASCII case-insensitively.
+    function detachAttrNode(element, name) {
+        const cache = internalsOf(element).attrNodes;
+        if (!cache || !cache.size) return;
+        const lower = asciiLower(name);
+        for (const [key, attr] of cache) {
+            if (key !== name && asciiLower(key) !== lower) continue;
+            const state = internalsOf(attr).attrNode, value = __dom_get_attr(nodeIds.get(element), key);
+            if (value !== null) state.value = value;
+            state.element = null;
+            cache.delete(key);
+        }
+    }
+    function htmlAttributeNames(element) {
+        return element.namespaceURI === HTML_NS && element.ownerDocument.contentType === "text/html";
+    }
+    // DOM #dom-node-comparedocumentposition steps 2-10 when an Attr is
+    // involved: Attrs compare through their elements, and two Attrs of one
+    // element by attribute-list order.
+    function compareAttrPosition(self, other, attrThis, attrOther) {
+        let node1 = other, node2 = self;
+        if (attrOther) { attrValue(attrOther); node1 = attrOther.element; }
+        if (attrThis) {
+            attrValue(attrThis);
+            node2 = attrThis.element;
+            if (attrOther && node1 && node2 === node1) {
+                const names = elementAttributeNames(node2);
+                for (let i = 0; i < names.length; i++) {
+                    const attr = elementAttrNode(node2, names[i]);
+                    if (attr === other) return 32 + 2;
+                    if (attr === self) return 32 + 4;
+                }
+            }
+        }
+        if (!node1 || !node2) return 1 + 32 + 2;
+        if (node1 === node2) return attrThis ? 8 + 2 : 16 + 4;
+        const relation = Node.prototype.compareDocumentPosition.call(node2, node1);
+        if (relation & 1) return relation;
+        if ((relation & 8) && attrOther) return 2;
+        if ((relation & 16) && attrThis) return 4;
+        return relation;
+    }
+    // DOM #concept-pre-insert / #concept-replace step 1: an Attr cannot be a parent.
+    function rejectAttrParent(node) {
+        if (internalsOf(node).attrNode)
+            throw new DOMException("An Attr node cannot have children.", "HierarchyRequestError");
+    }
+    // DOM #concept-element-attributes-get-by-name.
+    function attributeNodeByName(element, name) {
+        const html = htmlAttributeNames(element);
+        if (html) name = asciiLower(name);
+        const names = elementAttributeNames(element);
+        for (let i = 0; i < names.length; i++)
+            if (names[i] === name || (html && asciiLower(names[i]) === name)) return elementAttrNode(element, names[i]);
+        return null;
+    }
+    // DOM #concept-element-attributes-get-by-namespace.
+    function attributeNodeByNamespace(element, namespace, localName) {
+        if (namespace !== null) return null;
+        const names = elementAttributeNames(element);
+        for (let i = 0; i < names.length; i++)
+            if (names[i] === localName) return elementAttrNode(element, names[i]);
+        return null;
+    }
+    // DOM #concept-element-attributes-set.
+    function setAttributeNode(element, attr) {
+        const state = attrState(attr);
+        attrValue(state);
+        if (state.element && state.element !== element)
+            throw new DOMException("The attribute is in use by another element.", "InUseAttributeError");
+        const old = attributeNodeByNamespace(element, state.namespace, state.localName);
+        if (old === attr) return attr;
+        if (old) detachAttrNode(element, internalsOf(old).attrNode.qualifiedName);
+        const record = internalsFor(element);
+        const cache = record.attrNodes || (record.attrNodes = new Map());
+        cache.set(state.qualifiedName, attr);
+        state.element = element;
+        state.document = element.ownerDocument;
+        Reflect.apply(elementSetAttribute, element, [state.qualifiedName, state.value]);
+        // Keep the cache keyed by the stored spelling of the name.
+        const names = elementAttributeNames(element), lower = asciiLower(state.qualifiedName);
+        for (let i = 0; i < names.length; i++) {
+            if (names[i] !== state.qualifiedName && asciiLower(names[i]) === lower) {
+                cache.delete(state.qualifiedName);
+                cache.set(names[i], attr);
+                break;
+            }
+        }
+        return old;
+    }
+    // DOM #dom-element-removeattributenode.
+    function removeAttributeNode(element, attr) {
+        const state = attrState(attr);
+        attrValue(state);
+        if (state.element !== element)
+            throw new DOMException("The attribute is not an attribute of this element.", "NotFoundError");
+        Reflect.apply(elementRemoveAttribute, element, [state.qualifiedName]);
+        return attr;
+    }
     // WHATWG DOM puts the element-traversal accessors on the ParentNode mixin
     // (Document/DocumentFragment/Element/ShadowRoot) and NonDocumentTypeChildNode
     // (Element/CharacterData) — NOT on Node. We author them once on `class Node`
@@ -13613,6 +13760,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const CHILD_ELEMENT_COLLECTIONS = new WeakMap();
     function childNodeCollection(root) {
         let list = CHILD_NODE_COLLECTIONS.get(root);
+        if (!list && internalsOf(root).attrNode) {
+            // An Attr never has children.
+            list = makeStaticNodeList([], __dom_epoch(), undefined);
+            CHILD_NODE_COLLECTIONS.set(root, list);
+        }
         if (!list) {
             const target = Object.create(NodeList.prototype);
             const liveGet = installNativeCollection(target, root, false, wrapKnown);
@@ -13908,7 +14060,136 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         [Symbol.iterator]() { return formControlsList.call(this)[Symbol.iterator](); }
         get [Symbol.toStringTag]() { return "HTMLFormControlsCollection"; }
     }
-    class NamedNodeMap {}
+    // DOM §4.9.1 #interface-namednodemap: the element's live [SameObject]
+    // attribute list, a legacy platform object with indexed and
+    // [LegacyUnenumerableNamedProperties] named properties.
+    class NamedNodeMap {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() { return elementAttributeNames(namedNodeMapElement(this)).length; }
+        item(index) {
+            const element = namedNodeMapElement(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            const names = elementAttributeNames(element);
+            index = index >>> 0;
+            return index < names.length ? elementAttrNode(element, names[index]) : null;
+        }
+        getNamedItem(qualifiedName) {
+            const element = namedNodeMapElement(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return attributeNodeByName(element, domString(qualifiedName));
+        }
+        getNamedItemNS(namespace, localName) {
+            const element = namedNodeMapElement(this);
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            return attributeNodeByNamespace(element, namespace == null || namespace === "" ? null : domString(namespace),
+                domString(localName));
+        }
+        setNamedItem(attr) {
+            const element = namedNodeMapElement(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return setAttributeNode(element, attr);
+        }
+        setNamedItemNS(attr) {
+            const element = namedNodeMapElement(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return setAttributeNode(element, attr);
+        }
+        removeNamedItem(qualifiedName) {
+            const element = namedNodeMapElement(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            const attr = attributeNodeByName(element, domString(qualifiedName));
+            if (!attr) throw new DOMException("No attribute named '" + qualifiedName + "' was found.", "NotFoundError");
+            return removeAttributeNode(element, attr);
+        }
+        removeNamedItemNS(namespace, localName) {
+            const element = namedNodeMapElement(this);
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            const attr = attributeNodeByNamespace(element,
+                namespace == null || namespace === "" ? null : domString(namespace), domString(localName));
+            if (!attr) throw new DOMException("No attribute named '" + localName + "' was found.", "NotFoundError");
+            return removeAttributeNode(element, attr);
+        }
+    }
+    for (const name of Object.getOwnPropertyNames(NamedNodeMap.prototype))
+        if (name !== "constructor") Object.defineProperty(NamedNodeMap.prototype, name, {enumerable: true});
+    Object.defineProperty(NamedNodeMap.prototype, Symbol.iterator,
+        {value: Array.prototype.values, writable: true, configurable: true});
+    function namedNodeMapElement(map) {
+        const element = internalsOf(map).namedNodeMapElement;
+        if (!element) throw new TypeError("Illegal invocation");
+        return element;
+    }
+    // DOM #concept-namednodemap-supported-property-names.
+    function namedNodeMapNames(element) {
+        const names = elementAttributeNames(element), html = htmlAttributeNames(element), out = [];
+        for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            if (html && /[A-Z]/.test(name)) continue;
+            if (out.indexOf(name) < 0) out.push(name);
+        }
+        return out;
+    }
+    function createNamedNodeMap(element) {
+        const target = Object.create(NamedNodeMap.prototype);
+        internalsFor(target).namedNodeMapElement = element;
+        const indexed = property => {
+            const index = nodeListArrayIndex(property);
+            return index >= 0 && index < elementAttributeNames(element).length ? index : -1;
+        };
+        // Web IDL #dfn-named-property-visibility: own and inherited
+        // properties shadow named properties.
+        const named = (t, property) => {
+            if (typeof property !== "string" || nodeListArrayIndex(property) >= 0 ||
+                Reflect.getOwnPropertyDescriptor(t, property) || Reflect.has(Reflect.getPrototypeOf(t), property))
+                return null;
+            return namedNodeMapNames(element).indexOf(property) >= 0 ? attributeNodeByName(element, property) : null;
+        };
+        const proxy = new Proxy(target, {
+            get(t, property, receiver) {
+                const index = indexed(property);
+                if (index >= 0) return elementAttrNode(element, elementAttributeNames(element)[index]);
+                const attr = named(t, property);
+                return attr || Reflect.get(t, property, receiver);
+            },
+            has(t, property) {
+                return indexed(property) >= 0 || named(t, property) !== null || Reflect.has(t, property);
+            },
+            ownKeys(t) {
+                const keys = [], count = elementAttributeNames(element).length;
+                for (let i = 0; i < count; i++) keys.push(String(i));
+                const names = namedNodeMapNames(element);
+                for (let i = 0; i < names.length; i++)
+                    if (!Reflect.getOwnPropertyDescriptor(t, names[i])) keys.push(names[i]);
+                return keys.concat(Reflect.ownKeys(t));
+            },
+            getOwnPropertyDescriptor(t, property) {
+                const index = indexed(property);
+                if (index >= 0) return {value: elementAttrNode(element, elementAttributeNames(element)[index]),
+                    writable: false, enumerable: true, configurable: true};
+                const attr = named(t, property);
+                if (attr) return {value: attr, writable: false, enumerable: false, configurable: true};
+                return Reflect.getOwnPropertyDescriptor(t, property);
+            },
+            defineProperty(t, property, descriptor) {
+                if (typeof property === "string" && (nodeListArrayIndex(property) >= 0 ||
+                        namedNodeMapNames(element).indexOf(property) >= 0)) return false;
+                return Reflect.defineProperty(t, property, descriptor);
+            },
+            set(t, property, value, receiver) {
+                if (typeof property === "string" && (nodeListArrayIndex(property) >= 0 || named(t, property)))
+                    return false;
+                return Reflect.set(t, property, value, receiver);
+            },
+            deleteProperty(t, property) {
+                const index = nodeListArrayIndex(property);
+                if (index >= 0) return index >= elementAttributeNames(element).length;
+                if (named(t, property)) return false;
+                return Reflect.deleteProperty(t, property);
+            },
+            preventExtensions() { return false; },
+        });
+        return shareInternals(proxy, target);
+    }
     g.NodeList = NodeList; g.HTMLCollection = HTMLCollection;
     g.RadioNodeList = RadioNodeList;
     g.HTMLFormControlsCollection = HTMLFormControlsCollection;
