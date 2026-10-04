@@ -1069,6 +1069,58 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     Object.defineProperty(DOMRectList.prototype, Symbol.iterator,
         {value: Array.prototype.values, writable: true, configurable: true});
     Object.defineProperty(g, "DOMRectList", {value: DOMRectList, writable: true, configurable: true});
+    /*__DOM_STRING_LIST_BEGIN__*/
+    // HTML #domstringlist ([Exposed=(Window,Worker)]): a static list of
+    // strings with an indexed getter, kept in an internal slot.
+    const stringListApply = Reflect.apply, stringListWeakGet = WeakMap.prototype.get;
+    const stringListWeakSet = WeakMap.prototype.set, stringListCreate = Object.create;
+    const stringListSlots = __platform_slots("internals", new WeakMap());
+    function stringListItems(list) {
+        const record = (typeof list === "object" && list !== null)
+            ? stringListApply(stringListWeakGet, stringListSlots, [list]) : undefined;
+        if (!record || !record.domStringList) throw new TypeError("Illegal invocation");
+        return record.domStringList;
+    }
+    class DOMStringList {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() { return stringListItems(this).length; }
+        item(index) {
+            const items = stringListItems(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            index = index >>> 0;
+            return index < items.length ? items[index] : null;
+        }
+        contains(string) {
+            const items = stringListItems(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            string = `${string}`;
+            for (let i = 0; i < items.length; i++) if (items[i] === string) return true;
+            return false;
+        }
+    }
+    function stringListIndexedGetter(index) { return stringListItems(this)[index]; }
+    function createDOMStringList(strings) {
+        const list = stringListCreate(DOMStringList.prototype), items = [];
+        for (let i = 0; i < strings.length; i++) items[i] = `${strings[i]}`;
+        let record = stringListApply(stringListWeakGet, stringListSlots, [list]);
+        if (!record) {
+            record = stringListCreate(null);
+            stringListApply(stringListWeakSet, stringListSlots, [list, record]);
+        }
+        record.domStringList = items;
+        if (!(typeof __dom_install_readonly_indexed === "function" &&
+                __dom_install_readonly_indexed(list, items.length, stringListIndexedGetter))) {
+            for (let i = 0; i < items.length; i++)
+                Object.defineProperty(list, i, {value: items[i], enumerable: true, configurable: true});
+        }
+        return list;
+    }
+    for (const name of ["length", "item", "contains"])
+        Object.defineProperty(DOMStringList.prototype, name, {enumerable: true});
+    Object.defineProperty(DOMStringList.prototype, Symbol.iterator,
+        {value: Array.prototype.values, writable: true, configurable: true});
+    Object.defineProperty(g, "DOMStringList", {value: DOMStringList, writable: true, configurable: true});
+    /*__DOM_STRING_LIST_END__*/
     // LegacyWindowAlias (Geometry 1 §3, §2, §6) exposes SVGRect, SVGPoint,
     // SVGMatrix and WebKitCSSMatrix only in a Window: the same interface
     // objects as DOMRect, DOMPoint and DOMMatrix.
@@ -11656,7 +11708,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             [raw, "", "", "", "", "/", "", "", "", "", ""];
         const state = parsed.slice();
         if (inherited) state[0] = raw;
-        return {
+        // A legacy scoped frame's Location is still a Location instance.
+        return Object.setPrototypeOf({
             get href() { return state[0]; },
             get protocol() { return state[1]; }, get host() { return state[2]; },
             get hostname() { return state[3]; }, get port() { return state[4]; },
@@ -11667,7 +11720,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             replace(v) { try { frame.setAttribute("src", String(v)); } catch (e) {} },
             reload() { try { internalsFor(frame).loadedSrc = undefined; queueFrameNavigation(frame); } catch (e) {} },
             toString() { return state[0]; },
-        };
+        }, Location.prototype);
     }
     function frameParentFrame(frame) {
         return frame ? frameOwnerForNode(frame) : null;
@@ -14442,10 +14495,55 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const r = __url_set(locState.href, which, String(v));
         if (r) navigateLoc(r[0], false);
     };
-    const loc = {
-        get href() { return locState.href; }, set href(v) { navigateLoc(v, false); },
-        get protocol() { return locState.protocol; },
+    // HTML #the-location-interface: every member is [LegacyUnforgeable], so
+    // each Location object carries them as non-configurable own properties
+    // (Web IDL #es-unforgeable); Location.prototype holds no members.
+    class Location {
+        constructor() { throw new TypeError("Illegal constructor"); }
+    }
+    Object.defineProperty(g, "Location", {value: Location, writable: true, configurable: true});
+    // HTML #concept-document-internal-ancestor-origin-objects-list: the
+    // container documents' origins, nearest first. A container whose
+    // referrerpolicy is "no-referrer" (or "same-origin" across origins)
+    // masks its document's origin and that origin's further occurrences.
+    function ancestorOriginObjects() {
+        const record = internalsFor(g.document);
+        if (record.ancestorOriginObjects) return record.ancestorOriginObjects;
+        const output = [], opaque = () => ({serialized: "null", key: Symbol()});
+        const parent = cfg.parentWindow ? windowMessageState(cfg.parentWindow) : null;
+        if (parent) {
+            const policy = parent.containerReferrerPolicy(messageWindowState.frameId);
+            let masked = policy === "no-referrer" ||
+                (policy === "same-origin" && parent.originKey !== messageWindowState.originKey);
+            output.push(masked ? opaque() : {serialized: parent.origin, key: parent.originKey});
+            for (const origin of parent.ancestorOriginObjects()) {
+                if (masked && origin.key === parent.originKey) {
+                    output.push(opaque());
+                    continue;
+                }
+                output.push(origin);
+                masked = false;
+            }
+        }
+        return record.ancestorOriginObjects = output;
+    }
+    function locationOwner(object) {
+        if (!internalsOf(object).locationObject) throw new TypeError("Illegal invocation");
+    }
+    function locationAncestorOrigins() {
+        // HTML #dom-location-ancestororigins: the relevant Document's
+        // ancestor origins list, created once for that Document.
+        const record = internalsFor(g.document);
+        if (!record.ancestorOrigins)
+            record.ancestorOrigins = createDOMStringList(ancestorOriginObjects().map(origin => origin.serialized));
+        return record.ancestorOrigins;
+    }
+    const locationAccessors = {
+        get href() { locationOwner(this); return locState.href; },
+        get origin() { locationOwner(this); return locState.origin; },
+        get protocol() { locationOwner(this); return locState.protocol; },
         set protocol(v) {
+            locationOwner(this);
             // Basic-parse `v + ":"` with scheme start state: the scheme is
             // whatever precedes the first ":" (so "https:" == "https::::" ==
             // "https", and trailing junk after the colon is ignored); a
@@ -14459,34 +14557,53 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const r = __url_set(locState.href, "protocol", scheme);
             if (r && (r[1] === "http:" || r[1] === "https:")) navigateLoc(r[0], false);
         },
-        get host() { return locState.host; }, set host(v) { setLocPart("host", v); },
-        get hostname() { return locState.hostname; }, set hostname(v) { setLocPart("hostname", v); },
-        get port() { return locState.port; }, set port(v) { setLocPart("port", v); },
-        get pathname() { return locState.pathname; }, set pathname(v) { navigateLoc(locState.origin + String(v) + locState.search + locState.hash, false); },
-        get search() { return locState.search; }, set search(v) { const q = String(v); navigateLoc(locState.origin + locState.pathname + (q && q[0] === "?" ? q : (q ? "?" + q : "")) + locState.hash, false); },
-        get hash() { return locState.hash; }, set hash(v) { const h = String(v); navigateLoc(withoutHash(locState.href) + (h[0] === "#" ? h : "#" + h), true); },
-        get origin() { return locState.origin; },
-        assign(u) { if (!arguments.length) throw new TypeError("Location.assign requires a URL"); navigateLoc(u, false); },
-        replace(u) { if (!arguments.length) throw new TypeError("Location.replace requires a URL"); navigateLoc(u, false, true); },
-        reload() { trust.navigation = locState.href; trust.navigationReplace = true; trust.navigationReload = true;
-            trust.navigationSourceBase = baseHref(); trust.navigationSourceURL = g.document.URL; },
-        toString() { return locState.href; },
+        get host() { locationOwner(this); return locState.host; },
+        set host(v) { locationOwner(this); setLocPart("host", v); },
+        get hostname() { locationOwner(this); return locState.hostname; },
+        set hostname(v) { locationOwner(this); setLocPart("hostname", v); },
+        get port() { locationOwner(this); return locState.port; },
+        set port(v) { locationOwner(this); setLocPart("port", v); },
+        get pathname() { locationOwner(this); return locState.pathname; },
+        set pathname(v) { locationOwner(this); navigateLoc(locState.origin + String(v) + locState.search + locState.hash, false); },
+        get search() { locationOwner(this); return locState.search; },
+        set search(v) { locationOwner(this); const q = String(v); navigateLoc(locState.origin + locState.pathname + (q && q[0] === "?" ? q : (q ? "?" + q : "")) + locState.hash, false); },
+        get hash() { locationOwner(this); return locState.hash; },
+        set hash(v) { locationOwner(this); const h = String(v); navigateLoc(withoutHash(locState.href) + (h[0] === "#" ? h : "#" + h), true); },
+        get ancestorOrigins() { locationOwner(this); return locationAncestorOrigins(); },
     };
-    function locationNavigationAPI(replace, setter) {
+    const locationOperations = {
+        reload() { locationOwner(this); trust.navigation = locState.href; trust.navigationReplace = true; trust.navigationReload = true;
+            trust.navigationSourceBase = baseHref(); trust.navigationSourceURL = g.document.URL; },
+        toString() { locationOwner(this); return locState.href; },
+    };
+    function locationNavigationAPI(replace, setter, forwarded = false) {
         return makeCallbackAPI(function(source, receiver, args, incumbent) {
+            // Window.location's [PutForwards=href] setter runs on the Window.
+            if (!forwarded) locationOwner(receiver);
             if (!setter && !args.length) throw new TypeError("Location navigation requires a URL");
             navigateLoc(args[0], false, replace, source, incumbent);
-        }, setter ? "set href" : replace ? "replace" : "assign", 1, true);
+        }, forwarded ? "set location" : setter ? "set href" : replace ? "replace" : "assign", 1, true);
     }
     const setLocationHref = locationNavigationAPI(false, true);
-    Object.defineProperty(loc,"href",{get(){return locState.href;},set:setLocationHref,
-        enumerable:true,configurable:true});
-    loc.assign = locationNavigationAPI(false, false);
-    loc.replace = locationNavigationAPI(true, false);
+    locationOperations.assign = locationNavigationAPI(false, false);
+    locationOperations.replace = locationNavigationAPI(true, false);
+    // HTML "create a Location object": the unforgeable attributes and
+    // operations, then own valueOf and @@toPrimitive data properties.
+    const loc = Object.create(Location.prototype);
+    internalsFor(loc).locationObject = true;
+    for (const name of ["href", "origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "ancestorOrigins"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(locationAccessors, name);
+        Object.defineProperty(loc, name, {get: descriptor.get, set: name === "href" ? setLocationHref : descriptor.set,
+            enumerable: true, configurable: false});
+    }
+    for (const name of ["assign", "replace", "reload", "toString"])
+        Object.defineProperty(loc, name, {value: locationOperations[name], writable: false, enumerable: true, configurable: false});
+    Object.defineProperty(loc, "valueOf", {value: Object.prototype.valueOf, writable: false, enumerable: false, configurable: false});
+    Object.defineProperty(loc, Symbol.toPrimitive, {value: undefined, writable: false, enumerable: false, configurable: false});
     Object.defineProperty(g, "location", {
         configurable: true, enumerable: true,
         get() { return loc; },
-        set: setLocationHref,
+        set: locationNavigationAPI(false, true, true),
     });
     // Secure Contexts §3.1–§3.2: the Rust loader supplies the result for
     // network documents; this fallback keeps hand-built test contexts honest
@@ -17113,6 +17230,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return frame ? frame.contentWindow : undefined;
         },
         documentURL() { return g.document.URL; },
+        // HTML #concept-document-internal-ancestor-origin-objects-list.
+        ancestorOriginObjects() { return ancestorOriginObjects(); },
+        containerReferrerPolicy(frameId) {
+            const frame = wrap(frameId);
+            const policy = frame && frame.nodeType === 1 ? frame.getAttribute("referrerpolicy") : null;
+            return policy === null ? "" : policy.toLowerCase();
+        },
         frameId: realmRootFrame ? nodeIds.get(realmRootFrame) : 0,
         // HTML #sandboxed-origin-browsing-context-flag: without allow-same-origin
         // a sandboxed navigable's Document has a fresh opaque origin.
