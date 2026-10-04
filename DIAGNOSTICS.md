@@ -877,6 +877,9 @@ TRUST_CAPTURE_SCRIPT_DOCUMENT=/tmp/page.html \
 | `TRUST_LAYOUT_BENCH_FILTER` | text | Runs only matrix cases whose name contains this text. Default: all cases. |
 | `TRUST_LAYOUT_BENCH_PROFILE` | presence flag | Adds operation accounting to the engine matrix and prints named `ENGINE_OPS` fields. This also adds measurement overhead to its wall times. |
 | `TRUST_LAYOUT2_BENCH` | — | Appears in the `p8_layout_bench` source example but is not read by the test. The Cargo test selector is the actual switch. |
+| `TRUST_AVIF_BENCH` | AVIF file path | Input for the ignored `avif_decode_bench`: five decodes, printing the best and median time and the process peak-RSS (`VmHWM`) growth. Without it the test returns at once. |
+| `TRUST_AVIF_CORPUS` | directory | Input for the ignored `avif_corpus`: decodes every `.avif`/`.avifs` below it (for example the AOM av1-avif `testFiles`) and prints each size, translucency and time, or the error. |
+| `TRUST_AVIF_CORPUS_OUT` | directory | With `TRUST_AVIF_CORPUS`, also writes each decoded image as PNG for comparison with a reference decoder. |
 
 Run the fixture benchmarks with:
 
@@ -893,6 +896,10 @@ TRUST_LAYOUT_BENCH_PROFILE=1 TRUST_LAYOUT_BENCH_FILTER=nested-grid \
 cargo test --release --lib selector_workload_profile -- --ignored --nocapture
 TRUST_SELECTOR_PROFILE_DEEP=1 \
   cargo test --release --lib selector_workload_profile -- --ignored --nocapture
+
+TRUST_AVIF_BENCH=photo.avif cargo test --release --lib avif_decode_bench -- --ignored --nocapture
+TRUST_AVIF_CORPUS=av1-avif/testFiles TRUST_AVIF_CORPUS_OUT=/tmp/avif-png \
+  cargo test --release --lib avif_corpus -- --ignored --nocapture
 ```
 
 The engine matrix isolates style/box construction, flow, and retained CSSOM

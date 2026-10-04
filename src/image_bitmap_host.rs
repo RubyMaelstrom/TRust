@@ -14,6 +14,14 @@ fn byte_len(width: u32, height: u32) -> Option<usize> {
 }
 
 fn decode(bytes: &[u8], from_image: bool) -> Option<RgbaImage> {
+    // AVIF's transformative properties (clap, irot, imir) are part of
+    // producing its image, not EXIF-style orientation metadata, so they apply
+    // whatever `imageOrientation` says.
+    if let Some(image) = crate::img::decode_avif_rgba(bytes, MAX_BYTES as u64) {
+        let image = image.ok()?;
+        byte_len(image.width(), image.height())?;
+        return Some(image);
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;

@@ -20,7 +20,9 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FilterType, Resize};
 
+mod avif;
 mod inline_svg;
+mod yuv;
 pub(crate) use inline_svg::{
     begin_document_svg_navigation, document_svg_data_url, document_svg_image_requests,
     document_svg_image_target, document_svg_image_url, document_svg_revision,
@@ -32,6 +34,9 @@ pub(crate) use inline_svg::{document_svg_data_url_for_navigation, document_svg_n
 /// Hard ceiling on decoded raster dimensions: a small download can still claim
 /// to be a gigapixel image.
 const MAX_DIMENSION: u32 = 12_000;
+/// Decoded-allocation ceiling for AVIF, matching the 512 MiB `max_alloc` that
+/// `image::Limits::default()` applies to the `image` codecs.
+const MAX_AVIF_BYTES: u64 = 512 * 1024 * 1024;
 /// SVG and SVGZ are text formats whose compressed representation can be tiny.
 /// Bound the expanded XML before usvg sees it.
 const MAX_SVG_BYTES: usize = 16 * 1024 * 1024;
@@ -310,13 +315,63 @@ fn percent_decode(s: &str) -> Vec<u8> {
     out
 }
 
+/// A raster format TRust decodes: one of `image`'s codecs, or AVIF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RasterFormat {
+    Codec(image::ImageFormat),
+    Avif,
+}
+
+impl RasterFormat {
+    fn mime(self) -> &'static str {
+        match self {
+            Self::Codec(format) => format.to_mime_type(),
+            Self::Avif => avif::MIME,
+        }
+    }
+}
+
+/// Identify a raster format from its signature. `image` only recognizes an
+/// `avif` major brand; AVIF files may instead list `avif`/`avis` among the
+/// compatible brands (see [`avif::sniff`]).
+fn raster_format(bytes: &[u8]) -> Option<RasterFormat> {
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Avif) => Some(RasterFormat::Avif),
+        _ if avif::sniff(bytes) => Some(RasterFormat::Avif),
+        Ok(format) => Some(RasterFormat::Codec(format)),
+        Err(_) => None,
+    }
+}
+
+fn avif_limits(max_bytes: u64) -> avif::Limits {
+    avif::Limits {
+        max_dimension: MAX_DIMENSION,
+        max_bytes,
+    }
+}
+
+/// Decode an AVIF image to straight-alpha RGBA within `max_bytes` of pixels.
+/// `None` when `bytes` is not AVIF.
+pub(crate) fn decode_avif_rgba(
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Option<Result<image::RgbaImage, String>> {
+    (raster_format(bytes) == Some(RasterFormat::Avif))
+        .then(|| avif::decode(bytes, avif_limits(max_bytes)))
+}
+
+/// Whether a raster MIME type names a format TRust can decode.
+pub fn raster_mime_supported(mime: &str) -> bool {
+    mime.eq_ignore_ascii_case(avif::MIME)
+        || image::ImageFormat::from_mime_type(mime).is_some_and(|format| format.reading_enabled())
+}
+
 /// Sniff the image format from magic bytes or a bounded SVG/XML prologue.
 /// This remains deliberately cheap because HTTP uses it on the UI thread for
 /// application/octet-stream responses; full XML validation happens off-thread.
 pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
-    image::guess_format(bytes)
-        .ok()
-        .map(|f| f.to_mime_type())
+    raster_format(bytes)
+        .map(RasterFormat::mime)
         .or_else(|| looks_like_svg(bytes).then_some(SVG_MIME))
 }
 
@@ -324,7 +379,7 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
 /// rest of the app. Raster images retain the existing decode-first behavior;
 /// SVG is parsed in secure static mode and reports its CSS-pixel viewport.
 pub fn info(bytes: &[u8]) -> Result<ImageInfo, String> {
-    if image::guess_format(bytes).is_ok() {
+    if raster_format(bytes).is_some() {
         let (image, mime) = decode_raster(bytes)?;
         return Ok(ImageInfo {
             width: image.width(),
@@ -347,7 +402,7 @@ pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     if cur_hotspot(bytes).is_some() {
         return decode_cur(bytes);
     }
-    if image::guess_format(bytes).is_ok() {
+    if raster_format(bytes).is_some() {
         return decode_raster(bytes);
     }
 
@@ -363,7 +418,7 @@ pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
 pub fn decode_graphical(bytes: &[u8]) -> Result<crate::render::ImageResource, String> {
     let (image, mime) = decode(bytes)?;
     let has_alpha = image_has_alpha(&image);
-    let rgba = image.to_rgba8();
+    let rgba = image.into_rgba8();
     Ok(crate::render::ImageResource {
         svg_source: (mime == SVG_MIME).then(|| Arc::from(bytes)),
         width: rgba.width(),
@@ -738,8 +793,14 @@ fn decode_cur(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
 }
 
 fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
-    let format =
-        image::guess_format(bytes).map_err(|_| String::from("unrecognized image format"))?;
+    let format = match raster_format(bytes) {
+        Some(RasterFormat::Codec(format)) => format,
+        Some(RasterFormat::Avif) => {
+            let image = avif::decode(bytes, avif_limits(MAX_AVIF_BYTES))?;
+            return Ok((DynamicImage::ImageRgba8(image), avif::MIME));
+        }
+        None => return Err(String::from("unrecognized image format")),
+    };
     let mime = format.to_mime_type();
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -1348,7 +1409,7 @@ fn decode_for_box(
     crop: bool,
     tint: Option<SvgTint>,
 ) -> Result<(DynamicImage, ImageInfo, bool), String> {
-    if image::guess_format(bytes).is_ok() {
+    if raster_format(bytes).is_some() {
         let (image, mime) = decode_raster(bytes)?;
         let info = ImageInfo {
             width: image.width(),
