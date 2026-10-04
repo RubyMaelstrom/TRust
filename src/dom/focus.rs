@@ -30,15 +30,17 @@ impl Dom {
     /// HTML #focus-update-steps and Selectors 4 #the-focus-pseudo /
     /// #the-focus-within-pseudo (local HTML e5071a20, CSSWG 81c27f68).
     /// Focus can restyle descendants, siblings, :has() subjects and shadow
-    /// scopes. Until there is a dependency proof, invalidate the whole render
-    /// while retaining the parsed sheet index. Repeated focus is a no-op.
+    /// scopes. The elements whose state changes are known exactly, so the
+    /// selector dependency routes name the subjects to restyle; shadow trees
+    /// keep the whole-render fallback. Repeated focus is a no-op.
     pub(crate) fn set_focused_area(&mut self, document: NodeId, target: Option<NodeId>) {
         let target = target.filter(|&node| {
             self.is_valid(node)
                 && self.nodes[node].owner_document == document
                 && self.is_connected(node)
         });
-        if self.focused_area(document) == target {
+        let old = self.focused_area(document);
+        if old == target {
             return;
         }
         if let Some(node) = target {
@@ -46,9 +48,59 @@ impl Dom {
         } else {
             self.focused_areas.remove(&document);
         }
-        if self.focus_css_affects_rendering() {
+        let changed = self.focus_state_changes(old, target);
+        if !self.invalidate_focus_state(&changed) {
             self.touch();
         }
+    }
+
+    /// The elements whose :focus or :focus-within match differs between the
+    /// focused areas `old` and `new` of one Document (see `matches_focus`
+    /// and `matches_focus_within`): :focus holds for the focused area and
+    /// its shadow-including hosts, :focus-within for its flat-tree inclusive
+    /// ancestors, and neither when the area is a navigable container.
+    /// Ancestors common to both chains keep their state.
+    fn focus_state_changes(
+        &self,
+        old: Option<NodeId>,
+        new: Option<NodeId>,
+    ) -> Vec<(NodeId, invalidation::FocusState)> {
+        use invalidation::FocusState;
+        let chains = |focused: Option<NodeId>| {
+            let mut focus = FxHashSet::default();
+            let mut within = FxHashSet::default();
+            let Some(focused) = focused.filter(|&node| {
+                self.is_valid(node) && !matches!(self.tag_name(node), Some("iframe" | "frame"))
+            }) else {
+                return (focus, within);
+            };
+            let mut current = Some(focused);
+            while let Some(node) = current {
+                focus.insert(node);
+                current = self.shadow_hosts.get(&self.tree_scope(node)).copied();
+            }
+            let mut current = Some(focused);
+            while let Some(node) = current {
+                if self.tag_name(node).is_some() {
+                    within.insert(node);
+                }
+                current = self.parent_flat(node);
+            }
+            (focus, within)
+        };
+        let (old_focus, old_within) = chains(old);
+        let (new_focus, new_within) = chains(new);
+        let mut changed: Vec<_> = old_focus
+            .symmetric_difference(&new_focus)
+            .map(|&node| (node, FocusState::Focus))
+            .chain(
+                old_within
+                    .symmetric_difference(&new_within)
+                    .map(|&node| (node, FocusState::FocusWithin)),
+            )
+            .collect();
+        changed.sort_unstable_by_key(|&(node, state)| (node, state as u8));
+        changed
     }
 
     /// Removal moves focus to the viewport. Clear before unlinking so an

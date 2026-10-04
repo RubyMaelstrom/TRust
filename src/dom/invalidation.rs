@@ -12,6 +12,8 @@ use super::*;
 
 mod attributes;
 
+pub(super) use attributes::FocusState;
+
 /// CSSOM #dom-window-getcomputedstyle requires current, live values at reads;
 /// it does not require retiring derived cache entries after every write.
 /// Keep only stable node IDs and flush before any style/layout observation.
@@ -448,7 +450,8 @@ impl RelationalDependency {
             // and every child-list change that can alter an argument match lies
             // below or beside a possible anchor, which `restyle_root` walks.
             // So other states and positional pseudo-classes are safe: focus
-            // changes restyle the document (`set_focused_area`), hover
+            // changes reverse :has() paths like attributes do
+            // (`invalidate_focus_state`), hover
             // transitions compare every hover subject including :has()
             // anchors (`set_hover_chain`), :dir() keeps the text-direction
             // fallback, fieldset parents restyle their subtree (:disabled),
@@ -1076,6 +1079,73 @@ impl Dom {
             cache.invalidate(subject);
         }
         subjects
+    }
+
+    /// HTML #focus-update-steps change :focus and :focus-within (Selectors 4
+    /// #the-focus-pseudo, #the-focus-within-pseudo) on exactly the elements
+    /// of `changed`. Like an attribute write, that can only change the
+    /// selector subjects reached through compiled routes: the element
+    /// itself, descendant and sibling dependents, `:has()` anchors and their
+    /// dependents, and `:nth-child(of …)` siblings. Restyle those and, for
+    /// inheritance, their descendants. Returns false when only a complete
+    /// invalidation is provably correct: shadow trees can couple tree scopes
+    /// (`:host`, `::slotted()`, slot distribution) beyond these routes.
+    pub(super) fn invalidate_focus_state(&mut self, changed: &[(NodeId, FocusState)]) -> bool {
+        let index = self.style_index();
+        let observed: Vec<_> = changed
+            .iter()
+            .copied()
+            .filter(|&(node, _)| {
+                index
+                    .selector_dependencies
+                    .for_node(self, node)
+                    .attributes
+                    .observes_focus()
+            })
+            .collect();
+        if observed.is_empty() {
+            // No selector in the node's Document reads focus; matches(':focus')
+            // reads the focused area directly and caches nothing.
+            return true;
+        }
+        if observed
+            .iter()
+            .any(|&(node, _)| self.shadow_style_dependencies(node))
+        {
+            return false;
+        }
+        let mut subjects = FxHashSet::default();
+        for &(node, state) in &observed {
+            let Some(reached) = index
+                .selector_dependencies
+                .for_node(self, node)
+                .attributes
+                .focus_subjects(self, node, state)
+            else {
+                return false;
+            };
+            subjects.extend(reached);
+        }
+        if subjects.is_empty() {
+            return true;
+        }
+        let mut subjects: Vec<_> = subjects.into_iter().collect();
+        subjects.sort_unstable();
+        {
+            let mut cache = self.selector_cache.borrow_mut();
+            for &subject in &subjects {
+                cache.invalidate(subject);
+            }
+        }
+        // Descendants keep their selector matches: every element whose match
+        // changed is a subject. They can still inherit changed values.
+        self.invalidate_style_subtrees(&subjects, false);
+        self.mark_dom_revision();
+        for &subject in &subjects {
+            self.dirty_nodes.push((subject, DirtyKind::Attr));
+            self.record_geometry_dirty(subject, DirtyKind::Attr);
+        }
+        true
     }
 
     #[track_caller]
@@ -2433,6 +2503,138 @@ mod tests {
         assert_matches_full_scan(&dom);
         dom.detach(measure);
         assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable")));
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    fn focus(dom: &mut Dom, id: Option<&str>) {
+        let target = id.map(|id| dom.get_by_id(id).unwrap());
+        dom.set_focused_area(DOCUMENT, target);
+    }
+
+    fn value_of(dom: &Dom, id: &str, property: &str) -> Option<String> {
+        dom.computed_value_resolved(dom.get_by_id(id).unwrap(), property)
+    }
+
+    #[test]
+    fn focus_changes_restyle_only_focus_dependent_subjects() {
+        // Speedometer TodoMVC's `.todo-area :focus` and `.toggle:focus + label`,
+        // plus :focus-within ancestors, :has() anchors and :nth-child(of S).
+        let mut dom = Dom::parse_document(
+            "<style>.area :focus{width:11px}\
+             .toggle:focus + label{width:12px}\
+             .form:focus-within .hint{color:red}\
+             .form:focus-within{height:13px}\
+             .card:has(input:focus) .title{width:14px}\
+             li:nth-child(1 of .done:focus-within) span{color:green}\
+             .form :not(:focus){padding-left:3px}</style>\
+             <section class=area id=area>\
+             <form class=form id=form><input id=a class=toggle><label id=la>a</label>\
+             <p class=hint id=hint>hint</p><input id=b></form>\
+             <div class=card id=card><input id=c><b class=title id=title>t</b></div>\
+             <ul><li id=li1>x</li><li class=done id=li2><span id=span2>s</span><input id=d></li></ul>\
+             </section>\
+             <aside id=stable><span id=stable_child>independent</span></aside>",
+        );
+        assert_matches_full_scan(&dom);
+        let stable = cached(&dom, "stable_child");
+        let epoch = dom.style_value_epoch;
+        let check = |dom: &mut Dom, stable: &std::rc::Rc<Vec<u32>>| {
+            assert_eq!(dom.style_value_epoch, epoch, "focus expired every style");
+            assert!(std::rc::Rc::ptr_eq(stable, &cached(dom, "stable_child")));
+            assert_matches_full_scan(dom);
+        };
+
+        focus(&mut dom, Some("a"));
+        assert_eq!(value_of(&dom, "a", "width").as_deref(), Some("11px"));
+        assert_eq!(value_of(&dom, "la", "width").as_deref(), Some("12px"));
+        assert_eq!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        assert_eq!(value_of(&dom, "form", "height").as_deref(), Some("13px"));
+        assert_ne!(value_of(&dom, "a", "padding-left").as_deref(), Some("3px"));
+        assert_eq!(value_of(&dom, "b", "padding-left").as_deref(), Some("3px"));
+        check(&mut dom, &stable);
+
+        // The form stays :focus-within, so its dependents keep their caches.
+        let hint = dom.cascaded_maps(dom.get_by_id("hint").unwrap());
+        focus(&mut dom, Some("b"));
+        assert_ne!(value_of(&dom, "a", "width").as_deref(), Some("11px"));
+        assert_eq!(value_of(&dom, "b", "width").as_deref(), Some("11px"));
+        assert_ne!(value_of(&dom, "la", "width").as_deref(), Some("12px"));
+        assert_eq!(value_of(&dom, "a", "padding-left").as_deref(), Some("3px"));
+        assert_eq!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        assert!(std::rc::Rc::ptr_eq(
+            &hint,
+            &dom.cascaded_maps(dom.get_by_id("hint").unwrap())
+        ));
+        check(&mut dom, &stable);
+
+        focus(&mut dom, Some("c"));
+        assert_ne!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        assert_ne!(value_of(&dom, "form", "height").as_deref(), Some("13px"));
+        assert_eq!(value_of(&dom, "title", "width").as_deref(), Some("14px"));
+        check(&mut dom, &stable);
+
+        focus(&mut dom, Some("d"));
+        assert_ne!(value_of(&dom, "title", "width").as_deref(), Some("14px"));
+        assert_eq!(value_of(&dom, "span2", "color").as_deref(), Some("green"));
+        check(&mut dom, &stable);
+
+        focus(&mut dom, None);
+        assert_ne!(value_of(&dom, "span2", "color").as_deref(), Some("green"));
+        assert_ne!(value_of(&dom, "d", "width").as_deref(), Some("11px"));
+        check(&mut dom, &stable);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn focus_leaving_a_removed_subtree_or_entering_a_navigable_container_restyles_ancestors() {
+        let mut dom = Dom::parse_document(
+            "<style>.wrap:focus-within .hint{color:red}iframe:focus{width:31px}\
+             .wrap:focus-within{height:9px}</style>\
+             <div class=wrap id=wrap><input id=a><iframe id=frame></iframe>\
+             <p class=hint id=hint>h</p></div><div id=other><input id=b></div>",
+        );
+        let red = |dom: &Dom| value_of(dom, "hint", "color").as_deref() == Some("red");
+        focus(&mut dom, Some("a"));
+        assert!(red(&dom));
+        // HTML #selector-focus excludes navigable containers, so neither
+        // the iframe nor its ancestors match while it is the focused area.
+        focus(&mut dom, Some("frame"));
+        assert!(!red(&dom));
+        assert_ne!(value_of(&dom, "frame", "width").as_deref(), Some("31px"));
+        assert_ne!(value_of(&dom, "wrap", "height").as_deref(), Some("9px"));
+        focus(&mut dom, Some("a"));
+        assert!(red(&dom));
+        assert_matches_full_scan(&dom);
+        // Removal runs the focus fixup steps before unlinking.
+        let a = dom.get_by_id("a").unwrap();
+        dom.detach(a);
+        assert_eq!(dom.focused_area(DOCUMENT), None);
+        assert!(!red(&dom));
+        assert_ne!(value_of(&dom, "wrap", "height").as_deref(), Some("9px"));
+        focus(&mut dom, Some("b"));
+        assert!(!red(&dom));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn focus_in_a_shadow_including_tree_keeps_the_complete_fallback() {
+        let mut dom = Dom::parse_document(
+            "<style>.wrap:focus-within .hint{color:red}</style>\
+             <div class=wrap><input id=a><p class=hint id=hint>h</p></div><x-host id=host></x-host>",
+        );
+        let host = dom.get_by_id("host").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let inner = dom.create_element("button");
+        dom.append(shadow, inner);
+        assert_ne!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        let epoch = dom.style_value_epoch;
+        focus(&mut dom, Some("a"));
+        assert_ne!(dom.style_value_epoch, epoch);
+        assert_eq!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        dom.set_focused_area(DOCUMENT, Some(inner));
+        assert_ne!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        assert_matches_full_scan(&dom);
         assert_style_values_match_cold(&mut dom);
     }
 
