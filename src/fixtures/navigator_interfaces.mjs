@@ -9,7 +9,7 @@
     check(Object.prototype.toString.call(nav)==='[object '+name+']','Navigator tag');
     throws('TypeError',()=>new Constructor());throws('TypeError',()=>Constructor());
     const properties=['appCodeName','appName','appVersion','platform','product','userAgent','language','languages','onLine','hardwareConcurrency','globalPrivacyControl','permissions'];
-    if(!worker)properties.push('vendor','vendorSub','productSub','cookieEnabled','maxTouchPoints','webdriver','plugins','mimeTypes','pdfViewerEnabled');
+    if(!worker)properties.push('vendor','vendorSub','productSub','cookieEnabled','maxTouchPoints','webdriver','plugins','mimeTypes','pdfViewerEnabled','doNotTrack');
     for(const key of properties) {
         const descriptor=Object.getOwnPropertyDescriptor(Constructor.prototype,key);
         check(descriptor && descriptor.enumerable && descriptor.configurable && typeof descriptor.get==='function' && descriptor.set===undefined,'Navigator readonly descriptor '+key);
@@ -19,6 +19,15 @@
         throws('TypeError',()=>descriptor.get.call({}));
         throws('TypeError',()=>descriptor.get.call(Object.create(Constructor.prototype)));
         throws('TypeError',()=>descriptor.get.call(new Proxy(nav,{})));
+    }
+    check(Reflect.ownKeys(nav).length===0,'Navigator members live on the interface prototype: '+Reflect.ownKeys(nav).map(String));
+    if(!worker) {
+        // Beacon #sendbeacon-method: a Window-only Navigator operation.
+        const beacon=Object.getOwnPropertyDescriptor(Constructor.prototype,'sendBeacon');
+        check(beacon && beacon.writable && beacon.enumerable && beacon.configurable && beacon.value.length===1 && beacon.value.name==='sendBeacon','sendBeacon operation');
+        throws('TypeError',()=>beacon.value.call({},'/beacon'));
+        throws('TypeError',()=>nav.sendBeacon());
+        check(nav.doNotTrack===null,'no tracking preference header is sent');
     }
     check(nav.appCodeName==='Mozilla' && nav.appName==='Netscape' && nav.product==='Gecko','HTML compatibility constants');
     check(nav.userAgent==='TRust/0.1' && nav.appVersion==='','identity is not spoofed');
@@ -31,7 +40,7 @@
     check(typeof globalThis.__navigator_binding==='undefined','private binding consumed');
     if(worker) {
         check(typeof Navigator==='undefined' && typeof PluginArray==='undefined','Window-only interfaces not exposed in Worker');
-        for(const key of ['productSub','vendor','vendorSub','plugins','mimeTypes','pdfViewerEnabled','javaEnabled','taintEnabled','oscpu','webdriver','maxTouchPoints'])check(!(key in nav),'Window-only attribute '+key);
+        for(const key of ['productSub','vendor','vendorSub','plugins','mimeTypes','pdfViewerEnabled','javaEnabled','taintEnabled','oscpu','webdriver','maxTouchPoints','doNotTrack','sendBeacon'])check(!(key in nav),'Window-only attribute '+key);
     } else {
         check(clientInformation===nav,'clientInformation aliases associated Navigator');
         const alias=Object.getOwnPropertyDescriptor(globalThis,'clientInformation');
