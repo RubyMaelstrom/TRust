@@ -1768,6 +1768,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return true;
     }
     function updateListenerDiscovery(target, type) {
+        if (type === "change") trackMediaQueryListListeners(target);
         const click = type === undefined || type === "click";
         const hover = type === undefined || HOVER_TYPES.indexOf(type) >= 0;
         if (!click && !hover) return;
@@ -10686,19 +10687,100 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return changed;
     }
     trust.updateFrameResizes = fireChangedFrameViewportResizes;
+    // CSSOM View §4.2 #the-mediaquerylist-interface: an EventTarget whose
+    // matches state is the associated media query list evaluated against its
+    // viewport. "Evaluate media queries and report changes" fires change at
+    // the lists that have change listeners, oldest first.
+    class MediaQueryList extends EventTarget {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get media() { return mediaQueryListState(this).media; }
+        get matches() { return mediaQueryMatches(mediaQueryListState(this)); }
+        addListener(callback) {
+            mediaQueryListState(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            if (callback === null || callback === undefined) return;
+            if (typeof callback !== "object" && typeof callback !== "function")
+                throw new TypeError("The callback is not an EventListener");
+            addL(this, "change", callback, false);
+        }
+        removeListener(callback) {
+            mediaQueryListState(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            if (callback === null || callback === undefined) return;
+            if (typeof callback !== "object" && typeof callback !== "function")
+                throw new TypeError("The callback is not an EventListener");
+            removeL(this, "change", callback, false);
+        }
+    }
+    // CSSOM View #mediaquerylistevent.
+    class MediaQueryListEvent extends Event {
+        constructor(type, eventInitDict = undefined) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            super(type, eventInitDict);
+            if (eventInitDict !== undefined && eventInitDict !== null &&
+                typeof eventInitDict !== "object" && typeof eventInitDict !== "function")
+                throw new TypeError("MediaQueryListEventInit must be an object");
+            const init = eventInitDict == null ? {} : eventInitDict;
+            const matches = !!init.matches, media = init.media === undefined ? "" : domString(init.media);
+            internalsFor(this).mediaQueryListEvent = {media, matches};
+        }
+        get media() { return mediaQueryListEventState(this).media; }
+        get matches() { return mediaQueryListEventState(this).matches; }
+    }
+    function mediaQueryListEventState(event) {
+        const state = internalsOf(event).mediaQueryListEvent;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    for (const C of [MediaQueryList, MediaQueryListEvent]) {
+        for (const name of Object.getOwnPropertyNames(C.prototype)) {
+            if (name !== "constructor") Object.defineProperty(C.prototype, name, {enumerable: true});
+        }
+        Object.defineProperty(g, C.name, {value: C, writable: true, configurable: true});
+    }
+    installHandlerProps(MediaQueryList.prototype, ["change"]);
+    Object.defineProperty(MediaQueryList.prototype, "onchange", {enumerable: true});
+    let mediaQueryListSequence = 0;
+    const listenedMediaQueryLists = new Set();
+    function mediaQueryListState(list) {
+        const state = internalsOf(list).mediaQueryList;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function mediaQueryMatches(state) {
+        const size = state.viewport();
+        return !!__match_media(state.query, size[0], size[1]);
+    }
     function mediaQueryListForViewport(query, viewport) {
         const q = String(query);
-        return {
-            media: q,
-            get matches() {
-                const size = viewport();
-                return !!__match_media(q, size[0], size[1]);
-            },
-            onchange: null,
-            addListener() {}, removeListener() {},
-            addEventListener() {}, removeEventListener() {},
-            dispatchEvent() { return false; },
-        };
+        const list = Reflect.construct(EventTarget, [], MediaQueryList);
+        // The media is the serialized media query list (CSSOM #serialize-a-media-query-list).
+        const state = {query: q, viewport, sequence: mediaQueryListSequence++,
+            media: q.trim() ? cssSplitList(q).map(part => part || "not all").join(", ") : ""};
+        state.reported = mediaQueryMatches(state);
+        internalsFor(list).mediaQueryList = state;
+        return list;
+    }
+    // Only lists with change listeners can observe "report changes"; keep
+    // those (and only those) reachable from the Document.
+    function trackMediaQueryListListeners(list) {
+        if (!internalsOf(list).mediaQueryList) return;
+        const listeners = getListenerMap(list), changes = listeners && listeners.get("change");
+        if (changes && changes.length) listenedMediaQueryLists.add(list);
+        else listenedMediaQueryLists.delete(list);
+    }
+    // CSSOM View #evaluate-media-queries-and-report-changes.
+    function reportMediaQueryChanges() {
+        if (!listenedMediaQueryLists.size) return;
+        const lists = Array.from(listenedMediaQueryLists).sort((a, b) =>
+            internalsOf(a).mediaQueryList.sequence - internalsOf(b).mediaQueryList.sequence);
+        for (const list of lists) {
+            const state = internalsOf(list).mediaQueryList, matches = mediaQueryMatches(state);
+            if (matches === state.reported) continue;
+            state.reported = matches;
+            try { dispatch(list, createTrustedEvent(MediaQueryListEvent, "change", {media: state.media, matches}), false); }
+            catch (e) { trust.errors.push("media query change handler: " + ((e && e.message) || e)); }
+        }
     }
     // HTMLIFrameElement.contentDocument / .contentWindow — the nested browsing
     // context's document and WindowProxy. Backed by a real same-arena
@@ -15558,8 +15640,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // matchMedia evaluates the query against the real viewport through the same
     // Rust `@media` evaluator the cascade uses (width/height/orientation etc.);
     // `.matches` is a live getter so a later read reflects the current viewport.
-    // Listener plumbing stays inert — TRust re-evaluates media only on reload
-    // (a breakpoint-crossing resize reloads), so there is no change event to fire.
+    // A viewport change reports changed lists to their change listeners.
     g.matchMedia = (m) => mediaQueryListForViewport(m, function () {
         return [windowViewportDimension("width"), windowViewportDimension("height")];
     });
@@ -16571,6 +16652,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             try { dispatch(visualViewportObject, new Event("resize"), false); }
             catch (e) { trust.errors.push("visualViewport resize handler: " + ((e && e.message) || e)); }
         }
+        // HTML #update-the-rendering runs "evaluate media queries and report
+        // changes" after the resize and scroll steps.
+        reportMediaQueryChanges();
         // HTML's next rendering opportunity recalculates layout before CSSOM
         // View §13.1 runs resize steps for every nested Document. The actor's
         // rendering update invokes updateFrameResizes after fresh geometry;
