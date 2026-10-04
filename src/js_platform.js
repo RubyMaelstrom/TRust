@@ -15136,6 +15136,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         updateLoc(url);
         if (trust.replaceNavigationTiming) trust.replaceNavigationTiming(navigationTiming);
         baseHrefCache = null;
+        forgetWindowNames();
         return true;
     };
     // HTML §Location component setters: copy the URL, apply the component with
@@ -15384,6 +15385,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     let namedRecords = [];
     let namedElements = new Map(), namedFrames = new Map(), windowFrames = [];
     const namedCollections = new Map();
+    // The index describes one Document. HTML §7.5.1's Window reuse installs a
+    // new Document in this Realm; drop the old one's index rather than retain
+    // that Document and its frame wrappers until the next named lookup.
+    function forgetWindowNames() {
+        namedEpoch = namedTreeEpoch = namedRevision = -1;
+        namedDocument = undefined;
+        namedRecords = [];
+        namedElements = new Map(); namedFrames = new Map(); windowFrames = [];
+    }
     function refreshWindowNames() {
         const epoch = __dom_epoch(), doc = g.document;
         if (epoch === namedEpoch && namedRevision === navigableNamesRevision && namedDocument === doc) return;
