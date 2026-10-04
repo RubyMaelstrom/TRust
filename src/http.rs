@@ -8201,6 +8201,14 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
     let kind = match tag {
         "input" => {
             let ty = dom.attr(id, "type").unwrap_or("").to_ascii_lowercase();
+            // HTML #attr-input-placeholder: the hint is presented, after
+            // stripping newlines, by the types the attribute applies to.
+            if crate::dom::placeholder_input_type(&dom.input_type(id)) {
+                label = dom
+                    .attr(id, "placeholder")
+                    .unwrap_or("")
+                    .replace(['\n', '\r'], "");
+            }
             match ty.as_str() {
                 "hidden" => FieldKind::Hidden,
                 "number" => FieldKind::Number,
@@ -8232,10 +8240,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                     FieldKind::Reset
                 }
                 "file" => return None,
-                _ => {
-                    label = dom.attr(id, "placeholder").unwrap_or("").to_string();
-                    FieldKind::Text
-                }
+                _ => FieldKind::Text,
             }
         }
         "button" => {
@@ -10194,6 +10199,29 @@ mod tests {
                 pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220 && pixel[3] > 0
             })
         );
+    }
+
+    #[test]
+    fn placeholder_labels_follow_the_types_the_attribute_applies_to() {
+        // HTML #attr-input-placeholder: the Text, Search, Telephone, URL,
+        // Email, Password and Number states present the hint with newlines
+        // stripped; other types, such as Date, have no placeholder.
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            "<form><input name=t placeholder='two&#10;lines'><input name=p type=password \
+             placeholder=secret><input name=n type=number placeholder=count>\
+             <input name=d type=date placeholder=never><input name=r type=range placeholder=x>\
+             <textarea name=a placeholder='keeps&#10;lines'></textarea></form>",
+        );
+        let (forms, _) = extract_forms_arena(&dom, &base, None);
+        let labels: Vec<&str> = forms[0].fields.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["twolines", "secret", "count", "", "", "keeps\nlines"]
+        );
+        assert!(forms[0].fields[1].shows_placeholder());
+        assert_eq!(forms[0].fields[1].visual_label(), "secret");
+        assert_eq!(forms[0].fields[2].visual_label(), "count");
     }
 
     #[test]
