@@ -12,7 +12,7 @@ use super::*;
 
 mod attributes;
 
-pub(super) use attributes::FocusState;
+pub(super) use attributes::LiveState;
 
 /// CSSOM #dom-window-getcomputedstyle requires current, live values at reads;
 /// it does not require retiring derived cache entries after every write.
@@ -451,7 +451,7 @@ impl RelationalDependency {
             // below or beside a possible anchor, which `restyle_root` walks.
             // So other states and positional pseudo-classes are safe: focus
             // changes reverse :has() paths like attributes do
-            // (`invalidate_focus_state`), hover
+            // (`invalidate_live_state`), hover
             // transitions compare every hover subject including :has()
             // anchors (`set_hover_chain`), :dir() keeps the text-direction
             // fallback, fieldset parents restyle their subtree (:disabled),
@@ -1081,37 +1081,46 @@ impl Dom {
         subjects
     }
 
-    /// HTML #focus-update-steps change :focus and :focus-within (Selectors 4
-    /// #the-focus-pseudo, #the-focus-within-pseudo) on exactly the elements
-    /// of `changed`. Like an attribute write, that can only change the
-    /// selector subjects reached through compiled routes: the element
-    /// itself, descendant and sibling dependents, `:has()` anchors and their
-    /// dependents, and `:nth-child(of …)` siblings. Restyle those and, for
-    /// inheritance, their descendants. Returns false when only a complete
-    /// invalidation is provably correct: shadow trees can couple tree scopes
-    /// (`:host`, `::slotted()`, slot distribution) beyond these routes.
-    pub(super) fn invalidate_focus_state(&mut self, changed: &[(NodeId, FocusState)]) -> bool {
-        let index = self.style_index();
+    /// The focus update steps (HTML #focus-update-steps) change :focus and
+    /// :focus-within (Selectors 4 #the-focus-pseudo,
+    /// #the-focus-within-pseudo), and scrolling to a fragment changes
+    /// :target (HTML #selector-target), on exactly the elements of `changed`.
+    /// Like an attribute write, that can only change the selector subjects
+    /// reached through compiled routes: the element itself, descendant and
+    /// sibling dependents, `:has()` anchors and their dependents, and
+    /// `:nth-child(of …)` siblings. Restyle those and, for inheritance, their
+    /// descendants. `index` must reflect the current sheet set. Returns
+    /// false when only a complete invalidation is provably correct: shadow
+    /// trees can couple tree scopes (`:host`, `::slotted()`, slot
+    /// distribution) beyond these routes.
+    pub(super) fn invalidate_live_state(
+        &mut self,
+        index: &StyleIndex,
+        changed: &[(NodeId, LiveState)],
+    ) -> bool {
         let observed: Vec<_> = changed
             .iter()
             .copied()
-            .filter(|&(node, _)| {
+            .filter(|&(node, state)| {
                 index
                     .selector_dependencies
                     .for_node(self, node)
                     .attributes
-                    .observes_focus()
+                    .observes(state)
             })
             .collect();
         if observed.is_empty() {
-            // No selector in the node's Document reads focus; matches(':focus')
-            // reads the focused area directly and caches nothing.
+            // No selector in the node's Document reads the state; matches()
+            // reads Document state directly and caches nothing.
             return true;
         }
         if observed
             .iter()
             .any(|&(node, _)| self.shadow_style_dependencies(node))
         {
+            if casc_diag_on() {
+                eprintln!("DIAGINVALID live-state shadow={changed:?}");
+            }
             return false;
         }
         let mut subjects = FxHashSet::default();
@@ -1120,7 +1129,7 @@ impl Dom {
                 .selector_dependencies
                 .for_node(self, node)
                 .attributes
-                .focus_subjects(self, node, state)
+                .state_subjects(self, node, state)
             else {
                 return false;
             };
@@ -1146,6 +1155,14 @@ impl Dom {
             self.record_geometry_dirty(subject, DirtyKind::Attr);
         }
         true
+    }
+
+    /// The parsed rule index when it reflects the current sheet set, without
+    /// building one: no current index means no proof of independence.
+    pub(super) fn current_style_index(&self) -> Option<std::rc::Rc<StyleIndex>> {
+        let cache = self.style_cache.borrow();
+        let (epoch, index) = cache.as_ref()?;
+        (*epoch == self.style_epoch).then(|| index.clone())
     }
 
     #[track_caller]
@@ -2613,6 +2630,102 @@ mod tests {
         assert_ne!(value_of(&dom, "wrap", "height").as_deref(), Some("9px"));
         focus(&mut dom, Some("b"));
         assert!(!red(&dom));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn fragment_navigation_restyles_only_target_subjects() {
+        let mut dom = Dom::parse_document(
+            "<style>:target{width:21px}:target + p{color:red}\
+             section:has(> :target) h2{color:green}\
+             p:not(:target){padding-left:2px}</style>\
+             <section id=s1><h2 id=h1>a</h2><p id=one>One</p><p id=after1>x</p></section>\
+             <section id=s2><h2 id=h2>b</h2><p id=two>Two</p><p id=after2>y</p></section>\
+             <aside id=stable><span id=stable_child>independent</span></aside>\
+             <table id=hinted background=img/a.png><tr><td>t</td></tr></table>",
+        );
+        dom.set_doc_url(url::Url::parse("https://example.test/page/").ok());
+        // HTML rendering, Tables: the background hint resolves against the
+        // node document's base URL.
+        let background = |dom: &Dom| {
+            dom.computed_value(dom.get_by_id("hinted").unwrap(), "background-image")
+                .unwrap_or_default()
+        };
+        assert!(background(&dom).contains("example.test/page/img/a.png"));
+        assert_matches_full_scan(&dom);
+        let stable = cached(&dom, "stable_child");
+        let (values, sheets) = (dom.style_value_epoch, dom.style_epoch);
+        let check = |dom: &Dom, stable: &std::rc::Rc<Vec<u32>>| {
+            assert_eq!(dom.style_value_epoch, values, "expired every style");
+            assert_eq!(dom.style_epoch, sheets, "reparsed the style sheets");
+            assert!(std::rc::Rc::ptr_eq(stable, &cached(dom, "stable_child")));
+            assert_matches_full_scan(dom);
+        };
+
+        // Fragment navigation: a fragment-only URL change resolves every
+        // relative URL as before, and only the targets change state.
+        dom.set_doc_url(url::Url::parse("https://example.test/page/#one").ok());
+        dom.set_fragment_target(Some("one"));
+        assert_eq!(value_of(&dom, "one", "width").as_deref(), Some("21px"));
+        assert_eq!(value_of(&dom, "after1", "color").as_deref(), Some("red"));
+        assert_eq!(value_of(&dom, "h1", "color").as_deref(), Some("green"));
+        assert_ne!(
+            value_of(&dom, "one", "padding-left").as_deref(),
+            Some("2px")
+        );
+        assert!(background(&dom).contains("example.test/page/img/a.png"));
+        check(&dom, &stable);
+
+        dom.set_doc_url(url::Url::parse("https://example.test/page/#two").ok());
+        dom.set_fragment_target(Some("two"));
+        assert_ne!(value_of(&dom, "one", "width").as_deref(), Some("21px"));
+        assert_ne!(value_of(&dom, "after1", "color").as_deref(), Some("red"));
+        assert_ne!(value_of(&dom, "h1", "color").as_deref(), Some("green"));
+        assert_eq!(
+            value_of(&dom, "one", "padding-left").as_deref(),
+            Some("2px")
+        );
+        assert_eq!(value_of(&dom, "two", "width").as_deref(), Some("21px"));
+        assert_eq!(value_of(&dom, "after2", "color").as_deref(), Some("red"));
+        assert_eq!(value_of(&dom, "h2", "color").as_deref(), Some("green"));
+        check(&dom, &stable);
+
+        dom.set_fragment_target(None);
+        assert_ne!(value_of(&dom, "two", "width").as_deref(), Some("21px"));
+        assert_ne!(value_of(&dom, "h2", "color").as_deref(), Some("green"));
+        check(&dom, &stable);
+
+        // Another resource changes every relative URL's base.
+        dom.set_doc_url(url::Url::parse("https://example.test/other/#two").ok());
+        assert_ne!(dom.style_epoch, sheets);
+        assert!(background(&dom).contains("example.test/other/img/a.png"));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn focus_and_target_after_a_sheet_change_use_the_new_rules() {
+        let mut dom = Dom::parse_document(
+            "<style>.wrap:focus-within .hint{color:red}</style>\
+             <div class=wrap id=wrap><input id=a><p class=hint id=hint>h</p></div>\
+             <p id=goal>goal</p>",
+        );
+        assert_ne!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        // The rule index is stale until the next style query: focus builds
+        // a current one for its proof, :target takes the complete fallback.
+        let style = dom.create_element("style");
+        dom.set_text(
+            style,
+            "#hint{width:5px}.wrap:focus-within{height:7px}:target{width:8px}",
+        );
+        dom.append(dom.get_by_id("wrap").unwrap(), style);
+        focus(&mut dom, Some("a"));
+        dom.set_fragment_target(Some("goal"));
+        assert_eq!(value_of(&dom, "hint", "color").as_deref(), Some("red"));
+        assert_eq!(value_of(&dom, "hint", "width").as_deref(), Some("5px"));
+        assert_eq!(value_of(&dom, "wrap", "height").as_deref(), Some("7px"));
+        assert_eq!(value_of(&dom, "goal", "width").as_deref(), Some("8px"));
         assert_matches_full_scan(&dom);
         assert_style_values_match_cold(&mut dom);
     }

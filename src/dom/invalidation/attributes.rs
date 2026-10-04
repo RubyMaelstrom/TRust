@@ -116,13 +116,16 @@ struct Route {
     steps: Vec<Step>,
 }
 
-/// HTML #selector-focus and Selectors 4 #the-focus-within-pseudo: element
-/// states that change through the focus update steps, never through an
-/// attribute. Their routes start at an element whose state changed.
+/// Element states held by Document state rather than attributes or the
+/// tree: HTML #selector-focus, Selectors 4 #the-focus-within-pseudo (both
+/// changed by the focus update steps) and HTML #selector-target (changed by
+/// scrolling to a fragment). Their routes start at an element whose state
+/// changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::dom) enum FocusState {
+pub(in crate::dom) enum LiveState {
     Focus,
     FocusWithin,
+    Target,
 }
 
 /// Overflow expires optional caches; it NEVER truncates selector matching or
@@ -131,13 +134,13 @@ pub(in crate::dom) enum FocusState {
 pub(super) struct Dependencies {
     attributes: FxHashMap<String, FxHashSet<Route>>,
     classes: FxHashMap<String, FxHashSet<Route>>,
-    /// Indexed by `FocusState`; kept apart from `attributes` so that no
+    /// Indexed by `LiveState`; kept apart from `attributes` so that no
     /// author attribute name can alias a state.
-    focus: [FxHashSet<Route>; 2],
+    states: [FxHashSet<Route>; 3],
     broad: FxHashSet<String>,
-    /// A focus state inside `:host()`/`::slotted()` needs a scope-bearing
-    /// route, which these paths do not express.
-    broad_focus: bool,
+    /// A state inside `:host()`/`::slotted()` needs a scope-bearing route,
+    /// which these paths do not express. Indexed by `LiveState`.
+    broad_states: [bool; 3],
     overflow: bool,
     routes: usize,
     steps: usize,
@@ -145,10 +148,10 @@ pub(super) struct Dependencies {
 }
 
 /// Where a dependency path starts: an attribute (or class token) name, or a
-/// focus state.
+/// live state.
 enum Source<'a> {
     Attribute(&'a str, bool),
-    Focus(FocusState),
+    State(LiveState),
 }
 
 impl Dependencies {
@@ -165,8 +168,8 @@ impl Dependencies {
             match source {
                 Source::Attribute(_, true) => self.broad.insert("class".into()),
                 Source::Attribute(name, false) => self.broad.insert(name.to_ascii_lowercase()),
-                Source::Focus(_) => {
-                    self.broad_focus = true;
+                Source::State(state) => {
+                    self.broad_states[state as usize] = true;
                     true
                 }
             };
@@ -181,7 +184,7 @@ impl Dependencies {
             self.overflow = true;
             self.attributes.clear();
             self.classes.clear();
-            self.focus = Default::default();
+            self.states = Default::default();
             return;
         }
         let route = Route {
@@ -196,7 +199,7 @@ impl Dependencies {
                 .attributes
                 .entry(name.to_ascii_lowercase())
                 .or_default(),
-            Source::Focus(state) => &mut self.focus[state as usize],
+            Source::State(state) => &mut self.states[state as usize],
         };
         if routes.insert(route) {
             self.routes += 1;
@@ -233,7 +236,7 @@ impl Dependencies {
             host_inner,
             slotted,
             popover_open,
-            target: _,
+            target,
             hover: _,
             never: _,
             inert_pseudo_element: _,
@@ -255,6 +258,9 @@ impl Dependencies {
         }
         if *popover_open {
             self.add("popover", false, tag, path, broad);
+        }
+        if *target {
+            self.add_source(Source::State(LiveState::Target), tag, path, broad);
         }
         let mut same_subject = vec![Step::new(Axis::SelfOnly, tag)];
         same_subject.extend_from_slice(path);
@@ -303,11 +309,11 @@ impl Dependencies {
                 // :focus-within (`Dom::set_focused_area`).
                 StatePseudo::Focus | StatePseudo::FocusWithin => {
                     let state = if matches!(state, StatePseudo::Focus) {
-                        FocusState::Focus
+                        LiveState::Focus
                     } else {
-                        FocusState::FocusWithin
+                        LiveState::FocusWithin
                     };
-                    self.add_source(Source::Focus(state), tag, path, broad);
+                    self.add_source(Source::State(state), tag, path, broad);
                     continue;
                 }
                 // Modal state changes only through `set_dialog_modal`, which
@@ -411,29 +417,31 @@ impl Dependencies {
         Some(result.into_iter().collect())
     }
 
-    /// Whether any selector can observe a focus state. Overflow discarded the
+    /// Whether any selector can observe `state`. Overflow discarded the
     /// routes that would answer, so it conservatively says yes.
-    pub(super) fn observes_focus(&self) -> bool {
-        self.overflow || self.broad_focus || self.focus.iter().any(|routes| !routes.is_empty())
+    pub(super) fn observes(&self, state: LiveState) -> bool {
+        self.overflow
+            || self.broad_states[state as usize]
+            || !self.states[state as usize].is_empty()
     }
 
     /// The selector subjects whose match can change when `node` gains or
     /// loses `state`. None means a complete cache invalidation, never
     /// incomplete results.
-    pub(super) fn focus_subjects(
+    pub(super) fn state_subjects(
         &self,
         dom: &Dom,
         node: NodeId,
-        state: FocusState,
+        state: LiveState,
     ) -> Option<Vec<NodeId>> {
-        if self.overflow || self.broad_focus {
+        if self.overflow || self.broad_states[state as usize] {
             return None;
         }
         let mut result = FxHashSet::default();
         let mut budget = dom.node_count().saturating_mul(16).max(4096);
         // No attribute changed, so every guard tests a current value: the
         // empty name exempts none (attribute names are never empty).
-        let routes = &self.focus[state as usize];
+        let routes = &self.states[state as usize];
         Self::walk(dom, node, "", routes, &mut budget, &mut result)?;
         Some(result.into_iter().collect())
     }
@@ -558,7 +566,7 @@ impl Dependencies {
                         .sum::<usize>()
             })
             .sum::<usize>()
-            + self.focus.iter().map(routes_bytes).sum::<usize>()
+            + self.states.iter().map(routes_bytes).sum::<usize>()
             + self.broad.capacity() * std::mem::size_of::<String>()
             + self.broad.iter().map(String::capacity).sum::<usize>()
     }
