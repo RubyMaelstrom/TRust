@@ -14327,6 +14327,19 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // optional slash and vertical radii follow it. Keep the paired used-value
     // syntax in each corner longhand for graphical rounded geometry.
     if prop == "border-radius" {
+        // CSS Cascade 5 #defaulting-keywords: a CSS-wide keyword on a
+        // shorthand sets each longhand to that keyword, not to a pair.
+        if wide_keyword(value).is_some() {
+            return [
+                "border-top-left-radius",
+                "border-top-right-radius",
+                "border-bottom-right-radius",
+                "border-bottom-left-radius",
+            ]
+            .into_iter()
+            .map(|name| (name.to_string(), value.trim().to_string()))
+            .collect();
+        }
         let (horizontal, vertical) =
             split_top_level_slash(value).map_or((value, value), |(h, v)| (h.trim(), v.trim()));
         let (Some(h), Some(v)) = (four_sides(horizontal), four_sides(vertical)) else {
@@ -26930,6 +26943,29 @@ mod tests {
             dom3.computed_value(dom3.get_by_id("x").unwrap(), "overflow-x"),
             None,
             "and excludes the element WITH that title"
+        );
+    }
+
+    #[test]
+    fn border_radius_shorthand_takes_css_wide_keywords_per_corner() {
+        // CSS Cascade 5 #defaulting-keywords: `border-radius: inherit` gives
+        // every corner its parent's radius (YouTube's light-shape clips use
+        // it). Chromium reports 7px and 20px here.
+        let dom = Dom::parse_document(
+            r#"<div id="p" style="border-radius:20px;border-top-left-radius:7px">
+               <div id="c" style="border-radius:inherit"></div></div>"#,
+        );
+        let c = dom.get_by_id("c").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(c, "border-top-left-radius")
+                .as_deref(),
+            Some("7px")
+        );
+        // Corner longhands keep the paired used-value syntax internally.
+        assert_eq!(
+            dom.computed_value_resolved(c, "border-bottom-right-radius")
+                .as_deref(),
+            Some("20px 20px")
         );
     }
 
