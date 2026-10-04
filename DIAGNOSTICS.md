@@ -879,7 +879,7 @@ the output directory; nothing is written to the WPT tree. Test-only; it uses no
 | `--exclude GLOB` | Skip source paths (repeatable) | none |
 | `--skip-testdriver`, `--skip-firefox-disabled` | Skip tests needing WebDriver actions, or disabled in Firefox's metadata | off |
 | `--timeout-multiplier F`, `--grace S` | testharness `timeout_multiplier` (10 s normal, 60 s long); seconds before an unreported browser is killed | `1`, `8` |
-| `--depth N` | Directory depth of the summary matrix | `2` |
+| `--depth N` | Directory depth of the summary matrix; `0` groups by the requested paths | `2` |
 | `--baseline FILE` | An earlier `results.jsonl`; adds a per-directory before/after table | none |
 | `--list` | Print the selected test URLs only | off |
 | `--serve` | Only start the configured server, for loading tests by hand | off |
