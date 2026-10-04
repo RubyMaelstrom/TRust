@@ -448,7 +448,10 @@ impl BoxStyle {
         };
         BoxStyle {
             line_clamp: dom.legacy_line_clamp(id),
-            overflow: super::overflow::Overflow::axes(cv),
+            overflow: super::overflow::Overflow::axes_from_longhands(
+                cv("overflow-x"),
+                cv("overflow-y"),
+            ),
             vertical: vertical_mode(cv("writing-mode").as_deref()),
             sideways_text: sideways_text(
                 cv("writing-mode").as_deref(),
