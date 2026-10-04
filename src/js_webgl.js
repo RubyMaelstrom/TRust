@@ -569,17 +569,31 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         UNPACK_COLORSPACE_CONVERSION_WEBGL:0x9243,
         BROWSER_DEFAULT_WEBGL:0x9244,
     };
-    for(const [name,value] of Object.entries(constants))for(const target of [WebGLRenderingContext,WebGLRenderingContext.prototype])define(target,name,{value,enumerable:true});
-    for(const name of Object.getOwnPropertyNames(WebGLRenderingContext.prototype)){if(name!=="constructor")define(WebGLRenderingContext.prototype,name,{...descriptor(WebGLRenderingContext.prototype,name),enumerable:true});}
+    // Web IDL #js-operations and #js-attributes: interface members are enumerable.
     // Native entries share private slots and driver validation with the complete
-    // Web IDL wrappers. Unsupported argument shapes return to those wrappers.
-    for(const proto of [WebGLRenderingContext.prototype,vertexArrayPrototype])for(const name of Object.getOwnPropertyNames(proto)) {
-        const d=descriptor(proto,name);
-        if(name!=="constructor"&&typeof d.value==="function") {
-            const value=native(0,"fastMethod",[],d.value);
-            if(value!==d.value)save(value,{kind:"Method",fallback:d.value});
-            define(proto,name,{...d,value});
-        }
+    // Web IDL wrappers. Unsupported argument shapes return to those wrappers. One
+    // pass gives each member its final descriptor before the constants are appended
+    // (#js-constants: enumerable, read-only, non-configurable, on both the interface
+    // object and its prototype); member order is unchanged.
+    function nativeMember(d) {
+        if(typeof d.value!=="function")return;
+        const value=native(0,"fastMethod",[],d.value);
+        if(value!==d.value)save(value,{kind:"Method",fallback:d.value});
+        d.value=value;
+    }
+    for(const name of Object.getOwnPropertyNames(WebGLRenderingContext.prototype)) {
+        if(name==="constructor")continue;
+        const d=descriptor(WebGLRenderingContext.prototype,name);
+        d.enumerable=true;nativeMember(d);
+        define(WebGLRenderingContext.prototype,name,d);
+    }
+    for(const name of Object.getOwnPropertyNames(vertexArrayPrototype)) {
+        const d=descriptor(vertexArrayPrototype,name);
+        if(typeof d.value==="function"){nativeMember(d);define(vertexArrayPrototype,name,d);}
+    }
+    for(const name of keys(constants)) {
+        const d={value:constants[name],enumerable:true};
+        define(WebGLRenderingContext,name,d);define(WebGLRenderingContext.prototype,name,d);
     }
     define(WebGLRenderingContext.prototype,Symbol.toStringTag,{value:"WebGLRenderingContext",configurable:true});g.WebGLRenderingContext=WebGLRenderingContext;
     return {contexts:canvasContexts,is(value){const s=slot(value);return !!s&&s.kind==="Context";},create(canvas,options){
