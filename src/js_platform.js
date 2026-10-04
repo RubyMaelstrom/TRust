@@ -1146,6 +1146,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const nativeDomRelative = g.__dom_relative;
     const installNativeCollection = g.__dom_install_live_collection;
     const nativeCollectionLength = g.__dom_child_collection_length;
+    const installNativeQueryCollection = g.__dom_install_query_collection;
     const __dom_register_wrapper = g.__dom_register_wrapper;
     delete g.__dom_wrapper_cache_enabled;
     delete g.__dom_cached_wrapper;
@@ -1154,6 +1155,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     delete g.__dom_relative;
     delete g.__dom_install_live_collection;
     delete g.__dom_child_collection_length;
+    delete g.__dom_install_query_collection;
     delete g.__dom_register_wrapper;
     const W = nativeWrapperCache ? null : new Map();
     // Same-Agent Web IDL Element identity. Register only trusted wrapper
@@ -13992,6 +13994,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // qualified names independently of CSS syntax. Cache IDs only until the
     // next arena mutation and preserve lazy wrapping for length-only reads.
     function tagNameCollection(root, name, namespace) {
+        const native = nativeQueryCollection(root, false, name, namespace);
+        if (native) return native;
         let epoch = -1, list;
         return makeHTMLCollection(() => {
             const current = __dom_epoch();
@@ -14027,6 +14031,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // DOM #concept-getelementsbyclassname / #concept-collection-live: moves,
     // removals and class changes must be visible even in a synchronous loop.
     function classNameCollection(root, names) {
+        const native = nativeQueryCollection(root, true, names, root.nodeType === 9);
+        if (native) return native;
         let epoch = -1, list;
         return makeHTMLCollection(() => {
             const current = __dom_epoch();
@@ -14040,6 +14046,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     const HTML_COLLECTION_TOKEN = {};
     const HTML_COLLECTION_DATA = new WeakMap();
+    // Lumen answers tag/class membership natively, recomputed once per DOM
+    // mutation epoch, instead of through the Proxy-based fallback below.
+    function nativeQueryCollection(root, classes, query, extra) {
+        if (typeof installNativeQueryCollection !== "function") return null;
+        const target = new HTMLCollection(HTML_COLLECTION_TOKEN);
+        const native = installNativeQueryCollection(target, root, classes, query, extra, wrapKnown);
+        if (!native) return null;
+        HTML_COLLECTION_DATA.set(target, { root, liveGet: native[0], liveLength: native[1] });
+        return target;
+    }
     function htmlCollectionList(collection) {
         const resolve = HTML_COLLECTION_DATA.get(collection);
         if (!resolve) throw new TypeError("Illegal invocation");
@@ -14063,7 +14079,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get length() {
             const resolve = HTML_COLLECTION_DATA.get(this);
             if (!resolve) throw new TypeError("Illegal invocation");
-            return resolve.liveGet ? nativeCollectionLength(resolve.root, true) : resolve().length;
+            if (!resolve.liveGet) return resolve().length;
+            return resolve.liveLength ? resolve.liveLength() : nativeCollectionLength(resolve.root, true);
         }
         item(index) {
             if (!arguments.length) throw new TypeError("item requires an index");

@@ -8514,6 +8514,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
         2,
         host_child_collection_length,
     ),
+    (
+        "__dom_install_query_collection",
+        6,
+        host_install_query_collection,
+    ),
     ("__dom_node_identity", 1, host_node_identity),
     ("__dom_observer_targets", 2, host_dom_observer_targets),
     ("__live_range_register", 1, host_live_range_register),
@@ -9704,16 +9709,23 @@ fn live_element_list_names(ctx: &Ctx, root: &Value) -> Vec<String> {
         return Vec::new();
     };
     let dom = state.dom.borrow();
+    collection_supported_names(&dom, dom.child_iter(root))
+}
+
+/// DOM #ref-for-dfn-supported-property-names (HTMLCollection): each member's
+/// non-empty ID, then its name attribute when it is in the HTML namespace,
+/// in tree order without duplicates.
+fn collection_supported_names(dom: &Dom, members: impl Iterator<Item = usize>) -> Vec<String> {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut names = Vec::new();
-    for child in dom.child_iter(root) {
-        if !matches!(dom.node(child).data, NodeData::Element { .. }) {
+    for member in members {
+        if !matches!(dom.node(member).data, NodeData::Element { .. }) {
             continue;
         }
-        let html = dom.namespace_uri(child) == Some("http://www.w3.org/1999/xhtml");
+        let html = dom.namespace_uri(member) == Some("http://www.w3.org/1999/xhtml");
         for name in [
-            dom.get_attribute(child, "id"),
-            html.then(|| dom.get_attribute(child, "name")).flatten(),
+            dom.get_attribute(member, "id"),
+            html.then(|| dom.get_attribute(member, "name")).flatten(),
         ]
         .into_iter()
         .flatten()
@@ -9725,6 +9737,37 @@ fn live_element_list_names(ctx: &Ctx, root: &Value) -> Vec<String> {
         }
     }
     names
+}
+
+/// DOM #dom-htmlcollection-nameditem-key: the first member whose ID is
+/// `name`, or an HTML-namespace member whose name attribute is `name`.
+fn collection_named_item(
+    dom: &Dom,
+    mut members: impl Iterator<Item = usize>,
+    name: &str,
+) -> Option<usize> {
+    members.find(|&member| {
+        matches!(dom.node(member).data, NodeData::Element { .. })
+            && (dom.get_attribute(member, "id") == Some(name)
+                || (dom.namespace_uri(member) == Some("http://www.w3.org/1999/xhtml")
+                    && dom.get_attribute(member, "name") == Some(name)))
+    })
+}
+
+/// A collection member's canonical wrapper, creating it through the page's
+/// wrapper callback only when the node has none.
+fn collection_member_wrapper(ctx: &mut Ctx, member: usize, wrap: &Value) -> Result<Value, Value> {
+    let state = ctx.host::<HostState>().expect("DOM host");
+    let cached = state
+        .dom_gc
+        .wrappers
+        .get(&member)
+        .and_then(|identity| state.dom_gc.owners.get(identity))
+        .map(|entry| entry.value.clone());
+    if let Some(wrapper) = cached {
+        return Ok(wrapper);
+    }
+    ctx.invoke(wrap.clone(), Value::Undefined, &[Value::Num(member as f64)])
 }
 
 /// Native membership never manufactures a JS ID array. Only a consumed node
@@ -9746,33 +9789,15 @@ fn live_child_collection_get(
             dom.child_collection_item(root, *index as usize, elements)
         }
         Some(Value::Str(name)) if elements && !name.is_empty() => {
-            dom.child_iter(root).find(|&child| {
-                matches!(dom.node(child).data, NodeData::Element { .. })
-                    && (dom.get_attribute(child, "id") == Some(name.as_str())
-                        || (dom.namespace_uri(child) == Some("http://www.w3.org/1999/xhtml")
-                            && dom.get_attribute(child, "name") == Some(name.as_str())))
-            })
+            collection_named_item(&dom, dom.child_iter(root), name.as_str())
         }
         _ => None,
     };
+    drop(dom);
     let Some(target) = target else {
         return Ok(Value::Null);
     };
-    let cached = state
-        .dom_gc
-        .wrappers
-        .get(&target)
-        .and_then(|identity| state.dom_gc.owners.get(identity))
-        .map(|entry| entry.value.clone());
-    drop(dom);
-    if let Some(wrapper) = cached {
-        return Ok(wrapper);
-    }
-    ctx.invoke(
-        captures[1].clone(),
-        Value::Undefined,
-        &[Value::Num(target as f64)],
-    )
+    collection_member_wrapper(ctx, target, &captures[1])
 }
 
 fn host_install_live_collection(
@@ -9817,6 +9842,135 @@ fn host_install_live_collection(
     });
     ctx.install_live_readonly_indexed_properties(&target, root, length, getter.clone(), named)?;
     Ok(getter)
+}
+
+/// The members of the tag/class collection whose membership state is `key`.
+fn live_query_members(ctx: &Ctx, key: &Value) -> Option<Rc<[usize]>> {
+    let Value::Str(key) = key else {
+        return None;
+    };
+    let state = ctx.host::<HostState>()?;
+    Some(state.dom.borrow().query_collection(key.as_str()))
+}
+
+fn live_query_length(ctx: &Ctx, key: &Value) -> u32 {
+    live_query_members(ctx, key).map_or(0, |members| members.len().min(u32::MAX as usize) as u32)
+}
+
+fn live_query_names(ctx: &Ctx, key: &Value) -> Vec<String> {
+    let (Some(members), Some(state)) = (live_query_members(ctx, key), ctx.host::<HostState>())
+    else {
+        return Vec::new();
+    };
+    collection_supported_names(&state.dom.borrow(), members.iter().copied())
+}
+
+/// Captures: membership key, wrapper callback, and the root wrapper, which
+/// keeps the root node (and with it the key's identity) alive with the view.
+fn live_query_collection_get(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+    captures: &[Value],
+) -> Result<Value, Value> {
+    let Some(members) = live_query_members(ctx, &captures[0]) else {
+        return Ok(Value::Null);
+    };
+    let target = match args.first() {
+        Some(Value::Num(index)) if index.is_finite() && *index >= 0.0 && index.fract() == 0.0 => {
+            members.get(*index as usize).copied()
+        }
+        Some(Value::Str(name)) if !name.is_empty() => {
+            let state = ctx.host::<HostState>().expect("DOM host");
+            collection_named_item(&state.dom.borrow(), members.iter().copied(), name.as_str())
+        }
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Ok(Value::Null);
+    };
+    collection_member_wrapper(ctx, target, &captures[1])
+}
+
+fn live_query_collection_length(
+    ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+    captures: &[Value],
+) -> Result<Value, Value> {
+    Ok(Value::Num(live_query_length(ctx, &captures[0]) as f64))
+}
+
+/// `__dom_install_query_collection(target, root, classes, query, extra, wrap)`
+/// installs a live getElementsByTagName(NS)/getElementsByClassName view on a
+/// fresh HTMLCollection. `extra` is the tag query's namespace (undefined for
+/// the non-NS form, null for the null namespace) or whether a class query's
+/// root is a Document. Returns `[item getter, length function]`, or false when
+/// native collections are disabled.
+fn host_install_query_collection(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if !native_live_collections_enabled() {
+        return Ok(Value::Bool(false));
+    }
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let root_wrapper = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let classes = matches!(args.get(2), Some(Value::Bool(true)));
+    let query = host_arg_string(ctx, args, 3);
+    let namespace = match args.get(4) {
+        _ if classes => None,
+        None | Some(Value::Undefined) => None,
+        Some(Value::Null) => Some(String::new()),
+        _ => Some(host_arg_string(ctx, args, 4)),
+    };
+    let wrap = args.get(5).cloned().unwrap_or(Value::Undefined);
+    let root = ctx
+        .host::<HostState>()
+        .and_then(|state| state.dom_gc.node_identity(&root_wrapper));
+    let (Some(root), true) = (root, wrap.is_callable()) else {
+        return Err(ctx.make_error(
+            "TypeError",
+            "live collection requires a Node and wrapper callback",
+        ));
+    };
+    let key = if classes {
+        crate::dom::CollectionQuery::Class {
+            names: &query,
+            document_root: matches!(args.get(4), Some(Value::Bool(true))),
+        }
+    } else {
+        crate::dom::CollectionQuery::Tag {
+            qualified: &query,
+            namespace: namespace.as_deref(),
+        }
+    }
+    .key(root);
+    let key = Value::from_string(key);
+    let getter = ctx.new_native_fn_with_captures(
+        "collection item",
+        1,
+        live_query_collection_get,
+        vec![key.clone(), wrap, root_wrapper],
+    );
+    let length = ctx.new_native_fn_with_captures(
+        "collection length",
+        0,
+        live_query_collection_length,
+        vec![key.clone()],
+    );
+    ctx.install_live_readonly_indexed_properties(
+        &target,
+        key,
+        live_query_length,
+        getter.clone(),
+        Some((
+            live_query_names as fn(&Ctx, &Value) -> Vec<String>,
+            getter.clone(),
+        )),
+    )?;
+    Ok(ctx.make_array(vec![getter, length]))
 }
 
 fn host_node_identity(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -21282,7 +21436,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 199, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 200, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -21293,7 +21447,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 199);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 200);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -35363,6 +35517,120 @@ mod tests {
         eval(
             &mut engine,
             "heldChildren=null;heldNodes=null",
+            "release collection",
+        )
+        .unwrap();
+        engine.ctx().collect_garbage_for_host();
+    }
+
+    #[test]
+    fn query_collections_are_native_live_web_idl_views() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                const check=(x,s)=>{if(!x)throw Error(s)};
+                const root=document.createElement('div');
+                root.innerHTML='<i id=a name=n class=k></i><b id=b class="k x"></b><i class=k></i>';
+                const tags=root.getElementsByTagName('i'),classes=root.getElementsByClassName('k');
+                check(tags instanceof HTMLCollection && Object.getPrototypeOf(classes)===HTMLCollection.prototype,'interface');
+                check(tags.length===2 && classes.length===3 && classes[1].id==='b','membership');
+                check(tags.a===tags[0] && tags.n===tags[0] && classes.b===classes[1] && tags.b===undefined,'names');
+                const d=Object.getOwnPropertyDescriptor(classes,'a');
+                check(d.value===classes[0] && !d.enumerable && !d.writable && d.configurable,'named descriptor');
+                const i=Object.getOwnPropertyDescriptor(tags,'1');
+                check(i.value===tags[1] && i.enumerable && !i.writable && i.configurable,'indexed descriptor');
+                check(Object.keys(classes).join()==='0,1,2' && Reflect.ownKeys(classes).join()==='0,1,2,a,n,b','own keys');
+                check('1' in tags && !('2' in tags) && 'a' in tags && !('b' in tags),'has');
+                check(!Reflect.set(tags,'0',null) && !Reflect.deleteProperty(tags,'0') && !Reflect.defineProperty(tags,'5',{value:1}),'read-only indices');
+                check(tags.item(1)===tags[1] && tags.item(2)===null && tags.namedItem('n')===tags[0] && tags.namedItem('')===null,'methods');
+                check([...classes].map(e=>e.localName).join()==='i,b,i','iteration');
+                tags[0].id='length';
+                check(tags.length===2 && tags.namedItem('length')===tags[0],'prototype precedence');
+                root.appendChild(document.createElement('i'));
+                check(tags.length===3 && classes.length===3,'tree mutation');
+                classes[0].className='';
+                check(classes.length===2 && classes[0].id==='b','attribute mutation');
+                const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+                svg.setAttribute('name','svgname');svg.setAttribute('class','k');root.appendChild(svg);
+                check(classes.length===3 && classes.namedItem('svgname')===null,'HTML name namespace');
+                const ns=root.getElementsByTagNameNS('http://www.w3.org/2000/svg','svg'),none=root.getElementsByTagNameNS(null,'svg');
+                check(ns.length===1 && ns[0]===svg && none.length===0,'namespaces');
+                tags.expando=1;
+                check(tags.expando===1 && Object.keys(tags).includes('expando'),'expandos');
+                check(typeof globalThis.__dom_install_query_collection==='undefined','private capability');
+                return 'ok';
+            })()"#
+                ),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_collections_do_not_materialize_id_arrays_and_retain_detached_roots() {
+        if !native_live_collections_enabled() {
+            return;
+        }
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            "globalThis.queryRoot=document.createElement('div');queryRoot.innerHTML='<i class=k></i>'.repeat(128);",
+            "query setup",
+        )
+        .unwrap();
+        let id_arrays = |engine: &mut lumen::Engine| {
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .dom_gc
+                .owners
+                .values()
+                .filter(|owner| matches!(owner.kind, DomGcOwnerKind::IdArray))
+                .count()
+        };
+        let before = id_arrays(&mut engine);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            globalThis.heldTags=queryRoot.getElementsByTagName('*');
+            globalThis.heldClasses=queryRoot.getElementsByClassName('k');
+            let sum=0;
+            for(let i=0;i<100;i++){
+                queryRoot.setAttribute('data-test',i);
+                sum+=heldTags.length+heldClasses.length;
+                if(heldTags[i]!==heldClasses[i])throw Error('identity');
+            }
+            heldTags[0].expando=71;
+            queryRoot=null;
+            return String(sum);
+        })()"#
+            ),
+            "25600"
+        );
+        assert_eq!(
+            id_arrays(&mut engine),
+            before,
+            "native query views must not allocate retained ID arrays"
+        );
+        engine.ctx().collect_garbage_for_host();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[heldTags[0].expando,heldClasses.length,heldTags[127].parentNode.getElementsByClassName('k').length].join('|')"
+            ),
+            "71|128|128"
+        );
+        eval(
+            &mut engine,
+            "heldTags=null;heldClasses=null",
             "release collection",
         )
         .unwrap();

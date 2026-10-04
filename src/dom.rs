@@ -39,10 +39,12 @@ mod media;
 mod parallel_match;
 mod parallel_style;
 mod properties;
+mod query_collections;
 mod style_pool;
 mod style_records;
 mod style_sharing;
 mod style_view;
+pub(crate) use query_collections::CollectionQuery;
 pub(crate) use style_records::BoxContext;
 
 pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
@@ -512,6 +514,7 @@ pub struct Dom {
     /// Explicit class-attribute invalidation owns freshness (stamp is zero).
     class_cache: RefCell<NodeCache<class_tokens::ClassTokens>>,
     child_lists: RefCell<child_collections::State>,
+    query_lists: RefCell<query_collections::State>,
     /// Memoized per-element cascade WINNER MAPS for the current epoch (see
     /// `cascaded_maps`): the layout/serializer read 30+
     /// properties per element (across the flow AND the intrinsic-measurement
@@ -920,6 +923,7 @@ impl Dom {
             parallel_style: _, // Counters only; no owned allocation.
             class_cache,
             child_lists,
+            query_lists,
             cascaded_cache,
             hidden_cache,
             font_cache,
@@ -1158,6 +1162,10 @@ impl Dom {
                 bytes += state.retained_bytes();
                 opaque = true;
             }
+            Err(_) => unavailable = unavailable.saturating_add(1),
+        }
+        match query_lists.try_borrow() {
+            Ok(state) => bytes = bytes.saturating_add(state.retained_bytes()),
             Err(_) => unavailable = unavailable.saturating_add(1),
         }
         match style_sharing.try_borrow() {
@@ -1433,6 +1441,7 @@ impl Dom {
             parallel_style: Default::default(),
             class_cache: RefCell::new(NodeCache::default()),
             child_lists: RefCell::new(child_collections::State::default()),
+            query_lists: RefCell::new(query_collections::State::default()),
             cascaded_cache: RefCell::new(NodeCache::default()),
             hidden_cache: RefCell::new(NodeCache::default()),
             font_cache: RefCell::new(NodeCache::default()),
