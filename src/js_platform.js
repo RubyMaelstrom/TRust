@@ -6092,31 +6092,80 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // the live `class` attribute through `__el` so the list stays in sync with
     // direct attribute writes. `blocking` supplies its supported-token set;
     // lists such as classList with no supported tokens throw from supports().
-    function tokenListGet() { return (internalsFor(this).el.getAttribute(internalsFor(this).attr) || "").split(/\s+/).filter(Boolean); }
-    function tokenListSet(l) { internalsFor(this).el.setAttribute(internalsFor(this).attr, l.join(" ")); }
+    // DOM #concept-ordered-set-parser: split on ASCII whitespace only and
+    // keep the first occurrence of each token.
+    function tokenListGet() {
+        const value = internalsFor(this).el.getAttribute(internalsFor(this).attr);
+        const tokens = [];
+        if (value === null) return tokens;
+        for (const token of value.split(/[\t\n\f\r ]+/))
+            if (token && !tokens.includes(token)) tokens.push(token);
+        return tokens;
+    }
+    // DOM #concept-dtl-update: nothing to do for a missing attribute and an
+    // empty set; otherwise write the ordered set serialization.
+    function tokenListSet(l) {
+        const record = internalsFor(this);
+        if (!l.length && !record.el.hasAttribute(record.attr)) return;
+        record.el.setAttribute(record.attr, l.join(" "));
+    }
+    // DOM add(), remove(), toggle() and replace(): an empty token is a
+    // SyntaxError and one containing ASCII whitespace an InvalidCharacterError.
+    function tokenListValidate(tokens) {
+        for (const token of tokens) {
+            if (token === "") throw new DOMException("The token must not be empty.", "SyntaxError");
+            if (/[\t\n\f\r ]/.test(token))
+                throw new DOMException("The token must not contain ASCII whitespace.", "InvalidCharacterError");
+        }
+        return tokens;
+    }
     class DOMTokenList {
         constructor(el, attr, supported) {
             internalsFor(this).el = el;
             internalsFor(this).attr = attr || "class";
             internalsFor(this).supported = supported || null;
         }
-        add(...cs) { const l = tokenListGet.call(this); for (const c of cs) if (!l.includes(String(c))) l.push(String(c)); tokenListSet.call(this, l); }
-        remove(...cs) { const ss = cs.map(String); tokenListSet.call(this, tokenListGet.call(this).filter((x) => !ss.includes(x))); }
-        toggle(c, force) {
-            const has = tokenListGet.call(this).includes(String(c));
-            const want = force === undefined ? !has : !!force;
-            if (want && !has) this.add(c);
-            if (!want && has) this.remove(c);
-            return want;
+        add(...tokens) {
+            tokenListValidate(tokens = tokens.map(domString));
+            const l = tokenListGet.call(this);
+            for (const token of tokens) if (!l.includes(token)) l.push(token);
+            tokenListSet.call(this, l);
         }
-        replace(oldT, newT) {
-            const l = tokenListGet.call(this); const i = l.indexOf(String(oldT));
-            if (i < 0) return false;
-            if (!l.includes(String(newT))) l[i] = String(newT); else l.splice(i, 1);
-            tokenListSet.call(this, l); return true;
+        remove(...tokens) {
+            tokenListValidate(tokens = tokens.map(domString));
+            tokenListSet.call(this, tokenListGet.call(this).filter((token) => !tokens.includes(token)));
         }
-        contains(c) { return tokenListGet.call(this).includes(String(c)); }
-        item(i) { return tokenListGet.call(this)[i] ?? null; }
+        toggle(token, force) {
+            if (arguments.length < 1) throw new TypeError("toggle requires a token");
+            token = domString(token);
+            tokenListValidate([token]);
+            const l = tokenListGet.call(this);
+            if (l.includes(token)) {
+                if (force === undefined || !force) { tokenListSet.call(this, l.filter((t) => t !== token)); return false; }
+                return true;
+            }
+            if (force === undefined || force) { l.push(token); tokenListSet.call(this, l); return true; }
+            return false;
+        }
+        // DOM #concept-ordered-set-replace: the first of token or newToken
+        // becomes newToken and later occurrences of either are removed.
+        replace(token, newToken) {
+            if (arguments.length < 2) throw new TypeError("replace requires two tokens");
+            token = domString(token); newToken = domString(newToken);
+            tokenListValidate([token, newToken]);
+            const l = tokenListGet.call(this);
+            if (!l.includes(token)) return false;
+            const result = [];
+            let placed = false;
+            for (const t of l) {
+                if (t !== token && t !== newToken) result.push(t);
+                else if (!placed) { result.push(newToken); placed = true; }
+            }
+            tokenListSet.call(this, result);
+            return true;
+        }
+        contains(c) { return tokenListGet.call(this).includes(domString(c)); }
+        item(i) { return tokenListGet.call(this)[+i >>> 0] ?? null; }
         supports(token) {
             if (!internalsFor(this).supported) throw new TypeError("DOMTokenList has no supported tokens");
             // DOM §interface-DOMTokenList: supported-token matching first
@@ -6945,6 +6994,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!internalsFor(this).cl) internalsFor(this).cl = new DOMTokenList(this);
             return internalsFor(this).cl;
         }
+        // DOM #dom-element-classlist is [PutForwards=value].
+        set classList(value) { this.classList.value = value; }
         matches(s) { return selectorMatchesResult(__dom_matches(nodeIds.get(this), String(s))); }
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }
