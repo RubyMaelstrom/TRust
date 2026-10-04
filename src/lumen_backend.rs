@@ -18239,6 +18239,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_factories_and_visual_viewport_follow_their_idl() {
+        // HTML #dom-option, #dom-image and #dom-audio are legacy factory
+        // functions (Web IDL #legacy-factory-functions: length 0, a fixed
+        // prototype property, `new` required); option text is HTML's
+        // collect option text. CSSOM View #the-visualviewport-interface
+        // without pinch zoom reports the layout viewport. Values match
+        // Chromium's.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const s = document.createElement('select');\n\
+                 s.innerHTML = '<optgroup><option label=L> x <script>y</script> z </option>' +\n\
+                   '</optgroup><option>b</option>';\n\
+                 const [a, b] = s.querySelectorAll('option');\n\
+                 const o = new Option(' t ', 'v', false, true);\n\
+                 const i = new Image(3, 4), au = new Audio('x.mp3');\n\
+                 let thrown = false; try { Option(); } catch (e) { thrown = e instanceof TypeError; }\n\
+                 const p = Object.getOwnPropertyDescriptor(Option, 'prototype');\n\
+                 [a.text, a.value, a.label, b.label, a.index, b.index, a.form,\n\
+                  o.text, o.value, o.selected, Option.length, p.writable, p.configurable,\n\
+                  Option.prototype === HTMLOptionElement.prototype, thrown,\n\
+                  i.getAttribute('width'), i.height, Image.length,\n\
+                  au.getAttribute('preload'), au.getAttribute('src'), au instanceof HTMLAudioElement,\n\
+                  visualViewport instanceof EventTarget, visualViewport.width === innerWidth,\n\
+                  visualViewport.height === innerHeight, visualViewport.scale,\n\
+                  visualViewport.offsetLeft, visualViewport.pageTop, visualViewport.onresize,\n\
+                  String(visualViewport)].join('|')"
+            ),
+            "x z|x z|L|b|0|1||t|v|true|0|false|false|true|true|3|4|0|auto|x.mp3|true|true|true|true|1|0|0||[object VisualViewport]"
+        );
+    }
+
     fn platform_engine() -> lumen::Engine {
         let clock = Rc::new(RealmClock::new());
         configured_engine(

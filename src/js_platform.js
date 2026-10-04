@@ -34,6 +34,8 @@
     // The viewport belongs to the browsing context, not to the replaceable
     // Window.innerWidth/innerHeight properties exposed to author JavaScript.
     let windowViewportWidth = cfg.width, windowViewportHeight = cfg.height;
+    // CSSOM View #dom-window-visualviewport: set once the interface is installed.
+    let visualViewportObject = null;
     const setLayoutViewport = g.__dom_set_viewport;
     delete g.__dom_set_viewport;
     const storageContextId = Number(cfg.hostSettingsContext) || 0;
@@ -8659,9 +8661,49 @@
     // (round-trips a valueless <option>). selected/defaultSelected both reflect
     // the `selected` content attribute the layout/form path reads; React's
     // <select> commit reads+writes both, so they're read-write.
+    // HTML #collect-option-text (includeAltText false): descendant text
+    // outside script elements, with ASCII whitespace stripped and collapsed.
+    function collectOptionText(option) {
+        let text = "";
+        (function walk(node) {
+            for (let child = node.firstChild; child; child = child.nextSibling) {
+                if (child.nodeType === 3) text += child.data;
+                else if (child.nodeType === 1 && !(child.localName === "script" &&
+                    (child.namespaceURI === "http://www.w3.org/1999/xhtml" ||
+                     child.namespaceURI === "http://www.w3.org/2000/svg"))) walk(child);
+            }
+        })(option);
+        return text.replace(/[\t\n\f\r ]+/g, " ").replace(/^ | $/g, "");
+    }
+    // HTML #option-element-nearest-ancestor-select.
+    function optionNearestAncestorSelect(element) {
+        let optgroup = null;
+        for (let node = element.parentNode; node && node.nodeType === 1; node = node.parentNode) {
+            if (node.namespaceURI !== "http://www.w3.org/1999/xhtml") continue;
+            const name = node.localName;
+            if (name === "datalist" || name === "hr" || name === "option") return null;
+            if (name === "optgroup") {
+                if (optgroup) return null;
+                optgroup = node;
+            }
+            if (name === "select") return node;
+        }
+        return null;
+    }
     class HTMLOptionElement extends HTMLElement {
-        get value() { const v = this.getAttribute("value"); return v === null ? this.textContent : v; }
+        get value() { const v = this.getAttribute("value"); return v === null ? collectOptionText(this) : v; }
         set value(v) { this.setAttribute("value", String(v)); }
+        get text() { return collectOptionText(this); }
+        set text(v) { this.textContent = String(v); }
+        get label() { const v = this.getAttribute("label"); return v === null ? collectOptionText(this) : v; }
+        set label(v) { this.setAttribute("label", String(v)); }
+        get index() {
+            const select = optionNearestAncestorSelect(this);
+            if (!select) return 0;
+            const index = Array.prototype.indexOf.call(selectOptions.call(select), this);
+            return index < 0 ? 0 : index;
+        }
+        get form() { const select = optionNearestAncestorSelect(this); return select ? select.form : null; }
         get selected() { return this.hasAttribute("selected"); }
         set selected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
         get defaultSelected() { return this.hasAttribute("selected"); }
@@ -13095,29 +13137,54 @@
         try { Object.defineProperty(__C, "name", { value: __n }); } catch (e) {}
         g[__n] = __C;
     }
-    g.Image = function Image(width, height) {
-        if (!new.target) throw new TypeError("Image constructor requires new");
+    // HTML #dom-image, #dom-audio and #dom-option are [LegacyFactoryFunction]s:
+    // Web IDL #legacy-factory-functions gives each length 0 and a fixed
+    // `prototype` property naming the interface prototype object, and a call
+    // without `new` throws. Arguments convert as their IDL types.
+    function legacyFactory(name, iface, steps) {
+        const factory = {[name]: function () {
+            if (!new.target) throw new TypeError(name + " constructor requires 'new'");
+            return Reflect.apply(steps, undefined, arguments);
+        }}[name];
+        Object.defineProperty(factory, "length", {value: 0, configurable: true});
+        Object.defineProperty(factory, "prototype", {value: iface.prototype,
+            writable: false, enumerable: false, configurable: false});
+        g[name] = factory;
+    }
+    const idlUnsignedLong = value => {
+        const number = Number(value);
+        if (!Number.isFinite(number)) return 0;
+        const integer = Math.trunc(number) % 4294967296;
+        return integer < 0 ? integer + 4294967296 : integer;
+    };
+    legacyFactory("Image", HTMLImageElement, function (width, height) {
         const image = g.document.createElement("img");
-        if (width !== undefined) image.width = width;
-        if (height !== undefined) image.height = height;
+        if (width !== undefined) image.setAttribute("width", String(idlUnsignedLong(width)));
+        if (height !== undefined) image.setAttribute("height", String(idlUnsignedLong(height)));
         return image;
-    };
-    g.Image.prototype = HTMLImageElement.prototype;
-    // `new Audio(src)` — the legacy HTMLAudioElement constructor (parallel to
-    // Image). Returns an <audio> element with no-op media methods: TRust never
-    // plays audio (the video→mpv / no-media ethos), but sites construct one for
-    // sound-effect preloading and feature detection — a bare `Audio` reference
-    // (ReferenceError when absent) silently broke YouTube's whole renderer family.
-    g.Audio = class {
-        constructor(src) {
-            const el = g.document.createElement("audio");
-            if (src !== undefined && src !== null) el.setAttribute("src", String(src));
-            // createElement('audio') wraps as HTMLAudioElement, so play/pause/
-            // load/canPlayType come from the HTMLMediaElement prototype;
-            // external-player formats do not imply inline audio support.
-            return el;
-        }
-    };
+    });
+    // TRust never plays audio inline (the video→mpv / no-media ethos), but
+    // sites construct audio elements for sound-effect preloading and feature
+    // detection; a bare `Audio` reference (ReferenceError when absent) broke
+    // YouTube's whole renderer family. play/pause/load/canPlayType come from
+    // the HTMLMediaElement prototype.
+    legacyFactory("Audio", HTMLAudioElement, function (src) {
+        const audio = g.document.createElement("audio");
+        audio.setAttribute("preload", "auto");
+        if (src !== undefined) audio.setAttribute("src", String(src));
+        return audio;
+    });
+    legacyFactory("Option", HTMLOptionElement, function (text = "", value, defaultSelected = false, selected = false) {
+        text = String(text);
+        const option = g.document.createElement("option");
+        if (text !== "") option.appendChild(g.document.createTextNode(text));
+        if (value !== undefined) option.setAttribute("value", String(value));
+        // TRust models an option's selectedness by its `selected` attribute
+        // (see HTMLOptionElement), so the two flags cannot diverge as HTML's
+        // steps 5–6 allow: either one selects the option.
+        if (defaultSelected || selected) option.setAttribute("selected", "");
+        return option;
+    });
     // Blob/File — a standard data container. Sites construct Blobs (object
     // URLs, upload chunking, sanitizer/worker plumbing) and a bare `Blob`
     // reference (ReferenceError when absent) silently broke YouTube renderers.
@@ -14316,6 +14383,53 @@
                         {value, writable: true, enumerable: true, configurable: true});
                 }}.set, "set " + name)});
         }
+        // CSSOM View #the-visualviewport-interface and #dom-window-visualviewport.
+        // TRust has no pinch zoom and no classic scrollbars that take up
+        // viewport space, so the visual viewport is the layout viewport: zero
+        // offsets, scale 1, the page scroll position and the viewport size.
+        class VisualViewport extends EventTarget {
+            constructor() { throw new TypeErrorCtor("Illegal constructor"); }
+        }
+        const viewportState = receiver => {
+            const state = read(receiver);
+            if (!state || state.visualViewport !== true)
+                throw new TypeErrorCtor("Illegal VisualViewport invocation");
+            return state;
+        };
+        const VISUAL_VIEWPORT_ATTRIBUTES = {
+            offsetLeft: () => 0, offsetTop: () => 0,
+            pageLeft: () => g.scrollX || 0, pageTop: () => g.scrollY || 0,
+            width: () => windowViewportDimension("width"),
+            height: () => windowViewportDimension("height"),
+            scale: () => 1,
+        };
+        for (const name of Object.keys(VISUAL_VIEWPORT_ATTRIBUTES)) {
+            const value = VISUAL_VIEWPORT_ATTRIBUTES[name];
+            define(VisualViewport.prototype, name, {configurable: true, enumerable: true,
+                get: named({get() { viewportState(this); return value(); }}.get, "get " + name)});
+        }
+        for (const type of ["resize", "scroll", "scrollend"]) {
+            define(VisualViewport.prototype, "on" + type, {configurable: true, enumerable: true,
+                get: named({get() { return viewportState(this).handlers[type] || null; }}.get, "get on" + type),
+                set: named({set(handler) {
+                    const handlers = viewportState(this).handlers;
+                    if (handlers[type]) this.removeEventListener(type, handlers[type]);
+                    handlers[type] = typeof handler === "function" ? handler : null;
+                    if (handlers[type]) this.addEventListener(type, handlers[type]);
+                }}.set, "set on" + type)});
+        }
+        define(VisualViewport.prototype, Symbol.toStringTag, {value: "VisualViewport", configurable: true});
+        define(g, "VisualViewport", {value: VisualViewport, writable: true, configurable: true});
+        const visualViewport = Reflect.construct(EventTarget, [], VisualViewport);
+        apply(set, slots, [visualViewport, {visualViewport: true, handlers: Object.create(null)}]);
+        visualViewportObject = read(g).visualViewport = visualViewport;
+        define(g, "visualViewport", {configurable: true, enumerable: true,
+            get: named({get() { return windowRecord(this).visualViewport || null; }}.get, "get visualViewport"),
+            set: named({set(value) {
+                windowRecord(this);
+                define(this === null || this === undefined ? g : this, "visualViewport",
+                    {value, writable: true, enumerable: true, configurable: true});
+            }}.set, "set visualViewport")});
     })();
     // CSSOM View #dom-window-screenx/#dom-window-screeny and Web IDL
     // #Replaceable: these are live, replaceable Window attributes, not mouse
@@ -15546,6 +15660,12 @@
         windowViewportWidth = w; windowViewportHeight = h;
         try { dispatch(g, new Event("resize"), false); }
         catch (e) { trust.errors.push("resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        // CSSOM View #run-the-resize-steps: the visual viewport's width and
+        // height follow the viewport, so it is resized after the Window.
+        if (visualViewportObject) {
+            try { dispatch(visualViewportObject, new Event("resize"), false); }
+            catch (e) { trust.errors.push("visualViewport resize handler: " + ((e && e.message) || e)); }
+        }
         // HTML's next rendering opportunity recalculates layout before CSSOM
         // View §13.1 runs resize steps for every nested Document. The actor's
         // rendering update invokes updateFrameResizes after fresh geometry;
