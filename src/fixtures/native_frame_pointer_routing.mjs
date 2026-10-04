@@ -85,6 +85,9 @@ globalThis.frameRoutingRun = function (textId, boxId) {
     // Touch Events: no legacy ontouch* handlers with maxTouchPoints 0.
     assert(navigator.maxTouchPoints === 0 && !('ontouchstart' in window) && !('ontouchstart' in document) &&
         !('ontouchstart' in child) && typeof TouchEvent === 'function', 'legacy touch handlers');
+    // CSSOM View: the web-exposed screen is the window's, in every navigable.
+    assert(child.screen.width === screen.width && child.screen.height === screen.height &&
+        child.screen.availWidth === screen.availWidth, 'screen consistent across navigables');
     return 'native-frame-pointer-routing-ok';
 
     function nodeIdOf(element) { return element.__id; }
