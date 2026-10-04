@@ -16462,7 +16462,8 @@ fn host_text_encoding_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 }
 
 /// Encoding #dom-textdecoder-decode for every encoding except UTF-8:
-/// (name, bytes, stream, fatal, ignoreBOM, handle) → [text, handle, failed].
+/// (name, bytes, stream, fatal, ignoreBOM, handle) → [text, handle, failed],
+/// where text is a string or, for the characters noted below, UTF-16 code units.
 fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let name = host_arg_string(ctx, args, 0);
     let bytes = args
@@ -16480,8 +16481,21 @@ fn host_text_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         .text_decoders
         .decode(&name, &bytes, flag(2), flag(3), flag(4), handle)
         .ok_or_else(|| ctx.make_error("RangeError", "The encoding is not supported"))?;
+    // Lumen's string representation reserves U+10F800..=U+10FFFF for lone
+    // surrogates, and `Value::from_string` reads a real scalar there as one.
+    // Such text (possible from UTF-16 and gb18030) crosses as code units.
+    let text = if decoded.text.chars().any(|c| c >= '\u{10f800}') {
+        let units = decoded
+            .text
+            .encode_utf16()
+            .map(|unit| Value::Num(f64::from(unit)))
+            .collect();
+        ctx.make_array(units)
+    } else {
+        Value::from_string(decoded.text)
+    };
     Ok(ctx.make_array(vec![
-        Value::from_string(decoded.text),
+        text,
         Value::Num(f64::from(decoded.handle)),
         Value::Bool(decoded.failed),
     ]))
@@ -20705,6 +20719,8 @@ mod tests {
                 throwsType(() => new TextDecoder('shift_jis', {fatal: true}).decode(bytes(0x82)), 'fatal');
                 // UTF-16: only a BOM of the decoder's own byte order is removed.
                 check(new TextDecoder('utf-16le').decode(bytes(0xff, 0xfe, 0x41, 0)) === 'A', 'utf-16le BOM');
+                check(new TextDecoder('utf-16be').decode(bytes(0xdb, 0xff, 0xdf, 0xfd, 0, 0x41)) === '\u{10fffd}A',
+                    'plane-16 private use characters');
                 check(new TextDecoder('utf-16le').decode(bytes(0xfe, 0xff, 0x41, 0)) === '￾A', 'no byte-order switch');
                 check(new TextDecoder('utf-16be', {ignoreBOM: true}).decode(bytes(0xfe, 0xff, 0, 0x41)) === '﻿A', 'ignoreBOM');
                 const utf8 = new TextDecoder();

@@ -236,6 +236,28 @@ mod tests {
     }
 
     #[test]
+    fn utf16_supplementary_characters_round_trip() {
+        let text = "z\u{a2}\u{6c34}\u{1d11e}\u{10bff}\u{10fffd}\u{fffe}";
+        let le: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let mut registry = Registry::default();
+        assert_eq!(
+            registry
+                .decode("utf-16le", &le, false, false, false, 0)
+                .unwrap()
+                .text,
+            text
+        );
+        assert_eq!(
+            registry
+                .decode("utf-16be", &be, false, false, false, 0)
+                .unwrap()
+                .text,
+            text
+        );
+    }
+
+    #[test]
     fn abandoned_streams_are_bounded() {
         let mut registry = Registry::default();
         let first = registry
