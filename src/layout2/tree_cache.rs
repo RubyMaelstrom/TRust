@@ -5,7 +5,7 @@
 //! The builder's input/output list state is explicit: a
 //! sibling's counter mutation may change this subtree without restyling it.
 
-use super::tree::{Atom, AtomKind, BoxNode, Built, Content, Inline};
+use super::tree::{Atom, AtomKind, BoxNode, Built, Content, Inline, SharedBox};
 use crate::dom::NodeId;
 use rustc_hash::FxHashMap;
 use std::mem::size_of;
@@ -124,7 +124,7 @@ fn atom_bytes(atom: &Atom) -> usize {
     }
 }
 
-fn inline_bytes(inline: &Inline) -> usize {
+fn inline_bytes(inline: &Inline, child: &mut dyn FnMut(&SharedBox) -> usize) -> usize {
     match inline {
         Inline::Text(t) => t.capacity(),
         Inline::Box { style, kids, .. } => {
@@ -132,42 +132,57 @@ fn inline_bytes(inline: &Inline) -> usize {
                 + 4 * size_of::<usize>()
                 + super::memo::box_style_bytes(style)
                 + kids.len() * size_of::<Inline>()
-                + kids.iter().map(inline_bytes).sum::<usize>()
+                + kids
+                    .iter()
+                    .map(|kid| inline_bytes(kid, child))
+                    .sum::<usize>()
         }
         Inline::Atom(atom) => atom_bytes(atom),
-        Inline::OutOfFlow(b) | Inline::Float(b) | Inline::AtomBox(b) => box_bytes(b),
+        Inline::OutOfFlow(b) | Inline::Float(b) | Inline::AtomBox(b) => child(b),
         Inline::Br => 0,
     }
 }
 
-fn boxes_bytes(boxes: &[super::tree::SharedBox], capacity: usize) -> usize {
-    capacity * size_of::<super::tree::SharedBox>()
-        + boxes.iter().map(|b| box_bytes(b)).sum::<usize>()
+fn boxes_bytes(
+    boxes: &[SharedBox],
+    capacity: usize,
+    child: &mut dyn FnMut(&SharedBox) -> usize,
+) -> usize {
+    capacity * size_of::<SharedBox>() + boxes.iter().map(child).sum::<usize>()
 }
 
+/// Requested storage of a box subtree, every shared descendant counted.
+#[cfg(test)]
 pub(super) fn box_bytes(b: &BoxNode) -> usize {
+    box_bytes_with(b, &mut |child| box_bytes(child))
+}
+
+/// `box_bytes` with each shared descendant box measured by `child`, so a
+/// caller can reuse the totals of unchanged shared subtrees.
+pub(super) fn box_bytes_with(b: &BoxNode, child: &mut dyn FnMut(&SharedBox) -> usize) -> usize {
     size_of::<BoxNode>()
         + 2 * size_of::<usize>()
         + super::memo::box_style_bytes(&b.style)
         + b.marker.as_ref().map_or(0, String::capacity)
         + b.marker_image.as_ref().map_or(0, String::capacity)
-        + b.oof.capacity() * std::mem::size_of::<(usize, super::tree::SharedBox)>()
-        + b.oof.iter().map(|(_, b)| box_bytes(b)).sum::<usize>()
+        + b.oof.capacity() * std::mem::size_of::<(usize, SharedBox)>()
+        + b.oof.iter().map(|(_, b)| child(b)).sum::<usize>()
         + match &b.content {
             Content::Blocks(bs) | Content::Flex(bs) | Content::Grid(bs) => {
-                boxes_bytes(bs, bs.capacity())
+                boxes_bytes(bs, bs.capacity(), child)
             }
             Content::Inlines(is) => {
-                is.capacity() * size_of::<Inline>() + is.iter().map(inline_bytes).sum::<usize>()
+                is.capacity() * size_of::<Inline>()
+                    + is.iter().map(|i| inline_bytes(i, child)).sum::<usize>()
             }
             Content::Atomic(a) => atom_bytes(a),
             Content::Table(t) => {
                 size_of::<super::tree::TableBox>()
-                    + boxes_bytes(&t.top_captions, t.top_captions.capacity())
-                    + boxes_bytes(&t.bottom_captions, t.bottom_captions.capacity())
+                    + boxes_bytes(&t.top_captions, t.top_captions.capacity(), child)
+                    + boxes_bytes(&t.bottom_captions, t.bottom_captions.capacity(), child)
                     + t.col_specs.capacity() * size_of::<Option<super::tree::ColSpec>>()
                     + t.cells.capacity() * size_of::<super::tree::TableCell>()
-                    + t.cells.iter().map(|c| box_bytes(&c.b)).sum::<usize>()
+                    + t.cells.iter().map(|c| child(&c.b)).sum::<usize>()
                     + t.collapsed.as_ref().map_or(0, |c| c.retained_bytes())
             }
         }
