@@ -410,6 +410,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     Object.defineProperty(g, "isSecureContext", {
         configurable: true, enumerable: true, value: !!cfg.secureContext, writable: false,
     });
+    // HTML #dom-origin and Web IDL #Replaceable. A worker's origin is opaque
+    // for a data: URL and otherwise its owner's (HTML #run-a-worker), which a
+    // same-origin or blob: script URL carries.
+    (function () {
+        var origin = lp[8] || "null";
+        var descriptor = {
+            configurable: true, enumerable: true,
+            get: function () { return origin; },
+            set: function (value) {
+                Object.defineProperty(g, "origin", { value: value, writable: true, enumerable: true, configurable: true });
+            },
+        };
+        Object.defineProperty(descriptor.get, "name", { value: "get origin", configurable: true });
+        Object.defineProperty(descriptor.set, "name", { value: "set origin", configurable: true });
+        Object.defineProperty(g, "origin", descriptor);
+    })();
     // HTML #dom-crossoriginisolated: the settings object's cross-origin
     // isolated capability. TRust does not yet isolate agent clusters with
     // COOP/COEP, so the host never sets cfg.crossOriginIsolated outside
