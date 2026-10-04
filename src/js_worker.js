@@ -355,23 +355,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         __worker_self_post(JSON.stringify(portAPI.serialize(message, portAPI.optionsTransfer(options))));
     };
     g.close = function () { __worker_self_close(); };
-    if (cfg.shared) {
-        // A shared worker's global is a SharedWorkerGlobalScope, which scripts
-        // use to tell the two worker kinds apart. Its members stay own
+    {
+        // HTML #the-workerglobalscope-common-interface, #dedicated-workers-and-the-
+        // dedicatedworkerglobalscope-interface and #shared-workers-and-the-
+        // sharedworkerglobalscope-interface: a worker's global is a
+        // DedicatedWorkerGlobalScope or a SharedWorkerGlobalScope, both
+        // inheriting WorkerGlobalScope. Scripts (and testharness.js) use these
+        // interfaces to tell the worker kinds apart. Their members stay own
         // properties of the global; only the interface chain is installed.
         const illegal = function () { throw new TypeError("Illegal constructor"); };
         const WorkerGlobalScope = function WorkerGlobalScope() { illegal(); };
-        const SharedWorkerGlobalScope = function SharedWorkerGlobalScope() { illegal(); };
+        const kind = cfg.shared ? "SharedWorkerGlobalScope" : "DedicatedWorkerGlobalScope";
+        const KindGlobalScope = { [kind]: function () { illegal(); } }[kind];
         Object.setPrototypeOf(WorkerGlobalScope, g.EventTarget);
         Object.setPrototypeOf(WorkerGlobalScope.prototype, g.EventTarget.prototype);
-        Object.setPrototypeOf(SharedWorkerGlobalScope, WorkerGlobalScope);
-        Object.setPrototypeOf(SharedWorkerGlobalScope.prototype, WorkerGlobalScope.prototype);
-        for (const [C, tag] of [[WorkerGlobalScope, "WorkerGlobalScope"], [SharedWorkerGlobalScope, "SharedWorkerGlobalScope"]]) {
+        Object.setPrototypeOf(KindGlobalScope, WorkerGlobalScope);
+        Object.setPrototypeOf(KindGlobalScope.prototype, WorkerGlobalScope.prototype);
+        for (const [C, tag] of [[WorkerGlobalScope, "WorkerGlobalScope"], [KindGlobalScope, kind]]) {
             Object.defineProperty(C, "prototype", {writable: false});
             Object.defineProperty(C.prototype, Symbol.toStringTag, {value: tag, configurable: true});
             Object.defineProperty(g, tag, {value: C, writable: true, configurable: true});
         }
-        Object.setPrototypeOf(g, SharedWorkerGlobalScope.prototype);
+        Object.setPrototypeOf(g, KindGlobalScope.prototype);
     }
 
     // --- timers / microtasks / performance ---
