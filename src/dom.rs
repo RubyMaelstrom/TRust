@@ -3046,6 +3046,15 @@ impl Dom {
         self.new_node(NodeData::Comment(text.to_string()))
     }
 
+    /// DOM #create-a-processing-instruction-node, after the caller's target
+    /// and data validation.
+    pub fn create_processing_instruction(&mut self, target: &str, data: &str) -> NodeId {
+        self.new_node(NodeData::ProcessingInstruction {
+            target: target.to_string(),
+            data: data.to_string(),
+        })
+    }
+
     /// DOM #concept-doctype (HTML #insert-a-doctype, DOM
     /// #dom-domimplementation-createdocumenttype).
     pub fn create_doctype(&mut self, name: &str, public_id: &str, system_id: &str) -> NodeId {
