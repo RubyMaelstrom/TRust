@@ -2743,13 +2743,22 @@ impl Dom {
         // CSS Overflow 3 #overflow-control: visible computes to auto when
         // the other axis has a scrollable value (including hidden). Use the
         // same resolved axes as CSSOM geometry and graphical scrollports.
-        crate::layout2::Overflow::axes(|p| self.computed_value_resolved(id, p))[1].user_scrollable()
+        self.overflow_axes(id)[1].user_scrollable()
+    }
+
+    /// The element's resolved overflow axes (`Overflow::axes` over its
+    /// resolved values), reading each longhand once.
+    pub(crate) fn overflow_axes(&self, id: NodeId) -> [crate::layout2::Overflow; 2] {
+        crate::layout2::Overflow::axes_from_longhands(
+            self.computed_value_resolved(id, "overflow-x"),
+            self.computed_value_resolved(id, "overflow-y"),
+        )
     }
 
     /// A horizontal scroll container (`overflow-x: auto|scroll`) — the strip
     /// axis of a carousel.
     pub fn is_hscroll_container(&self, id: NodeId) -> bool {
-        crate::layout2::Overflow::axes(|p| self.computed_value_resolved(id, p))[0].user_scrollable()
+        self.overflow_axes(id)[0].user_scrollable()
     }
 
     /// Whether this element clips its overflow on the BLOCK (vertical) axis —
@@ -2760,7 +2769,7 @@ impl Dom {
     /// scrollbar" trick must NOT read as a locked viewport.
     fn clips_block_axis(&self, id: NodeId) -> bool {
         matches!(
-            crate::layout2::Overflow::axes(|p| self.computed_value_resolved(id, p))[1],
+            self.overflow_axes(id)[1],
             crate::layout2::Overflow::Hidden | crate::layout2::Overflow::Clip
         )
     }

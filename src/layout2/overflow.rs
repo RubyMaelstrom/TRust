@@ -38,13 +38,39 @@ impl Overflow {
     }
 
     pub fn axes(cv: impl Fn(&str) -> Option<String>) -> [Self; 2] {
-        let shorthand = cv("overflow").unwrap_or_default();
+        Self::axes_from(cv("overflow"), cv("overflow-x"), cv("overflow-y"))
+    }
+
+    /// `axes` for a reader whose `overflow` value is the CSSOM serialization
+    /// of its two longhands, as `computed_value_resolved` produces it: each
+    /// longhand is read once instead of again through the shorthand.
+    pub fn axes_from_longhands(x: Option<String>, y: Option<String>) -> [Self; 2] {
+        let shorthand = (x.is_some() || y.is_some()).then(|| {
+            let (x, y) = (
+                x.as_deref().unwrap_or("visible"),
+                y.as_deref().unwrap_or("visible"),
+            );
+            if x == y {
+                x.to_string()
+            } else {
+                format!("{x} {y}")
+            }
+        });
+        Self::axes_from(shorthand, x, y)
+    }
+
+    fn axes_from(
+        shorthand: Option<String>,
+        longhand_x: Option<String>,
+        longhand_y: Option<String>,
+    ) -> [Self; 2] {
+        let shorthand = shorthand.unwrap_or_default();
         let mut tokens = shorthand.split_whitespace();
         let x = tokens.next().unwrap_or("visible");
         let y = tokens.next().unwrap_or(x);
         let mut axes = [
-            Self::parse(cv("overflow-x").as_deref().unwrap_or(x)),
-            Self::parse(cv("overflow-y").as_deref().unwrap_or(y)),
+            Self::parse(longhand_x.as_deref().unwrap_or(x)),
+            Self::parse(longhand_y.as_deref().unwrap_or(y)),
         ];
         let scrollable = axes.map(Self::scrollable);
         for axis in 0..2 {
@@ -62,7 +88,7 @@ pub(super) fn overflow_axes(dom: &Dom, node: NodeId) -> [String; 2] {
     if node == NO_NODE {
         return ["visible".into(), "visible".into()];
     }
-    Overflow::axes(|property| dom.computed_value_resolved(node, property)).map(|v| {
+    dom.overflow_axes(node).map(|v| {
         match v {
             Overflow::Visible => "visible",
             Overflow::Clip => "clip",
