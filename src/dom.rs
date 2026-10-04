@@ -117,6 +117,45 @@ pub struct DocumentTypeInfo {
     pub system_id: String,
 }
 
+/// DOM strings (text, attributes, CSSOM values) live as Lumen engine text (see
+/// `lumen_backend::host_arg_string`): a character in U+10F800..=U+10FFFF is the pair of
+/// private-use scalars that encodes its surrogate pair, and a lone surrogate is one such scalar.
+/// For display, combine each pair into the character it encodes. A single scalar is left as it
+/// is: documents built without the script boundary may hold that real private-use character.
+pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
+    const HIGH: std::ops::RangeInclusive<u32> = 0x10F800..=0x10FBFF;
+    const LOW: std::ops::RangeInclusive<u32> = 0x10FC00..=0x10FFFF;
+    if !text.as_bytes().contains(&0xF4) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut changed = false;
+    while let Some(c) = chars.next() {
+        let high = c as u32;
+        if HIGH.contains(&high) {
+            if let Some(&next) = chars.peek() {
+                let low = next as u32;
+                if LOW.contains(&low) {
+                    let point = 0x10000 + ((high - 0x10F800) << 10) + (low - 0x10FC00);
+                    if let Some(character) = char::from_u32(point) {
+                        chars.next();
+                        out.push(character);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(c);
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 pub enum NodeData {
     Document,
     /// A document fragment: template contents, fragment-parse roots.
@@ -20079,6 +20118,16 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_text_shows_plane_16_characters_stored_as_engine_text() {
+        // Engine text stores U+10FFFD as the scalars for its surrogates DBFF DFFD.
+        let stored = lumen::embed::text_to_engine("a\u{10FFFD}b\u{10F800}");
+        assert_eq!(display_text(&stored), "a\u{10FFFD}b\u{10F800}");
+        // A lone surrogate (one scalar) and plain text stay as they are.
+        assert_eq!(display_text("x\u{10F800}y"), "x\u{10F800}y");
+        assert!(matches!(display_text("plain é"), std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn line_height_computes_lengths_before_inheriting_and_resolves_numbers_for_cssom() {

@@ -287,8 +287,10 @@ fn node_role(dom: &Dom, node: NodeId, controls: &ControlMap, forms: &[Form]) -> 
     }
 }
 
+/// Accessibility output is text: DOM strings are engine text (see `crate::dom::display_text`).
 fn accessible_name(dom: &Dom, node: NodeId, field_label: Option<&str>) -> String {
-    dom.attr(node, "aria-label")
+    let name = dom
+        .attr(node, "aria-label")
         .or_else(|| dom.attr(node, "alt"))
         .or_else(|| dom.attr(node, "title"))
         .or(field_label.filter(|label| !label.is_empty()))
@@ -298,13 +300,14 @@ fn accessible_name(dom: &Dom, node: NodeId, field_label: Option<&str>) -> String
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
-        })
+        });
+    crate::dom::display_text(&name).into_owned()
 }
 
 pub fn document_title(dom: &Dom) -> String {
     dom.descendants(DOCUMENT)
         .find(|node| dom.tag_name(*node) == Some("title"))
-        .map(|node| dom.text_content(node).trim().to_string())
+        .map(|node| crate::dom::display_text(dom.text_content(node).trim()).into_owned())
         .unwrap_or_default()
 }
 

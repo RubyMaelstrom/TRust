@@ -120,11 +120,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             op = "uniform".into();
         }
     }
-    let text = if let Value::Str(s) = &payload {
-        s.to_string()
-    } else {
-        String::new()
-    };
+    let text = payload.as_text().unwrap_or_default().into_owned();
     let bytes = if matches!(
         op.as_str(),
         "bufferData" | "bufferSubData" | "texImage2D" | "texSubImage2D" | "readPixels"

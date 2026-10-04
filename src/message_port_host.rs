@@ -301,7 +301,8 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         )
     };
     match result {
-        Ok(value) => Ok(Value::from_string(value.to_string())),
+        // Serialized messages are DOM engine text (see `host_arg_string`).
+        Ok(value) => Ok(Value::from_engine_text(value.to_string())),
         Err(message) => Err(ctx.make_error("QuotaExceededError", message)),
     }
 }
