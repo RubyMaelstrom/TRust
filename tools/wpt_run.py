@@ -490,6 +490,12 @@ def normalize_message(message):
 
 
 def group_of(source, depth):
+    if isinstance(depth, (list, tuple)):
+        # Group by the longest requested path that contains the source.
+        matches = [path for path in depth if source == path or source.startswith(path.rstrip("/") + "/")]
+        if matches:
+            return max(matches, key=len)
+        depth = 2
     parts = source.split("/")[:-1]
     return "/".join(parts[:depth]) if parts else "(root)"
 
@@ -613,7 +619,8 @@ def main():
                         help="testharness timeout_multiplier (normal 10 s, long 60 s)")
     parser.add_argument("--grace", type=float, default=8.0,
                         help="seconds beyond the harness timeout before the browser is killed")
-    parser.add_argument("--depth", type=int, default=2, help="directory depth for the summary matrix")
+    parser.add_argument("--depth", type=int, default=2,
+                        help="directory depth for the summary matrix; 0 groups by the requested paths")
     parser.add_argument("--baseline", type=pathlib.Path, help="earlier results.jsonl to compare against")
     parser.add_argument("--list", action="store_true", help="list the selected test URLs and exit")
     parser.add_argument("--serve", action="store_true",
@@ -624,7 +631,14 @@ def main():
     baseline = load_records(args.baseline) if args.baseline else None
     if args.summarize:
         output = args.summarize.resolve().parent
-        print(write_summary(load_records(args.summarize), output, args.depth, baseline))
+        depth = args.depth
+        if depth == 0:
+            try:
+                depth = [path.split("?", 1)[0].strip("/")
+                         for path in json.loads((output / "run.json").read_text())["paths"]]
+            except (OSError, ValueError, KeyError):
+                depth = 2
+        print(write_summary(load_records(args.summarize), output, depth, baseline))
         return 0
     if args.wpt is None or not (args.wpt / "resources" / "testharness.js").is_file():
         parser.error("pass --wpt or set TRUST_WPT_ROOT to a web-platform-tests checkout")
@@ -704,7 +718,8 @@ def main():
                  "timeout_multiplier": args.timeout_multiplier,
                  "elapsed_seconds": round(time.monotonic() - started, 1)}
     (output / "run.json").write_text(json.dumps(meta_info, indent=2) + "\n")
-    print(write_summary(records, output, args.depth, baseline))
+    depth = [path.split("?", 1)[0].strip("/") for path in args.paths] if args.depth == 0 else args.depth
+    print(write_summary(records, output, depth, baseline))
     print(f"elapsed {meta_info['elapsed_seconds']} s; results in {output}")
     return 0
 
