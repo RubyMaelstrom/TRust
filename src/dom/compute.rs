@@ -728,6 +728,10 @@ impl Dom {
         ComputeView(self).has_marker_style(id)
     }
     #[inline]
+    pub(crate) fn has_placeholder_style(&self, id: NodeId) -> bool {
+        ComputeView(self).has_placeholder_style(id)
+    }
+    #[inline]
     pub(crate) fn pseudo_layout_value(
         &self,
         id: NodeId,

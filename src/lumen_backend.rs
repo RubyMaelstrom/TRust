@@ -15039,9 +15039,20 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     if matches!(op.as_str(), "computed-names" | "computed-pseudo") {
         let value = read_layout_dependent_style(ctx, |dom| {
             if let Ok((id, pseudo)) = serde_json::from_str::<(usize, Option<String>)>(&text) {
+                // CSSOM #dom-window-getcomputedstyle parses the argument as a
+                // <pseudo-element-selector>: CSS2's single-colon spellings
+                // too, and ::placeholder's legacy aliases (CSS Pseudo 4
+                // #placeholder-pseudo; Selectors 4 #legacy-aliasing).
                 let which = match pseudo.as_deref() {
                     Some(":before" | "::before") => Some(crate::dom::PseudoEl::Before),
                     Some(":after" | "::after") => Some(crate::dom::PseudoEl::After),
+                    Some(":first-letter" | "::first-letter") => {
+                        Some(crate::dom::PseudoEl::FirstLetter)
+                    }
+                    Some("::marker") => Some(crate::dom::PseudoEl::Marker),
+                    Some(
+                        "::placeholder" | "::-webkit-input-placeholder" | "::-moz-placeholder",
+                    ) => Some(crate::dom::PseudoEl::Placeholder),
                     _ => None,
                 };
                 if !dom.is_valid(id) || !dom.is_connected(id) || pseudo.is_some() && which.is_none()
@@ -15055,7 +15066,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     serde_json::json!(dom.cssom_computed_names(id, which))
                 } else {
                     serde_json::json!(
-                        which.and_then(|which| dom.pseudo_layout_value(id, which, &extra))
+                        which.and_then(|which| dom.cssom_pseudo_resolved_value(id, which, &extra))
                     )
                 }
             } else {
@@ -19991,6 +20002,42 @@ mod tests {
             "2px|rgb(255, 0, 0)|rgb(10, 11, 12)|rgb(64, 191, 64)|rgb(10, 11, 12)|\
              3px|0px|rgb(0, 0, 0)|5px|rgba(0, 0, 0, 0.5)|\
              none|rgb(0, 0, 0)|rgba(0, 0, 0, 0)|start|baseline|none|auto|0|auto|normal"
+        );
+    }
+
+    #[test]
+    fn computed_style_serializes_shorthands_numbers_and_placeholders() {
+        // CSSOM #dom-window-getcomputedstyle: shorthands serialize from their
+        // longhands (#dom-cssstyledeclaration-getpropertyvalue), numbers and
+        // radii in their shortest forms (#serialize-a-css-value), and a
+        // ::placeholder argument (or a legacy alias of it) selects that
+        // pseudo-element (CSS Pseudo 4 #placeholder-pseudo).
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><style>#p::placeholder{color:green}\
+                     #p{opacity:.5;border-radius:20px;border-top-left-radius:7px;margin:1px 2px}\
+                     </style><input id=p placeholder=x><input id=q placeholder=y>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const p = document.getElementById('p'), q = document.getElementById('q');
+            const s = getComputedStyle(p);
+            [s.opacity, s.borderRadius, s.borderTopLeftRadius, s.getPropertyValue('border-radius'),
+             s.margin, getComputedStyle(p, '::placeholder').color,
+             getComputedStyle(q, '::placeholder').color,
+             getComputedStyle(p, '::-webkit-input-placeholder').color,
+             getComputedStyle(p, ':placeholder').color].join('|');
+        "#
+            ),
+            "0.5|7px 20px 20px|7px|7px 20px 20px|1px 2px|rgb(0, 128, 0)|rgba(0, 0, 0, 0.54)|\
+             rgb(0, 128, 0)|"
         );
     }
 

@@ -1289,6 +1289,22 @@ thread_local! {
 }
 
 /// Shape one unbroken text piece at CSS-pixel scale.
+/// Move `shaped`'s glyphs so that its line box is vertically centered in a
+/// line `line_height` tall, which then becomes its line height. A text
+/// control centers its one line of text in its content box; text in another
+/// font than the control's (its `::placeholder`) keeps that center.
+pub(crate) fn center_in_line(shaped: &mut ShapedText, line_height: f32) {
+    let dy = (line_height - shaped.line_height) / 2.0;
+    if !dy.is_finite() || dy == 0.0 {
+        return;
+    }
+    for glyph in shaped.runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
+        glyph.y += dy;
+    }
+    shaped.baseline += dy;
+    shaped.line_height = line_height;
+}
+
 pub fn shape(text: &str, style: &TextStyle) -> ShapedText {
     TEXT.with_borrow_mut(|system| system.shape(text, style))
 }

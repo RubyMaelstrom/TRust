@@ -400,6 +400,14 @@ pub struct RichEditorPresentation {
 pub struct NativeInputPresentation {
     pub node: NodeId,
     pub placeholder: String,
+    /// CSS Pseudo 4 #placeholder-pseudo: the text style, fill color and
+    /// group opacity of the control's `::placeholder`, shown while the
+    /// edited value is empty.
+    pub placeholder_style: crate::text::TextStyle,
+    pub placeholder_color: crate::render::PaintColor,
+    pub placeholder_opacity: f32,
+    /// The fill color of the control's own text.
+    pub text_color: crate::render::PaintColor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -469,8 +477,11 @@ pub(crate) fn rich_editor_presentation(
                 None
             }
         })?;
-        let style =
-            style::InlineStyle::derive(dom, node, &style::InlineStyle::root(), base).text_style();
+        let control = style::InlineStyle::derive(dom, node, &style::InlineStyle::root(), base);
+        let style = control.text_style();
+        let placeholder_style = control.placeholder(dom).text_style();
+        let (text_color, placeholder_color, placeholder_opacity) =
+            graphics::control_text_paint(dom, node);
         let caret_color = dom
             .computed_value_resolved(node, "caret-color")
             .filter(|v| !matches!(v.trim(), "auto" | "currentcolor" | "currentColor"))
@@ -489,7 +500,15 @@ pub(crate) fn rich_editor_presentation(
             pending_text: None,
             native_input: Some(NativeInputPresentation {
                 node,
-                placeholder: dom.attr(node, "placeholder").unwrap_or_default().to_owned(),
+                // HTML #attr-input-placeholder: shown with newlines stripped.
+                placeholder: dom
+                    .attr(node, "placeholder")
+                    .unwrap_or_default()
+                    .replace(['\n', '\r'], ""),
+                placeholder_style,
+                placeholder_color,
+                placeholder_opacity,
+                text_color,
             }),
         });
     }
@@ -6669,6 +6688,104 @@ b</xmp></body>"#;
             "{q_box:?} {q_glyph:?}"
         );
         assert!(r_box.width > q_box.width, "{q_box:?} {r_box:?}");
+    }
+
+    #[test]
+    fn placeholder_text_paints_with_its_pseudo_element_style() {
+        // CSS Pseudo 4 #placeholder-pseudo: a control presenting its
+        // placeholder (HTML #attr-input-placeholder) paints it in the
+        // ::placeholder style, whose legacy aliases also apply; the control's
+        // own box and line remain. The UA color is the control's color at
+        // 54% alpha, and only the types the attribute applies to show it.
+        use crate::render::{PaintColor, Primitive};
+        let html = r#"<!doctype html><style>body{margin:0;font:16px sans-serif}
+            input,textarea{display:block;width:300px;font:16px sans-serif;color:#000;
+            padding:0;border:0;background:none}
+            #a::placeholder{color:rgb(0,128,0);font-size:24px;text-align:right;
+            text-transform:uppercase}
+            #b::-webkit-input-placeholder{color:red;opacity:.5}
+            #c::placeholder{visibility:hidden}
+            #ta::-moz-placeholder{color:rgb(128,0,128)}
+            </style><input id=plain placeholder=plain><input id=a placeholder=big>
+            <input id=b placeholder=faded><input id=c placeholder=hidden>
+            <input id=v placeholder=hint value=typed><input id=pw type=password placeholder=secret>
+            <input id=n type=number placeholder=count><input id=d type=date placeholder=never>
+            <textarea id=ta placeholder=area></textarea>"#;
+        let layout = lay_graphical(html, 640.0, &HashMap::new());
+        let primitives = &layout.paint.primitives;
+        let run = |text: &str| {
+            primitives
+                .iter()
+                .enumerate()
+                .find_map(|(index, p)| match p {
+                    Primitive::GlyphRun {
+                        shaped,
+                        color,
+                        origin,
+                        ..
+                    } if shaped.text == text => Some((index, *color, *origin, shaped)),
+                    _ => None,
+                })
+        };
+        let (_, color, _, plain) = run("plain").expect("UA placeholder");
+        assert!(
+            matches!(color, PaintColor::Rgba(0, 0, 0, 137..=138)),
+            "{color:?}"
+        );
+        let (_, color, origin, big) = run("BIG").expect("transformed placeholder");
+        assert_eq!(color, PaintColor::Rgba(0, 128, 0, 255));
+        assert_eq!(big.runs[0].font_size, 24.0);
+        assert!(
+            (origin.x + big.advance - 300.0).abs() < 0.5,
+            "right-aligned: {origin:?} {}",
+            big.advance
+        );
+        assert_eq!(
+            big.line_height, plain.line_height,
+            "centered on the control's own line"
+        );
+        let dom = Dom::parse_document(html);
+        let height = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()].height;
+        assert_eq!(height("a"), height("plain"), "the control keeps its size");
+        let (index, color, _, _) = run("faded").expect("aliased placeholder");
+        assert_eq!(color, PaintColor::Rgba(255, 0, 0, 255));
+        assert!(
+            matches!(&primitives[index - 1], Primitive::PushLayer(layer) if layer.opacity == 0.5)
+                && matches!(
+                    primitives[index + 1..]
+                        .iter()
+                        .find(|p| !matches!(p, Primitive::HitRegion(_))),
+                    Some(Primitive::PopLayer)
+                ),
+            "opacity groups the placeholder text"
+        );
+        assert!(run("hidden").is_none(), "visibility: hidden");
+        assert_eq!(run("typed").unwrap().1, PaintColor::Rgba(0, 0, 0, 255));
+        assert!(run("hint").is_none());
+        assert!(run("secret").is_some() && run("count").is_some());
+        assert!(run("never").is_none(), "date inputs have no placeholder");
+        assert_eq!(run("area").unwrap().1, PaintColor::Rgba(128, 0, 128, 255));
+
+        // Terminal cells carry no CSS color; a placeholder that paints
+        // nothing leaves its widget blank.
+        let out = lay_with_forms(
+            r#"<style>#c::placeholder{visibility:hidden}</style><form>
+            <input id=c name=c placeholder=hidden><input name=d placeholder=shown></form>"#,
+            80,
+            &HashMap::new(),
+        );
+        let widgets: Vec<&str> = out
+            .rows
+            .iter()
+            .flat_map(|row| row.items.iter())
+            .filter(|item| item.kind == ItemKind::Form)
+            .map(|item| item.text.as_str())
+            .collect();
+        assert!(
+            widgets[0].starts_with("[      ") && !widgets[0].contains("hidden"),
+            "{widgets:?}"
+        );
+        assert!(widgets[1].starts_with("[shown"), "{widgets:?}");
     }
 
     #[test]

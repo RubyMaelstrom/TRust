@@ -1029,6 +1029,22 @@ pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
     Align2::Left
 }
 
+/// The `text-align` of text control `id`'s `::placeholder` text. CSS
+/// Pseudo 4 #placeholder-pseudo notes that authors want it to apply, and
+/// #first-line-styling lets user agents apply further properties; TRust
+/// applies it, as Blink and Gecko do. It inherits the control's alignment.
+pub(crate) fn placeholder_align(dom: &Dom, id: NodeId) -> Align2 {
+    if dom.has_placeholder_style(id)
+        && let Some(align) = dom
+            .pseudo_layout_value(id, PseudoEl::Placeholder, "text-align")
+            .as_deref()
+            .and_then(align_from_css)
+    {
+        return align;
+    }
+    block_align(dom, id)
+}
+
 /// The legacy HTML rendering alignment inherited by an over-constrained
 /// descendant block.  This is deliberately separate from [`block_align`]:
 /// ordinary CSS `text-align` positions inline content, while WHATWG HTML
@@ -1621,6 +1637,25 @@ impl InlineStyle {
                     .as_deref(),
                 Some("hidden" | "collapse")
             );
+        std::borrow::Cow::Owned(s)
+    }
+}
+
+impl InlineStyle {
+    /// The text of text control `self.node`'s `::placeholder`, which
+    /// inherits from the control (CSS Pseudo 4 #treelike). CSS Pseudo 4
+    /// #placeholder-pseudo applies the ::first-line properties
+    /// (#first-line-styling) except those of CSS Inline 3, so the control's
+    /// `line-height` and `vertical-align` remain; `writing-mode`,
+    /// `direction` and `text-orientation` never apply. Font, spacing,
+    /// transform, decoration, visibility and white-space declarations do.
+    pub fn placeholder(&self, dom: &Dom) -> std::borrow::Cow<'_, Self> {
+        if self.node == NO_NODE || !dom.has_placeholder_style(self.node) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut s = self.with_pseudo(dom, Some((self.node, PseudoEl::Placeholder)));
+        s.line_height = self.line_height;
+        s.vertical_align = self.vertical_align;
         std::borrow::Cow::Owned(s)
     }
 }
