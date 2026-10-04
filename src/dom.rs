@@ -7703,14 +7703,29 @@ impl Dom {
     /// that generate no boxes.
     pub(crate) fn flat_descendants(&self, root: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
-        let mut stack = self.flat_children(root);
-        stack.reverse();
+        let mut stack = Vec::new();
+        self.push_flat_children_reversed(root, &mut stack);
         while let Some(id) = stack.pop() {
             out.push(id);
-            let children = self.flat_children(id);
-            stack.extend(children.into_iter().rev());
+            self.push_flat_children_reversed(id, &mut stack);
         }
         out
+    }
+
+    /// Push `flat_children(id)` onto `stack` in reverse order, without an
+    /// intermediate list when no `<slot>` needs projecting.
+    fn push_flat_children_reversed(&self, id: NodeId, stack: &mut Vec<NodeId>) {
+        let start = stack.len();
+        let parent = self.shadow_root(id).unwrap_or(id);
+        if self
+            .child_iter(parent)
+            .any(|child| self.tag_name(child) == Some("slot"))
+        {
+            stack.extend(self.flat_children(id));
+        } else {
+            stack.extend(self.child_iter(parent));
+        }
+        stack[start..].reverse();
     }
 
     /// The light-DOM nodes assigned to a `<slot>` (HTML §4.8.2 slot
