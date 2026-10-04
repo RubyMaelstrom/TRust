@@ -5983,7 +5983,35 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.CSSStyleDeclaration = CSSStyleDeclaration;
     g.CSSStyleProperties = CSSStyleDeclaration;
 
-    function emptyTimeRanges() { return { length: 0, start() { return 0; }, end() { return 0; } }; }
+    // HTML #time-ranges: a static normalized list of [start, end] ranges in
+    // seconds. Media elements here have buffered, played and seekable no data.
+    class TimeRanges {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() { return timeRangeList(this).length; }
+        start(index) { return timeRangeEdge(this, index, arguments.length, 0); }
+        end(index) { return timeRangeEdge(this, index, arguments.length, 1); }
+    }
+    function timeRangeList(ranges) {
+        const list = internalsOf(ranges).timeRanges;
+        if (!list) throw new TypeError("Illegal invocation");
+        return list;
+    }
+    function timeRangeEdge(ranges, index, count, edge) {
+        const list = timeRangeList(ranges);
+        if (count < 1) throw new TypeError("1 argument required");
+        index = index >>> 0;
+        if (index >= list.length) throw new DOMException("Index " + index + " is out of range", "IndexSizeError");
+        return list[index][edge];
+    }
+    for (const name of ["length", "start", "end"])
+        Object.defineProperty(TimeRanges.prototype, name, {enumerable: true});
+    Object.defineProperty(g, "TimeRanges", {value: TimeRanges, writable: true, configurable: true});
+    // HTML #dom-media-buffered etc.: a new static TimeRanges object per read.
+    function emptyTimeRanges() {
+        const ranges = Object.create(TimeRanges.prototype);
+        internalsFor(ranges).timeRanges = [];
+        return ranges;
+    }
     function emptyTrackList() { const l = []; l.getTrackById = () => null; l.addEventListener = () => {}; l.removeEventListener = () => {}; return l; }
     // The WebIDL brand for an HTML element, i.e. what
     // `Object.prototype.toString.call(el)` must report ("[object HTMLDivElement]").

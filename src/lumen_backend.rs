@@ -18544,6 +18544,26 @@ mod tests {
     }
 
     #[test]
+    fn media_time_ranges_are_static_time_ranges() {
+        // HTML #time-ranges and #dom-media-buffered: a new TimeRanges object
+        // per read; start()/end() past the end throw IndexSizeError.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const video = document.createElement('video');\n\
+                 const ranges = video.buffered;\n\
+                 let start; try { ranges.start(0); } catch (e) { start = e.name; }\n\
+                 let constructed; try { new TimeRanges(); } catch (e) { constructed = e.name; }\n\
+                 [tag(ranges), tag(video.played), tag(video.seekable), ranges.length,\n\
+                  ranges === video.buffered, start, constructed].join('|')"
+            ),
+            "TimeRanges|TimeRanges|TimeRanges|0|false|IndexSizeError|TypeError"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or
