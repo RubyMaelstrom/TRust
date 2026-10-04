@@ -9,13 +9,14 @@
 //! resolved only after the final containing blocks and static positions exist
 //! (CSS Positioned Layout 3 #def-cb). Never reuse resolved fixed-list indices.
 
-use super::flow::{Frag, FragKind, GridTrackMap};
+use super::flow::{Frag, FragKind, GridTrackMap, LineFrag};
 use super::style::{BoxStyle, InlineStyle};
-use super::tree::BoxNode;
+use super::tree::{BoxNode, SharedBox};
 use super::value::{Len, Node, Vp};
 use super::{ControlMap, Dom, Form, ImageSizes, NodeId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem::size_of;
+use std::sync::Arc;
 use url::Url;
 
 // One foreground page owns this cache. Large galleries exceed the former
@@ -279,6 +280,7 @@ pub(crate) struct LayoutCache {
     clock: u64,
     recency: super::cache_order::Recency,
     inputs: inputs::Tracker,
+    shared_bytes: SharedBytes,
     pub(super) item_hits: usize,
     pub(super) intrinsic_hits: usize,
 }
@@ -331,6 +333,7 @@ impl LayoutCache {
     ) -> bool {
         self.item_hits = 0;
         self.intrinsic_hits = 0;
+        self.end_pass();
         #[cfg(test)]
         if self.cold {
             self.clear();
@@ -460,6 +463,12 @@ impl LayoutCache {
             }
         }
         true
+    }
+
+    /// Release the payloads counted during a layout pass. The next pass
+    /// builds new boxes, so their addresses are not comparable.
+    pub(super) fn end_pass(&mut self) {
+        self.shared_bytes = SharedBytes::default();
     }
 
     pub(super) fn replay_inputs(&mut self, inputs: &Inputs) {
@@ -636,7 +645,7 @@ impl LayoutCache {
         }
         // Reject oversized results before allocating a copy. The source's
         // Vec capacities conservatively cover the retained clone's storage.
-        let fragment_payload = fragment_bytes(fragment);
+        let fragment_payload = fragment_bytes(fragment, &mut self.shared_bytes);
         if fragment_payload > MAX_ENTRY_BYTES {
             return;
         }
@@ -674,26 +683,55 @@ impl LayoutCache {
     }
 }
 
-fn fragment_bytes(fragment: &Frag) -> usize {
+/// Retained-byte totals of the Arc-shared payloads in fragments being stored,
+/// valid for one layout pass. Every ancestor store measures its complete
+/// subtree again, and an out-of-flow placeholder's box can hold a whole child
+/// Document. Shared payloads never change in place (`Arc::make_mut` copies a
+/// shared one), and holding each counted Arc keeps its address from naming a
+/// different payload, so a total is computed once and reused unchanged.
+#[derive(Default)]
+struct SharedBytes {
+    lines: FxHashMap<usize, (Arc<LineFrag>, usize)>,
+    boxes: FxHashMap<usize, (SharedBox, usize)>,
+}
+
+impl SharedBytes {
+    fn line(&mut self, line: &Arc<LineFrag>) -> usize {
+        self.lines
+            .entry(Arc::as_ptr(line) as usize)
+            .or_insert_with(|| {
+                let bytes = size_of::<LineFrag>()
+                    + 2 * size_of::<usize>()
+                    + (line.pieces.capacity() + line.atom_boxes.capacity())
+                        * size_of::<super::inline::Piece>()
+                    + line
+                        .pieces
+                        .iter()
+                        .chain(&line.atom_boxes)
+                        .map(super::inline::Piece::retained_bytes)
+                        .sum::<usize>();
+                (line.clone(), bytes)
+            })
+            .1
+    }
+
+    fn boxed(&mut self, b: &SharedBox) -> usize {
+        self.boxes
+            .entry(Arc::as_ptr(b) as usize)
+            .or_insert_with(|| (b.clone(), super::tree_cache::box_bytes(b)))
+            .1
+    }
+}
+
+fn fragment_bytes(fragment: &Frag, shared: &mut SharedBytes) -> usize {
     let own = match &fragment.kind {
-        FragKind::Line(line) => {
-            size_of::<super::flow::LineFrag>()
-                + 2 * size_of::<usize>()
-                + (line.pieces.capacity() + line.atom_boxes.capacity())
-                    * size_of::<super::inline::Piece>()
-                + line
-                    .pieces
-                    .iter()
-                    .chain(&line.atom_boxes)
-                    .map(super::inline::Piece::retained_bytes)
-                    .sum::<usize>()
-        }
+        FragKind::Line(line) => shared.line(line),
         FragKind::TableCell(layers) => std::mem::size_of_val(layers.as_ref()),
         FragKind::Oof(b, placeholder) => {
             // Count every shared dependency conservatively, even when also
             // reachable from another cache entry or the box-tree cache.
             let inl = &placeholder.ctx;
-            super::tree_cache::box_bytes(b)
+            shared.boxed(b)
                 + size_of::<super::flow::OofStatic>()
                 + inl.font_family.capacity()
                 + inl.language.as_ref().map_or(0, String::capacity)
@@ -706,7 +744,11 @@ fn fragment_bytes(fragment: &Frag) -> usize {
         .as_ref()
         .map_or(0, |collapsed| collapsed.retained_bytes());
     own + fragment.children.capacity() * size_of::<Frag>()
-        + fragment.children.iter().map(fragment_bytes).sum::<usize>()
+        + fragment
+            .children
+            .iter()
+            .map(|child| fragment_bytes(child, shared))
+            .sum::<usize>()
 }
 
 #[cfg(test)]
@@ -1573,6 +1615,64 @@ pub(super) mod tests {
         dom.set_render_clickables([dom.get_by_id("box").unwrap()].into_iter().collect(), true);
         assert_cold(&mut dom, &base, vp, &[], &controls, &images);
         crate::img::record_svg_intrinsic_metadata(source, b"not svg");
+    }
+
+    #[test]
+    fn shared_payload_totals_do_not_change_entry_accounting() {
+        // Ancestor stores re-measure shared lines and out-of-flow boxes from
+        // the pass memo. Every total must equal a fresh measurement, so cache
+        // admission and eviction are unchanged by the memo.
+        let dom = Dom::parse_document(
+            r#"<style>
+            main { display:flex; gap:4px; width:500px; position:relative }
+            section { padding:3px } .abs { position:absolute; right:2px; top:3px; width:40px }
+            </style><main><section><p>alpha beta gamma delta epsilon zeta eta theta</p>
+            <div class=abs><p>positioned text inside a box</p></div></section>
+            <section><span>more inline text</span><div class=abs>second</div></section></main>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let _inputs = crate::layout2::stable_global_layout_inputs();
+        measure_retained_layout(
+            &dom,
+            &base,
+            Viewport::new(640., 480.),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+        );
+        fn kinds(fragment: &Frag, lines: &mut usize, boxes: &mut usize) {
+            match fragment.kind {
+                FragKind::Line(_) => *lines += 1,
+                FragKind::Oof(..) => *boxes += 1,
+                _ => {}
+            }
+            for child in &fragment.children {
+                kinds(child, lines, boxes);
+            }
+        }
+        let cache = dom.layout_cache.borrow();
+        let mut shared = SharedBytes::default();
+        let (mut lines, mut boxes, mut items) = (0, 0, 0);
+        for entry in cache.entries.values().flatten() {
+            let Value::Item(item) = &entry.value else {
+                continue;
+            };
+            items += 1;
+            kinds(&item.fragment, &mut lines, &mut boxes);
+            for _ in 0..2 {
+                assert_eq!(
+                    fragment_bytes(&item.fragment, &mut shared),
+                    fragment_bytes(&item.fragment, &mut SharedBytes::default())
+                );
+            }
+        }
+        assert!(
+            items > 1 && lines > 0 && boxes > 0,
+            "{items} {lines} {boxes}"
+        );
+        assert!(!shared.lines.is_empty() && !shared.boxes.is_empty());
+        // The completed transaction holds no counted payload.
+        assert!(cache.shared_bytes.lines.is_empty() && cache.shared_bytes.boxes.is_empty());
     }
 
     #[test]
