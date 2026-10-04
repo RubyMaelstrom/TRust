@@ -305,6 +305,12 @@ impl LayoutCache {
         }
     }
 
+    /// Whether any constraint variant of `node`'s retained layout survives.
+    #[cfg(test)]
+    pub(crate) fn retains(&self, node: NodeId) -> bool {
+        self.entries.contains_key(&node)
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         self.bytes
             + self.entries.capacity() * size_of::<(NodeId, Vec<Entry>)>()
