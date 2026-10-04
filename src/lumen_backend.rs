@@ -61,6 +61,10 @@ struct LumenGeomCache {
     frame_viewports: std::collections::HashMap<crate::dom::NodeId, crate::render::CssRect>,
     paint: Option<crate::render::PagePaint>,
     hit_index: Option<crate::render::PageHitIndex>,
+    /// Whether `paint` and `hit_index` were produced from `fragments`.
+    paint_current: bool,
+    /// The top-level Document's hit-testing inputs when `paint` was produced.
+    paint_top_key: Option<TopHitKey>,
     fragments: Option<std::sync::Arc<crate::layout2::LayoutFragments>>,
     /// The cached boxes belonging to the container Document remain valid. A nested Document may
     /// have advanced the arena-wide epoch without affecting these boxes (HTML §7.3.1.3).
@@ -83,9 +87,41 @@ impl LumenGeomCache {
             frame_viewports: Default::default(),
             paint: None,
             hit_index: None,
+            paint_current: false,
+            paint_top_key: None,
             fragments: None,
             top_document_valid: false,
         }
+    }
+}
+
+/// Everything besides scroll offsets that the top-level Document's
+/// `elementsFromPoint` results depend on. HTML §7.3.1.3 gives a child
+/// navigable its own Document; changes confined to it cannot alter the
+/// container Document's boxes, paint order or clips (`top_document_revision`).
+#[derive(Clone, Copy, PartialEq)]
+struct TopHitKey {
+    revisions: [u64; 6],
+    viewport: (u32, u32),
+    device_pixel_ratio: u32,
+}
+
+fn top_hit_key(ctx: &mut Ctx) -> TopHitKey {
+    let state = ctx.host_mut::<HostState>().expect("HostState installed");
+    let viewport = state.viewport.get();
+    let device_pixel_ratio = state.device_pixel_ratio.get();
+    let dom = state.dom.borrow();
+    TopHitKey {
+        revisions: [
+            dom.top_document_revision(),
+            dom.layout_presentation_epoch(),
+            dom.layout_paint_epoch(),
+            crate::font_system::page_font_epoch(),
+            crate::dom::svg_sprite_revision(),
+            crate::img::document_svg_revision(),
+        ],
+        viewport: (viewport.width.to_bits(), viewport.height.to_bits()),
+        device_pixel_ratio: device_pixel_ratio.to_bits(),
     }
 }
 
@@ -15278,6 +15314,7 @@ fn ensure_host_geometry(
     requested_box: Option<crate::dom::NodeId>,
 ) -> Rc<RefCell<LumenGeomCache>> {
     sync_css_transitions(ctx);
+    let top_key = top_hit_key(ctx);
     let (dom_handle, base, viewport, cache, images) = {
         let state = ctx
             .host_mut::<HostState>()
@@ -15358,8 +15395,14 @@ fn ensure_host_geometry(
         cached.scrolling_areas = measured.scrolling_areas;
         cached.frame_viewports = measured.frame_viewports;
         cached.fragments = measured.fragments;
-        cached.paint = None;
-        cached.hit_index = None;
+        // The superseded paint stays available to top-level hit testing
+        // while its `paint_top_key` still describes the container Document.
+        cached.paint_current = false;
+        if cached.paint_top_key != Some(top_key) {
+            cached.paint = None;
+            cached.hit_index = None;
+            cached.paint_top_key = None;
+        }
         cached.epoch = epoch;
         cached.presentation_epoch = dom.layout_presentation_epoch();
         cached.svg_sprite_revision = svg_sprite_revision;
@@ -15393,6 +15436,7 @@ fn ensure_host_geometry(
 
 fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
     let cache = ensure_host_geom_cache(ctx, "elements-from-point");
+    let top_key = top_hit_key(ctx);
     let (dom, base, viewport, images) = {
         let state = ctx.host_mut::<HostState>().expect("HostState installed");
         (
@@ -15405,18 +15449,11 @@ fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
     let dom = dom.borrow();
     {
         let mut cached = cache.borrow_mut();
-        if cached.paint.is_some() && cached.paint_epoch == dom.layout_paint_epoch() {
-            if cached.paint_scroll_epoch != dom.scroll_epoch() {
-                // Re-sample only retained scroll properties. Commands, text
-                // shaping, clips, image handles and layout remain valid.
-                for container in &mut cached.paint.as_mut().unwrap().scroll_containers {
-                    container.offset = crate::core::CssPoint::new(
-                        dom.scroll_metric(container.node, 1).unwrap_or(0.) as f32,
-                        dom.scroll_metric(container.node, 0).unwrap_or(0.) as f32,
-                    );
-                }
-                cached.paint_scroll_epoch = dom.scroll_epoch();
-            }
+        if cached.paint.is_some()
+            && cached.paint_current
+            && cached.paint_epoch == dom.layout_paint_epoch()
+        {
+            resample_hit_test_scroll(&mut cached, &dom);
             drop(cached);
             return cache;
         }
@@ -15435,8 +15472,48 @@ fn ensure_host_hit_test_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
     cached.paint_epoch = dom.layout_paint_epoch();
     cached.hit_index = cached.paint.as_ref().map(crate::render::PageHitIndex::new);
     cached.paint_scroll_epoch = dom.scroll_epoch();
+    cached.paint_current = true;
+    cached.paint_top_key = Some(top_key);
     drop(cached);
     cache
+}
+
+/// Re-sample only retained scroll properties. Commands, text shaping, clips,
+/// image handles and layout remain valid.
+fn resample_hit_test_scroll(cached: &mut LumenGeomCache, dom: &Dom) {
+    if cached.paint_scroll_epoch == dom.scroll_epoch() {
+        return;
+    }
+    if let Some(paint) = cached.paint.as_mut() {
+        for container in &mut paint.scroll_containers {
+            container.offset = crate::core::CssPoint::new(
+                dom.scroll_metric(container.node, 1).unwrap_or(0.) as f32,
+                dom.scroll_metric(container.node, 0).unwrap_or(0.) as f32,
+            );
+        }
+    }
+    cached.paint_scroll_epoch = dom.scroll_epoch();
+}
+
+/// The retained hit-testing paint for a top-level `elementsFromPoint`, when
+/// only nested Documents changed since it was produced. Samples CSS
+/// animations first, as the geometry transaction would.
+fn reusable_top_hit_test_cache(ctx: &mut Ctx) -> Option<Rc<RefCell<LumenGeomCache>>> {
+    sync_css_transitions(ctx);
+    let key = top_hit_key(ctx);
+    let (cache, dom) = {
+        let state = ctx.host_mut::<HostState>().expect("HostState installed");
+        (state.geom_cache.clone(), state.dom.clone())
+    };
+    {
+        let mut cached = cache.borrow_mut();
+        if cached.paint.is_none() || cached.hit_index.is_none() || cached.paint_top_key != Some(key)
+        {
+            return None;
+        }
+        resample_hit_test_scroll(&mut cached, &dom.borrow());
+    }
+    Some(cache)
 }
 
 /// CSSOM View §5 `elementsFromPoint()`: return paint-ordered arena node ids.
@@ -15459,7 +15536,13 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         .expect("HostState installed")
         .viewport
         .get();
-    let cache = ensure_host_hit_test_cache(ctx);
+    let cache = match (scope == DOCUMENT)
+        .then(|| reusable_top_hit_test_cache(ctx))
+        .flatten()
+    {
+        Some(cache) => cache,
+        None => ensure_host_hit_test_cache(ctx),
+    };
     let mut cached = cache.borrow_mut();
     let Some(paint) = cached.paint.as_ref() else {
         return Ok(ctx.make_array(Vec::new()));
@@ -15496,9 +15579,11 @@ fn host_elements_from_point(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     let wanted_frame = (scope != DOCUMENT).then_some(scope);
+    // A reused top-level paint may name since-collected nodes of a nested
+    // Document; those are never top-level hits.
     let nodes = hits
         .into_iter()
-        .filter(|hit| dom.frame_owner(hit.node) == wanted_frame)
+        .filter(|hit| dom.is_valid(hit.node) && dom.frame_owner(hit.node) == wanted_frame)
         .map(|hit| Value::Num(hit.node as f64))
         .collect();
     Ok(ctx.make_array(nodes))
@@ -18301,6 +18386,64 @@ mod tests {
                 .storage_identity(),
             hit_storage
         );
+    }
+
+    #[test]
+    fn top_level_hit_testing_reuses_paint_across_nested_document_changes() {
+        // HTML §7.3.1.3: a child navigable's Document changes neither the
+        // container's boxes nor its paint order, so top-level hit testing
+        // after a nested-only change needs no new layout or paint.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><style>body{margin:0} iframe{display:block;border:0;width:200px;height:100px}
+            #below{height:50px}</style><iframe id=frame
+            srcdoc='<!doctype html><style>body{margin:0}</style><p id=inner style="margin:0;height:20px">x</p>'></iframe>
+            <div id=below></div>"#,
+        )));
+        let mut engine = configured_engine(
+            HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "__trust.hydrateFrames(); document.elementFromPoint(10,10).id"
+            ),
+            "frame"
+        );
+        let passes = crate::layout2::layout_pass_count();
+        let revision = dom.borrow().top_document_revision();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"const inner = document.getElementById('frame').contentDocument.getElementById('inner');
+                inner.style.height = '60px'; inner.remove();
+                [document.elementFromPoint(10,10).id, document.elementFromPoint(10,120).id].join()"#
+            ),
+            "frame,below"
+        );
+        assert_eq!(dom.borrow().top_document_revision(), revision);
+        assert_eq!(
+            crate::layout2::layout_pass_count(),
+            passes,
+            "nested-only changes reuse top-level hit testing"
+        );
+        // Nested hit testing still reflects the nested Document's changes:
+        // the removed paragraph left an empty body below the root element.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('frame').contentDocument.elementFromPoint(10,10).localName"
+            ),
+            "html"
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "document.getElementById('below').style.height = '0px'; document.getElementById('frame').style.height = '130px'; document.elementFromPoint(10,120).id"
+            ),
+            "frame"
+        );
+        assert_ne!(dom.borrow().top_document_revision(), revision);
     }
 
     #[test]

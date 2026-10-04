@@ -434,6 +434,11 @@ pub struct Dom {
     /// only when deciding whether a cached top-level iframe rectangle remains usable.
     geometry_dirty_nodes: FxHashMap<NodeId, DirtyKind>,
     geometry_dirty_attributed: bool,
+    /// Advanced by every change that can reach the top-level Document's own
+    /// boxes, paint order or clips: a geometry invalidation outside nested
+    /// Documents (HTML §7.3.1.3) or an unattributed one. Changes confined to a
+    /// child navigable's Document leave it unchanged.
+    top_document_revision: u64,
     /// Monotonic STYLE epoch: advances only when the SHEET SET can have
     /// changed — exactly the triggers the standards define for sheet
     /// (re)creation (HTML §4.2.6: a `<style>`'s sheet re-creates when its
@@ -882,6 +887,7 @@ impl Dom {
             svg_dependencies,
             geometry_dirty_nodes,
             geometry_dirty_attributed,
+            top_document_revision,
             style_epoch,
             adopted_styles,
             external_sheets,
@@ -946,6 +952,7 @@ impl Dom {
             window_names_epoch,
             style_value_epoch,
             geometry_dirty_attributed,
+            top_document_revision,
             style_epoch,
             viewport_px,
             selector_epoch,
@@ -1392,6 +1399,7 @@ impl Dom {
             svg_dependencies: RefCell::new(svg_dependencies::State::default()),
             geometry_dirty_nodes: FxHashMap::default(),
             geometry_dirty_attributed: true,
+            top_document_revision: 0,
             style_epoch: 0,
             adopted_styles: FxHashMap::default(),
             external_sheets: FxHashMap::default(),
@@ -2106,7 +2114,7 @@ impl Dom {
             self.layout_cache.get_mut().clear();
             self.box_tree_cache.get_mut().clear();
             self.dirty_attributed = false;
-            self.geometry_dirty_attributed = false;
+            self.unattributed_geometry_change();
         }
         self.record_local_geometry_dirty(id, kind);
     }
@@ -2115,6 +2123,9 @@ impl Dom {
     /// content dependencies. Attribute changes dominate content, then paint.
     /// The queue stays bounded by the DOM even without intervening layout.
     fn record_local_geometry_dirty(&mut self, id: NodeId, kind: DirtyKind) {
+        if self.change_reaches_top_document(id, kind) {
+            self.top_document_revision = self.top_document_revision.wrapping_add(1);
+        }
         let strength = |kind| match kind {
             DirtyKind::Paint => 0,
             DirtyKind::Content => 1,
@@ -2130,6 +2141,28 @@ impl Dom {
             .or_insert(kind);
     }
 
+    /// Whether a geometry invalidation of `id` can reach the top-level
+    /// Document. As for cached top-level iframe rectangles: a disconnected
+    /// node has no box (its later insertion invalidates its new parent), a
+    /// node of a nested Document cannot change its container Document, and a
+    /// navigable container's child list is its nested Document.
+    fn change_reaches_top_document(&self, id: NodeId, kind: DirtyKind) -> bool {
+        if kind == DirtyKind::Content && matches!(self.tag_name(id), Some("iframe" | "frame")) {
+            return false;
+        }
+        self.is_connected(id) && self.frame_owner(id).is_none()
+    }
+
+    /// A geometry change no single element names; see `top_document_revision`.
+    pub(super) fn unattributed_geometry_change(&mut self) {
+        self.geometry_dirty_attributed = false;
+        self.top_document_revision = self.top_document_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn top_document_revision(&self) -> u64 {
+        self.top_document_revision
+    }
+
     /// An UNATTRIBUTED mutation — one we can't pin to a single element (a global
     /// stylesheet/viewport change). Forces the next render to a full relayout
     /// (no incremental patch), since it may have changed anything.
@@ -2137,7 +2170,7 @@ impl Dom {
     fn touch(&mut self) {
         self.mark();
         self.dirty_attributed = false;
-        self.geometry_dirty_attributed = false;
+        self.unattributed_geometry_change();
     }
 
     /// An attribute change on `id` (its own styling/box may have changed).
