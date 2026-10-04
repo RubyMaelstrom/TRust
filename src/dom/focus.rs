@@ -49,7 +49,10 @@ impl Dom {
             self.focused_areas.remove(&document);
         }
         let changed = self.focus_state_changes(old, target);
-        if !self.invalidate_focus_state(&changed) {
+        // Like the rendering check, consult a current rule index: without
+        // focus rules a change needs no invalidation at all.
+        let index = self.style_index();
+        if !self.invalidate_live_state(&index, &changed) {
             self.touch();
         }
     }
@@ -64,8 +67,8 @@ impl Dom {
         &self,
         old: Option<NodeId>,
         new: Option<NodeId>,
-    ) -> Vec<(NodeId, invalidation::FocusState)> {
-        use invalidation::FocusState;
+    ) -> Vec<(NodeId, invalidation::LiveState)> {
+        use invalidation::LiveState;
         let chains = |focused: Option<NodeId>| {
             let mut focus = FxHashSet::default();
             let mut within = FxHashSet::default();
@@ -92,11 +95,11 @@ impl Dom {
         let (new_focus, new_within) = chains(new);
         let mut changed: Vec<_> = old_focus
             .symmetric_difference(&new_focus)
-            .map(|&node| (node, FocusState::Focus))
+            .map(|&node| (node, LiveState::Focus))
             .chain(
                 old_within
                     .symmetric_difference(&new_within)
-                    .map(|&node| (node, FocusState::FocusWithin)),
+                    .map(|&node| (node, LiveState::FocusWithin)),
             )
             .collect();
         changed.sort_unstable_by_key(|&(node, state)| (node, state as u8));

@@ -2265,14 +2265,6 @@ impl Dom {
         self.record_geometry_dirty(id, DirtyKind::Attr);
     }
 
-    /// A mutation that can change the SHEET SET (`<style>`/`<link>` tree,
-    /// text, or attribute changes; adopted/external sheet attaches; viewport
-    /// changes): advances the style epoch — invalidating the parsed style
-    /// index — AND forces the next render to a full relayout via `touch`
-    /// (a changed stylesheet can restyle anything, so no incremental patch
-    /// is sound). This is the ONLY writer of `style_epoch`, which keeps the
-    /// "style epoch never advances without the main epoch" invariant.
-    #[track_caller]
     /// Whether changing attribute `name` of `id` can change HTML
     /// #meta-color-scheme's result: the name or content of a meta that is,
     /// or by name would be, a color-scheme meta.
@@ -2286,6 +2278,14 @@ impl Dom {
                 || name.eq_ignore_ascii_case("name"))
     }
 
+    /// A mutation that can change the SHEET SET (`<style>`/`<link>` tree,
+    /// text, or attribute changes; adopted/external sheet attaches; viewport
+    /// changes): advances the style epoch — invalidating the parsed style
+    /// index — AND forces the next render to a full relayout via `touch`
+    /// (a changed stylesheet can restyle anything, so no incremental patch
+    /// is sound). This is the ONLY writer of `style_epoch`, which keeps the
+    /// "style epoch never advances without the main epoch" invariant.
+    #[track_caller]
     fn touch_style(&mut self) {
         self.style_epoch = self.style_epoch.wrapping_add(1);
         self.touch();
@@ -2800,15 +2800,22 @@ impl Dom {
     }
 
     /// The base also participates in registered URL and image computed values.
+    /// The basic URL parser never copies a base URL's fragment (URL Standard
+    /// #no-scheme-state, #relative-state, #file-state), so a fragment-only
+    /// change (fragment navigation, a history entry differing only in its
+    /// fragment) resolves every relative reference exactly as before: sheet
+    /// `url()`s, presentational hints, registered URL values and sprite
+    /// references keep their values. Only :target can change, and
+    /// `set_fragment_target` handles it.
     pub fn set_doc_url(&mut self, url: Option<url::Url>) {
         if self.doc_url != url {
-            if !matches!((&self.doc_url, &url), (Some(old), Some(new))
-                if old[..url::Position::AfterQuery] == new[..url::Position::AfterQuery])
-            {
-                self.media_fallbacks.get_mut().clear();
-            }
+            let same_resource = matches!((&self.doc_url, &url), (Some(old), Some(new))
+                if old[..url::Position::AfterQuery] == new[..url::Position::AfterQuery]);
             self.doc_url = url;
-            self.touch_style();
+            if !same_resource {
+                self.media_fallbacks.get_mut().clear();
+                self.touch_style();
+            }
         }
     }
 
@@ -2825,9 +2832,26 @@ impl Dom {
                 .copied()
         });
         if self.fragment_target != target {
-            self.fragment_target = target;
+            let old = std::mem::replace(&mut self.fragment_target, target);
             self.nodes.remember(DOCUMENT);
-            self.touch_style();
+            // HTML #selector-target: only the old and new target elements
+            // change state. No style sheet input changes, so the parsed
+            // index survives even the complete fallback. A stale index is
+            // not rebuilt here: a page loaded with a fragment would parse its
+            // sheets once more before they attach, and after a connected
+            // sheet change every style has already expired.
+            let changed: Vec<_> = [old, target]
+                .into_iter()
+                .flatten()
+                .filter(|&node| self.is_valid(node))
+                .map(|node| (node, invalidation::LiveState::Target))
+                .collect();
+            let proved = self
+                .current_style_index()
+                .is_some_and(|index| self.invalidate_live_state(&index, &changed));
+            if !proved {
+                self.touch();
+            }
         }
         target
     }
