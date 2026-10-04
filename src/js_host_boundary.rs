@@ -28,6 +28,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_relative", 2),
     ("__dom_install_live_collection", 4),
     ("__dom_child_collection_length", 2),
+    ("__dom_install_query_collection", 6),
     ("__dom_traversal_enabled", 0),
     ("__dom_node_identity", 1),
     ("__dom_observer_targets", 2),
