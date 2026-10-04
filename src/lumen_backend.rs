@@ -9495,15 +9495,44 @@ fn host_dom_traversal_enabled(
 /// Do not materialize a retained ID array for a single edge, or consult
 /// author-overridable nodeType/children/parentNode properties. Web IDL
 /// 8f182624 #dfn-attribute-getter requires the actual platform receiver.
+/// Whether `value` is an Attr platform object: its internal-slot record (the
+/// prelude's shared `internals` WeakMap) carries Attr state.
+fn is_attr_node(ctx: &mut Ctx, value: &Value) -> bool {
+    if !matches!(value, Value::Obj(_)) {
+        return false;
+    }
+    let Some(map) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.platform_internals.clone())
+    else {
+        return false;
+    };
+    match ctx.weak_map_get(&map, value) {
+        Ok(record @ Value::Obj(_)) => {
+            matches!(ctx.member_get(&record, "attrNode"), Ok(Value::Obj(_)))
+        }
+        _ => false,
+    }
+}
+
 fn host_dom_relative(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let edge = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0) as i32;
     let Some(id) = args
         .first()
         .and_then(|value| state.dom_gc.node_identity(value))
     else {
+        // DOM #interface-attr: an Attr is a Node without an arena node. It
+        // has no parent, children or siblings, and no tree index.
+        if is_attr_node(ctx, args.first().unwrap_or(&Value::Undefined)) {
+            return Ok(match edge {
+                10 => Value::Num(0.0),
+                11 => Value::Num(-1.0),
+                _ => Value::Null,
+            });
+        }
         return Err(ctx.make_error("TypeError", "Node getter requires a Node receiver"));
     };
-    let edge = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0) as i32;
     let dom = state.dom.borrow();
     if !dom.is_valid(id) {
         drop(dom);
@@ -18560,6 +18589,48 @@ mod tests {
                   ranges === video.buffered, start, constructed].join('|')"
             ),
             "TimeRanges|TimeRanges|TimeRanges|0|false|IndexSizeError|TypeError"
+        );
+    }
+
+    #[test]
+    fn attributes_are_a_live_named_node_map_of_attr_nodes() {
+        // DOM §4.9.1 #interface-namednodemap and §4.9.2 #interface-attr:
+        // element.attributes is a live [SameObject] NamedNodeMap (not an
+        // Array) with indexed and unenumerable named properties, holding
+        // Attr nodes that keep their identity while the attribute exists and
+        // keep their value once removed. Values match Chromium's.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 const el = document.createElement('div');\n\
+                 el.setAttribute('id', 'd'); el.setAttribute('title', 'x');\n\
+                 const map = el.attributes, id = map[0];\n\
+                 const before = [tag(map), Array.isArray(map), map === el.attributes, map.length, tag(id),\n\
+                   id.name, id.value, id.nodeType, id.nodeName, id.nodeValue, id.ownerElement === el,\n\
+                   id instanceof Node, id.parentNode, id.childNodes.length, map.id === id,\n\
+                   map.getNamedItem('ID') === id, el.getAttributeNode('id') === id, map.item(5),\n\
+                   Object.keys(map).join(), Object.getOwnPropertyNames(map).join(),\n\
+                   Array.from(map, a => a.name).join()];\n\
+                 id.value = 'e';\n\
+                 const live = [el.id, map.length];\n\
+                 el.removeAttribute('id');\n\
+                 const removed = [map.length, id.ownerElement, id.value, 'id' in map, map[0].name];\n\
+                 const created = document.createAttribute('Data-X'); created.value = 'v';\n\
+                 const old = el.setAttributeNode(created);\n\
+                 const set = [created.name, old, created.ownerElement === el, el.getAttribute('data-x'),\n\
+                   err(() => document.createElement('p').setAttributeNode(created)),\n\
+                   el.removeAttributeNode(created) === created, el.hasAttribute('data-x'),\n\
+                   err(() => el.removeAttributeNode(created)), err(() => map.removeNamedItem('nope')),\n\
+                   err(() => new Attr()), err(() => structuredClone(map)),\n\
+                   created.cloneNode().value, created.compareDocumentPosition(el) & 1];\n\
+                 [...before, ...live, ...removed, ...set].join('|')"
+            ),
+            "NamedNodeMap|false|true|2|Attr|id|d|2|id|d|true|true||0|true|true|true||0,1|\
+             0,1,id,title|id,title|e|2|1||e|false|title|data-x||true|v|InUseAttributeError|\
+             true|false|NotFoundError|NotFoundError|TypeError|DataCloneError|v|1"
         );
     }
 
