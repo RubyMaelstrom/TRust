@@ -1958,6 +1958,7 @@ mod desktop {
             storage: env.storage.clone(),
             blobs: env.blobs.clone(),
             scripted_frames: env.scripted_frames,
+            last_modified: env.last_modified,
         };
         let mut page = match load_page(html, env, host_tx, &mut host_rx, None, interrupt.clone()) {
             Ok(page) => page,
@@ -3058,7 +3059,7 @@ mod desktop {
         // the route from location.pathname, so seeding the realm with `base`
         // collapses every such navigation to the base path.
         let config = format!(
-            "globalThis.__trust_cfg = {{ url: {}, ua: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {} }};",
+            "globalThis.__trust_cfg = {{ url: {}, ua: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {} }};",
             json_string(response_url.as_str()),
             json_string(crate::http::user_agent()),
             json_string(crate::locale::LANGUAGE),
@@ -3081,6 +3082,8 @@ mod desktop {
                     data["legacy:domLoading"] = serde_json::json!(document_creation_time.floor());
                     data
                 }),
+            env.last_modified
+                .map_or_else(|| String::from("null"), |time| time.to_string()),
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
             outcome.errors.push(error);
@@ -18297,6 +18300,36 @@ mod tests {
         .unwrap();
         eval_platform_prelude(&mut engine).unwrap();
         engine
+    }
+
+    #[test]
+    fn document_last_modified_uses_the_source_time_in_local_time() {
+        // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
+        // user's local time zone, from the source's modification time, or
+        // the current time when that is unknown. Round-trip through
+        // Date.parse so the assertion holds in any system time zone.
+        let clock = Rc::new(RealmClock::new());
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
+            DEFAULT_URL,
+        );
+        eval(
+            &mut engine,
+            "globalThis.__trust_cfg.lastModified = 1709622489000;",
+            "last modified",
+        )
+        .unwrap();
+        eval_platform_prelude(&mut engine).unwrap();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const created = document.implementation.createHTMLDocument('').lastModified;\n\
+                 const format = /^\\d\\d\\/\\d\\d\\/\\d{4} \\d\\d:\\d\\d:\\d\\d$/;\n\
+                 [format.test(document.lastModified), Date.parse(document.lastModified),\n\
+                  format.test(created), Math.abs(Date.parse(created) - Date.now()) < 5000].join()"
+            ),
+            "true,1709622489000,true,true"
+        );
     }
 
     fn worker_platform_engine() -> lumen::Engine {

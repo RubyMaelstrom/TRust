@@ -3108,6 +3108,23 @@ fn cookie_now_ms() -> i64 {
     }
 }
 
+/// HTML #dom-document-lastmodified: a document's last modification time, in
+/// ms since the epoch, from its `Last-Modified` header (an RFC 9110 §8.8.2
+/// HTTP-date) or, for a local file, its file-system modification time.
+fn document_last_modified(url: &Url, headers: &[(String, String)]) -> Option<f64> {
+    let time = if url.scheme() == "file" {
+        let path = url.to_file_path().ok()?;
+        std::fs::metadata(path).ok()?.modified().ok()?
+    } else {
+        let (_, value) = headers.iter().find(|(name, _)| name == "last-modified")?;
+        httpdate::parse_http_date(value).ok()?
+    };
+    Some(match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as f64,
+        Err(error) => -(error.duration().as_millis() as f64),
+    })
+}
+
 /// RFC 6265 §5.1.1, including verified erratum 4148: cookie dates use an
 /// ordered token scan, not HTTP-date's fixed grammar. Ignore weekday/timezone
 /// labels and interpret the extracted Gregorian date and time as UTC.
@@ -5425,6 +5442,7 @@ async fn execute_js_with_presentation(
         storage: Some(storage),
         blobs,
         scripted_frames,
+        last_modified: document_last_modified(&response.url, &response.headers),
     };
     // The page actor owns the engine on its own dedicated stack. Its first
     // event is `Static`
@@ -11239,6 +11257,32 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn document_last_modified_reads_the_http_date_or_file_time() {
+        // HTML #dom-document-lastmodified from RFC 9110 §8.8.2 Last-Modified
+        // (an IMF-fixdate), or local file-system metadata.
+        let url = Url::parse("https://example.test/").unwrap();
+        let header = |value: &str| vec![("last-modified".to_string(), value.to_string())];
+        assert_eq!(
+            document_last_modified(&url, &header("Tue, 05 Mar 2024 07:08:09 GMT")),
+            Some(1_709_622_489_000.0)
+        );
+        assert_eq!(document_last_modified(&url, &header("not a date")), None);
+        assert_eq!(document_last_modified(&url, &[]), None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.html");
+        std::fs::write(&path, "x").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            document_last_modified(&Url::from_file_path(&path).unwrap(), &[]),
+            Some(
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as f64
+            )
+        );
+    }
     #[tokio::test]
     async fn scriptless_pages_with_scripted_frames_keep_the_page_actor() {
         // HTML #the-iframe-element: a nested document runs its own scripts

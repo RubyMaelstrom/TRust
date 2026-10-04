@@ -41,6 +41,18 @@
     const storageContextId = Number(cfg.hostSettingsContext) || 0;
     const storageOpaque = !!cfg.cookieOpaque;
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
+    // HTML #dom-document-lastmodified: the source's last modification time
+    // (ms since the epoch) for documents loaded with one.
+    const documentLastModified = new WeakMap();
+    function lastModifiedString(document) {
+        const known = documentLastModified.get(document);
+        const date = new Date(known === undefined ? Date.now() : known);
+        const two = value => (value < 10 ? "0" : "") + value;
+        const year = String(date.getFullYear());
+        return two(date.getMonth() + 1) + "/" + two(date.getDate()) + "/" +
+            (year.length < 4 ? "0000".slice(year.length) + year : year) + " " +
+            two(date.getHours()) + ":" + two(date.getMinutes()) + ":" + two(date.getSeconds());
+    }
     const frameAboutBaseURLs = new WeakMap();
     const documentContentTypes = new WeakMap();
     const documentURLs = new WeakMap();
@@ -10276,6 +10288,7 @@
         // HTML Document creation: snapshot the final request referrer, or the
         // empty default for a Document without navigation request metadata.
         get referrer() { return documentReferrers.get(this) || ""; }
+        get lastModified() { return lastModifiedString(this); }
         get documentURI() { return this.URL; }
         get URL() { return documentURLs.get(this) || g.location.href; }
         get currentScript() { return wrap(trust.currentScript); }
@@ -10534,6 +10547,7 @@
         get URL() { return documentURLs.get(this); }
         get documentURI() { return this.URL; }
         get referrer() { return documentReferrers.get(this) || ""; }
+        get lastModified() { return lastModifiedString(this); }
         // Parent-side access must use this child document's base rather than
         // the currently active page scope.
         get baseURI() {
@@ -13533,6 +13547,8 @@
         }, enumerable:true, configurable:true,
     });
     documentReferrers.set(g.document, configuredReferrer);
+    if (typeof cfg.lastModified === "number" && Number.isFinite(cfg.lastModified))
+        documentLastModified.set(g.document, cfg.lastModified);
 
     // --- environment ---
     const L = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "", "", "", ""];

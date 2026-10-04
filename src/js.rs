@@ -162,6 +162,10 @@ pub struct PageEnv {
     /// their own scripts (HTML #the-iframe-element), which only the live
     /// actor can do, so the page stays live even without scripts of its own.
     pub(crate) scripted_frames: bool,
+    /// The document's last modification time in ms since the epoch, from
+    /// its `Last-Modified` header or file metadata (HTML
+    /// #dom-document-lastmodified); None when unknown.
+    pub(crate) last_modified: Option<f64>,
 }
 
 impl PageEnv {
@@ -183,6 +187,7 @@ impl PageEnv {
             storage: None,
             blobs: Default::default(),
             scripted_frames: false,
+            last_modified: None,
         }
     }
 }
