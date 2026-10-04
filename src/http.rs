@@ -10311,6 +10311,9 @@ mod tests {
         // SVG 2 §5.1 makes an outermost inline SVG a replaced element in an
         // HTML/CSS layout. A declared box must retain its paint resource while
         // intrinsic image data is pending; URL discovery alone is not paint.
+        // The SVG resource source carries the process-wide document-SVG
+        // navigation counter; hold it steady between discovery and paint.
+        let _stable = crate::layout2::stable_global_layout_inputs();
         let base = Url::parse("https://example.test/").unwrap();
         let mut dom = crate::dom::Dom::parse_document("<body><x-logo id=h></x-logo></body>");
         let host = dom.get_by_id("h").unwrap();
