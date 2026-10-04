@@ -112,6 +112,10 @@ pub(crate) const GLOBAL_PRIVACY_CONTROL: bool = true;
 /// "HTTP-network-or-cache fetch", step 5.)
 pub const IMAGE_ACCEPT: &str = "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
 
+/// Fetch's document `Accept` header value, sent by navigations
+/// (#document-accept-header-value).
+pub const DOCUMENT_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+
 /// An HTTP request as the app sees it: method plus optional body.
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -334,10 +338,11 @@ impl Request {
             .filter(|value| !value.contains(['\r', '\n']))
     }
 
-    /// Fetch #concept-fetch chooses the default Accept from the destination.
+    /// Fetch #concept-fetch chooses the default Accept from the destination;
+    /// navigations send the #document-accept-header-value.
     fn default_accept(&self) -> &'static str {
         match self.fetch_metadata.map(|metadata| metadata.destination) {
-            Some("document" | "frame" | "iframe") => "text/html, text/*;q=0.8, */*;q=0.1",
+            Some("document" | "frame" | "iframe") => DOCUMENT_ACCEPT,
             Some("image") => IMAGE_ACCEPT,
             Some("json") => "application/json,*/*;q=0.5",
             Some("style") => "text/css,*/*;q=0.1",
@@ -17520,7 +17525,7 @@ customElements.define('lit-counter', LitCounter);
     async fn fetch_destinations_and_body_types_reach_the_wire() {
         // Fetch #concept-fetch / #concept-bodyinit-extract / #cors-unsafe-request-header-names.
         // Local WHATWG snapshot 394d20d (2026-09-06); HTTP empty values: RFC 9110 §5.5.
-        let document_accept = "text/html, text/*;q=0.8, */*;q=0.1";
+        let document_accept = DOCUMENT_ACCEPT;
         for (destination, inferred_type, author_type, accept, expected_type, preflight) in [
             ("", Some(""), None, "*/*", None, false),
             ("script", None, None, "*/*", None, false),
