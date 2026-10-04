@@ -126,7 +126,11 @@ def main(request, response):
 '''
 
 SERVE_BOOTSTRAP = r"""
+import signal
 import sys
+# The runner stops the server with SIGINT, even when started as a background
+# job (which inherits an ignored SIGINT).
+signal.signal(signal.SIGINT, signal.default_int_handler)
 root = sys.argv[1]
 sys.path[0:0] = [root, root + "/tools"]
 import localpaths  # noqa: F401  (adds WPT's third_party packages)
@@ -330,20 +334,24 @@ def start_server(root, output, multiplier):
                                start_new_session=True)
     origin = f"http://localhost:{ports[0]}"
     deadline = time.monotonic() + 60
-    while True:
-        if process.poll() is not None:
-            raise SystemExit(f"WPT server exited; see {output / 'server.log'}")
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{ports[0]}/resources/testharnessreport.js",
-                                        timeout=2) as response:
-                if b"TRust WPT runner" in response.read():
-                    break
-        except (urllib.error.URLError, OSError):
-            pass
-        if time.monotonic() > deadline:
-            stop_server(process)
-            raise SystemExit("WPT server did not start within 60 s")
-        time.sleep(0.2)
+    try:
+        while True:
+            if process.poll() is not None:
+                raise SystemExit(f"WPT server exited; see {output / 'server.log'}")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{ports[0]}/resources/testharnessreport.js",
+                                            timeout=2) as response:
+                    if b"TRust WPT runner" in response.read():
+                        break
+            except (urllib.error.URLError, OSError):
+                pass
+            if time.monotonic() > deadline:
+                raise SystemExit("WPT server did not start within 60 s")
+            time.sleep(0.2)
+    except BaseException:
+        # Interrupted or failed while starting: do not leave the server behind.
+        stop_server(process)
+        raise
     return process, origin, results
 
 
@@ -596,7 +604,15 @@ def load_records(path):
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def interrupt(_signum, _frame):
+    # One interruption: later signals must not abort the server shutdown.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
 def main():
+    # SIGTERM stops the WPT server and summarizes, as Ctrl+C does.
+    signal.signal(signal.SIGTERM, interrupt)
     default_target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "target"))
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="*", help="WPT-relative directories, files or test URLs")
