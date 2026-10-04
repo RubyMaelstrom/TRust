@@ -16974,7 +16974,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }catch(error){return Promise.reject(error);}
     };
     const __typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype),Symbol.toStringTag).get;
-    g.crypto = {
+    const __cryptoMembers = {
         getRandomValues(a) {
             const tag=__typedArrayTag.call(a);
             if(!["Int8Array","Uint8Array","Uint8ClampedArray","Int16Array","Uint16Array","Int32Array","Uint32Array","BigInt64Array","BigUint64Array"].includes(tag))
@@ -16983,12 +16983,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             new Uint8Array(a.buffer,a.byteOffset,a.byteLength).set(__nativeRandom(a.byteLength));
             return a;
         },
-        randomUUID() {
-            const b=__nativeRandom(16);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;
-            const h=Array.from(b,v=>v.toString(16).padStart(2,"0")).join("");
-            return h.slice(0,8)+"-"+h.slice(8,12)+"-"+h.slice(12,16)+"-"+h.slice(16,20)+"-"+h.slice(20);
-        },
-        subtle: {
+        randomUUID() { return cryptoRandomUUID(); },
+    };
+    // WebCrypto #Crypto-method-randomUUID: a version 4 UUID from 16 random bytes.
+    function cryptoRandomUUID() {
+        const b=__nativeRandom(16);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;
+        let h="";
+        for (let i=0;i<16;i++) h+=(b[i]<16?"0":"")+b[i].toString(16);
+        return h.slice(0,8)+"-"+h.slice(8,12)+"-"+h.slice(12,16)+"-"+h.slice(16,20)+"-"+h.slice(20);
+    }
+    const __subtleMembers = {
             digest(algo, data) {
                 try {return __nativeDigest(__cryptoHash(algo),data);}
                 catch(error){return Promise.reject(error);}
@@ -17100,8 +17104,67 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             },
             sign(algorithm,key,data) {return __hmacOperation(algorithm,key,data,undefined,"sign");},
             verify(algorithm,key,signature,data) {return __hmacOperation(algorithm,key,data,signature,"verify");},
-        },
     };
+    // WebCrypto #crypto-interface / #subtlecrypto-interface: the global's
+    // [SameObject] crypto attribute is a Crypto object. Its [SecureContext]
+    // members (subtle, randomUUID) and the SubtleCrypto interface exist only
+    // in a secure context (Secure Contexts §3.2, Web IDL #SecureContext).
+    const __cryptoSecure = !!g.isSecureContext;
+    const __cryptoBrands = new WeakMap();
+    const __cryptoBrandGet = WeakMap.prototype.get, __cryptoBrandSet = WeakMap.prototype.set;
+    const __cryptoBrand = object => (typeof object === "object" && object !== null)
+        ? Reflect.apply(__cryptoBrandGet, __cryptoBrands, [object]) : undefined;
+    class Crypto {
+        constructor() { throw new TypeError("Illegal constructor"); }
+    }
+    class SubtleCrypto {
+        constructor() { throw new TypeError("Illegal constructor"); }
+    }
+    const __cryptoObject = Object.create(Crypto.prototype);
+    const __subtleObject = Object.create(SubtleCrypto.prototype);
+    Reflect.apply(__cryptoBrandSet, __cryptoBrands, [__cryptoObject, "Crypto"]);
+    Reflect.apply(__cryptoBrandSet, __cryptoBrands, [__subtleObject, "SubtleCrypto"]);
+    const __cryptoDefine = (target, name, descriptor) =>
+        Object.defineProperty(target, name, Object.assign({enumerable: true, configurable: true}, descriptor));
+    const __cryptoMethod = (name, length, body) => {
+        const method = {[name](...args) { return Reflect.apply(body, this, args); }}[name];
+        Object.defineProperty(method, "length", {value: length, configurable: true});
+        return method;
+    };
+    if (__cryptoSecure)
+        __cryptoDefine(Crypto.prototype, "subtle", {get: Object.getOwnPropertyDescriptor({get subtle() {
+            if (__cryptoBrand(this) !== "Crypto") throw new TypeError("Illegal invocation");
+            return __subtleObject;
+        }}, "subtle").get});
+    __cryptoDefine(Crypto.prototype, "getRandomValues", {writable: true, value: __cryptoMethod("getRandomValues", 1, function (...args) {
+        if (__cryptoBrand(this) !== "Crypto") throw new TypeError("Illegal invocation");
+        if (args.length < 1) throw new TypeError("1 argument required");
+        return __cryptoMembers.getRandomValues(args[0]);
+    })});
+    if (__cryptoSecure)
+        __cryptoDefine(Crypto.prototype, "randomUUID", {writable: true, value: __cryptoMethod("randomUUID", 0, function () {
+            if (__cryptoBrand(this) !== "Crypto") throw new TypeError("Illegal invocation");
+            return cryptoRandomUUID();
+        })});
+    // SubtleCrypto operations return promises, so a wrong receiver or a
+    // missing argument rejects (Web IDL #dfn-create-operation-function).
+    // Operations without a supported algorithm reject with NotSupportedError.
+    for (const [name, length] of [["encrypt", 3], ["decrypt", 3], ["sign", 3], ["verify", 4], ["digest", 2],
+            ["generateKey", 3], ["deriveKey", 5], ["deriveBits", 2], ["importKey", 5], ["exportKey", 2],
+            ["wrapKey", 4], ["unwrapKey", 7]]) {
+        const operation = __subtleMembers[name] || function () {
+            return Promise.reject(__cryptoError("NotSupportedError", "Unsupported " + name + " algorithm"));
+        };
+        __cryptoDefine(SubtleCrypto.prototype, name, {writable: true, value: __cryptoMethod(name, length, function (...args) {
+            if (__cryptoBrand(this) !== "SubtleCrypto") return Promise.reject(new TypeError("Illegal invocation"));
+            if (args.length < length) return Promise.reject(new TypeError(name + " requires " + length + " arguments"));
+            return Reflect.apply(operation, __subtleMembers, args);
+        })});
+    }
+    Object.defineProperty(g, "Crypto", {value: Crypto, writable: true, configurable: true});
+    if (__cryptoSecure) Object.defineProperty(g, "SubtleCrypto", {value: SubtleCrypto, writable: true, configurable: true});
+    Object.defineProperty(g, "crypto", {get: Object.getOwnPropertyDescriptor({get crypto() { return __cryptoObject; }}, "crypto").get,
+        enumerable: true, configurable: true});
     g.CryptoKey = CryptoKey;
     /*__CRYPTO_END__*/
 
@@ -18947,7 +19010,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // not Location.origin (about:srcdoc/blank URLs are opaque).
             const owner = windowMessageState(g);
             const origin = owner ? owner.origin : "null";
-            const u = "blob:" + (origin || "null") + "/" + g.crypto.randomUUID();
+            const u = "blob:" + (origin || "null") + "/" + cryptoRandomUUID();
             __blobURLStore[u] = { object: obj, origin, originKey: owner ? owner.originKey : Symbol() };
             // Mirror the bytes Rust-side so the APP can decode an
             // `<img src="blob:…">` (Steam's client-generated QR code); only

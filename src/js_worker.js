@@ -657,10 +657,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (Array.isArray(internalsFor(obj).parts)) return { bytes: __blobBytes(obj), type: obj.type || "" };
         return { bytes: "", type: "" };
     }
+    // File API #unicodeBlobURL: a fresh UUID, whether or not this worker is
+    // a secure context exposing crypto.randomUUID().
+    function blobUUID() {
+        var b = __crypto_random_bytes(16), h = "";
+        b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
+        for (var i = 0; i < 16; i++) h += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+        return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
+    }
     URL.createObjectURL = function (obj) {
         if (obj === null || typeof obj !== "object") throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
         var origin = (g.location && g.location.origin) || "null";
-        var u = "blob:" + (origin || "null") + "/" + g.crypto.randomUUID();
+        var u = "blob:" + (origin || "null") + "/" + blobUUID();
         __blobURLStore[u] = obj; return u;
     };
     URL.revokeObjectURL = function (u) {
