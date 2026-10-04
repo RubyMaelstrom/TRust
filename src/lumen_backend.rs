@@ -3074,14 +3074,20 @@ mod desktop {
             f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
         );
         let document_creation_time = crate::performance::now_ms();
-        let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
+        // The decoded document is Rust text; the DOM keeps engine text (see `dom_text_in`).
+        let dom = Rc::new(RefCell::new(Dom::parse_document(&dom_text_in(html))));
         {
             let mut dom = dom.borrow_mut();
             dom.set_viewport_px(viewport.width, viewport.height);
             dom.set_device_pixel_ratio(env.device_pixel_ratio);
             dom.set_doc_url(url::Url::parse(&env.url).ok());
             if !env.sheets.is_empty() {
-                dom.attach_external_sheets(&env.sheets);
+                let sheets: Vec<(String, String)> = env
+                    .sheets
+                    .iter()
+                    .map(|(url, css)| (url.clone(), dom_text_in(css).into_owned()))
+                    .collect();
+                dom.attach_external_sheets(&sheets);
             }
         }
         let scripts: Vec<_> = dom
@@ -3294,7 +3300,8 @@ mod desktop {
                 let dom = page.dom.borrow();
                 (
                     dom.attr(node, "src").map(str::to_string),
-                    dom.text_content(node),
+                    // Script source is text for Lumen's source entry points.
+                    dom_text_out(&dom.text_content(node)).into_owned(),
                     dom.attr(node, "type").map(str::to_string),
                 )
             };
@@ -9474,11 +9481,35 @@ fn guarded_doc_element(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Val
     host_doc_element(ctx, this, args)
 }
 
+/// Web IDL DOMString argument, kept as Lumen engine text: TRust stores DOM strings (text,
+/// attributes, CSSOM, storage, messages) in that form, so lone surrogates and plane-16
+/// private-use characters round-trip exactly. Return such strings with
+/// `Value::from_engine_text`; convert with `lumen::embed::engine_to_text` before treating them
+/// as Rust text (rendering, URLs, network, encoders). See `host_arg_usv` and `dom_text_in`.
 fn host_arg_string(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
     args.get(index)
-        .and_then(|value| ctx.coerce_string(value).ok())
+        .and_then(|value| ctx.coerce_engine_text(value).ok())
         .map(|value| value.to_string())
         .unwrap_or_default()
+}
+
+/// Web IDL USVString argument as Rust text: lone surrogates become U+FFFD. For URLs, network
+/// requests, cookies, encoders, script source and other consumers of scalar values.
+fn host_arg_usv(ctx: &mut Ctx, args: &[Value], index: usize) -> String {
+    args.get(index)
+        .and_then(|value| ctx.coerce_usv_string(value).ok())
+        .unwrap_or_default()
+}
+
+/// Rust text entering DOM storage (a decoded document or message) in engine text form; see
+/// `host_arg_string`.
+pub(crate) fn dom_text_in(text: &str) -> std::borrow::Cow<'_, str> {
+    lumen::embed::text_to_engine(text)
+}
+
+/// DOM engine text as Rust text for rendering and other text consumers; see `host_arg_string`.
+pub(crate) fn dom_text_out(text: &str) -> std::borrow::Cow<'_, str> {
+    lumen::embed::engine_to_text(text)
 }
 
 fn host_id_value(id: Option<usize>) -> Value {
@@ -9855,6 +9886,7 @@ fn live_child_collection_get(
             dom.child_collection_item(root, *index as usize, elements)
         }
         Some(Value::Str(name)) if elements && !name.is_empty() => {
+            // Attribute values are DOM engine text, like the payload (see `host_arg_string`).
             collection_named_item(&dom, dom.child_iter(root), name.as_str())
         }
         _ => None,
@@ -10013,7 +10045,8 @@ fn host_install_query_collection(
         }
     }
     .key(root);
-    let key = Value::from_string(key);
+    // The key carries DOM engine text and is read back as-is (see `host_arg_string`).
+    let key = Value::from_engine_text(key);
     let getter = ctx.new_native_fn_with_captures(
         "collection item",
         1,
@@ -10091,8 +10124,8 @@ fn host_fetch_args(
     Vec<(String, String)>,
     Option<(crate::http::RequestMode, crate::http::CredentialsMode)>,
 ) {
-    let target = host_arg_string(ctx, args, 0);
-    let mut method: String = host_arg_string(ctx, args, 1)
+    let target = host_arg_usv(ctx, args, 0);
+    let mut method: String = host_arg_usv(ctx, args, 1)
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(*ch))
         .collect();
@@ -10112,22 +10145,22 @@ fn host_fetch_args(
     let content_type = args
         .get(3)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
-        .map(|_| host_arg_string(ctx, args, 3));
+        .map(|_| host_arg_usv(ctx, args, 3));
     // BodyInit extraction already chose the inferred type. A null type is
     // significant for BufferSource and untyped Blob bodies (Fetch §5.2).
     let body = body.map(|bytes| (content_type.unwrap_or_default(), bytes));
     let headers = args
         .get(4)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
-        .map(|_| crate::js::parse_header_blob(&host_arg_string(ctx, args, 4)))
+        .map(|_| crate::js::parse_header_blob(&host_arg_usv(ctx, args, 4)))
         .unwrap_or_default();
     let policy = args.get(5).map(|_| {
-        let mode = match host_arg_string(ctx, args, 5).to_ascii_lowercase().as_str() {
+        let mode = match host_arg_usv(ctx, args, 5).to_ascii_lowercase().as_str() {
             "no-cors" => crate::http::RequestMode::NoCors,
             "same-origin" => crate::http::RequestMode::SameOrigin,
             _ => crate::http::RequestMode::Cors,
         };
-        let credentials = match host_arg_string(ctx, args, 6).to_ascii_lowercase().as_str() {
+        let credentials = match host_arg_usv(ctx, args, 6).to_ascii_lowercase().as_str() {
             "omit" => crate::http::CredentialsMode::Omit,
             "include" => crate::http::CredentialsMode::Include,
             _ => crate::http::CredentialsMode::SameOrigin,
@@ -10433,8 +10466,8 @@ struct NavigationFetch {
 
 fn prepare_navigation_fetch(ctx: &mut Ctx, args: &[Value]) -> Option<NavigationFetch> {
     use crate::referrer_policy::ReferrerPolicy;
-    let target = host_arg_string(ctx, args, 0);
-    let policy = ReferrerPolicy::parse(&host_arg_string(ctx, args, 2)).unwrap_or_default();
+    let target = host_arg_usv(ctx, args, 0);
+    let policy = ReferrerPolicy::parse(&host_arg_usv(ctx, args, 2)).unwrap_or_default();
     let node = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -11097,7 +11130,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         frame_id
     };
 
-    let url = host_arg_string(ctx, args, 2);
+    let url = host_arg_usv(ctx, args, 2);
     let parent_cookie_context = request_cookie_context(ctx);
     let creator_url = request_client_url(ctx);
     let creator_context = ctx.host_job_context();
@@ -11137,7 +11170,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     // Optional document metadata accompanies non-HTML navigations. Keep the
     // required host arity at nine for existing initial about:blank callers.
     let content_type = match args.get(9) {
-        Some(Value::Str(value)) => value.to_string(),
+        Some(value @ Value::Str(_)) => value.as_text().unwrap_or_default().into_owned(),
         _ => String::from("text/html"),
     };
     let navigation_timing = args.get(10).cloned().unwrap_or(Value::Null);
@@ -11932,7 +11965,8 @@ fn host_run_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
         };
         node_id
     };
-    let source = host_arg_string(ctx, args, 1);
+    // Script source is text for Lumen's source entry point, not a DOM string.
+    let source = host_arg_usv(ctx, args, 1);
     let name = host_arg_string(ctx, args, 2);
     host_eval_inline_classic(ctx, node_id, &name, source);
     Ok(Value::Undefined)
@@ -11951,7 +11985,8 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         (
             node_id,
             dom.attr(node_id, "src").map(str::to_string),
-            dom.text_content(node_id),
+            // Script source is text for Lumen's source entry points (see `dom_text_out`).
+            dom_text_out(&dom.text_content(node_id)).into_owned(),
             dom.attr(node_id, "type")
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("module")),
         )
@@ -12138,8 +12173,8 @@ fn host_load_injected_stylesheet(
 /// validation synchronously; this host applies the page's private-network policy and starts the
 /// RFC 6455 connection in parallel. Protocol feedback returns as WebSocket-task-source work.
 fn host_ws_open(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let target = host_arg_string(ctx, args, 0);
-    let protocols = host_arg_string(ctx, args, 1);
+    let target = host_arg_usv(ctx, args, 0);
+    let protocols = host_arg_usv(ctx, args, 1);
     let Some(protocols) = crate::ws::parse_protocols(&protocols) else {
         return Ok(Value::Num(-1.0));
     };
@@ -12191,7 +12226,7 @@ fn host_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
         .first()
         .and_then(Value::as_num_opt)
         .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
-    let data = host_arg_string(ctx, args, 1);
+    let data = host_arg_usv(ctx, args, 1);
     let binary = matches!(args.get(2), Some(Value::Bool(true)));
     let sent = ctx
         .host_mut::<HostState>()
@@ -12222,7 +12257,7 @@ fn host_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
         .and_then(Value::as_num_opt)
         .filter(|code| code.is_finite() && *code >= 0.0 && *code <= f64::from(u16::MAX))
         .unwrap_or_default() as u16;
-    let reason = host_arg_string(ctx, args, 2);
+    let reason = host_arg_usv(ctx, args, 2);
     if let Some(sender) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.websockets.as_mut())
@@ -12252,7 +12287,7 @@ fn lumen_potentially_trustworthy(url: &url::Url) -> bool {
 /// HTML §10.2.6 `Worker()` construction: URL parsing is synchronous in the shared prelude; the
 /// worker realm, script fetch, and evaluation start in parallel on a dedicated agent thread.
 fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let target = host_arg_string(ctx, args, 0);
+    let target = host_arg_usv(ctx, args, 0);
     // "shared:classic" / "shared:module" request a SharedWorkerGlobalScope.
     let requested = host_arg_string(ctx, args, 1);
     let (shared, kind) = match requested.strip_prefix("shared:") {
@@ -13131,7 +13166,7 @@ fn run_lumen_worker(
                 Ok(Value::Undefined)
             }
             WorkerTask::Command(LumenWorkerCtl::Message(message)) => {
-                lumen_worker_internal_call(&mut engine, "message", &[Value::from_string(message)])
+                lumen_worker_internal_call(&mut engine, "message", &[Value::from_engine_text(message)])
             }
             WorkerTask::Command(LumenWorkerCtl::HostTask(task)) => {
                 if let Err(error) = dispatch_host_task(&mut engine, *task) {
@@ -13804,7 +13839,9 @@ fn run_resource_task(
                     .expect("HostState installed before resource dispatch")
                     .dom
                     .clone();
-                dom.borrow_mut().attach_sheet_to_link(node_id, css);
+                // Decoded CSS is Rust text; CSSOM strings are DOM engine text.
+                dom.borrow_mut()
+                    .attach_sheet_to_link(node_id, dom_text_in(&css).into_owned());
                 fire_engine_script_event(engine, node_id, "load");
             }
             _ => fire_engine_script_event(engine, node_id, "error"),
@@ -14126,7 +14163,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 crate::js::WorkerOut::Message(message) => ("workerMessage", message),
                 crate::js::WorkerOut::Error(message) => ("workerError", message),
             };
-            dispatch_lumen_worker_task(engine, id, name, Value::from_string(payload))?;
+            dispatch_lumen_worker_task(engine, id, name, Value::from_engine_text(payload))?;
         }
         LumenHostTask::WorkerExited { id } => {
             let result = dispatch_lumen_worker_task(engine, id, "workerExited", Value::Undefined);
@@ -14261,7 +14298,7 @@ fn host_document_content_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     let content_type = host_arg_node(&dom, args, 0)
         .map(|id| dom.document_content_type(id))
         .unwrap_or("text/html");
-    Ok(Value::Str(content_type.to_owned().into()))
+    Ok(Value::from_engine_text(content_type))
 }
 
 fn host_document_quirks(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -14279,7 +14316,7 @@ fn host_pi_target(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         Some(NodeData::ProcessingInstruction { target, .. }) => target.as_str(),
         _ => "",
     };
-    Ok(Value::Str(target.to_owned().into()))
+    Ok(Value::from_engine_text(target))
 }
 
 fn host_creation_document(dom: &Dom, args: &[Value], index: usize) -> usize {
@@ -14315,9 +14352,9 @@ fn host_doctype(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     };
     Ok(match info {
         Some(info) => ctx.make_array(vec![
-            Value::Str(info.name.into()),
-            Value::Str(info.public_id.into()),
-            Value::Str(info.system_id.into()),
+            Value::from_engine_text(info.name),
+            Value::from_engine_text(info.public_id),
+            Value::from_engine_text(info.system_id),
         ]),
         None => Value::Null,
     })
@@ -14467,8 +14504,8 @@ fn host_form_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             items.extend([
                 Value::Num(node as f64),
                 Value::Bool(image),
-                Value::from_string(id.to_owned()),
-                Value::from_string(name.to_owned()),
+                Value::from_engine_text(id.to_owned()),
+                Value::from_engine_text(name.to_owned()),
             ]);
         }
     }
@@ -14488,8 +14525,8 @@ fn host_window_named_items(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
             items.extend([
                 Value::Num(node as f64),
                 Value::Bool(frame),
-                Value::from_string(id.to_owned()),
-                Value::from_string(name.to_owned()),
+                Value::from_engine_text(id.to_owned()),
+                Value::from_engine_text(name.to_owned()),
             ]);
         }
     }
@@ -14768,7 +14805,7 @@ fn host_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     let dom = dom.borrow();
     Ok(
         match host_arg_node(&dom, args, 0).and_then(|id| dom.tag_name(id)) {
-            Some(tag) => Value::from_string(tag.to_owned()),
+            Some(tag) => Value::from_engine_text(tag.to_owned()),
             None => Value::Null,
         },
     )
@@ -14779,7 +14816,7 @@ fn host_namespace(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let dom = dom.borrow();
     Ok(
         match host_arg_node(&dom, args, 0).and_then(|id| dom.namespace_uri(id)) {
-            Some(namespace) => Value::from_string(namespace.to_owned()),
+            Some(namespace) => Value::from_engine_text(namespace.to_owned()),
             None => Value::Null,
         },
     )
@@ -14795,12 +14832,12 @@ fn host_element_name(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         return Ok(Value::Null);
     };
     Ok(ctx.make_array(vec![
-        Value::from_string(local_name.to_owned()),
+        Value::from_engine_text(local_name.to_owned()),
         dom.namespace_uri(id)
-            .map(|namespace| Value::from_string(namespace.to_owned()))
+            .map(|namespace| Value::from_engine_text(namespace.to_owned()))
             .unwrap_or(Value::Null),
         dom.namespace_prefix(id)
-            .map(|prefix| Value::from_string(prefix.to_owned()))
+            .map(|prefix| Value::from_engine_text(prefix.to_owned()))
             .unwrap_or(Value::Null),
     ]))
 }
@@ -14811,7 +14848,7 @@ fn host_get_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     let dom = dom.borrow();
     Ok(
         match host_arg_node(&dom, args, 0).and_then(|id| dom.get_attribute(id, &name)) {
-            Some(value) => Value::from_string(value.to_owned()),
+            Some(value) => Value::from_engine_text(value.to_owned()),
             None => Value::Null,
         },
     )
@@ -14855,8 +14892,8 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
             ))
         }
         _ if dom.tag_name(id) != Some("input") => Value::Null,
-        "type" => Value::from_string(dom.input_type(id)),
-        "get" => Value::from_string(dom.input_value(id)),
+        "type" => Value::from_engine_text(dom.input_type(id)),
+        "get" => Value::from_engine_text(dom.input_value(id)),
         "set" | "user" => {
             let value = host_arg_string(ctx, args, 2);
             Value::Bool(dom.set_input_value(id, &value, op == "user"))
@@ -14946,7 +14983,7 @@ fn host_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
                 .unwrap_or_else(|| dom.text_content(id))
         })
         .unwrap_or_default();
-    Ok(Value::from_string(text))
+    Ok(Value::from_engine_text(text))
 }
 
 fn host_set_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -14969,7 +15006,7 @@ fn host_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let html = host_arg_node(&dom, args, 0)
         .map(|id| dom.inner_html(id))
         .unwrap_or_default();
-    Ok(Value::from_string(html))
+    Ok(Value::from_engine_text(html))
 }
 
 /// HTML §13.5 fragment parsing with the target element as the context. Template markup is directed
@@ -14994,7 +15031,7 @@ fn host_outer_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let html = host_arg_node(&dom, args, 0)
         .map(|id| dom.serialize_js(id))
         .unwrap_or_default();
-    Ok(Value::from_string(html))
+    Ok(Value::from_engine_text(html))
 }
 
 fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -15262,7 +15299,7 @@ fn host_adopt_styles(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 fn host_css_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let css = host_arg_string(ctx, args, 0);
     let quirks = matches!(args.get(1), Some(Value::Bool(true)));
-    Ok(Value::from_string(crate::dom::parse_cssom_json(
+    Ok(Value::from_engine_text(crate::dom::parse_cssom_json(
         &css, quirks,
     )))
 }
@@ -15305,7 +15342,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     .collect(),
             );
         }
-        return Ok(Value::from_string("null".into()));
+        return Ok(Value::from_engine_text("null"));
     }
     if matches!(op.as_str(), "computed-names" | "computed-pseudo") {
         let value = read_layout_dependent_style(ctx, |dom| {
@@ -15344,7 +15381,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                 serde_json::Value::Null
             }
         });
-        return Ok(Value::from_string(value.to_string()));
+        return Ok(Value::from_engine_text(value.to_string()));
     }
     if op == "register-property" {
         let result = match (
@@ -15363,7 +15400,7 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             }
             _ => Err("SyntaxError"),
         };
-        return Ok(Value::from_string(
+        return Ok(Value::from_engine_text(
             serde_json::to_string(&result.err()).unwrap(),
         ));
     }
@@ -15376,9 +15413,9 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             let mut dom = dom.borrow_mut();
             dom.set_cssom_inline(id, declarations);
         }
-        return Ok(Value::from_string("null".to_string()));
+        return Ok(Value::from_engine_text("null".to_string()));
     }
-    Ok(Value::from_string(
+    Ok(Value::from_engine_text(
         crate::dom::cssom::operation(&op, &text, &extra).to_string(),
     ))
 }
@@ -15485,9 +15522,9 @@ fn url_origin_serialization(url: &url::Url) -> String {
 /// or an unknown internal component name returns null.
 fn host_url_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     use url::quirks;
-    let href = host_arg_string(ctx, args, 0);
-    let component = host_arg_string(ctx, args, 1);
-    let value = host_arg_string(ctx, args, 2);
+    let href = host_arg_usv(ctx, args, 0);
+    let component = host_arg_usv(ctx, args, 1);
+    let value = host_arg_usv(ctx, args, 2);
     let Ok(mut url) = url::Url::parse(&href) else {
         return Ok(Value::Null);
     };
@@ -15576,14 +15613,14 @@ fn sync_css_transitions(ctx: &mut Ctx) {
 fn host_transition_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     sync_css_transitions(ctx);
     let events = host_dom(ctx).borrow_mut().take_css_transition_events();
-    Ok(Value::from_string(serde_json::to_string(&events).unwrap()))
+    Ok(Value::from_engine_text(serde_json::to_string(&events).unwrap()))
 }
 
 /// CSS Animations 2 #event-dispatch for this rendering update's sample.
 fn host_animation_events(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     sync_css_transitions(ctx);
     let events = host_dom(ctx).borrow_mut().take_css_animation_events();
-    Ok(Value::from_string(serde_json::to_string(&events).unwrap()))
+    Ok(Value::from_engine_text(serde_json::to_string(&events).unwrap()))
 }
 
 fn ensure_host_geom_cache(ctx: &mut Ctx, reason: &'static str) -> Rc<RefCell<LumenGeomCache>> {
@@ -15936,17 +15973,17 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     if (name == "width" || name == "height")
         && let Some(value) = host_resolved_box_size(ctx, args, name == "width")
     {
-        return Ok(Value::from_string(value));
+        return Ok(Value::from_engine_text(value));
     }
     if (name == "grid-template-columns" || name == "grid-template-rows")
         && let Some(value) = host_resolved_grid_tracks(ctx, args, name == "grid-template-columns")
     {
-        return Ok(Value::from_string(value));
+        return Ok(Value::from_engine_text(value));
     }
     Ok(read_layout_dependent_style(
         ctx,
         |dom| match host_arg_node(dom, args, 0).and_then(|id| dom.cssom_resolved_value(id, &name)) {
-            Some(value) => Value::from_string(value),
+            Some(value) => Value::from_engine_text(value),
             None => Value::Null,
         },
     ))
@@ -16351,7 +16388,7 @@ fn host_media_failed(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 fn document_cookie_url(ctx: &mut Ctx, args: &[Value]) -> Option<url::Url> {
     let id = args.first()?.as_num_opt()? as usize;
     let context_id = args.get(1)?.as_num_opt()? as u64;
-    let url = url::Url::parse(&host_arg_string(ctx, args, 2)).ok()?;
+    let url = url::Url::parse(&host_arg_usv(ctx, args, 2)).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
@@ -16392,10 +16429,10 @@ fn host_cookie_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::from_string(value))
 }
 fn host_cookie_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let line = host_arg_string(ctx, args, 3);
+    let line = host_arg_usv(ctx, args, 3);
     if let Some(page) = document_cookie_url(ctx, args) {
         crate::http::set_cookie_from_js(&page, &line);
-    } else if let Ok(page) = url::Url::parse(&host_arg_string(ctx, args, 2)) {
+    } else if let Ok(page) = url::Url::parse(&host_arg_usv(ctx, args, 2)) {
         crate::http::trace_cookie_line("script-write-denied-context", &page, &line);
     }
     Ok(Value::Undefined)
@@ -16433,7 +16470,7 @@ fn host_storage_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     let storage = storage.lock().unwrap();
     Ok(
         match storage.get(&bucket).and_then(|bucket| bucket.get(&key)) {
-            Some(value) => Value::from_string(value.clone()),
+            Some(value) => Value::from_engine_text(value.clone()),
             None => Value::Null,
         },
     )
@@ -16518,7 +16555,7 @@ fn host_storage_len(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// check: queue `text` for the frontend's system clipboard. `settle` is called with the
 /// frontend's answer and settles the operation's promise in its own Realm.
 fn host_clipboard_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let text = host_arg_string(ctx, args, 0);
+    let text = host_arg_usv(ctx, args, 0);
     let settle = args.get(1).cloned().unwrap_or(Value::Undefined);
     if !settle.is_callable() {
         return Err(ctx.make_error("TypeError", "clipboard writes require a settle callback"));
@@ -16555,10 +16592,10 @@ const CACHE_STORAGE_QUOTA: usize = 64 * 1024 * 1024;
 /// session shelf. Each bottle is measured as its endpoint enforces its quota, and the quota is
 /// the sum of those endpoint quotas, independent of the device's free space.
 fn host_storage_manager(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    if host_arg_string(ctx, args, 0) != "estimate" {
+    if host_arg_usv(ctx, args, 0) != "estimate" {
         return Ok(Value::Undefined);
     }
-    let origin = host_arg_string(ctx, args, 1);
+    let origin = host_arg_usv(ctx, args, 1);
     if origin == "null" {
         return Ok(Value::Undefined);
     }
@@ -16603,21 +16640,17 @@ fn host_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
     {
         return bytes;
     }
+    // A binary string's code units are its bytes (a lone surrogate keeps its low byte).
     args.get(index)
-        .and_then(|value| ctx.coerce_string(value).ok())
-        .map(|string| {
-            string
-                .chars()
-                .map(|character| character as u32 as u8)
-                .collect()
-        })
+        .and_then(|value| ctx.coerce_utf16(value).ok())
+        .map(|units| units.into_iter().map(|unit| unit as u8).collect())
         .unwrap_or_default()
 }
 
 fn host_blob_mirror(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let url = host_arg_string(ctx, args, 0);
+    let url = host_arg_usv(ctx, args, 0);
     let bytes = host_latin1_bytes(ctx, args, 1);
-    let mime = host_arg_string(ctx, args, 2);
+    let mime = host_arg_usv(ctx, args, 2);
     if !url.is_empty() {
         let blobs = ctx
             .host_mut::<HostState>()
@@ -16833,7 +16866,7 @@ fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
 /// Encoding §7.4 UTF-8 encode: the Web IDL `USVString` conversion has already replaced lone
 /// surrogates before the host call, and the result is a fresh realm-local `Uint8Array`.
 fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let text = host_arg_string(ctx, args, 0);
+    let text = host_arg_usv(ctx, args, 0);
     ctx.make_uint8array(text.as_bytes())
 }
 
@@ -34800,6 +34833,85 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "textEncoderResult"),
             "2|3|65,195,169|1|3|239,191,189"
+        );
+    }
+
+    #[test]
+    fn dom_strings_keep_lone_surrogates_and_plane_16_characters() {
+        // DOM §4.10/§4.9 and Web IDL §3.2.10: DOM strings are code-unit sequences, so lone
+        // surrogates set from script round-trip exactly; the host keeps them as Lumen engine
+        // text. Characters in U+10F800..U+10FFFF stay characters, including parsed markup.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const u = s => Array.from({length: s.length}, (_, i) => s.charCodeAt(i).toString(16)).join(' ');
+            const text = document.createTextNode('a\ud800b');
+            text.appendData('\udfff');
+            const comment = document.createComment('\udc00');
+            const el = document.createElement('div');
+            el.setAttribute('data-x', 'x\udbff');
+            el.textContent = '\u{10FFFD}\ud800';
+            const host = document.createElement('section');
+            host.innerHTML = '<p title="\udfff">\ud83d\u{10F800}</p>';
+            const split = document.createTextNode('🌠');
+            split.deleteData(1, 1);
+            el.style.setProperty('--v', '"\ud800\u{10FFFD}"');
+            globalThis.domResult = [
+                u(text.data), u(comment.data), u(el.getAttribute('data-x')), u(el.textContent),
+                u(host.firstChild.getAttribute('title')), u(host.firstChild.textContent),
+                u(host.innerHTML), u(split.data), u(el.style.getPropertyValue('--v')),
+                u(new DOMParser().parseFromString('<b>\udbff\u{10FFFF}</b>', 'text/html').body.textContent),
+            ].join('|');
+            "#,
+            "DOM strings",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "domResult"),
+            "61 d800 62 dfff|dc00|78 dbff|dbff dffd d800|dfff|d83d dbfe dc00|\
+             3c 70 20 74 69 74 6c 65 3d 22 dfff 22 3e d83d dbfe dc00 3c 2f 70 3e|d83c|\
+             22 d800 dbff dffd 22|dbff dbff dfff"
+        );
+        // Decoded markup is Rust text: its private-use characters reach script as characters.
+        let html = "<!doctype html><p id=p title=\"\u{10F800}\">x\u{10FFFD}</p><pre id=o></pre>\
+            <script>const u = s => Array.from({length: s.length}, (_, i) => s.charCodeAt(i).toString(16)).join(' ');\
+            const p = document.getElementById('p');\
+            document.getElementById('o').textContent = [u(p.textContent), u(p.title), p.textContent.length].join('|');</script>";
+        let (output, outcome) = crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let result = output
+            .split("<pre id=\"o\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</pre>").next())
+            .unwrap_or_default();
+        assert_eq!(result, "78 dbff dffd|dbfe dc00|3", "{output}");
+    }
+
+    #[test]
+    fn utf8_codecs_carry_plane_16_private_use_characters() {
+        // Encoding §7.4/§8.1: U+10F800..U+10FFFF are ordinary scalar values. Lumen stores lone
+        // surrogates in that range, so the host boundary must encode and decode these characters
+        // as themselves, while TextEncoder still replaces a lone surrogate with U+FFFD.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const units = s => Array.from({length: s.length}, (_, i) => s.charCodeAt(i).toString(16)).join(' ');
+            const bytes = s => Array.from(new TextEncoder().encode(s), b => b.toString(16)).join(' ');
+            const decoded = new TextDecoder().decode(new Uint8Array([0xf4, 0x8f, 0xbf, 0xbd, 0x41, 0xf4, 0x8f, 0xa0, 0x80]));
+            globalThis.plane16Result = [
+                bytes('\u{10FFFD}'), bytes('\u{10F800}'), bytes('\ud800'), bytes('\udbff\udffd'),
+                units(decoded), decoded === '\u{10FFFD}A\u{10F800}',
+                units(new TextDecoder().decode(new TextEncoder().encode('\u{10BFF}\u{10FFFD}'))),
+            ].join('|');
+            "#,
+            "plane-16 UTF-8 codecs",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "plane16Result"),
+            "f4 8f bf bd|f4 8f a0 80|ef bf bd|f4 8f bf bd|dbff dffd 41 dbfe dc00|true|d802 dfff dbff dffd"
         );
     }
 

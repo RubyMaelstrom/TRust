@@ -974,7 +974,9 @@ impl Builder<'_> {
         Some(BoxNode {
             node: id,
             style,
-            content: Content::Inlines(vec![Inline::Text(alt.clone())]),
+            content: Content::Inlines(vec![Inline::Text(
+                crate::dom::display_text(alt).into_owned(),
+            )]),
             marker: None,
             marker_image: None,
             marker_inside: false,
@@ -1270,7 +1272,9 @@ impl Builder<'_> {
             let text: String = items
                 .into_iter()
                 .filter_map(|item| match item {
-                    crate::dom::GeneratedContent::Text(text) => Some(text),
+                    crate::dom::GeneratedContent::Text(text) => {
+                        Some(crate::dom::display_text(&text).into_owned())
+                    }
                     crate::dom::GeneratedContent::Image(_) => None,
                 })
                 .collect();
@@ -1394,9 +1398,8 @@ impl Builder<'_> {
         let kids: Vec<Inline> = content
             .into_iter()
             .filter_map(|item| match item {
-                crate::dom::GeneratedContent::Text(text) => {
-                    (!text.is_empty()).then_some(Inline::Text(text))
-                }
+                crate::dom::GeneratedContent::Text(text) => (!text.is_empty())
+                    .then(|| Inline::Text(crate::dom::display_text(&text).into_owned())),
                 crate::dom::GeneratedContent::Image(source) => {
                     let url = self
                         .dom
@@ -1484,7 +1487,9 @@ impl Builder<'_> {
             }
             match &self.dom.node(c).data {
                 NodeData::Text(t) if !t.is_empty() => {
-                    out.push(Built::Inline(Inline::Text(t.clone())));
+                    out.push(Built::Inline(Inline::Text(
+                        crate::dom::display_text(t).into_owned(),
+                    )));
                 }
                 NodeData::Element { .. } => match self.element(c) {
                     Built::Hoist(kids) => out.extend(kids),

@@ -32,11 +32,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         }
     }
     let payload = args.get(3).cloned().unwrap_or(Value::Undefined);
-    let text = if let Value::Str(s) = &payload {
-        s.to_string()
-    } else {
-        String::new()
-    };
+    let text = payload.as_text().unwrap_or_default().into_owned();
     if op == "color" {
         return Ok(Canvas::color(&text).map_or(Value::Null, |(color, _)| {
             ctx.make_array(color.into_iter().map(|n| Value::Num(n as f64)).collect())
