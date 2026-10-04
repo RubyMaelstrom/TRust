@@ -2034,43 +2034,33 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     ctx,
                     self.vp,
                 );
-                let mut shaped = crate::text::shape(
-                    if labels.visual.is_empty() {
-                        " "
-                    } else {
-                        &labels.visual
-                    },
-                    &ctx.text_style(),
-                );
-                if labels.visual.is_empty() {
-                    shaped.text.clear();
-                    shaped.advance = 0.0;
-                    shaped.runs.clear();
-                    shaped.clusters.clear();
-                }
+                let shaped = control_shaped(&labels.visual, ctx);
+                let label = ControlLabel::new(self.dom, a.node, f, ctx);
                 let lines = (f.kind == crate::doc::FieldKind::Textarea)
                     .then(|| {
                         self.textarea_lines(
                             a.node,
                             &labels.visual,
-                            ctx,
+                            &label.style,
                             labels.geometry.paint_width,
                             labels.geometry.paint_height,
                             Some(self.cb_w_px),
+                            label.align,
                         )
                     })
                     .flatten();
+                let painted = label.shaped(&labels.visual, &shaped);
                 self.place_atom(
                     labels.geometry,
                     InlineItem {
                         text: labels.visual,
-                        terminal_text: Some(labels.terminal),
+                        terminal_text: Some(label.terminal(f, labels.terminal)),
                         kind: ItemKind::Form,
                         graphical_image: None,
                         image: None,
                         emph: Emphasis::default(),
                         style_node: a.node,
-                        pseudo: None,
+                        pseudo: label.pseudo,
                         node: a.node,
                         link: Some(Link::Form {
                             form: *form,
@@ -2090,6 +2080,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // `place_atom` always ends by pushing this control's piece.
                 if let Some(piece) = self.cur.last_mut() {
                     piece.control_text = lines;
+                    if let Some(painted) = painted {
+                        piece.shaped = Some(painted);
+                    }
                 }
             }
         }
@@ -2115,6 +2108,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// laid only as far as lines can reach the scrollport, and only those
     /// lines are kept for paint and hit testing. A value far longer than the
     /// control (a log, a pasted file) then costs what the control shows.
+    #[allow(clippy::too_many_arguments)] // The control's box and its label's style are independent.
     fn textarea_lines(
         &self,
         node: NodeId,
@@ -2123,6 +2117,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         width: f32,
         height: f32,
         padding_basis: Option<f32>,
+        align: super::style::Align2,
     ) -> Option<std::sync::Arc<ControlText>> {
         if self.measuring || text.is_empty() {
             return None;
@@ -2153,7 +2148,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.vp,
             width.max(0.0),
             None,
-            super::style::block_align(self.dom, node),
+            align,
             indent,
             None,
             &[],
@@ -2229,20 +2224,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             ctx,
             self.vp,
         );
-        let mut shaped = crate::text::shape(
-            if labels.visual.is_empty() {
-                " "
-            } else {
-                &labels.visual
-            },
-            &ctx.text_style(),
-        );
-        if labels.visual.is_empty() {
-            shaped.text.clear();
-            shaped.advance = 0.0;
-            shaped.runs.clear();
-            shaped.clusters.clear();
-        }
+        let shaped = control_shaped(&labels.visual, ctx);
+        let label = ControlLabel::new(self.dom, a.node, f, ctx);
         // CSS Display #blockify changes the outer display, not the text
         // viewport of the control. Its content box is the editing line's
         // available width even when the current label is empty or short.
@@ -2272,8 +2255,19 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let lines = textarea
             // The outer fragment resolved this box's percentage padding;
             // the content-width IFC no longer knows that basis.
-            .then(|| self.textarea_lines(a.node, &labels.visual, ctx, width, height, None))
+            .then(|| {
+                self.textarea_lines(
+                    a.node,
+                    &labels.visual,
+                    &label.style,
+                    width,
+                    height,
+                    None,
+                    label.align,
+                )
+            })
             .flatten();
+        let painted = label.shaped(&labels.visual, &shaped);
         self.place_atom(
             AtomGeometry {
                 box_width: width,
@@ -2289,13 +2283,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             },
             InlineItem {
                 text: labels.visual,
-                terminal_text: Some(labels.terminal),
+                terminal_text: Some(label.terminal(f, labels.terminal)),
                 kind: ItemKind::Form,
                 graphical_image: None,
                 image: None,
                 emph: Emphasis::default(),
                 style_node: a.node,
-                pseudo: None,
+                pseudo: label.pseudo,
                 node: a.node,
                 link: Some(Link::Form {
                     form: *form,
@@ -2314,6 +2308,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         );
         if let Some(piece) = self.cur.last_mut() {
             piece.control_text = lines;
+            if let Some(painted) = painted {
+                piece.shaped = Some(painted);
+            }
         }
     }
 
@@ -3775,6 +3772,110 @@ fn textarea_visible_prefix<'s>(text: &'s str, ctx: &InlineStyle, budget: usize) 
         }
     }
     text
+}
+
+/// A control label shaped in `ctx`'s text style. An empty label keeps the
+/// style's line metrics but has no glyphs.
+fn control_shaped(text: &str, ctx: &InlineStyle) -> crate::text::ShapedText {
+    let mut shaped =
+        crate::text::shape(if text.is_empty() { " " } else { text }, &ctx.text_style());
+    if text.is_empty() {
+        shaped.text.clear();
+        shaped.advance = 0.0;
+        shaped.runs.clear();
+        shaped.clusters.clear();
+    }
+    shaped
+}
+
+/// How a text control paints its label. HTML #attr-input-placeholder and
+/// #attr-textarea-placeholder: an input whose type the attribute applies to,
+/// or a textarea, presents its placeholder while its value is empty. CSS
+/// Pseudo 4 #placeholder-pseudo: that text is the control's `::placeholder`
+/// and takes the pseudo-element's style. The control's own box, line and
+/// baseline still come from the control, so a placeholder never resizes or
+/// realigns it.
+struct ControlLabel<'s> {
+    style: std::borrow::Cow<'s, InlineStyle>,
+    pseudo: Option<(NodeId, PseudoEl)>,
+    align: super::style::Align2,
+    /// The placeholder paints nothing (`visibility: hidden`, `opacity: 0` or
+    /// a transparent color) although the control itself is visible.
+    hidden: bool,
+}
+
+impl<'s> ControlLabel<'s> {
+    fn new(dom: &Dom, node: NodeId, field: &crate::doc::Field, ctx: &'s InlineStyle) -> Self {
+        let applies = match dom.tag_name(node) {
+            Some("input") => crate::dom::placeholder_input_type(&dom.input_type(node)),
+            Some("textarea") => true,
+            _ => false,
+        };
+        if !applies || !field.shows_placeholder() {
+            return Self {
+                style: std::borrow::Cow::Borrowed(ctx),
+                pseudo: None,
+                align: super::style::block_align(dom, node),
+                hidden: false,
+            };
+        }
+        let style = ctx.placeholder(dom);
+        let transparent = dom
+            .pseudo_layout_value(node, PseudoEl::Placeholder, "color")
+            .as_deref()
+            .and_then(crate::render::PaintColor::parse_css)
+            .is_some_and(crate::render::PaintColor::is_transparent);
+        let hidden = !ctx.invisible && (style.invisible || transparent);
+        Self {
+            style,
+            pseudo: Some((node, PseudoEl::Placeholder)),
+            align: super::style::placeholder_align(dom, node),
+            hidden,
+        }
+    }
+
+    /// The painted placeholder when its style differs from the control's
+    /// `shaped` text: it has its own font, or a `text-transform` (CSS Text 3
+    /// #text-transform-property). Its line keeps the control's `line-height`
+    /// (CSS Inline 3 properties do not apply to `::placeholder`), but another
+    /// font changes its `normal` height and baseline; center it on the
+    /// control's line as the field's one line of text is centered in its
+    /// content box.
+    fn shaped(
+        &self,
+        text: &str,
+        control: &crate::text::ShapedText,
+    ) -> Option<crate::text::ShapedText> {
+        let transformed =
+            self.pseudo.is_some() && self.style.transform != crate::layout2::TextTransform::None;
+        if matches!(self.style, std::borrow::Cow::Borrowed(_)) && !transformed {
+            return None;
+        }
+        let text = if transformed {
+            self.style.transform.apply(text)
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        let mut shaped = control_shaped(&text, &self.style);
+        crate::text::center_in_line(&mut shaped, control.line_height);
+        Some(shaped)
+    }
+
+    /// The terminal widget text. Cells carry no CSS color, so a placeholder
+    /// that paints nothing leaves its cells blank inside the brackets.
+    fn terminal(&self, field: &crate::doc::Field, terminal: String) -> String {
+        if !self.hidden {
+            return terminal;
+        }
+        match terminal.strip_prefix('[') {
+            Some(rest) if rest.starts_with(field.label.as_str()) => format!(
+                "[{}{}",
+                " ".repeat(crate::layout2::display_width(&field.label)),
+                &rest[field.label.len()..]
+            ),
+            _ => terminal,
+        }
+    }
 }
 
 fn control_labels(

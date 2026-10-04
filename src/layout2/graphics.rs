@@ -1803,7 +1803,11 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             // item even though they have no DOM identity of their own. Use
             // their style host for paint ancestry, retaining NO_NODE for hits.
             let paint_node = if node == NO_NODE { style_node } else { node };
-            if if let Some((node, pseudo)) = piece.item.pseudo {
+            // CSS Pseudo 4 #placeholder-pseudo: a text control showing its
+            // placeholder paints that text with its ::placeholder style; the
+            // control's box keeps its own.
+            let placeholder = matches!(piece.item.pseudo, Some((_, PseudoEl::Placeholder)));
+            if if let Some((node, pseudo)) = piece.item.pseudo.filter(|_| !placeholder) {
                 matches!(
                     builder
                         .dom
@@ -1957,7 +1961,12 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                                 .unwrap_or(0.0);
                             origin.x += indent;
                             let spare = (piece.paint_width - indent - label.advance).max(0.0);
-                            origin.x += match super::style::block_align(builder.dom, style_node) {
+                            let align = if placeholder {
+                                super::style::placeholder_align(builder.dom, style_node)
+                            } else {
+                                super::style::block_align(builder.dom, style_node)
+                            };
+                            origin.x += match align {
                                 super::style::Align2::Center => spare / 2.0,
                                 super::style::Align2::Right => spare,
                                 _ => 0.0,
@@ -1987,7 +1996,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     w: builder.viewport_w,
                     h: builder.viewport_h,
                 };
-                let decoration = TextDecorationPaint {
+                let mut decoration = TextDecorationPaint {
                     color: decoration_color(builder.dom, style_node).unwrap_or(current_color),
                     style: decoration_style(builder.dom, style_node),
                     thickness: decoration_metric(
@@ -2003,13 +2012,78 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                         viewport,
                     ),
                 };
-                let shadows = text_shadows(builder.dom, style_node, current_color);
+                let mut lines = if style_node == NO_NODE {
+                    (false, false)
+                } else {
+                    builder.dom.text_decoration(style_node)
+                };
+                let placeholder_paint = placeholder
+                    .then(|| PlaceholderPaint::of(builder.dom, paint_style, current_color));
+                if let Some(own) = placeholder_paint.as_ref().and_then(|p| p.decoration) {
+                    // A decoration ::placeholder declares itself is drawn in
+                    // its own decoration color, above any it inherits.
+                    lines.0 |= own.underline;
+                    lines.1 |= own.strikethrough;
+                    decoration.color = own.color;
+                    decoration.style = own.style;
+                }
+                let shadows = match &placeholder_paint {
+                    Some(paint) => paint.shadows.clone(),
+                    None => text_shadows(builder.dom, style_node, current_color),
+                };
+                let label_hidden = placeholder_paint.as_ref().is_some_and(|p| p.hidden);
+                let label_layer = placeholder_paint
+                    .as_ref()
+                    .is_some_and(|p| !p.hidden && p.opacity < 1.0);
+                if let Some(paint) = placeholder_paint.as_ref().filter(|_| label_layer) {
+                    builder.push_marquee_content(
+                        node,
+                        DisplayCommand::PushLayer(CompositingLayer::new(
+                            paint.opacity,
+                            BlendMode::Normal,
+                            std::sync::Arc::from([]),
+                        )),
+                    );
+                }
+                if let Some(background) = placeholder_paint
+                    .as_ref()
+                    .filter(|p| !p.hidden)
+                    .and_then(|p| p.background)
+                {
+                    if let Some(clip) = clip {
+                        builder.push_marquee_content(
+                            node,
+                            DisplayCommand::PushClip(PaintShape::Rect(clip)),
+                        );
+                    }
+                    // Each line of the placeholder spans the content box, as
+                    // the block that Blink lays the text in does.
+                    for (origin, shaped) in &runs {
+                        builder.push_marquee_content(
+                            node,
+                            DisplayCommand::FillRect {
+                                rect: CssRect::new(
+                                    content_origin.x,
+                                    origin.y,
+                                    piece.paint_width,
+                                    shaped.line_height,
+                                ),
+                                color: background,
+                            },
+                        );
+                    }
+                    if clip.is_some() {
+                        builder.push_marquee_content(node, DisplayCommand::PopClip);
+                    }
+                }
                 for (origin, shaped) in runs {
                     let mut shaped = shaped.clone();
                     if style_node != NO_NODE {
-                        let (underline, strikethrough) = builder.dom.text_decoration(style_node);
-                        shaped.underline = underline;
-                        shaped.strikethrough = strikethrough;
+                        (shaped.underline, shaped.strikethrough) = lines;
+                    }
+                    if label_hidden {
+                        push_label_hit_region(builder, piece, piece_rect, clip, origin, &shaped);
+                        continue;
                     }
                     builder.push_marquee_content(
                         node,
@@ -2071,32 +2145,10 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                             builder.push_marquee_content(node, DisplayCommand::PopClip);
                         }
                     }
-                    let mut rect =
-                        CssRect::new(origin.x, origin.y, shaped.advance, shaped.line_height);
-                    // CSS Overflow 3 #overflow-control: a control's text is
-                    // clipped to its content box (a textarea's to its
-                    // scrollport), so text drawn nowhere must not take the
-                    // clicks of the content beside or below the control.
-                    let clipped_away = piece_rect.is_some() && {
-                        rect = intersect_css_rects(clip, rect).unwrap_or(rect);
-                        rect.width <= 0.0 || rect.height <= 0.0
-                    };
-                    if !clipped_away
-                        && (style_node == NO_NODE || builder.dom.point_hit_testable(style_node))
-                    {
-                        builder.has_media_controls |=
-                            matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
-                        builder.push_marquee_content(
-                            node,
-                            DisplayCommand::HitRegion(HitRegion {
-                                rect,
-                                node,
-                                actor: interaction_actor(builder.dom, node),
-                                link: piece.item.link.clone(),
-                                cursor: cursor_value(builder.dom, style_node),
-                            }),
-                        );
-                    }
+                    push_label_hit_region(builder, piece, piece_rect, clip, origin, &shaped);
+                }
+                if label_layer {
+                    builder.push_marquee_content(node, DisplayCommand::PopLayer);
                 }
             } else if piece.item.graphical_image.is_some()
                 || piece.item.image.is_some()
@@ -4992,13 +5044,28 @@ fn text_shadows(dom: &Dom, node: NodeId, current_color: PaintColor) -> Vec<TextS
     if node == NO_NODE {
         return Vec::new();
     }
-    let Some(value) = dom.computed_value_resolved(node, "text-shadow") else {
+    text_shadows_for_style(
+        dom,
+        PaintStyle::Element(node),
+        Units::of(dom, node),
+        current_color,
+    )
+}
+
+/// `text_shadows` of an element or pseudo-element `style`, whose font-relative
+/// lengths resolve against `units`.
+fn text_shadows_for_style(
+    dom: &Dom,
+    style: PaintStyle,
+    units: Units,
+    current_color: PaintColor,
+) -> Vec<TextShadowPaint> {
+    let Some(value) = style.value(dom, "text-shadow") else {
         return Vec::new();
     };
     if value.trim().eq_ignore_ascii_case("none") {
         return Vec::new();
     }
-    let units = Units::of(dom, node);
     // Resource-bound hostile declarations while keeping substantially more
     // layers than ordinary outline recipes (Burgeritchi uses 26).
     split_top_level(&value, ',')
@@ -5011,7 +5078,7 @@ fn text_shadows(dom: &Dom, node: NodeId, current_color: PaintColor) -> Vec<TextS
                 .any(|token| token.eq_ignore_ascii_case("inset"));
             let color = tokens
                 .iter()
-                .find_map(|token| resolve_color(dom, node, token))
+                .find_map(|token| resolve_color_for_style(dom, style, token))
                 .unwrap_or(current_color);
             let lengths = tokens
                 .iter()
@@ -5034,6 +5101,143 @@ fn text_shadows(dom: &Dom, node: NodeId, current_color: PaintColor) -> Vec<TextS
             })
         })
         .collect()
+}
+
+/// The paint of a text control's `::placeholder` text besides its color and
+/// font. CSS Pseudo 4 #placeholder-pseudo applies the ::first-line
+/// properties (#first-line-styling): `opacity` (a group opacity over the
+/// text, its shadows and background), the background properties (TRust
+/// paints `background-color` behind each line across the content box, but
+/// no background images), text shadows and the text decoration properties,
+/// besides `visibility`.
+struct PlaceholderPaint {
+    opacity: f32,
+    hidden: bool,
+    background: Option<PaintColor>,
+    shadows: Vec<TextShadowPaint>,
+    /// A decoration the pseudo-element declares itself, rather than one
+    /// propagated from the control (CSS Text Decoration 3 #line-decoration).
+    decoration: Option<OwnDecoration>,
+}
+
+#[derive(Clone, Copy)]
+struct OwnDecoration {
+    underline: bool,
+    strikethrough: bool,
+    color: PaintColor,
+    style: DecorationStyle,
+}
+
+impl PlaceholderPaint {
+    fn of(dom: &Dom, style: PaintStyle, current_color: PaintColor) -> Self {
+        let node = style.node();
+        let value = |property: &str| style.value(dom, property);
+        let opacity = value("opacity")
+            .as_deref()
+            .and_then(parse_opacity)
+            .unwrap_or(1.0);
+        let hidden = opacity <= 0.0
+            || matches!(
+                value("visibility").as_deref().map(str::trim),
+                Some("hidden" | "collapse")
+            );
+        let background = value("background-color")
+            .as_deref()
+            .and_then(|color| resolve_color_for_style(dom, style, color))
+            .filter(|color| !color.is_transparent());
+        let mut units = Units::of(dom, node);
+        if let PaintStyle::Pseudo(_, which) = style
+            && (dom.pseudo_style(node, which, "font-size").is_some()
+                || dom.baked_pseudo_value(node, which, "font-size").is_some())
+            && let Some(size) = value("font-size").as_deref().and_then(|size| {
+                crate::dom::font_size_px_at(size, units.fs, dom.root_font_px(), dom.viewport_px())
+            })
+        {
+            units.fs = size;
+            units.ch = size * 0.5;
+        }
+        let shadows = text_shadows_for_style(dom, style, units, current_color);
+        let lines = value("text-decoration-line").unwrap_or_default();
+        let underline = lines.split_whitespace().any(|line| line == "underline");
+        let strikethrough = lines.split_whitespace().any(|line| line == "line-through");
+        let decoration = (underline || strikethrough).then(|| OwnDecoration {
+            underline,
+            strikethrough,
+            color: value("text-decoration-color")
+                .as_deref()
+                .and_then(|color| resolve_color_for_style(dom, style, color))
+                .unwrap_or(current_color),
+            style: match value("text-decoration-style").as_deref().map(str::trim) {
+                Some("double") => DecorationStyle::Double,
+                Some("dotted") => DecorationStyle::Dotted,
+                Some("dashed") => DecorationStyle::Dashed,
+                Some("wavy") => DecorationStyle::Wavy,
+                _ => DecorationStyle::Solid,
+            },
+        });
+        Self {
+            opacity,
+            hidden,
+            background,
+            shadows,
+            decoration,
+        }
+    }
+}
+
+/// The fill colors graphical paint gives a text control's own text and its
+/// `::placeholder` text (`-webkit-text-fill-color`, else `color`), and the
+/// placeholder's group opacity, for editing overlays that repaint them.
+pub(crate) fn control_text_paint(dom: &Dom, node: NodeId) -> (PaintColor, PaintColor, f32) {
+    let fill = |style: PaintStyle| {
+        let current = text_color_for_style(dom, style);
+        style
+            .value(dom, "-webkit-text-fill-color")
+            .as_deref()
+            .and_then(|value| resolve_color_for_style(dom, style, value))
+            .unwrap_or(current)
+    };
+    let placeholder = PaintStyle::Pseudo(node, PseudoEl::Placeholder);
+    let opacity = placeholder
+        .value(dom, "opacity")
+        .as_deref()
+        .and_then(parse_opacity)
+        .unwrap_or(1.0);
+    (fill(PaintStyle::Element(node)), fill(placeholder), opacity)
+}
+
+/// The hit region of one painted run of an inline piece's text.
+fn push_label_hit_region(
+    builder: &mut Builder<'_>,
+    piece: &super::inline::Piece,
+    piece_rect: Option<CssRect>,
+    clip: Option<CssRect>,
+    origin: CssPoint,
+    shaped: &crate::text::ShapedText,
+) {
+    let node = piece.item.node;
+    let style_node = piece.item.style_node;
+    let mut rect = CssRect::new(origin.x, origin.y, shaped.advance, shaped.line_height);
+    // CSS Overflow 3 #overflow-control: a control's text is clipped to its
+    // content box (a textarea's to its scrollport), so text drawn nowhere
+    // must not take the clicks of the content beside or below the control.
+    let clipped_away = piece_rect.is_some() && {
+        rect = intersect_css_rects(clip, rect).unwrap_or(rect);
+        rect.width <= 0.0 || rect.height <= 0.0
+    };
+    if !clipped_away && (style_node == NO_NODE || builder.dom.point_hit_testable(style_node)) {
+        builder.has_media_controls |= matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
+        builder.push_marquee_content(
+            node,
+            DisplayCommand::HitRegion(HitRegion {
+                rect,
+                node,
+                actor: interaction_actor(builder.dom, node),
+                link: piece.item.link.clone(),
+                cursor: cursor_value(builder.dom, style_node),
+            }),
+        );
+    }
 }
 
 /// A border or outline stroke along the center of its band. Corners join

@@ -18938,6 +18938,93 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[test]
+    fn native_input_presents_the_placeholder_in_its_pseudo_element_style() {
+        // CSS Pseudo 4 #placeholder-pseudo: while the edited value is empty
+        // the focused control presents its ::placeholder in that style and
+        // opacity group; typed text, the caret and the selection take the
+        // control's own style, whichever text canonical paint last showed.
+        use crate::render::{DisplayCommand, PaintColor};
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<!doctype html><style>body{margin:0}
+            input{font:20px sans-serif;color:#123456;width:260px;border:0;padding:0;
+            background:none;outline:0}
+            input::placeholder{color:rgb(0,128,0);opacity:.5;font-size:30px}
+            </style><input id=q placeholder="Search">"#,
+        );
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640., 480.),
+            1.,
+            None,
+            &Default::default(),
+        );
+        let node = dom.get_by_id("q").unwrap();
+        let presentation = &rendered.rich_editors[&node];
+        let input = presentation.native_input.as_ref().unwrap();
+        assert_eq!(input.placeholder_color, PaintColor::Rgba(0, 128, 0, 255));
+        assert_eq!(input.text_color, PaintColor::Rgba(0x12, 0x34, 0x56, 255));
+        assert_eq!(input.placeholder_opacity, 0.5);
+        assert_eq!(input.placeholder_style.size, 30.);
+        assert_eq!(presentation.style.size, 20.);
+        let layers = |paint: &[DisplayCommand]| {
+            paint
+                .iter()
+                .filter(|p| matches!(p, DisplayCommand::PushLayer(_)))
+                .count()
+        };
+        assert_eq!(layers(&rendered.layout.paint.primitives), 1);
+        let mut editor =
+            crate::text::TextEditor::new("", &presentation.style, presentation.width, false);
+        let mut paint = rendered.layout.paint.primitives.clone();
+        let mut scroll = 0.;
+        crate::render::paint_native_input(
+            &mut paint,
+            &editor.line_layout(false),
+            presentation,
+            &mut scroll,
+        );
+        let index = paint
+            .iter()
+            .position(|p| {
+                matches!(p, DisplayCommand::GlyphRun { node: id, shaped, color, .. }
+                    if *id == node && shaped.text == "Search"
+                        && *color == PaintColor::Rgba(0, 128, 0, 255))
+            })
+            .expect("placeholder presented");
+        assert!(
+            matches!(&paint[index - 1], DisplayCommand::PushLayer(layer) if layer.opacity == 0.5)
+        );
+        assert!(matches!(paint[index + 1], DisplayCommand::PopLayer));
+        assert_eq!(layers(&paint), 1, "the canonical group is replaced");
+        editor.set_text("abc");
+        let mut paint = rendered.layout.paint.primitives.clone();
+        crate::render::paint_native_input(
+            &mut paint,
+            &editor.line_layout(false),
+            presentation,
+            &mut scroll,
+        );
+        assert!(paint.iter().any(
+            |p| matches!(p, DisplayCommand::GlyphRun { node: id, shaped, color, .. }
+            if *id == node && shaped.text == "abc"
+                && *color == PaintColor::Rgba(0x12, 0x34, 0x56, 255))
+        ));
+        assert_eq!(
+            layers(&paint),
+            0,
+            "typed text is not part of the placeholder"
+        );
+        assert!(
+            paint
+                .iter()
+                .any(|p| matches!(p, DisplayCommand::HitRegion(hit) if hit.node == node)),
+            "hit regions survive"
+        );
+    }
+
+    #[test]
     fn pending_plain_edit_paints_immediately_without_replacing_the_authored_surface() {
         let base = Url::parse("https://example.test/").unwrap();
         let dom = crate::dom::Dom::parse_document(

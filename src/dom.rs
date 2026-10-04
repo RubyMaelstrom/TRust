@@ -759,8 +759,9 @@ impl<T> NodeCache<T> {
 }
 
 /// One element's author-cascade winners, per target box: the element itself
-/// plus its `::before`/`::after`/`::first-letter`/`::marker` boxes (their
-/// rules ride the same matched list, bucketed by the rule's pseudo target).
+/// plus its `::before`/`::after`/`::first-letter`/`::marker`/`::placeholder`
+/// boxes (their rules ride the same matched list, bucketed by the rule's
+/// pseudo target).
 /// An absent key = no author declaration for that property (the cascade's
 /// `None`).
 #[derive(Clone, Default)]
@@ -770,6 +771,7 @@ struct CascadedMaps {
     after: FxHashMap<String, String>,
     first_letter: FxHashMap<String, String>,
     marker: FxHashMap<String, String>,
+    placeholder: FxHashMap<String, String>,
     custom_bases: FxHashMap<(Option<PseudoEl>, String), std::sync::Arc<url::Url>>,
 }
 
@@ -781,6 +783,7 @@ impl CascadedMaps {
             && self.after == other.after
             && self.first_letter == other.first_letter
             && self.marker == other.marker
+            && self.placeholder == other.placeholder
             && self.custom_bases.len() == other.custom_bases.len()
             && self
                 .custom_bases
@@ -794,6 +797,7 @@ impl CascadedMaps {
             PseudoEl::After => &self.after,
             PseudoEl::FirstLetter => &self.first_letter,
             PseudoEl::Marker => &self.marker,
+            PseudoEl::Placeholder => &self.placeholder,
         }
     }
 
@@ -804,6 +808,7 @@ impl CascadedMaps {
             Some(PseudoEl::After) => &mut self.after,
             Some(PseudoEl::FirstLetter) => &mut self.first_letter,
             Some(PseudoEl::Marker) => &mut self.marker,
+            Some(PseudoEl::Placeholder) => &mut self.placeholder,
         }
     }
 }
@@ -1264,6 +1269,7 @@ impl Dom {
                         &value.after,
                         &value.first_letter,
                         &value.marker,
+                        &value.placeholder,
                     ] {
                         fixed_map!(map, (String, String));
                         for (name, value) in map {
@@ -5179,6 +5185,78 @@ impl Dom {
         }
     }
 
+    /// CSSOM #dom-window-getcomputedstyle with a pseudo-element: the
+    /// resolved value of `name` on `id`'s pseudo-element `which`, which
+    /// inherits from `id` (CSS Pseudo 4 #treelike). Shorthands, numbers and
+    /// colors resolve as for elements (`cssom_resolved_value`).
+    pub fn cssom_pseudo_resolved_value(
+        &self,
+        id: NodeId,
+        which: PseudoEl,
+        name: &str,
+    ) -> Option<String> {
+        if let Some(value) = cssom::resolved_shorthand(name, |longhand| {
+            self.cssom_pseudo_resolved_value(id, which, longhand)
+        }) {
+            return Some(value);
+        }
+        let direct = self
+            .pseudo_style(id, which, name)
+            .or_else(|| self.baked_pseudo_value(id, which, name));
+        let declared = direct.is_some();
+        if name == "font-size" {
+            let parent = self.font_px(id);
+            let size = declared
+                .then(|| self.pseudo_layout_value(id, which, name))
+                .flatten()
+                .and_then(|value| {
+                    font_size_px_at(&value, parent, self.root_font_px(), self.viewport_px())
+                })
+                .unwrap_or(parent);
+            return Some(cssom::css_px(size));
+        }
+        if !name.starts_with("--") {
+            // A property that inherits into the pseudo-element (CSS Cascade
+            // 5 #defaulting) has its originating element's resolved value.
+            // Only the UA placeholder color sits between them.
+            let ua = which == PseudoEl::Placeholder && name == "color";
+            let inherited = prop_index(name).is_some_and(|i| PROPS[i].inherited);
+            let inherits = match direct.as_deref().and_then(wide_keyword) {
+                Some(WideKeyword::Inherit) => true,
+                Some(WideKeyword::Unset) => inherited,
+                Some(WideKeyword::Revert) => inherited && !ua,
+                Some(WideKeyword::Initial) => false,
+                None => !declared && inherited && !ua,
+            };
+            if inherits {
+                return self.cssom_resolved_value(id, name);
+            }
+        }
+        let value = self
+            .pseudo_layout_value(id, which, name)
+            .or_else(|| cssom_initial_value(name).map(str::to_string));
+        if let Some(number) = value
+            .as_deref()
+            .and_then(|value| cssom::resolved_number(name, value))
+        {
+            return Some(number);
+        }
+        if (is_color_property(name) || matches!(name, "column-rule-color" | "caret-color"))
+            && let Some(color) = value.as_deref()
+        {
+            let color = color.trim();
+            if color.eq_ignore_ascii_case("currentcolor") || color.eq_ignore_ascii_case("auto") {
+                return if name == "color" {
+                    self.cssom_resolved_value(id, "color")
+                } else {
+                    self.cssom_pseudo_resolved_value(id, which, "color")
+                };
+            }
+            return Some(self.cssom_color(id, name, color));
+        }
+        value
+    }
+
     /// A `<line-width>` computed value: its keyword's or length's px,
     /// snapped as a line width (CSS Values 4 #snap-a-length-as-a-line-width).
     fn cssom_line_width(&self, id: NodeId, width: &str) -> String {
@@ -5975,6 +6053,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             mut after,
             mut first_letter,
             mut marker,
+            mut placeholder,
             conditional: conditional_pseudos,
             ..
         } = winners;
@@ -5994,6 +6073,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     after: Default::default(),
                     first_letter: Default::default(),
                     marker: Default::default(),
+                    placeholder: Default::default(),
                     custom_bases: Default::default(),
                 }),
             );
@@ -6009,6 +6089,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     Some(PseudoEl::Before) => &mut before,
                     Some(PseudoEl::FirstLetter) => &mut first_letter,
                     Some(PseudoEl::Marker) => &mut marker,
+                    Some(PseudoEl::Placeholder) => &mut placeholder,
                     _ => &mut after,
                 };
                 for (pk, (imp, value)) in &r.decls {
@@ -6036,6 +6117,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             after: strip_winners(&after),
             first_letter: strip_winners(&first_letter),
             marker: strip_winners(&marker),
+            placeholder: strip_winners(&placeholder),
             custom_bases: Default::default(),
         };
         for (pseudo, name, order) in custom_property_sources([
@@ -6044,6 +6126,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             (Some(PseudoEl::After), &after),
             (Some(PseudoEl::FirstLetter), &first_letter),
             (Some(PseudoEl::Marker), &marker),
+            (Some(PseudoEl::Placeholder), &placeholder),
         ]) {
             if let Some(base) = index.rule_bases.get(&order) {
                 maps.custom_bases.insert((pseudo, name), base.clone());
@@ -6061,6 +6144,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 (Some(PseudoEl::After), &after),
                 (Some(PseudoEl::FirstLetter), &first_letter),
                 (Some(PseudoEl::Marker), &marker),
+                (Some(PseudoEl::Placeholder), &placeholder),
             ] {
                 let custom_count = winners.keys().filter(|k| k.starts_with("--")).count();
                 for pass in 0..=custom_count + 1 {
@@ -6147,7 +6231,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         // CSS Logical 1 #box: compute axes before pairing declarations.
         // Keep every layer candidate, including a physical fallback below a
         // logical revert-layer. Source order includes declaration order.
-        if [&elem, &before, &after, &first_letter, &marker]
+        if [&elem, &before, &after, &first_letter, &marker, &placeholder]
             .iter()
             .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
         {
@@ -6162,6 +6246,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 (Some(PseudoEl::After), &mut after),
                 (Some(PseudoEl::FirstLetter), &mut first_letter),
                 (Some(PseudoEl::Marker), &mut marker),
+                (Some(PseudoEl::Placeholder), &mut placeholder),
             ] {
                 let logical: Vec<_> = winners
                     .keys()
@@ -6633,6 +6718,51 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         self.attr(id, PseudoEl::Marker.baked_style_attr()).is_some()
             || (self.style_index().has_marker && !self.cascaded_maps(id).marker.is_empty())
     }
+
+    /// Whether author `::placeholder` declarations apply to `id`, from the
+    /// cascade or (in a stylesheet-free snapshot) from their baked attribute.
+    pub(crate) fn has_placeholder_style(&self, id: NodeId) -> bool {
+        self.attr(id, PseudoEl::Placeholder.baked_style_attr())
+            .is_some()
+            || (self.style_index().has_placeholder
+                && !self.cascaded_maps(id).placeholder.is_empty())
+    }
+
+    /// The user-agent `color` of `id`'s `::placeholder`. Neither HTML's
+    /// Rendering section nor CSS UI 4 specifies placeholder styling, and CSS
+    /// Pseudo 4 #placeholder-pseudo leaves it to the UA. TRust follows
+    /// Gecko's UA sheet, `::placeholder { color: color-mix(in srgb,
+    /// currentColor 54%, transparent) }`: the control's own text color at 54%
+    /// alpha. Over the default white field this is rgb(117, 117, 117), the
+    /// gray Blink uses, and it stays legible for every author or
+    /// `color-scheme: dark` text color because it derives from that color.
+    /// Unlike Gecko's former `opacity: 0.54`, an author `::placeholder`
+    /// color replaces it outright instead of being dimmed further.
+    fn placeholder_ua_color(&self, id: NodeId) -> String {
+        let mut node = Some(id);
+        let mut color = None;
+        while let Some(current) = node {
+            match self.computed_value_resolved(current, "color") {
+                Some(value) if value.trim().eq_ignore_ascii_case("currentcolor") => {
+                    node = self.style_parent(current);
+                }
+                Some(value) => {
+                    color = crate::render::PaintColor::parse_css(&value);
+                    break;
+                }
+                None => break,
+            }
+        }
+        let (r, g, b, a) = match color.or_else(|| {
+            color_scheme::system_color("canvastext", self.color_scheme(id))
+                .and_then(crate::render::PaintColor::parse_css)
+        }) {
+            Some(crate::render::PaintColor::Rgba(r, g, b, a)) => (r, g, b, a),
+            _ => (0, 0, 0, 255),
+        };
+        let alpha = (f64::from(a) / 255.0 * 0.54 * 1e6).round() / 1e6;
+        format!("rgba({r}, {g}, {b}, {alpha})")
+    }
 }
 
 impl Dom {
@@ -6681,12 +6811,22 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             .map(|value| self.resolve_pseudo_vars(id, which, &value));
         let inherited = prop_index(prop).is_some_and(|i| PROPS[i].inherited);
         let inherited_value = || self.computed_value_resolved(id, prop);
+        // The UA origin of `::placeholder` sets its `color`; `revert` rolls
+        // an author declaration back to it (CSS Cascade 5 #default).
+        let ua_value = || {
+            (which == PseudoEl::Placeholder && prop == "color")
+                .then(|| self.placeholder_ua_color(id))
+        };
         let value = match direct.as_deref().and_then(wide_keyword) {
             Some(WideKeyword::Inherit) => inherited_value(),
             Some(WideKeyword::Initial) => None,
             Some(WideKeyword::Unset) => inherited.then(inherited_value).flatten(),
-            Some(WideKeyword::Revert) => inherited.then(inherited_value).flatten(),
-            None => direct.or_else(|| inherited.then(inherited_value).flatten()),
+            Some(WideKeyword::Revert) => {
+                ua_value().or_else(|| inherited.then(inherited_value).flatten())
+            }
+            None => direct
+                .or_else(ua_value)
+                .or_else(|| inherited.then(inherited_value).flatten()),
         };
         if guard.cyclic() {
             inherited.then(inherited_value).flatten()
@@ -7228,6 +7368,9 @@ impl Dom {
         index.has_marker = unique
             .iter()
             .any(|r| r.selector.0.last().and_then(|(_, c)| c.pseudo) == Some(PseudoEl::Marker));
+        index.has_placeholder = unique.iter().any(|r| {
+            r.selector.0.last().and_then(|(_, c)| c.pseudo) == Some(PseudoEl::Placeholder)
+        });
         index.has_revert_layer = unique.iter().copied().any(|r| {
             r.decls
                 .iter()
@@ -10196,6 +10339,21 @@ impl Dom {
                 out.push('"');
             }
         }
+        // CSS Pseudo 4 #placeholder-pseudo: a text control's ::placeholder
+        // declarations style its hint text; carry them across as for
+        // ::first-letter above. Other elements show no placeholder.
+        if self.style_index().has_placeholder
+            && matches!(self.tag_name(id), Some("input" | "textarea"))
+        {
+            let placeholder = self.baked_pseudo_style(id, PseudoEl::Placeholder);
+            if !placeholder.is_empty() {
+                out.push(' ');
+                out.push_str(PseudoEl::Placeholder.baked_style_attr());
+                out.push_str("=\"");
+                out.push_str(&escape_attr(&placeholder));
+                out.push('"');
+            }
+        }
         // Bake the clearfix signal for the same reason: the layout re-parses
         // this HTML with no `<style>`, so a `::after{clear:both}` rule (which
         // can't live in an inline `style`) would otherwise be lost and a float
@@ -11709,14 +11867,16 @@ enum Combinator {
 
 /// The `::before` / `::after` generated-content pseudo-elements, the
 /// `::first-letter` typographic pseudo-element (CSS2 single-colon legacy
-/// spellings too) and a list item's `::marker` (CSS Pseudo 4
-/// #marker-pseudo). The only pseudo-elements we act on.
+/// spellings too), a list item's `::marker` (CSS Pseudo 4 #marker-pseudo)
+/// and a text control's `::placeholder` text (CSS Pseudo 4
+/// #placeholder-pseudo). The only pseudo-elements we act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PseudoEl {
     Before,
     After,
     FirstLetter,
     Marker,
+    Placeholder,
 }
 
 impl PseudoEl {
@@ -11728,19 +11888,22 @@ impl PseudoEl {
             PseudoEl::After => "data-trust-after-style",
             PseudoEl::FirstLetter => "data-trust-first-letter-style",
             PseudoEl::Marker => "data-trust-marker-style",
+            PseudoEl::Placeholder => "data-trust-placeholder-style",
         }
     }
 
     /// The attributes carrying the pseudo's resolved generated text, and
     /// its items when they include images, into a stylesheet-free
     /// presentation snapshot. `::first-letter` takes no `content` (CSS
-    /// Pseudo 4 #first-letter-pattern: the letter is the element's own text).
+    /// Pseudo 4 #first-letter-pattern: the letter is the element's own text),
+    /// nor does `::placeholder`, whose text is the control's hint (HTML
+    /// #attr-input-placeholder).
     fn baked_content_attrs(self) -> Option<(&'static str, &'static str)> {
         match self {
             PseudoEl::Before => Some(("data-trust-before", "data-trust-before-items")),
             PseudoEl::After => Some(("data-trust-after", "data-trust-after-items")),
             PseudoEl::Marker => Some(("data-trust-marker", "data-trust-marker-items")),
-            PseudoEl::FirstLetter => None,
+            PseudoEl::FirstLetter | PseudoEl::Placeholder => None,
         }
     }
 
@@ -11752,6 +11915,7 @@ impl PseudoEl {
             PseudoEl::After => 1,
             PseudoEl::Marker => 2,
             PseudoEl::FirstLetter => 3,
+            PseudoEl::Placeholder => 4,
         }
     }
 }
@@ -12765,9 +12929,11 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         name.as_str(),
                         "before" | "after" | "first-letter" | "slotted"
                     )
-                    // A list item's ::marker is rendered; the marker of a
-                    // ::slotted() element stays inert like ::backdrop below.
-                    && !(name == "marker" && compound.slotted.is_none())
+                    // A list item's ::marker and a text control's
+                    // ::placeholder are rendered; those of a ::slotted()
+                    // element stay inert like ::backdrop below.
+                    && !((name == "marker" || placeholder_pseudo_element(&name))
+                        && compound.slotted.is_none())
                 {
                     if unrendered_pseudo_element(&name, arg.is_some()) {
                         // Defined pseudo-elements we do not render (e.g. CSS
@@ -12883,21 +13049,24 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     compound.slotted = Some(Box::new(inner));
                     compound.pseudos += 1;
                 } else if matches!(name.as_str(), "before" | "after" | "first-letter")
-                    || (double_colon && name == "marker")
+                    || (double_colon && (name == "marker" || placeholder_pseudo_element(&name)))
                 {
                     // Generated-content pseudo-element: the compound still
                     // matches the element (tag/class parts), but the rule
                     // targets the element's ::before/::after box. Counted in
                     // `spec()` via `pseudo` (the TYPE bucket), not `pseudos`.
                     // ::first-letter likewise targets a box inside the element
-                    // (CSS2 also spells all three with one colon), and
-                    // ::marker a list item's marker box (CSS Pseudo 4
-                    // #marker-pseudo; it has no single-colon spelling).
+                    // (CSS2 also spells all three with one colon), ::marker a
+                    // list item's marker box (CSS Pseudo 4 #marker-pseudo)
+                    // and ::placeholder a text control's placeholder text
+                    // (#placeholder-pseudo); neither has a single-colon
+                    // spelling.
                     compound.pseudo = Some(match name.as_str() {
                         "before" => PseudoEl::Before,
                         "after" => PseudoEl::After,
                         "marker" => PseudoEl::Marker,
-                        _ => PseudoEl::FirstLetter,
+                        "first-letter" => PseudoEl::FirstLetter,
+                        _ => PseudoEl::Placeholder,
                     });
                 } else if name == "scope" {
                     // Matches the query root (set by `query`); inert in the
@@ -13099,8 +13268,25 @@ pub(crate) fn placeholder_input_type(ty: &str) -> bool {
     )
 }
 
+/// CSS Pseudo 4 #placeholder-pseudo, with its two prevalent prefixed
+/// spellings treated as legacy selector aliases (Selectors 4
+/// #legacy-aliasing): they are converted to `::placeholder` at parse time.
+/// `::-webkit-input-placeholder` is a recognized -webkit- pseudo-element in
+/// the sense of Selectors 4 #compat, so it is not an unknown -webkit-
+/// pseudo-element that matches nothing; Gecko aliases
+/// `::-moz-placeholder` the same way. Neither alias has a standardized
+/// mapping (the WHATWG Compatibility Standard defines none), so this is a
+/// compatibility choice; serialization keeps the authored selector text.
+fn placeholder_pseudo_element(name: &str) -> bool {
+    matches!(
+        name,
+        "placeholder" | "-webkit-input-placeholder" | "-moz-placeholder"
+    )
+}
+
 /// Pseudo-elements defined by CSS Pseudo 4, Shadow Parts, Highlight API,
-/// WebVTT and View Transitions that this engine parses but does not render.
+/// WebVTT and View Transitions that this engine parses but does not render
+/// (and ::marker and ::placeholder after ::slotted()).
 fn unrendered_pseudo_element(name: &str, functional: bool) -> bool {
     if functional {
         matches!(
@@ -13121,6 +13307,7 @@ fn unrendered_pseudo_element(name: &str, functional: bool) -> bool {
                 | "first-line"
                 | "selection"
                 | "placeholder"
+                | "-moz-placeholder"
                 | "marker"
                 | "file-selector-button"
                 | "target-text"
@@ -16195,6 +16382,7 @@ struct CascadeWinners<'r> {
     after: FxHashMap<String, CascadeWinner>,
     first_letter: FxHashMap<String, CascadeWinner>,
     marker: FxHashMap<String, CascadeWinner>,
+    placeholder: FxHashMap<String, CascadeWinner>,
     /// Pseudo-element rules whose container conditions need layout sizes.
     conditional: Vec<&'r StyleRule>,
     preserve_layers: bool,
@@ -16249,7 +16437,7 @@ fn strip_winners(map: &FxHashMap<String, CascadeWinner>) -> FxHashMap<String, St
 /// The source order (`StyleRule::order`) of each custom property's winning
 /// declaration, for resolving its `url()`s against its sheet.
 fn custom_property_sources<'m>(
-    maps: [(Option<PseudoEl>, &'m FxHashMap<String, CascadeWinner>); 5],
+    maps: [(Option<PseudoEl>, &'m FxHashMap<String, CascadeWinner>); 6],
 ) -> impl Iterator<Item = (Option<PseudoEl>, String, usize)> + 'm {
     maps.into_iter().flat_map(|(pseudo, winners)| {
         winners
@@ -16293,6 +16481,7 @@ impl StyleView<'_> {
         let mut after = Winners::default();
         let mut first_letter = Winners::default();
         let mut marker = Winners::default();
+        let mut placeholder = Winners::default();
         let mut conditional_pseudos = Vec::new();
         // HTML rendering hints have their own origin below every author
         // layer. `revert` discards them, while `revert-layer` can reveal them
@@ -16354,6 +16543,7 @@ impl StyleView<'_> {
                 Some(PseudoEl::After) => &mut after,
                 Some(PseudoEl::FirstLetter) => &mut first_letter,
                 Some(PseudoEl::Marker) => &mut marker,
+                Some(PseudoEl::Placeholder) => &mut placeholder,
             };
             for (pk, (imp, v)) in &r.decls {
                 consider_into(
@@ -16461,6 +16651,7 @@ impl StyleView<'_> {
             after,
             first_letter,
             marker,
+            placeholder,
             conditional: conditional_pseudos,
             preserve_layers,
             declarations: declaration_order.get(),
@@ -16619,6 +16810,9 @@ struct StyleIndex {
     /// Whether any rule targets `::marker`, so list markers consult their
     /// pseudo-element only on pages that style it.
     has_marker: bool,
+    /// Whether any rule targets `::placeholder`, so text controls consult
+    /// author placeholder declarations only on pages that style them.
+    has_placeholder: bool,
     /// One probe per `:hover`-bearing compound of every rule whose
     /// applicability depends on the hover chain AND whose declarations can
     /// change the RENDER (a `PROPS`-tracked property, generated `content`, or
@@ -16873,6 +17067,7 @@ impl StyleIndex {
             has_opacity,
             has_first_letter,
             has_marker,
+            has_placeholder,
             hover_probes,
             hover_buckets,
             hover_paint_buckets,
@@ -16883,6 +17078,7 @@ impl StyleIndex {
             has_opacity,
             has_first_letter,
             has_marker,
+            has_placeholder,
             has_container_queries,
             has_container_units,
             has_revert_layer,
@@ -23844,6 +24040,125 @@ mod tests {
             "li::marker::before",
             "li::marker.x",
             "li::marker()",
+        ] {
+            assert!(!selector_parses(selector), "{selector}");
+        }
+    }
+
+    #[test]
+    fn placeholder_pseudo_elements_cascade_with_legacy_aliases_and_a_ua_color() {
+        // CSS Pseudo 4 #placeholder-pseudo: ::placeholder rules style a text
+        // control's placeholder text, which inherits from the control
+        // (#treelike). The prefixed spellings are legacy aliases converted at
+        // parse time (Selectors 4 #legacy-aliasing). Without an author color
+        // the UA gives it the control's color at 54% alpha, which `revert`
+        // restores; `inherit` takes the control's color.
+        let dom = Dom::parse_document(
+            "<style>.c { color: blue; font-size: 20px } \
+             #a::placeholder { color: green; letter-spacing: 2px } \
+             #w::-webkit-input-placeholder { color: orange } \
+             #m::-moz-placeholder { color: teal } \
+             #r::placeholder { color: red } #r::placeholder { color: revert } \
+             #i::placeholder { color: inherit; background-color: inherit } \
+             #i { background-color: yellow } \
+             .s::placeholder, h1 { font-style: italic; opacity: 50% } \
+             input:placeholder { color: red }</style>\
+             <input class=c id=a placeholder=a><input class=c id=w placeholder=w>\
+             <input class=c id=m placeholder=m><input class=c id=r placeholder=r>\
+             <input class=c id=i placeholder=i><input class=c id=plain placeholder=p>\
+             <textarea class='c s' id=s placeholder=s></textarea><h1 id=h>h</h1>\
+             <div style='color-scheme:dark'><input id=d placeholder=d></div>",
+        );
+        let check = |dom: &Dom| {
+            let by = |id: &str| dom.get_by_id(id).unwrap();
+            let value = |id: &str, property: &str| {
+                dom.pseudo_layout_value(by(id), PseudoEl::Placeholder, property)
+            };
+            assert_eq!(value("a", "color").as_deref(), Some("green"));
+            assert_eq!(value("a", "letter-spacing").as_deref(), Some("2px"));
+            assert_eq!(
+                value("a", "font-size").as_deref(),
+                Some("20px"),
+                "inherited from the control"
+            );
+            assert_eq!(value("w", "color").as_deref(), Some("orange"));
+            assert_eq!(value("m", "color").as_deref(), Some("teal"));
+            assert_eq!(
+                value("plain", "color").as_deref(),
+                Some("rgba(0, 0, 255, 0.54)")
+            );
+            assert_eq!(
+                value("r", "color").as_deref(),
+                Some("rgba(0, 0, 255, 0.54)"),
+                "revert reaches the UA origin"
+            );
+            assert_eq!(value("i", "color").as_deref(), Some("blue"));
+            assert_eq!(value("s", "font-style").as_deref(), Some("italic"));
+            assert_eq!(
+                value("d", "color").as_deref(),
+                Some("rgba(251, 251, 254, 0.54)"),
+                "a dark color scheme's light text"
+            );
+            assert_eq!(
+                dom.computed_value_resolved(by("plain"), "color").as_deref(),
+                Some("blue"),
+                "`input:placeholder` is no pseudo-element selector"
+            );
+            assert_eq!(
+                dom.computed_value_resolved(by("h"), "font-style")
+                    .as_deref(),
+                Some("italic"),
+                "the selector list stays valid"
+            );
+            assert!(dom.has_placeholder_style(by("a")));
+            assert!(!dom.has_placeholder_style(by("plain")));
+        };
+        check(&dom);
+        // CSSOM #dom-window-getcomputedstyle: the pseudo-element's resolved
+        // values.
+        let pseudo = |id: &str, property: &str| {
+            dom.cssom_pseudo_resolved_value(
+                dom.get_by_id(id).unwrap(),
+                PseudoEl::Placeholder,
+                property,
+            )
+        };
+        assert_eq!(pseudo("a", "color").as_deref(), Some("rgb(0, 128, 0)"));
+        assert_eq!(
+            pseudo("plain", "color").as_deref(),
+            Some("rgba(0, 0, 255, 0.54)")
+        );
+        assert_eq!(pseudo("i", "color").as_deref(), Some("rgb(0, 0, 255)"));
+        assert_eq!(
+            pseudo("i", "background-color").as_deref(),
+            Some("rgb(255, 255, 0)")
+        );
+        assert_eq!(
+            pseudo("plain", "background-color").as_deref(),
+            Some("rgba(0, 0, 0, 0)")
+        );
+        assert_eq!(pseudo("a", "font-size").as_deref(), Some("20px"));
+        assert_eq!(pseudo("s", "opacity").as_deref(), Some("0.5"));
+        // Stylesheet-free snapshots keep the declarations of controls'
+        // placeholders.
+        let snapshot =
+            Dom::parse_document(&dom.serialize_live(DOCUMENT, &std::collections::HashSet::new()));
+        check(&snapshot);
+        for selector in [
+            "::placeholder",
+            "input::placeholder",
+            "textarea.x::placeholder",
+            "::-webkit-input-placeholder",
+            "::-MOZ-placeholder",
+        ] {
+            assert!(selector_parses(selector), "{selector}");
+        }
+        for selector in [
+            "input:placeholder",
+            "input::placeholder::before",
+            "input::placeholder.x",
+            "input::placeholder()",
+            ":-moz-placeholder::placeholder",
         ] {
             assert!(!selector_parses(selector), "{selector}");
         }

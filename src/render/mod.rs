@@ -3848,17 +3848,59 @@ pub fn paint_native_input(
     let Primitive::GlyphRun {
         mut origin,
         shaped: old,
-        color,
         decoration,
         shadows,
         clip,
         node,
         link,
+        ..
     } = primitives[index].clone()
     else {
         return;
     };
     let Some(clip) = clip else { return };
+    // CSS Pseudo 4 #placeholder-pseudo: an empty value presents the
+    // control's ::placeholder text in that pseudo-element's style; typed
+    // text has the control's own color, whichever text the canonical paint
+    // last showed.
+    let placeholder = line.shaped.text.is_empty() && !input.placeholder.is_empty();
+    let color = if placeholder {
+        input.placeholder_color
+    } else {
+        input.text_color
+    };
+    // Canonical paint groups a translucent placeholder in its own opacity
+    // layer. The editor's caret, selection and typed text are not part of
+    // that group: replace the whole group, keeping its hit regions.
+    let mut span = index..=index;
+    let mut hits = Vec::new();
+    if input.placeholder_opacity < 1.0
+        && let Some(start) = (0..index).rev().find(|&i| {
+            !matches!(
+                primitives[i],
+                Primitive::FillRect { .. } | Primitive::PushClip(_) | Primitive::PopClip
+            )
+        })
+        && matches!(primitives[start], Primitive::PushLayer(_))
+        && let Some(end) = (index + 1..primitives.len()).find(|&i| {
+            !matches!(
+                primitives[i],
+                Primitive::HitRegion(_)
+                    | Primitive::Stroke { .. }
+                    | Primitive::PushClip(_)
+                    | Primitive::PopClip
+            )
+        })
+        && matches!(primitives[end], Primitive::PopLayer)
+    {
+        hits.extend(
+            primitives[index + 1..end]
+                .iter()
+                .filter(|command| matches!(command, Primitive::HitRegion(_)))
+                .cloned(),
+        );
+        span = start..=end;
+    }
     // The label's canonical line is vertically centered in the content box.
     // Preserve that center if editing/preedit supplies different font metrics.
     origin.y += (old.line_height - line.shaped.line_height) / 2.0;
@@ -3886,11 +3928,21 @@ pub fn paint_native_input(
             color: PaintColor::Rgba(88, 148, 255, 90),
         });
     }
-    let shaped = if line.shaped.text.is_empty() && !input.placeholder.is_empty() {
-        crate::text::shape(&input.placeholder, &presentation.style)
+    let shaped = if placeholder {
+        let mut shaped = crate::text::shape(&input.placeholder, &input.placeholder_style);
+        crate::text::center_in_line(&mut shaped, line.shaped.line_height);
+        shaped
     } else {
         line.shaped.clone()
     };
+    let layer = placeholder && input.placeholder_opacity < 1.0;
+    if layer {
+        replacement.push(Primitive::PushLayer(CompositingLayer::new(
+            input.placeholder_opacity,
+            BlendMode::Normal,
+            Arc::from([]),
+        )));
+    }
     replacement.push(Primitive::GlyphRun {
         origin,
         shaped,
@@ -3901,6 +3953,9 @@ pub fn paint_native_input(
         node,
         link,
     });
+    if layer {
+        replacement.push(Primitive::PopLayer);
+    }
     for underline in &line.underlines {
         replacement.push(Primitive::FillRect {
             rect: CssRect::new(
@@ -3924,7 +3979,8 @@ pub fn paint_native_input(
         });
     }
     replacement.push(Primitive::PopClip);
-    primitives.splice(index..=index, replacement);
+    replacement.extend(hits);
+    primitives.splice(span, replacement);
 }
 
 /// Present only the pending glyphs of a plain editing paragraph. Its CSS
