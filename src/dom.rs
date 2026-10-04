@@ -25165,6 +25165,9 @@ mod tests {
     #[test]
     fn font_units_cache_reuses_metrics_and_invalidates_dom_and_font_revisions() {
         use crate::layout2::Units;
+        // Cache entries carry the process-wide page font epoch; tests that
+        // register fonts in parallel advance it under the write side.
+        let _stable = crate::layout2::stable_global_layout_inputs();
         let mut dom = Dom::parse_document(
             "<style>html{font-size:20px}</style><div id=x style='font-size:10px'>x</div>",
         );
