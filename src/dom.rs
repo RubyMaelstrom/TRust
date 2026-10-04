@@ -1497,6 +1497,8 @@ impl Dom {
     /// it need not cascade hidden/unrelated nodes merely to find no cursor.
     pub(crate) fn cursor_style_candidates(&self, nodes: &[NodeId]) -> Vec<NodeId> {
         let index = self.style_index();
+        let view = self.style_view();
+        let mut ancestors = rule_index::WalkAncestors::new();
         let mut candidates = Vec::new();
         nodes
             .iter()
@@ -1526,7 +1528,14 @@ impl Dom {
                 candidates.clear();
                 let scope = self.tree_scope(id);
                 if let Some(buckets) = index.cursor_buckets.get(&scope) {
-                    buckets.candidates(&self.style_view(), id, &mut candidates);
+                    let mut entered = false;
+                    buckets.candidates_filtered(&view, id, &mut candidates, |required| {
+                        if !entered {
+                            ancestors.enter(&view, id);
+                            entered = true;
+                        }
+                        ancestors.may_match(required)
+                    });
                 }
                 index.scopes.get(&scope).is_some_and(|rules| {
                     candidates.iter().any(|&rule| {
@@ -1604,24 +1613,40 @@ impl Dom {
     pub fn hover_paint_subject_candidates_in(&self, roots: &[NodeId]) -> Vec<NodeId> {
         let index = self.style_index();
         let mut out = Vec::new();
-        for &root in roots {
-            for id in std::iter::once(root).chain(self.composed_descendants(root)) {
-                if self.tag_name(id).is_none() {
-                    continue;
-                }
-                let scope = self.tree_scope(id);
-                let (Some(rules), Some(buckets)) =
-                    (index.scopes.get(&scope), index.hover_buckets.get(&scope))
-                else {
-                    continue;
-                };
-                let mut candidates = Vec::new();
-                buckets.candidates(&self.style_view(), id, &mut candidates);
-                if candidates
-                    .into_iter()
-                    .any(|rule| rule_is_paint_only(&rules[rule as usize]))
-                {
-                    out.push(id);
+        // Equivalent to testing `hover_buckets` candidates for a paint-only
+        // rule: the paint-only buckets hold exactly those rules, and only the
+        // existence of one ancestor-admitted candidate matters.
+        if index
+            .hover_paint_buckets
+            .values()
+            .any(|buckets| !buckets.is_empty())
+        {
+            let view = self.style_view();
+            let mut ancestors = rule_index::WalkAncestors::new();
+            for &root in roots {
+                for id in std::iter::once(root).chain(self.composed_descendants(root)) {
+                    if self.tag_name(id).is_none() {
+                        continue;
+                    }
+                    let scope = self.tree_scope(id);
+                    let (Some(_), Some(buckets)) = (
+                        index.scopes.get(&scope),
+                        index.hover_paint_buckets.get(&scope),
+                    ) else {
+                        continue;
+                    };
+                    let mut entered = false;
+                    if !buckets.is_empty()
+                        && buckets.any_candidate(&view, id, |required| {
+                            if !entered {
+                                ancestors.enter(&view, id);
+                                entered = true;
+                            }
+                            ancestors.may_match(required)
+                        })
+                    {
+                        out.push(id);
+                    }
                 }
             }
         }
@@ -7078,6 +7103,20 @@ impl Dom {
                     *scope,
                     RuleBuckets::build_where(rules, |rule| {
                         rule_affects_render(rule) && rule_uses_hover(rule)
+                    }),
+                )
+            })
+            .collect();
+        index.hover_paint_buckets = index
+            .scopes
+            .iter()
+            .map(|(scope, rules)| {
+                (
+                    *scope,
+                    RuleBuckets::build_where(rules, |rule| {
+                        rule_affects_render(rule)
+                            && rule_uses_hover(rule)
+                            && rule_is_paint_only(rule)
                     }),
                 )
             })
@@ -16354,6 +16393,9 @@ struct StyleIndex {
     /// (rightmost compounds). `set_hover_chain` compares their old/new match
     /// state to attribute invalidation to the subjects that actually changed.
     hover_buckets: FxHashMap<NodeId, RuleBuckets>,
+    /// The paint-only subset of `hover_buckets` (`rule_is_paint_only`): the
+    /// plausible subjects that rendering marks as paint-patch hosts.
+    hover_paint_buckets: FxHashMap<NodeId, RuleBuckets>,
     /// A child-list/text mutation inside `display:none` can nevertheless
     /// change a rendered selector subject through `:has()` or through
     /// `:empty` combined with an outside combinator. Conservatively disable
@@ -16596,6 +16638,7 @@ impl StyleIndex {
             has_marker,
             hover_probes,
             hover_buckets,
+            hover_paint_buckets,
             cursor_buckets,
             boxless_content_may_escape,
         } = self;
@@ -16678,7 +16721,7 @@ impl StyleIndex {
                 }
             }
         }
-        for map in [buckets, hover_buckets, cursor_buckets] {
+        for map in [buckets, hover_buckets, hover_paint_buckets, cursor_buckets] {
             bytes = bytes.saturating_add(
                 map.capacity()
                     .saturating_mul(std::mem::size_of::<(NodeId, RuleBuckets)>()),
@@ -16752,6 +16795,7 @@ impl StyleIndex {
             || !buckets.is_empty()
             || !keyframes.is_empty()
             || !hover_buckets.is_empty()
+            || !hover_paint_buckets.is_empty()
             || !cursor_buckets.is_empty();
         (bytes, opaque)
     }
@@ -17022,6 +17066,69 @@ impl RuleBuckets {
         }
         b.ancestors.starts.push(b.ancestors.bits.len() as u32);
         b
+    }
+
+    /// Whether no rule was bucketed.
+    fn is_empty(&self) -> bool {
+        self.universal.is_empty()
+            && self.by_id.is_empty()
+            && self.by_class.is_empty()
+            && self.by_tag.is_empty()
+            && self.by_attribute.is_empty()
+    }
+
+    /// Whether `candidates_filtered` would return any rule for `id`, without
+    /// building or sorting the candidate list.
+    fn any_candidate(
+        &self,
+        view: &StyleView<'_>,
+        id: NodeId,
+        mut may_match_ancestors: impl FnMut(&[u16]) -> bool,
+    ) -> bool {
+        let mut admitted = |rule: u32| {
+            let required = self.ancestors.of(rule);
+            required.is_empty() || may_match_ancestors(required)
+        };
+        if self.universal.iter().any(|&rule| admitted(rule)) {
+            return true;
+        }
+        if let Some(value) = view.attr(id, "id")
+            && let Some(indices) = self.by_id.get(value)
+            && indices.iter().any(|&rule| admitted(rule))
+        {
+            return true;
+        }
+        if let Some(classes) = view.attr(id, "class") {
+            for class in classes.split_ascii_whitespace() {
+                if let Some(indices) = self.by_class.get(class)
+                    && indices.iter().any(|&rule| admitted(rule))
+                {
+                    return true;
+                }
+            }
+        }
+        if let Some(tag) = view.tag_name(id)
+            && let Some(indices) = self.by_tag.get(tag)
+            && indices.iter().any(|&rule| admitted(rule))
+        {
+            return true;
+        }
+        if !self.by_attribute.is_empty() {
+            for name in view.nodes.attr_names(id) {
+                let indices = self.by_attribute.get(name).or_else(|| {
+                    name.bytes()
+                        .any(|b| b.is_ascii_uppercase())
+                        .then(|| self.by_attribute.get(&name.to_ascii_lowercase()))
+                        .flatten()
+                });
+                if let Some(indices) = indices
+                    && indices.iter().any(|&rule| admitted(rule))
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn candidates(&self, view: &StyleView<'_>, id: NodeId, out: &mut Vec<u32>) {

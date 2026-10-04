@@ -397,6 +397,80 @@ impl AncestorBloom {
     }
 }
 
+/// `Ancestors::may_match` for the subjects of a document-order walk, with
+/// the same keys and the same traversal budget: a subject whose composed
+/// ancestry exceeds `Ancestors`'s visit or key limit admits every rule, as an
+/// exhausted `Ancestors` does. Each ancestor's keys are hashed once per walk
+/// rather than once per descendant subject.
+pub(super) struct WalkAncestors {
+    counts: Box<[u32; 2048]>,
+    /// Every composed ancestor of the last subject, root first, with the end
+    /// of its key bits in `bits` and the number of keys up to and including it.
+    stack: Vec<(NodeId, usize, usize)>,
+    bits: Vec<u16>,
+}
+
+impl WalkAncestors {
+    pub(super) fn new() -> Self {
+        Self {
+            counts: Box::new([0; 2048]),
+            stack: Vec::new(),
+            bits: Vec::new(),
+        }
+    }
+
+    /// Make the filter hold exactly `id`'s composed ancestors. Any visiting
+    /// order is correct; document order reuses the shared ancestors.
+    pub(super) fn enter(&mut self, view: &StyleView<'_>, id: NodeId) {
+        let mut chain = Vec::new();
+        let mut cursor = view.parent_composed(id);
+        let keep = loop {
+            let Some(node) = cursor else {
+                break 0;
+            };
+            if let Some(position) = self.stack.iter().rposition(|entry| entry.0 == node) {
+                break position + 1;
+            }
+            chain.push(node);
+            cursor = view.parent_composed(node);
+        };
+        while self.stack.len() > keep {
+            self.stack.pop();
+            let start = self.stack.last().map_or(0, |entry| entry.1);
+            for bit in self.bits.drain(start..) {
+                self.counts[bit as usize] -= 1;
+            }
+        }
+        for &node in chain.iter().rev() {
+            let mut keys = self.stack.last().map_or(0, |entry| entry.2);
+            for (kind, value) in view
+                .attr(node, "class")
+                .into_iter()
+                .flat_map(str::split_ascii_whitespace)
+                .map(|s| (0, s))
+                .chain(view.attr(node, "id").map(|s| (1, s)))
+                .chain(view.tag_name(node).map(|s| (2, s)))
+            {
+                keys += 1;
+                for bit in bits(kind, value) {
+                    self.counts[bit as usize] += 1;
+                    self.bits.push(bit);
+                }
+            }
+            self.stack.push((node, self.bits.len(), keys));
+        }
+    }
+
+    /// The result `Ancestors::of(view, id).may_match(view, required)` gives
+    /// for the subject last entered.
+    pub(super) fn may_match(&self, required: &[u16]) -> bool {
+        let keys = self.stack.last().map_or(0, |entry| entry.2);
+        self.stack.len() > Ancestors::MAX_VISITS
+            || keys > Ancestors::MAX_KEYS
+            || required.iter().all(|&bit| self.counts[bit as usize] != 0)
+    }
+}
+
 /// Composed ancestry skipping document/fragment nodes, which carry no keys.
 fn composed_element_parent(view: &StyleView<'_>, id: NodeId) -> Option<NodeId> {
     let mut cursor = view.parent_composed(id);
@@ -410,6 +484,9 @@ fn composed_element_parent(view: &StyleView<'_>, id: NodeId) -> Option<NodeId> {
 }
 
 impl Ancestors {
+    const MAX_VISITS: usize = 64;
+    const MAX_KEYS: usize = 256;
+
     pub(super) fn of(dom: &StyleView<'_>, id: NodeId) -> Self {
         Self {
             bits: [0; 32],
@@ -435,7 +512,7 @@ impl Ancestors {
             // Rejection is optional. Bound its extra traversal when the
             // subject's full compound might reject before ancestry matters.
             // An incomplete filter must always admit the full matcher.
-            if self.visits == 64 {
+            if self.visits == Self::MAX_VISITS {
                 self.exhausted = true;
                 return true;
             }
@@ -454,7 +531,7 @@ impl Ancestors {
                 .chain(dom.attr(node, "id").map(|s| (1, s)))
                 .chain(dom.tag_name(node).map(|s| (2, s)))
             {
-                if self.keys == 256 {
+                if self.keys == Self::MAX_KEYS {
                     self.exhausted = true;
                     return true;
                 }
@@ -470,6 +547,70 @@ impl Ancestors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_ancestors_answer_exactly_as_ancestors_including_their_budget() {
+        // Deep chains exceed the visit budget, wide class lists the key
+        // budget; a shadow tree adds keyless composed ancestors.
+        let mut html = String::from("<main id=root class='a b'>");
+        for depth in 0..70 {
+            let classes = (0..(depth % 9))
+                .map(|n| format!("c{n} d{depth}"))
+                .collect::<Vec<_>>();
+            html.push_str(&format!(
+                "<div class='{}'><i class=leaf{depth}></i>",
+                classes.join(" ")
+            ));
+        }
+        html.push_str(&"</div>".repeat(70));
+        html.push_str("<section class=wide>");
+        let wide = (0..300)
+            .map(|n| format!("w{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        html.push_str(&format!(
+            "<p class='{wide}'><b><u class=deep></u></b></p></section>"
+        ));
+        html.push_str("<span id=host class=hosting></span></main>");
+        let mut dom = Dom::parse_document(&html);
+        let host = dom.get_by_id("host").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let inner = dom.create_element("em");
+        dom.set_attr(inner, "class", "shadowed");
+        dom.append(shadow, inner);
+        let leaf = dom.create_element("q");
+        dom.append(inner, leaf);
+        let view = dom.style_view();
+        let mut keys: Vec<Vec<u16>> = [
+            "a", "b", "c3", "d5", "d69", "w0", "w299", "hosting", "shadowed",
+        ]
+        .iter()
+        .map(|class| bits(0, class).to_vec())
+        .collect();
+        keys.push(bits(1, "root").to_vec());
+        keys.push(bits(2, "section").to_vec());
+        keys.push(bits(2, "never").to_vec());
+        keys.push([bits(0, "a"), bits(0, "never")].concat());
+        let mut walk = WalkAncestors::new();
+        let mut subjects = dom.composed_descendants(DOCUMENT);
+        // Document order, then an out-of-order revisit of every subject.
+        let revisit: Vec<_> = subjects.iter().rev().step_by(3).copied().collect();
+        subjects.extend(revisit);
+        let mut rejected_some = false;
+        for id in subjects {
+            walk.enter(&view, id);
+            for required in &keys {
+                let expected = Ancestors::of(&view, id).may_match(&view, required);
+                assert_eq!(
+                    walk.may_match(required),
+                    expected,
+                    "subject {id} keys {required:?}"
+                );
+                rejected_some |= !expected;
+            }
+        }
+        assert!(rejected_some);
+    }
 
     #[test]
     #[ignore]
