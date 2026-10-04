@@ -849,6 +849,61 @@ Fetches a WPT testharness page, injects a completion callback, and reports each
 subtest's PASS/FAIL/TIMEOUT/NOTRUN status. It accepts `TRUST_NET_DIAG`,
 `TRUST_DIAG_VP` (default `200x50`), and `TRUST_NET_DIAG_OUT`.
 
+### `tools/wpt_run.py`: local web-platform-tests runner
+
+```sh
+cargo build --release --bin trust-headless
+TRUST_WPT_ROOT=/path/to/web-platform-tests \
+  python3 tools/wpt_run.py --jobs 8 --cpus 0-4,10-14 dom/nodes url encoding/api-basics.any.js
+```
+
+Serves a local, read-only WPT checkout with WPT's own server (`tools/serve`:
+`.any.js`/`.window.js`/`.worker.js` wrappers, `.sub.` substitutions and Python
+handlers), loads each testharness.js test in its own `trust-headless` process
+and collects the results through a replacement `/resources/testharnessreport.js`.
+That reporter posts the completion to a same-origin handler, which writes it to
+the output directory; the browser is stopped as soon as its report arrives. All
+state (server configuration, handler, results, logs, Python bytecode) lives in
+the output directory; nothing is written to the WPT tree. Test-only; it uses no
+`TRUST_*` variables.
+
+| Input | Meaning | Default |
+|---|---|---:|
+| `PATH...` | WPT-relative directories, files or test URLs (variants such as `x.any.html?include=file` select one test) | — |
+| `--wpt DIR` / `TRUST_WPT_ROOT` | WPT checkout | — |
+| `--meta DIR` | Firefox wptrunner expectations, evaluated for Linux desktop opt; adds "fail where Firefox passes" counts | `WPT/../meta` when present |
+| `--binary PATH` | Browser under test | `$CARGO_TARGET_DIR/release/trust-headless` |
+| `--output DIR` | Results directory | `$CARGO_TARGET_DIR/wpt-results` |
+| `--jobs N` / `--cpus LIST` | Concurrent browsers; optional `taskset` CPU list | `4` / none |
+| `--globals LIST` | Test globals: `window,worker,sharedworker,serviceworker,shadowrealm` | `window,worker,sharedworker` |
+| `--exclude GLOB` | Skip source paths (repeatable) | none |
+| `--skip-testdriver`, `--skip-firefox-disabled` | Skip tests needing WebDriver actions, or disabled in Firefox's metadata | off |
+| `--timeout-multiplier F`, `--grace S` | testharness `timeout_multiplier` (10 s normal, 60 s long); seconds before an unreported browser is killed | `1`, `8` |
+| `--depth N` | Directory depth of the summary matrix | `2` |
+| `--baseline FILE` | An earlier `results.jsonl`; adds a per-directory before/after table | none |
+| `--list` | Print the selected test URLs only | off |
+| `--serve` | Only start the configured server, for loading tests by hand | off |
+| `--summarize FILE` | Rewrite `summary.md`/`summary.json` for an existing `results.jsonl` | off |
+
+Outputs: `results.jsonl` (per test: harness status, subtests with status and
+message, Firefox expectation, flags, duration, the first `[js-errors]` lines of
+a browser that never reported), `summary.md` and `summary.json` (per-directory
+matrix of tests, subtests passed, harness OK/ERROR/TIMEOUT, tests without a
+result, plus the most frequent failure messages and "X is not defined" / "is not
+a function" / missing-property signals), `run.json`, `server.log`, and
+`logs/` for tests that did not fully pass.
+
+Limits: the server answers as `localhost`. `www.localhost` and other WPT
+subdomains reach it through the system resolver's `*.localhost` mapping
+(nss-myhostname), and `localhost.localdomain` stands in for WPT's alternate
+site; on a system without that mapping, multi-origin tests fail. TRust has no
+host-resolution override and trusts only WebPKI roots, so WPT's HTTPS
+certificate is rejected: `.https.` tests are loaded over HTTP, where
+`http://localhost` is still a secure context, but HTTPS origins and
+cross-origin HTTPS subresources fail. Testdriver (WebDriver) actions do not
+run, so such tests time out; they are flagged `testdriver`. Reftests and
+crashtests are not run. Only testharness.js tests are supported.
+
 ### Captured-document diagnostics
 
 These ignored `--lib` tests read saved files and use no network.
