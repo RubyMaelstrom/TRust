@@ -34038,6 +34038,40 @@ mod tests {
     }
 
     #[test]
+    fn native_frame_pointer_routing_focus_chain_and_click_coordinates() {
+        // Pointer Events boundary/motion dispatch into child Documents, HTML's
+        // focus update steps across navigables and Pointer Events' integral
+        // click coordinates, on parser-created child nodes no script touched.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(
+                &mut engine,
+                include_str!("fixtures/native_frame_pointer_routing.mjs"),
+                "frame routing fixture",
+            )
+            .unwrap();
+            eval(&mut engine, "frameRoutingSetup()", "frame routing setup").unwrap();
+            let [text, boxed] = {
+                let state = engine.ctx().host::<HostState>().unwrap();
+                let dom = state.dom.borrow();
+                ["text", "box"].map(|id| {
+                    dom.composed_descendants(crate::dom::DOCUMENT)
+                        .into_iter()
+                        .find(|&node| dom.get_attribute(node, "id") == Some(id))
+                        .expect("frame node")
+                })
+            };
+            assert_eq!(
+                string_value(&mut engine, &format!("frameRoutingRun({text}, {boxed})")),
+                "native-frame-pointer-routing-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn iframe_geometry_uses_the_owning_document_viewport() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
