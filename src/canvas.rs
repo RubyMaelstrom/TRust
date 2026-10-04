@@ -732,14 +732,12 @@ impl Canvas {
         let top = rect.y0.floor().max(0.);
         let right = rect.x1.ceil().min(f64::from(width));
         let bottom = rect.y1.ceil().min(f64::from(height));
-        (right > left && bottom > top).then(|| {
-            (
-                left as u32,
-                top as u32,
-                (right - left) as u32,
-                (bottom - top) as u32,
-            )
-        })
+        (right > left && bottom > top).then_some((
+            left as u32,
+            top as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        ))
     }
 
     fn text_source(
