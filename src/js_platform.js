@@ -11275,13 +11275,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!forms) collections.set("forms", forms = tagNameCollection(this, "form", HTML_NS));
             return forms;
         }
-        get links() { return this.querySelectorAll("a[href]"); }
-        get images() { return this.querySelectorAll("img"); }
-        // The arena keeps script ELEMENTS (only the render serializer drops
-        // them), so this is the real collection — it returned `[]` before,
-        // hiding every script from a view-transitions swap that re-executes
-        // the new document's scripts.
-        get scripts() { return this.querySelectorAll("script"); }
+        // HTML #dom-document-images, #dom-document-links and
+        // #dom-document-scripts: SameObject live HTMLCollections rooted at
+        // the Document. The arena keeps script ELEMENTS (only the render
+        // serializer drops them), so scripts is the real collection.
+        get images() { return documentCollection(this, "images", root => tagNameCollection(root, "img", HTML_NS)); }
+        get links() { return documentCollection(this, "links", root => selectorCollection(root, "a[href], area[href]")); }
+        get scripts() { return documentCollection(this, "scripts", root => tagNameCollection(root, "script", HTML_NS)); }
         // CSSOM §document.styleSheets: the document's sheets in tree order.
         // Our cascade folds fetched <link> sheets in Rust-side (link.sheet is
         // null — no CSSOM object exists for them), so the list is the <style>
@@ -13658,6 +13658,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return list;
         });
+    }
+    // A live collection of the elements matching a selector, re-queried
+    // whenever the arena changes.
+    function selectorCollection(root, selector) {
+        let epoch = -1, list;
+        return makeHTMLCollection(() => {
+            const current = __dom_epoch();
+            if (epoch !== current) {
+                list = wrapQueryResults(root, __dom_query(nodeIds.get(root), selector, false));
+                epoch = current;
+            }
+            return list;
+        });
+    }
+    // A Document's [SameObject] collection attribute.
+    function documentCollection(document, name, create) {
+        let collections = ELEMENT_COLLECTIONS.get(document);
+        if (!collections) ELEMENT_COLLECTIONS.set(document, collections = new Map());
+        let collection = collections.get(name);
+        if (!collection) collections.set(name, collection = create(document));
+        return collection;
     }
     // DOM #concept-getelementsbyclassname / #concept-collection-live: moves,
     // removals and class changes must be visible even in a synchronous loop.

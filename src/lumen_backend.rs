@@ -18564,6 +18564,33 @@ mod tests {
     }
 
     #[test]
+    fn document_scripts_images_and_links_are_live_collections() {
+        // HTML #dom-document-scripts, #dom-document-images and
+        // #dom-document-links: [SameObject] live HTMLCollections.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document("<p>x"))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const scripts = document.scripts, links = document.links, before = scripts.length;\n\
+                 const script = document.createElement('script'), area = document.createElement('area');\n\
+                 area.setAttribute('href', '#'); document.documentElement.append(script, area);\n\
+                 const after = [scripts.length - before, scripts[scripts.length - 1] === script, links.length];\n\
+                 script.remove();\n\
+                 [tag(scripts), scripts === document.scripts, tag(document.images), tag(links),\n\
+                  ...after, scripts.length - before].join('|')"
+            ),
+            "HTMLCollection|true|HTMLCollection|HTMLCollection|1|true|1|0"
+        );
+    }
+
+    #[test]
     fn computed_style_declarations_report_their_class_string() {
         // CSSOM #dom-window-getcomputedstyle: the resolved declaration is a
         // CSSStyleDeclaration ("[object CSSStyleDeclaration]", as in
