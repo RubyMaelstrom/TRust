@@ -99,11 +99,39 @@ struct NodeRows {
     display: Option<DisplayRecord>,
 }
 
+/// Properties whose value is computed per element (unit guards), never shared
+/// through a style-sharing row. Indexed by property, built at compile time so
+/// a cache read does not compare property names.
+const CONTEXTUAL: [bool; PROPS.len()] = {
+    const fn same(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut table = [false; PROPS.len()];
+    let mut i = 0;
+    while i < PROPS.len() {
+        let name = PROPS[i].name;
+        table[i] = same(name, "line-height")
+            || same(name, "font-weight")
+            || same(name, "-webkit-text-stroke-width");
+        i += 1;
+    }
+    table
+};
+
+#[inline]
 fn contextual(property: usize) -> bool {
-    matches!(
-        PROPS[property].name,
-        "line-height" | "font-weight" | "-webkit-text-stroke-width"
-    )
+    CONTEXTUAL[property]
 }
 
 impl Row {
