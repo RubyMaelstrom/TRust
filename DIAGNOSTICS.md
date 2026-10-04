@@ -225,6 +225,29 @@ TRUST_NET_DIAG=https://example.test/ \
   cargo test --release net_diag -- --ignored --nocapture
 ```
 
+### Spare page engine
+
+Each navigation runs its document in a new Lumen engine. `trust`,
+`trust-desktop` and `trust-headless` keep one pre-warmed spare engine on its
+own page thread (see [`src/page_spare.rs`](src/page_spare.rs)): it bootstraps
+the platform prelude once in a throwaway `about:blank` Realm, discards that
+Realm, and waits; the next navigation creates its Window in the spare's
+untouched default Realm, reusing only the compiled prelude. The interactive
+frontends warm the first spare at startup and another after each navigation's
+first rendering; `trust-headless` warms one at startup, and another only when
+`--click` may navigate again. Compare a navigation with and without it:
+
+```sh
+TRUST_NET_TRACE=1 target/release/trust-headless --click 100,20 http://127.0.0.1:8000/a.html
+TRUST_NET_TRACE=1 TRUST_NO_SPARE_ENGINE=1 target/release/trust-headless --click 100,20 http://127.0.0.1:8000/a.html
+```
+
+Measure from `prefetch done; spawning page` to `first PageEvt received`. The
+trace also reports `claimed spare page engine (warm|preparing|cold)`, `spare
+page engine still warming; this navigation runs cold` (a navigation never waits
+for the warm-up bootstrap; the spare stays for the next one), and `spare page
+engine warm after N ms`. An idle spare costs about 22 MiB of resident memory.
+
 ## Command-line inputs
 
 ### `trust`
@@ -458,6 +481,7 @@ scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. Lum
 | `TRUST_PANIC_LOG` | file path | Appends every panic, including background-thread panics, with thread name, terminal-owner status, message, and forced backtrace. The normal terminal panic hook remains separate. |
 | `TRUST_UA_FIREFOX` | affirmative value (`1`, `true`, `yes`, `on`) | Replaces TRust's `TRust/0.1` User-Agent with Firefox's current one (`Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0`) for diagnostics. Selection happens once per process, so the header on every HTTP/1.1, HTTP/2 and HTTP/3 request, fetch/XHR, WebSocket handshake and download matches `navigator.userAgent` in the page, every frame and every worker; HTML's `navigator.appVersion` then derives as `5.0 (X11)`. Prints one stderr line naming the active string. Nothing else about the request changes: `Accept`, `Accept-Language`, Fetch Metadata `Sec-*` and `Sec-GPC` keep TRust's own values. Unset, empty or `0` keeps TRust's User-Agent. |
 | `TRUST_WEBGL_TRACE` | presence flag | Prints why a page's WebGL context could not be created. |
+| `TRUST_NO_SPARE_ENGINE` | presence flag | Disables the pre-warmed spare page engine in every frontend, so each navigation builds its Lumen engine cold. Read once per process. With `TRUST_NET_TRACE`, the spare's warm-up and claims appear as `js :` lines (see [Spare page engine](#spare-page-engine)). |
 | `TRUST_TRACE_PAGE_EVENTS` | presence flag | Prints a `[trace-event] <variant>` line to stderr for every page event the shared controller handles (`Updated`, `Static`, `Patched`, `Trouble`, navigation/settle events). Useful for proving which render path a page reached and in what order. |
 
 #### A/B-testing a site's User-Agent gate

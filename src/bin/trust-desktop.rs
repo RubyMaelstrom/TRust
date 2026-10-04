@@ -8557,6 +8557,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Err(error) = trust::site_storage::initialize() {
         eprintln!("trust: {error}; using temporary site storage");
     }
+    // Keep one pre-warmed page engine for the next navigation (and, later,
+    // the next tab); the first is warmed while the window and first fetch start.
+    let web_start = options
+        .address
+        .as_deref()
+        .is_none_or(trust::js::start_address_may_use_page_engine);
+    if trust::js::enable_spare_page_engine(true) && web_start {
+        trust::js::prewarm_page_engine();
+    }
     let event_loop = EventLoop::<DesktopEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let storage_proxy = proxy.clone();

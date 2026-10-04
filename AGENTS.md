@@ -132,7 +132,9 @@ The project favors:
 - HTML output uses positioned `Row`/`Item` data. Gopher, Gemini, one-shot
   protocols, and plain text use the simpler line model.
 - Only one foreground page engine remains live. Navigation drops the old page
-  actor and its heap.
+  actor and its heap. At most one pre-warmed spare engine (`src/page_spare.rs`)
+  waits beside it; it has run no page code, and exactly one navigation claims
+  it and creates its Window there exactly as in a new engine.
 - Incremental layout is an optimization. If a patch cannot be proven safe,
   fall back to the always-correct full relayout.
 - Image intrinsic sizes must be shared with the live page geometry pass so DOM

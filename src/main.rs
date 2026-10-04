@@ -49,6 +49,16 @@ async fn main() -> ExitCode {
     if let Err(error) = trust::site_storage::initialize() {
         eprintln!("trust: {error}; using temporary site storage");
     }
+    // Keep one pre-warmed page engine for the next navigation. A web start
+    // address has its engine warmed while the terminal is queried and the
+    // first fetch starts; otherwise the first rendered page warms one.
+    let web_start = host
+        .as_deref()
+        .is_some_and(trust::js::start_address_may_use_page_engine)
+        && matches!(start_port, None | Some(80 | 443));
+    if trust::js::enable_spare_page_engine(true) && web_start {
+        trust::js::prewarm_page_engine();
+    }
     let terminal = ratatui::init();
     // This thread (the `#[tokio::main]` `block_on` driver) owns the live
     // terminal, and the run loop never migrates off it (verified). Claim it
