@@ -769,13 +769,19 @@ pub(crate) fn worker_prelude() -> &'static str {
                 wrapped_platform_block("/*__DOM_STRING_LIST_BEGIN__*/", "/*__DOM_STRING_LIST_END__*/");
             let class_strings =
                 platform_block("/*__CLASS_STRINGS_BEGIN__*/", "/*__CLASS_STRINGS_END__*/");
-            // The URL interfaces run inside the worker scope's own function,
-            // so its later code binds the pristine URL and URLSearchParams.
-            let worker_scope = WORKER_SCOPE.replacen(
-                "/*__URL_SHARED__*/",
-                platform_block("/*__URL_BEGIN__*/", "/*__URL_END__*/"),
-                1,
-            );
+            // The URL and text codec interfaces run inside the worker scope's
+            // own function, so its later code binds the pristine interfaces.
+            let worker_scope = WORKER_SCOPE
+                .replacen(
+                    "/*__URL_SHARED__*/",
+                    platform_block("/*__URL_BEGIN__*/", "/*__URL_END__*/"),
+                    1,
+                )
+                .replacen(
+                    "/*__TEXT_CODEC_SHARED__*/",
+                    platform_block("/*__TEXT_CODEC_BEGIN__*/", "/*__TEXT_CODEC_END__*/"),
+                    1,
+                );
             format!(
                 "{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{bitmap}\n{headers}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
