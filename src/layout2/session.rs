@@ -87,6 +87,16 @@ impl LayoutFragments {
             .get(node)
     }
 
+    /// The viewport of the child Document `frame` contains, as the complete
+    /// projection's `frame_viewports` records it.
+    pub(crate) fn frame_viewport(
+        &self,
+        dom: &Dom,
+        frame: NodeId,
+    ) -> Option<crate::render::CssRect> {
+        measure::frame_viewport(dom, &self.root, &self.fixed, &self.top_layer, frame)
+    }
+
     /// CSSOM View offset* ignores transforms on both the element and its
     /// ancestors. This projection shares the snapshot index; only fragmented
     /// and inline boxes require the complete composed projection.

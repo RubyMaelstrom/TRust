@@ -1305,14 +1305,30 @@ pub(crate) fn measure_retained_layout_for_box(
             {
                 return None;
             }
-            measure::single_border_box(&layout.root, &layout.fixed, &layout.top_layer, node)
-                .map(|rect| (node, rect))
+            let rect =
+                measure::single_border_box(&layout.root, &layout.fixed, &layout.top_layer, node)?;
+            // A node of a nested Document is reported in that Document's
+            // viewport, which needs its container's content-box origin too.
+            let frame = match dom.frame_owner(node) {
+                Some(frame) => Some((
+                    frame,
+                    measure::frame_viewport(
+                        dom,
+                        &layout.root,
+                        &layout.fixed,
+                        &layout.top_layer,
+                        frame,
+                    )?,
+                )),
+                None => None,
+            };
+            Some((node, rect, frame))
         });
         let (boxes, scrolling_areas, frame_viewports) = match single_box {
-            Some((node, rect)) => (
+            Some((node, rect, frame)) => (
                 HashMap::from([(node, rect)]),
                 HashMap::new(),
-                HashMap::new(),
+                frame.into_iter().collect(),
             ),
             None => measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer),
         };

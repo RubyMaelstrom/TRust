@@ -95,6 +95,16 @@ impl LumenGeomCache {
             top_document_valid: false,
         }
     }
+
+    /// Whether a rectangle-only read of `node` is already projected: its
+    /// border box and, for a node of a nested Document, that Document's
+    /// viewport, which places the box in its own coordinate space.
+    fn single_box_available(&self, dom: &Dom, node: crate::dom::NodeId) -> bool {
+        self.boxes.contains_key(&node)
+            && dom
+                .frame_owner(node)
+                .is_none_or(|frame| self.frame_viewports.contains_key(&frame))
+    }
 }
 
 /// Everything besides scroll offsets that the top-level Document's
@@ -15734,13 +15744,20 @@ fn ensure_host_geometry(
         cached.top_document_valid = true;
     }
     if !cached.complete_geometry
-        && !requested_box.is_some_and(|node| cached.boxes.contains_key(&node))
+        && !requested_box.is_some_and(|node| cached.single_box_available(&dom, node))
         && let Some(fragments) = cached.fragments.clone()
     {
-        if let Some((node, rect)) = requested_box
-            .and_then(|node| fragments.single_border_box(node).map(|rect| (node, rect)))
-        {
+        let single = requested_box.and_then(|node| {
+            let rect = fragments.single_border_box(node)?;
+            let frame = match dom.frame_owner(node) {
+                Some(frame) => Some((frame, fragments.frame_viewport(&dom, frame)?)),
+                None => None,
+            };
+            Some((node, rect, frame))
+        });
+        if let Some((node, rect, frame)) = single {
             cached.boxes.insert(node, rect);
+            cached.frame_viewports.extend(frame);
         } else {
             let (boxes, scrolling_areas, frame_viewports) = fragments.measure_boxes(&dom);
             cached.boxes = boxes;
@@ -16087,12 +16104,11 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         let top_level_frame = id.is_some_and(|id| {
             matches!(dom.tag_name(id), Some("iframe" | "frame")) && dom.frame_owner(id).is_none()
         });
-        // Child rectangles also need their container's content-box origin;
-        // viewport requests and tables retain the complete projection.
+        // A nested Document's node also projects its container's content-box
+        // origin; viewport requests and tables retain the complete projection.
         let requested_box = id.filter(|&id| {
             !matches!(args.get(1), Some(Value::Bool(true)))
                 && !matches!(dom.tag_name(id), Some("iframe" | "frame"))
-                && dom.frame_owner(id).is_none()
                 && !dom
                     .computed_value_resolved(id, "display")
                     .is_some_and(|display| display.contains("table"))
@@ -16113,13 +16129,14 @@ fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         available,
     ) = {
         let cached = cache.borrow();
+        let dom = dom_handle.borrow();
         (
             cached.epoch,
             cached.presentation_epoch,
             cached.svg_sprite_revision,
             cached.top_document_valid,
             cached.complete_geometry
-                || requested_box.is_some_and(|id| cached.boxes.contains_key(&id)),
+                || requested_box.is_some_and(|id| cached.single_box_available(&dom, id)),
         )
     };
     let reuse_cached = if cached_presentation_epoch != presentation_epoch
@@ -18527,6 +18544,33 @@ mod tests {
             ),
             "[8,37,186,186,57]"
         );
+        // A nested Document's node takes the rectangle-only projection too,
+        // placed in its own viewport by the container's content-box origin.
+        // It agrees with the complete projection of the same layout.
+        let start = crate::layout2::layout_pass_count();
+        let lazy = string_value(
+            &mut engine,
+            r#"
+            frame.style.marginLeft='13px';
+            var lazy=inside.getBoundingClientRect();
+            JSON.stringify([lazy.x,lazy.y,lazy.width,lazy.height])
+        "#,
+        );
+        assert_eq!(lazy, "[8,8,57,19]");
+        assert!(!cache.borrow().complete_geometry);
+        assert_eq!(cache.borrow().boxes.len(), 1);
+        assert_eq!(cache.borrow().frame_viewports.len(), 1);
+        let complete = string_value(
+            &mut engine,
+            r#"
+            document.getElementById('scroll').scrollWidth;
+            var complete=inside.getBoundingClientRect();
+            JSON.stringify([complete.x,complete.y,complete.width,complete.height])
+        "#,
+        );
+        assert!(cache.borrow().complete_geometry);
+        assert_eq!(lazy, complete);
+        assert_eq!(crate::layout2::layout_pass_count(), start + 1);
     }
 
     #[test]
