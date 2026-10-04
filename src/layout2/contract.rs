@@ -1475,18 +1475,35 @@ fn microdata_value(dom: &Dom, id: NodeId) -> Option<&str> {
 /// fallback and preview-image decode gate. A present `<video>` is itself the
 /// standardized playback signal and does not need metadata qualification.
 pub(crate) fn page_declares_video(dom: &Dom) -> bool {
-    ["og:video", "og:video:secure_url"]
-        .into_iter()
-        .any(|k| dom.meta_content(k).is_some())
-        || dom
-            .meta_content("og:type")
-            .is_some_and(|t| t.trim().to_ascii_lowercase().starts_with("video"))
-        || dom
-            .descendants(crate::dom::DOCUMENT)
-            .filter(|&id| schema_item_is(dom, id, "VideoObject"))
-            .take(2)
-            .count()
-            == 1
+    // One document walk for what `Dom::meta_content` would find per key: the
+    // first `<meta>` whose property/name matches decides that key, even when
+    // its content is empty.
+    const KEYS: [&str; 3] = ["og:video", "og:video:secure_url", "og:type"];
+    let mut metas: [Option<NodeId>; 3] = [None; 3];
+    let mut video_objects = 0;
+    for id in dom.descendants(crate::dom::DOCUMENT) {
+        if dom.tag_name(id) == Some("meta")
+            && let Some(key) = dom.attr(id, "property").or_else(|| dom.attr(id, "name"))
+        {
+            for (slot, wanted) in metas.iter_mut().zip(KEYS) {
+                if slot.is_none() && key.eq_ignore_ascii_case(wanted) {
+                    *slot = Some(id);
+                }
+            }
+        }
+        if video_objects < 2 && schema_item_is(dom, id, "VideoObject") {
+            video_objects += 1;
+        }
+    }
+    let content = |meta: Option<NodeId>| {
+        meta.and_then(|id| dom.attr(id, "content"))
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+    };
+    content(metas[0]).is_some()
+        || content(metas[1]).is_some()
+        || content(metas[2]).is_some_and(|t| t.trim().to_ascii_lowercase().starts_with("video"))
+        || video_objects == 1
 }
 
 /// Resolve an absolute CSS Fonts weight used by the font matcher. Relative
