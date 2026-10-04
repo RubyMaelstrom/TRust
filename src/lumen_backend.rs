@@ -18658,6 +18658,24 @@ mod tests {
     }
 
     #[test]
+    fn node_constants_exist_on_node_and_its_prototype() {
+        // DOM #interface-node / Web IDL #es-constants: every constant is a
+        // non-writable, enumerable, non-configurable property of both the
+        // interface object and the interface prototype object.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const d = Object.getOwnPropertyDescriptor(Node.prototype, 'ATTRIBUTE_NODE');\n\
+                 [Node.ATTRIBUTE_NODE, Node.DOCUMENT_TYPE_NODE, Node.prototype.NOTATION_NODE,\n\
+                  document.DOCUMENT_NODE, Node.DOCUMENT_POSITION_CONTAINED_BY,\n\
+                  d.writable, d.enumerable, d.configurable].join('|')"
+            ),
+            "2|10|12|9|16|false|true|false"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or
