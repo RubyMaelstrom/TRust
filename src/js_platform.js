@@ -25694,7 +25694,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const toStringTag = Symbol.toStringTag;
         const define = Object.defineProperty, own = Object.getOwnPropertyDescriptor;
         for (const name of Object.getOwnPropertyNames(globalThis)) {
-            if (engineNames.has(name) || !/^[A-Z]/.test(name)) continue;
+            // Interface and namespace names start with an ASCII capital letter.
+            const first = name.charCodeAt(0);
+            if (!(first >= 65 && first <= 90) || engineNames.has(name)) continue;
             const binding = own(globalThis, name);
             const C = binding && binding.value;
             if (typeof C !== "function") continue;

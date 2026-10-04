@@ -22444,6 +22444,55 @@ mod tests {
     }
 
     #[test]
+    fn webgl_interface_members_and_constants_keep_web_idl_descriptors_and_order() {
+        // Web IDL #js-operations / #js-attributes make interface members enumerable;
+        // #js-constants defines each constant { writable: false, enumerable: true,
+        // configurable: false } on the interface object and its prototype. TRust appends the
+        // constants after the members; the class-string pass then adds @@toStringTag
+        // (#interface-prototype-object), skipping aliases of another interface.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const W = WebGLRenderingContext, P = W.prototype;
+                    const isConstant = name => /^[A-Z][A-Z0-9_]*$/.test(name);
+                    const names = Object.getOwnPropertyNames(P).filter(n => n !== "constructor");
+                    const first = names.findIndex(isConstant);
+                    const members = names.slice(0, first), constants = names.slice(first);
+                    const constantDescriptor = (object, name) => {
+                        const d = Object.getOwnPropertyDescriptor(object, name);
+                        return typeof d.value === "number" && !d.writable && d.enumerable && !d.configurable;
+                    };
+                    const memberDescriptor = name => {
+                        const d = Object.getOwnPropertyDescriptor(P, name);
+                        return d.enumerable && d.configurable &&
+                            ("value" in d ? d.writable && typeof d.value === "function" : typeof d.get === "function");
+                    };
+                    const interfaceConstants = Object.getOwnPropertyNames(W).filter(isConstant);
+                    return [
+                        first > 100, members.every(name => !isConstant(name)), constants.every(isConstant),
+                        constants.length > 250, constants.every(name => constantDescriptor(P, name)),
+                        interfaceConstants.join() === constants.join(),
+                        interfaceConstants.every(name => constantDescriptor(W, name)),
+                        members.every(memberDescriptor),
+                        P.clear.name === "clear" && P.clear.length === 1,
+                        W.COLOR_BUFFER_BIT === 0x4000 && P.TEXTURE31 === 0x84DF,
+                        Reflect.ownKeys(P).filter(key => typeof key === "symbol").length === 1,
+                        Object.prototype.toString.call(P) === "[object WebGLRenderingContext]",
+                        Object.getOwnPropertyDescriptor(DOMMatrix.prototype, Symbol.toStringTag).value === "DOMMatrix",
+                        WebKitCSSMatrix === DOMMatrix,
+                        Object.prototype.toString.call(HTMLDivElement.prototype) === "[object HTMLDivElement]",
+                        !Object.getOwnPropertyDescriptor(Image.prototype, Symbol.toStringTag) ||
+                            Image.prototype === HTMLImageElement.prototype,
+                    ].join(",");
+                })()"#
+            ),
+            [true; 16].map(|ok| ok.to_string()).join(",")
+        );
+    }
+
+    #[test]
     #[ignore = "requires an installed EGL/GLES driver"]
     fn webgl_numeric_lists_use_typed_storage_before_iterators() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
