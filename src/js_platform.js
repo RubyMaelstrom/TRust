@@ -1297,7 +1297,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             rememberElement(w, id);
         } else if (t === 11) {
             const info = __dom_shadow_info(id);
-            w = info ? new ShadowRoot(id) : new DocumentFragment(id);
+            w = info ? new ShadowRoot(id, NODE_WRAPPER_TOKEN) : new DocumentFragment(id, NODE_WRAPPER_TOKEN);
             // Parsed roots already exist before any wrapper. Recognize them
             // even when first reached through child.parentNode/getRootNode.
             rememberWrapper(id, w, knownConnected);
@@ -1322,10 +1322,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
             }
             w = t === 9 ? (__dom_document_content_type(id) === "text/html" ? new Document(id) : new XMLDocument(id, XML_DOCUMENT_TOKEN))
-                : t === 3 ? new Text(id)
-                : t === 4 ? new CDATASection(id)
+                : t === 3 ? new Text(id, NODE_WRAPPER_TOKEN)
+                : t === 4 ? new CDATASection(id, NODE_WRAPPER_TOKEN)
                 : t === 7 ? new ProcessingInstruction(id)
-                : t === 8 ? new Comment(id)
+                : t === 8 ? new Comment(id, NODE_WRAPPER_TOKEN)
                 : t === 10 ? new DocumentType(id, DOCUMENT_TYPE_TOKEN)
                 : new Node(id);
         }
@@ -1335,6 +1335,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return wrapKnown(id, undefined);
     }
     const DOCUMENT_TYPE_TOKEN = {};
+    // Wrappers of existing arena nodes pass their ID with this token. Without
+    // it, the Text, Comment and DocumentFragment constructors create a node.
+    const NODE_WRAPPER_TOKEN = {};
+    // DOM #dom-text-text, #dom-comment-comment and
+    // #dom-documentfragment-documentfragment: the new node's node document is
+    // the current global object's associated Document. Interfaces without a
+    // constructor that inherit one stay illegal to construct.
+    function constructedNodeId(create, newTarget, illegal) {
+        if (illegal.includes(newTarget)) throw new TypeError("Illegal constructor");
+        return create(nodeIds.get(g.document));
+    }
     function doctypeInfo(node) {
         const info = __dom_doctype(nodeIds.get(node));
         if (!info) throw new TypeError("Illegal invocation");
@@ -11226,6 +11237,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
     class Text extends CharacterData {
+        constructor(data = "", token = undefined) {
+            if (token === NODE_WRAPPER_TOKEN) { super(data); return; }
+            const id = constructedNodeId(document => __dom_create_text(`${data}`, document), new.target, [CDATASection]);
+            super(id);
+            rememberWrapper(id, this);
+        }
         get nodeType() { return 3; }
         get nodeName() { return "#text"; }
         splitText(offset) {
@@ -12662,6 +12679,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
 
     class DocumentFragment extends Node {
+        constructor(id = undefined, token = undefined) {
+            if (token === NODE_WRAPPER_TOKEN) { super(id); return; }
+            const created = constructedNodeId(document => __dom_create_fragment(document), new.target, [ShadowRoot]);
+            super(created);
+            rememberWrapper(created, this);
+        }
         get nodeType() { return 11; }
         get nodeName() { return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "DocumentFragment"; }
@@ -12670,7 +12693,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
 
     }
-    class Comment extends CharacterData { get nodeType() { return 8; } get nodeName() { return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; } }
+    class Comment extends CharacterData {
+        constructor(data = "", token = undefined) {
+            if (token === NODE_WRAPPER_TOKEN) { super(data); return; }
+            const id = constructedNodeId(document => __dom_create_comment(`${data}`, document), new.target, []);
+            super(id);
+            rememberWrapper(id, this);
+        }
+        get nodeType() { return 8; } get nodeName() { return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; }
+    }
     // Lit walks comment markers with one of these.
     // A spec-faithful DOM TreeWalker (https://dom.spec.whatwg.org/#interface-treewalker).
     // The full traversal surface — firstChild/lastChild/next|previousSibling/
@@ -15629,6 +15660,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return (namedElements.get(name) || []).map(wrap);
         });
     }
+    // HTML #windowproxy-getownproperty: an array index names the document's
+    // document-tree child navigable at that position, whose WindowProxy is a
+    // read-only, non-enumerable value. A Realm's global is an ordinary object
+    // here, so like named access these resolve on the named properties
+    // object, ahead of every prototype.
+    function windowIndexedDescriptor(property) {
+        if (typeof property !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(property)) return undefined;
+        const index = Number(property);
+        if (index >= 4294967295) return undefined;
+        refreshWindowNames();
+        const frame = windowFrames[index];
+        const value = frame && frame.contentWindow;
+        return value ? {value, writable:false, enumerable:false, configurable:true} : undefined;
+    }
     const namedTarget = Object.create(EventTarget.prototype);
     Object.defineProperty(namedTarget, Symbol.toStringTag, {value:'WindowProperties', configurable:true});
     let windowProperties;
@@ -15661,12 +15706,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     windowProperties = new Proxy(namedTarget, {
         get(target, property, receiver) {
-            const descriptor = windowNamedDescriptor(property);
+            const descriptor = windowIndexedDescriptor(property) || windowNamedDescriptor(property);
             return descriptor ? descriptor.value : Reflect.get(target, property, receiver);
         },
-        has(target, property) { return !!windowNamedDescriptor(property) || Reflect.has(target, property); },
+        has(target, property) {
+            return !!(windowIndexedDescriptor(property) || windowNamedDescriptor(property)) || Reflect.has(target, property);
+        },
         getOwnPropertyDescriptor(target, property) {
-            return windowNamedDescriptor(property) || Reflect.getOwnPropertyDescriptor(target, property);
+            return windowIndexedDescriptor(property) || windowNamedDescriptor(property) ||
+                Reflect.getOwnPropertyDescriptor(target, property);
         },
         defineProperty() { return false; }, deleteProperty() { return false; },
         preventExtensions() { return false; },
