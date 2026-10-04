@@ -18466,6 +18466,45 @@ mod tests {
     }
 
     #[test]
+    fn crypto_objects_are_crypto_and_subtle_crypto_instances() {
+        // WebCrypto #crypto-interface / #subtlecrypto-interface: the global's
+        // [SameObject] crypto accessor returns a Crypto, whose subtle is a
+        // SubtleCrypto; both interfaces are illegal constructors and brand
+        // their receivers (a SubtleCrypto operation rejects). [SecureContext]
+        // members and SubtleCrypto are absent outside secure contexts.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 let constructed; try { new Crypto(); } catch (e) { constructed = e.name; }\n\
+                 let branded; try { Crypto.prototype.getRandomValues.call({}, new Uint8Array(1)); }\n\
+                 catch (e) { branded = e.name; }\n\
+                 [tag(crypto), tag(crypto.subtle), crypto === crypto, crypto.subtle === crypto.subtle,\n\
+                  typeof Object.getOwnPropertyDescriptor(globalThis, 'crypto').get,\n\
+                  Object.keys(Crypto.prototype).join(), Object.keys(SubtleCrypto.prototype).length,\n\
+                  SubtleCrypto.prototype.verify.length, constructed, branded,\n\
+                  tag(SubtleCrypto.prototype.digest.call({}, 'SHA-256', new Uint8Array(1))),\n\
+                  crypto.getRandomValues(new Uint8Array(4)).length, crypto.randomUUID()[14]].join('|')"
+            ),
+            "Crypto|SubtleCrypto|true|true|function|subtle,getRandomValues,randomUUID|12|4|\
+             TypeError|TypeError|Promise|4|4"
+        );
+        // The test worker's configuration is not a secure context.
+        let mut worker = worker_platform_engine();
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 [isSecureContext, tag(crypto), 'subtle' in crypto, 'randomUUID' in crypto,\n\
+                  typeof SubtleCrypto, crypto.getRandomValues(new Uint8Array(2)).length,\n\
+                  URL.createObjectURL(new Blob([])).length > 40].join('|')"
+            ),
+            "false|Crypto|false|false|undefined|2|true"
+        );
+    }
+
+    #[test]
     fn document_last_modified_uses_the_source_time_in_local_time() {
         // HTML #dom-document-lastmodified: "MM/DD/YYYY hh:mm:ss" in the
         // user's local time zone, from the source's modification time, or
@@ -30171,7 +30210,7 @@ mod tests {
         install_lumen_worker_boundary(&mut engine);
         eval(
             &mut engine,
-            "globalThis.__worker_cfg = { crossOriginIsolated: true };",
+            "globalThis.__worker_cfg = { crossOriginIsolated: true, secureContext: true };",
             "isolation",
         )
         .unwrap();
