@@ -23695,27 +23695,40 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function isXmlMime(mime) {
         return mime === "text/xml" || mime === "application/xml" || mime.endsWith("+xml");
     }
-    function xhrFire(t) {
-        const ev = new Event(t); ev.target = this;
-        const on = this["on" + t];
-        if (typeof on === "function") { try { on.call(this, ev); } catch (e) { trust.errors.push("xhr on" + t + ": " + ((e && e.message) || e)); } }
-        // Fire addEventListener listeners (app's + Zone's internal
-        // readystatechange handler) through the shared EventTarget dispatch.
+    // XHR #concept-event-fire-progress: readystatechange is a plain trusted
+    // Event, every other XHR event a ProgressEvent with transmitted/length.
+    // Event handler attributes are listeners, so the shared EventTarget
+    // dispatch runs them in registration order with the other listeners.
+    function xhrFire(t, transmitted = 0, length = 0) {
+        const ev = t === "readystatechange" ? createTrustedEvent(Event, t, {})
+            : createTrustedEvent(ProgressEvent, t, {lengthComputable: length !== 0, loaded: transmitted, total: length});
         dispatch(this, ev, false);
+    }
+    // XHR #request-error-steps for the upload object: once per request,
+    // before the upload is complete, and only when it had listeners at send().
+    function xhrUploadError(xhr, type) {
+        const state = internalsFor(xhr);
+        if (state.uploadComplete) return;
+        state.uploadComplete = true;
+        if (!state.uploadListener) return;
+        xhrFire.call(state.upload, type);
+        xhrFire.call(state.upload, "loadend");
     }
     function xhrFinish(r) {
         // A late result for an aborted/timed-out request is discarded —
         // its events already fired from abort()/the timeout timer.
         if (internalsFor(this).aborted || !internalsFor(this).inFlight) return;
-        internalsFor(this).inFlight = false;
         if (!r) {
-            this.readyState = 4; this.status = 0;
+            internalsFor(this).inFlight = false;
+            internalsFor(this).readyState = 4; internalsFor(this).status = 0;
             internalsFor(this).text = ""; internalsFor(this).bytes = null; internalsFor(this).decodedText = "";
             internalsFor(this).respObj = null; internalsFor(this).respXML = null;
-            xhrFire.call(this, "readystatechange"); xhrFire.call(this, "error"); xhrFire.call(this, "loadend");
+            xhrFire.call(this, "readystatechange");
+            xhrUploadError(this, "error");
+            xhrFire.call(this, "error"); xhrFire.call(this, "loadend");
             return;
         }
-        this.status = r[0]; internalsFor(this).ctype = r[1];
+        internalsFor(this).status = r[0]; internalsFor(this).ctype = r[1];
         internalsFor(this).text = r[2] == null ? "" : r[2];
         // Keep XHR's internal response body as a byte view. The host Fetch
         // result is an ArrayBuffer so it can cross the realm boundary
@@ -23726,13 +23739,34 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (internalsFor(this).hdrs && internalsFor(this).ctype && internalsFor(this).hdrs["content-type"] === undefined) internalsFor(this).hdrs["content-type"] = internalsFor(this).ctype;
         internalsFor(this).respObj = undefined; internalsFor(this).respXML = undefined;
         internalsFor(this).decodedText = undefined;
-        this.responseURL = internalsFor(this).url;
-        this.readyState = 4;
-        xhrFire.call(this, "readystatechange"); xhrFire.call(this, "load"); xhrFire.call(this, "loadend");
+        internalsFor(this).responseURL = internalsFor(this).url;
+        // XHR #handle-response-end-of-body: progress (async only), DONE,
+        // load and loadend, with the received body length.
+        const received = internalsFor(this).bytes != null ? __bodyBytes(internalsFor(this).bytes).byteLength
+            : utf8Binary(internalsFor(this).text).length;
+        if (!internalsFor(this).sync) {
+            // XHR #ref-for-handle-response steps: HEADERS_RECEIVED, then
+            // LOADING once body bytes arrive, each with readystatechange.
+            // A handler may abort() meanwhile; its request error steps run.
+            internalsFor(this).readyState = 2;
+            xhrFire.call(this, "readystatechange");
+            if (internalsFor(this).aborted) return;
+            if (received > 0) {
+                internalsFor(this).readyState = 3;
+                xhrFire.call(this, "readystatechange");
+                if (internalsFor(this).aborted) return;
+            }
+            xhrFire.call(this, "progress", received, received);
+            if (internalsFor(this).aborted) return;
+        }
+        internalsFor(this).inFlight = false;
+        internalsFor(this).readyState = 4;
+        xhrFire.call(this, "readystatechange");
+        xhrFire.call(this, "load", received, received); xhrFire.call(this, "loadend", received, received);
     }
     function xhrFinalMime() { return internalsFor(this).overrideMime || parseMimeType(internalsFor(this).ctype || "") || parseMimeType("text/xml"); }
     function xhrEnsureText() {
-        if (this.readyState < 3) return "";
+        if (internalsFor(this).readyState < 3) return "";
         if (internalsFor(this).decodedText === undefined) internalsFor(this).decodedText = xhrDecodeText.call(this, false);
         return internalsFor(this).decodedText;
     }
@@ -23769,20 +23803,53 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (isXml || (isHtml && internalsFor(this).respType === "document")) {
             try { out = wrap(__dom_parse_document(xhrDecodeText.call(this, isXml), ct)); }
             catch (error) { internalsFor(this).respXML = null; return null; }
-            documentURLs.set(out, this.responseURL);
+            documentURLs.set(out, internalsFor(this).responseURL);
             const root = out.documentElement;
             if (isXml && root && root.localName === "parsererror" && root.namespaceURI === "http://www.mozilla.org/newlayout/xml/parsererror.xml") out = null;
         }
         internalsFor(this).respXML = out;
         return out;
     }
-    class XMLHttpRequest extends EventTarget {
+    // XHR #interface-xmlhttprequest: XMLHttpRequestEventTarget declares the
+    // progress event handler attributes shared by XMLHttpRequest and its
+    // XMLHttpRequestUpload object; neither of those two is constructible.
+    class XMLHttpRequestEventTarget extends EventTarget {
+        constructor() { throw new TypeError("Illegal constructor"); }
+    }
+    class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {
+        constructor() { throw new TypeError("Illegal constructor"); }
+    }
+    function xhrState(xhr) {
+        const state = internalsOf(xhr);
+        if (!state.xhr) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    class XMLHttpRequest extends XMLHttpRequestEventTarget {
         constructor() {
-            super();
-            this.readyState = 0; this.status = 0; this.statusText = "";
-            internalsFor(this).text = ""; internalsFor(this).bytes = null; internalsFor(this).respType = ""; internalsFor(this).respObj = undefined;
-            this.responseURL = ""; internalsFor(this).timeout = 0; this.withCredentials = false;
-            internalsFor(this).h = {}; internalsFor(this).aborted = false; internalsFor(this).inFlight = false;
+            const xhr = Reflect.construct(EventTarget, [], new.target);
+            const state = internalsFor(xhr);
+            state.xhr = true;
+            state.readyState = 0; state.status = 0; state.statusText = ""; state.responseURL = "";
+            state.withCredentials = false;
+            // XHR #dom-xmlhttprequest-upload: the [SameObject] upload object.
+            state.upload = Reflect.construct(EventTarget, [], XMLHttpRequestUpload);
+            state.text = ""; state.bytes = null; state.respType = ""; state.respObj = undefined;
+            state.timeout = 0;
+            state.h = {}; state.aborted = false; state.inFlight = false;
+            return xhr;
+        }
+        get readyState() { return xhrState(this).readyState; }
+        get status() { return xhrState(this).status; }
+        get statusText() { return xhrState(this).statusText; }
+        get responseURL() { return xhrState(this).responseURL; }
+        get upload() { return xhrState(this).upload; }
+        // XHR #the-withcredentials-attribute.
+        get withCredentials() { return xhrState(this).withCredentials; }
+        set withCredentials(value) {
+            const state = xhrState(this);
+            if ((state.readyState !== 0 && state.readyState !== 1) || state.inFlight)
+                throw new DOMException("withCredentials cannot be set now", "InvalidStateError");
+            state.withCredentials = !!value;
         }
         // XHR §the timeout attribute: setting it while the request is
         // synchronous (in a window realm — ours always is) throws
@@ -23800,7 +23867,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         set responseType(v) {
             v = String(v);
             if (v !== "" && v !== "text" && v !== "arraybuffer" && v !== "blob" && v !== "document" && v !== "json") return;
-            if (this.readyState >= 3) throw new DOMException("responseType cannot be set once loading", "InvalidStateError");
+            if (internalsFor(this).readyState >= 3) throw new DOMException("responseType cannot be set once loading", "InvalidStateError");
             if (internalsFor(this).sync) throw new DOMException("responseType is unsupported on a synchronous request", "InvalidStateError");
             internalsFor(this).respType = v;
         }
@@ -23815,7 +23882,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get response() {
             const rt = internalsFor(this).respType;
             if (rt === "" || rt === "text") return xhrEnsureText.call(this);
-            if (this.readyState !== 4) return null;
+            if (internalsFor(this).readyState !== 4) return null;
             if (internalsFor(this).respObj !== undefined) return internalsFor(this).respObj;
             let out = null;
             if (rt === "arraybuffer" || rt === "blob") {
@@ -23839,7 +23906,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get responseXML() {
             if (internalsFor(this).respType !== "" && internalsFor(this).respType !== "document")
                 throw new DOMException("responseXML is only available for '' or 'document' responseType", "InvalidStateError");
-            if (this.readyState !== 4) return null;
+            if (internalsFor(this).readyState !== 4) return null;
             return xhrDocumentResponse.call(this);
         }
         open(method, url, isAsync) {
@@ -23853,7 +23920,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (isAsync === false && (internalsFor(this).timeout !== 0 || internalsFor(this).respType !== ""))
                 throw new DOMException("synchronous XMLHttpRequest cannot have a timeout or responseType", "InvalidAccessError");
             internalsFor(this).sync = isAsync === false;
-            this.readyState = 1;
+            internalsFor(this).readyState = 1;
             xhrFire.call(this, "readystatechange");
         }
         setRequestHeader(k, v) { internalsFor(this).h[String(k).toLowerCase()] = String(v); }
@@ -23873,7 +23940,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         overrideMimeType(mime) {
             if (!arguments.length) throw new TypeError("overrideMimeType requires a MIME type");
             mime = domString(mime);
-            if (this.readyState === 3 || this.readyState === 4)
+            if (internalsFor(this).readyState === 3 || internalsFor(this).readyState === 4)
                 throw new DOMException("The response is already loading or done", "InvalidStateError");
             internalsFor(this).overrideMime = parseMimeType(mime) || parseMimeType("application/octet-stream");
             internalsFor(this).decodedText = undefined;
@@ -23887,13 +23954,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             internalsFor(this).aborted = true;
             if (internalsFor(this).inFlight) {
                 internalsFor(this).inFlight = false;
-                this.status = 0; internalsFor(this).text = ""; internalsFor(this).bytes = null; internalsFor(this).respObj = undefined; internalsFor(this).respXML = undefined;
-                this.readyState = 4;
+                internalsFor(this).status = 0; internalsFor(this).text = ""; internalsFor(this).bytes = null; internalsFor(this).respObj = undefined; internalsFor(this).respXML = undefined;
+                internalsFor(this).readyState = 4;
                 xhrFire.call(this, "readystatechange");
+                xhrUploadError(this, "abort");
                 xhrFire.call(this, "abort");
                 xhrFire.call(this, "loadend");
             }
-            if (this.readyState === 4) this.readyState = 0; // DONE → UNSENT, silently
+            if (internalsFor(this).readyState === 4) internalsFor(this).readyState = 0; // DONE → UNSENT, silently
         }
         // addEventListener/removeEventListener are inherited from EventTarget so
         // listeners land in the shared `lsFor` store (and Zone's patched wrapper
@@ -23902,20 +23970,48 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             internalsFor(this).aborted = false;
             internalsFor(this).inFlight = true;
             internalsFor(this).frame = trust.__activeFrame || null;
+            // XHR #the-send()-method: GET and HEAD requests have no body; a
+            // request without a body has its upload complete from the start,
+            // and the upload listener flag records upload listeners now.
+            const method = internalsFor(this).method || "GET";
+            if (method === "GET" || method === "HEAD") body = null;
+            const upload = internalsFor(this).upload, uploadListeners = getListenerMap(upload);
+            internalsFor(this).uploadComplete = body === null || body === undefined;
+            internalsFor(this).uploadListener = !!(uploadListeners && uploadListeners.size);
             // Async requests fire `loadstart` synchronously from send() (XHR
             // §the send() method; a SYNC request deliberately doesn't), and an
             // armed `timeout` runs the timeout request-error steps if the
             // response hasn't landed by then (the late result is then dropped).
             if (!internalsFor(this).sync) {
                 xhrFire.call(this, "loadstart");
+                if (!internalsFor(this).uploadComplete && internalsFor(this).uploadListener) {
+                    // The request body's length, before it is transmitted.
+                    const isForm = body instanceof g.FormData && Array.isArray(internalsFor(body).entries);
+                    const wire = isForm ? __formDataWire(body).wire : __bodyWire(body);
+                    const length = typeof wire === "string" ? wire.length : wire ? wire.byteLength : 0;
+                    xhrFire.call(upload, "loadstart", 0, length);
+                    // processRequestEndOfBody: the host transmits the whole
+                    // body before the response, so its upload completes in
+                    // the next networking task unless an error came first.
+                    const xhr = this;
+                    __queue_network_task(function () {
+                        const state = internalsFor(xhr);
+                        if (state.uploadComplete || !state.inFlight) return;
+                        state.uploadComplete = true;
+                        xhrFire.call(upload, "progress", length, length);
+                        xhrFire.call(upload, "load", length, length);
+                        xhrFire.call(upload, "loadend", length, length);
+                    }, internalsOf(this).frame);
+                }
                 if (this.timeout > 0) {
                     const xhr = this;
                     g.setTimeout(function () {
                         if (!internalsFor(xhr).inFlight || internalsFor(xhr).aborted) return;
                         internalsFor(xhr).inFlight = false; internalsFor(xhr).aborted = true;
-                        xhr.status = 0; internalsFor(xhr).text = ""; internalsFor(xhr).bytes = null; internalsFor(xhr).respObj = undefined;
-                        xhr.readyState = 4;
+                        internalsFor(xhr).status = 0; internalsFor(xhr).text = ""; internalsFor(xhr).bytes = null; internalsFor(xhr).respObj = undefined;
+                        internalsFor(xhr).readyState = 4;
                         xhrFire.call(xhr, "readystatechange");
+                        xhrUploadError(xhr, "timeout");
                         xhrFire.call(xhr, "timeout");
                         xhrFire.call(xhr, "loadend");
                     }, this.timeout);
@@ -23950,7 +24046,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (internalsFor(this).sync) {
                 xhrFinish.call(this, __http_fetch(
                     internalsFor(this).url, internalsFor(this).method || "GET", b, ctype, hdrs,
-                    "cors", this.withCredentials ? "include" : "same-origin", 'xmlhttprequest'
+                    "cors", internalsFor(this).withCredentials ? "include" : "same-origin", 'xmlhttprequest'
                 ));
             } else {
                 // XHR §3.5.6 supplies processResponse/processEndOfBody to
@@ -23964,7 +24060,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const xhr = this;
                 __http_fetch_async(
                     internalsFor(this).url, internalsFor(this).method || "GET", b, ctype, hdrs,
-                    "cors", this.withCredentials ? "include" : "same-origin", 'xmlhttprequest'
+                    "cors", internalsFor(this).withCredentials ? "include" : "same-origin", 'xmlhttprequest'
                 )
                     .then(function (r) {
                         __queue_network_task(function () { xhrFinish.call(xhr, r); }, internalsOf(xhr).frame);
@@ -23972,6 +24068,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
         }
     }
+    installHandlerProps(XMLHttpRequestEventTarget.prototype,
+        ["loadstart", "progress", "abort", "error", "load", "timeout", "loadend"]);
+    installHandlerProps(XMLHttpRequest.prototype, ["readystatechange"]);
+    // Web IDL: attributes, operations and constants are enumerable; the
+    // UNSENT..DONE constants live on the interface object and prototype.
+    for (const C of [XMLHttpRequestEventTarget, XMLHttpRequest]) {
+        for (const name of Object.getOwnPropertyNames(C.prototype)) {
+            if (name !== "constructor") Object.defineProperty(C.prototype, name, {enumerable: true});
+        }
+    }
+    for (const [name, value] of [["UNSENT", 0], ["OPENED", 1], ["HEADERS_RECEIVED", 2], ["LOADING", 3], ["DONE", 4]]) {
+        Object.defineProperty(XMLHttpRequest, name, {value, enumerable: true});
+        Object.defineProperty(XMLHttpRequest.prototype, name, {value, enumerable: true});
+    }
+    g.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
+    g.XMLHttpRequestUpload = XMLHttpRequestUpload;
     g.XMLHttpRequest = XMLHttpRequest;
     // Response assembly for an XHR whose request is in flight, without the
     // network: a private hook for native diagnostics and tests.
