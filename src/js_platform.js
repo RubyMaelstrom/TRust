@@ -1538,6 +1538,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // getter does. Keep the focused DOM anchor itself when an element owns
     // focus so modal/focus-restoration code never observes `undefined`.
     let focusedArea = null;
+    // Whether this child navigable's Document is in the focus chain. A
+    // top-level Document always is while its window has focus.
+    let inFocusChain = !cfg.parentWindow;
+    function documentHasFocus(doc) {
+        if (doc === g.document) return trust.documentFocused();
+        const frame = internalsOf(doc).frame;
+        const child = frame && internalsOf(frame).contentRealmWindow;
+        return child ? trustOf(child).documentFocused() : false;
+    }
     function setFocusedArea(el) {
         focusedArea = el;
         // CSS :focus / :focus-within observe the same focused area as
@@ -1649,6 +1658,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function focusElement(el, options) {
         activeElementFor(g.document);
         if (focusedArea === el || !elementCanFocus(el)) return;
+        if (internalsOf(el).contentRealmWindow) {
+            // HTML focusing steps: focusing a navigable container focuses its
+            // content navigable's Document.
+            trust.focusChildNavigable(el);
+            return;
+        }
+        joinParentChain();
+        leaveChildNavigable();
         const old = focusedArea;
         // HTML §6.6.4's focus update steps remove focus before firing blur;
         // UI Events §3.3.2 orders blur, focusout, focus, then focusin. A handler
@@ -1682,18 +1699,73 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // activation, and deliberately leaves the document Selection intact
     // (Selection API §6: clicking non-editable content must not empty it).
     let focusedChildFrame = null;
+    // HTML #focus-chain / #focus-update-steps across navigables. A Document
+    // entering or leaving the chain fires focus/blur at its relevant global
+    // object; a navigable container is not itself an entry, so the iframe
+    // element becomes this Document's focused area without events.
+    function chainFocusWindow(type) {
+        dispatch(g, createTrustedEvent(FocusEvent, type, {
+            bubbles: false, cancelable: false, composed: true, view: g, detail: 0, relatedTarget: null,
+        }), false);
+    }
+    function blurChainElement(old) {
+        if (!old || !old.isConnected || internalsOf(old).contentRealmWindow) return;
+        commitTextControl(old);
+        focusEvent(old, "blur", null, false);
+        focusEvent(old, "focusout", null, true);
+    }
+    // Move this Document's part of the chain into child navigable `frame`:
+    // blur what leaves (old element, a previously focused child navigable,
+    // or this Document itself when focus was directly in it), then let the
+    // child's Document join.
+    trust.focusChildNavigable = function (frame) {
+        joinParentChain();
+        activeElementFor(g.document);
+        const childWindow = internalsOf(frame).contentRealmWindow;
+        if (!childWindow) return;
+        const child = trustOf(childWindow);
+        const wasChild = focusedChildFrame;
+        if (wasChild !== frame) {
+            if (wasChild) {
+                const previous = internalsOf(wasChild).contentRealmWindow;
+                if (previous) trustOf(previous).leaveFocusChain();
+            }
+            const old = focusedArea;
+            setFocusedArea(null);
+            blurChainElement(old);
+            if (!wasChild) chainFocusWindow("blur");
+            focusedChildFrame = frame;
+            setFocusedArea(frame);
+        }
+        child.joinFocusChain();
+    };
+    // Before focus lands in this Document, its own navigable must be in the
+    // chain: the parent focuses this navigable's container first.
+    function joinParentChain() {
+        if (inFocusChain) return;
+        const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
+        if (parent && realmRootFrame) parent.focusChildNavigable(realmRootFrame);
+        else trust.joinFocusChain();
+    }
+    // Focus returns to this Document from a focused child navigable.
+    function leaveChildNavigable() {
+        const wasChild = focusedChildFrame;
+        if (!wasChild) return;
+        focusedChildFrame = null;
+        const childWindow = internalsOf(wasChild).contentRealmWindow;
+        if (childWindow) trustOf(childWindow).leaveFocusChain();
+        if (focusedArea === wasChild) setFocusedArea(null);
+        chainFocusWindow("focus");
+    }
     trust.focusPage = function (id) {
         const childFrame = nativeInputChildFrame(id);
-        if (focusedChildFrame && focusedChildFrame !== childFrame) {
-            const childWindow = internalsOf(focusedChildFrame).contentRealmWindow;
-            if (childWindow) trustOf(childWindow).focusPage(null);
-        }
-        focusedChildFrame = childFrame;
         if (childFrame) {
-            focusElement(childFrame, { preventScroll: true });
+            trust.focusChildNavigable(childFrame);
             trustOf(internalsOf(childFrame).contentRealmWindow).focusPage(id);
             return;
         }
+        joinParentChain();
+        leaveChildNavigable();
         let target = id === null || id === undefined ? null : wrap(id);
         for (; target; target = target.parentNode || target.host || null) {
             if (target.nodeType !== 1) continue;
@@ -1704,6 +1776,40 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
         }
         blurElement(focusedArea);
+    };
+    // This navigable's Document enters the chain before any focused element.
+    trust.joinFocusChain = function () {
+        if (inFocusChain) return;
+        inFocusChain = true;
+        chainFocusWindow("focus");
+    };
+    // Focus moved out of this navigable: blur the focused element and any
+    // focused descendant navigable, then this Document's global.
+    trust.leaveFocusChain = function () {
+        if (!inFocusChain) return;
+        if (focusedChildFrame) {
+            const childWindow = internalsOf(focusedChildFrame).contentRealmWindow;
+            focusedChildFrame = null;
+            if (childWindow) trustOf(childWindow).leaveFocusChain();
+        }
+        activeElementFor(g.document);
+        const old = focusedArea;
+        setFocusedArea(null);
+        blurChainElement(old);
+        inFocusChain = false;
+        chainFocusWindow("blur");
+    };
+    // HTML #has-focus-steps: a top-level Document has focus with its window;
+    // a child Document only while its navigable container is the focused
+    // area of a parent Document that has focus.
+    trust.documentFocused = function () {
+        const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
+        if (!parent) return true;
+        return parent.documentFocused() && parent.focusedChildWindow() === g;
+    };
+    trust.focusedChildWindow = function () {
+        activeElementFor(g.document);
+        return focusedArea && internalsOf(focusedArea).contentRealmWindow || null;
     };
     trust.focusedNode = function () {
         activeElementFor(g.document); // Disconnected-focus fixup.
@@ -2320,13 +2426,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Read layout only when the getter is used, never on the motion hot path.
         let target = event.target;
         if (target && target.nodeType !== 1) target = target.parentElement;
+        let offset = horizontal ? event.pageX : event.pageY;
         if (event.eventPhase && target) {
             const rect = clientBoxRect(target);
-            if (rect) return (horizontal ? event.clientX - rect.x : event.clientY - rect.y)
+            if (rect) offset = (horizontal ? event.clientX - rect.x : event.clientY - rect.y)
                 - (parseFloat(__dom_computed(elementIdentity(target),
                     horizontal ? "border-left-width" : "border-top-width")) || 0);
         }
-        return horizontal ? event.pageX : event.pageY;
+        return state.integral ? mouseFloor(offset) : offset;
+    }
+    const mouseFloor = Math.floor;
+    // Pointer Events #event-coordinates: click, auxclick and contextmenu from
+    // a pointing device keep the original Mouse Events' integer coordinates
+    // (Math.floor); fractional values there break legacy code.
+    const integralCoordinates = ["screenX", "screenY", "clientX", "clientY", "pageX", "pageY"];
+    function integralPointerEvent(type, init) {
+        const integral = Object.assign({}, init);
+        for (let i = 0; i < integralCoordinates.length; i++) {
+            const key = integralCoordinates[i];
+            if (typeof integral[key] === "number") integral[key] = mouseFloor(integral[key]);
+        }
+        const event = createTrustedEvent(PointerEvent, type, integral);
+        const state = messageApply(messageWeakGet, pointerEventSlots, [event]);
+        if (state) state.integral = true;
+        return event;
     }
     class MouseEvent extends UIEvent {
         constructor(type, opts = undefined, internal) {
@@ -3939,7 +4062,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         if (pointing) Object.assign(init, nativePointerPosition);
         return trusted
-            ? createTrustedEvent(PointerEvent, "click", init)
+            ? pointing ? integralPointerEvent("click", init) : createTrustedEvent(PointerEvent, "click", init)
             : createPlatformPointerEvent("click", init);
     }
     // DOM §2.9 runs an input's legacy-pre-activation behavior before click
@@ -4450,6 +4573,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const state = pointerLockState, target = state.target;
         if (target && state.owner !== trust) return state.owner.releasePointerLock(voluntary, userExit);
         const position = state.position;
+        // Only a held or requested lock owns the pressed pointer: a frontend
+        // focus change without one leaves an ordinary mouse press running
+        // (Pointer Events never cancel a mouse pointer for a focus change).
+        if (!target && !state.queue.length && !(state.command && state.command[0])) return;
         if (target) {
             pointerRelock = !!voluntary;
             state.target = null; state.owner = null; state.position = null;
@@ -4578,10 +4705,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             dispatch(target, createTrustedEvent(MouseEvent, pressed ? "mousedown" : "mouseup", init), false);
         if (!pressed) {
             pointerInput.downs.delete(button);
-            if (button === 2) dispatch(target,createTrustedEvent(PointerEvent,"contextmenu",{...init,detail:0,isPrimary:false}),false);
+            if (button === 2) dispatch(target,integralPointerEvent("contextmenu",{...init,detail:0,isPrimary:false}),false);
             if (down) {
                 pointerInput.series = {target,button,detail:down.detail,time:currentTime()+agentTimeOffset,x:init.screenX,y:init.screenY};
-                dispatch(target, createTrustedEvent(PointerEvent, button === 0 ? "click" : "auxclick", {...init,isPrimary:false}), false);
+                dispatch(target, integralPointerEvent(button === 0 ? "click" : "auxclick", {...init,isPrimary:false}), false);
                 if (button === 0 && down.detail === 2) dispatch(target,createTrustedEvent(MouseEvent,"dblclick",init),false);
             }
         }
@@ -4612,6 +4739,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             pointerInput.buttons = pressed ? pointerInput.buttons | mask : pointerInput.buttons & ~mask;
             processPointerCapture();
         }
+        if (!pointerInput.capture) id = nativeFrameContentHit(id, x, y);
         const hit = id;
         if (pointerInput.capture && (!routed || id != null)) id = elementIdentity(pointerInput.capture.target);
         const childFrame = nativeInputChildFrame(id);
@@ -4658,7 +4786,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             dispatch(target, mouse, false);
             canceled = mouse.defaultPrevented;
         }
-        if (pressed && !canceled) trust.focusPage(id);
+        // A routed child press is focused by the top-level call, which moves
+        // the focus chain into this navigable first (HTML focus update steps).
+        if (pressed && !canceled && !routed) trust.focusPage(id);
         if (!pressed) {
             const clickTarget = captured ? target : pointerClickTarget(down && down.target, target);
             pointerInput.downs.delete(button);
@@ -4671,10 +4801,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 pointerInput.pending = null; processPointerCapture(); pointerInput.suppress = false;
                 trust.hover(hit,x,y,screenX,screenY,modifiers,true,false);
             }
-            if (button === 2) dispatch(target, createTrustedEvent(PointerEvent,"contextmenu", {
+            if (button === 2) dispatch(target, integralPointerEvent("contextmenu", {
                 ...init, detail:0, isPrimary:false, pressure:0
             }), false);
-            if (button !== 0 && clickTarget) dispatch(clickTarget,createTrustedEvent(PointerEvent,"auxclick", {
+            if (button !== 0 && clickTarget) dispatch(clickTarget,integralPointerEvent("auxclick", {
                 ...init, isPrimary:false, pressure:0
             }),false);
         }
@@ -4729,6 +4859,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             processPointerCapture();
         }
         if (pointerInput.capture && (!routed || id != null)) id = elementIdentity(pointerInput.capture.target);
+        else id = nativeFrameContentHit(id, x, y);
         const childFrame = nativeInputChildFrame(id);
         const t = childFrame || (id === null || id === undefined ? null : wrap(id));
         if (t && !childFrame) { pointerInput.document = t.ownerDocument; pointerInput.lastTarget = t; }
@@ -4762,9 +4893,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // UI Events §3.4.5.8 and Pointer Events require motion events when the
         // pointing device moves even if hit testing retains the same target.
         // The native lane may coalesce samples, but a target transition is not
-        // the condition for `pointermove`/`mousemove` dispatch.
+        // the condition for `pointermove`/`mousemove` dispatch. Inside a child
+        // navigable the hit target is in the child's Document, so the motion
+        // belongs there; this Document saw only the boundary transition.
         const previous = previousPointerMotion;
-        if (t && motion) fireHoverPair("move", t, null, true, x, y, screenX, screenY,
+        if (t && motion && !childFrame) fireHoverPair("move", t, null, true, x, y, screenX, screenY,
             previous ? screenX - previous.screenX : 0, previous ? screenY - previous.screenY : 0);
         lastPointerPosition = previousPointerMotion = t ? {clientX:x, clientY:y, screenX, screenY,
             pageX:x+(g.scrollX||0), pageY:y+(g.scrollY||0)} : null;
@@ -11287,7 +11420,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML §6.6.6 DocumentOrShadowRoot.activeElement getter. The viewport
         // focus fallback is body/documentElement, never JavaScript undefined.
         get activeElement() { return activeElementFor(this); }
-        hasFocus() { return true; }
+        hasFocus() { return documentHasFocus(this); }
         // `document.getSelection()` is the Selection API alias for
         // `window.getSelection()`. Without it ProseMirror monkey-patches the
         // root's prototype to add one — see `ownerDocument` above.
@@ -11575,7 +11708,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         elementFromPoint(x, y) { return documentElementFromPoint(this, x, y, arguments.length); }
         elementsFromPoint(x, y) { return documentElementsFromPoint(this, x, y, arguments.length); }
         createEvent(type) { const C = EVENT_INTERFACES[String(type)] || Event; return new C(""); }
-        hasFocus() { return true; }
+        hasFocus() { return documentHasFocus(this); }
         // A TRust document is always a visible, focused, non-prerendering
         // foreground page. SPAs routinely DEFER heavy rendering until
         // `visibilityState === "visible"` (or skip work while `prerendering`),
@@ -11696,7 +11829,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             messageApply(trustedEventDelete, trustedEvents, [ev]);
             return dispatch(this, ev, false);
         }
-        hasFocus() { return true; }
+        hasFocus() { return documentHasFocus(this); }
     }
     function frameDocument(frame) {
         return internalsOf(frame).contentDoc || (internalsFor(frame).contentDoc = new FrameDocument(frame));
@@ -11761,13 +11894,43 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // wrapper with an empty listener list. Descend one navigable at a time so
     // even deeply nested, cross-origin frames reach their existing real Realm.
     // This is a user-agent operation, not author access through WindowProxy.
+    // A hit on a navigable container inside its content box lands in the
+    // child Document (its root element), not on the container itself.
+    function nativeFrameContentHit(id, x, y) {
+        if (id === null || id === undefined) return id;
+        // Decide by arena ID: a node of a child Document is never wrapped here.
+        const root = realmRootFrame ? nodeIds.get(realmRootFrame) : null;
+        const owner = __dom_frame_owner(id);
+        const local = owner === null || owner === undefined ? root === null : owner === root;
+        const childDocument = local ? __dom_frame_document(id) : null;
+        if (childDocument === null || childDocument === undefined) return id;
+        const frame = wrap(id);
+        const child = frame && frame.nodeType === 1 && internalsOf(frame).contentRealmWindow;
+        if (!child) return id;
+        const rect = frameContentClientRect(frame);
+        if (!rect || x < rect.left || y < rect.top || x >= rect.left + rect.width || y >= rect.top + rect.height)
+            return id;
+        const rootElement = trustOf(child).documentRootId();
+        return rootElement === null || rootElement === undefined ? id : rootElement;
+    }
+    trust.documentRootId = function () {
+        const root = g.document.documentElement;
+        return root ? nodeIds.get(root) : null;
+    };
     function nativeInputChildFrame(id) {
         if (id === null || id === undefined) return null;
-        let frame = frameOwnerForNode(wrap(id));
-        while (frame && frame !== realmRootFrame) {
-            const parent = frameOwnerForNode(frame);
-            if (parent === realmRootFrame) return internalsOf(frame).contentRealmWindow ? frame : null;
-            frame = parent;
+        // Walk navigable containers by arena ID: only the container found in
+        // this Realm's own Document is wrapped, never the child-Document node.
+        const root = realmRootFrame ? nodeIds.get(realmRootFrame) : null;
+        const absent = owner => owner === null || owner === undefined;
+        let owner = __dom_frame_owner(id);
+        while (!absent(owner) && owner !== root) {
+            const parent = __dom_frame_owner(owner);
+            if (absent(parent) ? root === null : parent === root) {
+                const frame = wrap(owner);
+                return frame && internalsOf(frame).contentRealmWindow ? frame : null;
+            }
+            owner = parent;
         }
         return null;
     }
@@ -18248,11 +18411,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         "webkitanimationend", "webkitanimationiteration", "webkitanimationstart",
         "webkittransitionend", "wheel",
     ];
+    // Touch Events #conditionally-exposing-legacy-touch-event-apis: TRust
+    // reports maxTouchPoints 0, so it does not expose the legacy ontouch*
+    // handlers that pages read as a touch-device signal; TouchEvent and
+    // addEventListener("touchstart", ...) remain available.
     const EXTENDED_EVENT_HANDLER_TYPES = [
         "focusin", "focusout", "selectionchange", "loadend",
         "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
         "pointerenter", "pointerleave", "pointercancel", "gotpointercapture",
-        "lostpointercapture", "touchstart", "touchend", "touchmove", "touchcancel",
+        "lostpointercapture",
         "animationstart", "animationend", "animationiteration", "animationcancel",
         "transitionstart",
         "transitionend", "transitioncancel", "copy", "cut", "paste",
