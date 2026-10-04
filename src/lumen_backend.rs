@@ -18591,6 +18591,49 @@ mod tests {
     }
 
     #[test]
+    fn xhr_has_progress_event_handlers_and_an_upload_object() {
+        // XHR #interface-xmlhttprequest: XMLHttpRequestEventTarget's event
+        // handler attributes, onreadystatechange and the [SameObject]
+        // XMLHttpRequestUpload. An async request with a body and upload
+        // listeners fires loadstart, progress, load and loadend at the upload
+        // object before the response's readystatechange/progress events.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
+                 const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 globalThis.xhrLog = [];\n\
+                 const x = new XMLHttpRequest();\n\
+                 const shape = ['onload' in x, x.onload, x.onreadystatechange, x.upload === x.upload,\n\
+                   tag(x.upload), x.upload.onprogress, x.upload instanceof XMLHttpRequestEventTarget,\n\
+                   err(() => new XMLHttpRequestUpload()), err(() => new XMLHttpRequestEventTarget()),\n\
+                   XMLHttpRequest.DONE, x.HEADERS_RECEIVED, x.readyState,\n\
+                   Object.getOwnPropertyNames(XMLHttpRequestEventTarget.prototype).length].join('|');\n\
+                 const log = (who, e) => xhrLog.push(who + ':' + e.type + ':' + e.loaded + '/' + e.total + ':' + e.isTrusted);\n\
+                 for (const type of ['loadstart', 'progress', 'load', 'loadend']) {\n\
+                   x['on' + type] = e => log('xhr', e);\n\
+                   x.upload.addEventListener(type, e => log('up', e));\n\
+                 }\n\
+                 x.onreadystatechange = () => xhrLog.push('rs' + x.readyState);\n\
+                 x.open('POST', 'data:text/plain,hello');\n\
+                 x.send('body!');\n\
+                 xhrLog.push('sent');\n\
+                 while (__trust.hasPlatformTask()) __trust.runPlatformTask();\n\
+                 const plain = new XMLHttpRequest();\n\
+                 plain.upload.onloadstart = () => xhrLog.push('get-upload');\n\
+                 plain.open('GET', 'data:,x'); plain.send('ignored');\n\
+                 while (__trust.hasPlatformTask()) __trust.runPlatformTask();\n\
+                 shape + ' ' + xhrLog.join(' ')"
+            ),
+            "true|||true|XMLHttpRequestUpload||true|TypeError|TypeError|4|2|0|8 \
+             rs1 xhr:loadstart:0/0:true up:loadstart:0/5:true sent up:progress:5/5:true \
+             up:load:5/5:true up:loadend:5/5:true rs2 rs3 xhr:progress:5/5:true rs4 \
+             xhr:load:5/5:true xhr:loadend:5/5:true"
+        );
+    }
+
+    #[test]
     fn computed_style_declarations_report_their_class_string() {
         // CSSOM #dom-window-getcomputedstyle: the resolved declaration is a
         // CSSStyleDeclaration ("[object CSSStyleDeclaration]", as in
