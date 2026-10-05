@@ -187,6 +187,17 @@ enum LumenHostTask {
         /// receives the timing entry (Fetch #fetch-finale).
         timing_context: u64,
     },
+    /// A presentation image the document's rendering needs (CSS Images 4
+    /// #fetching-images and the other non-`img` image consumers) completed.
+    DocumentImageDone {
+        context: u64,
+        url: String,
+        timing: Option<LumenResourceTiming>,
+        /// Natural dimensions, when the response is an image.
+        size: Option<(u32, u32)>,
+        /// An inline SVG's `<image>` reference (`img::record_document_svg_image`).
+        document_svg: bool,
+    },
     FetchDone {
         id: usize,
         result: LumenFetchResult,
@@ -552,6 +563,8 @@ struct HostState {
     image_payloads: HashMap<u64, image_host::ImagePayload>,
     element_image_payloads: HashMap<usize, u64>,
     next_image_payload: u64,
+    /// Presentation images the document requested for its rendering, in flight.
+    pending_document_images: usize,
     task_events: Option<LumenTaskSender>,
     pending_resources: usize,
     /// HTML #link-type-preload fetches in flight. They never delay the load
@@ -673,6 +686,7 @@ impl HostState {
             image_payloads: HashMap::new(),
             element_image_payloads: HashMap::new(),
             next_image_payload: 1,
+            pending_document_images: 0,
             task_events: None,
             pending_resources: 0,
             pending_preloads: 0,
@@ -888,6 +902,7 @@ impl RetainedMemory for HostState {
             image_payloads,
             element_image_payloads,
             next_image_payload: _,
+            pending_document_images: _,
             task_events,
             pending_resources,
             pending_preloads: _,
@@ -3739,6 +3754,7 @@ mod desktop {
             .is_some_and(|state| {
                 state.pending_resources > state.pending_module_evaluations
                     || state.pending_preloads > 0
+                    || state.pending_document_images > 0
                     || state
                         .pending_dynamic_modules
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -3767,6 +3783,7 @@ mod desktop {
             .is_some_and(|state| {
                 state.pending_resources > 0
                     || state.pending_preloads > 0
+                    || state.pending_document_images > 0
                     || state
                         .pending_dynamic_modules
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -4293,7 +4310,173 @@ mod desktop {
         }
         let _ = trust_number(page, "updateIntersections");
         start_font_fetches(page);
+        start_document_image_fetches(page, &rendered.1);
         rendered
+    }
+
+    /// CSS Images 4 #fetching-images ("fetch an external image for a
+    /// stylesheet") and the other presentation consumers (SVG 2
+    /// #processingURL-fetch, HTML #poster-frame and #image-button-state):
+    /// the document fetches each image its rendering needs as its own
+    /// request, in the needing element's document, before a frontend can
+    /// present the rendering. An `img`'s own request comes from "update the
+    /// image data"; requesting one here only covers an element whose request
+    /// never started. Lazy images are not part of `image_sources`.
+    fn start_document_image_fetches(page: &mut LumenPage, rendered: &crate::http::RenderedPage) {
+        let paint = &rendered.layout.paint;
+        if rendered.image_sources.is_empty() && paint.image_requests.is_empty() {
+            return;
+        }
+        let Some((store, events)) = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+            Some((
+                state.network.as_ref()?.cache.images(),
+                state.task_events.clone()?,
+            ))
+        }) else {
+            return;
+        };
+        // Every painted image is needed too (border images, masks and other
+        // image-valued properties paint without being part of the resource
+        // discovery lists); attribute each to the element that paints it.
+        let mut sources = rendered.image_sources.to_vec();
+        let known: std::collections::HashSet<&str> =
+            sources.iter().map(|source| source.url.as_str()).collect();
+        // A lazy image's painted box waits for its lazy-load resumption.
+        let missing: Vec<_> = paint
+            .image_requests
+            .iter()
+            .filter(|request| {
+                !known.contains(request.source.as_str())
+                    && !rendered.lazy_image_handles.contains(&request.handle)
+            })
+            .collect();
+        drop(known);
+        if !missing.is_empty() {
+            let painters: HashMap<crate::render::ImageHandle, usize> = paint
+                .primitives
+                .iter()
+                .chain(&paint.fixed_under_primitives)
+                .chain(&paint.fixed_primitives)
+                .chain(paint.top_layer.iter().flat_map(|entry| &entry.primitives))
+                .filter_map(|command| match command {
+                    crate::render::DisplayCommand::Image { handle, node, .. } => {
+                        Some((*handle, *node))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let dom = page.dom.borrow();
+            for request in missing {
+                let node = painters
+                    .get(&request.handle)
+                    .copied()
+                    .filter(|&node| dom.is_valid(node))
+                    .unwrap_or(DOCUMENT);
+                let initiator = match dom.tag_name(node) {
+                    Some("img") => crate::page_images::ImageInitiator::Img,
+                    Some("video") => crate::page_images::ImageInitiator::Video,
+                    Some("input") => crate::page_images::ImageInitiator::Input,
+                    _ => crate::page_images::ImageInitiator::Css,
+                };
+                sources.push(crate::page_images::RenderImageSource {
+                    url: request.source.clone(),
+                    node,
+                    initiator,
+                });
+            }
+        }
+        for source in sources.iter() {
+            let url = crate::img::document_svg_image_target(&source.url)
+                .map_or(source.url.as_str(), |target| target.url());
+            if url.starts_with("data:") || url.starts_with("blob:") || store.contains(url) {
+                continue;
+            }
+            let (context, cors, referrer_policy) = {
+                let dom = page.dom.clone();
+                let dom = dom.borrow();
+                let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+                    return;
+                };
+                let context = if dom.is_valid(source.node) {
+                    node_window_context(state, &dom, source.node).unwrap_or(0)
+                } else {
+                    0
+                };
+                if source.initiator == crate::page_images::ImageInitiator::Img {
+                    (
+                        context,
+                        dom.attr(source.node, "crossorigin").map(|value| {
+                            if value.eq_ignore_ascii_case("use-credentials") {
+                                crate::http::CredentialsMode::Include
+                            } else {
+                                crate::http::CredentialsMode::SameOrigin
+                            }
+                        }),
+                        dom.attr(source.node, "referrerpolicy")
+                            .and_then(crate::referrer_policy::ReferrerPolicy::parse)
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    (context, None, Default::default())
+                }
+            };
+            let started = crate::performance::now_ms();
+            let url = url.to_owned();
+            let Some((fetch, join, handle)) = image_host::document_request(
+                page.engine.ctx(),
+                context,
+                &url,
+                cors,
+                referrer_policy,
+            ) else {
+                continue;
+            };
+            let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+                return;
+            };
+            state.pending_document_images += 1;
+            let cache = state
+                .network
+                .as_ref()
+                .map(|network| network.cache.clone())
+                .expect("document image request has a network");
+            let events = events.clone();
+            let initiator = source.initiator.initiator_type();
+            let request = source.url.clone();
+            cache.spawn(&handle, async move {
+                let outcome = fetch.await;
+                let timing =
+                    image_host::request_timing(&url, initiator, join, context, &outcome, started);
+                let image = outcome.ok();
+                let document_svg = crate::img::document_svg_image_target(&request);
+                if let Some(target) = &document_svg {
+                    crate::img::record_document_svg_image(
+                        target,
+                        image
+                            .as_ref()
+                            .filter(|image| image.ok())
+                            .map(|image| &image.body[..]),
+                    );
+                }
+                let probed = url.clone();
+                let size = match image {
+                    Some(image) => {
+                        tokio::task::spawn_blocking(move || image_host::probe(&probed, &image.body))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    None => None,
+                };
+                let _ = events.send(LumenHostTask::DocumentImageDone {
+                    context,
+                    url,
+                    timing,
+                    size,
+                    document_svg: document_svg.is_some(),
+                });
+            });
+        }
     }
 
     /// CSS Fonts 4 #font-fetching-requirements: fetch the network `@font-face`
@@ -14287,6 +14470,32 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
         } => {
             record_resource_timing_in(engine, timing_context, timing)?;
             settle_network_task(engine, id, move |ctx| image_host::result_value(ctx, result))?;
+        }
+        LumenHostTask::DocumentImageDone {
+            context,
+            url,
+            timing,
+            size,
+            document_svg,
+        } => {
+            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                state.pending_document_images = state.pending_document_images.saturating_sub(1);
+                // The document learns a stylesheet image's natural dimensions
+                // from its own request (CSS Images 3 #default-sizing); the next
+                // rendering opportunity relays out and repaints with them.
+                let changed = match size {
+                    Some(size) => state.images.borrow_mut().insert(url, size) != Some(size),
+                    None => false,
+                };
+                if changed {
+                    state.geom_cache.borrow_mut().epoch = u64::MAX;
+                }
+                // Inline SVG document images re-serialize at the next layout.
+                if changed || document_svg {
+                    state.dom.borrow_mut().resource_changed();
+                }
+            }
+            record_resource_timing_in(engine, context, timing)?;
         }
         LumenHostTask::NavigateDone {
             id,
