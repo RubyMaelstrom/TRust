@@ -19949,6 +19949,40 @@ mod tests {
     }
 
     #[test]
+    fn window_closed_reports_destroyed_child_navigables() {
+        // HTML #dom-window-closed: true once the Window's navigable is gone,
+        // through the cross-origin WindowProxy surface too.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement('iframe'), opaque = document.createElement('iframe');
+                opaque.src = 'data:text/html,<p>opaque</p>';
+                body.append(frame, opaque);
+                __trust.hydrateFrames();
+                const child = frame.contentWindow, foreign = opaque.contentWindow;
+                const descriptor = Object.getOwnPropertyDescriptor(window, 'closed');
+                const before = [window.closed, child.closed, foreign.closed, descriptor.get.call(child)];
+                let strict = 'none';
+                try { (function () { 'use strict'; window.closed = true; })(); } catch (e) { strict = e.name; }
+                frame.remove(); opaque.remove();
+                [before.join(), child.closed, foreign.closed, window.closed, descriptor.enumerable,
+                 descriptor.set, descriptor.get.name, strict].join('|')
+            "#
+                ),
+                "false,false,false,false|true|true|false|true||get closed|TypeError",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn document_all_is_a_live_html_all_collection() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();

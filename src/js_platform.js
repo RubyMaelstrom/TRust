@@ -142,6 +142,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const childTrust = childWindow && trustOf(childWindow);
         if (childTrust && childTrust !== trust) {
             childTrust.oneShot = trust.oneShot;
+            // Every Window a navigable hosts shares its record, as a
+            // WindowProxy would: a reference kept across navigation still
+            // observes the navigable being destroyed.
+            const container = internalsFor(frame);
+            if (!container.navigableRecord) container.navigableRecord = {closed: false};
+            childTrust.adoptNavigableRecord(container.navigableRecord);
             childWindowTrusts.add(childTrust);
             childActivationWindows.add(childWindow);
             childRenderingFrames.set(childTrust, nodeIds.get(frame));
@@ -149,6 +155,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             renderingChildrenCache = [];
         }
     };
+    // HTML #dom-window-closed: this Window's navigable has been destroyed
+    // (its iframe removed). Navigation keeps the browsing context, so it
+    // does not close the Window it replaces; the record is the navigable's.
+    let navigableRecord = {closed: false};
+    trust.adoptNavigableRecord = function (record) { navigableRecord = record; };
+    trust.navigableClosed = function () { return navigableRecord.closed; };
     trust.detachChildWindow = function (childWindow) {
         const childTrust = childWindow && trustOf(childWindow);
         if (childTrust) {
@@ -2157,6 +2169,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         internalsFor(frame).loadedSrc = undefined;
         internalsFor(frame).loadedSrcdoc = undefined;
         internalsFor(frame).frameUrl = undefined;
+        // A container inserted again gets a new navigable and record.
+        if (internalsFor(frame).navigableRecord) internalsFor(frame).navigableRecord.closed = true;
+        internalsFor(frame).navigableRecord = undefined;
         trust.detachChildWindow(internalsOf(frame).contentRealmWindow);
         if (internalsOf(frame).contentDoc) internalsFor(internalsOf(frame).contentDoc).destroyed = true;
         // HTML #destroy-a-child-navigable / #discard-a-document severs the browsing-context
@@ -11159,7 +11174,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 if (!internalsOf(this).contentWin) {
                     const frame = this;
+                    // HTML #dom-window-closed through this WindowProxy: the
+                    // navigable's record, shared with any Window it hosts.
+                    const navigable = internalsFor(frame).navigableRecord ||
+                        (internalsFor(frame).navigableRecord = {closed: false});
                     internalsFor(this).contentWin = {
+                        get closed() { return navigable.closed; },
                         get document() { return frame.contentDocument; },
                         get location() {
                             const u = internalsOf(frame).frameUrl;
@@ -15795,6 +15815,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.FileReader.EMPTY = 0; g.FileReader.LOADING = 1; g.FileReader.DONE = 2;
 
     g.window = g; g.self = g;
+    // HTML #dom-window-closed. TRust never closes a top-level traversable for
+    // script, so only a destroyed child navigable reports true.
+    Object.defineProperty(g, "closed", {configurable: true, enumerable: true,
+        get: Object.getOwnPropertyDescriptor({get closed() {
+            const target = this === undefined || this === null ? g : this;
+            const control = target === g ? trust : trustOf(target);
+            if (!control || typeof control.navigableClosed !== "function")
+                throw new TypeError("Illegal Window invocation");
+            return control.navigableClosed();
+        }}, "closed").get});
     g.top = cfg.topWindow || g;
     g.parent = cfg.parentWindow || g;
     // `window.frames` is the WindowProxy itself in a browser (an array-like of
@@ -19112,7 +19142,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             switch (key) {
                 case "window": case "self": case "frames": return view;
                 case "location": return location || (location = crossOriginLocationView(target));
-                case "closed": return false;
+                case "closed": {
+                    const control = trustOf(target);
+                    return !!(control && typeof control.navigableClosed === "function" && control.navigableClosed());
+                }
                 case "opener": return null;
                 case "length": return target.length >>> 0;
                 case "parent": {
