@@ -29940,6 +29940,46 @@ mod tests {
         );
     }
 
+    fn svg_fixture_engine(tier: Tier) -> lumen::Engine {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><html><body></body></html>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine
+    }
+
+    #[test]
+    fn svg_element_interfaces_follow_the_svg2_hierarchy() {
+        // SVG 2 SVGGraphicsElement/SVGGeometryElement/SVGTextContentElement/
+        // SVGGradientElement inheritance, Web IDL bindings, the SVGSVGElement
+        // factories and the transform list used by d3-interpolate.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = svg_fixture_engine(tier);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/svg_interfaces.mjs")),
+                "svg-interfaces-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_geometry_methods_measure_the_painted_geometry() {
+        // getBBox/getCTM/getScreenCTM, path lengths and hit tests and text
+        // metrics come from the inline-SVG usvg pipeline, in every tier.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = svg_fixture_engine(tier);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/svg_geometry.mjs")),
+                "svg-geometry-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
     #[test]
     fn dom_rect_interfaces_follow_geometry_level_one() {
         // Geometry Interfaces Module Level 1 §3: constructors/fromRect default
