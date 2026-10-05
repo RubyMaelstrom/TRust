@@ -7,6 +7,7 @@
 //! GLSL ES 1.00.17; EGL 1.5 §§3.5 and 3.7. Contexts belong to the page actor,
 //! while the canonical DOM owns the presentation bitmap consumed by both UIs.
 
+mod color_space;
 mod context;
 mod driver;
 mod objects;

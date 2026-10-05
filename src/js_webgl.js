@@ -24,6 +24,8 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     });
     const contextFinalizer = new FinalizationRegistry(id => native(id,"dispose",[]));
     function save(value,record) { apply(set,slots,[value,record]); return value; }
+    // HTML #predefinedcolorspace, encoded for the native context.
+    const COLOR_SPACES = {__proto__:null,"srgb":0,"display-p3":1};
     function context(value) { const s=slot(value); if(!s||s.kind!=="Context")throw new TypeError("Illegal WebGLRenderingContext invocation");return s; }
     function lostValue(s,op) {
         if(op==="getError")return s.errors.length?s.errors.shift():0;
@@ -52,6 +54,8 @@ globalThis.__trust_install_webgl = function(g, adapter) {
             if(!s.lost||!s.restorable)return;
             if(!native(s.id,"init",s.attributes,adapter.origin))return;
             s.lost=false;s.errors=[];s.restorable=false;s.simulated=false;
+            // A restored context keeps the color spaces the page selected.
+            for(const name of ["drawingBufferColorSpace","unpackColorSpace"])native(s.id,name,[COLOR_SPACES[s[name]]]);
             adapter.fire(s.canvas,WebGLContextEvent,"webglcontextrestored","");
         });
     }
@@ -195,6 +199,14 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         get canvas(){return context(this).canvas;}
         get drawingBufferWidth(){return call(context(this),"width");}
         get drawingBufferHeight(){return call(context(this),"height");}
+        // WebGL 1.0 #DOM-WebGLRenderingContext-drawingBufferColorSpace and
+        // #unpackColorSpace: PredefinedColorSpace attributes, "srgb" on
+        // creation. Web IDL ignores an assignment that is not an enumeration
+        // value; changing the drawing buffer's space reallocates it.
+        get drawingBufferColorSpace(){return context(this).drawingBufferColorSpace;}
+        set drawingBufferColorSpace(value){const s=context(this);value=`${value}`;if(!(value in COLOR_SPACES))return;s.drawingBufferColorSpace=value;call(s,"drawingBufferColorSpace",[COLOR_SPACES[value]]);}
+        get unpackColorSpace(){return context(this).unpackColorSpace;}
+        set unpackColorSpace(value){const s=context(this);value=`${value}`;if(!(value in COLOR_SPACES))return;s.unpackColorSpace=value;call(s,"unpackColorSpace",[COLOR_SPACES[value]]);}
         getContextAttributes(){const s=context(this);if(call(s,"isContextLost"))return null;const a=call(s,"attributes");return {alpha:a[0],depth:a[1],stencil:a[2],antialias:a[3],premultipliedAlpha:a[4],preserveDrawingBuffer:a[5],powerPreference:s.powerPreference,failIfMajorPerformanceCaveat:s.failCaveat,desynchronized:false};}
         getSupportedExtensions(){return call(context(this),"getSupportedExtensions");}
         getExtension(name){const s=context(this);required(arguments,1);name=`${name}`;if(name.toLowerCase()==="webgl_lose_context"&&s.extensions.has("WEBGL_lose_context"))return s.extensions.get("WEBGL_lose_context");const canonical=(this.getSupportedExtensions()||[]).find(n=>n.toLowerCase()===name.toLowerCase());if(!canonical)return null;if(s.extensions.has(canonical))return s.extensions.get(canonical);if(!call(s,"extension",[],canonical))return null;const ext=canonical==="OES_vertex_array_object"?save(create(vertexArrayPrototype),{kind:"VertexArrayExtension",context:s.owner,epoch:s.epoch}):{};
@@ -603,6 +615,6 @@ globalThis.__trust_install_webgl = function(g, adapter) {
         const id=adapter.identity(canvas),attributes=[+out.alpha,+out.depth,+!!out.stencil,+out.premultipliedAlpha,+!!out.preserveDrawingBuffer,+!!out.failIfMajorPerformanceCaveat];
         if(!native(id,"init",attributes,adapter.origin)){adapter.fire(canvas,WebGLContextEvent,"webglcontextcreationerror","A robust EGL/GLES drawing buffer could not be created");return null;}
         const defaultVertexRefs=new Map();
-        const owner=create(WebGLRenderingContext.prototype),s={kind:"Context",owner,canvas,id,attributes,epoch:0,lost:false,errors:[],objects:new Map(),refs:new Map(),defaultVertexRefs,vertexRefs:defaultVertexRefs,extensions:new Map(),powerPreference:out.powerPreference,failCaveat:!!out.failIfMajorPerformanceCaveat};save(owner,s);contextFinalizer.register(owner,id);apply(set,canvasContexts,[canvas,owner]);return owner;
+        const owner=create(WebGLRenderingContext.prototype),s={kind:"Context",owner,canvas,id,attributes,epoch:0,lost:false,errors:[],objects:new Map(),refs:new Map(),defaultVertexRefs,vertexRefs:defaultVertexRefs,extensions:new Map(),powerPreference:out.powerPreference,failCaveat:!!out.failIfMajorPerformanceCaveat,drawingBufferColorSpace:"srgb",unpackColorSpace:"srgb"};save(owner,s);contextFinalizer.register(owner,id);apply(set,canvasContexts,[canvas,owner]);return owner;
     }};
 };

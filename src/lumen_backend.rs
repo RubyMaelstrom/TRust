@@ -23690,6 +23690,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed EGL/GLES driver"]
+    fn webgl_color_spaces_convert_presentation_and_uploads() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/webgl_color_spaces.mjs")),
+                "webgl-color-spaces-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
     fn webgl_interface_members_and_constants_keep_web_idl_descriptors_and_order() {
         // Web IDL #js-operations / #js-attributes make interface members enumerable;
         // #js-constants defines each constant { writable: false, enumerable: true,
