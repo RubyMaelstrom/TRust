@@ -186,6 +186,12 @@ pub(crate) struct Context {
     pub(super) flip: bool,
     pub(super) premultiply: bool,
     pub(super) colorspace: u32,
+    /// WebGL 1.0 #DOM-WebGLRenderingContext-drawingBufferColorSpace: how the
+    /// drawing buffer's values are interpreted when displayed or consumed.
+    pub(super) drawing_buffer_color_space: super::color_space::ColorSpace,
+    /// #DOM-WebGLRenderingContext-unpackColorSpace: the space DOM sources are
+    /// converted into on upload (unless the colorspace conversion is NONE).
+    pub(super) unpack_color_space: super::color_space::ColorSpace,
     pub(super) derivatives: bool,
     pub(super) uint_indices: bool,
     pub(super) instancing: bool,
@@ -280,6 +286,8 @@ impl Context {
                 flip: false,
                 premultiply: false,
                 colorspace: 0x9244,
+                drawing_buffer_color_space: Default::default(),
+                unpack_color_space: Default::default(),
                 derivatives: false,
                 uint_indices: false,
                 instancing: false,
@@ -514,6 +522,14 @@ impl Context {
             let (a, b) = pixels.split_at_mut(opposite);
             a[y * stride..(y + 1) * stride].swap_with_slice(&mut b[..stride]);
         }
+        // The drawing buffer's values are in its color space; the DOM bitmap
+        // that the page and 2D canvases consume is sRGB.
+        super::color_space::convert_rgba8(
+            &mut pixels,
+            self.drawing_buffer_color_space,
+            super::color_space::ColorSpace::Srgb,
+            self.attrs.alpha && self.attrs.premultiplied,
+        );
         for p in pixels.as_chunks_mut::<4>().0 {
             if !self.attrs.alpha {
                 p[3] = 255;
@@ -636,6 +652,25 @@ impl Context {
             let g = &self.driver.gl;
             match op {
                 "getParameter" => return self.parameter(u(0)),
+                "drawingBufferColorSpace" => {
+                    let Some(space) = super::color_space::ColorSpace::from_code(a(0)) else {
+                        return Reply::Null;
+                    };
+                    // Changing the color space reallocates the drawing buffer;
+                    // its current contents are lost.
+                    if space != self.drawing_buffer_color_space {
+                        self.drawing_buffer_color_space = space;
+                        g.bind_framebuffer(gl::FRAMEBUFFER, Some(self.default_fb));
+                        self.clear_default();
+                        g.bind_framebuffer(gl::FRAMEBUFFER, Some(self.bound_framebuffer()));
+                        self.dirty = true;
+                    }
+                }
+                "unpackColorSpace" => {
+                    if let Some(space) = super::color_space::ColorSpace::from_code(a(0)) {
+                        self.unpack_color_space = space;
+                    }
+                }
                 "clearColor" => g.clear_color(f(0), f(1), f(2), f(3)),
                 "clearDepth" => g.clear_depth_f32(f(0)),
                 "clearStencil" => g.clear_stencil(i(0)),

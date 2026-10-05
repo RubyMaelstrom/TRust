@@ -739,6 +739,18 @@ impl Context {
                         };
                         let offset = (source_y * w as usize + x) * 4;
                         let mut p: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+                        // WebGL 1.0 #TEXIMAGE2D_HTML: DOM sources are first
+                        // converted into unpackColorSpace unless
+                        // UNPACK_COLORSPACE_CONVERSION_WEBGL is NONE; this
+                        // applies to ImageBitmaps too.
+                        if self.colorspace != gl::NONE {
+                            super::color_space::convert_rgba8(
+                                &mut p,
+                                super::color_space::ColorSpace::Srgb,
+                                self.unpack_color_space,
+                                false,
+                            );
+                        }
                         if self.premultiply && !bitmap {
                             for c in 0..3 {
                                 p[c] = ((p[c] as u16 * p[3] as u16 + 127) / 255) as u8;
