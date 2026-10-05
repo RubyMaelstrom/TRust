@@ -3347,9 +3347,14 @@ mod desktop {
             }
             if classic && src.is_none() {
                 // async/defer have no effect on an inline classic script.
-                if let Err(error) =
-                    run_injected_classic_task(&mut page.engine, node, "inline script", &inline)
-                {
+                let document_url = element_request_client_url(page.engine.ctx(), node).to_string();
+                if let Err(error) = run_injected_classic_task(
+                    &mut page.engine,
+                    node,
+                    "inline script",
+                    &document_url,
+                    &inline,
+                ) {
                     page.outcome.errors.push(error);
                 }
                 checkpoint(&mut page, "inline parser script");
@@ -7771,6 +7776,49 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn actor_stack_frames_name_inline_scripts_by_document_url() {
+            // Browsers report an inline script's frames at its document's URL (V8's frame
+            // format). TRust does not record where the element's text starts in the document,
+            // so lines count from the start of the script text.
+            let html = r#"<!doctype html><html><head><base href="/"></head><body>
+                <output id="result"></output>
+                <script>
+function where() { return new Error("w").stack; }
+document.getElementById("result").textContent = where().split("\n").slice(1).join("|");
+var injected = document.createElement("script");
+injected.textContent = "document.getElementById('result').textContent += '#' + new Error().stack.split('\\n')[1];";
+document.body.appendChild(injected);
+                </script>
+            </body></html>"#;
+            let route = "https://example.test/details/page";
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(route));
+            let rendered = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. } | PageEvt::Static { html, .. })
+                            if html.contains("#    at ") =>
+                        {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("stack URL test failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before rendering the stack"),
+                    }
+                }
+            })
+            .await
+            .expect("stack render timed out");
+            assert!(
+                rendered.contains(
+                    "    at where (https://example.test/details/page:2:27)|    at https://example.test/details/page:3:49#    at https://example.test/details/page:1:56"
+                ),
+                "inline script frames do not report the document URL: {rendered}"
+            );
+        }
+
+        #[tokio::test]
         async fn actor_starts_idle_period_only_after_ordinary_tasks_quiesce() {
             // W3C requestIdleCallback c4604781, IdleDeadline / invoke idle callbacks:
             // timeRemaining is max(deadline - now, 0). Compilation or scheduling after
@@ -11941,7 +11989,11 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: S
         let current = classic_current_script(ctx, node_id);
         let _ = ctx.member_set(trust, "currentScript", current);
     }
-    match ctx.eval_classic_script_interruptible(&source) {
+    // Error stacks name an inline script by its document's URL, as browsers do. The element's
+    // starting line within the document is not recorded, so lines count from the script text.
+    let document_url = element_request_client_url(ctx, node_id).to_string();
+    let origin = lumen::SourceOrigin::new(&document_url);
+    match ctx.eval_classic_script_interruptible_with_origin(&source, Some(&origin)) {
         Ok(Ok(_)) => {}
         Ok(Err(EvalError::Throw(error))) => {
             let message = ctx
@@ -12806,6 +12858,7 @@ fn eval_lumen_worker_platform_setup(engine: &mut lumen::Engine) -> Result<bool, 
     }
 }
 
+/// `label` is the worker script's URL, which its stack frames report.
 fn eval_lumen_worker_classic(
     engine: &mut lumen::Engine,
     source: &str,
@@ -12813,7 +12866,8 @@ fn eval_lumen_worker_classic(
     events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     id: usize,
 ) -> bool {
-    match engine.eval_value_interruptible(source) {
+    let origin = lumen::SourceOrigin::new(label);
+    match engine.eval_value_interruptible_with_origin(source, Some(&origin)) {
         Err(error) => {
             send_lumen_worker_error(
                 events,
@@ -13629,10 +13683,13 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
     attached
 }
 
+/// Run a parser-inserted or fetched classic script. `url` is what its stack frames report: the
+/// script's URL, or the document's for an inline script.
 fn run_injected_classic_task(
     engine: &mut lumen::Engine,
     node_id: usize,
     name: &str,
+    url: &str,
     source: &str,
 ) -> Result<(), String> {
     let trust = host_trust(engine.ctx()).map_err(|_| "read the platform control".to_string())?;
@@ -13649,8 +13706,9 @@ fn run_injected_classic_task(
     );
     let current = classic_current_script(engine.ctx(), node_id);
     let _ = engine.ctx().member_set(&trust, "currentScript", current);
+    let origin = lumen::SourceOrigin::new(url);
     let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        engine.eval_value_interruptible(source)
+        engine.eval_value_interruptible_with_origin(source, Some(&origin))
     }));
     match evaluated {
         Ok(Ok(Ok(_))) => {}
@@ -13799,7 +13857,7 @@ fn run_resource_task(
                 ) =>
             {
                 let source = crate::http::decode_body(&content_type, &body);
-                run_injected_classic_task(engine, node_id, &name, &source)?;
+                run_injected_classic_task(engine, node_id, &name, &name, &source)?;
                 if external {
                     fire_engine_script_event(engine, node_id, "load");
                 }
