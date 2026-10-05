@@ -463,6 +463,10 @@ pub struct RenderedPage {
     pub cookie_restricted_images: std::collections::HashSet<String>,
     pub lazy_image_handles: std::collections::HashSet<crate::render::ImageHandle>,
     pub deferred_images: Vec<crate::doc::DeferredImage>,
+    /// The element needing each eager image, so the page actor can request
+    /// it for that element's document (`page_images`). Derived from the DOM
+    /// like the URL lists above, so it takes no part in render equality.
+    pub(crate) image_sources: std::sync::Arc<[crate::page_images::RenderImageSource]>,
     /// Composed-tree ancestry and named-fragment geometry needed for native
     /// interaction. These are resolved facts, not a second mutable DOM.
     pub parents: std::collections::HashMap<crate::dom::NodeId, crate::dom::NodeId>,
@@ -490,6 +494,7 @@ impl Clone for RenderedPage {
             cookie_restricted_images: self.cookie_restricted_images.clone(),
             lazy_image_handles: self.lazy_image_handles.clone(),
             deferred_images: self.deferred_images.clone(),
+            image_sources: self.image_sources.clone(),
             parents: self.parents.clone(),
             fragment_y: self.fragment_y.clone(),
             semantics: self.semantics.clone(),
@@ -679,6 +684,7 @@ pub(crate) fn render_arena_with_layout(
         cookie_restricted_images: resources.cookie_restricted,
         lazy_image_handles: resources.lazy_handles,
         deferred_images,
+        image_sources: resources.sources.into(),
         parents,
         fragment_y,
         semantics,
@@ -7754,6 +7760,8 @@ pub(crate) struct CollectedImages {
     pub(crate) cookie_restricted: std::collections::HashSet<String>,
     pub(crate) lazy_handles: std::collections::HashSet<crate::render::ImageHandle>,
     pub(crate) lazy_nodes: Vec<(crate::dom::NodeId, String)>,
+    /// The first consumer of each eager source, for the document's requests.
+    pub(crate) sources: Vec<crate::page_images::RenderImageSource>,
 }
 
 pub(crate) fn collect_image_urls(
@@ -7835,6 +7843,17 @@ fn collect_image_urls_for_boxes(
     let mut cookie_restricted = std::collections::HashSet::new();
     let mut lazy_handles = std::collections::HashSet::new();
     let mut lazy_nodes = Vec::new();
+    let mut sources = Vec::new();
+    let mut attributed = rustc_hash::FxHashSet::default();
+    let mut attribute = |url: &str, node, initiator| {
+        if attributed.insert(url.to_owned()) {
+            sources.push(crate::page_images::RenderImageSource {
+                url: url.to_owned(),
+                node,
+                initiator,
+            });
+        }
+    };
     for id in dom.flat_descendants(crate::dom::DOCUMENT) {
         // `<img src>` and `<video poster>` (the poster renders as the video's
         // clickable thumbnail) both feed the decode pipeline.
@@ -7895,6 +7914,7 @@ fn collect_image_urls_for_boxes(
             if restricted {
                 cookie_restricted.insert(request.clone());
             }
+            attribute(&request, id, crate::page_images::ImageInitiator::SvgImage);
             urls.push(request.clone());
             eager.push(request);
         }
@@ -7904,6 +7924,17 @@ fn collect_image_urls_for_boxes(
             lazy_nodes.push((id, u));
         } else {
             lazy_handles.remove(&handle);
+            let initiator = if selected.is_some() {
+                crate::page_images::ImageInitiator::Img
+            } else if poster.is_some() {
+                crate::page_images::ImageInitiator::Video
+            } else if image_button.is_some() {
+                crate::page_images::ImageInitiator::Input
+            } else {
+                // An inline SVG's own serialization is a data: source.
+                crate::page_images::ImageInitiator::UserAgent
+            };
+            attribute(&u, id, initiator);
             eager.push(u);
         }
     }
@@ -7938,6 +7969,7 @@ fn collect_image_urls_for_boxes(
                 if dom.resource_cookies_restricted(id) {
                     cookie_restricted.insert(url.clone());
                 }
+                attribute(&url, id, crate::page_images::ImageInitiator::Css);
                 urls.push(url.clone());
                 eager.push(url);
             }
@@ -7969,6 +8001,7 @@ fn collect_image_urls_for_boxes(
                 if dom.resource_cookies_restricted(id) {
                     cookie_restricted.insert(url.clone());
                 }
+                attribute(&url, id, crate::page_images::ImageInitiator::Css);
                 urls.push(url.clone());
                 eager.push(url);
             }
@@ -8008,6 +8041,11 @@ fn collect_image_urls_for_boxes(
         && !urls.contains(&preview)
     {
         lazy_handles.remove(&crate::render::ImageHandle::for_source(&preview));
+        attribute(
+            &preview,
+            crate::dom::DOCUMENT,
+            crate::page_images::ImageInitiator::UserAgent,
+        );
         eager.push(preview.clone());
         urls.push(preview);
     }
@@ -8017,6 +8055,7 @@ fn collect_image_urls_for_boxes(
         cookie_restricted,
         lazy_handles,
         lazy_nodes,
+        sources,
     }
 }
 

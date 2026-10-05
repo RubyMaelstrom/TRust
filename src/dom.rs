@@ -4078,6 +4078,15 @@ impl Dom {
         }
     }
 
+    /// A page resource that layout reads by URL (a stylesheet image's natural
+    /// dimensions, an inline SVG's document image) changed availability.
+    /// Layout's observed resource reads invalidate what consumed it; request
+    /// the next rendering opportunity without invalidating style or the tree.
+    pub(crate) fn resource_changed(&mut self) {
+        self.dirty = true;
+        self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+    }
+
     /// HTML image request completion can change intrinsic layout without an
     /// attribute mutation. Detached image loads must not invalidate the page.
     pub(crate) fn image_changed(&mut self, id: NodeId) {

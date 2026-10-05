@@ -39,6 +39,49 @@ const RETAINED_BYTES: usize = 256 * 1024 * 1024;
 /// Queued time counts toward the entry's fetch duration, as in a browser.
 const FETCHES_PER_ORIGIN: usize = 8;
 
+/// Which consumer in the document needs a presentation image: Resource
+/// Timing's initiator type for the request (Fetch #concept-request-initiator-type).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageInitiator {
+    /// An `img` element's own request (HTML #updating-the-image-data).
+    Img,
+    /// A stylesheet image (CSS Images 4 #fetching-images, CSS Values 4
+    /// #fetch-a-style-resource).
+    Css,
+    /// An SVG `<image>` in an inline SVG document (SVG 2 #processingURL-fetch).
+    SvgImage,
+    /// A `video` element's poster frame (HTML #poster-frame).
+    Video,
+    /// An image button's image (HTML #image-button-state-(type=image)).
+    Input,
+    /// A presentation the user agent supplies itself (a video page's preview),
+    /// which the document never requested: no timing entry.
+    UserAgent,
+}
+
+impl ImageInitiator {
+    pub(crate) fn initiator_type(self) -> Option<&'static str> {
+        match self {
+            Self::Img => Some("img"),
+            Self::Css => Some("css"),
+            Self::SvgImage => Some("image"),
+            Self::Video => Some("video"),
+            Self::Input => Some("input"),
+            Self::UserAgent => None,
+        }
+    }
+}
+
+/// One eager presentation image of a rendering, attributed to the element
+/// (and so the Document and settings object) that needs it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RenderImageSource {
+    /// The presentation source (an inline SVG's document-image request string).
+    pub(crate) url: String,
+    pub(crate) node: crate::dom::NodeId,
+    pub(crate) initiator: ImageInitiator,
+}
+
 /// HTML #the-list-of-available-images keys an image by URL, CORS settings
 /// attribute mode and, for a CORS request, the document origin.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -331,6 +374,14 @@ impl PageImages {
         if !inner.closed && !inner.entries.contains_key(url) {
             inner.expected.insert(url.to_owned());
         }
+    }
+
+    /// Whether the document has requested `url` in any mode. The page actor
+    /// then learns the response's natural size from its own request.
+    pub(crate) fn contains(&self, url: &str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.entries.contains_key(url))
     }
 
     /// The document's response for `url`. The document requests every image
