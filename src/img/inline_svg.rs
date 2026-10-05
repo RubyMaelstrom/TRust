@@ -224,6 +224,72 @@ impl DocumentSvgContext {
     }
 }
 
+/// Recently parsed geometry documents. Scripts commonly ask several
+/// questions about one element between mutations (a box, then a text
+/// length); an unchanged document is not parsed and laid out again.
+const GEOMETRY_TREES: usize = 8;
+
+/// The geometry documents' parse state on one page thread.
+struct GeometryParser {
+    /// The usvg options of the current font environment. The SVG font
+    /// resolver materializes each selected file-backed face into the tree's
+    /// database; carrying that database (and the resolver whose face map
+    /// refers to it) into the next parse spares every SVG DOM geometry query
+    /// a font file read and a database copy.
+    options: Option<(u64, resvg::usvg::Options<'static>)>,
+    trees: VecDeque<(u64, String, std::rc::Rc<resvg::usvg::Tree>)>,
+}
+
+thread_local! {
+    static GEOMETRY_PARSER: std::cell::RefCell<GeometryParser> =
+        const { std::cell::RefCell::new(GeometryParser { options: None, trees: VecDeque::new() }) };
+}
+
+/// Parse a geometry document built by `Dom` for the SVG DOM geometry
+/// methods (`dom::svg_geometry`). Its text uses the inline SVG's document
+/// fonts, as the painted resource does (SVG Integration #referencing-modes);
+/// it has no external references and is never rendered.
+pub(crate) fn document_svg_geometry_tree(
+    svg: &str,
+    fonts: u64,
+) -> Option<std::rc::Rc<resvg::usvg::Tree>> {
+    if svg.len() > super::MAX_SVG_BYTES {
+        return None;
+    }
+    GEOMETRY_PARSER.with(|cell| {
+        let mut parser = cell.borrow_mut();
+        if let Some((_, _, tree)) = parser
+            .trees
+            .iter()
+            .find(|(environment, markup, _)| *environment == fonts && markup == svg)
+        {
+            return Some(tree.clone());
+        }
+        if parser
+            .options
+            .as_ref()
+            .is_none_or(|(environment, _)| *environment != fonts)
+        {
+            let mut options = super::secure_svg_options();
+            let (fontdb, font_resolver) = crate::font_system::svg_document_font_options(fonts);
+            options.fontdb = fontdb;
+            options.font_resolver = font_resolver;
+            parser.options = Some((fonts, options));
+            parser.trees.clear();
+        }
+        let (_, options) = parser.options.as_mut()?;
+        let tree = std::rc::Rc::new(resvg::usvg::Tree::from_str(svg, options).ok()?);
+        options.fontdb = tree.fontdb().clone();
+        if parser.trees.len() == GEOMETRY_TREES {
+            parser.trees.pop_back();
+        }
+        parser
+            .trees
+            .push_front((fonts, svg.to_owned(), tree.clone()));
+        Some(tree)
+    })
+}
+
 /// Decode one image referenced from inline SVG. Raster formats are handed to
 /// resvg as-is; SVG is parsed with fresh secure static options.
 fn image_kind(mime: &str, data: Arc<Vec<u8>>) -> Option<resvg::usvg::ImageKind> {
