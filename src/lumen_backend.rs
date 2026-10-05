@@ -8726,7 +8726,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_rendering_frames", 1, host_rendering_frames),
     ("__dom_clone", 2, guarded_clone),
     ("__dom_doc_element", 0, guarded_doc_element),
-    ("__html_dda", 0, host_html_dda),
+    ("__html_all_collection", 5, host_html_all_collection),
     ("__url_parse", 2, host_url_parse),
     ("__url_set", 3, host_url_set),
     ("__dom_attach_shadow", 6, guarded_attach_shadow),
@@ -15315,8 +15315,128 @@ fn host_doc_element(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Valu
 /// ECMA-262 Annex B.3.6 requires the host-defined `document.all` exotic to participate in
 /// language-level `typeof`, truthiness, and loose-equality exceptions. Lumen owns those semantics;
 /// the browser adapter only requests the realm-local exotic.
-fn host_html_dda(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(ctx.make_html_dda())
+/// HTML #all-named-elements: the elements whose `name` attribute names them
+/// in an HTMLAllCollection.
+fn is_all_named_element(dom: &Dom, node: usize) -> bool {
+    const ALL_NAMED: &[&str] = &[
+        "a", "button", "embed", "form", "frame", "frameset", "iframe", "img", "input", "map",
+        "meta", "object", "select", "textarea",
+    ];
+    dom.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml")
+        && dom
+            .tag_name(node)
+            .is_some_and(|tag| ALL_NAMED.contains(&tag))
+}
+
+/// HTML #dom-htmlallcollection supported property names: every member's
+/// non-empty ID and every "all"-named member's non-empty name, in tree order,
+/// later duplicates ignored, an element's ID before its name.
+fn live_all_names(ctx: &Ctx, key: &Value) -> Vec<String> {
+    let (Some(members), Some(state)) = (live_query_members(ctx, key), ctx.host::<HostState>())
+    else {
+        return Vec::new();
+    };
+    let dom = state.dom.borrow();
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut names = Vec::new();
+    for &member in members.iter() {
+        let name = is_all_named_element(&dom, member)
+            .then(|| dom.get_attribute(member, "name"))
+            .flatten();
+        for value in [dom.get_attribute(member, "id"), name]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.is_empty())
+        {
+            if seen.insert(value) {
+                names.push(value.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// HTML #concept-get-all-named: the members, in tree order, whose ID is the
+/// name, or that are "all"-named elements with that name attribute. Returns
+/// their node IDs for the platform to wrap.
+fn live_all_named_ids(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+    captures: &[Value],
+) -> Result<Value, Value> {
+    let name = host_arg_string(ctx, args, 0);
+    let ids = match (
+        live_query_members(ctx, &captures[0]),
+        ctx.host::<HostState>(),
+    ) {
+        (Some(members), Some(state)) if !name.is_empty() => {
+            let dom = state.dom.borrow();
+            members
+                .iter()
+                .copied()
+                .filter(|&member| {
+                    dom.get_attribute(member, "id") == Some(name.as_str())
+                        || (is_all_named_element(&dom, member)
+                            && dom.get_attribute(member, "name") == Some(name.as_str()))
+                })
+                .map(|member| Value::Num(member as f64))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    Ok(ctx.make_array(ids))
+}
+
+/// `__html_all_collection(prototype, document, wrap, named, caller)` mints a
+/// Document's HTMLAllCollection (HTML #the-htmlallcollection-interface): the
+/// engine's [[IsHTMLDDA]] object with `prototype`, live indexed members (the
+/// Document's descendant elements in tree order), the named getter `named`
+/// and the legacy caller `caller`. Returns `[collection, length function,
+/// all-named ID function]`.
+fn host_html_all_collection(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let arg = |index: usize| args.get(index).cloned().unwrap_or(Value::Undefined);
+    let (prototype, document, wrap, named, caller) = (arg(0), arg(1), arg(2), arg(3), arg(4));
+    let root = ctx
+        .host::<HostState>()
+        .and_then(|state| state.dom_gc.node_identity(&document));
+    let (Some(root), true) = (root, wrap.is_callable()) else {
+        return Err(ctx.make_error(
+            "TypeError",
+            "HTMLAllCollection requires a Document and a wrapper callback",
+        ));
+    };
+    // The collection's filter matches all elements, the same membership as
+    // getElementsByTagName("*") on the Document.
+    let key = crate::dom::CollectionQuery::Tag {
+        qualified: "*",
+        namespace: None,
+    }
+    .key(root);
+    let key = Value::from_engine_text(key);
+    let getter = ctx.new_native_fn_with_captures(
+        "collection item",
+        1,
+        live_query_collection_get,
+        vec![key.clone(), wrap, document],
+    );
+    let length = ctx.new_native_fn_with_captures(
+        "collection length",
+        0,
+        live_query_collection_length,
+        vec![key.clone()],
+    );
+    let named_ids =
+        ctx.new_native_fn_with_captures("all named", 1, live_all_named_ids, vec![key.clone()]);
+    let collection = ctx.make_html_all_collection(
+        &prototype,
+        key,
+        live_query_length,
+        getter,
+        (live_all_names as fn(&Ctx, &Value) -> Vec<String>, named),
+        caller,
+    )?;
+    Ok(ctx.make_array(vec![collection, length, named_ids]))
 }
 
 fn host_attach_shadow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -19823,6 +19943,23 @@ mod tests {
             assert_eq!(
                 string_value(&mut engine, include_str!("fixtures/screen_interfaces.mjs")),
                 "screen-interfaces-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn document_all_is_a_live_html_all_collection() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/html_all_collection.mjs")
+                ),
+                "html-all-collection-ok",
                 "{tier:?}"
             );
         }

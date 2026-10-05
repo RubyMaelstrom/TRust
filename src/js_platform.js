@@ -1539,10 +1539,73 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     trust.frameTargetName = function (id, value, write) {
         return navigableName(wrap(Number(id)), value, write);
     };
-    // Lazily-minted, then cached `document.all` (`[[IsHTMLDDA]]`) — see the
-    // `Document` class `get all()`. Per-page (fresh per realm), so its identity is
-    // stable within a page but never shared across pages.
-    let documentAllValue = null;
+    // HTML #the-htmlallcollection-interface. A Document's `all` attribute is
+    // the engine's [[IsHTMLDDA]] object (ECMA-262 Annex B.3.6: falsy, typeof
+    // "undefined", loosely equal to null) as a complete live collection of
+    // the Document's descendant elements: indexed and unenumerable named
+    // properties, these members, and `item` as its legacy caller.
+    class HTMLAllCollection {
+        constructor() { throw new TypeError("Illegal constructor"); }
+    }
+    // Collection -> {length(), namedIds(name)}; Document -> its collection.
+    const allCollectionStates = new WeakMap(), documentAllCollections = new WeakMap();
+    function allCollectionState(receiver) {
+        const state = allCollectionStates.get(receiver);
+        if (!state) throw new TypeError("Illegal HTMLAllCollection invocation");
+        return state;
+    }
+    // #concept-get-all-named: null, the one element, or a live HTMLCollection
+    // of every element with that ID or "all"-named element with that name.
+    function allNamedElements(state, name) {
+        const ids = state.namedIds(name);
+        if (ids.length === 0) return null;
+        if (ids.length === 1) return wrap(ids[0]);
+        return makeHTMLCollection(() => Array.from(state.namedIds(name), wrap));
+    }
+    // #concept-get-all-indexed-or-named.
+    function allIndexedOrNamed(collection, state, nameOrIndex) {
+        const key = `${nameOrIndex}`;
+        if (/^(?:0|[1-9][0-9]*)$/.test(key) && Number(key) < 4294967295) {
+            const index = Number(key);
+            return index < state.length() ? collection[index] : null;
+        }
+        return allNamedElements(state, key);
+    }
+    function htmlAllItem(collection, nameOrIndex) {
+        const state = allCollectionState(collection);
+        // An optional argument passed as undefined is not provided.
+        return nameOrIndex === undefined ? null : allIndexedOrNamed(collection, state, nameOrIndex);
+    }
+    Object.defineProperty(HTMLAllCollection.prototype, "length", {configurable: true, enumerable: true,
+        get: Object.getOwnPropertyDescriptor({get length() { return allCollectionState(this).length(); }}, "length").get});
+    for (const [name, method] of [
+        ["item", {item(nameOrIndex = undefined) { return htmlAllItem(this, nameOrIndex); }}.item],
+        ["namedItem", {namedItem(name) {
+            const state = allCollectionState(this);
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            return allNamedElements(state, `${name}`);
+        }}.namedItem],
+    ]) Object.defineProperty(HTMLAllCollection.prototype, name, {value: method, writable: true, enumerable: true, configurable: true});
+    // Web IDL #define-the-iteration-methods: an indexed getter with an
+    // integer length makes the interface iterable like an Array.
+    Object.defineProperty(HTMLAllCollection.prototype, Symbol.iterator,
+        {value: Array.prototype.values, writable: true, enumerable: false, configurable: true});
+    Object.defineProperty(HTMLAllCollection.prototype, Symbol.toStringTag, {value: "HTMLAllCollection", configurable: true});
+    function documentAllCollection(document) {
+        // The collection is falsy, so test for an entry, never its truthiness.
+        let collection = documentAllCollections.get(document);
+        if (collection !== undefined) return collection;
+        let state;
+        const native = __html_all_collection(HTMLAllCollection.prototype, document, wrapKnown,
+            name => allNamedElements(state, name),
+            // #the-htmlallcollection-interface: item() is the legacy caller.
+            function (nameOrIndex = undefined) { return htmlAllItem(collection, nameOrIndex); });
+        collection = native[0];
+        state = {length: native[1], namedIds: native[2]};
+        allCollectionStates.set(collection, state);
+        documentAllCollections.set(document, collection);
+        return collection;
+    }
     // HTML §6.6 focus model. `null` denotes the document viewport as the
     // focused area; DocumentOrShadowRoot.activeElement maps that viewport's
     // Document anchor to body, then documentElement, exactly as the specified
@@ -11431,17 +11494,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get nodeType() { return 9; }
         get nodeName() { return "#document"; }
         get [Symbol.toStringTag]() { return "Document"; }
-        // `document.all` — the legacy `HTMLAllCollection`, the web's one
-        // `[[IsHTMLDDA]]` object (Annex B.3.6): falsy, `typeof "undefined"`, and
-        // `== null`/`== undefined`, but a stable distinct object for `===`. Minted
-        // by the engine (`__html_dda`) and cached so its identity is stable across
-        // reads (polymer_resin and others compare `value === document.all`). We do
-        // not implement its named/indexed element access — identity + the falsy
-        // semantics are what the platform actually depends on here.
-        // NB: cache-test is `=== null`, NOT `||` — the cached value is the falsy
-        // `[[IsHTMLDDA]]` object, so a truthiness test would re-mint it every read
-        // and break `document.all === document.all` identity.
-        get all() { if (documentAllValue === null) documentAllValue = __html_dda(); return documentAllValue; }
+        // HTML #dom-document-all: [SameObject] HTMLAllCollection, one per
+        // Document (see documentAllCollection). The cache lookup never tests
+        // the falsy [[IsHTMLDDA]] value's truthiness.
+        get all() { return documentAllCollection(this); }
         // A document has NO owner document (DOM §`Document` overrides Node's
         // `ownerDocument` to null). Inheriting Node's "return the document" here
         // made `document.ownerDocument === document`, which sent ProseMirror's
@@ -14622,7 +14678,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // non-enumerable HTMLDocument property whose value is Document itself.
     Object.defineProperty(g, "HTMLDocument", {value: Document, writable: true, enumerable: false, configurable: true});
     g.XMLDocument = XMLDocument; g.DOMImplementation = DOMImplementation;
-    g.DocumentFragment = DocumentFragment; g.Comment = Comment;
+    g.DocumentFragment = DocumentFragment; g.Comment = Comment; g.HTMLAllCollection = HTMLAllCollection;
     g.Event = Event; g.CustomEvent = CustomEvent;
     g.UIEvent = UIEvent; g.MouseEvent = MouseEvent; g.PointerEvent = PointerEvent;
     g.WheelEvent = WheelEvent; g.DragEvent = DragEvent; g.KeyboardEvent = KeyboardEvent;
