@@ -471,6 +471,7 @@ async fn document_images_report_timing_in_their_documents_and_are_fetched_once()
     let html = r#"<!doctype html><head><style>body{background:url(/bg.png)}</style></head><body>
     <img id="parsed" src="/parsed.png"><img id="inline" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
     <template id="inert"><img src="/inert.png"></template><template id="stamp"><img id="cloned" src="/cloned.png"></template>
+    <svg width="20" height="20"><image href="/svgimage.png" width="20" height="20"/></svg>
     <iframe id="frame" src="/child"></iframe><script>
     const parsed = document.getElementById('parsed'), inline = document.getElementById('inline');
     const events = [];
@@ -487,6 +488,8 @@ async fn document_images_report_timing_in_their_documents_and_are_fetched_once()
         check(e.startTime >= 0 && e.requestStart >= e.fetchStart && e.responseEnd >= e.responseStart && e.responseStatus === 200 && e.decodedBodySize > 0, 'native image timing');
         await wait('/bg.png');
         check(entries('/bg.png').length === 1 && entries('/bg.png')[0].initiatorType === 'css', 'css entry');
+        await wait('/svgimage.png');
+        check(entries('/svgimage.png').length === 1 && entries('/svgimage.png')[0].initiatorType === 'image', 'SVG image entry');
         check(!performance.getEntriesByType('resource').some(entry => !entry.name.startsWith('http')), 'only HTTP(S) entries');
         const child = document.getElementById('frame').contentWindow;
         check(!entries('/child.png').length, 'nested image not reported to the parent');
@@ -524,6 +527,7 @@ async fn document_images_report_timing_in_their_documents_and_are_fetched_once()
                     .to_vec(),
             ),
             ("/childbg.png", "image/png", png.clone()),
+            ("/svgimage.png", "image/png", png.clone()),
             ("/parsed.png", "image/png", png.clone()),
             ("/bg.png", "image/png", png.clone()),
             ("/child.png", "image/png", png.clone()),
@@ -564,6 +568,7 @@ async fn document_images_report_timing_in_their_documents_and_are_fetched_once()
     for path in [
         "/parsed.png",
         "/bg.png",
+        "/svgimage.png",
         "/child.png",
         "/childbg.png",
         "/late.png",

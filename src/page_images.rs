@@ -519,6 +519,47 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn aborting_the_document_cancels_its_image_fetches() {
+        // HTML #abort-a-document: the page's task scope aborts in-flight image
+        // fetches; a presentation consumer then fetches for itself.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/hang.png",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let scope = Arc::new(PageTaskScope::default());
+        let images = Arc::new(PageImages::new(scope.clone()));
+        let (fetch, join) = images.fetch(
+            &tokio::runtime::Handle::current(),
+            key(url.as_str(), None),
+            0,
+            Request::get(url.clone()),
+            ReferrerPolicy::default(),
+        );
+        assert_eq!(join, ImageJoin::Started);
+        let presented = {
+            let images = images.clone();
+            let url = url.to_string();
+            tokio::spawn(async move { images.presentation(&url).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        scope.cancel();
+        images.close();
+        assert!(matches!(fetch.await, Err(ImageFailure::Cancelled)));
+        assert!(matches!(
+            presented.await.unwrap(),
+            Presentation::Unavailable
+        ));
+        held.abort();
+    }
+
     #[test]
     fn requests_with_different_cors_modes_are_distinct() {
         let runtime = tokio::runtime::Builder::new_current_thread()
