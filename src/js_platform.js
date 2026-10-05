@@ -10765,9 +10765,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         clippath: "ClipPath", lineargradient: "LinearGradient",
         radialgradient: "RadialGradient", foreignobject: "ForeignObject",
     };
+    // Abstract SVG 2 interfaces (SVGGraphicsElement, SVGGeometryElement,
+    // SVGGradientElement) belong to no element of their own.
+    const SVG_IFACE_ABSTRACT = new Set(["graphics", "geometry", "gradient"]);
     function svgInterfaceName(local) {
         const value = String(local || "");
         const lower = value.toLowerCase();
+        if (SVG_IFACE_ABSTRACT.has(lower)) return "SVGElement";
         const suffix = SVG_IFACE_IRREGULAR[lower]
             || (lower ? lower.charAt(0).toUpperCase() + lower.slice(1) : "");
         const name = "SVG" + suffix + "Element";
@@ -13736,7 +13740,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Distinct namespace bases so `instanceof` answers honestly. The dynamic
     // @@toStringTag on Element reports the concrete interface selected for an
     // expanded name (e.g. SVGRectElement versus HTMLUnknownElement).
-    class SVGElement extends Element {}
+    class SVGElement extends Element {
+        // SVG 2 interfaces have no constructor operation (Web IDL
+        // #interface-object: "Illegal constructor"); the platform creates
+        // element wrappers with their node id.
+        constructor(...args) {
+            if (typeof args[0] !== "number") throw new TypeError("Illegal constructor");
+            super(args[0]);
+        }
+    }
     class MathMLElement extends Element {}
     // (HTMLInputElement/HTMLSelectElement/… are defined with their real per-
     // interface bodies right after Element, above — not empty stubs anymore.)
@@ -14781,21 +14793,562 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     reflectOn(["HTMLImageElement", "HTMLSourceElement"], "sizes", reflectStrDesc);
     reflectOn(["HTMLLinkElement", "HTMLSourceElement", "HTMLStyleElement"], "media", reflectStrDesc);
     reflectOn(["HTMLImageElement"], "loading", reflectStrDesc);
-    // SVG element interface zoo (all extend SVGElement). SvelteKit's link
-    // handler branches on `e instanceof SVGAElement` to read `href.baseVal`
-    // vs `href` — a bare `SVGAElement` was a ReferenceError that broke its
-    // link interception/preloading; libraries also feature-detect these.
-    for (const __n of ["A", "SVG", "G", "Defs", "Desc", "Title", "Symbol", "Use",
-        "Image", "Switch", "Style", "Script", "Path", "Rect", "Circle", "Ellipse",
-        "Line", "Polyline", "Polygon", "Text", "TSpan", "TextPath", "Marker",
-        "ClipPath", "Mask", "Pattern", "LinearGradient", "RadialGradient", "Stop",
-        "Filter", "ForeignObject", "Graphics", "Geometry", "View", "GradientStop"]) {
-        const __cn = "SVG" + __n + "Element";
-        if (!g[__cn]) {
-            const __C = class extends SVGElement {};
-            try { Object.defineProperty(__C, "name", { value: __cn }); } catch (e) {}
-            g[__cn] = __C;
+    // SVG 2 element interfaces. SVGGraphicsElement (types.html
+    // #InterfaceSVGGraphicsElement) is the base of the elements that render
+    // graphics; SVGGeometryElement (#InterfaceSVGGeometryElement) of those
+    // with an equivalent path; SVGTextContentElement and
+    // SVGTextPositioningElement (text.html#InterfaceSVGTextContentElement,
+    // #InterfaceSVGTextPositioningElement) of the text content elements; and
+    // SVGGradientElement (pservers.html#InterfaceSVGGradientElement) of the
+    // gradients. The abstract interfaces are never an element's interface
+    // (svgInterfaceName). Geometry comes from the inline-SVG paint pipeline
+    // through `__svg_geometry` (src/dom/svg_geometry.rs).
+    const SVG_GRAPHICS_ELEMENTS = new Set(["svg", "g", "defs", "a", "use", "image", "switch",
+        "foreignObject", "rect", "circle", "ellipse", "line", "path", "polyline", "polygon",
+        "text", "tspan", "textPath"]);
+    const SVG_GEOMETRY_ELEMENTS = new Set(["rect", "circle", "ellipse", "line", "path",
+        "polyline", "polygon"]);
+    const SVG_TEXT_CONTENT_ELEMENTS = new Set(["text", "tspan", "textPath"]);
+    const SVG_SVG_ELEMENTS = new Set(["svg"]);
+    const SVG_GEOMETRY_BBOX = 0, SVG_GEOMETRY_CTM = 1, SVG_GEOMETRY_SCREEN_CTM = 2,
+        SVG_GEOMETRY_TOTAL_LENGTH = 3, SVG_GEOMETRY_POINT_AT_LENGTH = 4,
+        SVG_GEOMETRY_IN_FILL = 5, SVG_GEOMETRY_IN_STROKE = 6, SVG_GEOMETRY_CHARS = 7,
+        SVG_GEOMETRY_TEXT_LENGTH = 8, SVG_GEOMETRY_SUBSTRING_LENGTH = 9;
+    const svgGetAttribute = Element.prototype.getAttribute;
+    const svgSetAttribute = Element.prototype.setAttribute;
+    function svgInterface(name, Base) {
+        const C = {[name]: class extends Base {}}[name];
+        Object.defineProperty(g, name, {value: C, writable: true, configurable: true});
+        return C;
+    }
+    // Web IDL: attributes are enumerable accessors and operations enumerable
+    // writable methods on the interface prototype; method shorthand gives
+    // each its identifier as `name` and its required arguments as `length`.
+    function svgMembers(C, members) {
+        for (const key of Reflect.ownKeys(members)) {
+            const d = Object.getOwnPropertyDescriptor(members, key);
+            Object.defineProperty(C.prototype, key, "value" in d
+                ? {value: d.value, writable: true, enumerable: true, configurable: true}
+                : {get: d.get, set: d.set, enumerable: true, configurable: true});
         }
+    }
+    // Web IDL #es-constants: on the interface object and prototype object.
+    function svgConstants(C, constants) {
+        for (const key of Object.keys(constants)) {
+            const d = {value: constants[key], writable: false, enumerable: true, configurable: false};
+            Object.defineProperty(C, key, d);
+            Object.defineProperty(C.prototype, key, d);
+        }
+    }
+    function svgIllegalInterface(name) {
+        const C = {[name]: class { constructor() { throw new TypeError("Illegal constructor"); } }}[name];
+        Object.defineProperty(g, name, {value: C, writable: true, configurable: true});
+        return C;
+    }
+    // The node id of `element` when it is an SVG element implementing the
+    // interface whose elements are `names` (the Web IDL brand check).
+    function svgElementId(element, names) {
+        const id = elementIdentity(element);
+        const name = id === undefined ? null : __dom_element_name(id);
+        if (!name || name[1] !== SVG_NS || !names.has(name[0])) throw new TypeError("Illegal invocation");
+        return id;
+    }
+    function svgArguments(count, actual, operation) {
+        if (actual < count) throw new TypeError(`${operation} requires ${count} argument${count === 1 ? "" : "s"}`);
+    }
+    // Web IDL float and unsigned long conversions.
+    function svgFloat(value) {
+        const number = +value;
+        if (!Number.isFinite(number)) throw new TypeError("The value is not a finite floating-point number");
+        return Math.fround(number);
+    }
+    function svgUnsignedLong(value) {
+        const number = +value;
+        if (!Number.isFinite(number)) return 0;
+        const integer = Math.trunc(number) % 4294967296;
+        return integer < 0 ? integer + 4294967296 : integer;
+    }
+    const svgMatrix = (m) => createMatrix(elements2D(m[0], m[1], m[2], m[3], m[4], m[5]), true);
+    // The outermost svg element (struct.html#TermOutermostSVGElement) of an
+    // element's SVG document fragment, and the nearest svg ancestor.
+    function svgAncestors(id) {
+        let nearest = null, outermost = null;
+        for (let node = __dom_parent(id); typeof node === "number"; node = __dom_parent(node)) {
+            const name = __dom_element_name(node);
+            if (!name || name[1] !== SVG_NS) break;
+            if (name[0] === "svg") {
+                if (nearest === null) nearest = node;
+                outermost = node;
+            }
+        }
+        return [nearest, outermost];
+    }
+
+    // coords.html#InterfaceSVGTransform: a <transform-function> value and its
+    // matrix object. An item of a transform list is attached to that list and
+    // re-serializes its `transform` attribute when it changes. A change made
+    // through the matrix object makes the value a matrix(…) function.
+    const SVGTransform = svgIllegalInterface("SVGTransform");
+    svgConstants(SVGTransform, {SVG_TRANSFORM_UNKNOWN: 0, SVG_TRANSFORM_MATRIX: 1,
+        SVG_TRANSFORM_TRANSLATE: 2, SVG_TRANSFORM_SCALE: 3, SVG_TRANSFORM_ROTATE: 4,
+        SVG_TRANSFORM_SKEWX: 5, SVG_TRANSFORM_SKEWY: 6});
+    function svgTransformState(object) {
+        const state = internalsFor(object).svgTransform;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function svgTransformMatrix(type, numbers) {
+        // CSS Transforms 1 #two-d-transform-functions: angles in degrees.
+        const radians = (degrees) => degrees * Math.PI / 180;
+        switch (type) {
+            case 1: return numbers.slice(0, 6);
+            case 2: return [1, 0, 0, 1, numbers[0], numbers[1]];
+            case 3: return [numbers[0], 0, 0, numbers[1], 0, 0];
+            case 4: {
+                const [angle, cx, cy] = numbers, cos = Math.cos(radians(angle)), sin = Math.sin(radians(angle));
+                return [cos, sin, -sin, cos, cx - cos * cx + sin * cy, cy - sin * cx - cos * cy];
+            }
+            case 5: return [1, 0, Math.tan(radians(numbers[0])), 1, 0, 0];
+            default: return [1, Math.tan(radians(numbers[0])), 0, 1, 0, 0];
+        }
+    }
+    function createSVGTransformObject(type, numbers, list, readOnly) {
+        const transform = Object.create(SVGTransform.prototype);
+        const values = svgTransformMatrix(type, numbers);
+        internalsFor(transform).svgTransform = {type, numbers: numbers.slice(), values,
+            matrix: svgMatrix(values), list, readOnly: !!readOnly};
+        return transform;
+    }
+    function svgTransformSync(state) {
+        const m = matrixState(state.matrix, false).m;
+        const now = [m[0], m[1], m[4], m[5], m[12], m[13]];
+        if (now.some((value, i) => !Object.is(value, state.values[i]))) {
+            state.type = 1; state.numbers = now; state.values = now;
+        }
+        return state;
+    }
+    function svgTransformSet(object, type, numbers) {
+        const state = svgTransformState(object);
+        if (state.readOnly) throw new DOMException("The transform is read-only", "NoModificationAllowedError");
+        const values = svgTransformMatrix(type, numbers);
+        const m = matrixState(state.matrix, false).m;
+        const elements = elements2D(values[0], values[1], values[2], values[3], values[4], values[5]);
+        for (let i = 0; i < 16; i++) m[i] = elements[i];
+        matrixState(state.matrix, false).is2D = true;
+        state.type = type; state.numbers = numbers; state.values = values;
+        if (state.list) svgTransformListReserialize(state.list);
+    }
+    function svgSerializeTransform(object) {
+        const state = svgTransformSync(svgTransformState(object));
+        const n = state.numbers;
+        switch (state.type) {
+            case 2: return `translate(${n[0]}, ${n[1]})`;
+            case 3: return `scale(${n[0]}, ${n[1]})`;
+            case 4: return n[1] === 0 && n[2] === 0 ? `rotate(${n[0]})` : `rotate(${n[0]}, ${n[1]}, ${n[2]})`;
+            case 5: return `skewX(${n[0]})`;
+            case 6: return `skewY(${n[0]})`;
+            default: return `matrix(${state.values.join(", ")})`;
+        }
+    }
+    svgMembers(SVGTransform, {
+        get type() { return svgTransformSync(svgTransformState(this)).type; },
+        get matrix() { return svgTransformState(this).matrix; },
+        get angle() {
+            const state = svgTransformSync(svgTransformState(this));
+            return state.type === 4 || state.type === 5 || state.type === 6 ? state.numbers[0] : 0;
+        },
+        setMatrix(matrix = {}) {
+            svgTransformState(this);
+            const m = matrixInit(matrix, false)[0];
+            svgTransformSet(this, 1, [m[0], m[1], m[4], m[5], m[12], m[13]]);
+        },
+        setTranslate(tx, ty) {
+            svgTransformState(this); svgArguments(2, arguments.length, "setTranslate");
+            svgTransformSet(this, 2, [svgFloat(tx), svgFloat(ty)]);
+        },
+        setScale(sx, sy) {
+            svgTransformState(this); svgArguments(2, arguments.length, "setScale");
+            svgTransformSet(this, 3, [svgFloat(sx), svgFloat(sy)]);
+        },
+        setRotate(angle, cx, cy) {
+            svgTransformState(this); svgArguments(3, arguments.length, "setRotate");
+            svgTransformSet(this, 4, [svgFloat(angle), svgFloat(cx), svgFloat(cy)]);
+        },
+        setSkewX(angle) {
+            svgTransformState(this); svgArguments(1, arguments.length, "setSkewX");
+            svgTransformSet(this, 5, [svgFloat(angle)]);
+        },
+        setSkewY(angle) {
+            svgTransformState(this); svgArguments(1, arguments.length, "setSkewY");
+            svgTransformSet(this, 6, [svgFloat(angle)]);
+        },
+    });
+    // The SVG `transform` attribute grammar (coords.html#TransformProperty):
+    // transform functions with unitless numbers, separated by whitespace or
+    // commas. A value in error yields an empty list, as for `none`.
+    const SVG_TRANSFORM_FUNCTION = /\s*(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^)]*)\)\s*,?/y;
+    const SVG_NUMBER = /[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g;
+    function parseSVGTransformList(text) {
+        const items = [];
+        if (text === null || text === undefined) return items;
+        text = `${text}`;
+        let index = 0;
+        while (index < text.length) {
+            if (/^[\s,]*$/.test(text.slice(index))) break;
+            SVG_TRANSFORM_FUNCTION.lastIndex = index;
+            const match = SVG_TRANSFORM_FUNCTION.exec(text);
+            if (!match) return [];
+            const numbers = (match[2].match(SVG_NUMBER) || []).map(Number);
+            if (match[2].replace(SVG_NUMBER, " ").replace(/[\s,]+/g, "") !== "") return [];
+            const count = numbers.length, name = match[1];
+            let item = null;
+            if (name === "matrix" && count === 6) item = [1, numbers];
+            else if (name === "translate" && (count === 1 || count === 2)) item = [2, [numbers[0], count === 2 ? numbers[1] : 0]];
+            else if (name === "scale" && (count === 1 || count === 2)) item = [3, [numbers[0], count === 2 ? numbers[1] : numbers[0]]];
+            else if (name === "rotate" && (count === 1 || count === 3)) item = [4, count === 3 ? numbers : [numbers[0], 0, 0]];
+            else if (name === "skewX" && count === 1) item = [5, numbers];
+            else if (name === "skewY" && count === 1) item = [6, numbers];
+            if (!item || item[1].some((number) => !Number.isFinite(number))) return [];
+            items.push(item);
+            index = SVG_TRANSFORM_FUNCTION.lastIndex;
+        }
+        return items;
+    }
+    // coords.html#InterfaceSVGTransformList and the list interface behavior
+    // of types.html#ListInterfaces. The list re-reads its reflected attribute
+    // when that changes and re-serializes it after each modification.
+    const SVGTransformList = svgIllegalInterface("SVGTransformList");
+    function svgTransformListState(object) {
+        const state = internalsFor(object).svgTransformList;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function svgTransformListItems(state) {
+        const source = Reflect.apply(svgGetAttribute, state.element, ["transform"]);
+        if (source !== state.source) {
+            for (const item of state.items) svgTransformState(item).list = null;
+            state.items = parseSVGTransformList(source).map(([type, numbers]) =>
+                createSVGTransformObject(type, numbers, state, state.readOnly));
+            state.source = source;
+        }
+        return state.items;
+    }
+    function svgTransformListReserialize(state) {
+        const text = state.items.map(svgSerializeTransform).join(" ");
+        state.source = text;
+        Reflect.apply(svgSetAttribute, state.element, ["transform", text]);
+    }
+    function svgTransformListWritable(object) {
+        const state = svgTransformListState(object);
+        if (state.readOnly) throw new DOMException("The list is read-only", "NoModificationAllowedError");
+        svgTransformListItems(state);
+        return state;
+    }
+    // A new item that already belongs to a list is inserted as a copy.
+    function svgTransformListAdopt(state, item) {
+        const itemState = svgTransformState(item);
+        if (!itemState.list && !itemState.readOnly) { itemState.list = state; return item; }
+        svgTransformSync(itemState);
+        return createSVGTransformObject(itemState.type, itemState.numbers, state, false);
+    }
+    function svgTransformListIndex(state, index) {
+        index = svgUnsignedLong(index);
+        if (index >= state.items.length) throw new DOMException("Index out of range", "IndexSizeError");
+        return index;
+    }
+    function createSVGTransformList(element, readOnly) {
+        const list = Object.create(SVGTransformList.prototype);
+        internalsFor(list).svgTransformList = {element, readOnly, items: [], source: null};
+        return list;
+    }
+    svgMembers(SVGTransformList, {
+        get length() { return svgTransformListItems(svgTransformListState(this)).length; },
+        get numberOfItems() { return svgTransformListItems(svgTransformListState(this)).length; },
+        clear() {
+            const state = svgTransformListWritable(this);
+            for (const item of state.items) svgTransformState(item).list = null;
+            state.items = [];
+            svgTransformListReserialize(state);
+        },
+        initialize(newItem) {
+            const state = svgTransformListWritable(this);
+            svgArguments(1, arguments.length, "initialize");
+            svgTransformState(newItem);
+            for (const item of state.items) svgTransformState(item).list = null;
+            state.items = [];
+            const item = svgTransformListAdopt(state, newItem);
+            state.items.push(item);
+            svgTransformListReserialize(state);
+            return item;
+        },
+        getItem(index) {
+            const state = svgTransformListState(this);
+            svgArguments(1, arguments.length, "getItem");
+            svgTransformListItems(state);
+            return state.items[svgTransformListIndex(state, index)];
+        },
+        insertItemBefore(newItem, index) {
+            const state = svgTransformListWritable(this);
+            svgArguments(2, arguments.length, "insertItemBefore");
+            svgTransformState(newItem);
+            const item = svgTransformListAdopt(state, newItem);
+            state.items.splice(Math.min(svgUnsignedLong(index), state.items.length), 0, item);
+            svgTransformListReserialize(state);
+            return item;
+        },
+        replaceItem(newItem, index) {
+            const state = svgTransformListWritable(this);
+            svgArguments(2, arguments.length, "replaceItem");
+            svgTransformState(newItem);
+            const position = svgTransformListIndex(state, index);
+            const item = svgTransformListAdopt(state, newItem);
+            svgTransformState(state.items[position]).list = null;
+            state.items[position] = item;
+            svgTransformListReserialize(state);
+            return item;
+        },
+        removeItem(index) {
+            const state = svgTransformListWritable(this);
+            svgArguments(1, arguments.length, "removeItem");
+            const [item] = state.items.splice(svgTransformListIndex(state, index), 1);
+            svgTransformState(item).list = null;
+            svgTransformListReserialize(state);
+            return item;
+        },
+        appendItem(newItem) {
+            const state = svgTransformListWritable(this);
+            svgArguments(1, arguments.length, "appendItem");
+            svgTransformState(newItem);
+            const item = svgTransformListAdopt(state, newItem);
+            state.items.push(item);
+            svgTransformListReserialize(state);
+            return item;
+        },
+        createSVGTransformFromMatrix(matrix = {}) {
+            svgTransformListState(this);
+            const m = matrixInit(matrix, false)[0];
+            return createSVGTransformObject(1, [m[0], m[1], m[4], m[5], m[12], m[13]], null, false);
+        },
+        // coords.html#__svg__SVGTransformList__consolidate
+        consolidate() {
+            const state = svgTransformListWritable(this);
+            if (!state.items.length) return null;
+            let [a, b, c, d, e, f] = [1, 0, 0, 1, 0, 0];
+            for (const item of state.items) {
+                const m = svgTransformSync(svgTransformState(item)).values;
+                [a, b, c, d, e, f] = [a * m[0] + c * m[1], b * m[0] + d * m[1], a * m[2] + c * m[3],
+                    b * m[2] + d * m[3], a * m[4] + c * m[5] + e, b * m[4] + d * m[5] + f];
+                svgTransformState(item).list = null;
+            }
+            const transform = createSVGTransformObject(1, [a, b, c, d, e, f], state, false);
+            state.items = [transform];
+            svgTransformListReserialize(state);
+            return transform;
+        },
+    });
+    // coords.html#InterfaceSVGAnimatedTransformList. Declarative animation is
+    // not implemented, so animVal is a read-only view of the same attribute.
+    const SVGAnimatedTransformList = svgIllegalInterface("SVGAnimatedTransformList");
+    function svgAnimatedState(object, slot) {
+        const state = internalsFor(object)[slot];
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    svgMembers(SVGAnimatedTransformList, {
+        get baseVal() { return svgAnimatedState(this, "svgAnimatedTransformList").baseVal; },
+        get animVal() { return svgAnimatedState(this, "svgAnimatedTransformList").animVal; },
+    });
+    // types.html#InterfaceSVGAnimatedNumber reflecting a <number> attribute
+    // (shapes.html#__svg__SVGGeometryElement__pathLength reflects pathLength).
+    const SVGAnimatedNumber = svgIllegalInterface("SVGAnimatedNumber");
+    function svgAnimatedNumberValue(state) {
+        const value = Reflect.apply(svgGetAttribute, state.element, [state.attribute]);
+        const number = value === null || !/^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/.test(value) ? NaN : +value;
+        return Number.isFinite(number) ? Math.fround(number) : state.initial;
+    }
+    svgMembers(SVGAnimatedNumber, {
+        get baseVal() { return svgAnimatedNumberValue(svgAnimatedState(this, "svgAnimatedNumber")); },
+        set baseVal(value) {
+            const state = svgAnimatedState(this, "svgAnimatedNumber");
+            Reflect.apply(svgSetAttribute, state.element, [state.attribute, `${svgFloat(value)}`]);
+        },
+        get animVal() { return svgAnimatedNumberValue(svgAnimatedState(this, "svgAnimatedNumber")); },
+    });
+
+    // types.html#__svg__SVGElement__ownerSVGElement and #…__viewportElement:
+    // the nearest ancestor svg element, null for the outermost one.
+    function svgNearestViewport(element) {
+        const id = elementIdentity(element);
+        const name = id === undefined ? null : __dom_element_name(id);
+        if (!name || name[1] !== SVG_NS) throw new TypeError("Illegal invocation");
+        const nearest = svgAncestors(id)[0];
+        return nearest === null ? null : wrap(nearest);
+    }
+    svgMembers(SVGElement, {
+        get ownerSVGElement() { return svgNearestViewport(this); },
+        get viewportElement() { return svgNearestViewport(this); },
+    });
+
+    const SVGGraphicsElement = svgInterface("SVGGraphicsElement", SVGElement);
+    svgMembers(SVGGraphicsElement, {
+        // types.html#__svg__SVGGraphicsElement__transform ([SameObject]).
+        get transform() {
+            svgElementId(this, SVG_GRAPHICS_ELEMENTS);
+            const slots = internalsFor(this);
+            if (!slots.svgTransformProperty) {
+                const animated = Object.create(SVGAnimatedTransformList.prototype);
+                internalsFor(animated).svgAnimatedTransformList = {
+                    baseVal: createSVGTransformList(this, false),
+                    animVal: createSVGTransformList(this, true),
+                };
+                slots.svgTransformProperty = animated;
+            }
+            return slots.svgTransformProperty;
+        },
+        // types.html#__svg__SVGGraphicsElement__getBBox: the bounding box
+        // algorithm (coords.html#BoundingBoxes) in the element's user space.
+        getBBox(options = {}) {
+            const id = svgElementId(this, SVG_GRAPHICS_ELEMENTS);
+            // SVGBoundingBoxOptions members in lexicographic order.
+            if (options !== null && typeof options !== "object" && typeof options !== "function")
+                throw new TypeError("SVGBoundingBoxOptions must be an object");
+            const dictionary = options === null ? {} : options;
+            const member = (key, fallback) => {
+                const value = dictionary[key];
+                return value === undefined ? fallback : !!value;
+            };
+            const clipped = member("clipped", false), fill = member("fill", true);
+            const markers = member("markers", false), stroke = member("stroke", false);
+            const box = __svg_geometry(id, SVG_GEOMETRY_BBOX,
+                (fill ? 1 : 0) | (stroke ? 2 : 0) | (markers ? 4 : 0) | (clipped ? 8 : 0));
+            return box ? createDOMRect(box[0], box[1], box[2], box[3]) : createDOMRect(0, 0, 0, 0);
+        },
+        // types.html#__svg__SVGGraphicsElement__getCTM
+        getCTM() {
+            const matrix = __svg_geometry(svgElementId(this, SVG_GRAPHICS_ELEMENTS), SVG_GEOMETRY_CTM);
+            return matrix ? svgMatrix(matrix) : null;
+        },
+        // types.html#__svg__SVGGraphicsElement__getScreenCTM: the matrix to
+        // the outermost svg element's viewport, preceded by the offset of
+        // that element's content box in the document's viewport.
+        getScreenCTM() {
+            const id = svgElementId(this, SVG_GRAPHICS_ELEMENTS);
+            const matrix = __svg_geometry(id, SVG_GEOMETRY_SCREEN_CTM);
+            if (!matrix) return null;
+            const name = __dom_element_name(id);
+            const outermost = name[0] === "svg" && svgAncestors(id)[1] === null ? id : svgAncestors(id)[1];
+            let x = 0, y = 0;
+            if (outermost !== null) {
+                const box = clientBoxRect(wrap(outermost));
+                if (box) {
+                    const padding = (side) => parseFloat(__dom_computed(outermost, "padding-" + side)) || 0;
+                    x = box.x + (__dom_scroll_get(outermost, 7) || 0) + padding("left");
+                    y = box.y + (__dom_scroll_get(outermost, 6) || 0) + padding("top");
+                }
+            }
+            return svgMatrix([matrix[0], matrix[1], matrix[2], matrix[3], matrix[4] + x, matrix[5] + y]);
+        },
+    });
+    const SVGGeometryElement = svgInterface("SVGGeometryElement", SVGGraphicsElement);
+    svgMembers(SVGGeometryElement, {
+        // types.html#__svg__SVGGeometryElement__pathLength ([SameObject]).
+        get pathLength() {
+            svgElementId(this, SVG_GEOMETRY_ELEMENTS);
+            const slots = internalsFor(this);
+            if (!slots.svgPathLength) {
+                const animated = Object.create(SVGAnimatedNumber.prototype);
+                internalsFor(animated).svgAnimatedNumber = {element: this, attribute: "pathLength", initial: 0};
+                slots.svgPathLength = animated;
+            }
+            return slots.svgPathLength;
+        },
+        // types.html#__svg__SVGGeometryElement__isPointInFill
+        isPointInFill(point = {}) {
+            const id = svgElementId(this, SVG_GEOMETRY_ELEMENTS);
+            const p = pointInit(point);
+            return __svg_geometry(id, SVG_GEOMETRY_IN_FILL, p[0], p[1]) === true;
+        },
+        // types.html#__svg__SVGGeometryElement__isPointInStroke
+        isPointInStroke(point = {}) {
+            const id = svgElementId(this, SVG_GEOMETRY_ELEMENTS);
+            const p = pointInit(point);
+            return __svg_geometry(id, SVG_GEOMETRY_IN_STROKE, p[0], p[1]) === true;
+        },
+        // types.html#__svg__SVGGeometryElement__getTotalLength
+        getTotalLength() {
+            const length = __svg_geometry(svgElementId(this, SVG_GEOMETRY_ELEMENTS), SVG_GEOMETRY_TOTAL_LENGTH);
+            return typeof length === "number" ? Math.fround(length) : 0;
+        },
+        // types.html#__svg__SVGGeometryElement__getPointAtLength
+        getPointAtLength(distance) {
+            const id = svgElementId(this, SVG_GEOMETRY_ELEMENTS);
+            svgArguments(1, arguments.length, "getPointAtLength");
+            const point = __svg_geometry(id, SVG_GEOMETRY_POINT_AT_LENGTH, svgFloat(distance));
+            return createPoint(point ? Math.fround(point[0]) : 0, point ? Math.fround(point[1]) : 0, 0, 1);
+        },
+    });
+    for (const name of ["Rect", "Circle", "Ellipse", "Line", "Path", "Polyline", "Polygon"])
+        svgInterface("SVG" + name + "Element", SVGGeometryElement);
+    const SVGTextContentElement = svgInterface("SVGTextContentElement", SVGGraphicsElement);
+    svgConstants(SVGTextContentElement, {LENGTHADJUST_UNKNOWN: 0, LENGTHADJUST_SPACING: 1,
+        LENGTHADJUST_SPACINGANDGLYPHS: 2});
+    svgMembers(SVGTextContentElement, {
+        // text.html#__svg__SVGTextContentElement__getNumberOfChars
+        getNumberOfChars() {
+            const count = __svg_geometry(svgElementId(this, SVG_TEXT_CONTENT_ELEMENTS), SVG_GEOMETRY_CHARS);
+            return typeof count === "number" ? count : 0;
+        },
+        // text.html#__svg__SVGTextContentElement__getComputedTextLength
+        getComputedTextLength() {
+            const length = __svg_geometry(svgElementId(this, SVG_TEXT_CONTENT_ELEMENTS), SVG_GEOMETRY_TEXT_LENGTH);
+            return typeof length === "number" ? Math.fround(length) : 0;
+        },
+        // text.html#__svg__SVGTextContentElement__getSubStringLength
+        getSubStringLength(charnum, nchars) {
+            const id = svgElementId(this, SVG_TEXT_CONTENT_ELEMENTS);
+            svgArguments(2, arguments.length, "getSubStringLength");
+            const length = __svg_geometry(id, SVG_GEOMETRY_SUBSTRING_LENGTH,
+                svgUnsignedLong(charnum), svgUnsignedLong(nchars));
+            if (typeof length !== "number") throw new DOMException("The index is not in the allowed range", "IndexSizeError");
+            return Math.fround(length);
+        },
+    });
+    const SVGTextPositioningElement = svgInterface("SVGTextPositioningElement", SVGTextContentElement);
+    svgInterface("SVGTextElement", SVGTextPositioningElement);
+    svgInterface("SVGTSpanElement", SVGTextPositioningElement);
+    svgInterface("SVGTextPathElement", SVGTextContentElement);
+    const SVGSVGElement = svgInterface("SVGSVGElement", SVGGraphicsElement);
+    // struct.html#__svg__SVGSVGElement__createSVGPoint and the other factory
+    // methods: new detached objects (Geometry 1 aliases SVGPoint, SVGMatrix
+    // and SVGRect to DOMPoint, DOMMatrix and DOMRect).
+    svgMembers(SVGSVGElement, {
+        createSVGPoint() { svgElementId(this, SVG_SVG_ELEMENTS); return createPoint(0, 0, 0, 1); },
+        createSVGMatrix() { svgElementId(this, SVG_SVG_ELEMENTS); return svgMatrix([1, 0, 0, 1, 0, 0]); },
+        createSVGRect() { svgElementId(this, SVG_SVG_ELEMENTS); return createDOMRect(0, 0, 0, 0); },
+        createSVGTransform() {
+            svgElementId(this, SVG_SVG_ELEMENTS);
+            return createSVGTransformObject(1, [1, 0, 0, 1, 0, 0], null, false);
+        },
+        createSVGTransformFromMatrix(matrix = {}) {
+            svgElementId(this, SVG_SVG_ELEMENTS);
+            const m = matrixInit(matrix, false)[0];
+            return createSVGTransformObject(1, [m[0], m[1], m[4], m[5], m[12], m[13]], null, false);
+        },
+    });
+    for (const name of ["G", "Defs", "A", "Use", "Image", "Switch", "ForeignObject"])
+        svgInterface("SVG" + name + "Element", SVGGraphicsElement);
+    const SVGGradientElement = svgInterface("SVGGradientElement", SVGElement);
+    svgInterface("SVGLinearGradientElement", SVGGradientElement);
+    svgInterface("SVGRadialGradientElement", SVGGradientElement);
+    // The remaining SVG element interfaces derive from SVGElement directly.
+    // SvelteKit's link handler branches on `e instanceof SVGAElement` to read
+    // `href.baseVal` vs `href` — a bare `SVGAElement` was a ReferenceError
+    // that broke its link interception/preloading; libraries also
+    // feature-detect these.
+    for (const __n of ["Desc", "Title", "Symbol", "Style", "Script", "Marker",
+        "ClipPath", "Mask", "Pattern", "Stop", "Filter", "View"]) {
+        const __cn = "SVG" + __n + "Element";
+        if (!g[__cn]) svgInterface(__cn, SVGElement);
     }
     // The WebGL 2 interface remains non-constructible; unsupported context kinds
     // return null so content can select the implemented WebGL 1 API.
