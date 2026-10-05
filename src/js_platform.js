@@ -10351,29 +10351,34 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 __dom_get_attr(id, "srcset") !== null || imageInPicture(image);
             if (!state.current) state.url = source;
             let delayed = false;
-            const finish = function (result) {
-                result = imageRecord(result);
-                // A newer src assignment supersedes old completions, including
-                // failures. Delivery is an element task, never synchronous.
-                imageTask(function () {
-                    try {
-                        const current = state.generation === generation;
-                        imageNative("adopt", current && (result || !environment) ? id : null,
-                            result ? result[6] : null, current && (!!result || !environment));
-                        if (current) {
-                            state.pending = false;
-                            if (result || !environment) {
-                                state.current = result;
-                                state.url = source;
-                                state.broken = !result;
-                                if (result || hasSource) dispatch(image,
-                                    createTrustedEvent(Event, result ? "load" : "error"), false);
-                            }
+            // A newer src assignment supersedes old completions, including
+            // failures.
+            const complete = function (result) {
+                try {
+                    const current = state.generation === generation;
+                    imageNative("adopt", current && (result || !environment) ? id : null,
+                        result ? result[6] : null, current && (!!result || !environment));
+                    if (current) {
+                        state.pending = false;
+                        if (result || !environment) {
+                            state.current = result;
+                            state.url = source;
+                            state.broken = !result;
+                            if (result || hasSource) dispatch(image,
+                                createTrustedEvent(Event, result ? "load" : "error"), false);
                         }
-                    } finally {
-                        if (delayed) releaseImageLoadDelay();
                     }
-                }, 0);
+                } finally {
+                    if (delayed) releaseImageLoadDelay();
+                }
+            };
+            // HTML #img-load: the networking task that completes a fetched
+            // image fires its load event. Other outcomes (no source, failures,
+            // local data) queue an element task: never synchronously.
+            const finish = function (result, networking) {
+                result = imageRecord(result);
+                if (networking && result) complete(result);
+                else imageTask(function () { complete(result); }, 0);
             };
             if (!source) { finish(null); return; }
             // "Let delay load event be true if the img's lazy loading
@@ -10385,7 +10390,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 let request;
                 try { request = imageNative("load", id); }
                 catch (e) { finish(null); return; }
-                imageApply(imageThen, request, [finish, function () { finish(null); }]);
+                const networking = !/^(?:data|blob):/i.test(source);
+                imageApply(imageThen, request, [function (result) { finish(result, networking); },
+                    function () { finish(null); }]);
             };
             if (lazy) {
                 state.lazy = fetchImage;

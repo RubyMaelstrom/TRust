@@ -4460,12 +4460,15 @@ mod desktop {
                 }
                 let probed = url.clone();
                 let size = match image {
-                    Some(image) => {
-                        tokio::task::spawn_blocking(move || image_host::probe(&probed, &image.body))
-                            .await
-                            .ok()
-                            .flatten()
-                    }
+                    Some(image) => match image.known_natural_size() {
+                        Some(size) => size,
+                        None => tokio::task::spawn_blocking(move || {
+                            image.natural_size(|bytes| image_host::probe(&probed, bytes))
+                        })
+                        .await
+                        .ok()
+                        .flatten(),
+                    },
                     None => None,
                 };
                 let _ = events.send(LumenHostTask::DocumentImageDone {
