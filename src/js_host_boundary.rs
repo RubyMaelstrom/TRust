@@ -118,7 +118,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_rendering_frames", 1),
     ("__dom_clone", 2),
     ("__dom_doc_element", 0),
-    ("__html_dda", 0),
+    ("__html_all_collection", 5),
     ("__url_parse", 2),
     ("__url_set", 3),
     ("__dom_attach_shadow", 6),
