@@ -291,7 +291,7 @@ impl RequestMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum CredentialsMode {
     Omit,
     SameOrigin,
@@ -416,6 +416,9 @@ pub struct Response {
     /// The living page behind this response, when its JS left
     /// something to interact with.
     pub live: Option<LivePage>,
+    /// The document's image requests (`page_images`), when its page actor
+    /// ran. Frontends present those responses instead of fetching again.
+    pub images: Option<std::sync::Arc<crate::page_images::PageImages>>,
     /// The first successfully processed HTTP/HTML declarative refresh.
     /// Frontends arm this only after committing the completely loaded
     /// document, then navigate with replacement history handling.
@@ -743,6 +746,7 @@ pub fn image_navigation_response(mut response: Response, mime: &str) -> Response
     response.js = None;
     response.blobs = None;
     response.live = None;
+    response.images = None;
     response.declarative_refresh = None;
     response
 }
@@ -844,6 +848,66 @@ pub async fn fetch_graphical_image_with_cookie_policy(
             .map(|(_, bytes)| bytes.as_slice()),
     );
     result.map(|(_, bytes)| bytes)
+}
+
+/// Obtain one page image's bytes for presentation. A live document owns its
+/// image requests (HTML #updating-the-image-data, CSS Images 4
+/// #fetching-images): with its `images` store, an http(s) image joins the
+/// document's own request, waiting until the document makes it (a lazy image
+/// resumes only near the viewport), and the frontend never repeats the fetch.
+/// `data:`/`blob:` images stay local. Without a live document, or for a URL
+/// its retired page will not request, the frontend fetches as before.
+pub async fn fetch_presentation_image(
+    page: &Url,
+    source: &str,
+    blobs: Option<&crate::js::BlobMap>,
+    images: Option<&crate::page_images::PageImages>,
+    restricted: bool,
+) -> Result<std::sync::Arc<[u8]>, String> {
+    let Some(document_image) = crate::img::document_svg_image_target(source) else {
+        return presentation_page_image(page, source, blobs, images, restricted)
+            .await
+            .map(|(_, bytes)| bytes);
+    };
+    let result =
+        presentation_page_image(page, document_image.url(), blobs, images, restricted).await;
+    crate::img::record_document_svg_image(
+        &document_image,
+        result
+            .as_ref()
+            .ok()
+            .filter(|(ok, _)| *ok)
+            .map(|(_, bytes)| &bytes[..]),
+    );
+    result.map(|(_, bytes)| bytes)
+}
+
+/// [`fetch_presentation_image`] for one page image (not an inline SVG's
+/// document-image request), with the response's ok-status flag.
+pub(crate) async fn presentation_page_image(
+    page: &Url,
+    source: &str,
+    blobs: Option<&crate::js::BlobMap>,
+    images: Option<&crate::page_images::PageImages>,
+    restricted: bool,
+) -> Result<(bool, std::sync::Arc<[u8]>), String> {
+    if let Some(images) = images
+        && !source.starts_with("data:")
+        && !source.starts_with("blob:")
+    {
+        match images.presentation(source).await {
+            crate::page_images::Presentation::Image(image) => {
+                return Ok((image.ok(), image.body.clone()));
+            }
+            crate::page_images::Presentation::Failed => {
+                return Err(String::from("the document's image request failed"));
+            }
+            crate::page_images::Presentation::Unavailable => {}
+        }
+    }
+    fetch_page_image(page, source, blobs, restricted)
+        .await
+        .map(|(ok, bytes)| (ok, std::sync::Arc::from(bytes)))
 }
 
 /// Load one page image's bytes. The flag says whether the response was a
@@ -978,7 +1042,7 @@ impl PageTaskScope {
         tasks.push(task.abort_handle());
     }
 
-    fn track_fetch(&self, fetch: futures::future::AbortHandle) {
+    pub(crate) fn track_fetch(&self, fetch: futures::future::AbortHandle) {
         use std::sync::atomic::Ordering;
 
         let mut fetches = self.fetches.lock().unwrap();
@@ -1007,10 +1071,17 @@ impl PageTaskScope {
     }
 }
 
-#[derive(Default)]
 pub struct PageCache {
     map: std::sync::Mutex<HashMap<String, CachedFetch>>,
     tasks: std::sync::Arc<PageTaskScope>,
+    /// The document's image requests (`page_images`), in the same task scope.
+    images: std::sync::Arc<crate::page_images::PageImages>,
+}
+
+impl Default for PageCache {
+    fn default() -> Self {
+        Self::with_task_scope(Default::default())
+    }
 }
 
 struct CachedFetch {
@@ -1067,8 +1138,14 @@ impl PageCache {
     pub fn with_task_scope(tasks: std::sync::Arc<PageTaskScope>) -> Self {
         Self {
             map: Default::default(),
+            images: std::sync::Arc::new(crate::page_images::PageImages::new(tasks.clone())),
             tasks,
         }
+    }
+
+    /// The per-page image request store shared with presentation frontends.
+    pub fn images(&self) -> std::sync::Arc<crate::page_images::PageImages> {
+        self.images.clone()
     }
 
     pub fn task_scope(&self) -> std::sync::Arc<PageTaskScope> {
@@ -1089,6 +1166,7 @@ impl PageCache {
     pub fn cancel(&self) {
         self.tasks.cancel();
         self.map.lock().unwrap().clear();
+        self.images.close();
     }
 
     /// Get-or-start the shared fetch for `url`. The first caller spawns it
@@ -4193,6 +4271,7 @@ fn finish_response_parts(
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -4213,6 +4292,7 @@ fn finish_response_parts(
         js: None,
         blobs: None,
         live: None,
+        images: None,
         declarative_refresh: None,
         challenge: detect_challenge(&headers),
         from_post: false,
@@ -5437,6 +5517,9 @@ async fn execute_js_with_presentation(
     // and decodes blob: image srcs from it even after the page froze.
     let blobs = crate::js::BlobMap::default();
     response.blobs = Some(blobs.clone());
+    // The page actor owns the document's image requests; frontends present
+    // its responses from this store (HTML #updating-the-image-data).
+    response.images = Some(cache.images());
     let env = crate::js::PageEnv {
         url: response.url.to_string(),
         navigation_timing: response.timing.clone(),
@@ -8772,6 +8855,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -8793,6 +8877,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -9240,6 +9325,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -11102,6 +11188,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -11167,6 +11254,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -11447,6 +11535,7 @@ mod tests {
                 js: None,
                 blobs: None,
                 live: None,
+                images: None,
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,
@@ -11486,6 +11575,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -11519,6 +11609,7 @@ mod tests {
                 js: None,
                 blobs: None,
                 live: None,
+                images: None,
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,
@@ -11595,6 +11686,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,

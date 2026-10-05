@@ -4068,6 +4068,7 @@ mod tests {
                 js: None,
                 blobs: None,
                 live: None,
+                images: None,
                 declarative_refresh: Some(crate::http::DeclarativeRefresh {
                     delay: std::time::Duration::ZERO,
                     url: destination.clone(),
@@ -4130,6 +4131,7 @@ mod tests {
                 js: None,
                 blobs: None,
                 live: None,
+                images: None,
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,
@@ -4527,6 +4529,7 @@ mod tests {
                 js: None,
                 blobs: None,
                 live: None,
+                images: None,
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,

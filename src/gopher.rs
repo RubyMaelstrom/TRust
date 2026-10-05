@@ -1027,6 +1027,7 @@ fn response(url: &GopherUrl, body: Vec<u8>, mime: &str) -> Result<crate::http::R
         js: None,
         blobs: None,
         live: None,
+        images: None,
         declarative_refresh: None,
         challenge: None,
         from_post: false,

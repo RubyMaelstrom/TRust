@@ -2056,22 +2056,33 @@ impl DesktopApp {
     fn pump_image_loads(&mut self, generation: u64, image_epoch: u64, page: &url::Url) {
         let slots = IMAGE_FETCH_CONCURRENCY.saturating_sub(self.image_tasks.len());
         let blobs = self.current_page_blobs();
+        // HTML #updating-the-image-data: the live document requests its own
+        // images; present those responses instead of fetching again.
+        let images = self
+            .browser
+            .current_page()
+            .and_then(|page| match &page.document {
+                FetchedDocument::Http(response) => response.images.clone(),
+                _ => None,
+            });
         for request in self.image_loads.take_ready(slots) {
             let proxy = self.event_proxy.clone();
             let page = page.clone();
             let source = request.source.clone();
             let handle = request.handle;
             let blobs = blobs.clone();
+            let images = images.clone();
             let restricted = self
                 .browser
                 .current_page()
                 .and_then(|page| page.rendered_page())
                 .is_some_and(|page| page.cookie_restricted_images.contains(&source));
             let task = self.runtime.spawn(async move {
-                let result = match trust::http::fetch_graphical_image_with_cookie_policy(
+                let result = match trust::http::fetch_presentation_image(
                     &page,
                     &source,
                     blobs.as_ref(),
+                    images.as_deref(),
                     restricted,
                 )
                 .await
@@ -8732,6 +8743,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,

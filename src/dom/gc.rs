@@ -214,6 +214,7 @@ impl Dom {
             self.popover_order.retain(|id| !dead.contains(id));
         }
         self.dirty_nodes.retain(|(id, _)| !dead.contains(id));
+        self.created_images.retain(|(id, _)| !dead.contains(id));
         // Scroll and transition events are roots, so a dead target here is a host-tracing bug.
         debug_assert!(
             self.scroll_changes
@@ -361,6 +362,7 @@ impl Dom {
             .retain(|&doc, node| valid(doc) && valid(*node));
         self.dirty_nodes.retain(|(id, _)| valid(*id));
         self.scroll_changes.retain(|(id, _, _)| valid(*id));
+        self.created_images.retain(|(id, _)| valid(*id));
         macro_rules! shrink_vec {
             ($($field:ident),+ $(,)?) => {$(
                 if self.$field.capacity() > self.$field.len().saturating_mul(4).max(64) {

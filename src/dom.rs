@@ -441,6 +441,14 @@ pub struct Dom {
     media_fallbacks: RefCell<media::MediaFallbacks>,
     control_selections: FxHashMap<NodeId, crate::doc::ControlSelection>,
     pub(crate) canvases: RefCell<FxHashMap<NodeId, crate::canvas::Canvas>>,
+    /// HTML #when-to-obtain-images: `img` elements created by fragment parsing,
+    /// cloning or frame-document installation (`false`), or adopted into
+    /// another document (`true`, a relevant mutation), whose page actor has
+    /// not yet run "update the image data". Never includes inert template
+    /// contents. The actor drains this at each microtask checkpoint.
+    created_images: Vec<(NodeId, bool)>,
+    /// Advanced for each newly queued image creation or adoption.
+    created_images_generation: u64,
     /// host element → shadow root fragment (attachShadow).
     shadow_roots: FxHashMap<NodeId, NodeId>,
     /// and the reverse: shadow root fragment → host element.
@@ -919,6 +927,8 @@ impl Dom {
             media_fallbacks,
             control_selections,
             canvases,
+            created_images,
+            created_images_generation: _,
             shadow_roots,
             shadow_hosts,
             shadow_data,
@@ -1119,6 +1129,11 @@ impl Dom {
             }
             Err(_) => unavailable += 1,
         }
+        bytes = bytes.saturating_add(
+            created_images
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(NodeId, bool)>()),
+        );
         fixed_map!(shadow_hosts, (NodeId, NodeId));
         fixed_map!(shadow_data, (NodeId, shadow::ShadowRootData));
         fixed_map!(geometry_dirty_nodes, (NodeId, DirtyKind));
@@ -1437,6 +1452,8 @@ impl Dom {
             media_fallbacks: RefCell::new(media::MediaFallbacks::default()),
             control_selections: FxHashMap::default(),
             canvases: RefCell::new(FxHashMap::default()),
+            created_images: Vec::new(),
+            created_images_generation: 0,
             shadow_roots: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
             shadow_data: FxHashMap::default(),
@@ -3138,15 +3155,18 @@ impl Dom {
         if !self.is_valid(root) {
             return;
         }
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
+        let mut stack = vec![(root, false)];
+        while let Some((id, inert)) = stack.pop() {
             // HTML child navigables share the presentation arena, not their node document.
             // A Document is always its own node document and adoption cannot cross it.
             if matches!(self.nodes[id].data, NodeData::Document) {
                 continue;
             }
-            self.nodes[id].owner_document = document;
-            stack.extend(self.child_iter(id));
+            let previous = std::mem::replace(&mut self.nodes[id].owner_document, document);
+            if previous != document && !inert {
+                self.note_adopted_image(id);
+            }
+            stack.extend(self.child_iter(id).map(|child| (child, inert)));
             let template_contents = match &self.nodes[id].data {
                 NodeData::Element {
                     template_contents: Some(contents),
@@ -3155,11 +3175,25 @@ impl Dom {
                 _ => None,
             };
             if let Some(contents) = template_contents {
-                stack.push(contents);
+                stack.push((contents, true));
             }
             if let Some(&shadow) = self.shadow_roots.get(&id) {
-                stack.push(shadow);
+                stack.push((shadow, inert));
             }
+        }
+    }
+
+    /// HTML #reacting-to-dom-mutations: an `img`'s adopting steps are a
+    /// relevant mutation. A freshly created image still awaiting its first
+    /// update already updates in its new document.
+    fn note_adopted_image(&mut self, id: NodeId) {
+        if let NodeData::Element { name, .. } = &self.nodes[id].data
+            && name.ns == ns!(html)
+            && &*name.local == "img"
+            && !self.created_images.iter().any(|&(queued, _)| queued == id)
+        {
+            self.created_images.push((id, true));
+            self.created_images_generation = self.created_images_generation.wrapping_add(1);
         }
     }
 
@@ -8700,6 +8734,12 @@ impl Dom {
     /// template always owns a fresh content fragment, populated when
     /// deep (webcomponents-loader probes exactly this).
     pub fn clone_subtree(&mut self, id: NodeId, deep: bool) -> NodeId {
+        self.clone_subtree_with(id, deep, false)
+    }
+
+    /// `inert`: the copy lands in template contents, whose node document is
+    /// never fully active (HTML #template-contents), so its images never load.
+    fn clone_subtree_with(&mut self, id: NodeId, deep: bool, inert: bool) -> NodeId {
         let data = match &self.nodes[id].data {
             NodeData::Document => NodeData::Document,
             NodeData::Fragment => NodeData::Fragment,
@@ -8725,6 +8765,9 @@ impl Dom {
             _ => None,
         };
         let copy = self.new_node(data);
+        if !inert {
+            self.note_created_image(copy);
+        }
         if matches!(self.nodes[id].data, NodeData::Document) {
             self.nodes[copy].owner_document = copy;
             self.document_modes.insert(copy, self.document_mode(id));
@@ -8746,7 +8789,7 @@ impl Dom {
             }
             if deep {
                 for c in self.children(sc) {
-                    let cc = self.clone_subtree(c, true);
+                    let cc = self.clone_subtree_with(c, true, true);
                     self.append(frag, cc);
                 }
             }
@@ -8757,7 +8800,7 @@ impl Dom {
                 if matches!(self.nodes[c].data, NodeData::Document) {
                     continue;
                 }
-                let cc = self.clone_subtree(c, true);
+                let cc = self.clone_subtree_with(c, true, inert);
                 self.append(copy, cc);
             }
         }
@@ -8770,7 +8813,7 @@ impl Dom {
             let copy_root = self.attach_shadow(copy);
             self.shadow_data.insert(copy_root, data);
             for child in self.children(root) {
-                let cc = self.clone_subtree(child, true);
+                let cc = self.clone_subtree_with(child, true, inert);
                 self.append(copy_root, cc);
             }
         }
@@ -8850,6 +8893,11 @@ impl Dom {
     /// Deep-copy a subtree from another arena into this one. Template
     /// content rides along (html5ever parks template children there).
     fn transplant(&mut self, other: &Dom, id: NodeId) -> NodeId {
+        self.transplant_with(other, id, false)
+    }
+
+    /// `inert`: the copy lands in template contents (see `clone_subtree_with`).
+    fn transplant_with(&mut self, other: &Dom, id: NodeId, inert: bool) -> NodeId {
         let data = match &other.nodes[id].data {
             NodeData::Document | NodeData::Fragment => NodeData::Fragment,
             NodeData::Doctype(info) => NodeData::Doctype(info.clone()),
@@ -8874,6 +8922,9 @@ impl Dom {
             _ => None,
         };
         let copy = self.new_node(data);
+        if !inert {
+            self.note_created_image(copy);
+        }
         if let Some(sc) = src_content {
             let frag = self.new_node(NodeData::Fragment);
             if let NodeData::Element {
@@ -8883,12 +8934,12 @@ impl Dom {
                 *template_contents = Some(frag);
             }
             for c in other.child_iter(sc) {
-                let cc = self.transplant(other, c);
+                let cc = self.transplant_with(other, c, true);
                 self.append_fresh(frag, cc);
             }
         }
         for c in other.child_iter(id) {
-            let cc = self.transplant(other, c);
+            let cc = self.transplant_with(other, c, inert);
             self.append_fresh(copy, cc);
         }
         // This is an arena transfer (e.g. an iframe navigation), not cloneNode:
@@ -8897,11 +8948,58 @@ impl Dom {
             let copy_root = self.attach_shadow(copy);
             self.shadow_data.insert(copy_root, other.shadow_data[&root]);
             for child in other.child_iter(root) {
-                let cc = self.transplant(other, child);
+                let cc = self.transplant_with(other, child, inert);
                 self.append_fresh(copy_root, cc);
             }
         }
         copy
+    }
+
+    /// HTML #when-to-obtain-images: a created `img` updates its image data.
+    fn note_created_image(&mut self, id: NodeId) {
+        if let NodeData::Element { name, .. } = &self.nodes[id].data
+            && name.ns == ns!(html)
+            && &*name.local == "img"
+        {
+            self.created_images.push((id, false));
+            self.created_images_generation = self.created_images_generation.wrapping_add(1);
+        }
+    }
+
+    /// The created (not adopted) images of `document` awaiting "update the
+    /// image data", in creation order. Other entries stay queued.
+    pub(crate) fn take_created_images_in(&mut self, document: NodeId) -> Vec<NodeId> {
+        let mut taken = Vec::new();
+        let nodes = &self.nodes;
+        self.created_images.retain(|&(id, adopted)| {
+            let mine = !adopted
+                && nodes
+                    .get(id)
+                    .is_some_and(|node| node.owner_document == document);
+            if mine {
+                taken.push(id);
+            }
+            !mine
+        });
+        taken
+    }
+
+    /// Every queued image creation or adoption (see `created_images`).
+    pub(crate) fn take_created_images(&mut self) -> Vec<(NodeId, bool)> {
+        std::mem::take(&mut self.created_images)
+    }
+
+    /// Return images whose document is not yet ready to take them.
+    pub(crate) fn requeue_created_images(&mut self, images: Vec<(NodeId, bool)>) {
+        self.created_images.extend(images);
+    }
+
+    pub(crate) fn created_images_generation(&self) -> u64 {
+        self.created_images_generation
+    }
+
+    pub(crate) fn has_created_images(&self) -> bool {
+        !self.created_images.is_empty()
     }
 
     /// First element (document order) whose id attribute matches.

@@ -634,6 +634,7 @@ pub(crate) mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
