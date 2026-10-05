@@ -83,7 +83,9 @@ pub(crate) struct RenderImageSource {
 }
 
 /// HTML #the-list-of-available-images keys an image by URL, CORS settings
-/// attribute mode and, for a CORS request, the document origin.
+/// attribute mode and, for a CORS request, the document origin. A no-CORS
+/// request's Referer and Fetch Metadata also depend on its client, so every
+/// request here is keyed by its client's origin.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ImageRequestKey {
     pub(crate) url: String,
@@ -102,9 +104,40 @@ pub struct FetchedImage {
     /// determination for no-CORS images).
     pub(crate) url_list: Vec<Url>,
     pub(crate) timing: Option<Box<FetchTiming>>,
+    /// Natural dimensions, probed once for every request sharing the response.
+    natural_size: std::sync::OnceLock<Option<(u32, u32)>>,
 }
 
 impl FetchedImage {
+    pub(crate) fn new(
+        status: u16,
+        body: Arc<[u8]>,
+        url_list: Vec<Url>,
+        timing: Option<Box<FetchTiming>>,
+    ) -> Self {
+        Self {
+            status,
+            body,
+            url_list,
+            timing,
+            natural_size: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The probed natural size, when an earlier requester computed it.
+    pub(crate) fn known_natural_size(&self) -> Option<Option<(u32, u32)>> {
+        self.natural_size.get().copied()
+    }
+
+    /// HTML #img-load: the image's natural dimensions (`None`: broken), probed
+    /// once per response; `probe` runs only for the first requester.
+    pub(crate) fn natural_size(
+        &self,
+        probe: impl FnOnce(&[u8]) -> Option<(u32, u32)>,
+    ) -> Option<(u32, u32)> {
+        *self.natural_size.get_or_init(|| probe(&self.body))
+    }
+
     /// Fetch #ok-status. HTML #img-determine-type ignores it for element
     /// images; the terminal and inline SVG consumers still consult it.
     pub fn ok(&self) -> bool {
@@ -278,12 +311,12 @@ impl PageImages {
                 match crate::http::fetch_with_timing(&request, policy).await {
                     Ok(details) => {
                         let response = details.response;
-                        let image = Arc::new(FetchedImage {
-                            status: response.status,
-                            body: Arc::from(response.body),
-                            url_list: details.url_list,
-                            timing: response.timing,
-                        });
+                        let image = Arc::new(FetchedImage::new(
+                            response.status,
+                            Arc::from(response.body),
+                            details.url_list,
+                            response.timing,
+                        ));
                         if let Some(store) = store.upgrade()
                             && let Ok(mut store) = store.lock()
                         {

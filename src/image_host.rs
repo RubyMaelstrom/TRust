@@ -222,12 +222,12 @@ pub(super) fn document_request(
             preloaded
                 .await
                 .map(|response| {
-                    Arc::new(crate::page_images::FetchedImage {
-                        status: response.status,
-                        body: Arc::from(response.body.as_slice()),
-                        url_list: response.url_list.clone(),
-                        timing: response.timing.clone(),
-                    })
+                    Arc::new(crate::page_images::FetchedImage::new(
+                        response.status,
+                        Arc::from(response.body.as_slice()),
+                        response.url_list.clone(),
+                        response.timing.clone(),
+                    ))
                 })
                 .map_err(|()| ImageFailure::Network(None))
         });
@@ -336,9 +336,8 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         None
     };
     let source = selected.source.clone();
-    let loaded = move |data: Option<(Arc<[u8]>, bool)>| {
-        let (bytes, clean) = data?;
-        let (width, height) = probe(&source, &bytes)?;
+    let loaded = move |bytes: Arc<[u8]>, clean: bool, size: Option<(u32, u32)>| {
+        let (width, height) = size?;
         Some(LoadedImage {
             node_id: id,
             source,
@@ -352,7 +351,11 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     // Inline data has no network latency. Promise reactions still defer the
     // element's completion, and the prelude queues load/error as an element task.
     if let Some(data) = inline {
-        let result = result_value(ctx, loaded(data));
+        let result = data.and_then(|(bytes, clean)| {
+            let size = probe(&selected.source, &bytes);
+            loaded(bytes, clean, size)
+        });
+        let result = result_value(ctx, result);
         ctx.invoke(resolve, Value::Undefined, &[result])?;
         return Ok(promise);
     }
@@ -388,21 +391,33 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     cache.spawn(&handle, async move {
         let outcome = fetch.await;
         let timing = request_timing(&name, Some("img"), join, context, &outcome, started);
-        let data = outcome.ok().map(|image| {
-            // HTML #cors-same-origin: a CORS request that passed is clean; a
-            // no-CORS response is clean only when every hop was same-origin.
-            let clean = credentials.is_some()
-                || (!image.url_list.is_empty()
-                    && image
-                        .url_list
-                        .iter()
-                        .all(|url| url.origin() == client.origin()));
-            (image.body.clone(), clean)
-        });
-        let result = tokio::task::spawn_blocking(move || loaded(data))
-            .await
-            .ok()
-            .flatten();
+        let result = match outcome {
+            Ok(image) => {
+                // HTML #cors-same-origin: a CORS request that passed is clean;
+                // a no-CORS response is clean only when every hop was same-origin.
+                let clean = credentials.is_some()
+                    || (!image.url_list.is_empty()
+                        && image
+                            .url_list
+                            .iter()
+                            .all(|url| url.origin() == client.origin()));
+                // Elements sharing a response probe its dimensions once.
+                let size = match image.known_natural_size() {
+                    Some(size) => size,
+                    None => {
+                        let (probed, source) = (image.clone(), name.clone());
+                        tokio::task::spawn_blocking(move || {
+                            probed.natural_size(|bytes| probe(&source, bytes))
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                };
+                loaded(image.body.clone(), clean, size)
+            }
+            Err(_) => None,
+        };
         let _ = events
             .expect("checked events")
             .send(LumenHostTask::ImageDone {
