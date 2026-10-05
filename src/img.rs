@@ -393,6 +393,47 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo, String> {
     Ok(svg.info)
 }
 
+/// The natural dimensions of an image resource, without decoding its pixels
+/// where the format allows. HTML #img-load and #img-error make an image
+/// request completely available once the user agent can determine the image's
+/// width and height; it is broken only when the data is so corrupted that they
+/// cannot be obtained. This applies `decode`'s format support and size limits,
+/// so a resource probed here is also one `decode` presents (damaged pixel data
+/// becomes transparent, see `decode_damaged_raster`).
+pub fn natural_size(bytes: &[u8]) -> Result<(u32, u32), String> {
+    if cur_hotspot(bytes).is_some() {
+        let (image, _) = decode_cur(bytes)?;
+        return Ok((image.width(), image.height()));
+    }
+    match raster_format(bytes) {
+        Some(RasterFormat::Codec(format)) => {
+            let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+            reader.limits(raster_limits());
+            let (width, height) = reader
+                .into_dimensions()
+                .map_err(|error| format!("decode: {error}"))?;
+            let max_alloc = image::Limits::default().max_alloc.unwrap_or(u64::MAX);
+            if width == 0
+                || height == 0
+                || width > MAX_DIMENSION
+                || height > MAX_DIMENSION
+                || u64::from(width) * u64::from(height) * 4 > max_alloc
+            {
+                return Err(String::from("image dimensions exceed the decode limits"));
+            }
+            Ok((width, height))
+        }
+        Some(RasterFormat::Avif) => {
+            let image = avif::decode(bytes, avif_limits(MAX_AVIF_BYTES))?;
+            Ok((image.width(), image.height()))
+        }
+        None => {
+            let svg = parse_svg(bytes)?;
+            Ok((svg.info.width, svg.info.height))
+        }
+    }
+}
+
 /// Decode raw bytes into pixels, returning the detected MIME type too.
 /// Animated raster formats decode to their first frame. SVG uses its intrinsic
 /// viewport, reduced when necessary to stay inside the pixmap allocation cap.
@@ -483,9 +524,9 @@ pub fn decode_graphical_svg_data_url(
 /// accidentally reinterpreting format-specific disposal state.
 pub fn decode_graphical_image_for_source(
     source: &str,
-    bytes: Vec<u8>,
+    bytes: impl Into<Arc<[u8]>>,
 ) -> Result<DecodedGraphicalImage, String> {
-    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let bytes: Arc<[u8]> = bytes.into();
     let cursor_hotspot = cur_hotspot(&bytes);
     let animated_format = image::guess_format(&bytes)
         .ok()

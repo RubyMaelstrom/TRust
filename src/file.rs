@@ -200,6 +200,7 @@ pub(crate) async fn fetch(request: &crate::http::Request) -> Result<crate::http:
         js: None,
         blobs: None,
         live: None,
+        images: None,
         declarative_refresh: None,
         challenge: None,
         from_post: false,

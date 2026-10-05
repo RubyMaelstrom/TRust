@@ -37,6 +37,7 @@ pub mod finger;
 pub mod fragment;
 mod history;
 mod import_maps;
+pub mod page_images;
 mod page_threads;
 mod referrer_policy;
 mod relative_color;

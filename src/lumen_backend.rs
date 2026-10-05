@@ -183,6 +183,9 @@ enum LumenHostTask {
         id: usize,
         result: Option<image_host::LoadedImage>,
         timing: Option<LumenResourceTiming>,
+        /// The element's node document's settings context, whose global
+        /// receives the timing entry (Fetch #fetch-finale).
+        timing_context: u64,
     },
     FetchDone {
         id: usize,
@@ -544,6 +547,11 @@ struct HostState {
     screen_position: Cell<(i32, i32)>,
     geom_cache: Rc<RefCell<LumenGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
+    /// Compressed bytes behind element image request records, by record token
+    /// (`image_host`), and each element's current request's token.
+    image_payloads: HashMap<u64, image_host::ImagePayload>,
+    element_image_payloads: HashMap<usize, u64>,
+    next_image_payload: u64,
     task_events: Option<LumenTaskSender>,
     pending_resources: usize,
     /// HTML #link-type-preload fetches in flight. They never delay the load
@@ -662,6 +670,9 @@ impl HostState {
             screen_position: Cell::new((0, 0)),
             geom_cache: Rc::new(RefCell::new(LumenGeomCache::empty())),
             images: Default::default(),
+            image_payloads: HashMap::new(),
+            element_image_payloads: HashMap::new(),
+            next_image_payload: 1,
             task_events: None,
             pending_resources: 0,
             pending_preloads: 0,
@@ -874,6 +885,9 @@ impl RetainedMemory for HostState {
             screen_position,
             geom_cache,
             images,
+            image_payloads,
+            element_image_payloads,
+            next_image_payload: _,
             task_events,
             pending_resources,
             pending_preloads: _,
@@ -1115,6 +1129,25 @@ impl RetainedMemory for HostState {
         } else {
             visitor.unavailable();
         }
+
+        // Element image request payloads share their compressed bytes with the
+        // page's image store; report the native maps and the payload bytes.
+        if image_payloads.capacity() != 0 || element_image_payloads.capacity() != 0 {
+            visitor.opaque_storage();
+        }
+        visitor.allocation(RetainedManagedAllocation::new(
+            "trust.image-request-payloads",
+            image_payloads as *const _ as usize,
+            image_payloads
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u64, image_host::ImagePayload)>())
+                .saturating_add(
+                    element_image_payloads
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(usize, u64)>()),
+                )
+                .saturating_add(image_payloads.values().map(|payload| payload.len()).sum()),
+        ));
 
         if task_events.is_some() {
             // Tokio owns the queue allocation and does not expose its capacity or queued payload.
@@ -1559,6 +1592,9 @@ impl HostGc for HostState {
         for node in &removed {
             self.dom_gc.documents.remove(node);
             self.dom_gc.wrappers.remove(node);
+            if let Some(token) = self.element_image_payloads.remove(node) {
+                self.image_payloads.remove(&token);
+            }
         }
         dom.finish_gc_generation();
         self.dom_gc.young_owners.clear();
@@ -2050,7 +2086,7 @@ mod desktop {
             }
             if !lifecycle_complete
                 && pending_resources(&mut page) == 0
-                && !trust_bool(&mut page, "hasInitialFramesPending")
+                && !trust_bool(&mut page, "loadEventDelayed")
             {
                 let _ = call_trust(&mut page, "completeDocumentLoad", &[], "load event");
                 checkpoint(&mut page, "load event");
@@ -2489,7 +2525,7 @@ mod desktop {
             };
             let load_ready = !lifecycle_complete
                 && pending_resources(&mut page) == 0
-                && !trust_bool(&mut page, "hasInitialFramesPending");
+                && !trust_bool(&mut page, "loadEventDelayed");
 
             let mut immediate = None;
             // User interaction retains priority and FIFO order, but a stream
@@ -3269,15 +3305,32 @@ mod desktop {
         // and processes each external resource link as it connects it, in
         // token order (arena IDs are allocated monotonically by the tree
         // builder, as for `Dom::scripts`), before any later parser script.
-        let mut parser_links: std::collections::VecDeque<usize> = {
+        // HTML #when-to-obtain-images: the parser creates each `img`, which
+        // updates its image data at once. The native parse is atomic, so start
+        // those requests in token order relative to the parser's scripts, as
+        // for links: a script sees (and can change) only images before it.
+        let (mut parser_links, mut parser_images): (
+            std::collections::VecDeque<usize>,
+            std::collections::VecDeque<usize>,
+        ) = {
             let dom = page.dom.borrow();
-            let mut links: Vec<_> = dom
-                .shadow_including_subtree(DOCUMENT)
-                .into_iter()
+            let subtree = dom.shadow_including_subtree(DOCUMENT);
+            let mut links: Vec<_> = subtree
+                .iter()
+                .copied()
                 .filter(|&node| dom.tag_name(node) == Some("link"))
                 .collect();
             links.sort_unstable();
-            links.into()
+            let mut images: Vec<_> = subtree
+                .into_iter()
+                .filter(|&node| {
+                    dom.tag_name(node) == Some("img")
+                        && dom.namespace_uri(node) == Some("http://www.w3.org/1999/xhtml")
+                        && dom.owner_document(node) == Some(DOCUMENT)
+                })
+                .collect();
+            images.sort_unstable();
+            (links.into(), images.into())
         };
         // The parser owns its pending script list independently of the live DOM.
         // An earlier script may detach a later entry while this native list still
@@ -3305,6 +3358,7 @@ mod desktop {
         while let Some((node, written)) = queue.pop_front() {
             if !written {
                 process_parser_links(&mut page, &mut parser_links, Some(node));
+                process_parser_images(&mut page, &mut parser_images, Some(node));
             }
             // Earlier scripts may change a later element before the parser
             // prepares it. The speculative scanner is never authoritative.
@@ -3414,6 +3468,7 @@ mod desktop {
             }
         }
         process_parser_links(&mut page, &mut parser_links, None);
+        process_parser_images(&mut page, &mut parser_images, None);
         let _ = call_trust(&mut page, "parserFinished", &[], "parser EOF");
         checkpoint(&mut page, "parser EOF");
         for node in deferred {
@@ -3453,6 +3508,30 @@ mod desktop {
         for &node in written.iter().rev() {
             queue.push_front((node, true));
         }
+    }
+
+    /// Update the image data of the parser-inserted images that precede
+    /// `before` (all of them at the end of parsing), in token order. Their
+    /// selection and fetch run in this step's microtask checkpoint.
+    fn process_parser_images(
+        page: &mut LumenPage,
+        images: &mut std::collections::VecDeque<usize>,
+        before: Option<usize>,
+    ) {
+        let mut ids = Vec::new();
+        while let Some(&image) = images.front() {
+            if before.is_some_and(|script| image > script) {
+                break;
+            }
+            images.pop_front();
+            ids.push(Value::Num(image as f64));
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let ids = page.engine.ctx().make_array(ids);
+        let _ = call_trust(page, "startCreatedImages", &[ids], "parser images");
+        checkpoint(page, "parser images");
     }
 
     /// Process the parser-inserted links that precede `before` (all of them
@@ -3840,20 +3919,111 @@ mod desktop {
         }
     }
 
+    /// Bound on microtask checkpoint rounds that only start images created by
+    /// the previous round's microtasks; later ones start at the next checkpoint.
+    const CREATED_IMAGE_ROUNDS: usize = 64;
+
+    /// HTML #when-to-obtain-images: an `img` created by fragment parsing or
+    /// cloning, or adopted into another document, updates its image data
+    /// synchronously; that algorithm's own microtask selects and fetches. Run
+    /// the synchronous part in each image's node document's Realm before this
+    /// checkpoint performs those microtasks. Images of a Document without a
+    /// browsing context (DOMParser, inert documents) wait (not fully active).
+    fn start_created_images(page: &mut LumenPage) {
+        if !page.dom.borrow().has_created_images() {
+            return;
+        }
+        let created = page.dom.borrow_mut().take_created_images();
+        let mut groups: Vec<(u64, Vec<Value>, Vec<Value>)> = Vec::new();
+        let mut waiting = Vec::new();
+        {
+            let dom = page.dom.clone();
+            let dom = dom.borrow();
+            let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+                return;
+            };
+            for (id, adopted) in created {
+                if !dom.is_valid(id) {
+                    continue;
+                }
+                let context = node_window_context(state, &dom, id)
+                    .filter(|&context| context == 0 || state.window_realms.contains_key(&context));
+                let Some(context) = context else {
+                    // A navigable's new Document whose Window is still being
+                    // created takes its parser images itself; keep them.
+                    let document = dom.owner_document(id).unwrap_or(DOCUMENT);
+                    if document != DOCUMENT && dom.node(document).parent.is_some() {
+                        waiting.push((id, adopted));
+                    }
+                    continue;
+                };
+                let group = match groups.iter().position(|(owner, ..)| *owner == context) {
+                    Some(index) => &mut groups[index],
+                    None => {
+                        groups.push((context, Vec::new(), Vec::new()));
+                        groups.last_mut().expect("pushed")
+                    }
+                };
+                group.1.push(Value::Num(id as f64));
+                group.2.push(Value::Bool(adopted));
+            }
+        }
+        if !waiting.is_empty() {
+            page.dom.borrow_mut().requeue_created_images(waiting);
+        }
+        for (context, ids, adopted) in groups {
+            let ids = page.engine.ctx().make_array(ids);
+            let adopted = page.engine.ctx().make_array(adopted);
+            if context == 0 {
+                let _ = call_trust(
+                    page,
+                    "startCreatedImages",
+                    &[ids, adopted],
+                    "created images",
+                );
+                continue;
+            }
+            let realm = page
+                .engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.window_realms.get(&context).cloned());
+            if let Some(realm) = realm {
+                let result = page.engine.with_embed_realm(&realm, |engine| {
+                    engine_call_trust(engine, "startCreatedImages", &[ids, adopted])
+                });
+                if let Ok(Err(error)) = result {
+                    record_eval_error(page, error, "created images");
+                }
+            }
+        }
+    }
+
     fn checkpoint(page: &mut LumenPage, label: &str) {
         let started = Instant::now();
-        let checkpoint = page.engine.run_microtasks_interruptible();
-        let completed = checkpoint.is_ok();
-        if let Err(reason) = checkpoint
-            && !matches!(
-                reason,
-                lumen::InterruptReason::UserNavigation | lumen::InterruptReason::Cancelled
-            )
-        {
-            page.outcome.errors.push(format!(
-                "{label} microtasks interrupted: {}",
-                reason.message()
-            ));
+        let mut completed = false;
+        // Images created by microtasks (an awaited continuation's innerHTML)
+        // update within this checkpoint too: their own microtasks then run
+        // before it completes, as HTML #perform-a-microtask-checkpoint does.
+        for _ in 0..CREATED_IMAGE_ROUNDS {
+            start_created_images(page);
+            let created = page.dom.borrow().created_images_generation();
+            let checkpoint = page.engine.run_microtasks_interruptible();
+            completed = checkpoint.is_ok();
+            if let Err(reason) = checkpoint
+                && !matches!(
+                    reason,
+                    lumen::InterruptReason::UserNavigation | lumen::InterruptReason::Cancelled
+                )
+            {
+                page.outcome.errors.push(format!(
+                    "{label} microtasks interrupted: {}",
+                    reason.message()
+                ));
+            }
+            if !completed || page.dom.borrow().created_images_generation() == created {
+                break;
+            }
         }
         drain_diagnostics(page);
         // HTML #perform-a-microtask-checkpoint completes jobs and ClearKeptObjects
@@ -4801,16 +4971,11 @@ mod desktop {
                 if changed {
                     page.render_environment_dirty = true;
                     prepare_unbounded_task(interrupt);
-                    // HTML §4.8.4 / §8.1.7: the frontend's decoded-resource
-                    // completion makes the selected image request complete;
-                    // only then queue its non-bubbling `load` event as a later
-                    // task. BookReader removes BRpageloading from this event.
-                    let _ = call_trust(
-                        page,
-                        "scanImageLoadsWhenReady",
-                        &[],
-                        "decoded image load scan",
-                    );
+                    // Element image requests belong to the document (HTML
+                    // #updating-the-image-data), which fires their load and
+                    // error events itself. Frontend decodes only supply the
+                    // presentation sizes of images it did not request (inline
+                    // SVG, canvas snapshots) and the same sizes again.
                     checkpoint(page, "image geometry");
                     // HTML #update-the-rendering and Intersection Observer
                     // §3.4.1 update layout/observations at the next rendering
@@ -4862,6 +5027,8 @@ mod desktop {
                         ],
                         "resize",
                     );
+                    // HTML #img-environment-changes: reselect responsive images.
+                    let _ = call_trust(page, "reactToImageEnvironment", &[], "image environment");
                     checkpoint(page, "resize");
                     finish_task(page, events)
                 } else {
@@ -4895,6 +5062,7 @@ mod desktop {
                         &format!("globalThis.devicePixelRatio={ratio}"),
                         "devicePixelRatio",
                     );
+                    let _ = call_trust(page, "reactToImageEnvironment", &[], "image environment");
                     checkpoint(page, "devicePixelRatio");
                     finish_task(page, events)
                 } else {
@@ -7054,53 +7222,54 @@ mod desktop {
         }
 
         #[tokio::test]
-        async fn decoded_image_completion_updates_complete_and_delivers_load() {
+        async fn document_image_request_completes_and_delivers_load() {
             // WHATWG HTML §4.8.4 makes `complete` reflect the current image
             // request, while the successful request's `load` event is queued
             // separately from the task that learned the resource was ready.
             // This is the BookReader regression: its page container remains
-            // BRpageloading until this event removes that class.
+            // BRpageloading until this event removes that class. The parser-
+            // created image's request is the document's own (HTML
+            // #when-to-obtain-images); no frontend decode is involved.
+            use futures::FutureExt as _;
             let html = r#"<!doctype html><html><body>
                 <button id="keep">keep actor resident</button>
-                <img id="picture" src="/page.jpg">
+                <img id="picture" src="/page.png">
                 <output id="result">initial</output>
                 <script>
                     const picture = document.getElementById("picture");
                     const result = document.getElementById("result");
                     document.getElementById("keep").addEventListener("click", () => {});
                     picture.addEventListener("load", () => {
-                        result.textContent = "loaded:" + picture.complete;
+                        result.textContent = "loaded:" + picture.complete + ":" + picture.naturalWidth;
                     });
                     result.textContent = "initial:" + picture.complete;
                 </script>
             </body></html>"#;
-            let (handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            let cache = Arc::new(crate::http::PageCache::default());
+            let url = String::from("https://example.com/page.png");
+            let response = Arc::new(crate::http::CachedResp {
+                status: 200,
+                content_type: String::from("image/png"),
+                headers: Vec::new(),
+                body: crate::img::red_png(),
+                url_list: vec![url::Url::parse(&url).unwrap()],
+                timing: None,
+            });
+            cache.seed_pending(url, futures::future::ready(Ok(response)).boxed().shared());
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.cache = cache;
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
 
-            let first = tokio::time::timeout(Duration::from_secs(30), events.recv())
-                .await
-                .expect("initial image fixture render timed out")
-                .expect("Lumen actor closed before image fixture render");
-            let PageEvt::Updated { html, .. } = first else {
-                panic!("expected an interactive image fixture, got {first:?}");
-            };
-            assert!(
-                html.contains("initial:false"),
-                "image started incomplete: {html}"
-            );
-
-            handle
-                .cmds
-                .send(PageCmd::ImageSizes(vec![(
-                    String::from("https://example.com/page.jpg"),
-                    (640, 480),
-                )]))
-                .await
-                .expect("image completion command accepted");
             let loaded = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut initial = None;
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::Updated { html, .. }) if html.contains("loaded:true") => {
-                            break html;
+                        Some(PageEvt::Updated { html, .. }) => {
+                            initial.get_or_insert_with(|| html.clone());
+                            if html.contains("loaded:true") {
+                                break (initial.unwrap(), html);
+                            }
                         }
                         Some(PageEvt::Trouble(errors)) => {
                             panic!("image completion fixture failed: {errors:?}")
@@ -7111,8 +7280,13 @@ mod desktop {
                 }
             })
             .await
-            .expect("decoded image load event timed out");
-            assert!(loaded.contains("loaded:true"), "{loaded}");
+            .expect("document image load event timed out");
+            assert!(
+                loaded.0.contains("initial:false") || loaded.0.contains("loaded:true"),
+                "image started incomplete: {}",
+                loaded.0
+            );
+            assert!(loaded.1.contains("loaded:true:4"), "{}", loaded.1);
         }
 
         #[test]
@@ -8773,7 +8947,6 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_animation_events", 0, host_animation_events),
     ("__dom_offset_style", 1, guarded_offset_style),
     ("__image_current_src", 1, guarded_image_current_src),
-    ("__image_complete", 1, guarded_image_complete),
     ("__media_failed", 2, guarded_media_failed),
     ("__match_media", 3, host_match_media),
     ("__dom_rect", 1, guarded_rect),
@@ -9456,7 +9629,6 @@ node_access_guards! {
     guarded_pi_target = host_pi_target, [0], Invalidate;
     guarded_css_sheet = host_css_sheet, [0], Invalidate;
     guarded_image_current_src = host_image_current_src, [0], Invalidate;
-    guarded_image_complete = host_image_complete, [0], Invalidate;
     guarded_media_failed = host_media_failed, [0], Invalidate;
     guarded_load_frame = host_load_frame, [0], Invalidate;
     guarded_create_window_realm = host_create_window_realm, [1], Invalidate;
@@ -10300,6 +10472,34 @@ fn prepare_client_request(
     Arc<crate::http::PageCache>,
     crate::http::Request,
 )> {
+    let prepared =
+        prepare_uncounted_client_request(state, page, target, method, body, headers, fetch_policy)?;
+    // Fetch Standard §5.6 invokes Fetch for every successfully constructed request. A count of
+    // earlier page requests is neither a network error nor a specified rejection condition.
+    state
+        .network
+        .as_ref()?
+        .fetched
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(prepared)
+}
+
+/// `prepare_client_request` without counting toward the page's speculative
+/// prefetch budget (`MAX_PAGE_FETCHES_WITH_SPECULATION`). Document image
+/// requests, which frontends used to make, keep that budget for scripts.
+fn prepare_uncounted_client_request(
+    state: &mut HostState,
+    page: &url::Url,
+    target: &str,
+    method: String,
+    body: Option<(String, Vec<u8>)>,
+    headers: Vec<(String, String)>,
+    fetch_policy: Option<(crate::http::RequestMode, crate::http::CredentialsMode)>,
+) -> Option<(
+    tokio::runtime::Handle,
+    Arc<crate::http::PageCache>,
+    crate::http::Request,
+)> {
     let resolved = page.join(target).ok()?;
     // Fetch #populate-request-from-client uses the settings ORIGIN, not the
     // scheme/host of the API base URL (notably blob: dedicated workers).
@@ -10319,11 +10519,6 @@ fn prepare_client_request(
     }) {
         return None;
     }
-    // Fetch Standard §5.6 invokes Fetch for every successfully constructed request. A count of
-    // earlier page requests is neither a network error nor a specified rejection condition.
-    network
-        .fetched
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut request = crate::http::Request {
         method,
         url: resolved,
@@ -10465,6 +10660,33 @@ fn resource_initiator(ctx: &mut Ctx, args: &[Value]) -> &'static str {
 fn record_resource_timing(ctx: &mut Ctx, report: Option<LumenResourceTiming>) {
     let Some(report) = report else { return };
     record_resource_timing_ref(ctx, &report);
+}
+
+/// Resource Timing #marking-resource-timing in the global of settings context
+/// `context` (a request's client), which can differ from the running Realm.
+/// A retired Document's global no longer receives entries.
+fn record_resource_timing_in(
+    engine: &mut lumen::Engine,
+    context: u64,
+    report: Option<LumenResourceTiming>,
+) -> Result<(), String> {
+    let Some(report) = report else {
+        return Ok(());
+    };
+    if context == engine.ctx().host_job_context() {
+        record_resource_timing_ref(engine.ctx(), &report);
+        return Ok(());
+    }
+    let realm = engine
+        .ctx()
+        .host_mut::<HostState>()
+        .and_then(|state| state.window_realms.get(&context).cloned());
+    let Some(realm) = realm else { return Ok(()) };
+    engine
+        .with_embed_realm(&realm, move |engine| {
+            record_resource_timing_ref(engine.ctx(), &report);
+        })
+        .map_err(|_| String::from("resource timing Realm is unavailable"))
 }
 
 fn record_resource_timing_ref(ctx: &mut Ctx, report: &LumenResourceTiming) {
@@ -14057,11 +14279,14 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
         LumenHostTask::ParserResourceTiming(timing) => {
             record_resource_timing_ref(engine.ctx(), &timing);
         }
-        LumenHostTask::ImageDone { id, result, timing } => {
-            settle_network_task(engine, id, move |ctx| {
-                record_resource_timing(ctx, timing);
-                image_host::result_value(ctx, result)
-            })?;
+        LumenHostTask::ImageDone {
+            id,
+            result,
+            timing,
+            timing_context,
+        } => {
+            record_resource_timing_in(engine, timing_context, timing)?;
+            settle_network_task(engine, id, move |ctx| image_host::result_value(ctx, result))?;
         }
         LumenHostTask::NavigateDone {
             id,
@@ -16239,40 +16464,6 @@ fn host_image_current_src(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
             |selected| Value::from_string(selected.source),
         ),
     )
-}
-
-/// HTML §4.8.4 `complete`: omitted/empty sources are complete, as are current
-/// requests whose resource fetch/decode has completed. The terminal frontend
-/// injects decoded image sizes through `PageCmd::ImageSizes`; that map is the
-/// page actor's resource-availability state and is shared with layout so a
-/// script cannot observe a different image state from the one being painted.
-fn host_image_complete(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let (_, viewport, density) = host_layout_environment(ctx);
-    let base = request_client_url(ctx);
-    let source = {
-        let dom = host_dom(ctx);
-        let dom = dom.borrow();
-        let Some(id) = host_arg_node(&dom, args, 0) else {
-            return Ok(Value::Bool(false));
-        };
-        let src = dom.attr(id, "src").unwrap_or("").trim();
-        let srcset = dom.attr(id, "srcset").unwrap_or("").trim();
-        if src.is_empty() && srcset.is_empty() {
-            return Ok(Value::Bool(true));
-        }
-        crate::responsive_image::select(&dom, id, &base, viewport, density)
-            .map(|selected| selected.source)
-    };
-    let Some(source) = source else {
-        return Ok(Value::Bool(false));
-    };
-    // Data URLs are consumed synchronously by the platform. Other URLs become
-    // complete only after the frontend has decoded the selected source.
-    let complete = source.starts_with("data:")
-        || ctx
-            .host_mut::<HostState>()
-            .is_some_and(|state| state.images.borrow().contains_key(&source));
-    Ok(Value::Bool(complete))
 }
 
 /// CSSOM View §6 bounding-box backing, sourced directly from canonical layout fragments.
@@ -21974,7 +22165,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 201, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 200, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -21985,7 +22176,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 201);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 200);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -22018,6 +22209,7 @@ mod tests {
         "__wasm_extern_get",
         "__wasm_invoke_import",
         "__wasm_import_results",
+        "__image_complete",
     ];
 
     /// The `typeof` of each host binding and former internal global, as one string.
@@ -29875,9 +30067,12 @@ mod tests {
         )
         .unwrap();
 
+        // HTML #updating-the-image-data: a just-created image has no current
+        // request URL until its update's microtask runs, and its request is
+        // not complete (only a src-less image is); data: URLs are not exempt.
         assert_eq!(
             string_value(&mut engine, "geometryResult"),
-            "true|false|grid|100px 140px|240|80|true|30|25|https://example.com/large.png|false|true|true|child|https://example.com/child"
+            "true|false|grid|100px 140px|240|80|true|30|25||false|true|false|child|https://example.com/child"
         );
     }
 

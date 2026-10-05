@@ -3296,45 +3296,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             trust.performanceLifecycle(value === 'interactive' ? 'domInteractive' : 'domComplete');
         trust.fire(g.document,'readystatechange',false);
     };
-    // The Lumen page actor receives image completion from the frontend only
-    // after the shared image pipeline has fetched and decoded the resource.
-    // HTML §4.8.4 exposes that state through `complete`, and the successful
-    // request's `load` event is delivered as a later task. Do not announce a
-    // network image before its bytes are available.
-    trust.__imgReadyDelivered = new WeakMap();
-    trust.scanImageLoadsWhenReady = function () {
-        let imgs;
-        try { imgs = g.document.querySelectorAll("img"); } catch (e) { return 0; }
-        const pending = [];
-        for (let i = 0; i < imgs.length; i++) {
-            const im = imgs[i];
-            // Script-prepared requests own their completion independently of
-            // the frontend; do not synthesize a second event from paint state.
-            if (imageState(im)) continue;
-            const id = nodeIds.get(im);
-            if (typeof id !== "number") continue;
-            let complete = false;
-            try { complete = !!im.complete; } catch (e) {}
-            if (!complete) continue;
-            const source = String(im.currentSrc || im.getAttribute("src") || "");
-            if (!source) continue;
-            const previous = trust.__imgReadyDelivered.get(im);
-            if (previous === source) continue;
-            const m = getListenerMap(im);
-            const listening =
-                (m && m.get("load") && m.get("load").length) || typeof im.onload === "function";
-            // Mark the request delivered even when nobody listens. A listener
-            // attached after the resource event has run must not receive a
-            // second, synthetic notification.
-            trust.__imgReadyDelivered.set(im, source);
-            if (!listening) continue;
-            pending.push(im);
-        }
-        if (pending.length) setTimeout(function () {
-            for (const im of pending) { try { dispatch(im, createTrustedEvent(Event, "load"), false); } catch (e) {} }
-        }, 0);
-        return pending.length;
-    };
     // --- iframe processing: HTML "process the iframe attributes" ----------
     // An <iframe>/<frame> renders its nested document INLINE (the serializer
     // rewrites the frame + its realized content into a <div data-trust-frame>;
@@ -3638,6 +3599,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // need to execute with readiness "loading". runFrameScripts marks
         // EOF only after those scripts and before deferred/module execution.
         queueFrameNavigationsIn(frameDocument(frame));
+        // HTML #when-to-obtain-images: each parser-created img updates its
+        // image data when created; start them in token order around scripts.
+        const parserImages = imageNative("created", nodeIds.get(frameDocument(frame))) || [];
+        let nextParserImage = 0;
+        function startParserImages(limit) {
+            const ids = [];
+            while (nextParserImage < parserImages.length && parserImages[nextParserImage] < limit)
+                ids.push(parserImages[nextParserImage++]);
+            if (ids.length) trust.startCreatedImages(ids);
+        }
 
         // HTML §13.2.7: parser-deferred and module scripts run before
         // DOMContentLoaded. HTML then waits for everything delaying load (such
@@ -3648,9 +3619,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         let allScriptsDone = false;
         let stylesDone = false;
         let domContentLoaded = false;
+        let imagesDone = false;
         function maybeFinishLoad() {
             if (generation !== internalsFor(frame).trustLoadGeneration ||
-                !domContentLoaded || !allScriptsDone || !stylesDone) return;
+                !domContentLoaded || !allScriptsDone || !stylesDone || !imagesDone) return;
             fireFrameLoad(frame, generation);
         }
         loadFrameStyles(frame, function () {
@@ -3659,17 +3631,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
         runFrameScripts(frame, function () {
             if (generation !== internalsFor(frame).trustLoadGeneration) return;
+            startParserImages(Infinity);
             try {
                 runInFrame(frame, function () {
                     trust.fire(g.document, "DOMContentLoaded", true);
                 });
             } catch (e) {}
             domContentLoaded = true;
-            maybeFinishLoad();
+            // HTML #the-end: the load event also waits for eager image
+            // fetches (#delay-the-load-event), including script-started ones.
+            whenImageLoadsSettle(function () {
+                imagesDone = true;
+                maybeFinishLoad();
+            });
         }, function () {
             allScriptsDone = true;
             maybeFinishLoad();
-        });
+        }, startParserImages);
     }
     trust.finishParsedFrameLoad = function (frameId, generation) {
         frameId = Number(frameId);
@@ -6889,6 +6867,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // Changing src/srcdoc re-runs "process the iframe attributes".
             if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
             if (this.localName === "img" && imageRelevantAttribute(lower)) updateImageData(this);
+            if (lower === "loading" && this.localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(this);
             if (lower === "src" && (this.localName === "video" || this.localName === "audio")) loadMediaElement(this);
             if (linkOld !== undefined) linkAttributeChanged(this, lower, linkOld);
         }
@@ -6912,6 +6891,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // Removing src/srcdoc re-runs "process the iframe attributes".
             if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
             if (this.localName === "img" && imageRelevantAttribute(lower)) updateImageData(this);
+            // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
+            if (lower === "loading" && this.localName === "img") resumeLazyImage(this);
         }
         hasAttribute(n) { return this.getAttribute(n) !== null; }
         getAttributeNames() { return __dom_attr_names(nodeIds.get(this)); }
@@ -10267,8 +10248,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return proxy;
     }
     // HTML "update the image data" / "when to obtain images": creation and
-    // relevant mutations, NOT painting, drive requests. Keep decoded pixels in
-    // private weak slots so detached image objects are collectible.
+    // relevant mutations, NOT painting, drive requests. The document owns each
+    // request: its fetch, Resource Timing entry, load-event delay and events;
+    // frontends present the bytes it fetched. A completed request's record
+    // holds no pixels until a canvas, WebGL or ImageBitmap consumer reads them,
+    // and records live in private weak slots so detached images are collectible.
     const imageNative = g.__image_binding;
     const imageSlots = imageNative("slots", new WeakMap());
     delete g.__image_binding;
@@ -10276,46 +10260,174 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const imageThen = Promise.prototype.then;
     const imageCheckpoint = Promise.resolve();
     const imageMicrotask = fn => imageApply(imageThen, imageCheckpoint, [fn]);
+    const imageDefine = Object.defineProperty;
     let imageTask; // Captured after the event-loop binding below.
     function imageState(image) { return imageApply(imageGet, imageSlots, [image]); }
     function imageRelevantAttribute(name) {
         return name === "src" || name === "srcset" || name === "sizes" || name === "width" ||
             name === "crossorigin" || name === "referrerpolicy";
     }
-    function updateImageData(image) {
+    function imageInPicture(image) {
+        const parent = image.parentNode;
+        return !!parent && htmlElementName(parent) === "picture";
+    }
+    // HTML #delay-the-load-event: this Document's eager image fetches delay its
+    // load event until their networking task (the element task below) has run.
+    let imageLoadDelays = 0;
+    const imageLoadIdle = [];
+    function releaseImageLoadDelay() {
+        if (--imageLoadDelays > 0) return;
+        imageLoadDelays = 0;
+        for (const fn of imageLoadIdle.splice(0)) {
+            try { fn(); } catch (e) { trust.errors.push("image load delay: " + ((e && e.message) || e)); }
+        }
+    }
+    function whenImageLoadsSettle(fn) {
+        if (imageLoadDelays > 0) imageLoadIdle.push(fn); else fn();
+    }
+    trust.loadEventDelayed = function () {
+        return trust.hasInitialFramesPending() || imageLoadDelays > 0;
+    };
+    // HTML #lazy-loading-attributes: this Document's lazy load intersection
+    // observer. Its targets resume their requests from a task on the
+    // intersection observer task source once they approach the viewport.
+    const lazyImages = new Set();
+    let lazyImageUpdatePending = false;
+    function imageWillLazyLoad(image) {
+        const loading = __dom_get_attr(nodeIds.get(image), "loading");
+        return loading !== null && loading.toLowerCase() === "lazy";
+    }
+    function startLazyImage(image) {
+        lazyImages.add(image);
+        lazyImageUpdatePending = true;
+    }
+    function resumeLazyImage(image) {
+        lazyImages.delete(image);
+        const state = imageState(image);
+        const steps = state && state.lazy;
+        if (!steps) return;
+        state.lazy = null;
+        steps();
+    }
+    // A completed request's record: natural size, CORS-same-origin flag and
+    // density, with pixels (index 2) decoded from its native bytes on demand.
+    function imageRecord(result) {
+        if (!result) return null;
+        const token = result[6];
+        let pixels;
+        imageDefine(result, "2", {
+            get() {
+                if (pixels === undefined) pixels = imageNative("pixels", token);
+                return pixels;
+            },
+            enumerable: true,
+            configurable: false,
+        });
+        return result;
+    }
+    // `environment`: HTML #img-environment-changes, which keeps the current
+    // request until a newly selected source loads and fires no error event.
+    function updateImageData(image, environment = false) {
         let state = imageState(image);
         if (!state) {
-            state = { generation: 0, current: null, url: "", pending: false, broken: false };
+            state = { generation: 0, current: null, url: "", pending: false, broken: false, lazy: null };
             imageApply(imageSet, imageSlots, [image, state]);
         }
         const generation = ++state.generation;
+        if (state.lazy) {
+            lazyImages.delete(image);
+            state.lazy = null;
+        }
         state.pending = true;
         imageMicrotask(function () {
             if (state.generation !== generation) return;
-            const source = __image_current_src(nodeIds.get(image));
-            const hasSource = image.hasAttribute("src") || image.hasAttribute("srcset");
+            const id = nodeIds.get(image);
+            const source = __image_current_src(id);
+            if (environment && (!source || source === state.url)) {
+                state.pending = false;
+                return;
+            }
+            const hasSource = __dom_get_attr(id, "src") !== null ||
+                __dom_get_attr(id, "srcset") !== null || imageInPicture(image);
             if (!state.current) state.url = source;
+            let delayed = false;
             const finish = function (result) {
+                result = imageRecord(result);
                 // A newer src assignment supersedes old completions, including
                 // failures. Delivery is an element task, never synchronous.
                 imageTask(function () {
-                    if (state.generation !== generation) return;
-                    state.pending = false;
-                    state.current = result;
-                    state.url = source;
-                    state.broken = !result;
-                    if (result || hasSource) dispatch(image,
-                        createTrustedEvent(Event, result ? "load" : "error"), false);
+                    try {
+                        const current = state.generation === generation;
+                        imageNative("adopt", current && (result || !environment) ? id : null,
+                            result ? result[6] : null, current && (!!result || !environment));
+                        if (current) {
+                            state.pending = false;
+                            if (result || !environment) {
+                                state.current = result;
+                                state.url = source;
+                                state.broken = !result;
+                                if (result || hasSource) dispatch(image,
+                                    createTrustedEvent(Event, result ? "load" : "error"), false);
+                            }
+                        }
+                    } finally {
+                        if (delayed) releaseImageLoadDelay();
+                    }
                 }, 0);
             };
-            if (!source) finish(null);
-            else imageApply(imageThen, imageNative("load", nodeIds.get(image)), [finish, function () { finish(null); }]);
+            if (!source) { finish(null); return; }
+            // "Let delay load event be true if the img's lazy loading
+            // attribute is in the Eager state" (scripting is enabled here).
+            const lazy = !environment && imageWillLazyLoad(image);
+            const fetchImage = function () {
+                if (state.generation !== generation) return;
+                if (!lazy) { delayed = true; imageLoadDelays++; }
+                let request;
+                try { request = imageNative("load", id); }
+                catch (e) { finish(null); return; }
+                imageApply(imageThen, request, [finish, function () { finish(null); }]);
+            };
+            if (lazy) {
+                state.lazy = fetchImage;
+                startLazyImage(image);
+                imageNative("lazy", source);
+                return;
+            }
+            fetchImage();
         });
     }
+    // HTML #when-to-obtain-images: images the parser, fragment parsing or
+    // cloning created (or that another document adopted, a relevant mutation)
+    // update their image data. A later attribute mutation already did.
+    trust.startCreatedImages = function (ids, adopted) {
+        for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            const relevant = !!(adopted && adopted[i]);
+            const image = wrap(id);
+            if (!image || (!relevant && imageState(image))) continue;
+            if (!relevant && __dom_get_attr(id, "src") === null &&
+                __dom_get_attr(id, "srcset") === null && !imageInPicture(image)) continue;
+            try { updateImageData(image); }
+            catch (e) { trust.errors.push("update the image data: " + ((e && e.message) || e)); }
+        }
+    };
+    // HTML #img-environment-changes: a viewport or device-pixel-ratio change
+    // reselects images that use srcset or picture.
+    trust.reactToImageEnvironment = function () {
+        let images = [];
+        try { images = g.document.images; } catch (e) {}
+        for (let i = 0; i < images.length; i++) {
+            const image = images[i];
+            const state = imageState(image);
+            if (!state || state.pending || !state.current) continue;
+            if (__dom_get_attr(nodeIds.get(image), "srcset") === null && !imageInPicture(image)) continue;
+            updateImageData(image, true);
+        }
+        for (const child of renderingChildren()) child.reactToImageEnvironment();
+    };
     function imageNaturalDimension(image, axis) {
         const state = imageState(image);
-        if (state) return state.current ? Math.floor(state.current[axis] / state.current[4]) : 0;
-        return Math.floor(imageNative("size", nodeIds.get(image))[axis]);
+        return state && state.current ? Math.floor(state.current[axis] / state.current[4]) : 0;
     }
     function imageDimension(image, axis) {
         if (image.isConnected && image.getClientRects().length) {
@@ -10339,11 +10451,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return imageNaturalDimension(image, axis);
     }
     class HTMLImageElement extends HTMLElement {
-        get currentSrc() { const state = imageState(this); return state ? state.url : __image_current_src(nodeIds.get(this)); }
+        // Before its first update runs, an image has no current request.
+        get currentSrc() { const state = imageState(this); return state ? state.url : ""; }
         get complete() {
             if (!this.hasAttribute("srcset") && !this.getAttribute("src")) return true;
             const state = imageState(this);
-            return state ? !state.pending && !!(state.current || state.broken) : __image_complete(nodeIds.get(this));
+            return !!state && !state.pending && !!(state.current || state.broken);
         }
         get naturalWidth() { return imageNaturalDimension(this, 0); }
         get naturalHeight() { return imageNaturalDimension(this, 1); }
@@ -12641,9 +12754,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         loadFrameStyles(realmRootFrame, done);
         return true;
     };
-    function runFrameScripts(frame, parserDone, allDone) {
+    function runFrameScripts(frame, parserDone, allDone, parserImages) {
         parserDone = typeof parserDone === "function" ? parserDone : function () {};
         allDone = typeof allDone === "function" ? allDone : function () {};
+        // Starts the parser-created images preceding a node (all at EOF).
+        parserImages = typeof parserImages === "function" ? parserImages : function () {};
         runInFrame(frame, function () {
             let scripts;
             try { scripts = frameDocument(frame).querySelectorAll("script"); }
@@ -12696,6 +12811,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 for (; index < scripts.length; index++) {
                     const script = scripts[index];
                     if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script)) continue;
+                    parserImages(nodeIds.get(script));
                     const type = (script.getAttribute("type") || "").trim().toLowerCase();
                     if (type === "importmap") {maybeRunScript(script);continue;}
                     const module = type === "module";
@@ -12719,6 +12835,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     } else runInline(script);
                     if (!active()) return;
                 }
+                parserImages(Infinity);
                 // HTML #the-end: interactive precedes the ordered defer/module
                 // list. DOMContentLoaded waits for that list; load also waits
                 // for every asynchronous classic or module script.
@@ -12741,6 +12858,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 for (const script of scripts) {
                     if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script) ||
                         (script.hasAttribute('nomodule')&&(script.getAttribute('type')||'').trim().toLowerCase()!=='importmap')) continue;
+                    parserImages(nodeIds.get(script));
                     const type = (script.getAttribute('type') || '').trim().toLowerCase();
                     if(type==='importmap') {maybeRunScript(script);continue;}
                     if (type && type !== 'text/javascript' && type !== 'application/javascript' &&
@@ -12748,6 +12866,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     runInline(script);
                     if (!active()) return;
                 }
+                parserImages(Infinity);
                 if (frame === realmRootFrame) trust.setDocumentReadiness('interactive');
                 else internalsFor(frame).trustReadyState = 'interactive';
                 parserDone();
@@ -17953,7 +18072,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const RO = [];
     let roInitialUpdatePending = false;
     trust.hasRenderingUpdate = function () {
-        if (ioInitialUpdatePending || roInitialUpdatePending || PENDING_ELEMENT_SCROLLS.size > 0 || viewportScrollRequest !== null) return true;
+        if (ioInitialUpdatePending || roInitialUpdatePending || lazyImageUpdatePending ||
+            PENDING_ELEMENT_SCROLLS.size > 0 || viewportScrollRequest !== null) return true;
         for (const child of renderingChildren()) if (child.hasRenderingUpdate()) return true;
         return false;
     };
@@ -17963,7 +18083,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return false;
     };
     trust.hasIntersectionObserver = function () {
-        if (IO.length) return true;
+        if (IO.length || lazyImages.size) return true;
         for (const child of renderingChildren()) if (child.hasIntersectionObserver()) return true;
         return false;
     };
@@ -18102,11 +18222,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // or isIntersecting changed (edge-triggered, per spec — not a flood). Entry
     // recording queues the separate IntersectionObserver notification task;
     // callbacks never run synchronously inside this rendering-update step.
+    // HTML #lazy-load-root-margin is implementation-defined: two viewport
+    // heights above and below and one width beside, so images load before
+    // they scroll into view (the frontends' presentation look-ahead).
+    function updateLazyImages() {
+        lazyImageUpdatePending = false;
+        if (!lazyImages.size) return 0;
+        const sx = g.scrollX || 0, sy = g.scrollY || 0;
+        const vw = windowViewportDimension("width"), vh = windowViewportDimension("height");
+        const rL = sx - vw, rT = sy - 2 * vh, rR = sx + 2 * vw, rB = sy + 3 * vh;
+        const resume = [];
+        for (const image of lazyImages) {
+            let dr = null;
+            try { dr = __dom_rect(nodeIds.get(image)); } catch (e) { dr = null; }
+            if (!dr) continue;
+            if (dr[0] + dr[2] >= rL && dr[0] <= rR && dr[1] + dr[3] >= rT && dr[1] <= rB) resume.push(image);
+        }
+        if (!resume.length) return 0;
+        // The observer's callback stops observing each intersecting target and
+        // runs its lazy load resumption steps, in a notification task.
+        for (const image of resume) lazyImages.delete(image);
+        intersectionTasks.push({ frame: trust.__activeFrame || null, windowState: activeWindowState(), fn: function () {
+            for (const image of resume) resumeLazyImage(image);
+        }});
+        return resume.length;
+    }
     trust.updateIntersections = function (localOnly = false) {
         if (!localOnly) return updateDocumentObservers("updateIntersections");
         ioInitialUpdatePending = false;
-        if (!IO.length) return 0;
-        let queued = 0;
+        const lazyQueued = updateLazyImages();
+        if (!IO.length) return lazyQueued;
+        let queued = lazyQueued;
         const sx = g.scrollX || 0, sy = g.scrollY || 0;
         const vw = windowViewportDimension("width"), vh = windowViewportDimension("height");
         const observers = IO.slice();

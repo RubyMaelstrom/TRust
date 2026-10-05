@@ -300,6 +300,7 @@ pub(crate) fn image_response(response: Response) -> Result<crate::http::Response
         js: None,
         blobs: None,
         live: None,
+        images: None,
         declarative_refresh: None,
         challenge: None,
         from_post: false,

@@ -518,6 +518,9 @@ pub struct App {
     /// The living page behind the current browser doc, if its JS left
     /// anything to interact with. ONE live engine, ever.
     live_page: Option<crate::js::PageHandle>,
+    /// The current document's image requests (`page_images`), when its page
+    /// actor ran: the image pipeline presents those responses.
+    page_images: Option<std::sync::Arc<crate::page_images::PageImages>>,
     page_rx: Option<mpsc::Receiver<crate::js::PageEvt>>,
     /// The document row last pushed to the live page as its scroll position
     /// (`PageCmd::Scroll`). Diffed each run-loop tick so a scroll command is
@@ -886,6 +889,7 @@ impl App {
             js_enabled: true,
             web_storage: crate::site_storage::web_storage(),
             live_page: None,
+            page_images: None,
             page_rx: None,
             last_scroll_sent: None,
             image_sizes_sent: None,
@@ -3905,6 +3909,7 @@ impl App {
             .as_ref()
             .map(|g| g.doc.cookie_restricted_images.clone())
             .unwrap_or_default();
+        let images = self.page_images.clone();
         for u in &todo {
             self.imgs_in_flight.insert(u.clone());
         }
@@ -3916,11 +3921,17 @@ impl App {
                 let tx = tx.clone();
                 let page = page.clone();
                 let blobs = blobs.clone();
+                let images = images.clone();
                 let restricted = cookie_restrictions.contains(&url);
                 async move {
-                    let decoded =
-                        load_image_with_cookie_policy(&page, &url, blobs.as_ref(), restricted)
-                            .await;
+                    let decoded = load_image_with_cookie_policy(
+                        &page,
+                        &url,
+                        blobs.as_ref(),
+                        images.as_deref(),
+                        restricted,
+                    )
+                    .await;
                     let _ = tx.send(ImgLoadMsg { url, decoded }).await;
                 }
             }))
@@ -5193,6 +5204,7 @@ impl App {
         }
         self.nav_from_post = response.from_post;
         self.navigate_to(doc);
+        self.page_images = response.images.take();
         // navigate_to dropped the previous living page; install this one.
         if let Some(live) = live {
             self.live_page = Some(live.handle);
@@ -7031,6 +7043,7 @@ impl App {
         // reload retries images that failed last time.
         self.abort_image_loads();
         self.failed_images.clear();
+        self.page_images = None;
         // Capture before dropping: a doc going into history that had a
         // living engine should be revived (not restored static) on back.
         let was_live = self.live_page.is_some();
@@ -9499,21 +9512,22 @@ async fn load_one_image(
     url: &str,
     blobs: Option<&crate::js::BlobMap>,
 ) -> Option<DecodedImage> {
-    load_image_with_cookie_policy(page, url, blobs, false).await
+    load_image_with_cookie_policy(page, url, blobs, None, false).await
 }
 
 async fn load_image_with_cookie_policy(
     page: &Url,
     url: &str,
     blobs: Option<&crate::js::BlobMap>,
+    images: Option<&crate::page_images::PageImages>,
     restricted: bool,
 ) -> Option<DecodedImage> {
     // An inline SVG's `<image>` loads as an ordinary page image of its URL;
     // the outcome is also recorded for the SVG decoder (`img::inline_svg`).
     let Some(document_image) = crate::img::document_svg_image_target(url) else {
-        return load_page_image(page, url, blobs, restricted).await;
+        return load_page_image(page, url, blobs, images, restricted).await;
     };
-    let decoded = load_page_image(page, document_image.url(), blobs, restricted).await;
+    let decoded = load_page_image(page, document_image.url(), blobs, images, restricted).await;
     crate::img::record_document_svg_image(
         &document_image,
         decoded.as_ref().map(|decoded| &decoded.raw[..]),
@@ -9525,8 +9539,33 @@ async fn load_page_image(
     page: &Url,
     url: &str,
     blobs: Option<&crate::js::BlobMap>,
+    images: Option<&crate::page_images::PageImages>,
     restricted: bool,
 ) -> Option<DecodedImage> {
+    // HTML #updating-the-image-data: a live document requests its own
+    // images. Present its response instead of fetching the URL again.
+    if let Some(images) = images
+        && !url.starts_with("data:")
+        && !url.starts_with("blob:")
+    {
+        match images.presentation(url).await {
+            crate::page_images::Presentation::Image(image) => {
+                if image.status != 200 || image.body.is_empty() {
+                    return None;
+                }
+                let raw = image.body.clone();
+                let (intrinsic, has_alpha) = decoded_intrinsic(raw.clone()).await?;
+                crate::img::record_svg_intrinsic_metadata(url, &raw);
+                return Some(DecodedImage {
+                    raw,
+                    intrinsic,
+                    has_alpha,
+                });
+            }
+            crate::page_images::Presentation::Failed => return None,
+            crate::page_images::Presentation::Unavailable => {}
+        }
+    }
     // A `data:` image (a rewritten inline SVG, or a page's own data image)
     // carries its bytes — decode locally, no fetch, no SSRF concern.
     if url.starts_with("data:") {
@@ -9804,6 +9843,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -14455,6 +14495,7 @@ mod tests {
             rendered: None,
             js: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: Some(String::from("AWS WAF (challenge)")),
             from_post: false,
@@ -14516,6 +14557,7 @@ mod tests {
             rendered: None,
             js: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
@@ -15884,6 +15926,7 @@ mod tests {
                 rendered: None,
                 js: None,
                 live: None,
+                images: None,
                 declarative_refresh: None,
                 challenge: None,
                 from_post: false,

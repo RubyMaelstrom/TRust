@@ -684,18 +684,21 @@ async fn snapshot_with_images(
         }
         let base = response.url.clone();
         let blobs = response.blobs.clone();
+        // The live document owns its image requests; present its responses.
+        let images = response.images.clone();
         let restricted = rendered.cookie_restricted_images.clone();
         let results: Vec<_> = futures::stream::iter(sources)
             .map(|source| {
-                let (base, blobs) = (base.clone(), blobs.clone());
+                let (base, blobs, images) = (base.clone(), blobs.clone(), images.clone());
                 let restricted = restricted.contains(&source);
                 async move {
                     let fetched = tokio::time::timeout(
                         remaining,
-                        trust::http::fetch_graphical_image_with_cookie_policy(
+                        trust::http::fetch_presentation_image(
                             &base,
                             &source,
                             blobs.as_ref(),
+                            images.as_deref(),
                             restricted,
                         ),
                     )
@@ -736,6 +739,11 @@ async fn snapshot_with_images(
             if !controller.send_image_sizes(&sizes) {
                 break;
             }
+            // The document already learned the sizes of the images it
+            // requested itself, so the sizes alone need not change anything.
+            // Ask for a complete render after them: it reflects every image
+            // completion the actor processed, even behind a long task.
+            controller.request_live_resync();
             // A page that keeps rendering (marquees, timers) can publish
             // revisions the sizes have not reached yet: take the render only
             // once the actor has gone quiet after the first new revision.
@@ -1180,6 +1188,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            images: None,
             declarative_refresh: None,
             challenge: None,
             from_post: false,
