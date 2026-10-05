@@ -377,3 +377,284 @@ async fn resource_timing_redirect_tao_failure_is_monotone() {
     }
     final_server.abort();
 }
+
+type RequestCounts = std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>;
+
+/// A local origin serving fixed routes and counting each path's requests.
+async fn serve_counted(
+    routes: Vec<(&'static str, &'static str, Vec<u8>)>,
+    extra: &'static str,
+) -> (Url, RequestCounts, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let counts = RequestCounts::default();
+    let routes = std::sync::Arc::new(routes);
+    let served = counts.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (routes, counts) = (routes.clone(), served.clone());
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 2048];
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let path = std::str::from_utf8(&request)
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                *counts.lock().unwrap().entry(path.clone()).or_default() += 1;
+                let (status, mime, body) = routes.iter().find(|(route, ..)| *route == path).map_or(
+                    (404, "text/plain", b"missing".to_vec()),
+                    |(_, mime, body)| (200, *mime, body.clone()),
+                );
+                let head = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{extra}\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+        }
+    });
+    (url, counts, server)
+}
+
+/// Wait for a live page's rendering to contain `marker`, keeping its actor.
+async fn live_html_containing(live: &mut LivePage, marker: &str) -> String {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match live.events.recv().await {
+                Some(
+                    crate::js::PageEvt::Updated { html, outcome }
+                    | crate::js::PageEvt::Static { html, outcome },
+                ) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains(marker) {
+                        break html;
+                    }
+                }
+                Some(crate::js::PageEvt::Patched { patches, .. }) => {
+                    if let Some(patch) = patches
+                        .into_iter()
+                        .find(|patch| patch.html.contains(marker))
+                    {
+                        break patch.html;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("page actor ended before {marker}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {marker}"))
+}
+
+#[tokio::test]
+async fn document_images_report_timing_in_their_documents_and_are_fetched_once() {
+    // HTML #when-to-obtain-images / #updating-the-image-data: the parser
+    // created image's request is its document's own, delays the load event
+    // and reports an "img" entry; CSS Images 4 #fetching-images makes a
+    // stylesheet image a "css" request of its document; a nested document's
+    // image reports to that document (Resource Timing's iframe example);
+    // data: URLs report nothing (Fetch #fetch-finale). Frontends then present
+    // those responses: each image is requested exactly once.
+    let png = crate::img::red_png();
+    let html = r#"<!doctype html><head><style>body{background:url(/bg.png)}</style></head><body>
+    <img id="parsed" src="/parsed.png"><img id="inline" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+    <template id="inert"><img src="/inert.png"></template><template id="stamp"><img id="cloned" src="/cloned.png"></template>
+    <iframe id="frame" src="/child"></iframe><script>
+    const parsed = document.getElementById('parsed'), inline = document.getElementById('inline');
+    const events = [];
+    parsed.onload = () => events.push('parsed:' + parsed.complete + ':' + parsed.naturalWidth + ':' + parsed.currentSrc.endsWith('/parsed.png'));
+    inline.onload = () => events.push('inline:' + inline.naturalWidth);
+    addEventListener('load', async () => {
+      try {
+        const check = (v, m) => { if (!v) throw Error(m); };
+        const entries = name => performance.getEntriesByName(new URL(name, location.href).href, 'resource');
+        const wait = async name => { for (let i = 0; i < 250 && !entries(name).length; i++) await new Promise(r => setTimeout(r, 20)); };
+        check(events.includes('parsed:true:4:true') && events.includes('inline:1'), 'image loads precede window load: ' + events.join());
+        check(entries('/parsed.png').length === 1 && entries('/parsed.png')[0].initiatorType === 'img', 'parser img entry');
+        const e = entries('/parsed.png')[0];
+        check(e.startTime >= 0 && e.requestStart >= e.fetchStart && e.responseEnd >= e.responseStart && e.responseStatus === 200 && e.decodedBodySize > 0, 'native image timing');
+        await wait('/bg.png');
+        check(entries('/bg.png').length === 1 && entries('/bg.png')[0].initiatorType === 'css', 'css entry');
+        check(!performance.getEntriesByType('resource').some(entry => !entry.name.startsWith('http')), 'only HTTP(S) entries');
+        const child = document.getElementById('frame').contentWindow;
+        check(!entries('/child.png').length, 'nested image not reported to the parent');
+        const childEntries = child.performance.getEntriesByType('resource').filter(entry => entry.name.endsWith('/child.png'));
+        check(childEntries.length === 1 && childEntries[0].initiatorType === 'img', 'nested image reported to its document');
+        const c = child.document.getElementById('c');
+        check(c.complete && c.naturalWidth === 4, 'nested image complete before the frame load');
+        const childCss = () => child.performance.getEntriesByType('resource').filter(entry => entry.name.endsWith('/childbg.png'));
+        for (let i = 0; i < 250 && !childCss().length; i++) await new Promise(r => setTimeout(r, 20));
+        check(childCss().length === 1 && childCss()[0].initiatorType === 'css' && !entries('/childbg.png').length,
+          'nested stylesheet image reported to its document');
+        const late = new Image();
+        await new Promise((resolve, reject) => { late.onload = resolve; late.onerror = reject; late.src = '/late.png'; document.body.append(late); });
+        check(entries('/late.png').length === 1, 'script-inserted image entry');
+        // Fragment parsing and cloning create images that update their data.
+        document.body.insertAdjacentHTML('beforeend', '<img id="fragment" src="/fragment.png">');
+        const fragment = document.getElementById('fragment');
+        check(!fragment.complete && fragment.currentSrc === '', 'created image starts unavailable');
+        await new Promise((resolve, reject) => { fragment.onload = resolve; fragment.onerror = reject; });
+        document.body.append(document.getElementById('stamp').content.cloneNode(true));
+        const cloned = document.getElementById('cloned');
+        await new Promise((resolve, reject) => { cloned.onload = resolve; cloned.onerror = reject; });
+        check(entries('/fragment.png').length === 1 && entries('/cloned.png').length === 1, 'created image entries');
+        check(!entries('/inert.png').length, 'template contents stay inert');
+        document.body.setAttribute('data-images', 'ok');
+      } catch (error) { document.body.setAttribute('data-images', String(error && error.message || error)); }
+    });</script>"#;
+    let (url, counts, server) = serve_counted(
+        vec![
+            ("/", "text/html", html.as_bytes().to_vec()),
+            (
+                "/child",
+                "text/html",
+                b"<!doctype html><body style='background:url(/childbg.png)'><img id=c src=/child.png>"
+                    .to_vec(),
+            ),
+            ("/childbg.png", "image/png", png.clone()),
+            ("/parsed.png", "image/png", png.clone()),
+            ("/bg.png", "image/png", png.clone()),
+            ("/child.png", "image/png", png.clone()),
+            ("/late.png", "image/png", png.clone()),
+            ("/fragment.png", "image/png", png.clone()),
+            ("/cloned.png", "image/png", png.clone()),
+            ("/inert.png", "image/png", png.clone()),
+        ],
+        "",
+    )
+    .await;
+    let response = fetch(&Request::get(url.clone())).await.unwrap();
+    let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+    let images = response.images.clone().expect("live document image store");
+    let initial = String::from_utf8_lossy(&response.body).into_owned();
+    let rendered = if initial.contains("data-images=") {
+        initial
+    } else {
+        let mut live = response
+            .live
+            .take()
+            .expect("pending image work keeps the actor");
+        let rendered = live_html_containing(&mut live, "data-images=").await;
+        drop(live);
+        rendered
+    };
+    assert!(rendered.contains("data-images=\"ok\""), "{rendered}");
+    // A frontend presenting the rendering joins the document's responses.
+    for path in ["/parsed.png", "/bg.png", "/child.png", "/late.png"] {
+        let source = url.join(path).unwrap();
+        let bytes = fetch_presentation_image(&url, source.as_str(), None, Some(&images), false)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], &png[..], "{path}");
+    }
+    server.abort();
+    let counts = counts.lock().unwrap().clone();
+    for path in [
+        "/parsed.png",
+        "/bg.png",
+        "/child.png",
+        "/childbg.png",
+        "/late.png",
+        "/fragment.png",
+        "/cloned.png",
+    ] {
+        assert_eq!(counts.get(path), Some(&1), "{path} requests: {counts:?}");
+    }
+    assert_eq!(counts.get("/inert.png"), None, "{counts:?}");
+}
+
+#[tokio::test]
+async fn lazy_images_load_near_the_viewport_without_delaying_load() {
+    // HTML #lazy-loading-attributes: a lazy image's request waits for the
+    // lazy load intersection observer, and lazy images never delay the load
+    // event (#updating-the-image-data's "delay load event").
+    let png = crate::img::red_png();
+    let html = r#"<!doctype html><body style="margin:0"><img id="near" loading="lazy" src="/near.png" width="10" height="10">
+    <div style="height:30000px"></div><img id="far" loading="lazy" src="/far.png" width="10" height="10"><script>
+    const near = document.getElementById('near'), far = document.getElementById('far');
+    far.onload = () => document.body.setAttribute('data-far', 'loaded:' + far.complete);
+    near.onload = () => document.body.setAttribute('data-near', 'loaded');
+    addEventListener('load', () => document.body.setAttribute('data-load', String(far.complete)));
+    </script>"#;
+    let (url, counts, server) = serve_counted(
+        vec![
+            ("/", "text/html", html.as_bytes().to_vec()),
+            ("/near.png", "image/png", png.clone()),
+            ("/far.png", "image/png", png.clone()),
+        ],
+        "",
+    )
+    .await;
+    let response = fetch(&Request::get(url.clone())).await.unwrap();
+    let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+    let mut live = response.live.take().expect("lazy images keep the actor");
+    let loaded = live_html_containing(&mut live, "data-near=").await;
+    assert!(loaded.contains("data-near=\"loaded\""), "{loaded}");
+    let loaded = if loaded.contains("data-load=") {
+        loaded
+    } else {
+        live_html_containing(&mut live, "data-load=").await
+    };
+    assert!(loaded.contains("data-load=\"false\""), "{loaded}");
+    assert_eq!(counts.lock().unwrap().get("/far.png"), None);
+    live.handle
+        .try_send_user(crate::js::PageCmd::Scroll { x: 0., y: 30000. })
+        .unwrap();
+    let scrolled = live_html_containing(&mut live, "data-far=").await;
+    assert!(scrolled.contains("data-far=\"loaded:true\""), "{scrolled}");
+    drop(live);
+    server.abort();
+    let counts = counts.lock().unwrap().clone();
+    assert_eq!(counts.get("/near.png"), Some(&1), "{counts:?}");
+    assert_eq!(counts.get("/far.png"), Some(&1), "{counts:?}");
+}
+
+#[tokio::test]
+async fn cross_origin_image_timing_keeps_timing_allow_origin_privacy() {
+    // Resource Timing #sec-timing-allow-origin / Fetch "create an opaque
+    // timing info": a cross-origin image without TAO exposes only start and
+    // end; TAO grants detail. A no-CORS response never exposes sizes.
+    let png = crate::img::red_png();
+    let (opaque, _, opaque_server) =
+        serve_counted(vec![("/pixel.png", "image/png", png.clone())], "").await;
+    let (allowed, _, allowed_server) = serve_counted(
+        vec![("/pixel.png", "image/png", png.clone())],
+        "Timing-Allow-Origin: *\r\n",
+    )
+    .await;
+    let html = r#"<!doctype html><body><img src="OPAQUE"><img src="ALLOWED"><script>
+    addEventListener('load', () => {
+      try {
+        const check = (v, m) => { if (!v) throw Error(m); };
+        const [o] = performance.getEntriesByName('OPAQUE'), [a] = performance.getEntriesByName('ALLOWED');
+        check(o && o.initiatorType === 'img' && a && a.initiatorType === 'img', 'entries');
+        check(o.responseEnd >= o.startTime && o.fetchStart === o.startTime && o.requestStart === 0 &&
+          o.responseStart === 0 && o.transferSize === 0 && o.decodedBodySize === 0 && o.nextHopProtocol === '', 'opaque timing');
+        check(a.requestStart > 0 && a.responseStart >= a.requestStart && a.nextHopProtocol !== '' &&
+          a.decodedBodySize === 0 && a.transferSize === 0, 'TAO timing without body sizes');
+        document.body.setAttribute('data-tao', 'ok');
+      } catch (error) { document.body.setAttribute('data-tao', String(error && error.message || error)); }
+    });</script>"#
+        .replace("OPAQUE", opaque.join("pixel.png").unwrap().as_str())
+        .replace("ALLOWED", allowed.join("pixel.png").unwrap().as_str());
+    let (url, _, server) = serve_counted(vec![("/", "text/html", html.into_bytes())], "").await;
+    let response = fetch(&Request::get(url)).await.unwrap();
+    let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+    let rendered = super::tests::navigation_timing_snapshot_after(response, "data-tao=").await;
+    server.abort();
+    opaque_server.abort();
+    allowed_server.abort();
+    assert!(rendered.contains("data-tao=\"ok\""), "{rendered}");
+}
