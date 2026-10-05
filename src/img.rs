@@ -806,8 +806,109 @@ fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
     reader.limits(raster_limits());
-    let image = reader.decode().map_err(|e| format!("decode: {e}"))?;
-    Ok((image, mime))
+    match reader.decode() {
+        Ok(image) => Ok((image, mime)),
+        // HTML #img-error: an image is broken only when it is corrupted so
+        // fatally that its dimensions cannot be obtained. Otherwise it is
+        // completely available (the load event fires) and presents the pixel
+        // data that decoded, with the rest transparent.
+        Err(error) => decode_damaged_raster(bytes, format)
+            .map(|image| (image, mime))
+            .ok_or_else(|| format!("decode: {error}")),
+    }
+}
+
+/// The presentable image of a raster whose header decodes but whose pixel
+/// data does not, or None when its dimensions cannot be obtained either.
+fn decode_damaged_raster(bytes: &[u8], format: image::ImageFormat) -> Option<DynamicImage> {
+    match format {
+        image::ImageFormat::Png => return decode_damaged_png(bytes),
+        image::ImageFormat::Gif => return decode_damaged_gif(bytes),
+        // The JPEG decoder is tolerant and presents truncated scans itself;
+        // the remaining decoders yield no partial output.
+        _ => {}
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(raster_limits());
+    let (width, height) = reader.into_dimensions().ok()?;
+    transparent_raster(width, height)
+}
+
+/// A fully transparent image, within the raster decode limits.
+fn transparent_raster(width: u32, height: u32) -> Option<DynamicImage> {
+    let max_alloc = image::Limits::default().max_alloc.unwrap_or(u64::MAX);
+    (width > 0
+        && height > 0
+        && width <= MAX_DIMENSION
+        && height <= MAX_DIMENSION
+        && u64::from(width) * u64::from(height) * 4 <= max_alloc)
+        .then(|| DynamicImage::ImageRgba8(image::RgbaImage::new(width, height)))
+}
+
+/// Decode a GIF whose image data is damaged: the first frame's decoded rows
+/// on its logical screen, the remainder transparent.
+fn decode_damaged_gif(bytes: &[u8]) -> Option<DynamicImage> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = options.read_info(std::io::Cursor::new(bytes)).ok()?;
+    let (width, height) = (u32::from(decoder.width()), u32::from(decoder.height()));
+    let DynamicImage::ImageRgba8(mut canvas) = transparent_raster(width, height)? else {
+        return None;
+    };
+    let Ok(Some(frame)) = decoder.next_frame_info() else {
+        return Some(DynamicImage::ImageRgba8(canvas));
+    };
+    let (left, top) = (u32::from(frame.left), u32::from(frame.top));
+    let (frame_width, frame_height) = (u32::from(frame.width), u32::from(frame.height));
+    if transparent_raster(frame_width, frame_height).is_none() {
+        return Some(DynamicImage::ImageRgba8(canvas));
+    }
+    let mut pixels = vec![0; decoder.buffer_size()];
+    // A decoding error leaves the rows decoded before it in the buffer.
+    let _ = decoder.read_into_buffer(&mut pixels);
+    for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+        let (x, y) = (index as u32 % frame_width, index as u32 / frame_width);
+        if left + x < width && top + y < height {
+            canvas.put_pixel(left + x, top + y, image::Rgba(*pixel));
+        }
+    }
+    Some(DynamicImage::ImageRgba8(canvas))
+}
+
+/// Decode a PNG whose image data is damaged: rows decoded before the damage
+/// keep their pixels and the remainder is transparent. Every output carries
+/// an alpha channel, so undecoded (zero) samples are transparent.
+fn decode_damaged_png(bytes: &[u8]) -> Option<DynamicImage> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let (width, height) = (reader.info().width, reader.info().height);
+    let DynamicImage::ImageRgba8(blank) = transparent_raster(width, height)? else {
+        return None;
+    };
+    let mut buffer = vec![0; reader.output_buffer_size()?];
+    // A decoding error leaves the rows decoded before it in the buffer.
+    let _ = reader.next_frame(&mut buffer);
+    let (color, depth) = reader.output_color_type();
+    if depth != png::BitDepth::Eight {
+        return Some(DynamicImage::ImageRgba8(blank));
+    }
+    let rows = height as usize;
+    let image = match color {
+        png::ColorType::Rgba if buffer.len() >= width as usize * rows * 4 => {
+            buffer.truncate(width as usize * rows * 4);
+            image::RgbaImage::from_raw(width, height, buffer)?
+        }
+        png::ColorType::GrayscaleAlpha if buffer.len() >= width as usize * rows * 2 => {
+            buffer.truncate(width as usize * rows * 2);
+            DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_raw(width, height, buffer)?)
+                .to_rgba8()
+        }
+        _ => blank,
+    };
+    Some(DynamicImage::ImageRgba8(image))
 }
 
 /// Parse a top-level SVG in the SVG 2 secure static processing mode used for
@@ -1703,6 +1804,88 @@ pub(crate) fn red_png() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn damaged_png_data_decodes_the_rows_before_the_damage() {
+        // HTML #img-error: only an image whose dimensions cannot be obtained
+        // is broken. A PNG whose image data is truncated or fails its checksum
+        // still decodes to its declared size, keeping the rows that decoded.
+        let mut image = image::RgbImage::new(8, 64);
+        for (_, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([200, (y * 4) as u8, 50]);
+        }
+        let mut encoded = Vec::new();
+        let mut encoder = png::Encoder::new(&mut encoded, 8, 64);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_compression(png::Compression::NoCompression);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(image.as_raw())
+            .unwrap();
+        let truncated = &encoded[..encoded.len() * 3 / 5];
+        let (decoded, mime) = decode_raster(truncated).expect("dimensions are known");
+        let decoded = decoded.to_rgba8();
+        assert_eq!((mime, decoded.dimensions()), ("image/png", (8, 64)));
+        assert_eq!(
+            decoded.get_pixel(3, 0).0,
+            [200, 0, 50, 255],
+            "rows before the damage"
+        );
+        assert_eq!(
+            decoded.get_pixel(3, 63).0,
+            [0, 0, 0, 0],
+            "transparent remainder"
+        );
+        // The decoder streams IDAT data and checks the chunk's CRC at its end,
+        // so rows decoded before the mismatch is detected are presented.
+        let mut corrupt = encoded.clone();
+        let idat = corrupt
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .unwrap();
+        corrupt[idat + 200] ^= 0xFF;
+        let (decoded, _) = decode_raster(&corrupt).expect("dimensions are known");
+        assert_eq!(decoded.dimensions(), (8, 64));
+        assert_eq!(decoded.to_rgba8().get_pixel(3, 0).0, [200, 0, 50, 255]);
+        // Without readable dimensions the image is broken.
+        assert!(decode_raster(&encoded[..20]).is_err());
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image.clone())
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let mut gif = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut std::io::Cursor::new(&mut gif), image::ImageFormat::Gif)
+            .unwrap();
+        let (decoded, mime) = decode_raster(&gif[..gif.len() * 3 / 5]).expect("GIF header decodes");
+        let decoded = decoded.to_rgba8();
+        assert_eq!((mime, decoded.dimensions()), ("image/gif", (8, 64)));
+        assert_eq!(
+            decoded.get_pixel(3, 0).0[3],
+            255,
+            "GIF rows before the damage"
+        );
+        assert_eq!(
+            decoded.get_pixel(3, 63).0,
+            [0, 0, 0, 0],
+            "GIF transparent remainder"
+        );
+        // Cut inside the entropy-coded data, after the start-of-scan header.
+        let scan = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xFF, 0xDA])
+            .unwrap();
+        let (decoded, _) = decode_raster(&jpeg[..scan + 20]).expect("JPEG header decodes");
+        assert_eq!(decoded.dimensions(), (8, 64));
+        // The tolerant JPEG decoder presents what the truncated scan decoded.
+        assert_eq!(decoded.to_rgba8().get_pixel(3, 0).0[3], 255);
+        // A cut inside the header tables leaves no dimensions: broken.
+        assert!(decode_raster(&jpeg[..scan / 2]).is_err());
+    }
+
     use super::*;
     use image::GenericImageView as _;
 

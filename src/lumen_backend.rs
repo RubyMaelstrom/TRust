@@ -26042,6 +26042,20 @@ mod tests {
                 imageResults.push('broken:' + brokenImage.complete + ':' + brokenImage.naturalWidth + ':' + event.isTrusted);
             };
             brokenImage.src = 'data:image/png,invalid';
+            // HTML #img-error: dimensions decode, so a truncated PNG is
+            // completely available, showing the rows that decoded.
+            globalThis.damagedImage = new Image();
+            damagedImage.onload = function (event) {
+                const canvas = document.createElement('canvas');
+                canvas.width = 2; canvas.height = 8;
+                const context = canvas.getContext('2d');
+                context.drawImage(damagedImage, 0, 0);
+                const top = context.getImageData(0, 0, 1, 1).data, bottom = context.getImageData(0, 7, 1, 1).data;
+                imageResults.push(['damaged', damagedImage.complete, damagedImage.naturalWidth,
+                    damagedImage.naturalHeight, event.isTrusted, top[0], top[3], bottom[3]].join(':'));
+            };
+            damagedImage.onerror = function () { imageResults.push('damaged:error'); };
+            damagedImage.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAAICAIAAABcT7kVAAAAQ0lEQVR4AQE4AMf/AMgAMsgAMgDIHjLIHjIAyDwyyDwyAMhaMshaMg==';
             globalThis.initialImageState = [goodImage.complete, goodImage.naturalWidth, imageResults.length].join(':');
         "#, "detached image requests").unwrap();
         assert_eq!(string_value(&mut engine, "initialImageState"), "false:0:0");
@@ -26080,7 +26094,8 @@ mod tests {
         }
         assert_eq!(
             string_value(&mut engine, "imageResults.sort().join('|')"),
-            "broken:true:0:true|good:true:2:1:2:1:false:true:255|opaque:true:2:1:2:1:false:true:SecurityError"
+            "broken:true:0:true|damaged:true:2:8:true:200:255:0|good:true:2:1:2:1:false:true:255|\
+             opaque:true:2:1:2:1:false:true:SecurityError"
         );
         assert_eq!(
             string_value(&mut engine, "typeof __image_binding"),
