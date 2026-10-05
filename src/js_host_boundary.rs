@@ -93,6 +93,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_rect", 1),
     ("__geometry_bind", 2),
     ("__geometry_parse_matrix", 1),
+    ("__svg_geometry", 5),
     ("__dom_elements_from_point", 5),
     ("__dom_scroll_get", 2),
     ("__dom_scroll_set", 3),

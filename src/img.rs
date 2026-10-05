@@ -26,9 +26,9 @@ mod yuv;
 #[cfg(test)]
 pub(crate) use inline_svg::document_svg_data_url_for_navigation;
 pub(crate) use inline_svg::{
-    begin_document_svg_navigation, document_svg_data_url, document_svg_image_requests,
-    document_svg_image_target, document_svg_image_url, document_svg_navigation,
-    document_svg_revision, record_document_svg_image,
+    begin_document_svg_navigation, document_svg_data_url, document_svg_geometry_tree,
+    document_svg_image_requests, document_svg_image_target, document_svg_image_url,
+    document_svg_navigation, document_svg_revision, record_document_svg_image,
 };
 
 /// Hard ceiling on decoded raster dimensions: a small download can still claim

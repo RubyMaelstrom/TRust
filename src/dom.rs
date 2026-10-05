@@ -61,6 +61,7 @@ mod rule_index;
 pub(crate) mod shadow;
 mod sheet_cache;
 mod svg_dependencies;
+pub(crate) mod svg_geometry;
 mod transitions;
 mod xml;
 

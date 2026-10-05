@@ -35,6 +35,8 @@ mod lumen_wasm;
 mod message_port_host;
 #[path = "page_spare.rs"]
 mod page_spare;
+#[path = "svg_geometry_host.rs"]
+mod svg_geometry_host;
 #[path = "text_decoder_host.rs"]
 mod text_decoder_host;
 #[path = "webgl_host.rs"]
@@ -8729,6 +8731,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_rect", 1, guarded_rect),
     ("__geometry_bind", 2, geometry_host::bind),
     ("__geometry_parse_matrix", 1, geometry_host::parse_matrix),
+    ("__svg_geometry", 5, guarded_svg_geometry),
     ("__dom_elements_from_point", 5, guarded_elements_from_point),
     ("__dom_scroll_get", 2, guarded_scroll_get),
     ("__dom_scroll_set", 3, guarded_scroll_set),
@@ -9386,6 +9389,7 @@ node_access_guards! {
     guarded_computed_style = host_computed_style, [0], Invalidate;
     guarded_offset_style = host_offset_style, [0], Invalidate;
     guarded_rect = host_rect, [0], Invalidate;
+    guarded_svg_geometry = svg_geometry_host::call, [0], Invalidate;
     guarded_scroll_get = host_scroll_get, [0], Invalidate;
     guarded_scroll_set = host_scroll_set, [0], Invalidate;
     guarded_set_hover = host_set_hover, [0], Invalidate;
@@ -21741,7 +21745,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 200, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 201, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -21752,7 +21756,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 200);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 201);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
