@@ -853,6 +853,7 @@ file and prints rows, regions, carousels, a DOM legend, and optional geometry.
 |---|---|---|
 | `TRUST_LAYOUT_FILE` | HTML file path | Required input document. |
 | `TRUST_DIAG_VP` | `WIDTHxHEIGHT` | Terminal-cell viewport. Default: `80x0`. |
+| `TRUST_DIAG_CELL` | `WIDTHxHEIGHT` | Terminal font cell size in pixels. Default: `8x16`. Text is laid out in this cell font, and row/column rounding depends on it. |
 | `TRUST_DIAG_URL` | absolute URL | Base URL for relative resources and the legend. Default: `https://store.steampowered.com/`. |
 | `TRUST_LAYOUT_GREP` | text | Restricts printed row/region output to lines containing this substring. |
 | `TRUST_LAYOUT_SPRITE` | SVG/text file path | Primes every external SVG sprite sheet referenced by `<use>` for offline replay. |

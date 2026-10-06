@@ -15476,13 +15476,22 @@ mod tests {
             } else {
                 std::collections::HashMap::new()
             };
+        // TRUST_DIAG_CELL=WxH: the terminal font's cell size in pixels
+        // (default 8x16). Row/column rounding depends on it.
+        let cell_px = std::env::var("TRUST_DIAG_CELL")
+            .ok()
+            .and_then(|v| {
+                let (w, h) = v.split_once('x')?;
+                Some((w.parse().ok()?, h.parse().ok()?))
+            })
+            .unwrap_or((8, 16));
         let doc = parse_seeded(
             &url,
             "text/html",
             &html,
             w,
             vh,
-            (8, 16),
+            cell_px,
             None,
             &images,
             &alpha,
