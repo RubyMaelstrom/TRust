@@ -1141,8 +1141,9 @@ pub struct Output {
 }
 
 /// Lay an HTML document for a terminal content area. The fragment pass uses
-/// `viewport.css_viewport()`; cell metrics are consumed only by the terminal
-/// adapter after canonical layout.
+/// `viewport.css_viewport()` and measures text in the terminal's cell font
+/// (`crate::text::cells`); edges become cells only in the terminal adapter
+/// after canonical layout.
 pub fn lay_out_document(
     dom: &Dom,
     base: &Url,
@@ -1154,6 +1155,7 @@ pub fn lay_out_document(
     // compositor groups only image overlaps where an upper image is transparent.
     alpha: &HashMap<String, bool>,
 ) -> Output {
+    let _cells = crate::text::cell_metrics_scope(viewport.cell_metrics());
     let css = viewport.css_viewport();
     let pixel = lay_out_graphical(dom, base, css, forms, controls, images);
     adapt_terminal(&pixel, viewport, alpha)
@@ -1437,6 +1439,7 @@ pub fn lay_subtree_fragment(
     _sub_box: bool,
     quantization_phase: (f32, f32),
 ) -> crate::layout2::SubtreeFragment {
+    let _cells = crate::text::cell_metrics_scope(viewport.cell_metrics());
     let cols = content_width.max(1);
     let cell_w = viewport.cell_width;
     let cell_h = viewport.cell_height;
@@ -1562,6 +1565,7 @@ pub fn lay_region_fragment(
     images: &ImageSizes,
     boundary: NodeId,
 ) -> terminal::RegionBuffer {
+    let _cells = crate::text::cell_metrics_scope(viewport.cell_metrics());
     let cols = content_width.max(1);
     let cell_w = viewport.cell_width;
     let cell_h = viewport.cell_height;
@@ -3815,6 +3819,156 @@ mod tests {
         for (fr, fullr) in sub.rows.iter().zip(full_rows.iter()) {
             assert!(row_text(fullr).ends_with(&row_text(fr)), "{fr:?} {fullr:?}");
         }
+    }
+
+    /// The words of every row, split at a terminal column: (left, right).
+    fn split_words(out: &Output, column: usize) -> (Vec<String>, Vec<String>) {
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for row in &out.rows {
+            let text: Vec<char> = row_text(row).chars().collect();
+            let cut = column.min(text.len());
+            let words = |chars: &[char]| {
+                chars
+                    .iter()
+                    .collect::<String>()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+            left.extend(words(&text[..cut]));
+            right.extend(words(&text[cut..]));
+        }
+        (left, right)
+    }
+
+    #[test]
+    fn terminal_text_wraps_inside_its_own_column() {
+        // CSS Fonts 4 #font-matching-algorithm: the terminal lays text out in
+        // the cell font it renders, so each column breaks its lines at its own
+        // width in cells. Proportional advances painted one glyph per cell
+        // used to spill every line into the neighbouring column.
+        let left = "mastodon.sdf.org is one of the many independent Mastodon servers you can use";
+        let right = "These are the most recent public posts from people whose accounts are hosted";
+        let out = lay(
+            &format!(
+                r#"<body style="margin:0;font:15px/1.5 sans-serif"><div style="display:flex">
+                     <p style="width:160px;margin:0">{left}</p>
+                     <p style="width:160px;margin:0">{right}</p>
+                   </div><p id=after style="margin:0">after</p></body>"#
+            ),
+            40,
+        );
+        let (mut painted_left, painted_right) = split_words(&out, 20);
+        assert_eq!(painted_left.pop().as_deref(), Some("after"));
+        assert_eq!(painted_left, left.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(painted_right, right.split_whitespace().collect::<Vec<_>>());
+        // Canonical geometry (what CSSOM View reports) agrees with the paint:
+        // no terminal-only continuation rows push later content down.
+        let after_row = out
+            .rows
+            .iter()
+            .position(|row| row_text(row).trim() == "after")
+            .unwrap();
+        assert_eq!(out.anchor_rows["after"], after_row);
+    }
+
+    #[test]
+    fn terminal_text_lines_are_consecutive_rows_whatever_the_line_height() {
+        // A terminal glyph row has no sub-row positions: loose author line
+        // heights must not leave irregular blank rows between wrapped lines.
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0;font-size:21px;line-height:1.6;width:160px">one two three four five six seven eight nine ten eleven twelve thirteen fourteen</p><p style="margin:0">after</p></body>"#,
+            40,
+        );
+        let rows: Vec<usize> = out
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row_text(row).trim().is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        assert!(rows.len() >= 5, "{rows:?}");
+        assert_eq!(rows, (0..rows.len()).collect::<Vec<_>>(), "{:?}", out.rows);
+        assert_eq!(row_text(&out.rows[*rows.last().unwrap()]).trim(), "after");
+    }
+
+    #[test]
+    fn terminal_table_rows_keep_every_cell_line() {
+        // Hacker News: rank and title cells with `overflow:hidden`, then a
+        // smaller subtext row. Each table row's text keeps its own terminal
+        // row; the adapter used to overwrite titles with subtext.
+        let out = lay(
+            r#"<body style="font-family:Verdana"><table cellspacing=0 cellpadding=0>
+                 <tr><td style="overflow:hidden;font-size:10pt" align=right>1.</td>
+                     <td><div style="width:14px;height:10px"></div></td>
+                     <td style="overflow:hidden;font-size:10pt"><a href="/a">Beam: an open-weight model</a> (example.ai)</td></tr>
+                 <tr><td colspan=2></td><td style="font-size:7pt">395 points by someone | 123 comments</td></tr>
+                 <tr><td style="overflow:hidden;font-size:10pt" align=right>2.</td>
+                     <td><div style="width:14px;height:10px"></div></td>
+                     <td style="overflow:hidden;font-size:10pt"><a href="/b">Find the flattest route</a> (flatten.com)</td></tr>
+                 <tr><td colspan=2></td><td style="font-size:7pt">162 points by another | 54 comments</td></tr>
+               </table></body>"#,
+            80,
+        );
+        let painted: Vec<String> = out
+            .rows
+            .iter()
+            .map(row_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        let expected = [
+            "1. Beam: an open-weight model (example.ai)",
+            "395 points by someone | 123 comments",
+            "2. Find the flattest route (flatten.com)",
+            "162 points by another | 54 comments",
+        ];
+        assert_eq!(painted.len(), expected.len(), "{painted:?}");
+        for (row, text) in painted.iter().zip(expected) {
+            assert_eq!(
+                row.split_whitespace().collect::<Vec<_>>(),
+                text.split_whitespace().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn graphical_layout_stays_proportional_beside_terminal_layout() {
+        // The cell font is a terminal layout's own: graphical layout on the
+        // same thread, before and after one, measures proportional glyphs.
+        let html = r#"<body style="margin:0;font:16px sans-serif"><span id=narrow style="display:inline-block">iiiiiiii</span><br><span id=wide style="display:inline-block">MMMMMMMM</span></body>"#;
+        let widths = || {
+            let dom = Dom::parse_document(html);
+            let base = Url::parse("http://e.com/").unwrap();
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(640.0, 400.0),
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            let width = |id| layout.boxes[&dom.get_by_id(id).unwrap()].width;
+            (width("narrow"), width("wide"))
+        };
+        let before = widths();
+        assert!(before.0 < before.1, "proportional advances: {before:?}");
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let terminal = lay_out_document(
+            &dom,
+            &base,
+            TerminalViewport::new(80, 24, 8.0, 16.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            terminal.rows.iter().map(row_text).collect::<Vec<_>>()[..2],
+            ["iiiiiiii", "MMMMMMMM"]
+        );
+        assert_eq!(widths(), before);
+        assert_eq!(crate::text::cell_metrics(), None);
     }
 
     #[test]
@@ -8542,15 +8696,16 @@ b</xmp></body>"#;
     fn terminal_flex_nav_does_not_reflow_at_overflow_visible_item_edges() {
         // CSS Overflow 3 §3.1: `overflow:visible` renders content outside a
         // box instead of clipping it. The fixed-cell adapter must therefore
-        // not reinterpret every proportional flex-item edge as a new wrapping
-        // boundary. At a 10px terminal cell, these 14px sans-serif labels need
-        // more cells than their graphical advances, matching Steam's store nav.
+        // not reinterpret flex-item edges (which need not fall on cell
+        // boundaries: 32px gaps at a 10px cell) as new wrapping boundaries.
+        // The labels fit their items in the terminal's cell font, as in
+        // Steam's store nav.
         let out = lay_with_cells(
-            r#"<body style="margin:0"><nav style="display:flex;width:730px;gap:32px;font-size:14px">
+            r#"<body style="margin:0"><nav style="display:flex;width:850px;gap:32px;font-size:14px">
                 <a>Browse</a><a>Recommendations</a><a>Categories</a>
                 <a>Hardware</a><a>Ways to Play</a><a>Special Sections</a>
                </nav></body>"#,
-            73,
+            85,
             10.0,
             18.0,
         );
@@ -8662,11 +8817,12 @@ b</xmp></body>"#;
         let html = r#"<body style="margin:0;font:14px/20px Arial,sans-serif">
                  <nav style="position:fixed;left:42px;top:40px;display:flex;gap:18px">
                    <a style="width:60px;overflow:hidden;white-space:nowrap">Browse</a>
-                   <a style="width:130px;overflow:hidden;white-space:nowrap">Recommendations</a>
-                   <a style="width:85px;overflow:hidden;white-space:nowrap">Categories</a>
-                   <a style="width:75px;overflow:hidden;white-space:nowrap">Hardware</a>
+                   <a style="width:150px;overflow:hidden;white-space:nowrap">Recommendations</a>
+                   <a style="width:100px;overflow:hidden;white-space:nowrap">Categories</a>
+                   <a style="width:80px;overflow:hidden;white-space:nowrap">Hardware</a>
                  </nav>
                </body>"#;
+        // Each item is exactly as wide as its label in the 10px cell font.
         // A viewport rebuild follows the same path as the user's reliable
         // resize reproduction. Repeat the original width after narrower and
         // wider layouts so no later pass may turn an intact label into a
@@ -8810,10 +8966,11 @@ b</xmp></body>"#;
     fn terminal_atomic_inline_and_following_text_keep_their_characters() {
         // Steam's global action row combines an inline-block install button
         // with following sign-in/language text. Their canonical boxes do not
-        // overlap, but independently-rounded terminal runs can share a cell.
+        // overlap, but independently-rounded terminal runs can share a cell:
+        // here the button ends half-way through a 10px cell.
         let out = lay_with_cells(
-            r#"<body style="margin:0"><div style="width:241px;font:12px/24px Arial,sans-serif">
-                 <a style="display:inline-block;position:relative;z-index:0;width:116px"><span style="display:block;padding-left:35px">Install Steam</span></a><a>Sign in</a> | <a>language</a>
+            r#"<body style="margin:0"><div style="width:350px;font:12px/24px Arial,sans-serif">
+                 <a style="display:inline-block;position:relative;z-index:0;width:165px"><span style="display:block;padding-left:35px">Install Steam</span></a><a>Sign in</a> | <a>language</a>
                </div></body>"#,
             40,
             10.0,
@@ -8837,15 +8994,15 @@ b</xmp></body>"#;
 
     #[test]
     fn terminal_preserves_a_canonically_fitting_run_across_a_real_clip() {
-        // A proportional run can fit its CSS overflow clip while its terminal
-        // spelling needs several fixed cells more. The clip must distinguish
-        // canonical overflow from adapter expansion; truncating to one extra
-        // cell produces the widespread `Security` -> `Securit` failure.
+        // A run can exactly fit its CSS overflow clip. The clip must
+        // distinguish canonical overflow from quantization at its edge;
+        // truncating by one cell produces the widespread `Security` ->
+        // `Securit` failure.
         let out = lay_with_cells(
             r#"<body style="margin:0;font:12px/20px monospace">
                  <nav style="display:flex;gap:40px">
-                   <span style="display:block;width:60px;overflow:hidden;white-space:nowrap">Security</span>
-                   <span style="display:block;width:132px;overflow:hidden;white-space:nowrap">Apache-2.0 License</span>
+                   <span style="display:block;width:80px;overflow:hidden;white-space:nowrap">Security</span>
+                   <span style="display:block;width:180px;overflow:hidden;white-space:nowrap">Apache-2.0 License</span>
                  </nav>
                </body>"#,
             40,
@@ -10648,14 +10805,14 @@ b</xmp></body>"#;
     #[test]
     fn overflow_hidden_truncates_a_wide_line() {
         // Horizontal clipping is resolved from canonical shaped clusters,
-        // before the 64px box becomes eight terminal cells. In the default
-        // proportional face only seven complete/intersecting glyph clusters
-        // fit; fixed-cell character counting must not invent an eighth.
+        // before the 64px box becomes terminal cells. The terminal lays text
+        // out in its cell font, so exactly eight 8px glyph cells fit; the
+        // ninth is clipped, not squeezed in.
         let out = lay(
             r#"<body style="margin:0"><div style="width:64px;overflow:hidden;white-space:nowrap;margin:0">abcdefghijklmnop</div></body>"#,
             40,
         );
-        assert_eq!(row_text(&out.rows[0]), "abcdefg");
+        assert_eq!(row_text(&out.rows[0]), "abcdefgh");
     }
 
     #[test]
@@ -10674,12 +10831,12 @@ b</xmp></body>"#;
 
     #[test]
     fn overflow_hidden_preserves_a_fitting_word_at_a_fractional_internal_edge() {
-        // The same case inside a page: the box starts one terminal cell in,
-        // and its 51px right edge quantizes to seven cells although the shaped
-        // word occupies eight terminal cells. The hidden line has no vertical
-        // reflow room, so the intersected edge cell must be retained.
+        // The same case inside a page: the box starts half a terminal cell
+        // in, so its right edge falls at 8.5 cells while the word fills its
+        // eight cells exactly. The hidden line has no vertical reflow room,
+        // so the intersected edge cell must be retained.
         let out = lay(
-            r#"<body style="margin:0"><div style="margin-left:8px;width:51px;font-size:12px;overflow:hidden;white-space:nowrap">Palworld</div></body>"#,
+            r#"<body style="margin:0"><div style="margin-left:4px;width:64px;font-size:12px;overflow:hidden;white-space:nowrap">Palworld</div></body>"#,
             20,
         );
         assert!(row_text(&out.rows[0]).contains("Palworld"));

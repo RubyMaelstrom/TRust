@@ -27,9 +27,11 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::core::{ImeAction, Key, KeyInput, KeyState};
 
+mod cells;
 mod layout_cache;
 mod outline;
 pub use crate::font_system::FontSet;
+pub use cells::CellMetrics;
 pub(crate) use outline::{append_glyph_path, append_text_path, x_height};
 
 /// CSS-facing text style. No Parley, Glifo, or renderer type escapes this
@@ -744,6 +746,9 @@ struct TextSystem {
     layout_cache: layout_cache::Cache,
     /// Emoji-presentation family lists by (font set, CSS family list).
     emoji_families: HashMap<(u64, String), Arc<str>>,
+    /// The terminal frontend's cell font, when this thread lays out for it
+    /// (see `cells`). `None` keeps proportional shaping.
+    cells: Option<CellMetrics>,
     #[cfg(test)]
     shaped_input_bytes: usize,
 }
@@ -830,6 +835,7 @@ impl TextSystem {
             shape_cache_bytes: 0,
             layout_cache: Default::default(),
             emoji_families: HashMap::new(),
+            cells: None,
             #[cfg(test)]
             shaped_input_bytes: 0,
         }
@@ -882,24 +888,7 @@ impl TextSystem {
 
     fn shape_uncached(&mut self, text: &str, style: &TextStyle, quantize: bool) -> ShapedText {
         if text.is_empty() || style.size <= 0.0 {
-            // CSS2 #leading / #strut: a zero-size font has zero ascent and
-            // descent, but an absolute line-height still contributes its
-            // full leading, split equally above and below the baseline.
-            let line_height = if !text.is_empty() {
-                match style.line_height {
-                    CssLineHeight::Length(px) => px.max(0.0),
-                    _ => 0.0,
-                }
-            } else {
-                0.0
-            };
-            return ShapedText {
-                text: text.to_string(),
-                line_height,
-                leading: line_height,
-                baseline: line_height / 2.0,
-                ..ShapedText::default()
-            };
+            return zero_size_shape(text, style);
         }
         let mut layout = self.styled_layout(text, style, quantize, None);
         layout.break_all_lines(None);
@@ -1299,6 +1288,28 @@ fn shape_cost(key: &ShapeKey, shaped: &ShapedText) -> usize {
         )
 }
 
+/// Empty text, or text in a zero-size font. CSS2 #leading / #strut: a
+/// zero-size font has zero ascent and descent, but an absolute line-height
+/// still contributes its full leading, split equally above and below the
+/// baseline.
+fn zero_size_shape(text: &str, style: &TextStyle) -> ShapedText {
+    let line_height = if !text.is_empty() {
+        match style.line_height {
+            CssLineHeight::Length(px) => px.max(0.0),
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    ShapedText {
+        text: text.to_string(),
+        line_height,
+        leading: line_height,
+        baseline: line_height / 2.0,
+        ..ShapedText::default()
+    }
+}
+
 thread_local! {
     // LayoutContext is reusable scratch storage. A thread-local owner avoids a
     // global lock across the terminal owner, desktop event loop, and live-page
@@ -1324,7 +1335,43 @@ pub(crate) fn center_in_line(shaped: &mut ShapedText, line_height: f32) {
 }
 
 pub fn shape(text: &str, style: &TextStyle) -> ShapedText {
-    TEXT.with_borrow_mut(|system| system.shape(text, style))
+    TEXT.with_borrow_mut(|system| match system.cells {
+        Some(cells) => cells::shape(text, style, cells),
+        None => system.shape(text, style),
+    })
+}
+
+/// Lay this thread's text out in the terminal's cell font (`Some`), or in
+/// proportional fonts (`None`, the default). Returns the previous setting.
+/// Only the terminal frontend's layout threads enable it; canvas text
+/// (`shape_canvas`) and text editing stay proportional regardless.
+pub fn set_cell_metrics(cells: Option<CellMetrics>) -> Option<CellMetrics> {
+    TEXT.with_borrow_mut(|system| std::mem::replace(&mut system.cells, cells))
+}
+
+/// This thread's terminal cell font, if it lays text out in cells.
+pub fn cell_metrics() -> Option<CellMetrics> {
+    TEXT.with_borrow(|system| system.cells)
+}
+
+/// Lay text out in the cell font until the returned guard drops, restoring
+/// the thread's previous setting — for terminal layouts run on shared worker
+/// threads.
+#[must_use]
+pub fn cell_metrics_scope(cells: Option<CellMetrics>) -> CellMetricsScope {
+    CellMetricsScope {
+        previous: set_cell_metrics(cells),
+    }
+}
+
+pub struct CellMetricsScope {
+    previous: Option<CellMetrics>,
+}
+
+impl Drop for CellMetricsScope {
+    fn drop(&mut self) {
+        set_cell_metrics(self.previous);
+    }
 }
 
 /// Color-only ranges share a whole-paragraph shaping pass, preserving bidi,
@@ -1394,7 +1441,10 @@ pub(crate) fn shape_canvas(text: &str, style: &TextStyle) -> ShapedText {
 
 /// CSS `ch` basis: advance measure of U+0030 ZERO in the element's font.
 pub fn zero_advance(style: &TextStyle) -> f32 {
-    shape("0", style).advance.max(style.size * 0.25)
+    TEXT.with_borrow_mut(|system| match system.cells {
+        Some(cells) => cells::zero_advance(style, cells),
+        None => system.shape("0", style).advance.max(style.size * 0.25),
+    })
 }
 
 /// Return the byte end of the first Unicode/CSS line that fits `width`.
@@ -1402,7 +1452,10 @@ pub fn zero_advance(style: &TextStyle) -> f32 {
 /// emergency wrapping. The caller remains responsible for CSS whitespace
 /// processing and for composing differently styled inline boxes.
 pub fn first_line_end(text: &str, style: &TextStyle, width: f32, breaks: TextBreakStyle) -> usize {
-    TEXT.with_borrow_mut(|system| system.first_line_end(text, style, width, breaks))
+    TEXT.with_borrow_mut(|system| match system.cells {
+        Some(cells) => cells::first_line_end(text, style, width, breaks, cells),
+        None => system.first_line_end(text, style, width, breaks),
+    })
 }
 
 /// Shape and wrap a preserved-whitespace run in a rectangular inline region.
@@ -1415,7 +1468,10 @@ pub(crate) fn wrapped_lines(
     width: f32,
     breaks: TextBreakStyle,
 ) -> Vec<ShapedText> {
-    TEXT.with_borrow_mut(|system| system.wrapped_lines(text, style, first_width, width, breaks))
+    TEXT.with_borrow_mut(|system| match system.cells {
+        Some(cells) => cells::wrapped_lines(text, style, first_width, width, breaks, cells),
+        None => system.wrapped_lines(text, style, first_width, width, breaks),
+    })
 }
 
 /// The first `max_lines` of [`wrapped_lines`], breaking only as much of a
@@ -1451,7 +1507,10 @@ pub(crate) fn wrapped_lines_limited(
 
 /// CSS min-/max-content bounds for a single styled text run.
 pub fn content_widths(text: &str, style: &TextStyle, breaks: TextBreakStyle) -> (f32, f32) {
-    TEXT.with_borrow_mut(|system| system.content_widths(text, style, breaks))
+    TEXT.with_borrow_mut(|system| match system.cells {
+        Some(cells) => cells::content_widths(text, style, breaks, cells),
+        None => system.content_widths(text, style, breaks),
+    })
 }
 
 /// CSS 2.2 §10.8.1: the baseline sits the ascent plus one half-leading

@@ -718,6 +718,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// Lay no more than this many line boxes: content past them cannot be
     /// seen (a multiline control's scrollport, `textarea_line_budget`).
     line_budget: Option<usize>,
+    /// The terminal frontend's cell font (`crate::text::cells`): line boxes
+    /// are whole rows and text sits on its row. `None` for graphical layout.
+    cells: Option<crate::text::CellMetrics>,
 }
 
 impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
@@ -806,9 +809,23 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             strut: crate::text::shape(" ", &crate::text::TextStyle::default()),
             quirky_strut_root: None,
             line_budget: None,
+            cells: crate::text::cell_metrics(),
         };
         ifc.begin_line();
         ifc
+    }
+
+    /// The vertical alignment a piece is laid with. The terminal's cell font
+    /// has no sub-row positions: `sub`/`super`, `middle` and length shifts
+    /// cannot move a run of text part of a row and never warrant a row of
+    /// their own, so text stays on the line's baseline. Atomic inline boxes
+    /// keep their CSS 2.2 §10.8.1 alignment.
+    fn piece_align(&self, piece: &Piece) -> VerticalAlign {
+        if self.cells.is_some() && piece.text_style.is_some() && !piece.atom_box {
+            VerticalAlign::Baseline
+        } else {
+            piece.vertical_align
+        }
     }
 
     /// Size a block-level replaced element laid by `block_atom_content`
@@ -922,12 +939,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // top-aligned slide as an ascent adds an unnecessary descender gap.
         let edge_aligned_height = pieces
             .iter()
-            .filter(|p| matches!(p.vertical_align, VerticalAlign::Top | VerticalAlign::Bottom))
+            .filter(|p| {
+                matches!(
+                    self.piece_align(p),
+                    VerticalAlign::Top | VerticalAlign::Bottom
+                )
+            })
             .map(Piece::layout_height)
             .fold(0.0, f32::max);
         let ascent = pieces
             .iter()
-            .map(|p| match p.vertical_align {
+            .map(|p| match self.piece_align(p) {
                 VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
                 VerticalAlign::Shift(rise) => p.ascent + rise,
                 VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 + half_x,
@@ -936,7 +958,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .fold(strut.baseline, f32::max);
         let descent = pieces
             .iter()
-            .map(|p| match p.vertical_align {
+            .map(|p| match self.piece_align(p) {
                 VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
                 VerticalAlign::Shift(rise) => p.descent - rise,
                 VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 - half_x,
@@ -2946,11 +2968,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             shift += piece.box_width - old_width;
         }
         self.pen += shift;
-        let (ascent, height) = self.line_extent(&pieces);
+        let (ascent, mut height) = self.line_extent(&pieces);
+        if let Some(cells) = self.cells
+            && pieces.iter().any(|p| p.text_style.is_some() && !p.atom_box)
+        {
+            // A terminal line of text is a whole number of rows: one, or more
+            // only for atomic boxes reaching well into another row. A line of
+            // atomic boxes alone (a block-level image's line) keeps their CSS
+            // heights; the adapter quantizes its edges.
+            height = (height / cells.height).round() * cells.height;
+        }
         let descent = height - ascent;
         let baseline = ascent;
         for p in &mut pieces {
-            p.y = match p.vertical_align {
+            p.y = match self.piece_align(p) {
                 VerticalAlign::Baseline => baseline - p.ascent,
                 VerticalAlign::Shift(rise) => baseline - p.ascent - rise,
                 VerticalAlign::Top => 0.0,

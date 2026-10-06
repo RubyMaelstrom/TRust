@@ -3131,6 +3131,15 @@ mod desktop {
         interrupt: Arc<lumen::RuntimeInterrupt>,
         warm: Option<lumen::Engine>,
     ) -> Result<LumenPage, Outcome> {
+        // A terminal page actor lays its document out in the terminal's cell
+        // font for its whole life (CSSOM View geometry then agrees with the
+        // painted cells); a graphical one never does. Set it either way: page
+        // threads outlive one navigation.
+        crate::text::set_cell_metrics(
+            env.terminal_presentation
+                .then(|| crate::http::terminal_cell_metrics(env.cell_px))
+                .flatten(),
+        );
         let mut outcome = Outcome::default();
         let viewport = crate::layout2::Viewport::new(
             f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
@@ -6402,10 +6411,10 @@ mod desktop {
                         let rendered = outcome.rendered.expect("typed presentation");
                         if outcome.animation_frame {
                             frames += 1;
-                            // Paint-only frames repaint the retained geometry
-                            // without the full presentation rebuild (which
-                            // serializes the document under test).
-                            if !html.contains("letter-spacing") {
+                            // Paint-only (color) frames repaint the retained
+                            // geometry without the full presentation rebuild
+                            // (which serializes the document under test).
+                            if html.contains("{from{color:") {
                                 assert_eq!(rendered.layout.boxes, boxes);
                                 assert!(serialized.is_empty(), "paint-only frame was rebuilt");
                             }
@@ -6443,10 +6452,11 @@ mod desktop {
                 css_animation_frames(near, true, Duration::from_millis(1000), vec![]).await;
             assert_eq!(frames, 0, "a terminal repainted an invisible color change");
             // Layout-affecting animations reach a terminal at a low rate
-            // instead of 60 Hz.
+            // instead of 60 Hz. (Not `letter-spacing`: the terminal's cell
+            // font has fixed advances, so it never changes terminal layout.)
             let spacing = r#"<!doctype html><style>body{margin:0}
                 p{margin:0;animation:s 1s linear infinite alternate}
-                @keyframes s{from{letter-spacing:0px}to{letter-spacing:40px}}</style>
+                @keyframes s{from{margin-left:0px}to{margin-left:400px}}</style>
                 <p>spreading out</p>"#;
             let (frames, _) =
                 css_animation_frames(spacing, true, Duration::from_millis(1500), vec![]).await;
@@ -7473,6 +7483,43 @@ mod desktop {
                 loaded.0
             );
             assert!(loaded.1.contains("loaded:true:4"), "{}", loaded.1);
+        }
+
+        #[test]
+        fn terminal_actors_report_geometry_in_the_cell_font_they_paint() {
+            // CSSOM View geometry comes from the layout fragments. A terminal
+            // actor lays text out in the terminal's cell font, so a run's
+            // rect is its cells; a graphical actor keeps proportional fonts.
+            let html = r#"<!doctype html><body style="margin:0;font:15px sans-serif">
+                <span id=narrow>iiiiiiii</span><br><span id=wide>MMMMMMMM</span>
+                <p id=loose style="margin:0;line-height:3">one</p>
+                <script>window.ready = true</script>"#;
+            let geometry = |terminal_presentation: bool| {
+                let mut env = PageEnv::bare(DEFAULT_URL);
+                env.terminal_presentation = terminal_presentation;
+                env.cell_px = (8, 16);
+                let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+                let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut page = load_page(html, env, host_tx, &mut host_rx, None, interrupt, None)
+                    .unwrap_or_else(|outcome| panic!("fixture load failed: {outcome:?}"));
+                render_with_observers(&mut page);
+                let value = evaluate_task(
+                    &mut page,
+                    "['narrow', 'wide', 'loose'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return r.width + 'x' + r.height; }).join(' ')",
+                    "geometry",
+                )
+                .unwrap();
+                value_string(&mut page.engine, &value)
+            };
+            assert_eq!(geometry(true), "64x16 64x16 640x16");
+            let graphical = geometry(false);
+            let widths: Vec<f32> = graphical
+                .split(' ')
+                .map(|rect| rect.split('x').next().unwrap().parse().unwrap())
+                .collect();
+            assert!(widths[0] < widths[1], "proportional advances: {graphical}");
+            assert!(graphical.ends_with("x45"), "CSS line-height: {graphical}");
+            assert_eq!(crate::text::cell_metrics(), None);
         }
 
         #[test]

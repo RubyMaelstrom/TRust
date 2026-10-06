@@ -12095,6 +12095,11 @@ mod tests {
             80.0 * f32::from(font.width.max(1)),
             10.0 * f32::from(font.height.max(1)),
         );
+        // Lay out as the terminal page actor does: in the cell font.
+        let _cells = crate::text::cell_metrics_scope(crate::http::terminal_cell_metrics((
+            font.width,
+            font.height,
+        )));
         let mut dom = crate::dom::Dom::parse_document(&page(2));
         dom.set_render_clickables(Default::default(), true);
         let changing = dom.get_by_id("changing").unwrap();
@@ -15414,11 +15419,11 @@ mod tests {
           <div style="height:40px"></div>
           <nav style="margin-left:42px;display:flex;gap:18px">
             <a style="width:60px;overflow:hidden;white-space:nowrap">Browse</a>
-            <a style="width:130px;overflow:hidden;white-space:nowrap">Recommendations</a>
-            <a style="width:85px;overflow:hidden;white-space:nowrap">Categories</a>
-            <a style="width:75px;overflow:hidden;white-space:nowrap">Hardware</a>
-            <a style="width:110px;overflow:hidden;white-space:nowrap">Ways to Play</a>
-            <a style="width:150px;overflow:hidden;white-space:nowrap">Special Sections</a>
+            <a style="width:150px;overflow:hidden;white-space:nowrap">Recommendations</a>
+            <a style="width:100px;overflow:hidden;white-space:nowrap">Categories</a>
+            <a style="width:80px;overflow:hidden;white-space:nowrap">Hardware</a>
+            <a style="width:120px;overflow:hidden;white-space:nowrap">Ways to Play</a>
+            <a style="width:160px;overflow:hidden;white-space:nowrap">Special Sections</a>
           </nav>
         </body>"#;
 
