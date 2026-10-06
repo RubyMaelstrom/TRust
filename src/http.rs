@@ -5371,6 +5371,7 @@ async fn execute_js_with_presentation(
                 device_pixel_ratio,
                 sheets,
                 frames,
+                terminal_presentation,
             )
             .await;
         }
@@ -5579,13 +5580,27 @@ async fn execute_js_with_presentation(
     let (out, rendered, outcome, live) = match first {
         Ok(Some(crate::js::PageEvt::Static { html, mut outcome })) => {
             let Some(rendered) = outcome.rendered.take() else {
-                return css_only_for_device(response, viewport, cell_px, device_pixel_ratio).await;
+                return css_only_for_device(
+                    response,
+                    viewport,
+                    cell_px,
+                    device_pixel_ratio,
+                    terminal_presentation,
+                )
+                .await;
             };
             (html, rendered, outcome, None)
         }
         Ok(Some(crate::js::PageEvt::Updated { html, mut outcome })) => {
             let Some(rendered) = outcome.rendered.take() else {
-                return css_only_for_device(response, viewport, cell_px, device_pixel_ratio).await;
+                return css_only_for_device(
+                    response,
+                    viewport,
+                    cell_px,
+                    device_pixel_ratio,
+                    terminal_presentation,
+                )
+                .await;
             };
             (html, rendered, outcome, Some(LivePage { handle, events }))
         }
@@ -5593,7 +5608,16 @@ async fn execute_js_with_presentation(
         // slow to first-paint within the timeout — a big GitHub code file).
         // Fall back to a CSS-only render so it still lays out per its own
         // stylesheets (flex gutter, collapsed menus) instead of UA defaults.
-        _ => return css_only_for_device(response, viewport, cell_px, device_pixel_ratio).await,
+        _ => {
+            return css_only_for_device(
+                response,
+                viewport,
+                cell_px,
+                device_pixel_ratio,
+                terminal_presentation,
+            )
+            .await;
+        }
     };
     // Keep source bytes for diagnostics/history. Presentation uses `rendered`
     // directly, so neither frontend reparses this body. Tests and an explicit
@@ -6534,8 +6558,14 @@ async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_
 /// every page JS won't transform — no `<script>`, `set js off`, and the
 /// `execute_js` load-timeout/early-exit fallback — so the page still lays out
 /// per its own CSS instead of UA defaults (see `crate::js::css_bake`).
+/// The terminal's cell font for a frontend with `cell_px` font pixels per
+/// cell (one CSS pixel per terminal font pixel; see `TerminalViewport`).
+pub(crate) fn terminal_cell_metrics(cell_px: (u16, u16)) -> Option<crate::text::CellMetrics> {
+    crate::text::CellMetrics::new(f32::from(cell_px.0.max(1)), f32::from(cell_px.1.max(1)))
+}
+
 pub async fn css_only(response: Response, viewport: (u16, u16), cell_px: (u16, u16)) -> Response {
-    css_only_for_device(response, viewport, cell_px, 1.0).await
+    css_only_for_device(response, viewport, cell_px, 1.0, true).await
 }
 
 async fn css_only_for_device(
@@ -6543,6 +6573,7 @@ async fn css_only_for_device(
     viewport: (u16, u16),
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
+    terminal_presentation: bool,
 ) -> Response {
     let media = response
         .content_type
@@ -6566,6 +6597,7 @@ async fn css_only_for_device(
         device_pixel_ratio,
         sheets,
         None,
+        terminal_presentation,
     )
     .await
 }
@@ -6581,6 +6613,7 @@ async fn css_only_with_sheets(
     device_pixel_ratio: f32,
     sheets: Vec<(String, String)>,
     frames: Option<HashMap<String, (Url, String)>>,
+    terminal_presentation: bool,
 ) -> Response {
     let html = decode_body(&response.content_type, &response.body);
     install_stylesheet_fonts(&html, &sheets, &response.url).await;
@@ -6605,6 +6638,11 @@ async fn css_only_with_sheets(
             }
         }
     }
+    // The terminal lays text out in its cell font from the cascade on (`ch`
+    // units resolve against it). No `.await` follows: the guard and the DOM
+    // stay on this worker thread.
+    let _cells = terminal_presentation
+        .then(|| crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px)));
     let mut dom = crate::js::css_prepare(&html, viewport, cell_px);
     if !frames.is_empty() {
         install_page_frames(&mut dom, &response.url, &frames);
@@ -7381,6 +7419,9 @@ pub fn parse_seeded(
     // layout2's overlap compositor (P8). Pass `no_alpha()` when unknown.
     alpha: &std::collections::HashMap<String, bool>,
 ) -> Doc {
+    // This is the terminal frontend's layout: measure text in its cell font
+    // from the cascade on, on whatever thread runs it.
+    let _cells = crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px));
     let width = width.max(10);
     let media = content_type
         .split(';')
@@ -7614,6 +7655,7 @@ pub fn lay_region_patch(
     images: &crate::layout2::ImageSizes,
     boundary_node: usize,
 ) -> Option<RegionPatch> {
+    let _cells = crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px));
     let diag = std::env::var_os("TRUST_DIAG_PATCH").is_some();
     let t0 = std::time::Instant::now();
     let html = decode_body("text/html; charset=utf-8", fragment_html);
@@ -7710,6 +7752,7 @@ pub fn lay_subtree_patch(
     sub_box: bool,
     quantization_phase: (f32, f32),
 ) -> Option<SubtreeLaid> {
+    let _cells = crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px));
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
     let terminal_viewport =

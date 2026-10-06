@@ -3447,9 +3447,16 @@ fn composite(
                 let end = (top as i64 + i64::from(item.height.max(1)))
                     .min(band1)
                     .max(top as i64) as usize;
+                // A run of spaces paints no glyph: like a paint-suppressed box
+                // it claims only free cells and never erases the image or text
+                // beneath it (backgrounds are `Op::Fill`s).
+                let ghost = item.invisible
+                    || (item.image.is_none()
+                        && !item.text.is_empty()
+                        && item.text.chars().all(char::is_whitespace));
                 for r in top..end {
                     ensure(&mut grid, r);
-                    if item.invisible {
+                    if ghost {
                         grid[r].stamp_ghost(c0, c1, i);
                     } else {
                         grid[r].stamp(c0, c1, i);

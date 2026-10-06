@@ -124,6 +124,11 @@ The project favors:
 
 - Layout geometry remains `f32` CSS pixels until `layout2::paint`; quantize
   edges to terminal cells exactly once at the paint boundary.
+- Terminal layouts measure text in the terminal's cell font
+  (`src/text/cells.rs`): one cell per narrow grapheme, one row per text line.
+  Terminal page actors set it for their thread; terminal-side static, CSS-only
+  and patch layouts scope it at their entry points. Graphical frontends and
+  canvas text never enable it, so their layout stays byte-identical.
 - Widths resolve top-down from containing blocks; heights resolve from content.
 - JavaScript geometry comes from layout fragments, not reconstructed painted
   text.

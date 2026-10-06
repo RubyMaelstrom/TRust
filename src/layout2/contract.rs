@@ -119,6 +119,11 @@ impl TerminalViewport {
             self.rows as f32 * self.cell_height,
         )
     }
+
+    /// The terminal's cell font, in which its layouts measure text.
+    pub fn cell_metrics(self) -> Option<crate::text::CellMetrics> {
+        crate::text::CellMetrics::new(self.cell_width, self.cell_height)
+    }
 }
 
 impl Default for TerminalViewport {
