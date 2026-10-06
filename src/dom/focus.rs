@@ -19,6 +19,12 @@ impl Dom {
         self.attr(node, "tabindex").and_then(tabindex).is_some()
     }
 
+    /// The `tabindex` attribute's value under HTML's rules for parsing
+    /// integers, when it has one.
+    pub(crate) fn tabindex_value(&self, node: NodeId) -> Option<i32> {
+        self.attr(node, "tabindex").and_then(tabindex)
+    }
+
     pub(crate) fn focused_area(&self, document: NodeId) -> Option<NodeId> {
         self.focused_areas.get(&document).copied()
     }

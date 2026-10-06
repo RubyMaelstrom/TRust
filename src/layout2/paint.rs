@@ -64,6 +64,8 @@ pub(crate) struct TerminalPaintModel {
     /// (`crate::text::cells`): every line already fits its box in cells, so
     /// the adapter quantizes positions instead of adapting proportional runs.
     cell_text: bool,
+    /// Focus containers that are not terminal links (`focus_containers`).
+    focus_only: std::collections::HashSet<NodeId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -305,6 +307,10 @@ impl TerminalPaintModel {
             );
         }
         nodes.retain(|_, node| *node != TerminalNodePaint::default());
+        let focus_only = focus_containers(dom, &links);
+        for node in &focus_only {
+            links.remove(node);
+        }
         Self {
             nodes,
             fragment_targets: crate::fragment::targets(dom),
@@ -313,6 +319,16 @@ impl TerminalPaintModel {
             page_media: None,
             media_fallbacks: dom.retained_media_controls(),
             cell_text: crate::text::cell_metrics().is_some(),
+            focus_only,
+        }
+    }
+
+    /// The terminal link an item inherits from its inline ancestors, unless
+    /// that ancestor is a focus container (`focus_containers`).
+    fn item_link(&self, link: &Option<Link>) -> Option<Link> {
+        match link {
+            Some(Link::JsClick { node, .. }) if self.focus_only.contains(node) => None,
+            link => link.clone(),
         }
     }
 
@@ -661,6 +677,47 @@ pub(crate) fn paint(
         carousels,
         composites,
     }
+}
+
+/// HTML #tabindex-value: a negative `tabindex` makes an element focusable by
+/// click and script but gives it no activation behavior. When such an element
+/// only contains other interactive content (Mastodon wraps its whole UI in one
+/// for keyboard shortcuts), it is not a terminal link of its own: a click
+/// inside still reaches the page as pointer events, while a link would turn
+/// every word it contains, and the cells over its fixed side rails, into one
+/// page-wide selectable target.
+fn focus_containers(dom: &Dom, links: &HashMap<NodeId, Link>) -> std::collections::HashSet<NodeId> {
+    let candidates: Vec<NodeId> = links
+        .iter()
+        .filter(|&(&node, link)| {
+            matches!(link, Link::JsClick { .. })
+                && dom.tabindex_value(node).is_some_and(|index| index < 0)
+                && dom.attr(node, "onclick").is_none()
+                && dom.attr(node, "role").is_none()
+                && !matches!(
+                    dom.tag_name(node),
+                    Some("a" | "button" | "summary" | "input" | "select" | "textarea")
+                )
+        })
+        .map(|(&node, _)| node)
+        .collect();
+    if candidates.is_empty() {
+        return Default::default();
+    }
+    let mut containing = std::collections::HashSet::new();
+    for &node in links.keys() {
+        let mut current = dom.parent_composed(node);
+        while let Some(parent) = current {
+            if !containing.insert(parent) {
+                break;
+            }
+            current = dom.parent_composed(parent);
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|node| containing.contains(node))
+        .collect()
 }
 
 fn has_transform(f: &Frag) -> bool {
@@ -2518,7 +2575,7 @@ fn inflow_content(
                                 image: None,
                                 emph: piece.item.emph,
                                 node: piece.item.node,
-                                link: piece.item.link.clone(),
+                                link: dom.item_link(&piece.item.link),
                                 crop: false,
                                 pixelated: false,
                                 invisible: piece.item.invisible,
@@ -2603,7 +2660,7 @@ fn inflow_content(
                     image: p.item.image.clone(),
                     emph: p.item.emph,
                     node: p.item.node,
-                    link: p.item.link.clone(),
+                    link: dom.item_link(&p.item.link),
                     crop: p.item.crop,
                     pixelated: p.item.pixelated,
                     invisible: p.item.invisible,
