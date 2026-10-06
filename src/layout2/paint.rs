@@ -60,6 +60,10 @@ pub(crate) struct TerminalPaintModel {
     has_editing_hosts: bool,
     page_media: Option<TerminalPageMedia>,
     media_fallbacks: HashMap<NodeId, url::Url>,
+    /// Canonical layout measured text in the terminal's cell font
+    /// (`crate::text::cells`): every line already fits its box in cells, so
+    /// the adapter quantizes positions instead of adapting proportional runs.
+    cell_text: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -308,6 +312,7 @@ impl TerminalPaintModel {
             links,
             page_media: None,
             media_fallbacks: dom.retained_media_controls(),
+            cell_text: crate::text::cell_metrics().is_some(),
         }
     }
 
@@ -1523,6 +1528,8 @@ pub(crate) fn line_row_map(
         /// and inline-blocks share their outer panel's terminal cursor.
         adapt_band: Option<(f32, f32)>,
         parent: usize,
+        /// The line box hosting the atomic inline box this line is inside.
+        host: Option<usize>,
     }
 
     #[derive(Clone, Copy)]
@@ -1532,6 +1539,7 @@ pub(crate) fn line_row_map(
         horizontal_item: bool,
         adapt_band: Option<(f32, f32)>,
         parent: usize,
+        host: Option<usize>,
     }
 
     #[derive(Clone, Copy)]
@@ -1560,10 +1568,28 @@ pub(crate) fn line_row_map(
                 horizontal_item: state.horizontal_item,
                 adapt_band: state.adapt_band,
                 parent: state.parent,
+                host: state.host,
             });
         }
         let child_containing_right = Some(fragment.x + fragment.w);
+        let mut previous_line: Option<&Frag> = None;
         for child in &fragment.children {
+            // An in-flow box spliced beside a line box and starting inside it
+            // is that line's atomic inline content.
+            let host = if matches!(child.kind, FragKind::Line(_)) {
+                previous_line = Some(child);
+                state.host
+            } else {
+                previous_line
+                    .filter(|line| {
+                        !child.paint.float
+                            && !child.paint.positioned
+                            && child.y >= line.y - 0.01
+                            && child.y < line.y + line.h
+                    })
+                    .map(|line| std::ptr::from_ref(line) as usize)
+                    .or(state.host)
+            };
             let independent_band = if child.paint.float || dom.independent_band(child.node) {
                 Some((child.x, child.x + child.w))
             } else {
@@ -1584,6 +1610,7 @@ pub(crate) fn line_row_map(
                     horizontal_item: state.horizontal_item || dom.horizontal_item(child.node),
                     adapt_band: child_adapt_band,
                     parent: std::ptr::from_ref(fragment) as usize,
+                    host,
                 },
                 lines,
             );
@@ -1600,6 +1627,7 @@ pub(crate) fn line_row_map(
             horizontal_item: dom.horizontal_item(root.node),
             adapt_band: None,
             parent: std::ptr::from_ref(root) as usize,
+            host: None,
         },
         &mut lines,
     );
@@ -1624,6 +1652,12 @@ pub(crate) fn line_row_map(
     let mut next_row_by_positioned_parent: HashMap<usize, i64> = HashMap::new();
     let mut last_band_parent: HashMap<Option<(i64, i64)>, usize> = HashMap::new();
     let mut flow_states: HashMap<usize, FlowState> = HashMap::new();
+    // The canonical top of each placed line, for its hosted atomic inlines.
+    let mut line_tops: HashMap<usize, f32> = HashMap::new();
+    // Cell-font layouts: rows reserved by placed lines, with their canonical
+    // horizontal extent `(end_row, left, right)`, per band. Only a line
+    // overlapping one horizontally is displaced by it.
+    let mut reserved_by_band: HashMap<Option<(i64, i64)>, Vec<RowReservation>> = HashMap::new();
     for entry in lines {
         let line = entry.line;
         let positioned = entry.positioned;
@@ -1686,7 +1720,22 @@ pub(crate) fn line_row_map(
             let state = previous_flow.expect("can_continue implies a flow state");
             state.row + state.span - 1
         });
-        let mut band_floor = next_row_by_band.get(&band).copied().unwrap_or(i64::MIN);
+        let extent = line_horizontal_extent(line);
+        let mut band_floor = if dom.cell_text {
+            // A side-by-side column (a float beside its text, a sidebar) never
+            // shares cells with this line however their rows round; a line of
+            // the same column that rounds onto a taken row moves below it.
+            let reserved = reserved_by_band.entry(band).or_default();
+            reserved.retain(|&(end_row, ..)| end_row > preferred);
+            reserved
+                .iter()
+                .filter(|&&(_, left, right)| left < extent.1 && extent.0 < right)
+                .map(|&(end_row, ..)| end_row)
+                .max()
+                .unwrap_or(i64::MIN)
+        } else {
+            next_row_by_band.get(&band).copied().unwrap_or(i64::MIN)
+        };
         let positioned_floor = next_row_by_positioned_parent
             .get(&entry.parent)
             .copied()
@@ -1722,8 +1771,20 @@ pub(crate) fn line_row_map(
             continue;
         }
         let same_band = !positioned && previous_y.is_some_and(|y| (line.y - y).abs() <= 0.01);
+        // CSS 2.2 §10.8: an atomic inline box (a tag chip, a badge, an
+        // inline-block button) is laid inside its host line box, offset by
+        // its alignment, padding and border. Its lines take rows relative to
+        // the host line's row, so a few pixels of offset can never round
+        // them onto a different row than the text beside them.
+        let hosted_row = entry
+            .host
+            .filter(|_| dom.cell_text)
+            .and_then(|host| Some((map.get(&host)?.row, *line_tops.get(&host)?)))
+            .map(|(row, top)| row + ((line.y - top) / cell_h).round() as i64);
         let row = if same_band {
             previous_row
+        } else if let Some(hosted_row) = hosted_row {
+            hosted_row
         } else if let Some(carry_row) = carry_row {
             carry_row
         } else if positioned {
@@ -1776,9 +1837,18 @@ pub(crate) fn line_row_map(
         );
         previous_y = Some(line.y);
         previous_row = row;
+        line_tops.insert(std::ptr::from_ref(line) as usize, line.y);
         if !positioned {
-            let next_row = next_row_by_band.entry(band).or_insert(i64::MIN);
-            *next_row = (*next_row).max(row + span.max(1));
+            if dom.cell_text {
+                reserved_by_band.entry(band).or_default().push((
+                    row + span.max(1),
+                    extent.0,
+                    extent.1,
+                ));
+            } else {
+                let next_row = next_row_by_band.entry(band).or_insert(i64::MIN);
+                *next_row = (*next_row).max(row + span.max(1));
+            }
             last_band_parent.insert(band, entry.parent);
         } else {
             let next_row = next_row_by_positioned_parent
@@ -1802,6 +1872,26 @@ pub(crate) fn line_row_map(
         );
     }
     map
+}
+
+/// Rows reserved by a placed line in a cell-font layout: `(end_row, left,
+/// right)`, its exclusive end row and canonical horizontal extent in pixels.
+type RowReservation = (i64, f32, f32);
+
+/// The canonical horizontal extent `[left, right)` a line box's content
+/// occupies: its pieces and atomic inline boxes (a line fragment's own width
+/// is zero; its extent lives in the pieces).
+fn line_horizontal_extent(line: &Frag) -> (f32, f32) {
+    let FragKind::Line(line_fragment) = &line.kind else {
+        return (line.x, line.x + line.w);
+    };
+    line_fragment
+        .pieces
+        .iter()
+        .chain(&line_fragment.atom_boxes)
+        .map(|piece| (line.x + piece.x, line.x + piece.x + piece.box_width))
+        .reduce(|(left, right), (l, r)| (left.min(l), right.max(r)))
+        .unwrap_or((line.x, line.x))
 }
 
 fn terminal_piece_width(piece: &super::inline::Piece, cell_w: f32, _cell_h: f32) -> usize {

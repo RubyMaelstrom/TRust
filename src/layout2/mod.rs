@@ -3931,6 +3931,68 @@ mod tests {
         }
     }
 
+    fn painted_rows(out: &Output) -> Vec<(usize, String)> {
+        out.rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (index, row_text(row).trim().to_string()))
+            .filter(|(_, text)| !text.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn terminal_float_beside_text_does_not_push_it_down() {
+        // Lobsters: a float of vote arrow and score beside each story's title
+        // and byline. A line placed in the float's column reserves its row
+        // only against content it overlaps (CSS 2.2 §9.5: line boxes beside a
+        // float are shortened, not moved below it).
+        let out = lay_with_cells(
+            r#"<body style="margin:0;font:15px sans-serif"><div style="display:flex"><div style="flex:1">
+                 <div style="float:left;width:30px"><div>^</div><div>31</div></div>
+                 <div style="margin-left:40px"><div style="padding-top:2px">Title text</div><div>byline text</div></div>
+               </div></div></body>"#,
+            40,
+            10.0,
+            20.0,
+        );
+        let rows = painted_rows(&out);
+        assert_eq!(rows[0].0, 0, "{rows:?}");
+        assert!(
+            rows[0].1.contains('^') && rows[0].1.contains("Title text"),
+            "{rows:?}"
+        );
+        assert_eq!(rows[1].0, 1, "{rows:?}");
+        assert!(
+            rows[1].1.contains("31") && rows[1].1.contains("byline text"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_inline_block_content_shares_its_host_line_row() {
+        // CSS 2.2 §10.8: a padded, bordered inline-block (a tag chip) sits in
+        // its host line box; its own line starts a few pixels lower. Those
+        // pixels straddle a row boundary here (top 7px, chip text 11px at
+        // 20px rows), yet the chip is on the same visual line as its host.
+        let out = lay_with_cells(
+            r#"<body style="margin:0;font:15px sans-serif">
+                 <div style="padding-top:7px">Title <span style="display:inline-block;padding:3px 0;border:1px solid">chip</span> domain</div>
+                 <div>byline</div>
+               </body>"#,
+            40,
+            10.0,
+            20.0,
+        );
+        let rows = painted_rows(&out);
+        assert_eq!(
+            rows.iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["Title chip domain", "byline"],
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn graphical_layout_stays_proportional_beside_terminal_layout() {
         // The cell font is a terminal layout's own: graphical layout on the
