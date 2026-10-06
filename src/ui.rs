@@ -132,8 +132,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     true,
                 );
             }
-            let doc = Paragraph::new(browser_lines(g, inner.height as usize, app.find.as_ref()))
-                .scroll((
+            let lines = browser_lines(g, inner.height as usize, app.find.as_ref());
+            // A fixed layer composited beneath the document shows through
+            // every cell the document leaves blank (CSS 2.1 Appendix E: a box
+            // paints only its own area), so the row padding is not drawn.
+            let under_layer = g.doc.laid_out()
+                && g.doc.text_view().is_none()
+                && g.doc.gopher.is_none()
+                && g.doc.gemini.is_none()
+                && g.doc.fixed.iter().any(|item| item.under_document);
+            if under_layer {
+                frame.render_widget(block, session_area);
+                render_rows_over_layer(frame.buffer_mut(), inner, &lines);
+            } else {
+                let doc = Paragraph::new(lines).scroll((
                     0,
                     g.doc.text_view().map_or(0, |view| {
                         if g.doc.gemini.is_some() && view.wrap {
@@ -143,32 +155,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         }
                     }),
                 ));
-            if g.doc.gopher.is_some() || g.doc.gemini.is_some() {
-                // Equal horizontal margins (CSS 2 §10.3.3 #blockwidth), with
-                // left-aligned lines. Keep last_inner as the full viewport:
-                // wrapping and subsequent HTTP/Telnet navigation still use it.
-                let width = g.doc.gopher.as_ref().map_or_else(
-                    || {
-                        g.doc
-                            .gemini
-                            .as_ref()
-                            .unwrap()
-                            .reading_columns
-                            .min(inner.width as usize)
-                    },
-                    |view| view.reading_columns(inner.width as usize),
-                ) as u16;
-                let content = Rect::new(
-                    inner.x + (inner.width - width) / 2,
-                    inner.y,
-                    width,
-                    inner.height,
-                );
-                app.last_content_area = content;
-                frame.render_widget(block, session_area);
-                frame.render_widget(doc, content);
-            } else {
-                frame.render_widget(doc.block(block), session_area);
+                if g.doc.gopher.is_some() || g.doc.gemini.is_some() {
+                    // Equal horizontal margins (CSS 2 §10.3.3 #blockwidth), with
+                    // left-aligned lines. Keep last_inner as the full viewport:
+                    // wrapping and subsequent HTTP/Telnet navigation still use it.
+                    let width = g.doc.gopher.as_ref().map_or_else(
+                        || {
+                            g.doc
+                                .gemini
+                                .as_ref()
+                                .unwrap()
+                                .reading_columns
+                                .min(inner.width as usize)
+                        },
+                        |view| view.reading_columns(inner.width as usize),
+                    ) as u16;
+                    let content = Rect::new(
+                        inner.x + (inner.width - width) / 2,
+                        inner.y,
+                        width,
+                        inner.height,
+                    );
+                    app.last_content_area = content;
+                    frame.render_widget(block, session_area);
+                    frame.render_widget(doc, content);
+                } else {
+                    frame.render_widget(doc.block(block), session_area);
+                }
             }
             // Second pass: overlay decoded inline images on their reserved
             // boxes. Each box encodes once to a `SlicedProtocol`; the renderer
@@ -844,6 +857,39 @@ fn render_fixed_layer(
     }
 }
 
+/// Draw document rows over a fixed layer composited beneath them, leaving
+/// every span that paints nothing — the gap padding between items, and
+/// paint-suppressed (`opacity:0`) items — undrawn, so the layer beneath shows
+/// through. `browser_rows` pads gaps with spaces so an opaque frame needs no
+/// per-cell placement; drawing that padding erased Mastodon's side rails
+/// wherever a row also held center-column content.
+fn render_rows_over_layer(buffer: &mut ratatui::buffer::Buffer, area: Rect, lines: &[Line]) {
+    let blank = |span: &Span| {
+        span.style.bg.is_none()
+            && !span
+                .style
+                .add_modifier
+                .intersects(Modifier::REVERSED | Modifier::UNDERLINED | Modifier::CROSSED_OUT)
+            && span.content.chars().all(|c| c == ' ')
+    };
+    for (line, y) in lines.iter().zip(area.top()..area.bottom()) {
+        let mut x = area.x;
+        for span in &line.spans {
+            if x >= area.right() {
+                break;
+            }
+            if blank(span) {
+                x = x.saturating_add(span.width().min(u16::MAX as usize) as u16);
+                continue;
+            }
+            let width = usize::from(area.right() - x);
+            x = buffer
+                .set_stringn(x, y, &span.content, width, line.style.patch(span.style))
+                .0;
+        }
+    }
+}
+
 /// A pinned fixed-layer row as a styled `Line`: items placed at their
 /// box-relative columns (gap-filled), coloured by kind + emphasis. `sel` is the
 /// hovered/selected item's index in `row.items` (highlighted reversed+bold).
@@ -869,6 +915,13 @@ fn fixed_row_line(
     for (idx, it) in items {
         if it.col > col {
             spans.push(Span::raw(" ".repeat((it.col - col) as usize)));
+        }
+        // Paint suppression (`opacity:0`) reserves the box but paints blank,
+        // exactly as in the scrolling document rows.
+        if it.invisible {
+            spans.push(Span::raw(" ".repeat(usize::from(it.width))));
+            col = it.col + it.width;
+            continue;
         }
         let mut style = item_kind_style(it.kind);
         if it.emph.bold {

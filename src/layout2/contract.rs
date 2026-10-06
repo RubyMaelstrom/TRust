@@ -359,6 +359,17 @@ impl Item {
     pub fn is_interactive(&self) -> bool {
         self.link.is_some()
     }
+
+    /// Whether this item's box occupies its cells in the composited terminal
+    /// frame: visible text, or an image box (decoded or alt). A run of
+    /// collapsed-away spaces does not. Paint suppression is separate
+    /// (`invisible`): an `opacity:0` box still occupies its cells for hit
+    /// testing even though it paints nothing.
+    pub fn occupies_cells(&self) -> bool {
+        self.image.is_some()
+            || self.kind == ItemKind::Image
+            || self.text.chars().any(|c| !c.is_whitespace())
+    }
 }
 
 /// One visual row: a left-to-right sequence of inline items. Empty rows
