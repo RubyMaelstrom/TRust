@@ -5490,17 +5490,19 @@ impl App {
                 }
             }
         }
-        if let Some((fi, r, i)) = self.fixed_hit_test(col, row) {
+        if let Some((fi, r, i)) = self.fixed_hit_test(col, row, false) {
             hit.hover = Self::hover_resolve(g, &g.doc.fixed[fi].rows[r].items[i]);
             hit.fixed = Some((fi, r, i));
             return hit;
         }
         if !self.mouse_in_content_area(col, row) || !g.doc.laid_out() {
+            self.under_document_hit(col, row, &mut hit);
             return hit;
         }
         let local_row = row.saturating_sub(self.last_content_area.y) as usize;
         let doc_row = g.scroll + local_row;
         if doc_row >= g.doc.rows.len() {
+            self.under_document_hit(col, row, &mut hit);
             return hit;
         }
         let local_col = col.saturating_sub(self.last_content_area.x);
@@ -5542,6 +5544,10 @@ impl App {
             hit.item = Some((r, i));
             return hit;
         }
+        // Whether any document box paints this cell. An under-document fixed
+        // layer is composited beneath every document row, so it can be the
+        // topmost target only where the document left the cell empty.
+        let mut covered = false;
         'rows: for r in (g.scroll..=doc_row).rev() {
             if r >= g.doc.rows.len() {
                 continue;
@@ -5562,6 +5568,7 @@ impl App {
                 if !covers {
                     continue;
                 }
+                covered |= item.occupies_cells();
                 if hit.item.is_none() && item.is_interactive() {
                     hit.item = Some((r, i));
                 }
@@ -5615,7 +5622,26 @@ impl App {
                 }
             }
         }
+        if hit.item.is_none() && !covered {
+            self.under_document_hit(col, row, &mut hit);
+        }
         hit
+    }
+
+    /// CSSOM View `elementsFromPoint` visits boxes "in paint order, starting
+    /// with the topmost box". A fixed box whose CSS 2.1 Appendix E step-8
+    /// position precedes later z-index:auto/0 positioned content is composited
+    /// beneath every document row (`FixedItem::under_document`). It is not
+    /// inert: wherever no document box covers the cell, it is the topmost box
+    /// there — Mastodon's side rails sit beside its positioned center column.
+    fn under_document_hit(&self, col: u16, row: u16, hit: &mut PointerHit) {
+        let Some(g) = self.browser.as_ref() else {
+            return;
+        };
+        if let Some((fi, r, i)) = self.fixed_hit_test(col, row, true) {
+            hit.hover = Self::hover_resolve(g, &g.doc.fixed[fi].rows[r].items[i]).or(hit.hover);
+            hit.fixed = Some((fi, r, i));
+        }
     }
 
     /// Record a pointer-target change for the live page. The run loop arms the
@@ -7303,15 +7329,22 @@ impl App {
     /// `(fixed, row, item)` index of an INTERACTIVE item under the cursor, or
     /// `None`. Fixed items pin to the viewport, so they map by SCREEN position
     /// (content-area origin + the item's `col`/`row`), NOT the scroll offset.
-    /// Later items draw on top, so scan in reverse.
-    fn fixed_hit_test(&self, col: u16, row: u16) -> Option<(usize, usize, usize)> {
+    /// Later items draw on top, so scan in reverse. `under_document` selects
+    /// which compositing pass to test: the layers drawn over the document, or
+    /// those drawn beneath it (see `under_document_hit`).
+    fn fixed_hit_test(
+        &self,
+        col: u16,
+        row: u16,
+        under_document: bool,
+    ) -> Option<(usize, usize, usize)> {
         if !self.mouse_in_content_area(col, row) {
             return None;
         }
         let g = self.browser.as_ref()?;
         let (ox, oy) = (self.last_content_area.x, self.last_content_area.y);
         for (fi, f) in g.doc.fixed.iter().enumerate().rev() {
-            if f.under_document {
+            if f.under_document != under_document {
                 continue;
             }
             if row >= oy.saturating_add(f.row) && col >= ox.saturating_add(f.col) {
@@ -7602,13 +7635,12 @@ impl App {
     /// document order; otherwise it jumps to the column-nearest item in an
     /// adjacent row. The page scrolls to keep the new selection visible.
     /// Every INTERACTIVE item in the pinned fixed layer, as `(fixed, row, item)`
-    /// addresses in reading order — the keyboard-navigable rail links.
+    /// addresses in reading order — the keyboard-navigable rail links. Layers
+    /// composited beneath the document are included: their links are painted
+    /// and pointer-reachable wherever the document leaves them uncovered.
     fn fixed_interactives(g: &BrowserView) -> Vec<(usize, usize, usize)> {
         let mut out = Vec::new();
         for (fi, f) in g.doc.fixed.iter().enumerate() {
-            if f.under_document {
-                continue;
-            }
             for (r, row) in f.rows.iter().enumerate() {
                 for (i, it) in row.items.iter().enumerate() {
                     if it.is_interactive() {
@@ -10900,6 +10932,121 @@ mod tests {
         app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
 
         assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
+    }
+
+    /// A Mastodon-shaped page: a `position:fixed` rail followed in tree order
+    /// by a positioned center column. CSS 2.1 Appendix E step 8 paints the
+    /// later z-index:auto box above the rail, so the terminal composites the
+    /// rail beneath the document (`under_document`).
+    fn under_document_rail_app() -> super::App {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(1, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = b"<body style='margin:0'>\
+            <div style='position:fixed;top:0;left:0;width:160px'>\
+              <a href='/rail'>Rail link</a><div>Rail text</div></div>\
+            <div style='position:relative;margin-left:240px'>\
+              <div>Center one</div><div>Center <a href='/center'>two</a></div></div>\
+            </body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            0,
+            &Default::default(),
+        ));
+        let g = app.browser.as_mut().unwrap();
+        assert!(
+            g.doc.fixed.len() == 1 && g.doc.fixed[0].under_document,
+            "the rail is composited beneath the later positioned column"
+        );
+        g.sel_item = None;
+        g.sel_fixed = None;
+        app
+    }
+
+    fn rail_item_point(app: &super::App, text: &str) -> (u16, u16, (usize, usize, usize)) {
+        let g = app.browser.as_ref().unwrap();
+        for (fi, layer) in g.doc.fixed.iter().enumerate() {
+            for (r, row) in layer.rows.iter().enumerate() {
+                for (i, item) in row.items.iter().enumerate() {
+                    if item.text.contains(text) {
+                        return (
+                            app.last_content_area.x + layer.col + item.col,
+                            app.last_content_area.y + layer.row + r as u16,
+                            (fi, r, i),
+                        );
+                    }
+                }
+            }
+        }
+        panic!("rail item {text:?} not found")
+    }
+
+    #[test]
+    fn under_document_fixed_rail_links_are_pointer_targets_where_uncovered() {
+        // CSSOM View #dom-document-elementsfrompoint: hit testing visits boxes
+        // topmost-first in paint order. Beside the positioned column nothing
+        // covers the rail, so its link is the target (Mastodon's side rails).
+        let mut app = under_document_rail_app();
+        let (x, y, target) = rail_item_point(&app, "Rail");
+        assert!(target.1 == 0, "the link is on the rail's first row");
+
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
+
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.sel_fixed, Some(target));
+        assert_eq!(
+            g.doc.fixed[target.0].rows[target.1].items[target.2].link,
+            Some(crate::doc::Link::Http(
+                url::Url::parse("https://example.com/rail").unwrap()
+            ))
+        );
+        // Document content still wins over the rail where it paints.
+        let (cx, cy, center) = item_point(&app, |it| it.link.is_some());
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, cx, cy));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!((g.sel_item, g.sel_fixed), (Some(center), None));
+    }
+
+    #[test]
+    fn under_document_fixed_rail_links_are_keyboard_navigable() {
+        let app = under_document_rail_app();
+        let g = app.browser.as_ref().unwrap();
+        let (_, _, target) = rail_item_point(&app, "Rail");
+        assert_eq!(super::App::fixed_interactives(g), vec![target]);
+    }
+
+    #[test]
+    fn document_rows_do_not_erase_an_under_document_rail() {
+        // A document row's gap fill is not paint: the rail beneath shows
+        // through every cell no document item occupies (CSS 2.1 Appendix E).
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = under_document_rail_app();
+        let mut terminal = Terminal::new(TestBackend::new(82, 14)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let top = app.last_content_area.y;
+        let first = row_text(top);
+        let second = row_text(top + 1);
+        assert!(
+            first.contains("Rail link") && first.contains("Center one"),
+            "{first:?}"
+        );
+        assert!(
+            second.contains("Rail text") && second.contains("Center two"),
+            "{second:?}"
+        );
     }
 
     #[test]
