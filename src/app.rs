@@ -482,6 +482,24 @@ fn tally_evt(slot: usize) {
     });
 }
 
+/// A keyboard-selectable target: a document item `(row, item)`, or an item of
+/// a pinned fixed layer `(layer, row, item)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NavTarget {
+    Doc(usize, usize),
+    Fixed(usize, usize, usize),
+}
+
+impl NavTarget {
+    /// `None` for the scrolling document, else the fixed layer's index.
+    fn layer(self) -> Option<usize> {
+        match self {
+            Self::Doc(..) => None,
+            Self::Fixed(layer, ..) => Some(layer),
+        }
+    }
+}
+
 /// Everything under the pointer at a screen cell, found by ONE walk of the
 /// pinned fixed layer and the visible rows (each row's `visual_columns`
 /// computed once). Mouse motion needs all three every event; scanning
@@ -7631,6 +7649,123 @@ impl App {
         })
     }
 
+    /// Every interactive target on screen, from the scrolling document and the
+    /// pinned fixed layers, with its screen row and `[left, right)` columns.
+    fn screen_targets(g: &BrowserView, height: usize) -> Vec<(NavTarget, usize, u16, u16)> {
+        let mut out = Vec::new();
+        let end = (g.scroll + height).min(g.doc.rows.len());
+        for r in g.scroll..end {
+            let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
+            for (i, start, width, _) in crate::layout2::visual_columns(&row, &g.doc.carousels, r) {
+                if row.items[i].is_interactive() {
+                    out.push((
+                        NavTarget::Doc(r, i),
+                        r - g.scroll,
+                        start,
+                        start.saturating_add(width.max(1)),
+                    ));
+                }
+            }
+        }
+        for (fi, layer) in g.doc.fixed.iter().enumerate() {
+            for (r, row) in layer.rows.iter().enumerate() {
+                let y = usize::from(layer.row) + r;
+                if y >= height {
+                    break;
+                }
+                for (i, item) in row.items.iter().enumerate() {
+                    if item.is_interactive() {
+                        let left = layer.col.saturating_add(item.col);
+                        out.push((
+                            NavTarget::Fixed(fi, r, i),
+                            y,
+                            left,
+                            left.saturating_add(item.width.max(1)),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Left/Right from a target into another layer — the document beside a
+    /// pinned rail, or a rail beside the document: the nearest target in that
+    /// direction by screen row, then by distance. Returns whether it moved.
+    fn http_move_across_layers(g: &mut BrowserView, height: usize, dir: i64) -> bool {
+        let current = match (g.sel_fixed, g.sel_item) {
+            (Some((fi, r, i)), _) => NavTarget::Fixed(fi, r, i),
+            (None, Some((r, i))) => NavTarget::Doc(r, i),
+            (None, None) => return false,
+        };
+        let targets = Self::screen_targets(g, height);
+        let Some(&(_, row, left, right)) = targets.iter().find(|target| target.0 == current) else {
+            return false;
+        };
+        let best = targets
+            .iter()
+            .filter(|target| target.0.layer() != current.layer())
+            .filter(|target| {
+                if dir > 0 {
+                    target.2 >= right
+                } else {
+                    target.3 <= left
+                }
+            })
+            .min_by_key(|target| {
+                let gap = if dir > 0 {
+                    target.2 - right
+                } else {
+                    left - target.3
+                };
+                (target.1.abs_diff(row), gap)
+            });
+        match best {
+            Some(&(NavTarget::Doc(r, i), ..)) => {
+                g.sel_item = Some((r, i));
+                g.sel_fixed = None;
+                true
+            }
+            Some(&(NavTarget::Fixed(fi, r, i), ..)) => {
+                g.sel_fixed = Some((fi, r, i));
+                g.sel_item = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Left/Right to the nearest link on the same row of a pinned rail.
+    fn fixed_row_step(g: &mut BrowserView, (fi, r, i): (usize, usize, usize), dir: i64) -> bool {
+        let Some(row) = g.doc.fixed.get(fi).and_then(|layer| layer.rows.get(r)) else {
+            return false;
+        };
+        let Some(col) = row.items.get(i).map(|item| item.col) else {
+            return false;
+        };
+        let next = row
+            .items
+            .iter()
+            .enumerate()
+            .filter(|&(j, item)| {
+                j != i
+                    && item.is_interactive()
+                    && if dir > 0 {
+                        item.col > col
+                    } else {
+                        item.col < col
+                    }
+            })
+            .min_by_key(|(_, item)| item.col.abs_diff(col))
+            .map(|(j, _)| j);
+        if let Some(j) = next {
+            g.sel_fixed = Some((fi, r, j));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Move the item selection. `horizontal` steps within/between rows in
     /// document order; otherwise it jumps to the column-nearest item in an
     /// adjacent row. The page scrolls to keep the new selection visible.
@@ -7669,14 +7804,33 @@ impl App {
         // items → (boundary) → rail links → (boundary) → document items.
         let fixed = Self::fixed_interactives(g);
 
-        // Selection is in a pinned rail: step through the rail links; past the
-        // end, drop back into the document.
+        // Selection is in a pinned rail: Left/Right first move along its own
+        // row, then across to the document or another rail beside it; other
+        // steps go through the rail links, and past the end drop back into
+        // the document.
         if let Some(cur) = g.sel_fixed {
-            let next = fixed
+            if horizontal
+                && (Self::fixed_row_step(g, cur, dir)
+                    || Self::http_move_across_layers(g, height, dir))
+            {
+                self.http_keep_visible();
+                return;
+            }
+            // An icon and its label are two items of one link (a rail's nav
+            // entries): step to the next different target.
+            let link_of =
+                |(fi, r, i): (usize, usize, usize)| g.doc.fixed[fi].rows[r].items[i].link.clone();
+            let current_link = link_of(cur);
+            let mut next = fixed
                 .iter()
                 .position(|&t| t == cur)
                 .map(|p| p as i64 + dir)
                 .filter(|&n| n >= 0 && (n as usize) < fixed.len());
+            while let Some(n) = next
+                && link_of(fixed[n as usize]) == current_link
+            {
+                next = Some(n + dir).filter(|&n| n >= 0 && (n as usize) < fixed.len());
+            }
             match next {
                 Some(n) => g.sel_fixed = Some(fixed[n as usize]),
                 None => {
@@ -7721,6 +7875,15 @@ impl App {
         } else {
             Self::http_step_vertical(&g.doc.rows, &g.doc.regions, cr, ci, dir)
         };
+        // Left/Right past the last target on this row moves to the pinned
+        // rail beside it before spilling into another document row.
+        if horizontal
+            && target.is_none_or(|(row, _)| row != cr)
+            && Self::http_move_across_layers(g, height, dir)
+        {
+            self.http_keep_visible();
+            return;
+        }
         if let Some(next) = target {
             g.sel_item = Some(next);
         } else if !fixed.is_empty() {
@@ -11010,6 +11173,73 @@ mod tests {
         app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, cx, cy));
         let g = app.browser.as_ref().unwrap();
         assert_eq!((g.sel_item, g.sel_fixed), (Some(center), None));
+    }
+
+    /// A rail of icon-and-label entries (two items per link) beside a feed.
+    fn rail_nav_app() -> super::App {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(1, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = b"<body style='margin:0'>\
+            <div style='position:fixed;top:0;left:0;width:160px'>\
+              <a href='/home'><span>*</span> Home</a><br>\
+              <a href='/explore'><span>#</span> Trending</a></div>\
+            <div style='position:relative;margin-left:240px'>\
+              <div>Feed <a href='/post'>post</a></div><div>More <a href='/more'>more</a></div></div>\
+            </body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            0,
+            &Default::default(),
+        ));
+        let g = app.browser.as_mut().unwrap();
+        g.sel_item = None;
+        g.sel_fixed = None;
+        app
+    }
+
+    fn selected_link(app: &super::App) -> Option<String> {
+        app.selected_link().map(|link| link.to_string())
+    }
+
+    #[test]
+    fn left_and_right_move_between_the_document_and_a_pinned_rail() {
+        let mut app = rail_nav_app();
+        let (_, _, post) = item_point(&app, |it| it.text.contains("post"));
+        app.browser.as_mut().unwrap().sel_item = Some(post);
+        app.http_move(-1, true);
+        assert_eq!(
+            selected_link(&app).as_deref(),
+            Some("https://example.com/home"),
+            "Left from the feed's first row reaches the rail entry beside it"
+        );
+        app.http_move(1, true);
+        assert_eq!(
+            selected_link(&app).as_deref(),
+            Some("https://example.com/post")
+        );
+    }
+
+    #[test]
+    fn rail_steps_skip_an_entrys_icon_and_label_twin() {
+        let mut app = rail_nav_app();
+        let (_, _, home) = rail_item_point(&app, "*");
+        app.browser.as_mut().unwrap().sel_fixed = Some(home);
+        app.http_move(1, false);
+        assert_eq!(
+            selected_link(&app).as_deref(),
+            Some("https://example.com/explore")
+        );
+        app.http_move(-1, false);
+        assert_eq!(
+            selected_link(&app).as_deref(),
+            Some("https://example.com/home")
+        );
     }
 
     #[test]

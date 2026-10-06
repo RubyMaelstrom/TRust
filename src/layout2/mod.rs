@@ -3994,6 +3994,58 @@ mod tests {
     }
 
     #[test]
+    fn terminal_focus_container_is_not_a_page_wide_link() {
+        // HTML #tabindex-value: a negative tabindex is click focusable, with
+        // no activation behavior. Mastodon wraps its whole UI in one; as a
+        // terminal link it made every word of the page one selectable target
+        // whose hit box also covered its fixed side rails.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id=wrapper tabindex=-1>
+                 <p>Plain words <a href="/next">next</a></p>
+                 <div id=lone tabindex=-1>Focusable alone</div>
+               </div></body>"#,
+        );
+        let wrapper = node_by_id(&dom, "wrapper");
+        let lone = node_by_id(&dom, "lone");
+        dom.set_render_clickables(std::collections::HashSet::from([wrapper, lone]), true);
+        let base = Url::parse("http://e.com/").unwrap();
+        let out = lay_out_document(
+            &dom,
+            &base,
+            TerminalViewport::new(40, 24, 8.0, 16.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let items: Vec<&Item> = out.rows.iter().flat_map(|row| &row.items).collect();
+        let link_of = |text: &str| {
+            items
+                .iter()
+                .find(|item| item.text.contains(text))
+                .unwrap_or_else(|| panic!("{text:?} painted"))
+                .link
+                .clone()
+        };
+        assert_eq!(link_of("Plain"), None, "text is not the wrapper's link");
+        assert!(matches!(link_of("next"), Some(crate::doc::Link::Http(_))));
+        assert!(
+            matches!(link_of("Focusable"), Some(crate::doc::Link::JsClick { node, .. }) if node == lone),
+            "a focusable element with no inner targets stays activatable"
+        );
+        assert!(
+            !out.rows
+                .iter()
+                .flat_map(|row| &row.hits)
+                .any(|hit| out.rows.iter().any(|row| row
+                    .items
+                    .get(hit.item)
+                    .is_some_and(|item| matches!(item.link, Some(crate::doc::Link::JsClick { node, .. }) if node == wrapper)))),
+            "no hit surface for the wrapper"
+        );
+    }
+
+    #[test]
     fn graphical_layout_stays_proportional_beside_terminal_layout() {
         // The cell font is a terminal layout's own: graphical layout on the
         // same thread, before and after one, measures proportional glyphs.
