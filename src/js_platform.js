@@ -20617,6 +20617,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     };
     pristineAnimationFrameMethods = animationFrameMethods();
     topAnimationFrameMethods = pristineAnimationFrameMethods;
+    // The time value of the last "update animations and send events", in
+    // this realm's clock, shared by rAF callbacks and document.timeline.
+    let documentTimelineFrame = null;
+    trust.documentTimelineTime = function () {
+        const time = documentTimelineFrame === null ? currentTime() : documentTimelineFrame;
+        return trust.performanceTimestamp ? trust.performanceTimestamp(time) : time;
+    };
     function runAnimationFrameCallbacks(now, runScroll = true) {
         if (runScroll) {
             trust.runScrollSteps();
@@ -20675,6 +20682,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const now = Math.max(currentTime(), frameTime);
         timers.now = now;
         __clockSync();
+        // Web Animations 1 #update-animations-and-send-events: the document
+        // timeline takes this rendering update's time.
+        documentTimelineFrame = frameTime;
         return runAnimationFrameCallbacks(frameTime, false);
     };
     // Background fetch (dispatch/at-rest, resident actor): the request runs OFF
@@ -21524,9 +21534,59 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         g.Animation = Animation;
         Element.prototype.animate = function (keyframes, options) { return new Animation(null, null); };
         Element.prototype.getAnimations = function () { return []; };
+        // Web Animations 1 #the-animationtimeline-interface and
+        // #the-documenttimeline-interface: a document timeline's current
+        // time is the time value of the last "update animations and send
+        // events" (the time rAF callbacks receive, on performance.now()'s
+        // scale) minus its origin time; the default timeline's is zero.
+        // The page actor samples CSS animations and transitions, and paint
+        // composites them, on this same rendering-update clock.
+        const timelineApply = Reflect.apply, timelineGet = WeakMap.prototype.get;
+        const timelineSet = WeakMap.prototype.set;
+        const timelineOrigins = new WeakMap();
+        const timelineTime = trust.documentTimelineTime;
+        class AnimationTimeline {
+            constructor() { throw new TypeError("Illegal constructor"); }
+            get currentTime() {
+                const origin = timelineApply(timelineGet, timelineOrigins, [this]);
+                if (origin === undefined) throw new TypeError("Illegal invocation");
+                return timelineTime() - origin;
+            }
+            get [Symbol.toStringTag]() { return "AnimationTimeline"; }
+        }
+        class DocumentTimeline extends AnimationTimeline {
+            constructor(options = undefined) {
+                // Web IDL dictionary: undefined/null are empty; other
+                // non-objects are a TypeError.
+                if (options !== undefined && options !== null && typeof options !== "object" &&
+                    typeof options !== "function") throw new TypeError("DocumentTimelineOptions must be a dictionary");
+                const raw = options === undefined || options === null ? undefined : options.originTime;
+                const originTime = raw === undefined ? 0 : +raw;
+                if (!Number.isFinite(originTime)) throw new TypeError("originTime must be finite");
+                const timeline = Object.create(new.target.prototype);
+                timelineApply(timelineSet, timelineOrigins, [timeline, originTime]);
+                return timeline;
+            }
+            get [Symbol.toStringTag]() { return "DocumentTimeline"; }
+        }
+        g.AnimationTimeline = AnimationTimeline;
+        g.DocumentTimeline = DocumentTimeline;
+        // Web Animations 1 #extensions-to-the-document-interface: [SameObject]
+        // default document timeline, one per Document.
+        const defaultTimelines = new WeakMap();
+        Object.defineProperty(Document.prototype, "timeline", {
+            configurable: true, enumerable: true,
+            get() {
+                let timeline = timelineApply(timelineGet, defaultTimelines, [this]);
+                if (!timeline) {
+                    timeline = new DocumentTimeline();
+                    timelineApply(timelineSet, defaultTimelines, [this, timeline]);
+                }
+                return timeline;
+            },
+        });
         if (g.document) {
             g.document.getAnimations = function () { return []; };
-            try { g.document.timeline = { currentTime: 0 }; } catch (e) {}
         }
     }
     // ECMA-402: Intl and Number/Date locale methods are provided by Lumen.

@@ -1037,6 +1037,7 @@ fn paint_in_spaces(
         canvas_images: builder.canvas_images,
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,
+        timeline_origin_ms: dom.document_timeline_origin(),
     };
     let media_fallbacks = dom.retained_media_controls();
     if builder.has_media_controls || !media_fallbacks.is_empty() {
@@ -1289,7 +1290,21 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
         .and_then(|value| super::transform::animation_steps(&value, units, viewport, reference))
         .unwrap_or_default();
     let mut animations = Vec::new();
+    let mut occurrences = std::collections::HashMap::<String, usize>::new();
     for definition in definitions {
+        let occurrence = occurrences.entry(definition.name.clone()).or_default();
+        // Web Animations 1 #playing-an-animation-section: the page actor
+        // resolved this animation's start time when it became ready (or holds
+        // its current time while paused). Without an actor, a script-free
+        // document's animations start with its timeline.
+        let (start_seconds, hold_seconds) = builder
+            .dom
+            .css_animation_clock(fragment.node, &definition.name, *occurrence)
+            .map_or(
+                (0.0, (!definition.running).then_some(0.0)),
+                |(start, hold)| (start as f32, hold.map(|hold| hold as f32)),
+            );
+        *occurrence += 1;
         let mut opacity = definition
             .keyframes
             .iter()
@@ -1362,6 +1377,8 @@ fn paint_animation_scope(fragment: &Frag, builder: &Builder<'_>) -> Option<CssAn
             fill_mode: definition.fill_mode,
             timing_function: definition.timing_function,
             running: definition.running,
+            start_seconds,
+            hold_seconds,
             position,
             transform,
             transform_origin,

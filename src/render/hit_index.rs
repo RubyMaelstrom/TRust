@@ -778,6 +778,8 @@ mod tests {
                 fill_mode: "both".into(),
                 timing_function: "linear".into(),
                 running: true,
+                start_seconds: 0.0,
+                hold_seconds: None,
                 opacity: Vec::new(),
                 position: Vec::new(),
                 transform: vec![

@@ -7727,6 +7727,72 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn document_timeline_reads_the_rendering_update_clock() {
+            // Web Animations 1 #the-documenttimeline-interface and
+            // #update-animations-and-send-events (local CSSWG snapshot
+            // 81c27f686901): the default document timeline's current time is
+            // this rendering update's time, which rAF callbacks receive; a
+            // DocumentTimeline's originTime offsets it.
+            let html = r#"<!doctype html><html><body>
+                <button id="keep">keep actor resident</button>
+                <output id="result">pending</output>
+                <script>
+                    document.getElementById("keep").addEventListener("click", () => {});
+                    const results = {
+                        same: document.timeline === document.timeline,
+                        type: document.timeline instanceof DocumentTimeline &&
+                            document.timeline instanceof AnimationTimeline,
+                        tag: Object.prototype.toString.call(document.timeline),
+                    };
+                    try { new AnimationTimeline(); results.abstract = false; }
+                    catch (e) { results.abstract = e instanceof TypeError; }
+                    try { new DocumentTimeline({ originTime: NaN }); results.finite = false; }
+                    catch (e) { results.finite = e instanceof TypeError; }
+                    requestAnimationFrame(first => {
+                        results.frame = document.timeline.currentTime === first;
+                        results.origin = new DocumentTimeline({ originTime: 100 }).currentTime ===
+                            first - 100;
+                        requestAnimationFrame(second => {
+                            results.advances = document.timeline.currentTime === second &&
+                                second >= first;
+                            document.getElementById("result").textContent =
+                                "done " + JSON.stringify(results);
+                        });
+                    });
+                </script>
+            </body></html>"#;
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(DEFAULT_URL));
+            let html = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("done {") => {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("timeline fixture failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the frames ran"),
+                    }
+                }
+            })
+            .await
+            .expect("animation frames did not run");
+            for expected in [
+                r#""same":true"#,
+                r#""type":true"#,
+                r#""tag":"[object DocumentTimeline]""#,
+                r#""abstract":true"#,
+                r#""finite":true"#,
+                r#""frame":true"#,
+                r#""origin":true"#,
+                r#""advances":true"#,
+            ] {
+                assert!(html.contains(expected), "missing {expected}: {html}");
+            }
+        }
+
+        #[tokio::test]
         async fn picture_children_are_relevant_mutations_for_their_images() {
             // WHATWG HTML #reacting-to-dom-mutations (local snapshot e5071a20)
             // and the img/source HTML element insertion and removing steps:
@@ -16955,7 +17021,7 @@ fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport
 /// resources/viewport (explicit invalidation), and activation metadata all
 /// participate in freshness. Paint is a later, independently lazy consumer.
 fn sync_css_transitions(ctx: &mut Ctx) {
-    let (dom, seconds, viewport, base) = {
+    let (dom, seconds, origin_ms, viewport, base) = {
         let state = ctx.host_mut::<HostState>().expect("DOM host");
         (
             state.dom.clone(),
@@ -16964,11 +17030,15 @@ fn sync_css_transitions(ctx: &mut Ctx) {
                 .animation_sample
                 .get()
                 .unwrap_or_else(|| (state.clock.now_ms() - state.clock.origin_ms) / 1000.),
+            // The timeline's zero on the shared `performance::now_ms` clock,
+            // where frontends sample paint-composited animations.
+            state.clock.origin_ms - state.clock.offset_ms.get(),
             state.viewport.get(),
             state.base.clone(),
         )
     };
     let mut dom = dom.borrow_mut();
+    dom.set_document_timeline_origin(origin_ms);
     // After a broad invalidation, compute the styles that the transition
     // update and box-tree construction are about to read, in parallel.
     dom.prepare_styles(viewport, &base);

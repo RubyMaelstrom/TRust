@@ -2218,7 +2218,13 @@ impl DesktopApp {
             self.css_animation_generation = generation;
             self.css_animation_started = Instant::now();
         }
-        self.css_animation_started.elapsed().as_secs_f32()
+        // A page actor's paint carries the document timeline its animation
+        // start times are measured on; a script-free document's timeline
+        // starts when this frontend first presents it.
+        self.page_layout
+            .as_ref()
+            .and_then(|page| page.layout.paint.timeline_seconds())
+            .unwrap_or_else(|| self.css_animation_started.elapsed().as_secs_f32())
     }
 
     fn cancel_heart_glide(&mut self) {

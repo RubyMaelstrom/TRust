@@ -608,11 +608,17 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
         if layout.paint.has_css_animations() {
             tokio::time::sleep(options.settle.saturating_sub(origin.elapsed())).await;
         }
+        // Web Animations #document-timelines: a page actor's paint carries
+        // the timeline its animations' start times are measured on.
+        let timeline = layout
+            .paint
+            .timeline_seconds()
+            .unwrap_or_else(|| origin.elapsed().as_secs_f32());
         let frame = trust::render::headless::render_paint_with_images(
             &layout.paint,
             CssSize::new(options.width, options.height),
             store,
-            origin.elapsed().as_secs_f32(),
+            timeline,
         )?;
         trust::render::headless::write_png(&frame, path)?;
         eprintln!("[snapshot] display list with {loaded} image(s) loaded, {failed} failed");
