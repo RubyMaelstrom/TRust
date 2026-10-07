@@ -66,6 +66,7 @@ use crate::{
         TranslationError,
         code_map::FuncEntry,
         costs::{OperatorCostStrategy, WasmOperator},
+        executor::NO_DELEGATE_TARGET,
         translator::{
             WasmTranslator,
             comparator::{
@@ -1445,6 +1446,47 @@ impl FuncTranslator {
         }
         self.instrs.pin_label(frame.handler())?;
         self.encode_rethrow_pending(&frame)?;
+        self.translate_end_try_construct(frame)
+    }
+
+    /// Translates the `delegate` that ends the body of a legacy Wasm `try`.
+    ///
+    /// # Note
+    ///
+    /// The body installs a handler like a `try` without clauses, but its dispatch re-raises the
+    /// exception at the `try` targeted by `relative_depth`, which counts the labels outside
+    /// this `try` (`valid-try-delegate`). That is the innermost `try` body at or beyond the
+    /// label: a `block`, `loop` or `if` label, and a `try` whose catch clause is executing,
+    /// pass the exception outward, and the function body passes it to the caller (legacy
+    /// exception-handling explainer, "Try-delegate blocks"). Handlers nested within the label
+    /// are skipped (`exec-throw_ref` step 16h).
+    fn translate_delegate(&mut self, relative_depth: u32) -> Result<(), Error> {
+        let mut frame = match self.stack.pop_control() {
+            ControlFrame::Try(frame) => frame,
+            ControlFrame::Unreachable(kind @ ControlFrameKind::Try) => {
+                return self.translate_end_unreachable(kind);
+            }
+            unexpected => {
+                panic!("`delegate` must end a legacy `try` body but found: {unexpected:?}")
+            }
+        };
+        let Ok(depth) = usize::try_from(relative_depth) else {
+            panic!("out of bounds depth: {relative_depth}")
+        };
+        let target = (depth..self.stack.control_height())
+            .find_map(|depth| match self.stack.peek_control(depth) {
+                ControlFrame::Try(frame) => Some(frame.try_id()),
+                _ => None,
+            })
+            .unwrap_or(NO_DELEGATE_TARGET);
+        if self.reachable {
+            self.copy_branch_params(frame.branch_params())?;
+            frame.branch_to();
+            self.encode_br(frame.label())?;
+        }
+        self.instrs.pin_label(frame.handler())?;
+        self.instrs.encode_op(Op::exception_delegate(target))?;
+        self.reachable = false;
         self.translate_end_try_construct(frame)
     }
 

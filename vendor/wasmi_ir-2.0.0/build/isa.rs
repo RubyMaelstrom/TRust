@@ -129,6 +129,13 @@ fn add_exception_ops(isa: &mut Isa) {
             Ident::ExceptionRethrow,
             [Field::new(Ident::TryId, FieldTy::U32)],
         )),
+        // Re-raises the pending exception for the `delegate` of a `try`: in the current frame
+        // only the handler of the `try` `target` may select it, and none if `target` is
+        // `u32::MAX`, which continues at the callers.
+        Op::from(GenericOp::new(
+            Ident::ExceptionDelegate,
+            [Field::new(Ident::Target, FieldTy::U32)],
+        )),
     ];
     isa.push_ops(ops);
 }

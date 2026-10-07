@@ -3,7 +3,7 @@
 //! Exception handling proposal, `document/legacy/exceptions/core/exec.rst` (local snapshot
 //! af287a73): handlers cover only their `try` body, clauses are tested in order, unmatched
 //! exceptions continue outward and `rethrow` re-raises the caught exception of an enclosing
-//! catch clause.
+//! catch clause, and `delegate` hands it to the `try` at its label.
 //!
 //! `WASMI_LEGACY_EH_DIR=/path/to/exception-handling/test/legacy/exceptions/core cargo test
 //! legacy_exception_spec -- --ignored` runs the official scripts. Modules that import or
@@ -200,6 +200,153 @@ fn catch_bodies_are_not_covered_by_their_own_handler() {
 }
 
 #[test]
+fn delegate_targets_the_try_at_its_label() {
+    // The legacy explainer's "Try-delegate blocks" example: `delegate l` counts the labels
+    // outside its `try` and hands the exception to the innermost `try` body at or beyond that
+    // label. A `block` label or a `try` whose catch clause is executing passes it outward,
+    // and the function body label passes it to the caller.
+    let (mut store, instance) = instantiate(
+        r#"
+        (module
+          (tag $e)
+          (func $throw throw $e)
+          ;; $site selects the delegate; the result names the catching clause:
+          ;; 1 = catch ($lC), 2 = catch ($lA), 3 = the caller.
+          (func $test (param $site i32) (param $in_catch i32) (result i32)
+            try $lA (result i32)
+              block $lB (result i32)
+                try $lC (result i32)
+                  local.get $in_catch
+                  if
+                    call $throw
+                  end
+                  local.get $site
+                  i32.const 0
+                  i32.eq
+                  if
+                    try
+                      call $throw
+                    delegate $lC
+                  end
+                  local.get $site
+                  i32.const 1
+                  i32.eq
+                  if
+                    try
+                      call $throw
+                    delegate $lB
+                  end
+                  local.get $site
+                  i32.const 2
+                  i32.eq
+                  if
+                    try
+                      call $throw
+                    delegate $lA
+                  end
+                  try
+                    call $throw
+                  delegate 3
+                  i32.const 0
+                catch $e
+                  local.get $in_catch
+                  i32.eqz
+                  if
+                    i32.const 1
+                    return
+                  end
+                  local.get $site
+                  i32.const 0
+                  i32.eq
+                  if
+                    try
+                      call $throw
+                    delegate $lC
+                  end
+                  local.get $site
+                  i32.const 1
+                  i32.eq
+                  if
+                    try
+                      call $throw
+                    delegate $lB
+                  end
+                  local.get $site
+                  i32.const 2
+                  i32.eq
+                  if
+                    try
+                      call $throw
+                    delegate $lA
+                  end
+                  try
+                    call $throw
+                  delegate 3
+                  i32.const 0
+                end
+              end
+            catch $e
+              i32.const 2
+            end)
+          (func (export "run") (param i32 i32) (result i32)
+            try (result i32)
+              local.get 0
+              local.get 1
+              call $test
+            catch $e
+              i32.const 3
+            end))
+        "#,
+    );
+    // In the body of `try $lC`: the delegates to $lC, $lB, $lA and the function body.
+    let body = [1, 2, 2, 3];
+    // In the catch clause of `try $lC`, whose handler is no longer active.
+    let in_catch = [2, 2, 2, 3];
+    for (site, (body, in_catch)) in body.into_iter().zip(in_catch).enumerate() {
+        let site = Val::I32(site as i32);
+        assert_eq!(
+            call_i32(&mut store, instance, "run", &[site.clone(), Val::I32(0)]),
+            Ok(body),
+            "body {site:?}"
+        );
+        assert_eq!(
+            call_i32(&mut store, instance, "run", &[site.clone(), Val::I32(1)]),
+            Ok(in_catch),
+            "catch {site:?}"
+        );
+    }
+}
+
+#[test]
+fn delegate_skips_handlers_of_enclosing_frames_only_in_its_own_frame() {
+    // A delegate to the function body continues at the caller's handlers, while an
+    // exception that is not delegated is still caught by the innermost handler.
+    let (mut store, instance) = instantiate(
+        r#"
+        (module
+          (tag $e (param i32))
+          (func $inner (param i32)
+            try
+              try
+                local.get 0
+                throw $e
+              delegate 1
+            catch $e
+              drop
+            end)
+          (func (export "run") (param i32) (result i32)
+            try (result i32)
+              local.get 0
+              call $inner
+              i32.const -1
+            catch $e
+            end))
+        "#,
+    );
+    assert_eq!(call_i32(&mut store, instance, "run", &[Val::I32(7)]), Ok(7));
+}
+
+#[test]
 fn unsupported_exception_operators_fail_translation() {
     let mut config = wasmi::Config::default();
     config.compilation_mode(wasmi::CompilationMode::Eager);
@@ -209,9 +356,11 @@ fn unsupported_exception_operators_fail_translation() {
         (module
           (tag $e)
           (func
-            try
-              throw $e
-            delegate 0))
+            block
+              try_table (catch_all 0)
+                throw $e
+              end
+            end))
         "#,
     )
     .unwrap();
@@ -540,7 +689,7 @@ fn run_script(path: &Path) -> (usize, usize) {
 #[ignore]
 fn legacy_exception_spec() {
     let dir = std::env::var_os("WASMI_LEGACY_EH_DIR").expect("set WASMI_LEGACY_EH_DIR");
-    for script in ["throw.wast", "try_catch.wast", "rethrow.wast"] {
+    for script in ["throw.wast", "try_catch.wast", "rethrow.wast", "try_delegate.wast"] {
         let (passed, skipped) = run_script(&Path::new(&dir).join(script));
         std::println!("{script}: {passed} directives, {skipped} skipped");
     }

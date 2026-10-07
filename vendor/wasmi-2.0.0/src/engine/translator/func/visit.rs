@@ -277,9 +277,11 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
         Ok(())
     }
 
+    /// TRust: legacy exception handling (`document/legacy/exceptions/core/exec.rst`,
+    /// `exec-try-delegate`).
     #[inline(never)]
-    fn visit_delegate(&mut self, _relative_depth: u32) -> Self::Output {
-        Err(Error::from(TranslationError::UnsupportedOperator("delegate")))
+    fn visit_delegate(&mut self, relative_depth: u32) -> Self::Output {
+        self.translate_delegate(relative_depth)
     }
 
     #[inline(never)]
