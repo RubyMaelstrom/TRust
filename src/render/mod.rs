@@ -398,6 +398,45 @@ impl PagePaint {
             || self.top_layer.iter().any(|entry| has(&entry.primitives))
     }
 
+    /// How many seconds after `elapsed_seconds` on the document timeline the
+    /// paint next changes: `Some(0.0)` while a CSS animation is in play or a
+    /// marquee moves, the time until a delayed animation's active phase
+    /// begins, and `None` once nothing can change without a new paint.
+    ///
+    /// Web Animations 1 #animation-effect-phases-and-states: only an effect
+    /// in its active phase has an active time that changes each frame. In the
+    /// after phase its value is constant (filled or absent), and a before
+    /// phase ends at the before-active boundary time. This retained model
+    /// plays each running animation at rate 1 from the start of the document
+    /// timeline and holds a paused one at time zero (see
+    /// `css_animation_progress`), so a paused animation never needs a frame.
+    pub fn css_animation_wake(&self, elapsed_seconds: f32) -> Option<f32> {
+        let mut wake: Option<f32> = None;
+        let mut visit = |commands: &[Primitive]| {
+            for command in commands {
+                let next = match command {
+                    Primitive::BeginCssAnimation(scope) => scope
+                        .animations
+                        .iter()
+                        .filter_map(|animation| css_animation_wake(animation, elapsed_seconds))
+                        .reduce(f32::min),
+                    Primitive::BeginMarquee(scope) => scope.running.then_some(0.0),
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    wake = Some(wake.map_or(next, |wake| wake.min(next)));
+                }
+            }
+        };
+        visit(&self.primitives);
+        visit(&self.fixed_under_primitives);
+        visit(&self.fixed_primitives);
+        for entry in &self.top_layer {
+            visit(&entry.primitives);
+        }
+        wake
+    }
+
     // The Lumen host visitor consumes this inventory.
     pub(crate) fn retained_memory(&self) -> (usize, bool) {
         let PagePaint {
@@ -2940,6 +2979,27 @@ fn sample_css_animation_opacity(scope: &CssAnimationScope, elapsed_seconds: f32)
         .map(|opacity| opacity.clamp(0.0, 1.0))
 }
 
+/// When one animation's sampled value next changes; see
+/// [`PagePaint::css_animation_wake`]. Mirrors `css_animation_progress`: an
+/// effect without a positive duration or iteration count never applies, and
+/// the active interval spans `duration * iteration count` after the delay.
+fn css_animation_wake(animation: &CssPaintAnimation, elapsed_seconds: f32) -> Option<f32> {
+    if !animation.running || animation.duration_seconds <= 0.0 {
+        return None;
+    }
+    let local = elapsed_seconds - animation.delay_seconds;
+    if local < 0.0 {
+        // Before phase: constant until the before-active boundary time.
+        return Some(-local);
+    }
+    match animation.iteration_count {
+        // `infinite`: the active phase never ends.
+        None => Some(0.0),
+        Some(count) if count <= 0.0 => None,
+        Some(count) => (local < animation.duration_seconds * count).then_some(0.0),
+    }
+}
+
 fn css_animation_progress(animation: &CssPaintAnimation, elapsed_seconds: f32) -> Option<f32> {
     if animation.duration_seconds <= 0.0 {
         return None;
@@ -4669,6 +4729,80 @@ mod tests {
             sample_css_animation_scope(&scope, 5.0),
             Affine2d::translate(60.0, 330.0)
         );
+    }
+
+    #[test]
+    fn css_animation_wake_follows_the_effect_phases() {
+        // Web Animations 1 #animation-effect-phases-and-states: only the
+        // active phase changes each frame; a before phase ends at the
+        // before-active boundary, and the after phase is constant whatever
+        // the fill. reflection.ai's finished `both`-filled hero intro kept
+        // trust-desktop presenting identical frames at 60 Hz.
+        let animation =
+            |delay: f32, count: Option<f32>, fill: &str, running: bool| CssPaintAnimation {
+                name: "intro".into(),
+                duration_seconds: 4.0,
+                delay_seconds: delay,
+                iteration_count: count,
+                direction: "normal".into(),
+                fill_mode: fill.into(),
+                timing_function: "ease".into(),
+                running,
+                opacity: vec![
+                    CssAnimationPoint {
+                        offset: 0.0,
+                        value: CssPoint::new(0.0, 0.0),
+                    },
+                    CssAnimationPoint {
+                        offset: 1.0,
+                        value: CssPoint::new(1.0, 0.0),
+                    },
+                ],
+                position: Vec::new(),
+                transform: Vec::new(),
+                transform_origin: CssPoint::default(),
+                static_transform: Affine2d::IDENTITY,
+            };
+        let page = |animations: Vec<CssPaintAnimation>| PagePaint {
+            primitives: vec![
+                Primitive::BeginCssAnimation(CssAnimationScope { animations }),
+                Primitive::EndCssAnimation,
+            ],
+            ..PagePaint::default()
+        };
+        let both = page(vec![animation(1.2, Some(1.0), "both", true)]);
+        assert_eq!(both.css_animation_wake(0.2), Some(1.0), "before phase");
+        assert_eq!(
+            both.css_animation_wake(1.2),
+            Some(0.0),
+            "active phase start"
+        );
+        assert_eq!(both.css_animation_wake(5.19), Some(0.0), "still active");
+        assert_eq!(both.css_animation_wake(5.25), None, "after phase, filled");
+        assert_eq!(both.css_animation_wake(60.0), None);
+        // A paused animation is held at time zero; nothing advances.
+        let paused = page(vec![animation(1.2, Some(1.0), "both", false)]);
+        assert_eq!(paused.css_animation_wake(2.0), None);
+        // `infinite` never leaves the active phase; fractional counts end.
+        let infinite = page(vec![animation(0.0, None, "none", true)]);
+        assert_eq!(infinite.css_animation_wake(1_000.0), Some(0.0));
+        let partial = page(vec![animation(0.0, Some(1.5), "forwards", true)]);
+        assert_eq!(partial.css_animation_wake(5.9), Some(0.0));
+        assert_eq!(partial.css_animation_wake(6.0), None);
+        // Zero iterations never apply.
+        assert_eq!(
+            page(vec![animation(0.0, Some(0.0), "both", true)]).css_animation_wake(0.0),
+            None
+        );
+        // The earliest demand of several effects wins.
+        let mixed = page(vec![
+            animation(3.0, Some(1.0), "none", true),
+            animation(0.0, Some(1.0), "none", true),
+        ]);
+        assert_eq!(mixed.css_animation_wake(1.0), Some(0.0));
+        assert_eq!(mixed.css_animation_wake(4.5), Some(0.0));
+        assert_eq!(mixed.css_animation_wake(7.5), None);
+        assert!(PagePaint::default().css_animation_wake(0.0).is_none());
     }
 
     #[test]
