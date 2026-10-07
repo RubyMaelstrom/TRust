@@ -18714,6 +18714,41 @@ mod tests {
     }
 
     #[test]
+    fn fragment_serialization_writes_only_the_elements_own_attributes() {
+        // HTML #serialising-html-fragments: each attribute's serialized name
+        // and escaped value, nothing else. Cascaded styles and generated
+        // content are layout state, not attributes, and must not leak into
+        // innerHTML/outerHTML (a copied subtree would freeze them inline).
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><style>.a{display:flex;color:red}.a::before{content:'x'}</style>\
+             <body><div class=a id=a title='a&quot;b&lt;c&#160;d'>t&#160;&lt;u<!--x--y--></div>\
+             <svg id=s><use xlink:href='#i' xml:lang=en /></svg>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r##"(() => {
+            const a = document.getElementById('a');
+            if (getComputedStyle(a).display !== 'flex') return 'cascade';
+            const outer = a.outerHTML;
+            if (outer !== '<div class="a" id="a" title="a&quot;b&lt;c&nbsp;d">t&nbsp;&lt;u<!--x--y--></div>')
+                return 'outerHTML: ' + outer;
+            if (a.getAttribute('style') !== null) return 'style attribute';
+            const svg = document.getElementById('s').innerHTML;
+            if (svg !== '<use xlink:href="#i" xml:lang="en"></use>') return 'namespaced: ' + svg;
+            const copy = document.createElement('div');
+            copy.innerHTML = document.body.innerHTML;
+            if (copy.querySelector('[style]') || copy.querySelector('[data-trust-before]')) return 'copied';
+            return 'ok';
+        })()"##
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
     fn tag_name_uppercases_only_html_elements_of_html_documents() {
         // DOM #dom-element-tagname / #element-html-uppercased-qualified-name:
         // ASCII-uppercase the qualified name of an HTML-namespace element whose
