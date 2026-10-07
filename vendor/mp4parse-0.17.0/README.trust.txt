@@ -21,6 +21,10 @@ grids for large images and clap for odd-sized crops, so TRust carries:
   (with getters on `NclxColourInformation`) and `image_mirror`, instead of the
   raw-pointer C-API accessors.
 - Three `'_` lifetime annotations that current rustc warns about.
+- `u32::MAX`/`u64::MAX` replace the module constants `std::u32::MAX` and
+  `std::u64::MAX`, deprecated by rustc 1.99, in `parse_mdhd`, `read_mvhd` and
+  `read_mdhd`; test-only uses are unchanged. Upstream made the same change in
+  8d6e19e8 (2024-05-01), after 0.17.0; no later crates.io release exists.
 
 The upstream integration tests (tests/public.rs) need test files that the
 crates.io package excludes, and still expect clap and grid to be unsupported.
