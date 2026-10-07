@@ -22397,6 +22397,44 @@ mod tests {
         );
     }
 
+    /// Wrappers of created nodes and Node's base-class constructor keep Web IDL
+    /// interface identity, wrapper caching and the EventTarget superclass,
+    /// including for custom elements constructed with `new`.
+    #[test]
+    fn created_node_wrappers_keep_interfaces_and_the_event_target_superclass() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const out = [];
+                out.push(Object.getPrototypeOf(Node) === EventTarget,
+                    Object.getPrototypeOf(Node.prototype) === EventTarget.prototype,
+                    Node.prototype.constructor === Node, document.createElement('div') instanceof EventTarget);
+                class Probe extends HTMLElement {} customElements.define('x-new-probe', Probe);
+                const viaNew = new Probe();
+                out.push(viaNew.localName, viaNew instanceof Node, viaNew.isConnected);
+                body.appendChild(viaNew); out.push(body.lastChild === viaNew);
+                const t = document.createTextNode('t'), c = document.createComment('c'), f = document.createDocumentFragment();
+                out.push(t instanceof Text, t.nodeType, c instanceof Comment, c.nodeType, f instanceof DocumentFragment, f.nodeType);
+                body.append(t, c);
+                out.push(body.lastChild === c, c.previousSibling === t, new Text().data === '', new Text('q').data, new Comment('z').data);
+                const fresh = document.createElement('div'); fresh.innerHTML = 'a<!--b--><i>c</i>';
+                out.push(fresh.firstChild instanceof Text, fresh.childNodes[1] instanceof Comment, fresh.firstChild === fresh.firstChild);
+                out.join('|');
+            "#
+                ),
+                "true|true|true|true|x-new-probe|true|false|true|true|3|true|8|true|11|true|true|true|q|z|true|true|true",
+                "{tier:?}"
+            );
+        }
+    }
+
     #[test]
     fn node_constructors_create_nodes_and_windows_index_child_navigables() {
         // DOM #dom-text-text, #dom-comment-comment and

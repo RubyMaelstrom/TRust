@@ -1180,16 +1180,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Same-Agent Web IDL Element identity. Register only trusted wrapper
     // creation paths, never a public getter/prototype-based reconstruction.
     // The host roots this WeakMap without keeping detached elements alive.
-    const elementSlots = g.__element_slots(new WeakMap());
+    const elementSlots = g.__element_slots(privateSlots());
     delete g.__element_slots;
     const registerLiveRange = g.__live_range_register;
     const snapshotLiveRanges = g.__live_range_snapshot;
     delete g.__live_range_register;
     delete g.__live_range_snapshot;
-    // Bind pristine intrinsics once: no temporary argument arrays or author
-    // prototype lookups on each wrapper creation / interface conversion.
-    const rememberElement = messageWeakSet.bind(elementSlots);
-    const elementIdentity = messageWeakGet.bind(elementSlots);
+    // The map's own get/set hold the pristine intrinsics (privateSlots): no
+    // temporary argument arrays or author prototype lookups on each wrapper
+    // creation / interface conversion, and no bound-function call.
+    function rememberElement(element, id) { return elementSlots.set(element, id); }
+    function elementIdentity(element) { return elementSlots.get(element); }
     const formElementTargets = new WeakMap();
     // Infra namespace constants used by DOM's expanded-name algorithms.
     const HTML_NS = "http://www.w3.org/1999/xhtml";
@@ -1270,9 +1271,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return ids;
     }
     function seedElementName(element, localName, namespace, prefix) {
-        internalsFor(element).trustLN = localName || "";
-        internalsFor(element).trustNS = namespace === undefined ? null : namespace;
-        internalsFor(element).trustPrefix = prefix === undefined ? null : prefix;
+        const slots = internalsFor(element);
+        slots.trustLN = localName || "";
+        slots.trustNS = namespace === undefined ? null : namespace;
+        slots.trustPrefix = prefix === undefined ? null : prefix;
         return element;
     }
     // DOM #dom-element-tagname: the element's HTML-uppercased qualified
@@ -1313,8 +1315,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             namespace,
             prefix
         );
-        rememberElement(wrapper, id);
+        elementSlots.set(wrapper, id);
         return rememberWrapper(id, wrapper);
+    }
+    // The wrapper of an existing Text, Comment or DocumentFragment node, as
+    // `new Interface(id, NODE_WRAPPER_TOKEN)` creates it: with that token the
+    // interface constructors (and CharacterData's) only pass the id on, so
+    // Node's constructor runs with the interface as new.target.
+    const reflectConstruct = Reflect.construct;
+    function newNodeWrapper(Interface, id) {
+        return reflectConstruct(Node, [id], Interface);
+    }
+    // A wrapper for a node the platform has just created: it has no wrapper
+    // yet and cannot be a navigable container of this Realm (see wrapKnown).
+    function wrapCreatedNode(Interface, id) {
+        if (id === null || id === undefined) return null;
+        return rememberWrapper(id, newNodeWrapper(Interface, id));
     }
     function wrapKnown(id, knownConnected) {
         if (id === null || id === undefined) return null;
@@ -1346,10 +1362,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 new (classFor(parts[0], parts[1]))(id),
                 parts[0], parts[1], parts[2]
             );
-            rememberElement(w, id);
+            elementSlots.set(w, id);
         } else if (t === 11) {
             const info = __dom_shadow_info(id);
-            w = info ? new ShadowRoot(id, NODE_WRAPPER_TOKEN) : new DocumentFragment(id, NODE_WRAPPER_TOKEN);
+            w = info ? new ShadowRoot(id, NODE_WRAPPER_TOKEN) : newNodeWrapper(DocumentFragment, id);
             // Parsed roots already exist before any wrapper. Recognize them
             // even when first reached through child.parentNode/getRootNode.
             rememberWrapper(id, w, knownConnected);
@@ -1374,10 +1390,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
             }
             w = t === 9 ? (__dom_document_content_type(id) === "text/html" ? new Document(id) : new XMLDocument(id, XML_DOCUMENT_TOKEN))
-                : t === 3 ? new Text(id, NODE_WRAPPER_TOKEN)
-                : t === 4 ? new CDATASection(id, NODE_WRAPPER_TOKEN)
+                : t === 3 ? newNodeWrapper(Text, id)
+                : t === 4 ? newNodeWrapper(CDATASection, id)
                 : t === 7 ? new ProcessingInstruction(id)
-                : t === 8 ? new Comment(id, NODE_WRAPPER_TOKEN)
+                : t === 8 ? newNodeWrapper(Comment, id)
                 : t === 10 ? new DocumentType(id, DOCUMENT_TYPE_TOKEN)
                 : new Node(id);
         }
@@ -1990,9 +2006,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // strong table roots even a target -> callback -> target cycle forever,
     // including Documents of destroyed navigables visited by another Realm.
     // Connectedness affects presentation discovery, never listener lifetime.
-    const LS = new WeakMap();
-    const getListenerMap = messageWeakGet.bind(LS), setListenerMap = messageWeakSet.bind(LS);
-    const deleteListenerMap = WeakMap.prototype.delete.bind(LS);
+    const LS = privateSlots();
+    Object.defineProperty(LS, "delete", { value: WeakMap.prototype.delete });
+    function getListenerMap(target) { return LS.get(target); }
+    function setListenerMap(target, map) { return LS.set(target, map); }
+    function deleteListenerMap(target) { return LS.delete(target); }
     const EMPTY_LISTENERS = Object.freeze([]);
     // DOM #concept-event-listener: presentation discovery depends on the
     // listener lists, not on every value/style/child-list mutation. Retain
@@ -5883,9 +5901,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (effects & REMOVE_SLOTS) slotQueueCheck(parent);
         return c;
     }
-    class Node extends EventTarget {
+    // Node's superclass is EventTarget (DOM #interface-node). The class is
+    // declared without `extends` and linked to EventTarget right after it,
+    // which gives the same constructor and prototype chains: EventTarget's
+    // constructor has no steps beyond creating the object from new.target,
+    // which a base-class constructor does itself. Every wrapper is created
+    // through this constructor, and an explicit derived constructor's
+    // super() call costs the engine several times a whole base construction.
+    class Node {
         constructor(id) {
-            super();
             if (CE.upgrading !== null) {
                 const target = CE.upgrading;
                 CE.upgrading = null;
@@ -6335,6 +6359,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // them solely there means a polyfill that augments EventTarget.prototype
         // (ShadyDOM's `__shady_*` accessors) is visible on every node too.
     }
+    Object.setPrototypeOf(Node, EventTarget);
+    Object.setPrototypeOf(Node.prototype, EventTarget.prototype);
     // An element's attributes as [namespace, prefix, localName, value] in
     // attribute-list order (DOM #concept-element-attribute).
     function elementAttributeList(element) {
@@ -11571,10 +11597,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const name = "SVG" + suffix + "Element";
         return g[name] ? name : "SVGElement";
     }
+    // Interface classes by namespace, then local name.
     const ELEM_CLASS = new Map();
     function classFor(local, namespace) {
-        const key = String(namespace) + "\0" + String(local);
-        let C = ELEM_CLASS.get(key);
+        const localKey = String(local);
+        let byLocal = ELEM_CLASS.get(namespace);
+        if (byLocal === undefined) ELEM_CLASS.set(namespace, byLocal = new Map());
+        let C = byLocal.get(localKey);
         if (C !== undefined) return C;
         // The interface class comes from the GLOBAL (so a page that subclasses,
         // say, HTMLElement keeps inheriting our methods). BUT a page may REPLACE
@@ -11599,7 +11628,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         } else {
             C = Element;
         }
-        ELEM_CLASS.set(key, C);
+        byLocal.set(localKey, C);
         return C;
     }
 
@@ -12445,11 +12474,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // a required DOMString (undefined converts to "undefined").
         createTextNode(s) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createTextNode' on 'Document': 1 argument required.");
-            return wrap(__dom_create_text(domString(s), nodeIds.get(this)));
+            return wrapCreatedNode(Text, __dom_create_text(domString(s), nodeIds.get(this)));
         }
         createComment(s) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createComment' on 'Document': 1 argument required.");
-            return wrap(__dom_create_comment(domString(s), nodeIds.get(this)));
+            return wrapCreatedNode(Comment, __dom_create_comment(domString(s), nodeIds.get(this)));
         }
         // DOM #dom-document-createcdatasection.
         createCDATASection(data) {
@@ -12549,7 +12578,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return new NodeIterator(root, whatToShow, filter);
         }
         createDocumentFragment() {
-            return wrap(__dom_create_fragment(nodeIds.get(this)));
+            return wrapCreatedNode(DocumentFragment, __dom_create_fragment(nodeIds.get(this)));
         }
         createRange() { return new Range(); }
         getElementById(i) {
@@ -14932,9 +14961,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // validity): a parent of the wrong type (step 1), then a reference child
     // of another parent (step 3), then the Attr itself (step 4).
     function insertionArgument(parent, node, child, operation) {
-        nodeArgument(node, operation, 1);
+        // A platform object with an arena node is never an Attr (see
+        // createAttrNode), so only a node without one needs the Attr steps.
+        const nodeId = node !== null && typeof node === "object" ? nodeIds.get(node) : undefined;
+        if (nodeId === undefined) nodeArgument(node, operation, 1);
         if (nodeIds.get(parent) === undefined) rejectAttrParent(parent);
-        if (!internalsOf(node).attrNode) return;
+        if (nodeId !== undefined || !internalsOf(node).attrNode) return;
         const type = parent.nodeType;
         if (type === 1 || type === 9 || type === 11) {
             if (child !== null && (internalsOf(child).attrNode || !rangeSame(rangeParent(child), parent)))
