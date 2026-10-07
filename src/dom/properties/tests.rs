@@ -524,6 +524,40 @@ fn registration_uses_node_document_through_fallback_shadow_adoption_and_navigati
 }
 
 #[test]
+fn typed_math_keeps_ieee_zeros_exact_quotients_and_percent_hints() {
+    let max = "340282350000000000000000000000000000000";
+    let min = "-340282350000000000000000000000000000000";
+    for (syntax, value, expected) in [
+        // CSS Values 4 #calc-ieee: 0⁻ orders below 0⁺ in comparisons.
+        ("<number>", "calc(1 / min(0, 0 * -1))", min),
+        ("<number>", "calc(1 / max(0 * -1, 0))", max),
+        ("<number>", "calc(1 / clamp(0, 0 * -1, 1))", max),
+        // Division divides rather than multiplying by a reciprocal.
+        ("<number>", "calc(-103 / -103)", "1"),
+        ("<number>", "round(up, -103 + -103 / -103 - 1, 10)", "-100"),
+        // #round-func: an identifier that is no <rounding-strategy> begins
+        // the first calculation.
+        ("<number>", "round(infinity, 5)", max),
+        ("<number>", "round(-Infinity, 5)", min),
+        // #calc-type-checking: sign() is a <number> made consistent with a
+        // percentage argument, valid where percentages are.
+        ("<percentage>", "calc(sign(10%) * 50%)", "50%"),
+        ("<number>", "sign(10px)", "1"),
+    ] {
+        assert_eq!(
+            compute(syntax, value).as_deref(),
+            Some(expected),
+            "{syntax}: {value}"
+        );
+    }
+    // Typed OM #cssnumericvalue-match: a percent hint matches no <number>
+    // where percentages are not allowed.
+    for value in ["sign(10%)", "calc(10% / 1%)", "round(1, 1%)"] {
+        assert_eq!(compute("<number>", value), None, "{value}");
+    }
+}
+
+#[test]
 fn registered_numeric_ranges_preserve_valid_calculations() {
     for (syntax, value, expected) in [
         ("<number>", "calc(NaN)", "0"),

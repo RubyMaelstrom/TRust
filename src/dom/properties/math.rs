@@ -2,7 +2,7 @@
 //! #calc-serialize. Numeric dimensions survive intermediate products; a
 //! length-percentage retains its percentage basis until used-value time.
 use super::*;
-use crate::layout2::value::{MathFn, Rounding};
+use crate::layout2::value::{MathFn, Rounding, css_clamp, css_max, css_min};
 
 // length, angle, time, frequency, resolution, flex, percentage
 type Dim = [i8; 7];
@@ -10,7 +10,9 @@ const NUMBER: Dim = [0; 7];
 const LENGTH: Dim = [1, 0, 0, 0, 0, 0, 0];
 const ANGLE: Dim = [0, 1, 0, 0, 0, 0, 0];
 const TIME: Dim = [0, 0, 1, 0, 0, 0, 0];
+const FREQUENCY: Dim = [0, 0, 0, 1, 0, 0, 0];
 const RESOLUTION: Dim = [0, 0, 0, 0, 1, 0, 0];
+const FLEX: Dim = [0, 0, 0, 0, 0, 1, 0];
 const PERCENT: Dim = [0, 0, 0, 0, 0, 0, 1];
 
 #[derive(Clone, Debug)]
@@ -26,6 +28,11 @@ enum Node {
 struct Numeric {
     dim: Dim,
     node: Node,
+    /// CSS Values 4 #calc-type-checking: the type's percent hint is
+    /// "percent". A percentage that resolves against no other type keeps it
+    /// through sums, products and the functions that add their argument
+    /// types, so `sign(10%)` is a <number> that still contains a percentage.
+    percent: bool,
 }
 
 pub(super) fn number(value: f64) -> String {
@@ -57,8 +64,8 @@ fn unit(dim: Dim) -> &'static str {
         TIME => "s",
         RESOLUTION => "dppx",
         PERCENT => "%",
-        [0, 0, 0, 1, 0, 0, 0] => "Hz",
-        [0, 0, 0, 0, 0, 1, 0] => "fr",
+        FREQUENCY => "Hz",
+        FLEX => "fr",
         _ => "",
     }
 }
@@ -134,6 +141,7 @@ impl Numeric {
         Self {
             dim,
             node: Node::Value(v, unit),
+            percent: dim == PERCENT,
         }
     }
     fn sum(self, other: Self, subtract: bool) -> Option<Self> {
@@ -141,12 +149,13 @@ impl Numeric {
             return None;
         }
         let dim = self.dim;
+        let percent = self.percent || other.percent;
         let mut values = match self.node {
             Node::Sum(values) => values,
             value => vec![value],
         };
         let other = if subtract {
-            other.scale(-1.).node
+            other.scale(-1., false).node
         } else {
             other.node
         };
@@ -178,23 +187,31 @@ impl Numeric {
         } else {
             Node::Sum(values)
         };
-        Some(Self { dim, node })
+        Some(Self { dim, node, percent })
     }
-    fn scale(mut self, factor: f64) -> Self {
+    /// Multiply (or divide) by a number. Division divides, rather than
+    /// multiplying by a reciprocal, so `calc(-103 / -103)` is exactly 1 and
+    /// IEEE-754 gives a zero divisor its signed infinity (#calc-ieee).
+    fn scale(mut self, factor: f64, divide: bool) -> Self {
+        let apply = |n: f64| if divide { n / factor } else { n * factor };
         self.node = match self.node {
-            Node::Value(n, u) => Node::Value(n * factor, u),
+            Node::Value(n, u) => Node::Value(apply(n), u),
             Node::Sum(v) => Node::Sum(
                 v.into_iter()
                     .map(|n| {
                         Self {
                             dim: self.dim,
                             node: n,
+                            percent: self.percent,
                         }
-                        .scale(factor)
+                        .scale(factor, divide)
                         .node
                     })
                     .collect(),
             ),
+            node if divide => {
+                Node::Product(Box::new(node), Box::new(Node::Value(factor, "")), true)
+            }
             node => Node::Product(Box::new(Node::Value(factor, "")), Box::new(node), false),
         };
         self
@@ -208,34 +225,36 @@ impl Numeric {
                 self.dim[i].checked_add(other.dim[i])?
             };
         }
+        let percent = self.percent || other.percent;
         if let Node::Value(n, "") = other.node
             && other.dim == NUMBER
         {
-            let mut scaled = self.scale(if divide { 1. / n } else { n });
+            let mut scaled = self.scale(n, divide);
             scaled.dim = dim;
+            scaled.percent = percent;
             return Some(scaled);
         }
         if !divide
             && let Node::Value(n, "") = self.node
             && self.dim == NUMBER
         {
-            let mut scaled = other.scale(n);
+            let mut scaled = other.scale(n, false);
             scaled.dim = dim;
+            scaled.percent = percent;
             return Some(scaled);
         }
         if let (Some((a, _)), Some((b, _))) = (self.node.scalar(), other.node.scalar())
             && (hint.is_none()
                 || !self.node.contains_percentage() && !other.node.contains_percentage())
         {
-            return Some(Self::literal(
-                if divide { a / b } else { a * b },
-                dim,
-                unit(dim),
-            ));
+            let mut product = Self::literal(if divide { a / b } else { a * b }, dim, unit(dim));
+            product.percent = percent;
+            return Some(product);
         }
         Some(Self {
             dim,
             node: Node::Product(Box::new(self.node), Box::new(other.node), divide),
+            percent,
         })
     }
 }
@@ -258,9 +277,37 @@ pub(super) fn parse_range<'i>(
     kind: &Kind,
     ctx: &Context<'_>,
     depth: usize,
-    mut minimum: f64,
+    minimum: f64,
     maximum: f64,
 ) -> ParseResult<String> {
+    Ok(resolve(p, kind, ctx, depth, minimum, maximum)?.computed_text())
+}
+
+/// The computed value of one numeric component of type `kind` as a single
+/// number in its canonical unit (CSS Values 4 #calc-computed-value), range
+/// checked like [`parse_range`]. `None` when it retains a percentage that
+/// resolves against a used value.
+pub(super) fn computed_number<'i>(
+    p: &mut Parser<'i>,
+    kind: &Kind,
+    ctx: &Context<'_>,
+    minimum: f64,
+    maximum: f64,
+) -> ParseResult<Option<f64>> {
+    Ok(match resolve(p, kind, ctx, 0, minimum, maximum)? {
+        Node::Value(n, unit) if unit != "%" || *kind == Kind::Percentage => Some(n),
+        _ => None,
+    })
+}
+
+fn resolve<'i>(
+    p: &mut Parser<'i>,
+    kind: &Kind,
+    ctx: &Context<'_>,
+    depth: usize,
+    mut minimum: f64,
+    maximum: f64,
+) -> ParseResult<Node> {
     let hint = match kind {
         Kind::LengthPercentage => Some(LENGTH),
         Kind::AnglePercentage => Some(ANGLE),
@@ -284,7 +331,7 @@ pub(super) fn parse_range<'i>(
         Kind::Angle | Kind::AnglePercentage => ANGLE,
         Kind::Time => TIME,
         Kind::Resolution => RESOLUTION,
-        Kind::Number | Kind::Integer => NUMBER,
+        Kind::Number | Kind::Integer | Kind::NumberPercentage => NUMBER,
         _ => return Err(cssparser::ParseError::custom(())),
     };
     if matches!(kind, Kind::Length | Kind::LengthPercentage)
@@ -299,7 +346,12 @@ pub(super) fn parse_range<'i>(
             value = Numeric::literal(0., LENGTH, "px");
         }
     }
-    if value.dim != expected {
+    // Typed OM #cssnumericvalue-match: where percentages are not allowed
+    // (or are not resolved against numbers), a type with a percent hint
+    // matches nothing, so `font-weight: sign(10%)` is invalid.
+    if value.dim != expected
+        || value.percent && !matches!(kind, Kind::Percentage | Kind::NumberPercentage)
+    {
         return Err(cssparser::ParseError::custom(()));
     }
     if *kind == Kind::Integer {
@@ -329,7 +381,7 @@ pub(super) fn parse_range<'i>(
             *n = n.clamp(-supported, supported);
         }
     }
-    Ok(value.node.computed_text())
+    Ok(value.node)
 }
 
 fn value<'i>(
@@ -473,14 +525,18 @@ fn function<'i>(
         return sum(p, ctx, hint, depth);
     }
     let mut strategy = Rounding::Nearest;
+    // #round-func: an optional <rounding-strategy> keyword. Any other
+    // identifier, such as the `infinity` constant, begins the first
+    // calculation.
     if name == "round"
-        && let Ok(value) = p.try_parse(|p| {
-            let value = p.expect_ident_cloned()?;
+        && let Ok(rounding) = p.try_parse(|p| {
+            let rounding = Rounding::parse(&p.expect_ident_cloned()?)
+                .ok_or_else(|| cssparser::ParseError::custom(()))?;
             p.expect_comma()?;
-            Ok::<_, cssparser::BasicParseError>(value)
+            Ok::<_, cssparser::ParseError<()>>(rounding)
         })
     {
-        strategy = Rounding::parse(&value).ok_or_else(|| cssparser::ParseError::custom(()))?;
+        strategy = rounding;
     }
     let mut args = p.parse_comma_separated(|p| {
         if name == "clamp" && p.try_parse(|p| p.expect_ident_matching("none")).is_ok() {
@@ -526,6 +582,14 @@ fn function<'i>(
     let same = args.iter().all(|a| a.dim == args[0].dim);
     let count = args.len();
     let input_dim = args[0].dim;
+    // #calc-type-checking: functions whose type adds their arguments' types
+    // (or, for sign(), is made consistent with it) keep a percent hint; the
+    // trigonometric and exponential functions have fixed types.
+    let percent = match name {
+        "asin" | "acos" | "atan" | "atan2" | "sin" | "cos" | "tan" | "pow" | "sqrt" | "exp"
+        | "log" => false,
+        _ => args.iter().any(|arg| arg.percent),
+    };
     let dim = match name {
         "min" | "max" | "hypot" if same => input_dim,
         "clamp" if same && count == 3 => input_dim,
@@ -550,9 +614,10 @@ fn function<'i>(
             f64::NAN
         } else {
             match name {
-                "min" => v.iter().copied().fold(f64::INFINITY, f64::min),
-                "max" => v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                "clamp" => a.max(b.min(v[2])),
+                // #calc-ieee: 0⁻ is less than 0⁺.
+                "min" => v.iter().copied().fold(f64::INFINITY, css_min),
+                "max" => v.iter().copied().fold(f64::NEG_INFINITY, css_max),
+                "clamp" => css_clamp(a, b, v[2]),
                 _ => {
                     let degrees = input_dim == ANGLE;
                     let function = match name {
@@ -581,7 +646,9 @@ fn function<'i>(
                 }
             }
         };
-        return Ok(Numeric::literal(n, dim, unit(dim)));
+        let mut result = Numeric::literal(n, dim, unit(dim));
+        result.percent = percent;
+        return Ok(result);
     }
     let mut nodes: Vec<_> = args
         .into_iter()
@@ -606,5 +673,6 @@ fn function<'i>(
     Ok(Numeric {
         dim,
         node: Node::Function(name.to_owned(), nodes),
+        percent,
     })
 }

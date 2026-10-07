@@ -59,6 +59,10 @@ pub(super) enum Kind {
     Angle,
     Time,
     Resolution,
+    /// A <number> where <percentage>s resolve against numbers (CSS Color 4
+    /// <opacity-value>, Transforms 2 `scale`), so a calculation may hold
+    /// one (`sign(10%)`); not a registration syntax name.
+    NumberPercentage,
     TransformFunction,
     TransformList,
     CustomIdent,
@@ -433,29 +437,30 @@ impl Context<'_> {
 
 /// Reuse CSS Values' typed math evaluator for transform numbers and angles.
 /// Percentage scale values are numbers divided by 100 (Transforms 2
-/// #individual-transforms). Length percentages keep their used-value basis
-/// in layout's retained length expressions instead of being flattened here.
+/// #individual-transforms), and a scale calculation may hold a percentage
+/// that resolves against a number (`scale(sign(10%))`). Length percentages
+/// keep their used-value basis in layout's retained length expressions
+/// instead of being flattened here.
 pub(super) fn transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
     if angle && text.trim() == "0" {
         return Some(0.);
     }
-    let parse = |kind: Kind, suffix: &str| {
+    let parse = |kind: Kind| {
         let mut parser = Parser::new(text);
-        let computed = math::parse(&mut parser, &kind, &Context::validation(), 0).ok()?;
-        parser.expect_exhausted().ok()?;
-        computed
-            .strip_suffix(suffix)?
-            .parse::<f32>()
+        let (min, max) = (f64::NEG_INFINITY, f64::INFINITY);
+        let value = math::computed_number(&mut parser, &kind, &Context::validation(), min, max)
             .ok()
-            .filter(|n| n.is_finite())
+            .flatten()?;
+        parser.expect_exhausted().ok()?;
+        Some(value as f32).filter(|n| n.is_finite())
     };
-    if percentage && let Some(value) = parse(Kind::Percentage, "%") {
-        return Some(value / 100.);
+    if angle {
+        parse(Kind::Angle)
+    } else if percentage {
+        parse(Kind::NumberPercentage).or_else(|| parse(Kind::Percentage).map(|n| n / 100.))
+    } else {
+        parse(Kind::Number)
     }
-    parse(
-        if angle { Kind::Angle } else { Kind::Number },
-        if angle { "deg" } else { "" },
-    )
 }
 
 /// Scan component values with the CSS Syntax tokenizer. Strings, escaped
