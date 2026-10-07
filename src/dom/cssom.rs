@@ -280,8 +280,7 @@ fn longhands(property: &str, value: &str) -> Vec<(String, String)> {
                     .into_iter()
                     .map(|image| {
                         let image = image.trim();
-                        let mut input = cssparser::ParserInput::new(image);
-                        let mut parser = cssparser::Parser::new(&mut input);
+                        let mut parser = cssparser::Parser::new(image);
                         if let Ok(url) = parser.expect_url()
                             && parser.is_exhausted()
                         {
@@ -386,11 +385,10 @@ pub(super) fn supports(property: &str, value: &str) -> bool {
 /// CSS Anchor Positioning 1 §2: serialize `none | <dashed-ident>#` after CSS
 /// Syntax has decoded identifier escapes. Names retain their case.
 pub(super) fn anchor_name_value(value: &str) -> Option<String> {
-    let mut input = cssparser::ParserInput::new(value);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value);
     let names: Vec<String> = parser
         .parse_comma_separated(|parser| {
-            Ok::<_, cssparser::ParseError<'_, ()>>(parser.expect_ident_cloned()?.to_string())
+            Ok::<_, cssparser::ParseError<()>>(parser.expect_ident_cloned()?.to_string())
         })
         .ok()?;
     if !parser.is_exhausted() {

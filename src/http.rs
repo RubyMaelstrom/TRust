@@ -6322,8 +6322,7 @@ pub(crate) fn font_face_descriptors(block: &str) -> Option<CssFontFace> {
         } else if name.trim().eq_ignore_ascii_case("src") {
             sources.clear();
             for source in crate::dom::split_top_level(value, ',') {
-                let mut input = cssparser::ParserInput::new(source);
-                let mut parser = cssparser::Parser::new(&mut input);
+                let mut parser = cssparser::Parser::new(source);
                 if let Ok(url) = parser.expect_url() {
                     sources.push(url.to_string());
                 }
@@ -6386,8 +6385,7 @@ fn unicode_ranges(value: &str) -> Option<Vec<(u32, u32)>> {
 /// unquoted form cannot begin with a generic family or CSS-wide keyword
 /// (`font-family: Cursive` names no face; only `"Cursive"` does).
 fn font_family_name(value: &str) -> Option<String> {
-    let mut input = cssparser::ParserInput::new(value);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value);
     if let Ok(name) = parser.try_parse(|p| p.expect_string().map(|name| name.to_string())) {
         return parser.is_exhausted().then_some(name);
     }

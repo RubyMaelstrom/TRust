@@ -12,9 +12,8 @@ pub(crate) fn filters(
     length: &dyn Fn(&str) -> Option<f32>,
     current_color: PaintColor,
 ) -> Option<Vec<CssFilter>> {
-    use cssparser::{Parser, ParserInput};
-    let mut input = ParserInput::new(value);
-    let mut parser = Parser::new(&mut input);
+    use cssparser::Parser;
+    let mut parser = Parser::new(value);
     if parser
         .try_parse(|p| p.expect_ident_matching("none"))
         .is_ok()
@@ -25,7 +24,7 @@ pub(crate) fn filters(
     while !parser.is_exhausted() {
         let name = parser.expect_function().ok()?.to_ascii_lowercase();
         let filter = parser
-            .parse_nested_block(|p| -> Result<CssFilter, cssparser::ParseError<'_, ()>> {
+            .parse_nested_block(|p| -> Result<CssFilter, cssparser::ParseError<()>> {
                 let filter = match name.as_str() {
                     "blur" => CssFilter::Blur(if p.is_exhausted() {
                         0.
@@ -39,7 +38,8 @@ pub(crate) fn filters(
                         angle(p)?
                     })),
                     _ => CssFilter::ColorMatrix(
-                        amount_matrix(&name, amount(p)?).ok_or_else(|| p.new_custom_error(()))?,
+                        amount_matrix(&name, amount(p)?)
+                            .ok_or_else(|| cssparser::ParseError::custom(()))?,
                     ),
                 };
                 p.expect_exhausted()?;
@@ -64,13 +64,13 @@ pub(crate) fn valid(value: &str) -> bool {
     filters(value, &length, PaintColor::Rgba(0, 0, 0, 255)).is_some()
 }
 
-type Failure<'i> = cssparser::ParseError<'i, ()>;
+type Failure = cssparser::ParseError<()>;
 
 /// A non-percentage `<length>` (unitless only for zero).
 fn length_token<'i>(
-    p: &mut cssparser::Parser<'i, '_>,
+    p: &mut cssparser::Parser<'i>,
     length: &dyn Fn(&str) -> Option<f32>,
-) -> Result<f32, Failure<'i>> {
+) -> Result<f32, Failure> {
     use cssparser::Token;
     let px = match p.next()?.clone() {
         Token::Number { value: 0., .. } => Some(0.),
@@ -78,16 +78,16 @@ fn length_token<'i>(
         _ => None,
     };
     px.filter(|px| px.is_finite())
-        .ok_or_else(|| p.new_custom_error(()))
+        .ok_or_else(|| cssparser::ParseError::custom(()))
 }
 
 fn one_length<'i>(
-    p: &mut cssparser::Parser<'i, '_>,
+    p: &mut cssparser::Parser<'i>,
     length: &dyn Fn(&str) -> Option<f32>,
-) -> Result<f32, Failure<'i>> {
+) -> Result<f32, Failure> {
     let px = length_token(p, length)?;
     if px < 0. {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(px)
 }
@@ -95,10 +95,10 @@ fn one_length<'i>(
 /// `drop-shadow( [ <color>? && <length>{2,3} ] )`, the third length being
 /// a standard deviation.
 fn drop_shadow<'i>(
-    p: &mut cssparser::Parser<'i, '_>,
+    p: &mut cssparser::Parser<'i>,
     length: &dyn Fn(&str) -> Option<f32>,
     current_color: PaintColor,
-) -> Result<CssFilter, Failure<'i>> {
+) -> Result<CssFilter, Failure> {
     let mut color = None;
     let mut lengths = Vec::new();
     // How many lengths preceded the color: the lengths are one run, before
@@ -107,7 +107,7 @@ fn drop_shadow<'i>(
     while !p.is_exhausted() {
         if let Ok(px) = p.try_parse(|p| length_token(p, length)) {
             if color.is_some() && color_after > 0 {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             lengths.push(px);
             continue;
@@ -115,7 +115,7 @@ fn drop_shadow<'i>(
         let start = p.position();
         // A color function's arguments come with it.
         if matches!(p.next()?, cssparser::Token::Function(_)) {
-            p.parse_nested_block(|p| -> Result<(), Failure<'i>> {
+            p.parse_nested_block(|p| -> Result<(), Failure> {
                 while p.next().is_ok() {}
                 Ok(())
             })?;
@@ -127,13 +127,13 @@ fn drop_shadow<'i>(
             PaintColor::parse_css(text)
         };
         if color.is_some() || lengths.len() == 1 {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         color_after = lengths.len();
-        color = Some(parsed.ok_or_else(|| p.new_custom_error(()))?);
+        color = Some(parsed.ok_or_else(|| cssparser::ParseError::custom(()))?);
     }
     if !(2..=3).contains(&lengths.len()) || lengths.get(2).is_some_and(|blur| *blur < 0.) {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(CssFilter::DropShadow {
         dx: lengths[0],
@@ -144,7 +144,7 @@ fn drop_shadow<'i>(
 }
 
 /// `[ <number> | <percentage> ]?`, defaulting to 1.
-fn amount<'i>(p: &mut cssparser::Parser<'i, '_>) -> Result<f32, Failure<'i>> {
+fn amount<'i>(p: &mut cssparser::Parser<'i>) -> Result<f32, Failure> {
     use cssparser::Token;
     if p.is_exhausted() {
         return Ok(1.);
@@ -152,16 +152,16 @@ fn amount<'i>(p: &mut cssparser::Parser<'i, '_>) -> Result<f32, Failure<'i>> {
     let amount = match p.next()? {
         Token::Number { value, .. } => *value,
         Token::Percentage { unit_value, .. } => *unit_value,
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     if !amount.is_finite() || amount < 0. {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(amount)
 }
 
 /// `<angle> | <zero>` in radians.
-fn angle<'i>(p: &mut cssparser::Parser<'i, '_>) -> Result<f32, Failure<'i>> {
+fn angle<'i>(p: &mut cssparser::Parser<'i>) -> Result<f32, Failure> {
     use cssparser::Token;
     let radians = match p.next()?.clone() {
         Token::Number { value: 0., .. } => Some(0.),
@@ -176,7 +176,7 @@ fn angle<'i>(p: &mut cssparser::Parser<'i, '_>) -> Result<f32, Failure<'i>> {
     };
     radians
         .filter(|radians| radians.is_finite())
-        .ok_or_else(|| p.new_custom_error(()))
+        .ok_or_else(|| cssparser::ParseError::custom(()))
 }
 
 /// #huerotateEquivalent: feColorMatrix type="hueRotate".

@@ -55,8 +55,8 @@ architecture-diagnostics = ["lumen/architecture-diagnostics"]
 asm = ["rav1d/asm", "rav1d/asm_arm64_dotprod", "rav1d/asm_arm64_i8mm", "rav1d/asm_arm64_sve2"]
 
 [dependencies]
-accesskit = "0.24.1"
-accesskit_winit = { version = "0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
+accesskit = "0.25.1"
+accesskit_winit = { version = "0.34.1", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
 # Web Crypto AES-GCM, including its standardized 32/64-bit tags. Reuse the
 # re-exported AES primitive for CTR; OS randomness comes from our host API.
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "hazmat", "zeroize"] }
@@ -67,7 +67,7 @@ bytes = "1.12.1"
 color = "0.3.3"
 # CSS Syntax 3 tokenization for registered-property syntax and typed values.
 # The cascade and value semantics remain in TRust's shared DOM implementation.
-cssparser = { version = "0.37.0", default-features = false }
+cssparser = { version = "0.38.0", default-features = false }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 # Default features = the pure-Rust `miniz_oxide` backend. NEVER enable the
 # `zlib`/`zlib-ng`/`cloudflare_zlib`/`miniz-sys` features — those pull a C
@@ -77,7 +77,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 flate2 = "1"
 # Firefox's pure-Rust implementation of the WHATWG Encoding Standard: its label
 # table and the legacy single- and multi-byte decoders behind TextDecoder.
-encoding_rs = "0.8.35"
+encoding_rs = "0.8.42"
 # Pure-Rust decoders for the `br` (RFC 7932) and `zstd` (RFC 9659) HTTP
 # content codings every browser advertises. brotli-decompressor is already in
 # the tree through the WOFF2 decoder.
@@ -86,7 +86,7 @@ ruzstd = "0.9.0"
 futures = "0.3.34"
 # HTTP/2 framing, HPACK and stream state; TRust owns connections and all
 # browser policy. This is not a second general-purpose HTTP client.
-h2 = "0.4.15"
+h2 = "0.4.20"
 # HTTP/3 framing/QPACK and QUIC transport; browser policy stays in src/http.
 # Our cancellation/size-limiting QUIC adapter needs structured error access;
 # pin the backend API explicitly rather than accepting breaking patch changes.
@@ -96,7 +96,7 @@ quinn = { version = "0.11.12", default-features = false, features = ["runtime-to
 http_wire = { package = "http", version = "1.5.0" }
 # WebGL uses Rust validation and bindings to the installed EGL/GLES driver.
 # No ANGLE or bundled native shader compiler is linked into the browser.
-glow = "0.17.0"
+glow = "0.18.0"
 glsl-lang = { version = "0.8.1", features = ["lexer-full"] }
 glsl-lang-pp = "0.8.1"
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }
@@ -165,7 +165,7 @@ serde = { version = "1", features = ["derive"] }
 # Fetch Metadata uses HTML's schemeful same-site relation, including private
 # suffixes (e.g. github.io). This compiled PSL has no runtime network refresh;
 # Cargo.lock pins the data revision delivered with each browser build.
-psl = "2.1.232"
+psl = "2.1.240"
 # Static SVG image rendering. `resvg`/`usvg`/tiny-skia are pure Rust; text and
 # embedded data: raster images stay enabled for web compatibility. TRust
 # supplies usvg's font database from its shared pure-Rust catalog. Keep
@@ -174,21 +174,22 @@ psl = "2.1.232"
 # is deliberately omitted; selected SVG fonts are read safely on demand.
 resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images"] }
 roxmltree = "0.21.1"
-xml-rs = "0.8.29"
-rcgen = "0.14.9"
+# DOMParser's CDATA- and PI-preserving event reader (formerly published as `xml-rs`).
+xml = "1.0.0"
+rcgen = "0.14.10"
 sha2 = "0.11.0"
 sha1 = "0.11.0"
 hmac = "0.13.0"
 getrandom = "0.4.3"
-textwrap = "0.16.2"
+textwrap = "0.16.4"
 tiny-skia = "0.12.0"
 svgtypes = "0.16.1"
-tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
-tokio-rustls = "0.26.4"
+tokio = { version = "1.53.2", features = ["fs", "net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
+tokio-rustls = "0.26.6"
 # The TLS features browsers offer, which rustls leaves to the embedder:
 # `prefer-post-quantum` puts the X25519MLKEM768 hybrid (with its key share)
 # first, and `brotli` adds RFC 8879 certificate compression (pure Rust).
-rustls = { version = "0.23.44", default-features = false, features = ["prefer-post-quantum", "brotli"] }
+rustls = { version = "0.23.45", default-features = false, features = ["prefer-post-quantum", "brotli"] }
 unicode-width = "0.2"
 # HTML text-node directionality uses the first Unicode L/R/AL character.
 unicode-bidi = "0.3.18"
@@ -200,10 +201,10 @@ unicode-segmentation = "1.13.3"
 unicode-casefold = "0.2.0"
 # CSS Pseudo 4 #first-letter-pattern classifies text by Unicode general
 # category. Already in the graph through URL's IDNA support.
-icu_properties = "2.2.0"
+icu_properties = "2.3.0"
 # Inline layout finds soft wrap opportunities between inline boxes with the
 # rule-based line segmenter Parley already uses within text runs.
-icu_segmenter = { version = "2.2.0", default-features = false, features = ["compiled_data"] }
+icu_segmenter = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 url = "2.5.8"
 vello_cpu = { version = "0.2.0", default-features = false, features = ["std", "text", "u8_pipeline"] }
 # Accelerated implementation of the same renderer-neutral display list.  Keep
@@ -228,13 +229,13 @@ webpki-roots = "1.0.9"
 # CSS Fonts web resources commonly use WOFF or WOFF2 containers. `wuff`
 # decodes both to the SFNT bytes consumed by Fontique/Skrifa, entirely in
 # Rust (including its default Brotli and DEFLATE backends).
-wuff = "0.2.8"
+wuff = "0.2.9"
 
 [target.'cfg(unix)'.dependencies]
 # Safe platform flags for nonblocking local-file opens (including FIFO races),
 # and CPU affinity for style worker threads on heterogeneous CPUs.
 # Already part of the native windowing stack; Linux uses Rust syscalls.
-rustix = { version = "1.1.4", features = ["fs", "thread"] }
+rustix = { version = "1.1.5", features = ["fs", "thread"] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
 parley = { version = "0.11.1", default-features = false, features = ["system", "complex-scripts"] }

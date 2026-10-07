@@ -39,8 +39,7 @@ pub(crate) fn transform_list_matrix(text: &str) -> Option<([f64; 16], bool)> {
     if !valid_tokens(text) || !absolute_units(text) {
         return None;
     }
-    let mut input = ParserInput::new(text);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(text);
     // Step 3: `none` is a list holding one identity matrix. It is the only
     // keyword the grammar admits, so CSS-wide keywords are failures.
     if parser
@@ -69,16 +68,16 @@ pub(crate) fn transform_list_matrix(text: &str) -> Option<([f64; 16], bool)> {
 /// Every dimension must be an absolute length or an angle: nothing else can
 /// be resolved without an element (Geometry 1 #dommatrix-parse step 2).
 fn absolute_units(text: &str) -> bool {
-    fn scan<'i>(p: &mut Parser<'i, '_>, depth: usize) -> ParseResult<'i, ()> {
+    fn scan<'i>(p: &mut Parser<'i>, depth: usize) -> ParseResult<()> {
         if depth > MAX_DEPTH {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         while !p.is_exhausted() {
             match p.next()?.clone() {
                 Token::Dimension { unit, .. }
                     if length_unit(&unit).is_none() && angle_unit(&unit).is_none() =>
                 {
-                    return Err(p.new_custom_error(()));
+                    return Err(cssparser::ParseError::custom(()));
                 }
                 Token::Function(_)
                 | Token::ParenthesisBlock
@@ -89,7 +88,7 @@ fn absolute_units(text: &str) -> bool {
         }
         Ok(())
     }
-    scan(&mut Parser::new(&mut ParserInput::new(text)), 0).is_ok()
+    scan(&mut Parser::new(text), 0).is_ok()
 }
 
 /// CSS Values 4 #absolute-lengths, in CSS pixels.
@@ -117,7 +116,7 @@ fn angle_unit(unit: &str) -> Option<f64> {
     })
 }
 
-fn transform_function<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, ([f64; 16], bool)> {
+fn transform_function<'i>(p: &mut Parser<'i>) -> ParseResult<([f64; 16], bool)> {
     use Argument::*;
     let name = p.expect_function()?.to_ascii_lowercase();
     let (arguments, minimum, three_dimensional): (&[Argument], usize, bool) = match name.as_str() {
@@ -136,13 +135,13 @@ fn transform_function<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, ([f64; 16],
         "rotate3d" => (&[Number, Number, Number, Angle], 4, true),
         "skew" => (&[Angle; 2], 1, false),
         "perspective" => (&[Perspective], 1, true),
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     let values = p.parse_nested_block(|p| {
         let mut values = Vec::with_capacity(arguments.len());
         loop {
             let Some(&kind) = arguments.get(values.len()) else {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             };
             values.push(argument(p, kind)?);
             if p.is_exhausted() {
@@ -151,14 +150,14 @@ fn transform_function<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, ([f64; 16],
             p.expect_comma()?;
         }
         if values.len() < minimum {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         Ok(values)
     })?;
     Ok((function_matrix(&name, &values), three_dimensional))
 }
 
-fn argument<'i>(p: &mut Parser<'i, '_>, kind: Argument) -> ParseResult<'i, f64> {
+fn argument<'i>(p: &mut Parser<'i>, kind: Argument) -> ParseResult<f64> {
     if let Ok(value) = p.try_parse(|p| literal(p, kind)) {
         return Ok(value);
     }
@@ -185,11 +184,11 @@ fn argument<'i>(p: &mut Parser<'i, '_>, kind: Argument) -> ParseResult<'i, f64> 
         .strip_suffix(unit)
         .and_then(|number| number.parse::<f64>().ok())
         .map(|number| number * scale)
-        .ok_or_else(|| p.new_custom_error(()))
+        .ok_or_else(|| cssparser::ParseError::custom(()))
 }
 
 /// A single numeric token keeps its source's double precision.
-fn literal<'i>(p: &mut Parser<'i, '_>, kind: Argument) -> ParseResult<'i, f64> {
+fn literal<'i>(p: &mut Parser<'i>, kind: Argument) -> ParseResult<f64> {
     p.skip_whitespace();
     let start = p.position();
     let token = p.next()?.clone();
@@ -211,17 +210,17 @@ fn literal<'i>(p: &mut Parser<'i, '_>, kind: Argument) -> ParseResult<'i, f64> {
             Token::Number { value: 0., .. },
         ) => 0.,
         (Argument::Length | Argument::Perspective, Token::Dimension { value, unit, .. }) => {
-            let scale = length_unit(&unit).ok_or_else(|| p.new_custom_error(()))?;
+            let scale = length_unit(&unit).ok_or_else(|| cssparser::ParseError::custom(()))?;
             precise(value, unit.len()) * scale
         }
         (Argument::Angle, Token::Dimension { value, unit, .. }) => {
-            let scale = angle_unit(&unit).ok_or_else(|| p.new_custom_error(()))?;
+            let scale = angle_unit(&unit).ok_or_else(|| cssparser::ParseError::custom(()))?;
             precise(value, unit.len()) * scale
         }
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     if kind == Argument::Perspective && value < 0. {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(value)
 }

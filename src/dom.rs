@@ -17862,8 +17862,7 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
 fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     let uncommented = strip_css_comments(decl);
     let decl = uncommented.as_ref();
-    let mut input = cssparser::ParserInput::new(decl);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(decl);
     let k = parser.expect_ident_cloned().ok()?.to_string();
     parser.expect_colon().ok()?;
     let v = &decl[parser.position().byte_index()..];
@@ -18028,8 +18027,7 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
 /// Whether a component value list has a `:` token outside any block or
 /// function (strings and URLs are single tokens).
 fn has_top_level_colon(value: &str) -> bool {
-    let mut input = cssparser::ParserInput::new(value);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value);
     while let Ok(token) = parser.next() {
         if matches!(token, cssparser::Token::Colon) {
             return true;
@@ -18355,12 +18353,12 @@ fn strip_css_comments(css: &str) -> Cow<'_, str> {
     }
     // CSS Syntax comments are tokens, not substrings inside a string or URL.
     fn collect<'i>(
-        p: &mut cssparser::Parser<'i, '_>,
+        p: &mut cssparser::Parser<'i>,
         spans: &mut Vec<std::ops::Range<usize>>,
         depth: usize,
-    ) -> Result<(), cssparser::ParseError<'i, ()>> {
+    ) -> Result<(), cssparser::ParseError<()>> {
         if depth > 128 {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         loop {
             let start = p.position().byte_index();
@@ -18381,11 +18379,7 @@ fn strip_css_comments(css: &str) -> Cow<'_, str> {
         Ok(())
     }
     let mut spans = Vec::new();
-    let _ = collect(
-        &mut cssparser::Parser::new(&mut cssparser::ParserInput::new(css)),
-        &mut spans,
-        0,
-    );
+    let _ = collect(&mut cssparser::Parser::new(css), &mut spans, 0);
     if spans.is_empty() {
         return Cow::Borrowed(css);
     }

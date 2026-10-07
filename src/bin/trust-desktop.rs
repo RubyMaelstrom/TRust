@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use accesskit::{
     Action as AccessAction, ActionData, ActionRequest, Affine, Node as AccessNode,
-    NodeId as AccessNodeId, Rect as AccessRect, Role as AccessRole, Tree, TreeId, TreeUpdate,
+    NodeId as AccessNodeId, Rect as AccessRect, Role as AccessRole, TreeId, TreeInfo, TreeUpdate,
     Vec2 as AccessVec2,
 };
 use accesskit_winit::{Adapter as AccessAdapter, Event as AccessEvent};
@@ -8084,7 +8084,7 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
     };
     TreeUpdate {
         nodes,
-        tree: initial.then(|| Tree::new(ACCESS_ROOT)),
+        tree: initial.then(|| TreeInfo::new(ACCESS_ROOT)),
         tree_id: TreeId::ROOT,
         focus,
     }

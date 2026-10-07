@@ -2,22 +2,22 @@
 use super::*;
 use values::{parse as value, parse_color};
 
-fn keyword<'i>(p: &mut Parser<'i, '_>, choices: &[&str]) -> ParseResult<'i, String> {
+fn keyword<'i>(p: &mut Parser<'i>, choices: &[&str]) -> ParseResult<String> {
     let name = p.expect_ident_cloned()?.to_ascii_lowercase();
     if choices.contains(&name.as_str()) {
         Ok(name)
     } else {
-        Err(p.new_custom_error(()))
+        Err(cssparser::ParseError::custom(()))
     }
 }
 
-fn angle<'i>(p: &mut Parser<'i, '_>, ctx: &Context<'_>, depth: usize) -> ParseResult<'i, String> {
+fn angle<'i>(p: &mut Parser<'i>, ctx: &Context<'_>, depth: usize) -> ParseResult<String> {
     if p.try_parse(|p| {
         p.expect_number().and_then(|n| {
             if n == 0. {
                 Ok(())
             } else {
-                Err(p.new_basic_unexpected_token_error(Token::Delim('?')))
+                Err(cssparser::BasicParseError::unexpected_token())
             }
         })
     })
@@ -29,7 +29,7 @@ fn angle<'i>(p: &mut Parser<'i, '_>, ctx: &Context<'_>, depth: usize) -> ParseRe
     }
 }
 
-fn interpolation<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, String> {
+fn interpolation<'i>(p: &mut Parser<'i>) -> ParseResult<String> {
     p.expect_ident_matching("in")?;
     let space = keyword(
         p,
@@ -56,7 +56,7 @@ fn interpolation<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, String> {
         p.try_parse(|p| {
             let hue = keyword(p, &["shorter", "longer", "increasing", "decreasing"])?;
             p.expect_ident_matching("hue")?;
-            Ok::<_, cssparser::ParseError<'i, ()>>(hue)
+            Ok::<_, cssparser::ParseError<()>>(hue)
         })
         .ok()
     } else {
@@ -68,11 +68,7 @@ fn interpolation<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, String> {
     ))
 }
 
-fn position<'i>(
-    p: &mut Parser<'i, '_>,
-    ctx: &Context<'_>,
-    depth: usize,
-) -> ParseResult<'i, String> {
+fn position<'i>(p: &mut Parser<'i>, ctx: &Context<'_>, depth: usize) -> ParseResult<String> {
     // Try the unambiguous four-component grammar first, then the two- and
     // one-component alternatives. `try_parse` restores the input on failure.
     if let Ok((x, y)) = p.try_parse(|p| {
@@ -87,11 +83,11 @@ fn position<'i>(
         let first_horizontal = first == "left" || first == "right";
         let a = format!("{first} {a}");
         let b = format!("{second} {b}");
-        Ok::<_, cssparser::ParseError<'i, ()>>(if first_horizontal { (a, b) } else { (b, a) })
+        Ok::<_, cssparser::ParseError<()>>(if first_horizontal { (a, b) } else { (b, a) })
     }) {
         return Ok(format!("{x} {y}"));
     }
-    let component = |p: &mut Parser<'i, '_>| {
+    let component = |p: &mut Parser<'i>| {
         p.try_parse(|p| keyword(p, &["left", "right", "top", "bottom", "center"]))
             .or_else(|_| value(p, &Kind::LengthPercentage, ctx, depth))
     };
@@ -122,11 +118,11 @@ fn position<'i>(
 }
 
 fn geometry<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     name: &str,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     if name.contains("linear") {
         if p.try_parse(|p| p.expect_ident_matching("to")).is_ok() {
             let first = keyword(p, &["left", "right", "top", "bottom"])?;
@@ -166,7 +162,7 @@ fn geometry<'i>(
                         "farthest-side",
                     ];
                     let first = keyword(p, extents)?;
-                    Ok::<_, cssparser::ParseError<'_, ()>>((
+                    Ok::<_, cssparser::ParseError<()>>((
                         first,
                         p.try_parse(|p| keyword(p, extents)).ok(),
                     ))
@@ -180,7 +176,7 @@ fn geometry<'i>(
                     continue;
                 }
                 if let Ok((value, count)) = p.try_parse(|p| {
-                    let radius = |p: &mut Parser<'i, '_>| {
+                    let radius = |p: &mut Parser<'i>| {
                         math::parse_range(
                             p,
                             &Kind::LengthPercentage,
@@ -193,7 +189,7 @@ fn geometry<'i>(
                     let first = radius(p)?;
                     let second = p.try_parse(radius).ok();
                     if let Some(second) = second {
-                        Ok::<_, cssparser::ParseError<'_, ()>>((format!("{first} {second}"), 2))
+                        Ok::<_, cssparser::ParseError<()>>((format!("{first} {second}"), 2))
                     } else {
                         Ok((first, 1))
                     }
@@ -208,7 +204,7 @@ fn geometry<'i>(
             && (shape.as_deref() == Some("circle") && *count == 2
                 || shape.as_deref() == Some("ellipse") && *count == 1)
         {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         if let Some(shape) = shape {
             parts.push(shape);
@@ -221,17 +217,17 @@ fn geometry<'i>(
         parts.push(format!("at {}", position(p, ctx, depth)?));
     }
     if parts.is_empty() {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(parts.join(" "))
 }
 
 fn prelude<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     name: &str,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     let before = p.try_parse(interpolation).ok();
     let geometry = p.try_parse(|p| geometry(p, name, ctx, depth)).ok();
     let after = if before.is_none() {
@@ -240,7 +236,7 @@ fn prelude<'i>(
         None
     };
     if before.is_none() && geometry.is_none() && after.is_none() {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     p.expect_exhausted()?;
     Ok(geometry
@@ -251,11 +247,11 @@ fn prelude<'i>(
 }
 
 pub(super) fn parse<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     name: &str,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     let stop_kind = if name.contains("conic") {
         Kind::AnglePercentage
     } else {
@@ -285,23 +281,23 @@ pub(super) fn parse<'i>(
             return prelude(p, name, ctx, depth);
         }
         if previous_hint || stops == 0 {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         previous_hint = true;
         stop_position(p, &stop_kind, ctx, depth)
     })?;
     if stops == 0 || previous_hint || parts.len() > MAX_COMPONENTS {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(parts.join(", "))
 }
 
 fn stop_position<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     kind: &Kind,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     if *kind == Kind::AnglePercentage
         && let Ok(zero) = p.try_parse(|p| angle(p, ctx, depth))
     {
