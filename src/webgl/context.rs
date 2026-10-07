@@ -491,8 +491,10 @@ impl Context {
     }
 
     /// Resolve only on canvas consumption or presentation, never after every
-    /// draw. GPU rows are bottom-up; the DOM bitmap is top-down premultiplied RGBA.
-    pub fn snapshot(&mut self, present: bool) -> Option<Vec<u8>> {
+    /// draw. GPU rows are bottom-up; the DOM bitmap is top-down premultiplied
+    /// RGBA. Also reports whether every pixel is opaque, in which case the
+    /// premultiplied pixels are their straight-alpha values too.
+    pub fn snapshot(&mut self, present: bool) -> Option<(Vec<u8>, bool)> {
         if self.lost || self.driver.make_current().is_err() {
             return None;
         }
@@ -530,24 +532,34 @@ impl Context {
             super::color_space::ColorSpace::Srgb,
             self.attrs.alpha && self.attrs.premultiplied,
         );
-        for p in pixels.as_chunks_mut::<4>().0 {
-            if !self.attrs.alpha {
+        let mut opaque = true;
+        if !self.attrs.alpha {
+            for p in pixels.as_chunks_mut::<4>().0 {
                 p[3] = 255;
             }
-            if !self.attrs.premultiplied {
-                for c in 0..3 {
-                    p[c] = ((p[c] as u16 * p[3] as u16 + 127) / 255) as u8;
+        } else {
+            for p in pixels.as_chunks_mut::<4>().0 {
+                let alpha = p[3];
+                // An opaque pixel is the same premultiplied or not.
+                if alpha == 255 {
+                    continue;
                 }
-            } else {
-                for c in 0..3 {
-                    p[c] = p[c].min(p[3]);
+                opaque = false;
+                if self.attrs.premultiplied {
+                    for c in 0..3 {
+                        p[c] = p[c].min(alpha);
+                    }
+                } else {
+                    for c in 0..3 {
+                        p[c] = ((p[c] as u16 * alpha as u16 + 127) / 255) as u8;
+                    }
                 }
             }
         }
         if present {
             self.dirty = false;
         }
-        Some(pixels)
+        Some((pixels, opaque))
     }
 
     pub fn execute(&mut self, op: &str, n: &[f64], bytes: Option<&[u8]>, text: &str) -> Reply {

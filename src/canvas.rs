@@ -1052,6 +1052,13 @@ impl Canvas {
     }
 
     pub fn get(&self, x: i64, y: i64, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.straight_rgba(x, y, width, height)
+            .map(|(rgba, _)| rgba)
+    }
+
+    /// The straight-alpha RGBA of a rectangle (transparent black outside the
+    /// bitmap) and whether any copied pixel is translucent.
+    fn straight_rgba(&self, x: i64, y: i64, width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
         let len = (width as usize)
             .checked_mul(height as usize)?
             .checked_mul(4)?;
@@ -1060,39 +1067,81 @@ impl Canvas {
         }
         let mut out = vec![0; len];
         let Some(bitmap) = &self.bitmap else {
-            return Some(out);
+            return Some((out, len > 0));
         };
-        for sy in y.max(0)..(y + height as i64).min(self.height as i64) {
-            for sx in x.max(0)..(x + width as i64).min(self.width as i64) {
-                let pixel = bitmap.pixels()[(sy * self.width as i64 + sx) as usize].demultiply();
-                let target = (((sy - y) * width as i64 + sx - x) * 4) as usize;
-                out[target..target + 4].copy_from_slice(&[
-                    pixel.red(),
-                    pixel.green(),
-                    pixel.blue(),
-                    pixel.alpha(),
-                ]);
+        let (x0, x1) = (x.max(0), (x + width as i64).min(self.width as i64));
+        let mut translucent = x1 - x0 < width as i64;
+        if x1 <= x0 {
+            return Some((out, len > 0));
+        }
+        let pixels = bitmap.pixels();
+        let (y0, y1) = (y.max(0), (y + height as i64).min(self.height as i64));
+        translucent |= y1 - y0 < height as i64;
+        for sy in y0..y1 {
+            let row = (sy * self.width as i64) as usize;
+            let source = &pixels[row + x0 as usize..row + x1 as usize];
+            let target = (((sy - y) * width as i64 + x0 - x) * 4) as usize;
+            let target = out[target..target + source.len() * 4]
+                .as_chunks_mut::<4>()
+                .0;
+            for (pixel, out) in source.iter().zip(target) {
+                *out = if pixel.alpha() == 255 {
+                    [pixel.red(), pixel.green(), pixel.blue(), 255]
+                } else {
+                    translucent = true;
+                    let straight = pixel.demultiply();
+                    [
+                        straight.red(),
+                        straight.green(),
+                        straight.blue(),
+                        straight.alpha(),
+                    ]
+                };
             }
         }
-        Some(out)
+        Some((out, translucent))
     }
 
     pub fn snapshot(&self) -> Option<sk::Pixmap> {
         self.bitmap.clone()
     }
 
+    /// Adopts a WebGL drawing buffer as this canvas's premultiplied bitmap.
+    /// `opaque` frames (every alpha 255, as WebGL guarantees for `alpha:
+    /// false`) are presented from the same pixels, which are then also their
+    /// straight-alpha values.
     pub(crate) fn publish_webgl(
         &mut self,
         width: u32,
         height: u32,
         pixels: Vec<u8>,
+        opaque: bool,
         present: bool,
     ) {
         self.width = width;
         self.height = height;
+        let straight: Option<Arc<[u8]>> = (present && opaque).then(|| pixels.as_slice().into());
         self.bitmap =
             sk::IntSize::from_wh(width, height).and_then(|size| sk::Pixmap::from_vec(pixels, size));
-        self.changed();
+        // The snapshot already made an `alpha: false` frame opaque, so this is
+        // `changed()` without its alpha pass.
+        self.bitmap_revision = self.bitmap_revision.wrapping_add(1);
+        self.presentation = None;
+        if let Some(rgba) = straight
+            && self.bitmap.is_some()
+        {
+            self.presentation = Some(crate::render::CanvasImage::new(
+                self.image_handle,
+                self.bitmap_revision,
+                crate::render::ImageResource {
+                    svg_source: None,
+                    width,
+                    height,
+                    has_alpha: false,
+                    rgba,
+                },
+            ));
+        }
         if present {
             self.webgl_front = self.backing_image();
         }
@@ -1218,7 +1267,7 @@ impl Canvas {
             return Some(image.clone());
         }
         self.bitmap.as_ref()?;
-        let rgba = self.get(0, 0, self.width, self.height)?;
+        let (rgba, has_alpha) = self.straight_rgba(0, 0, self.width, self.height)?;
         let image = crate::render::CanvasImage::new(
             self.image_handle,
             self.bitmap_revision,
@@ -1226,7 +1275,7 @@ impl Canvas {
                 svg_source: None,
                 width: self.width,
                 height: self.height,
-                has_alpha: rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255),
+                has_alpha,
                 rgba: rgba.into(),
             },
         );
