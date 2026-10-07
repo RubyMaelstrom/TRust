@@ -156,7 +156,7 @@ pub(super) fn call(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         return Ok(Value::Undefined);
     }
     static RECORDS: AtomicUsize = AtomicUsize::new(0);
-    let count = RECORDS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+    let count = RECORDS.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         (n <= MAX_RECORDS).then_some(n + 1)
     });
     match count {

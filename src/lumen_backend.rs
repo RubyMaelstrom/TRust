@@ -14070,7 +14070,7 @@ fn speculate_module_imports(
         }
         if !crate::http::subresource_allowed(page, &resolved)
             || fetched
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                     |count| {
@@ -14735,10 +14735,10 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             result,
         } => {
             if let Some(state) = engine.ctx().host_mut::<HostState>() {
-                let _ = state.pending_dynamic_modules.fetch_update(
+                state.pending_dynamic_modules.update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
-                    |count| Some(count.saturating_sub(1)),
+                    |count| count.saturating_sub(1),
                 );
             }
             install_context_module_loader(engine, context);
