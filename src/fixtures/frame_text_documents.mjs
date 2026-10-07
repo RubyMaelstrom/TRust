@@ -44,7 +44,10 @@
         frame.remove();
     }
     const opaque = document.createElement('iframe');
-    opaque.src = 'data:text/plain,' + encodeURIComponent(source);
+    // The percent-encoded bytes are UTF-8; without the charset an opaque
+    // text document decodes with the windows-1252 default (HTML
+    // #encoding-sniffing-algorithm step 8).
+    opaque.src = 'data:text/plain;charset=utf-8,' + encodeURIComponent(source);
     body.appendChild(opaque);
     __trust.hydrateFrames(); drain();
     assert(opaque.contentDocument === null, 'data navigation retains the same-origin boundary');

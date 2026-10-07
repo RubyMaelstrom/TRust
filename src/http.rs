@@ -714,7 +714,7 @@ pub fn render_html_for_environment(
     if !matches!(media.as_str(), "text/html" | "application/xhtml+xml") {
         return None;
     }
-    let html = decode_body(&response.content_type, &response.body);
+    let html = decode_document_body(&response.url, &response.content_type, &response.body).text;
     let base = base_with_doc_base(&html, &response.url);
     let mut dom = crate::dom::Dom::parse_document(&html);
     dom.set_doc_url(Some(base.clone()));
@@ -5074,17 +5074,46 @@ fn inflate_tolerant<R: std::io::Read>(mut dec: R) -> Vec<u8> {
     out
 }
 
-/// Decode the body per the content-type charset: UTF-8 by default,
-/// Latin-1 (and its windows-1252 sibling, near enough) by byte map.
+/// Decode a subresource body (Encoding #decode): a byte order mark wins,
+/// then a supported `Content-Type` charset, and otherwise UTF-8, the default
+/// of RFC 9239 §4.2 for scripts and of CSS Syntax §3.2 without a referring
+/// document. Navigated documents use [`decode_document_body`].
 pub(crate) fn decode_body(content_type: &str, body: &[u8]) -> String {
-    let charset = content_type
-        .split(';')
-        .find_map(|p| p.trim().strip_prefix("charset="))
-        .map(|c| c.trim_matches('"').to_ascii_lowercase());
-    match charset.as_deref() {
-        Some("iso-8859-1" | "latin1" | "windows-1252") => body.iter().map(|&b| b as char).collect(),
-        _ => String::from_utf8_lossy(body).into_owned(),
-    }
+    let fallback =
+        crate::document_encoding::transport_encoding(content_type).unwrap_or(encoding_rs::UTF_8);
+    fallback.decode(body).0.into_owned()
+}
+
+/// HTML #read-html, #read-xml and #read-text: decode a top-level navigation
+/// response's body and determine the document's character encoding (HTML
+/// §13.2.3 encoding sniffing for HTML, XML's rules for XML MIME types).
+pub(crate) fn decode_document_body(
+    url: &Url,
+    content_type: &str,
+    body: &[u8],
+) -> crate::document_encoding::DecodedDocument {
+    decode_nested_document_body(url, content_type, body, None)
+}
+
+/// [`decode_document_body`] for a nested document, given its container
+/// document's encoding when the two documents are same origin (HTML
+/// #encoding-sniffing-algorithm step 6).
+fn decode_nested_document_body(
+    url: &Url,
+    content_type: &str,
+    body: &[u8],
+    container: Option<&'static encoding_rs::Encoding>,
+) -> crate::document_encoding::DecodedDocument {
+    let essence = content_type.split(';').next().unwrap_or("").trim();
+    crate::document_encoding::decode_document(
+        crate::document_encoding::DocumentKind::for_essence(essence),
+        body,
+        crate::document_encoding::SniffContext {
+            content_type,
+            container,
+            local_file: url.scheme() == "file",
+        },
+    )
 }
 
 /// Whether a MIME type is a JavaScript MIME type (MIME Sniffing §4.2).
@@ -5330,7 +5359,8 @@ async fn execute_js_with_presentation(
     if !(media == "text/html" || media == "application/xhtml+xml") {
         return response;
     }
-    let html = decode_body(&response.content_type, &response.body);
+    let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
+    let (html, document_encoding) = (decoded.text, decoded.encoding);
     if response.declarative_refresh.is_none() {
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
@@ -5353,7 +5383,7 @@ async fn execute_js_with_presentation(
         let lower = html.to_ascii_lowercase();
         let frames = if !needs_live_dom && (lower.contains("<iframe") || lower.contains("<frame")) {
             let base = base_with_doc_base(&html, &response.url);
-            Some(prefetch_frame_documents(&html, &base, &response.url).await)
+            Some(prefetch_frame_documents(&html, &base, &response.url, document_encoding).await)
         } else {
             None
         };
@@ -5543,6 +5573,7 @@ async fn execute_js_with_presentation(
         blobs,
         scripted_frames,
         last_modified: document_last_modified(&response.url, &response.headers),
+        document_encoding,
     };
     // The page actor owns the engine on its own dedicated stack. Its first
     // event is `Static`
@@ -6582,7 +6613,7 @@ async fn css_only_for_device(
     if !(media == "text/html" || media == "application/xhtml+xml") {
         return response;
     }
-    let html = decode_body(&response.content_type, &response.body);
+    let html = decode_document_body(&response.url, &response.content_type, &response.body).text;
     if response.declarative_refresh.is_none() {
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
@@ -6612,7 +6643,8 @@ async fn css_only_with_sheets(
     frames: Option<HashMap<String, (Url, String)>>,
     terminal_presentation: bool,
 ) -> Response {
-    let html = decode_body(&response.content_type, &response.body);
+    let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
+    let (html, document_encoding) = (decoded.text, decoded.encoding);
     install_stylesheet_fonts(&html, &sheets, &response.url).await;
     let base = base_with_doc_base(&html, &response.url);
     fetch_svg_sprite_sheets(&html, &base, &response.url).await;
@@ -6621,7 +6653,7 @@ async fn css_only_with_sheets(
     // real arena synchronously.
     let frames = match frames {
         Some(frames) => frames,
-        None => prefetch_frame_documents(&html, &base, &response.url).await,
+        None => prefetch_frame_documents(&html, &base, &response.url, document_encoding).await,
     };
     // A nested document owns its stylesheets (HTML #the-iframe-element): fetch
     // each frame's `<link rel=stylesheet>` against that frame's own URL. The
@@ -6886,7 +6918,14 @@ fn data_frame_document(url: &Url) -> Option<String> {
         return None;
     }
     let bytes = crate::img::decode_data_url(url.as_str())?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    // A data: document's origin is opaque, so it never inherits its
+    // container's encoding (HTML #encoding-sniffing-algorithm step 6).
+    let content_type = url
+        .as_str()
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+        .map_or("", |(metadata, _)| metadata);
+    Some(decode_nested_document_body(url, content_type, &bytes, None).text)
 }
 
 /// Scan one document's markup for its frames' `src` URLs to fetch and inline
@@ -6931,18 +6970,29 @@ async fn prefetch_frame_documents(
     html: &str,
     base: &Url,
     page_url: &Url,
+    encoding: &'static encoding_rs::Encoding,
 ) -> std::collections::HashMap<String, (Url, String)> {
     use std::collections::VecDeque;
     let mut map: HashMap<String, (Url, String)> = HashMap::new();
-    // (document markup, its base, fragment-stripped ancestor URLs)
-    let mut queue: VecDeque<(String, Url, Vec<String>)> = VecDeque::new();
+    // (document markup, its base, fragment-stripped ancestor URLs, the URL
+    // that determines its origin, its character encoding)
+    type Pending = (
+        String,
+        Url,
+        Vec<String>,
+        Url,
+        &'static encoding_rs::Encoding,
+    );
+    let mut queue: VecDeque<Pending> = VecDeque::new();
     queue.push_back((
         html.to_string(),
         base.clone(),
         vec![strip_fragment(page_url.as_str()).to_string()],
+        page_url.clone(),
+        encoding,
     ));
 
-    while let Some((markup, base, ancestors)) = queue.pop_front() {
+    while let Some((markup, base, ancestors, origin_url, encoding)) = queue.pop_front() {
         let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors);
 
         let cookie_ancestor = ancestors.iter().any(|ancestor| {
@@ -6951,10 +7001,14 @@ async fn prefetch_frame_documents(
                 .is_none_or(|url| !crate::site_storage::same_site(page_url, &url))
         });
         // Fetch this level's `src` documents concurrently.
-        let fetched: Vec<Option<(Url, Url, String)>> =
+        let origin_url = &origin_url;
+        let fetched: Vec<Option<(Url, Url, String, &'static encoding_rs::Encoding)>> =
             futures::stream::iter(srcs.into_iter().map(|url| async move {
                 if url.scheme() == "data" {
-                    return data_frame_document(&url).map(|body| (url.clone(), url, body));
+                    // The CSS-only presentation never reads a data: frame's
+                    // encoding; its nested documents are cross-origin.
+                    return data_frame_document(&url)
+                        .map(|body| (url.clone(), url, body, encoding_rs::UTF_8));
                 }
                 let mut request = Request::subresource(url.clone(), page_url, "iframe", None);
                 request.cookie_context.as_mut().unwrap().cross_site_ancestor = cookie_ancestor;
@@ -6967,24 +7021,48 @@ async fn prefetch_frame_documents(
                     .trim()
                     .to_ascii_lowercase();
                 let is_html = media == "text/html" || media == "application/xhtml+xml";
-                (resp.status >= 200 && resp.status < 300 && is_html)
-                    .then(|| (url, resp.url, decode_body(&resp.content_type, &resp.body)))
+                if !(resp.status >= 200 && resp.status < 300 && is_html) {
+                    return None;
+                }
+                // HTML #encoding-sniffing-algorithm step 6: a same-origin
+                // container document lends its encoding.
+                let container = (resp.url.origin() == origin_url.origin()).then_some(encoding);
+                let decoded = decode_nested_document_body(
+                    &resp.url,
+                    &resp.content_type,
+                    &resp.body,
+                    container,
+                );
+                Some((url, resp.url, decoded.text, decoded.encoding))
             }))
             .buffered(PREFETCH_CONCURRENCY)
             .collect()
             .await;
 
-        for (requested, url, body) in fetched.into_iter().flatten() {
+        for (requested, url, body, child_encoding) in fetched.into_iter().flatten() {
             let mut child_ancestors = ancestors.clone();
             child_ancestors.push(strip_fragment(url.as_str()).to_string());
             // Nested frames in the fetched content resolve against ITS url.
-            queue.push_back((body.clone(), url.clone(), child_ancestors));
+            queue.push_back((
+                body.clone(),
+                url.clone(),
+                child_ancestors,
+                url.clone(),
+                child_encoding,
+            ));
             map.insert(requested.to_string(), (url, body));
         }
         // srcdoc bodies hold no URL of their own; recurse to load THEIR frames
-        // (base/origin inherit the parent document, per about:srcdoc).
+        // (base/origin inherit the parent document, per about:srcdoc). Their
+        // source is already decoded text (HTML #charset), hence UTF-8.
         for srcdoc in srcdocs {
-            queue.push_back((srcdoc, base.clone(), ancestors.clone()));
+            queue.push_back((
+                srcdoc,
+                base.clone(),
+                ancestors.clone(),
+                origin_url.clone(),
+                encoding_rs::UTF_8,
+            ));
         }
     }
     map
@@ -7448,7 +7526,7 @@ pub fn parse_seeded(
         );
     }
     let lines = if media == "text/html" || media == "application/xhtml+xml" {
-        let html = decode_body(content_type, body);
+        let html = decode_document_body(url, content_type, body).text;
         // The HTTP renderer: our own arena DOM laid out into rows of
         // positioned items (multi-link rows, real CSS, live form
         // controls). Forms are extracted from the SAME arena so the
@@ -7536,7 +7614,7 @@ pub fn parse_seeded(
         anchor_rows = found_anchors;
         Vec::new()
     } else if crate::download::mime_is_renderable(&media, false) {
-        crate::doc::wrap_plain(&decode_body(content_type, body), width)
+        crate::doc::wrap_plain(&decode_document_body(url, content_type, body).text, width)
     } else {
         vec![DocLine {
             kind: Kind::Error,
@@ -18646,9 +18724,67 @@ customElements.define('lit-counter', LitCounter);
 
     #[test]
     fn decodes_latin1() {
-        let body = [b'c', b'a', b'f', 0xe9];
-        assert_eq!(decode_body("text/html; charset=ISO-8859-1", &body), "café");
+        // Encoding #names-and-labels: ISO-8859-1 labels windows-1252.
+        let body = [b'c', b'a', b'f', 0xe9, 0x80];
+        assert_eq!(decode_body("text/html; charset=ISO-8859-1", &body), "café€");
         assert_eq!(decode_body("text/html", "café".as_bytes()), "café");
+        assert_eq!(
+            decode_body("text/css; charset=\"Shift_JIS\"", &[0x82, 0xA0]),
+            "あ"
+        );
+        assert_eq!(
+            decode_body("text/css; charset=koi8-r", b"\xEF\xBB\xBF\xC3\xA9"),
+            "é"
+        );
+    }
+
+    #[test]
+    fn navigated_documents_decode_with_html_encoding_sniffing() {
+        let url = Url::parse("https://example.test/").unwrap();
+        let decoded = decode_document_body(&url, "text/html", b"<p>caf\xE9");
+        assert_eq!(
+            (decoded.text.as_str(), decoded.encoding.name()),
+            ("<p>café", "windows-1252")
+        );
+        let decoded = decode_document_body(&url, "text/html", b"<meta charset=koi8-r>\xC1");
+        assert_eq!(decoded.encoding.name(), "KOI8-R");
+        assert!(decoded.text.ends_with('а'));
+        // HTML #encoding-sniffing-algorithm step 7 autodetects UTF-8 only in
+        // local files.
+        let file = Url::parse("file:///tmp/page.html").unwrap();
+        let decoded = decode_document_body(&file, "text/html", "<p>café".as_bytes());
+        assert_eq!(
+            (decoded.text.as_str(), decoded.encoding.name()),
+            ("<p>café", "UTF-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_documents_report_their_character_encoding() {
+        // DOM #dom-document-characterset reports the encoding the navigated
+        // bytes were decoded with (HTML #documentEncoding).
+        let mut response = refresh_response("http://encoding.test/", "");
+        response.body = b"<p id=t>\xE9</p><p id=out></p><script>\
+            document.getElementById('out').textContent = [document.characterSet,\
+            document.charset, document.inputEncoding, document.getElementById('t').textContent].join('|');\
+            </script>"
+            .to_vec();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(
+            body.contains("windows-1252|windows-1252|windows-1252|é"),
+            "{body}"
+        );
+
+        let mut response = refresh_response("http://encoding.test/", "");
+        response.content_type = String::from("text/html; charset=Shift_JIS");
+        response.body = b"<p id=t>\x82\xA0</p><p id=out></p><script>\
+            document.getElementById('out').textContent = document.characterSet + '|' +\
+            document.getElementById('t').textContent;</script>"
+            .to_vec();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(body.contains("Shift_JIS|あ"), "{body}");
     }
 
     #[tokio::test]

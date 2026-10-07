@@ -2078,6 +2078,7 @@ mod desktop {
             blobs: env.blobs.clone(),
             scripted_frames: env.scripted_frames,
             last_modified: env.last_modified,
+            document_encoding: env.document_encoding,
         };
         let mut page = match load_page(
             html,
@@ -3179,6 +3180,7 @@ mod desktop {
             dom.set_viewport_px(viewport.width, viewport.height);
             dom.set_device_pixel_ratio(env.device_pixel_ratio);
             dom.set_doc_url(url::Url::parse(&env.url).ok());
+            dom.set_document_encoding(DOCUMENT, env.document_encoding);
             if !env.sheets.is_empty() {
                 let sheets: Vec<(String, String)> = env
                     .sheets
@@ -9094,6 +9096,9 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_create_document", 1, host_create_document),
     ("__dom_document_content_type", 1, host_document_content_type),
     ("__dom_document_quirks", 1, host_document_quirks),
+    ("__dom_document_encoding", 1, host_document_encoding),
+    ("__document_decode", 4, host_document_decode),
+    ("__xhr_decode", 3, host_xhr_decode),
     ("__dom_pi_target", 1, guarded_pi_target),
     ("__dom_create_comment", 2, guarded_create_comment),
     ("__dom_create_cdata", 2, guarded_create_cdata),
@@ -14866,6 +14871,9 @@ fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
         .filter(|value| !matches!(value, Value::Undefined))
         .map(|_| host_arg_string(ctx, args, 1))
         .unwrap_or_else(|| "text/html".into());
+    // XHR #document-response step 8 sets the decoded document's encoding;
+    // DOMParser and createHTMLDocument keep DOM's UTF-8 default.
+    let encoding = host_arg_encoding(ctx, args, 2);
     let dom = host_dom(ctx);
     let id = if content_type == "text/html" {
         dom.borrow_mut().parse_document_into(&html)
@@ -14873,7 +14881,93 @@ fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
         dom.borrow_mut()
             .parse_xml_document_into(&html, &content_type)
     };
+    dom.borrow_mut().set_document_encoding(id, encoding);
     Ok(host_id_value(Some(id)))
+}
+
+/// An encoding name (or label) argument; absent or unknown means UTF-8.
+fn host_arg_encoding(
+    ctx: &mut Ctx,
+    args: &[Value],
+    index: usize,
+) -> &'static encoding_rs::Encoding {
+    match args.get(index) {
+        Some(Value::Str(_)) => {
+            encoding_rs::Encoding::for_label(host_arg_string(ctx, args, index).as_bytes())
+                .unwrap_or(encoding_rs::UTF_8)
+        }
+        _ => encoding_rs::UTF_8,
+    }
+}
+
+/// DOM #dom-document-characterset: the name of a document's encoding.
+fn host_document_encoding(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let encoding =
+        host_arg_node(&dom, args, 0).map_or(encoding_rs::UTF_8, |id| dom.document_encoding(id));
+    Ok(Value::from_engine_text(encoding.name()))
+}
+
+/// Decoded document text and its encoding's name, as a two-element array.
+fn host_decoded_document(
+    ctx: &mut Ctx,
+    decoded: crate::document_encoding::DecodedDocument,
+) -> Value {
+    ctx.make_array(vec![
+        Value::from_string(decoded.text),
+        Value::from_engine_text(decoded.encoding.name()),
+    ])
+}
+
+/// HTML #read-html, #read-xml and #read-text for a nested navigable's
+/// response: (bytes, Content-Type, response URL, container Document's
+/// encoding name when same origin, or null) → [text, encoding name].
+fn host_document_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let bytes = args
+        .first()
+        .and_then(|value| ctx.buffer_source_bytes(value, true))
+        .ok_or_else(|| ctx.make_error("TypeError", "Document body is not a BufferSource"))?;
+    let content_type = host_arg_string(ctx, args, 1);
+    let url = host_arg_usv(ctx, args, 2);
+    let container = match args.get(3) {
+        Some(Value::Str(_)) => {
+            encoding_rs::Encoding::for_label(host_arg_string(ctx, args, 3).as_bytes())
+        }
+        _ => None,
+    };
+    let essence = content_type.split(';').next().unwrap_or("").trim();
+    let decoded = crate::document_encoding::decode_document(
+        crate::document_encoding::DocumentKind::for_essence(essence),
+        &bytes,
+        crate::document_encoding::SniffContext {
+            content_type: &content_type,
+            container,
+            local_file: url::Url::parse(&url).is_ok_and(|url| url.scheme() == "file"),
+        },
+    );
+    Ok(host_decoded_document(ctx, decoded))
+}
+
+/// XHR response decoding: (bytes, a label or null, html) → [text, encoding
+/// name]. With `html`, #document-response step 5 for an HTML document (the
+/// final encoding's label, else the prescan, else UTF-8); otherwise
+/// #text-response's Encoding #decode with the label's fallback encoding.
+fn host_xhr_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let bytes = args
+        .first()
+        .and_then(|value| ctx.buffer_source_bytes(value, true))
+        .ok_or_else(|| ctx.make_error("TypeError", "Response body is not a BufferSource"))?;
+    let label = match args.get(1) {
+        Some(Value::Str(_)) => Some(host_arg_string(ctx, args, 1)),
+        _ => None,
+    };
+    let decoded = if matches!(args.get(2), Some(Value::Bool(true))) {
+        crate::document_encoding::decode_xhr_html(&bytes, label.as_deref())
+    } else {
+        crate::document_encoding::decode_with_label(&bytes, label.as_deref())
+    };
+    Ok(host_decoded_document(ctx, decoded))
 }
 
 fn host_create_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -17183,6 +17277,8 @@ fn host_scroll_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let html = host_arg_string(ctx, args, 1);
     let base = host_arg_string(ctx, args, 2);
+    // HTML #documentEncoding: the encoding the markup was decoded with.
+    let encoding = host_arg_encoding(ctx, args, 4);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let Some(frame) = host_arg_node(&dom, args, 0) {
@@ -17190,6 +17286,9 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             dom.install_frame_text_document(frame, &html, &base);
         } else {
             dom.install_frame_document(frame, &html, &base);
+        }
+        if let Some(document) = dom.frame_document(frame) {
+            dom.set_document_encoding(document, encoding);
         }
     }
     Ok(Value::Undefined)
@@ -22756,7 +22855,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 203, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 206, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -22767,7 +22866,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 203);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 206);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -23770,6 +23869,42 @@ mod tests {
                         "{tier:?}"
                     );
                 }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn nested_documents_decode_with_their_sniffed_encodings() {
+        // HTML #encoding-sniffing-algorithm and DOM #dom-document-characterset
+        // for navigated frame documents and API-created documents.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dom = Rc::new(RefCell::new(Dom::new()));
+                dom.borrow_mut()
+                    .set_document_encoding(DOCUMENT, encoding_rs::WINDOWS_1250);
+                let mut engine = configured_engine_before_prelude(
+                    HostState::new(dom, Rc::new(RealmClock::new())),
+                    DEFAULT_URL,
+                );
+                eval(
+                    &mut engine,
+                    "globalThis.frameNavigationResponses = Object.create(null); \
+                     globalThis.__http_navigate = url => frameNavigationResponses[url] || null; \
+                     globalThis.__http_navigate_async = undefined;",
+                    "HTTP navigation response fixture",
+                )
+                .unwrap();
+                eval_platform_prelude(&mut engine).unwrap();
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        include_str!("fixtures/frame_document_encodings.mjs")
+                    ),
+                    "frame-document-encodings-ok"
+                );
             })
             .unwrap()
             .join()

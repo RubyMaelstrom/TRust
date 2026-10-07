@@ -138,6 +138,7 @@ impl Dom {
             map_remove!(
                 document_content_types,
                 document_modes,
+                document_encodings,
                 input_values,
                 control_selections,
                 shadow_roots,
@@ -243,6 +244,7 @@ impl Dom {
         shrink!(
             document_content_types,
             document_modes,
+            document_encodings,
             input_values,
             control_selections,
             shadow_roots,
@@ -335,6 +337,7 @@ impl Dom {
         map!(
             document_content_types,
             document_modes,
+            document_encodings,
             input_values,
             control_selections,
             shadow_roots,

@@ -52,6 +52,7 @@ mod webgl;
 pub mod app;
 pub mod cp437;
 pub mod doc;
+mod document_encoding;
 pub mod dom;
 pub mod download;
 pub mod file;

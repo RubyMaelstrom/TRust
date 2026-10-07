@@ -166,6 +166,9 @@ pub struct PageEnv {
     /// its `Last-Modified` header or file metadata (HTML
     /// #dom-document-lastmodified); None when unknown.
     pub(crate) last_modified: Option<f64>,
+    /// HTML #documentEncoding: the encoding the document's bytes were
+    /// decoded with (`document.characterSet`).
+    pub(crate) document_encoding: &'static encoding_rs::Encoding,
 }
 
 impl PageEnv {
@@ -188,6 +191,7 @@ impl PageEnv {
             blobs: Default::default(),
             scripted_frames: false,
             last_modified: None,
+            document_encoding: encoding_rs::UTF_8,
         }
     }
 }

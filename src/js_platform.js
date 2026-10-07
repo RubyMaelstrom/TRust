@@ -3513,7 +3513,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return childWindow;
     }
-    function loadFrameMarkup(frame, markup, base, frameUrl, generation, referrer = "", contentType = "text/html", navigationTiming = null) {
+    function loadFrameMarkup(frame, markup, base, frameUrl, generation, referrer = "", contentType = "text/html", navigationTiming = null, encoding = "UTF-8") {
         if (navigationTiming) navigationTiming['legacy:domLoading'] = navigationFloorTime(__clockNow());
         if (frameBlobOrigins.get(frame)?.url !== frameUrl) frameBlobOrigins.delete(frame);
         frameReferrers.set(frame, referrer);
@@ -3536,7 +3536,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (const root of replacedRoots) destroyFrameNavigablesIn(root);
         }
         __dom_load_frame(nodeIds.get(frame), String(markup == null ? "" : markup), base,
-            isTextDocumentType(contentType));
+            isTextDocumentType(contentType), encoding);
         for (let i = 0; i < replacedRoots.length; i++)
             syncWrapperSubtreeRetention(nodeIds.get(replacedRoots[i]));
 
@@ -3580,10 +3580,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             /^(?:application|text)\/(?:x-)?(?:ecmascript|javascript)$/.test(type) ||
             /^text\/(?:javascript1\.[0-5]|jscript|livescript)$/.test(type);
     }
-    function loadFrameResource(frame, text, contentType, url, generation, referrer = "", navigationTiming = null) {
+    // `body` is the response's bytes, or text already decoded as UTF-8.
+    function loadFrameResource(frame, body, contentType, url, generation, referrer = "", navigationTiming = null) {
         const essence = String(contentType || "text/html").split(";", 1)[0].trim().toLowerCase();
         if (essence === "text/html" || essence === "application/xhtml+xml" || isTextDocumentType(essence)) {
-            loadFrameMarkup(frame, text, url, url, generation, referrer, essence, navigationTiming);
+            let text = body, encoding = "UTF-8";
+            if (typeof body !== "string") {
+                // HTML #read-html / #read-text: decode with the encoding
+                // sniffing algorithm, whose step 6 lends a same-origin
+                // container document's encoding (HTML #documentEncoding).
+                const container = frameSameOrigin(url, frame)
+                    ? __dom_document_encoding(nodeIds.get(frame.ownerDocument)) : null;
+                const decoded = __document_decode(body, String(contentType || "text/html"), url, container);
+                text = decoded[0];
+                encoding = decoded[1];
+            }
+            loadFrameMarkup(frame, text, url, url, generation, referrer, essence, navigationTiming, encoding);
         } else {
             fireFrameLoad(frame, generation);
         }
@@ -3748,7 +3760,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!locationNavigation) internalsFor(frame).loadedSrc = url;
             const generation = beginFrameLoad(frame, url);
             const parts = __dataURLParts(url);
-            if (parts) loadFrameResource(frame, parts.text, parts.ctype, url, generation);
+            if (parts) loadFrameResource(frame, __latin1ToBytes(parts.bytes), parts.ctype, url, generation);
             else fireFrameLoad(frame, generation);
             return;
         }
@@ -3760,8 +3772,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 ? __blobURLParts(capturedURL.blob) : __resolveBlobURL(url);
             if (entry) {
                 frameBlobOrigins.set(frame, { url, origin: entry.origin, originKey: entry.originKey });
-                const text = new g.TextDecoder().decode(__latin1ToBytes(entry.bytes));
-                loadFrameResource(frame, text, entry.type || "text/plain", url, generation);
+                loadFrameResource(frame, __latin1ToBytes(entry.bytes), entry.type || "text/plain", url, generation);
             } else {
                 fireFrameLoad(frame, generation);
             }
@@ -3818,7 +3829,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             trust.recordResourceTiming(r[8]);
         }
         const finalURL = r[5] || url;
-        loadFrameResource(frame, r[2] || "", r[1], finalURL, generation, r[6] || "", r[7]);
+        // The response bytes (r[3]) are decoded per the document's rules; a
+        // record without them carries text already decoded as UTF-8 (r[2]).
+        const body = r[3] instanceof ArrayBuffer || ArrayBuffer.isView(r[3]) ? r[3] : (r[2] || "");
+        loadFrameResource(frame, body, r[1], finalURL, generation, r[6] || "", r[7]);
     }
     // Process every frame within `root` (the document at load, or a freshly
     // installed frame document for nested frames). Idempotent (the __loaded*
@@ -11640,6 +11654,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (target === null) throw new TypeError("Document has no active Location");
         target.href = value;
     }
+    function documentEncodingName(document) {
+        const id = nodeIds.get(document);
+        if (id === undefined || __dom_node_type(id) !== 9) throw new TypeError("Illegal invocation");
+        return __dom_document_encoding(id);
+    }
     class Document extends Node {
         constructor(id) {
             super(id === undefined ? __dom_create_document("application/xml") : id);
@@ -11696,6 +11715,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get readyState() { return trust.readyState; }
         get contentType() { return documentContentTypes.get(this) || __dom_document_content_type(nodeIds.get(this)); }
         get compatMode() { return __dom_document_quirks(nodeIds.get(this)) ? "BackCompat" : "CSS1Compat"; }
+        // DOM #dom-document-characterset: the name of this document's
+        // encoding; charset and inputEncoding are its legacy aliases.
+        get characterSet() { return documentEncodingName(this); }
+        get charset() { return documentEncodingName(this); }
+        get inputEncoding() { return documentEncodingName(this); }
         // CSS Font Loading Module Level 3 §4.2: a document's font source is a
         // stable FontFaceSet.  Its setlike collection is independent per
         // Document, including detached documents created by DOMParser.
@@ -25948,6 +25972,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (internalsFor(this).decodedText === undefined) internalsFor(this).decodedText = xhrDecodeText.call(this, false);
         return internalsFor(this).decodedText;
     }
+    // XHR #final-charset: the label whose encoding "get a final encoding"
+    // returns (the response MIME type's charset, overridden by the override
+    // MIME type's), or null. The host maps a failing label to null.
+    function xhrFinalEncodingLabel() {
+        const responseMime = parseMimeType(internalsFor(this).ctype || "");
+        let label = responseMime && responseMime.parameters.has("charset")
+            ? responseMime.parameters.get("charset") : null;
+        const override = internalsFor(this).overrideMime;
+        if (override && override.parameters.has("charset")) label = override.parameters.get("charset");
+        return label;
+    }
     function xhrDecodeText(fatal) {
         if (internalsFor(this).bytes == null) return internalsFor(this).text || "";
         const bytes = __bodyBytes(internalsFor(this).bytes);
@@ -25967,10 +26002,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (match) label = match[2];
             }
         }
-        let decoder;
-        try { decoder = new g.TextDecoder(label || "utf-8", { fatal }); }
-        catch (error) { if (fatal) throw error; decoder = new g.TextDecoder("utf-8"); }
-        return decoder.decode(bytes);
+        // XHR #text-response: Encoding #decode, whose fallback may be the
+        // replacement encoding. Only the XML parser's fatal decode refuses
+        // malformed input or an unsupported label.
+        if (!fatal) return __xhr_decode(bytes, label || null, false)[0];
+        return new g.TextDecoder(label || "utf-8", { fatal }).decode(bytes);
     }
     function xhrDocumentResponse() {
         if (internalsFor(this).respXML !== undefined) return internalsFor(this).respXML;
@@ -25979,7 +26015,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const isHtml = ct === "text/html";
         let out = null;
         if (isXml || (isHtml && internalsFor(this).respType === "document")) {
-            try { out = wrap(__dom_parse_document(xhrDecodeText.call(this, isXml), ct)); }
+            try {
+                if (isHtml && internalsFor(this).bytes != null) {
+                    // XHR #document-response step 5: decode with the final
+                    // encoding, else the prescan, else UTF-8, which step 8
+                    // makes the document's encoding. An XML document keeps
+                    // UTF-8 (step 7).
+                    const decoded = __xhr_decode(__bodyBytes(internalsFor(this).bytes),
+                        xhrFinalEncodingLabel.call(this), true);
+                    out = wrap(__dom_parse_document(decoded[0], ct, decoded[1]));
+                } else {
+                    out = wrap(__dom_parse_document(xhrDecodeText.call(this, isXml), ct));
+                }
+            }
             catch (error) { internalsFor(this).respXML = null; return null; }
             documentURLs.set(out, internalsFor(this).responseURL);
             const root = out.documentElement;
