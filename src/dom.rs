@@ -17559,15 +17559,15 @@ struct StyleRuleData {
     /// for each importance (the layer order REVERSES for `!important`).
     /// See `encode_layer`; unlayered rules carry the implicit-final-layer
     /// encodings.
-    layer_normal: u64,
-    layer_important: u64,
+    layer_normal: u128,
+    layer_important: u128,
     decls: Vec<(String, (bool, String))>,
     containers: Vec<std::sync::Arc<container_queries::Query>>,
 }
 
 impl StyleRule {
     /// The importance-matched cascade-layer encoding for the cascade key.
-    fn layer_key(&self, important: bool) -> u64 {
+    fn layer_key(&self, important: bool) -> u128 {
         if important {
             self.layer_important
         } else {
@@ -17874,7 +17874,7 @@ impl StyleView<'_> {
 /// sorted before element-attached styles, and element-attached styles before
 /// layers (CSS Cascade 5 §6.1), and BEFORE specificity (layers beat
 /// specificity — the point of the feature).
-type CascadeKey = (bool, bool, bool, bool, u64, (u32, u32, u32), usize, usize);
+type CascadeKey = (bool, bool, bool, bool, u128, (u32, u32, u32), usize, usize);
 
 /// CSS Cascade 5 #revert-layer: keep the strongest declaration at each
 /// importance/context/inline/layer level when rollback occurs in the sheet.
@@ -17884,7 +17884,7 @@ enum CascadeWinner {
     Layers(Vec<(CascadeKey, String)>),
 }
 
-fn cascade_level(key: CascadeKey) -> (bool, bool, bool, bool, u64) {
+fn cascade_level(key: CascadeKey) -> (bool, bool, bool, bool, u128) {
     (key.0, key.1, key.2, key.3, key.4)
 }
 
@@ -17949,8 +17949,9 @@ impl CascadeWinner {
             } else if key.0 {
                 // Remove this layer and everything between its important and
                 // normal levels. Invert encode_layer's per-component ordering.
-                let mut normal_layer = 0u64;
-                for shift in [48, 32, 16, 0] {
+                let mut normal_layer = 0u128;
+                for level in 0..LAYER_LEVELS {
+                    let shift = 16 * level;
                     let component = (key.4 >> shift) & 0xffff;
                     normal_layer |= (if component == 0 {
                         0xffff
@@ -19502,25 +19503,26 @@ impl LayerRegistry {
     }
 }
 
-/// Encode a cascade-layer path into ONE lexicographically-comparable u64
-/// (css-cascade-5 §6.4): four 16-bit per-level components, most significant
-/// first. A present component is the layer's first-declaration index among
-/// its siblings; a missing level is the IMPLICIT final (sub)layer — the
-/// spec puts a parent layer's direct rules "in an implicit sub-layer after
-/// the explicitly nested layers", and unlayered rules (the empty path) "in
-/// an implicit final layer" after everything. For NORMAL declarations the
-/// LAST layer wins, so implicit levels encode 0xFFFF (max); for IMPORTANT
-/// declarations the layer order REVERSES ("for important rules the
-/// declaration whose cascade layer is first wins"), so every component
-/// flips. Depth caps at 4 levels and width at 0xFFFE siblings — beyond
-/// either the ordering degrades gracefully (real-world sheets are flat:
-/// Tailwind v4 declares 4 top-level layers).
-fn encode_layer(path: &[u32], important: bool) -> u64 {
-    let mut key = 0u64;
-    for lvl in 0..4 {
+/// Encode a cascade-layer path into ONE lexicographically-comparable u128
+/// (CSS Cascade 5 #layer-ordering): eight 16-bit per-level components, most
+/// significant first. A present component is the layer's first-declaration
+/// index among its siblings; a missing level is the IMPLICIT final
+/// (sub)layer: "unlayered rules are sorted later than any layered rules
+/// within the same parent layer", so a parent layer's direct rules follow
+/// its explicitly nested layers, and unlayered rules (the empty path) follow
+/// everything. For NORMAL declarations the LAST layer wins, so implicit
+/// levels encode 0xFFFF (max); for IMPORTANT declarations the layer order
+/// REVERSES ("for important rules the declaration whose cascade layer is
+/// earliest wins"), so every component flips. Depth caps at
+/// `LAYER_LEVELS` and width at 0xFFFE siblings; beyond either the ordering
+/// degrades gracefully. (daisyUI 5 nests five levels deep, as
+/// `utilities.daisyui.l1.l2.l3`, to rank its component rules.)
+fn encode_layer(path: &[u32], important: bool) -> u128 {
+    let mut key = 0u128;
+    for lvl in 0..LAYER_LEVELS {
         let comp = match path.get(lvl) {
             Some(&i) => {
-                let i = u64::from(i.min(0xFFFD));
+                let i = u128::from(i.min(0xFFFD));
                 if important { 0xFFFE - i } else { i }
             }
             None => {
@@ -19535,6 +19537,9 @@ fn encode_layer(path: &[u32], important: bool) -> u64 {
     }
     key
 }
+
+/// The cascade-layer nesting depth `encode_layer` orders exactly.
+const LAYER_LEVELS: usize = 8;
 
 /// A syntactically-plausible `<layer-name>` (`<ident> [ '.' <ident> ]*`).
 /// Loose on ident internals (unicode allowed) but strict on shape: no
@@ -28500,6 +28505,38 @@ mod tests {
             dom.computed_style(t, "text-indent").as_deref(),
             Some("4px"),
             "the dotted form reaches the same nested layer"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_layers_keep_parent_direct_rules_last() {
+        // CSS Cascade 5 #layer-ordering at daisyUI 5's depth: `.menu` sits in
+        // utilities.daisyui.l1.l2.l3 and `.menu-horizontal` directly in
+        // utilities.daisyui.l1.l2, whose direct rules follow its sublayers.
+        // A four-level key truncated both to the same layer, and source
+        // order then let the deeper rule win.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @layer utilities {
+                    @layer daisyui.l1.l2 { .h { flex-direction: row } }
+                    @layer daisyui.l1.l2.l3 { .m { flex-flow: column wrap } }
+                    @layer a.b.c.d.e.f.g { .i { letter-spacing: 1px !important } }
+                    @layer a.b.c.d.e.f { .i { letter-spacing: 2px !important } }
+                }
+             </style></head>
+             <body><ul id=t class='m h'></ul><p id=u class=i>x</p></body>",
+        );
+        let t = dom.get_by_id("t").unwrap();
+        assert_eq!(
+            dom.computed_style(t, "flex-direction").as_deref(),
+            Some("row")
+        );
+        assert_eq!(dom.computed_style(t, "flex-wrap").as_deref(), Some("wrap"));
+        // Important reverses the order: the deeper (earlier) layer wins.
+        let u = dom.get_by_id("u").unwrap();
+        assert_eq!(
+            dom.computed_style(u, "letter-spacing").as_deref(),
+            Some("1px")
         );
     }
 
