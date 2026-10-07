@@ -331,6 +331,7 @@ fn resolve<'i>(
         Kind::Angle | Kind::AnglePercentage => ANGLE,
         Kind::Time => TIME,
         Kind::Resolution => RESOLUTION,
+        Kind::Flex => FLEX,
         Kind::Number | Kind::Integer | Kind::NumberPercentage => NUMBER,
         _ => return Err(cssparser::ParseError::custom(())),
     };

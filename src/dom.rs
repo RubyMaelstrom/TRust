@@ -5165,7 +5165,14 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         // an inherited `em`/`%` token to resolve again on a smaller child.
         let v = if name == "line-height" {
             v.and_then(|value| {
-                let value = value.trim();
+                // CSS Values 4 #calc-computed-value: a <number> math
+                // function computes to its number, still relative to each
+                // descendant's font size.
+                let number = properties::numeric::computed(self, id, None, name, &value);
+                let value = match &number {
+                    Ok(Some(number)) => number.as_str(),
+                    _ => value.trim(),
+                };
                 if value.eq_ignore_ascii_case("normal") {
                     Some("normal".into())
                 } else if let Ok(number) = value.parse::<f32>() {
@@ -5191,6 +5198,13 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         };
         let v = if name == "font-weight" {
             v.map(|v| {
+                // CSS Values 4 #calc-computed-value, under this property's
+                // unit guard: `font-weight: calc(400 * 1ch / 1ch)` measures
+                // the font whose weight it is computing.
+                let v = match properties::numeric::computed(self, id, None, name, &v) {
+                    Ok(Some(weight)) => weight,
+                    _ => v,
+                };
                 if matches!(v.as_str(), "bolder" | "lighter") {
                     let parent = parent_computed()
                         .as_deref()
@@ -5277,6 +5291,15 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             value
         } else {
             properties::resolve_container_units(self, id, &value).unwrap_or(value)
+        };
+        // CSS Values 4 #calc-computed-value: a math function in a numeric
+        // production computes to its value (`z-index: round(23, 10)` is 20),
+        // with the element's font metrics. One that no longer type checks
+        // after var() substitution makes the declaration invalid at
+        // computed-value time (CSS Variables 1), so it acts as `unset`.
+        let value = match properties::numeric::computed(self, id, None, name, &value) {
+            Ok(computed) => computed.unwrap_or(value),
+            Err(()) => "unset".to_owned(),
         };
         let inherited = || prop_index(name).is_some_and(|index| PROPS[index].inherited);
         match resolved_wide_keyword(&value) {
@@ -5443,7 +5466,10 @@ impl Dom {
         }
         let value = self
             .computed_value_resolved(id, name)
-            .or_else(|| cssom_initial_value(name).map(str::to_string));
+            .or_else(|| cssom_initial_value(name).map(str::to_string))
+            // CSSOM #resolved-values: numbers, angles and times in their
+            // canonical units (`rotate: 1turn` reads back as `360deg`).
+            .map(|value| properties::numeric::resolved(name, &value).unwrap_or(value));
         if let Some(number) = value
             .as_deref()
             .and_then(|value| cssom::resolved_number(name, value))
@@ -5772,7 +5798,8 @@ impl Dom {
         }
         let value = self
             .pseudo_layout_value(id, which, name)
-            .or_else(|| cssom_initial_value(name).map(str::to_string));
+            .or_else(|| cssom_initial_value(name).map(str::to_string))
+            .map(|value| properties::numeric::resolved(name, &value).unwrap_or(value));
         if let Some(number) = value
             .as_deref()
             .and_then(|value| cssom::resolved_number(name, value))
@@ -7352,7 +7379,14 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             .pseudo_style(id, which, prop)
             .or_else(|| self.baked_pseudo_value(id, which, prop))
             .and_then(|value| self.resolve_pseudo_pending_shorthand(id, which, prop, &value))
-            .map(|value| self.resolve_pseudo_vars(id, which, &value));
+            .map(|value| self.resolve_pseudo_vars(id, which, &value))
+            // CSS Values 4 #calc-computed-value, as for elements.
+            .map(|value| {
+                match properties::numeric::computed(self, id, Some(which), prop, &value) {
+                    Ok(computed) => computed.unwrap_or(value),
+                    Err(()) => "unset".to_owned(),
+                }
+            });
         let inherited = prop_index(prop).is_some_and(|i| PROPS[i].inherited);
         let inherited_value = || self.computed_value_resolved(id, prop);
         // The UA origin of `::placeholder` sets its `color`; `revert` rolls
@@ -18508,11 +18542,27 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     {
         return None;
     }
+    // CSS Values 4 #calc-type-checking: a math function that resolves to
+    // none of the property's numeric productions (`z-index: calc(1px)`,
+    // `transform: rotate(sin(1deg))`) invalidates the declaration, as does a
+    // value outside the numeric grammars of `scale`, `rotate` and `tab-size`
+    // (`tab-size: 10%`), which have no other declaration-time parser.
+    let literals = if wide_keyword(&value).is_none() && find_var_function(&value).is_none() {
+        let literals = properties::numeric::specified_literals(&k, &value).ok()?;
+        if k == "transform" && !properties::valid_transform(&value)
+            || properties::numeric::valid_value(&k, &value) == Some(false)
+        {
+            return None;
+        }
+        literals
+    } else {
+        Cow::Borrowed(value.as_str())
+    };
     if matches!(k.as_str(), "-webkit-line-clamp" | "-webkit-box-orient")
         && wide_keyword(&value).is_none()
         && find_var_function(&value).is_none()
         && if k == "-webkit-line-clamp" {
-            value != "none" && !value.parse::<usize>().is_ok_and(|n| n > 0)
+            literals != "none" && !literals.parse::<usize>().is_ok_and(|n| n > 0)
         } else {
             !matches!(
                 value.as_str(),
@@ -20412,6 +20462,10 @@ fn parse_full_animation_segment(segment: &str) -> ParsedAnimationSegment {
 }
 
 fn parse_animation_time(value: &str) -> Option<f32> {
+    // CSS Values 4 #calc-type-checking: a math function resolving to <time>.
+    if let Some(seconds) = properties::numeric::math_seconds(value) {
+        return Some(seconds as f32);
+    }
     let value = value.trim().to_ascii_lowercase();
     let seconds = if let Some(milliseconds) = value.strip_suffix("ms") {
         milliseconds.trim().parse::<f32>().ok()? / 1000.0
@@ -20429,6 +20483,9 @@ fn parse_iteration_count(value: &str) -> Option<Option<f32>> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("infinite") {
         return Some(None);
+    }
+    if let Some(count) = properties::numeric::math_count(value) {
+        return Some(Some(count as f32));
     }
     let count = value.parse::<f32>().ok()?;
     (count.is_finite() && count >= 0.0).then_some(Some(count))

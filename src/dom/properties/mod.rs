@@ -9,6 +9,7 @@
 mod gradients;
 mod math;
 mod matrix;
+pub(super) mod numeric;
 mod resolution;
 mod values;
 pub(super) use matrix::transform_list_matrix;
@@ -59,6 +60,8 @@ pub(super) enum Kind {
     Angle,
     Time,
     Resolution,
+    /// <flex>, used by grid track lists; not a registration syntax name.
+    Flex,
     /// A <number> where <percentage>s resolve against numbers (CSS Color 4
     /// <opacity-value>, Transforms 2 `scale`), so a calculation may hold
     /// one (`sign(10%)`); not a registration syntax name.
@@ -461,6 +464,19 @@ pub(super) fn transform_number(text: &str, angle: bool, percentage: bool) -> Opt
     } else {
         parse(Kind::Number)
     }
+}
+
+/// CSS Transforms 1 #transform-property for a value holding a math function:
+/// `none` or a <transform-list> whose functions' arguments type check
+/// (Transforms 2 #transform-functions), so `rotate(sin(1deg))`, a number
+/// where an angle belongs, is invalid. Layout parses the remaining values.
+pub(super) fn valid_transform(text: &str) -> bool {
+    if !numeric::has_math_function(text) {
+        return true;
+    }
+    let mut parser = Parser::new(text);
+    values::parse(&mut parser, &Kind::TransformList, &Context::validation(), 0).is_ok()
+        && parser.expect_exhausted().is_ok()
 }
 
 /// Scan component values with the CSS Syntax tokenizer. Strings, escaped
