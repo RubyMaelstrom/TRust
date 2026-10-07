@@ -568,12 +568,12 @@ impl Context {
                 }
                 opaque = false;
                 if self.attrs.premultiplied {
-                    for c in 0..3 {
-                        p[c] = p[c].min(alpha);
+                    for channel in &mut p[..3] {
+                        *channel = (*channel).min(alpha);
                     }
                 } else {
-                    for c in 0..3 {
-                        p[c] = ((p[c] as u16 * alpha as u16 + 127) / 255) as u8;
+                    for channel in &mut p[..3] {
+                        *channel = ((*channel as u16 * alpha as u16 + 127) / 255) as u8;
                     }
                 }
             }
