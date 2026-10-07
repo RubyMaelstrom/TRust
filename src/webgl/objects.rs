@@ -28,6 +28,7 @@ impl Context {
                                     target: 0,
                                     usage: gl::STATIC_DRAW,
                                     bytes: vec![],
+                                    index_ranges: Default::default(),
                                 },
                             );
                             id.into()
@@ -92,6 +93,7 @@ impl Context {
                         }
                         self.resources = self.resources - b.bytes.len() + size;
                         b.bytes = data;
+                        b.index_ranges.clear();
                         b.usage = u(2);
                     } else {
                         let Some(bytes) = bytes else {
@@ -109,6 +111,7 @@ impl Context {
                             .gl
                             .buffer_sub_data_u8_slice(u(0), offset as i32, bytes);
                         b.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+                        b.index_ranges.clear();
                     }
                     Reply::Null
                 }
@@ -346,7 +349,13 @@ impl Context {
                                     if let Some(loc) =
                                         self.driver.gl.get_uniform_location(p.handle, &name)
                                     {
-                                        p.samplers.push((loc, info.utype));
+                                        // GLSL ES 1.00.17 §4.3.3: a linked
+                                        // program's uniforms start at zero.
+                                        p.samplers.push(Sampler {
+                                            location: loc,
+                                            kind: info.utype,
+                                            unit: 0,
+                                        });
                                     }
                                 }
                             }
@@ -690,9 +699,11 @@ impl Context {
         {
             return self.error(gl::INVALID_VALUE);
         }
+        let sampler = matches!(loc.kind, gl::SAMPLER_2D | gl::SAMPLER_CUBE);
+        let (program, location) = (loc.program, loc.location);
         unsafe {
             let g = &self.driver.gl;
-            let l = Some(&loc.location);
+            let l = Some(&location);
             if integer != 0. {
                 let v: Vec<i32> = values.iter().map(|x| *x as i32).collect();
                 match width {
@@ -702,8 +713,29 @@ impl Context {
                     4 => g.uniform_4_i32_slice(l, &v),
                     _ => return self.error(gl::INVALID_OPERATION),
                 }
+                if sampler && let Some(p) = self.programs.get_mut(&program) {
+                    // Keep the units that draws validate in step with the
+                    // program; an array upload may set several samplers.
+                    for sampler in &mut p.samplers {
+                        let mut unit = [0];
+                        g.get_uniform_i32(p.handle, &sampler.location, &mut unit);
+                        sampler.unit = unit[0];
+                    }
+                }
             } else {
-                let v: Vec<f32> = values.iter().map(|x| *x as f32).collect();
+                // Uniform vectors and matrices are at most 16 floats wide;
+                // only arrays need the heap.
+                let mut inline = [0f32; 16];
+                let mut heap = Vec::new();
+                let v: &[f32] = if values.len() <= inline.len() {
+                    for (slot, value) in inline.iter_mut().zip(values) {
+                        *slot = *value as f32;
+                    }
+                    &inline[..values.len()]
+                } else {
+                    heap.extend(values.iter().map(|x| *x as f32));
+                    &heap
+                };
                 if matrix != 0. {
                     match width {
                         4 => g.uniform_matrix_2_f32_slice(l, false, &v),
@@ -770,7 +802,7 @@ impl Context {
             if !offset.is_multiple_of(width) {
                 return self.error(gl::INVALID_OPERATION);
             }
-            let Some(b) = self.buffers.get(&self.element_buffer) else {
+            let Some(b) = self.buffers.get_mut(&self.element_buffer) else {
                 return self.error(gl::INVALID_OPERATION);
             };
             let Some(end) = offset
@@ -779,15 +811,31 @@ impl Context {
             else {
                 return self.error(gl::INVALID_OPERATION);
             };
-            b.bytes[offset..end]
-                .chunks_exact(width)
-                .map(|v| match width {
-                    1 => v[0] as usize,
-                    2 => u16::from_ne_bytes([v[0], v[1]]) as usize,
-                    _ => u32::from_ne_bytes([v[0], v[1], v[2], v[3]]) as usize,
-                })
-                .max()
-                .unwrap_or(0)
+            // WebGL 1.0 §6.6: every index must address stored vertices. Scenes
+            // redraw the same ranges each frame, so the largest index of a
+            // range is kept until the buffer's contents change.
+            let key = (kind, offset, count as usize);
+            if let Some(&max) = b.index_ranges.get(&key) {
+                max
+            } else {
+                let max = b.bytes[offset..end]
+                    .chunks_exact(width)
+                    .map(|v| match width {
+                        1 => v[0] as usize,
+                        2 => u16::from_ne_bytes([v[0], v[1]]) as usize,
+                        _ => u32::from_ne_bytes([v[0], v[1], v[2], v[3]]) as usize,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if b.index_ranges.len() >= MAX_INDEX_RANGES {
+                    b.index_ranges.clear();
+                }
+                b.index_ranges.insert(key, max);
+                max
+            }
+        };
+        let Some(p) = self.programs.get(&self.program) else {
+            return self.error(gl::INVALID_OPERATION);
         };
         if instanced
             && !p.active.iter().any(|i| {
@@ -858,17 +906,18 @@ impl Context {
                     return self.error(gl::INVALID_OPERATION);
                 }
             }
-            let mut units = std::collections::HashMap::new();
-            for (loc, kind) in &p.samplers {
-                let mut v = [0];
-                g.get_uniform_i32(p.handle, loc, &mut v);
-                let unit = v[0] as usize;
+            // WebGL 1.0 §6.10: one texture unit cannot serve samplers of
+            // different types in a draw.
+            for (index, sampler) in p.samplers.iter().enumerate() {
+                let (unit, kind) = (sampler.unit as usize, sampler.kind);
                 if unit >= self.texture_units.len()
-                    || units.insert(unit, *kind).is_some_and(|k| k != *kind)
+                    || p.samplers[..index]
+                        .iter()
+                        .any(|other| other.unit == sampler.unit && other.kind != kind)
                 {
                     return self.error(gl::INVALID_OPERATION);
                 }
-                let slot = usize::from(*kind == gl::SAMPLER_CUBE);
+                let slot = usize::from(kind == gl::SAMPLER_CUBE);
                 let id = self.texture_units[unit][slot];
                 if id != 0
                     && self
@@ -905,11 +954,13 @@ impl Context {
             } else {
                 g.draw_elements(mode, count as i32, a(2) as u32, a(3) as i32);
             }
-            for (unit, target, handle) in restore {
-                g.active_texture(gl::TEXTURE0 + unit as u32);
-                g.bind_texture(target, Some(handle));
+            if !restore.is_empty() {
+                for (unit, target, handle) in restore {
+                    g.active_texture(gl::TEXTURE0 + unit as u32);
+                    g.bind_texture(target, Some(handle));
+                }
+                g.active_texture(gl::TEXTURE0 + self.active_texture as u32);
             }
-            g.active_texture(gl::TEXTURE0 + self.active_texture as u32);
         }
         if self.framebuffer == 0 {
             self.dirty = true;
@@ -917,6 +968,10 @@ impl Context {
         Reply::Null
     }
 }
+/// The validated index ranges an element buffer remembers; a scene drawing
+/// more distinct ranges from one buffer recomputes them.
+const MAX_INDEX_RANGES: usize = 1024;
+
 pub(super) fn uniform_shape(kind: u32) -> (usize, bool) {
     match kind {
         gl::FLOAT => (1, false),

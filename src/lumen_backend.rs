@@ -24428,6 +24428,64 @@ mod tests {
 
     #[test]
     #[ignore = "requires an installed EGL/GLES driver"]
+    fn webgl_draw_validation_follows_cached_state() {
+        // WebGL 1.0 §6.6 (index ranges), §6.10 (one texture unit per sampler
+        // type) and OpenGL ES 2.0 §3.8.2 (texture completeness): draws reuse
+        // what they validated until the uniforms, buffers or textures change.
+        let mut engine = platform_engine();
+        let value = eval_value(
+            &mut engine,
+            r#"(() => {
+                const c = document.createElement('canvas'); c.width = c.height = 4;
+                const gl = c.getContext('webgl');
+                const shader = (type, source) => {
+                    const s = gl.createShader(type); gl.shaderSource(s, source); gl.compileShader(s); return s;
+                };
+                const p = gl.createProgram();
+                gl.attachShader(p, shader(gl.VERTEX_SHADER,
+                    'attribute vec2 v; void main(){ gl_Position = vec4(v, 0., 1.); }'));
+                gl.attachShader(p, shader(gl.FRAGMENT_SHADER,
+                    'precision mediump float; uniform sampler2D a; uniform samplerCube b;' +
+                    'void main(){ gl_FragColor = texture2D(a, vec2(.5)) + textureCube(b, vec3(1., 0., 0.)); }'));
+                gl.linkProgram(p); gl.useProgram(p);
+                gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+                gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+                gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2]), gl.STATIC_DRAW);
+                const draw = () => { gl.drawElements(gl.TRIANGLES, 3, gl.UNSIGNED_SHORT, 0); return gl.getError(); };
+                const pixel = () => { const px = new Uint8Array(4); gl.readPixels(1, 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); return px.join(); };
+                // Both samplers start on unit 0.
+                if (draw() !== gl.INVALID_OPERATION) return 'shared unit';
+                gl.uniform1i(gl.getUniformLocation(p, 'b'), 1);
+                if (draw() !== gl.NO_ERROR) return 'separate units';
+                gl.uniform1i(gl.getUniformLocation(p, 'b'), 0);
+                if (draw() !== gl.INVALID_OPERATION) return 'unit changed back';
+                gl.uniform1i(gl.getUniformLocation(p, 'b'), 1);
+                gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, new Uint16Array([0, 1, 7]));
+                if (draw() !== gl.INVALID_OPERATION) return 'index out of range';
+                gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, new Uint16Array([0, 1, 2]));
+                if (draw() !== gl.NO_ERROR) return 'index restored';
+                // A mipmap-filtered texture without mipmaps is incomplete and
+                // samples as opaque black until its filter changes.
+                gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+                    new Uint8Array([255,0,0,255, 255,0,0,255, 255,0,0,255, 255,0,0,255]));
+                if (draw() !== gl.NO_ERROR || pixel() !== '0,0,0,255') return 'incomplete ' + pixel();
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                if (draw() !== gl.NO_ERROR || pixel() !== '255,0,0,255') return 'complete ' + pixel();
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+                if (draw() !== gl.NO_ERROR || pixel() !== '0,0,0,255') return 'incomplete again ' + pixel();
+                return 'ok';
+            })()"#,
+            "WebGL cached validation",
+        )
+        .unwrap();
+        assert_eq!(value_string(&mut engine, &value), "ok");
+    }
+
+    #[test]
+    #[ignore = "requires an installed EGL/GLES driver"]
     fn webgl_color_spaces_convert_presentation_and_uploads() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
