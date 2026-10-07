@@ -309,7 +309,9 @@ The terminal browser accepts `trust [URL-or-host] [port]`. Press Ctrl+] and type
 desktop frontend, it first fetches and decodes the page's eager, painted and
 near-viewport images (at most 200 per round, 20 s in all) and lays the page out
 again with their sizes; the stderr `[snapshot]` line counts loaded and failed
-images. Animated images show their first frame. CSS animations are sampled on
+images. A live page's `loading=lazy` images are taken only within two viewport
+heights, where its lazy load observer resumes their requests; a far lazy image
+is not requested at all, as in a browser. Animated images show their first frame. CSS animations are sampled on
 the document timeline at capture time; a page with CSS animations is not
 captured before `--settle` has elapsed on that timeline, even when it was final
 earlier.
