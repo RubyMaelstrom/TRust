@@ -1516,6 +1516,67 @@ mod tests {
     }
 
     #[test]
+    fn computed_length_percentages_simplify_math_functions() {
+        // CSS Values 4 #calc-computed-value: lengths absolutize and a math
+        // function simplifies at computed-value time; percentages remain,
+        // serialized as a sorted calc() sum (#calc-serialize). A result with
+        // no percentage clamps to the property's range (#calc-range), an
+        // infinity to the largest length layout represents (#calc-ieee).
+        // Without a box (display:none) CSSOM #resolved-values exposes these
+        // computed values for margins and padding too.
+        let dom = Dom::parse_document(
+            "<!doctype html><style>div { display: none; font-size: 40px }</style>\
+             <div id=t></div>",
+        );
+        let id = dom.get_by_id("t").unwrap();
+        let mut dom = dom;
+        for (property, specified, expected) in [
+            ("top", "calc(10px + 5px)", "15px"),
+            ("top", "calc(10px + 0.5em)", "30px"),
+            ("top", "calc(10px - 0.5em)", "-10px"),
+            ("top", "calc(1em + 1px)", "41px"),
+            ("top", "round(17px, 5px)", "15px"),
+            ("top", "mod(17px, 5px)", "2px"),
+            ("top", "calc(2px * 3px / 1px)", "6px"),
+            ("top", "calc(10% + 1px)", "calc(10% + 1px)"),
+            ("top", "calc(50% + 60px)", "calc(50% + 60px)"),
+            ("top", "calc(1px + 50% - 2.5em)", "calc(50% - 99px)"),
+            ("top", "-40%", "-40%"),
+            ("top", "auto", "auto"),
+            ("inset-inline-start", "calc(0.25em * 2)", "20px"),
+            ("margin-left", "calc(-infinity * 1px)", "-33554432px"),
+            ("margin-left", "calc(1em / sign(1em - 40px))", "33554432px"),
+            ("margin-left", "calc(NaN * 1px)", "0px"),
+            ("margin-left", "calc(10% + 1px)", "calc(10% + 1px)"),
+            ("margin-top", "max(1em, 50px)", "50px"),
+            ("padding-top", "calc(-infinity * 1px)", "0px"),
+            ("padding-top", "calc(10px - 0.5em)", "0px"),
+            ("flex-basis", "calc(-infinity * 1px)", "0px"),
+            ("flex-basis", "calc(10px + 0.5em)", "30px"),
+            ("flex-basis", "calc(10%)", "10%"),
+            ("flex-basis", "calc(0% + 10px)", "calc(0% + 10px)"),
+            ("flex-basis", "content", "content"),
+            ("min-width", "calc(10% + 40px)", "calc(10% + 40px)"),
+            (
+                "min-width",
+                "fit-content(calc(10px + 0.5em))",
+                "fit-content(30px)",
+            ),
+            ("max-height", "calc(1px * 3 / 3)", "1px"),
+            ("column-gap", "calc(-0.5em + 10px)", "0px"),
+            ("row-gap", "calc(0.5em + 10px)", "30px"),
+            ("outline-offset", "calc(-0.5em)", "-20px"),
+        ] {
+            dom.set_attr(id, "style", &format!("{property}: {specified}"));
+            assert_eq!(
+                dom.cssom_resolved_value(id, property).as_deref(),
+                Some(expected),
+                "{property}: {specified}"
+            );
+        }
+    }
+
+    #[test]
     fn all_shorthand_cssom_accepts_resets_and_roundtrips_exceptions() {
         for keyword in ["initial", "inherit", "unset", "revert", "revert-layer"] {
             assert!(supports("all", keyword));

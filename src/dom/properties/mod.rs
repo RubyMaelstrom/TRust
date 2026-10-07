@@ -167,6 +167,42 @@ pub(in crate::dom) fn resolve_container_units<B: StyleBackend + ?Sized>(
     changed.then_some(out)
 }
 
+/// The computed value of a standard property's `<length-percentage>` (CSS
+/// Values 4 #calc-computed-value): lengths become absolute px with the
+/// element's (or pseudo-element's) font and viewport metrics, percentages
+/// stay, and a math function is simplified with that information. A result
+/// without a percentage is one numeric value, clamped to `[minimum, ∞]`
+/// (#calc-range; NaN censored to zero, #calc-ieee); one with a percentage
+/// keeps its sorted calculation (#calc-serialize). `None` when `value` is not
+/// one `<length-percentage>` (a keyword, or a token this grammar rejects).
+pub(in crate::dom) fn computed_length_percentage<B: StyleBackend + ?Sized>(
+    dom: &ComputeView<'_, B>,
+    id: NodeId,
+    pseudo: Option<PseudoEl>,
+    value: &str,
+    minimum: f64,
+) -> Option<String> {
+    let ctx = Context {
+        dom: Some(dom),
+        id,
+        pseudo,
+        base: None,
+        independent: false,
+    };
+    let mut parser = Parser::new(value);
+    let computed = math::parse_range(
+        &mut parser,
+        &Kind::LengthPercentage,
+        &ctx,
+        0,
+        minimum,
+        f64::INFINITY,
+    )
+    .ok()?;
+    parser.expect_exhausted().ok()?;
+    Some(computed)
+}
+
 /// CSS Color 4 #resolving-color-values for CSSOM: sRGB-family colors as
 /// `rgb()`/`rgba()`, other spaces in their own notation. `None` for
 /// `currentcolor`, system colors and non-colors, which the caller resolves.
