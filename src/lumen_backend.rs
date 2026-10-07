@@ -9115,7 +9115,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_create_doctype", 4, guarded_create_doctype),
     ("__dom_doctype", 1, guarded_doctype),
     ("__dom_append", 2, guarded_append),
-    ("__dom_insert_before", 3, guarded_insert_before),
+    ("__dom_insert_before", 4, guarded_insert_before),
     ("__dom_detach", 1, guarded_detach),
     ("__dom_owner_document", 1, host_owner_document),
     ("__dom_adopt", 2, guarded_adopt),
@@ -15158,34 +15158,53 @@ fn host_create_processing_instruction(
 
 /// DOM Standard §4.2.3's host-including inclusive-ancestor validity check. The prelude translates
 /// `false` to `HierarchyRequestError`, preserving the existing one-call mutation boundary.
+/// DOM #concept-node-pre-insert / #concept-node-append after
+/// #concept-node-ensure-pre-insertion-validity: true once inserted, false for
+/// a HierarchyRequestError and -1 for a NotFoundError (nothing mutated).
+fn pre_insert_result(result: Result<(), crate::dom::PreInsertError>) -> Value {
+    match result {
+        Ok(()) => Value::Bool(true),
+        Err(crate::dom::PreInsertError::HierarchyRequest) => Value::Bool(false),
+        Err(crate::dom::PreInsertError::NotFound) => Value::Num(-1.0),
+    }
+}
+
 fn host_append(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let (Some(parent), Some(child)) =
         (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
     {
-        if dom.is_host_including_inclusive_ancestor(child, parent) {
-            return Ok(Value::Bool(false));
+        if let Err(error) = dom.ensure_pre_insert_validity(child, parent, None, &|_| false) {
+            return Ok(pre_insert_result(Err(error)));
         }
         dom.append(parent, child);
     }
     Ok(Value::Bool(true))
 }
 
+/// `__dom_insert_before(parent, node, child, mode)`: pre-insert `node` before
+/// `child` (mode 0), or for mode 1 validate as DOM #concept-node-replace
+/// does, excluding `child` (which the caller then removes), and insert. Modes
+/// 2 and 3 only validate, as modes 0 and 1 would: a DocumentFragment's
+/// children are inserted one by one by the caller. Mode 4 only validates,
+/// excluding every child (DOM #dom-parentnode-replacechildren).
 fn host_insert_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    if let (Some(parent), Some(child)) =
-        (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
+    if let (Some(parent), Some(node)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
     {
-        if dom.is_host_including_inclusive_ancestor(child, parent) {
-            return Ok(Value::Bool(false));
-        }
         let reference = host_arg_node(&dom, args, 2);
-        if reference.is_some_and(|reference| dom.node(reference).parent != Some(parent)) {
-            return Ok(Value::Num(-1.0));
+        let mode = args.get(3).and_then(Value::as_num_opt).unwrap_or(0.0);
+        let excluded = reference.filter(|_| mode == 1.0 || mode == 3.0);
+        let exclude = |c| mode == 4.0 || Some(c) == excluded;
+        if let Err(error) = dom.ensure_pre_insert_validity(node, parent, reference, &exclude) {
+            return Ok(pre_insert_result(Err(error)));
         }
-        dom.insert_before(parent, child, reference);
+        if mode >= 2.0 {
+            return Ok(Value::Bool(true));
+        }
+        dom.insert_before(parent, node, reference);
     }
     Ok(Value::Bool(true))
 }
@@ -20403,6 +20422,86 @@ mod tests {
                   document.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC].join('|')"
             ),
             "true|true|4|#cdata-section|a<b|true|a<b|NotSupportedError|InvalidCharacterError|32|32"
+        );
+    }
+
+    #[test]
+    fn node_getters_brand_check_and_namespace_lookups_follow_dom() {
+        // Web IDL #dfn-attribute-getter (prototypes are not nodes), SVG 2
+        // Document.rootElement, HTML #current-document-readiness, and DOM
+        // #locate-a-namespace / #locate-a-namespace-prefix.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const err = f => { try { return String(f()); } catch (e) { return e.name; } };\n\
+                 const svg = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg', null);\n\
+                 const xml = new DOMParser().parseFromString(\n\
+                   '<r xmlns=\"urn:d\" xmlns:p=\"urn:p\" p:a=\"1\"><p:c xmlns=\"\"><d/></p:c></r>', 'text/xml');\n\
+                 const r = xml.documentElement, c = r.firstChild, d = c.firstChild;\n\
+                 const t = xml.createTextNode('t'); d.appendChild(t);\n\
+                 [err(() => Document.prototype.nodeType), err(() => Element.prototype.nodeName),\n\
+                  err(() => Node.prototype.nodeType), document.nodeType, document.createElement('p').nodeName,\n\
+                  svg.rootElement === svg.documentElement, xml.rootElement, svg.readyState, xml.readyState,\n\
+                  r.lookupNamespaceURI(null), r.lookupNamespaceURI('p'), c.lookupNamespaceURI(''),\n\
+                  d.lookupNamespaceURI('xml'), t.lookupNamespaceURI('p'), xml.lookupNamespaceURI('p'),\n\
+                  r.getAttributeNodeNS('urn:p', 'a').lookupNamespaceURI('p'),\n\
+                  document.createDocumentFragment().lookupNamespaceURI('xmlns'),\n\
+                  d.lookupPrefix('urn:p'), d.lookupPrefix(''), xml.lookupPrefix('urn:d'),\n\
+                  r.isDefaultNamespace('urn:d'), d.isDefaultNamespace(''), d.isDefaultNamespace(null)].map(String).join('|')"
+            ),
+            "TypeError|TypeError|TypeError|9|P|true|null|complete|complete|urn:d|urn:p|null|\
+             http://www.w3.org/XML/1998/namespace|urn:p|urn:p|urn:p|null|p|null|null|true|true|true"
+        );
+    }
+
+    #[test]
+    fn insertion_validity_equality_and_normalize_follow_dom() {
+        // DOM #concept-node-ensure-pre-insertion-validity (via appendChild,
+        // insertBefore and replaceChild), #concept-node-equals and
+        // #dom-node-normalize with its live Range updates.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 const doc = document.implementation.createDocument(null, 'r', null);\n\
+                 const r = doc.documentElement, text = doc.createTextNode('t');\n\
+                 const two = doc.createDocumentFragment();\n\
+                 two.append(doc.createElement('a'), doc.createElement('b'));\n\
+                 const dt = document.implementation.createDocumentType('x', '', '');\n\
+                 const errors = [err(() => text.appendChild(doc.createTextNode('x'))),\n\
+                   err(() => text.insertBefore(doc.createElement('a'), r)),\n\
+                   err(() => r.insertBefore(doc.createElement('a'), doc.createElement('b'))),\n\
+                   err(() => doc.appendChild(doc.createElement('second'))),\n\
+                   err(() => doc.appendChild(doc.createTextNode('t'))),\n\
+                   err(() => doc.replaceChild(two, r)), err(() => r.appendChild(dt)),\n\
+                   err(() => r.appendChild(document)), err(() => r.appendChild(null)),\n\
+                   err(() => r.removeChild(null)), err(() => doc.insertBefore(dt, r)),\n\
+                   err(() => doc.appendChild(document.implementation.createDocumentType('y', '', ''))),\n\
+                   err(() => r.appendChild(r.getRootNode())), err(() => doc.replaceChild(doc.createElement('n'), r))];\n\
+                 const a = document.createElementNS('urn:x', 'p:e'), b = document.createElementNS('urn:x', 'q:e');\n\
+                 const c = document.createElement('i'), e = document.createElement('i');\n\
+                 c.setAttributeNS('urn:1', 'x:a', 'v'); e.setAttributeNS('urn:2', 'x:a', 'v');\n\
+                 const f = document.createElement('i'), g2 = document.createElement('i');\n\
+                 f.setAttributeNS('urn:1', 'x:a', 'v'); g2.setAttributeNS('urn:1', 'y:a', 'v');\n\
+                 const pi = (t, d) => document.createProcessingInstruction(t, d);\n\
+                 const equal = [a.isEqualNode(b), c.isEqualNode(e), f.isEqualNode(g2),\n\
+                   pi('a', 'd').isEqualNode(pi('b', 'd')), pi('a', 'd').isEqualNode(pi('a', 'd')),\n\
+                   a.isEqualNode(undefined)];\n\
+                 const host = document.createElement('div');\n\
+                 host.append('', 'ab', '', 'cd', document.createElement('br'), 'ef', '');\n\
+                 const range = document.createRange();\n\
+                 range.setStart(host.childNodes[3], 1); range.setEnd(host, 4);\n\
+                 host.normalize();\n\
+                 [errors.join(','), equal.join(','), host.childNodes.length, host.firstChild.data,\n\
+                  range.startContainer === host.firstChild, range.startOffset, range.endContainer === host,\n\
+                  range.endOffset].join('|')"
+            ),
+            "HierarchyRequestError,HierarchyRequestError,NotFoundError,HierarchyRequestError,\
+             HierarchyRequestError,HierarchyRequestError,HierarchyRequestError,HierarchyRequestError,\
+             TypeError,TypeError,none,HierarchyRequestError,HierarchyRequestError,none|\
+             false,false,true,false,true,false|3|abcd|true|3|true|1"
         );
     }
 
@@ -31763,7 +31862,7 @@ mod tests {
                 __trust_cfg, window, window, frame, 0, '');
             third.eval(`
                 const frame = document.createElement('iframe');
-                document.appendChild(frame); frame.__contentDoc = undefined;
+                document.documentElement.appendChild(frame); frame.__contentDoc = undefined;
                 __dom_load_frame(frame.__id, '<body></body>', 'https://nested.example.net/');
                 __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
                     'https://nested.example.net/', __trust_cfg, window, top, frame, 0, '');
@@ -31907,10 +32006,13 @@ mod tests {
         );
         eval(&mut engine, r#"
             document.cookie = 'ancestor=top; Path=/';
+            // DOM #concept-node-ensure-pre-insertion-validity: a Document has
+            // at most one element child, so the frames share a root element.
+            const root = document.appendChild(document.createElement('html'));
             function realm(url, sandbox) {
                 const frame = document.createElement('iframe');
                 if (sandbox !== undefined) frame.setAttribute('sandbox', sandbox);
-                document.appendChild(frame); frame.__contentDoc = undefined;
+                root.appendChild(frame); frame.__contentDoc = undefined;
                 __dom_load_frame(frame.__id, '<body></body>', url);
                 return __dom_create_window_realm(__dom_allocate_job_context(), frame.__id, url,
                     __trust_cfg, window, window, frame, 0, '');
@@ -31918,7 +32020,7 @@ mod tests {
             const third = realm('https://elsewhere.example.net/');
             third.eval(`
                 const frame = document.createElement('iframe');
-                document.appendChild(frame); frame.__contentDoc = undefined;
+                document.documentElement.appendChild(frame); frame.__contentDoc = undefined;
                 __dom_load_frame(frame.__id, '<body></body>', 'https://cookie-ancestors.example/');
                 const nested = __dom_create_window_realm(__dom_allocate_job_context(), frame.__id,
                     'https://cookie-ancestors.example/', __trust_cfg, window, top, frame, 0, '');
