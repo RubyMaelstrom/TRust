@@ -6058,7 +6058,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             ["DOCUMENT_TYPE_NODE", 10], ["DOCUMENT_FRAGMENT_NODE", 11], ["NOTATION_NODE", 12],
             ["DOCUMENT_POSITION_DISCONNECTED", 1], ["DOCUMENT_POSITION_PRECEDING", 2],
             ["DOCUMENT_POSITION_FOLLOWING", 4], ["DOCUMENT_POSITION_CONTAINS", 8],
-            ["DOCUMENT_POSITION_CONTAINED_BY", 16], ["DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC_ORDER", 32]]) {
+            ["DOCUMENT_POSITION_CONTAINED_BY", 16], ["DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 32]]) {
         Object.defineProperty(Node, name, {value, enumerable: true});
         Object.defineProperty(Node.prototype, name, {value, enumerable: true});
     }
@@ -6842,59 +6842,73 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         setAttribute(n, v) {
             n = String(n); v = String(v);
-            const lower = n.toLowerCase();
-            // HTMLScriptElement's force-async flag is cleared whenever its
-            // async content attribute is added. Removing it later must not
-            // restore force-async (HTML "prepare the script element").
-            if (lower === "async" && this.localName === "script") internalsFor(this).trustForceAsync = false;
-            const old = (internalsFor(this).ceUpgraded || MO.length) ? this.getAttribute(n) : null;
-            const linkOld = (lower === "rel" || lower === "href" || lower === "as") &&
-                this.localName === "link" ? this.getAttribute(n) : undefined;
-            __dom_set_attr(nodeIds.get(this), n, v);
-            internalsFor(this).ac = undefined; // attrs changed: drop the read cache (see getAttribute)
-            // DOM §4.9.1: NamedNodeMap is a live collection. Refresh the
-            // existing [SameObject] map synchronously so a caller holding
-            // `const attrs = el.attributes` observes this write immediately,
-            // including while it is iterating the map.
-            internalsFor(this).attrMapStale = true;
-            if (n === "href" && this.localName === "base") baseHrefCache = null;
-            ceAttrChanged(this, lower, old, v);
-            moAttr(this, n, old);
-            // DOM §4.2.2.4: changing a light child's `slot`, or a slot's
-            // `name`, can change the assigned-node lists and must signal the
-            // affected slots at the next microtask checkpoint.
-            if (lower === "slot" || (lower === "name" && this.localName === "slot")) slotQueueCheck(this.parentNode || this);
-            // Changing src/srcdoc re-runs "process the iframe attributes".
-            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
-            if (this.localName === "img" && imageRelevantAttribute(lower)) updateImageData(this);
-            if (lower === "loading" && this.localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(this);
-            if (lower === "src" && (this.localName === "video" || this.localName === "audio")) loadMediaElement(this);
-            if (linkOld !== undefined) linkAttributeChanged(this, lower, linkOld);
+            // DOM #dom-element-setattribute step 1.
+            if (!VALID_ATTRIBUTE_LOCAL_NAME.test(n))
+                throw new DOMException("The name is not a valid attribute local name.", "InvalidCharacterError");
+            const id = nodeIds.get(this);
+            setAttributeSteps(this, n, v, () => this.getAttribute(n), () => __dom_set_attr(id, n, v));
         }
-        setAttributeNS(_, n, v) { this.setAttribute(n, v); }
+        // DOM #dom-element-setattributens: validate and extract, then set an
+        // attribute value by namespace and local name. A null-namespace
+        // attribute runs the same attribute change steps as setAttribute; HTML
+        // assigns no meaning to attributes in other namespaces.
+        setAttributeNS(namespace, qualifiedName, value) {
+            if (arguments.length < 3) throw new TypeError("3 arguments required");
+            const [ns, prefix, localName] = validateAndExtractElementName(
+                namespace == null ? null : domString(namespace), domString(qualifiedName), "attribute");
+            value = String(value);
+            const id = nodeIds.get(this);
+            const read = () => __dom_attr_ns(id, "get", ns, localName, null, null);
+            const write = () => __dom_attr_ns(id, "set", ns, localName, prefix, value);
+            if (ns === null) return setAttributeSteps(this, localName, value, read, write, true);
+            const old = read();
+            write();
+            attributesChanged(this);
+            ceAttrChanged(this, localName, old, value, ns);
+            moAttr(this, localName, old, ns);
+        }
         removeAttribute(n) {
             n = String(n);
-            const lower = n.toLowerCase();
-            const old = (internalsFor(this).ceUpgraded || MO.length) ? this.getAttribute(n) : null;
-            // The removed attribute's Attr node keeps its value, detached.
-            detachAttrNode(this, n);
-            __dom_remove_attr(nodeIds.get(this), n);
-            internalsFor(this).ac = undefined; // attrs changed: drop the read cache (see getAttribute)
-            // DOM §4.9.1 requires the same live-list behavior for removals.
-            // FAST's standards-based template compiler removes marker Attrs
-            // while walking `element.attributes`, so the list refreshes at once.
-            internalsFor(this).attrMapStale = true;
-            if (n === "href" && this.localName === "base") baseHrefCache = null;
-            ceAttrChanged(this, lower, old, null);
-            moAttr(this, n, old);
-            if (lower === "slot" || (lower === "name" && this.localName === "slot")) slotQueueCheck(this.parentNode || this);
-            // Removing src/srcdoc re-runs "process the iframe attributes".
-            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(this); }
-            if (this.localName === "img" && imageRelevantAttribute(lower)) updateImageData(this);
-            // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
-            if (lower === "loading" && this.localName === "img") resumeLazyImage(this);
+            const id = nodeIds.get(this);
+            removeAttributeSteps(this, n, () => this.getAttribute(n), () => {
+                // The removed attribute's Attr node keeps its value, detached.
+                const entry = attributeEntryByName(this, n);
+                if (entry) detachAttrNode(this, entry[0], entry[2]);
+                __dom_remove_attr(id, n);
+            });
+        }
+        // DOM #dom-element-removeattributens.
+        removeAttributeNS(namespace, localName) {
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            const ns = namespace == null || namespace === "" ? null : domString(namespace);
+            localName = domString(localName);
+            const id = nodeIds.get(this);
+            const read = () => __dom_attr_ns(id, "get", ns, localName, null, null);
+            const remove = () => {
+                detachAttrNode(this, ns, localName);
+                __dom_attr_ns(id, "remove", ns, localName, null, null);
+            };
+            if (ns === null) return removeAttributeSteps(this, localName, read, remove, true);
+            const old = read();
+            if (old === null) return;
+            remove();
+            attributesChanged(this);
+            ceAttrChanged(this, localName, old, null, ns);
+            moAttr(this, localName, old, ns);
         }
         hasAttribute(n) { return this.getAttribute(n) !== null; }
+        // DOM #dom-element-getattributens.
+        getAttributeNS(namespace, localName) {
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            return __dom_attr_ns(nodeIds.get(this), "get",
+                namespace == null || namespace === "" ? null : domString(namespace), domString(localName), null, null);
+        }
+        // DOM #dom-element-hasattributens.
+        hasAttributeNS(namespace, localName) {
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            return __dom_attr_ns(nodeIds.get(this), "get",
+                namespace == null || namespace === "" ? null : domString(namespace), domString(localName), null, null) !== null;
+        }
         getAttributeNames() { return __dom_attr_names(nodeIds.get(this)); }
         hasAttributes() { return __dom_attr_names(nodeIds.get(this)).length > 0; }
         // Attr-node accessors (DOM §4.9.2). React DOM's property commit reads
@@ -6925,12 +6939,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const record = internalsFor(this);
             return record.attrMap || (record.attrMap = createNamedNodeMap(this));
         }
-        // Lit's ?attr= boolean bindings commit through this.
+        // DOM #dom-element-toggleattribute; Lit's ?attr= boolean bindings
+        // commit through this. An existing attribute keeps its value.
         toggleAttribute(name, force) {
-            const want = force === undefined ? !this.hasAttribute(name) : !!force;
-            if (want) this.setAttribute(name, "");
-            else this.removeAttribute(name);
-            return want;
+            name = String(name);
+            if (!VALID_ATTRIBUTE_LOCAL_NAME.test(name))
+                throw new DOMException("The name is not a valid attribute local name.", "InvalidCharacterError");
+            if (this.hasAttribute(name)) {
+                if (force === undefined || !force) { this.removeAttribute(name); return false; }
+                return true;
+            }
+            if (force !== undefined && !force) return false;
+            this.setAttribute(name, "");
+            return true;
         }
         get id() { return this.getAttribute("id") || ""; }
         set id(v) { this.setAttribute("id", v); }
@@ -11832,6 +11853,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         createComment(s) {
             return wrap(__dom_create_comment(s === undefined ? "" : String(s), nodeIds.get(this)));
         }
+        // DOM #dom-document-createcdatasection.
+        createCDATASection(data) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            if (this.contentType === "text/html")
+                throw new DOMException("HTML documents cannot contain CDATA sections.", "NotSupportedError");
+            data = domString(data);
+            if (data.includes("]]>"))
+                throw new DOMException("CDATA section data cannot contain \"]]>\".", "InvalidCharacterError");
+            return wrap(__dom_create_cdata(data, nodeIds.get(this)));
+        }
         // DOM #dom-document-createprocessinginstruction and #concept-pi-initialize:
         // the target must match XML's Name production and data must not
         // contain "?>".
@@ -13335,11 +13366,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         if (node.childNodes) for (const c of node.childNodes) ceDisconnect(c);
     }
-    function ceAttrChanged(el, name, old, val) {
+    // HTML #concept-element-attributes-change-ext: attributeChangedCallback
+    // receives the attribute's local name, old and new values, and namespace.
+    function ceAttrChanged(el, name, old, val, namespace = null) {
         if (!internalsFor(el).ceUpgraded || old === val) return;
         const observed = (el.constructor && el.constructor.observedAttributes) || [];
         if (observed.includes(name) && typeof el.attributeChangedCallback === "function") {
-            try { el.attributeChangedCallback(name, old, val); }
+            try { el.attributeChangedCallback(name, old, val, namespace); }
             catch (e) { trust.errors.push("attributeChangedCallback: " + ((e && e.message) || e)); }
         }
     }
@@ -14008,7 +14041,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // owned it reads its element's attribute and changes it through the same
     // setAttribute funnel as every other write; created detached or removed,
     // it keeps its own value. An element reuses one Attr per attribute while
-    // that attribute exists. TRust attributes have no namespace or prefix.
+    // that attribute exists. An Attr reports its attribute's namespace and
+    // prefix (SVG xlink:href, XML documents, setAttributeNS).
     class Attr extends Node {
         constructor() { throw new TypeError("Illegal constructor"); }
         get namespaceURI() { return attrState(this).namespace; }
@@ -14022,8 +14056,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     for (const name of ["namespaceURI", "prefix", "localName", "name", "value", "ownerElement", "specified"])
         Object.defineProperty(Attr.prototype, name, {enumerable: true});
-    const elementSetAttribute = Element.prototype.setAttribute;
-    const elementRemoveAttribute = Element.prototype.removeAttribute;
+    const elementSetAttributeNS = Element.prototype.setAttributeNS;
+    const elementRemoveAttributeNS = Element.prototype.removeAttributeNS;
     function attrState(attr) {
         const state = internalsOf(attr).attrNode;
         if (!state) throw new TypeError("Illegal invocation");
@@ -14035,12 +14069,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             qualifiedName: prefix === null ? localName : prefix + ":" + localName, value};
         return attr;
     }
+    // An element's Attr nodes are keyed by namespace and local name, which
+    // identify one attribute (DOM #concept-element-attribute); qualified names
+    // may repeat across namespaces.
+    function attrKey(namespace, localName) {
+        return (namespace === null ? "" : namespace) + "\u0000" + localName;
+    }
     // An owned Attr's value is its element's; an attribute removed by other
     // means leaves its last value with the then detached Attr.
     function attrValue(state) {
         if (state.element) {
-            const value = __dom_get_attr(nodeIds.get(state.element), state.qualifiedName);
-            if (value === null) detachAttrNode(state.element, state.qualifiedName);
+            const value = __dom_attr_ns(nodeIds.get(state.element), "get", state.namespace, state.localName, null, null);
+            if (value === null) detachAttrNode(state.element, state.namespace, state.localName);
             else state.value = value;
         }
         return state.value;
@@ -14049,7 +14089,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // DOM #set-an-existing-attribute-value: change the element's
         // attribute, or set a detached Attr's own value.
         attrValue(state);
-        if (state.element) Reflect.apply(elementSetAttribute, state.element, [state.qualifiedName, value]);
+        if (state.element) writeAttrNode(state, value);
         else state.value = value;
     }
     // The element's attribute qualified names, refreshed after any write.
@@ -14062,31 +14102,127 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return record.attrNames;
     }
-    // The element's Attr for its existing attribute `name` (as stored).
-    function elementAttrNode(element, name) {
+    // Change an owned Attr's attribute through the element, by namespace and
+    // local name: setAttributeNode keeps an Attr's case on HTML elements too
+    // (DOM #concept-element-attributes-set).
+    function writeAttrNode(state, value) {
+        Reflect.apply(elementSetAttributeNS, state.element, [state.namespace, state.qualifiedName, value]);
+    }
+    // The element's Attr for its attribute with this namespace and local name.
+    function elementAttrNode(element, namespace, prefix, localName) {
         const record = internalsFor(element);
         const cache = record.attrNodes || (record.attrNodes = new Map());
-        let attr = cache.get(name);
+        const key = attrKey(namespace, localName);
+        let attr = cache.get(key);
         if (!attr) {
-            const value = __dom_get_attr(nodeIds.get(element), name);
-            attr = createAttrNode(element.ownerDocument, element, null, null, name, value === null ? "" : value);
-            cache.set(name, attr);
+            const value = __dom_attr_ns(nodeIds.get(element), "get", namespace, localName, null, null);
+            attr = createAttrNode(element.ownerDocument, element, namespace, prefix, localName, value === null ? "" : value);
+            cache.set(key, attr);
         }
         return attr;
     }
+    // The Attr at `index` in the element's attribute list, or null.
+    function elementAttrNodeAt(element, index) {
+        const entry = elementAttributeEntries(element)[index];
+        return entry ? elementAttrNode(element, entry[0], entry[1], entry[2]) : null;
+    }
+    // The attribute change steps of setAttribute and null-namespace
+    // setAttributeNS (DOM #concept-element-attributes-change, then HTML's
+    // steps for the element's own attributes). `read` returns the attribute's
+    // current value and `write` changes it in the arena. setAttribute reports
+    // the folded name to attributeChangedCallback; setAttributeNS its exact
+    // local name.
+    function setAttributeSteps(element, n, v, read, write, exactName = false) {
+        const lower = n.toLowerCase();
+        // HTMLScriptElement's force-async flag is cleared whenever its
+        // async content attribute is added. Removing it later must not
+        // restore force-async (HTML "prepare the script element").
+        if (lower === "async" && element.localName === "script") internalsFor(element).trustForceAsync = false;
+        const old = (internalsFor(element).ceUpgraded || MO.length) ? read() : null;
+        const linkOld = (lower === "rel" || lower === "href" || lower === "as") &&
+            element.localName === "link" ? read() : undefined;
+        write();
+        attributesChanged(element);
+        if (n === "href" && element.localName === "base") baseHrefCache = null;
+        ceAttrChanged(element, exactName ? n : lower, old, v);
+        moAttr(element, n, old);
+        // DOM §4.2.2.4: changing a light child's `slot`, or a slot's
+        // `name`, can change the assigned-node lists and must signal the
+        // affected slots at the next microtask checkpoint.
+        if (lower === "slot" || (lower === "name" && element.localName === "slot")) slotQueueCheck(element.parentNode || element);
+        // Changing src/srcdoc re-runs "process the iframe attributes".
+        if (n === "src" || n === "srcdoc") { const ln = element.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(element); }
+        if (element.localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
+        if (lower === "loading" && element.localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(element);
+        if (lower === "src" && (element.localName === "video" || element.localName === "audio")) loadMediaElement(element);
+        if (linkOld !== undefined) linkAttributeChanged(element, lower, linkOld);
+    }
+    // The removal counterpart of setAttributeSteps; `remove` detaches the
+    // attribute's Attr node and removes the attribute from the arena.
+    function removeAttributeSteps(element, n, read, remove, exactName = false) {
+        const lower = n.toLowerCase();
+        const old = (internalsFor(element).ceUpgraded || MO.length) ? read() : null;
+        remove();
+        attributesChanged(element);
+        if (n === "href" && element.localName === "base") baseHrefCache = null;
+        ceAttrChanged(element, exactName ? n : lower, old, null);
+        moAttr(element, n, old);
+        if (lower === "slot" || (lower === "name" && element.localName === "slot")) slotQueueCheck(element.parentNode || element);
+        // Removing src/srcdoc re-runs "process the iframe attributes".
+        if (n === "src" || n === "srcdoc") { const ln = element.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(element); }
+        if (element.localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
+        // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
+        if (lower === "loading" && element.localName === "img") resumeLazyImage(element);
+    }
+    // Attributes changed: drop the getAttribute read cache, and refresh the
+    // [SameObject] NamedNodeMap (DOM §4.9.1, a live collection) so a caller
+    // holding or iterating `element.attributes` observes the change at once.
+    function attributesChanged(element) {
+        const record = internalsFor(element);
+        record.ac = undefined;
+        record.attrMapStale = true;
+        record.attrEntries = undefined;
+    }
+    // Each attribute's [namespace, prefix, localName] in attribute-list order,
+    // refreshed after any write.
+    function elementAttributeEntries(element) {
+        const record = internalsFor(element), epoch = __dom_epoch();
+        if (record.attrEntries === undefined || record.attrEntriesEpoch !== epoch) {
+            const flat = __dom_attr_ns(nodeIds.get(element), "entries", null, "", null, null) || [];
+            const entries = [];
+            for (let i = 0; i + 2 < flat.length; i += 3) entries.push([flat[i], flat[i + 1], flat[i + 2]]);
+            record.attrEntries = entries;
+            record.attrEntriesEpoch = epoch;
+        }
+        return record.attrEntries;
+    }
+    // DOM #concept-element-attributes-get-by-name: the first attribute whose
+    // qualified name is `name`, ASCII-lowercased first for an HTML element in
+    // an HTML document.
+    function attributeEntryByName(element, name) {
+        if (htmlAttributeNames(element)) name = asciiLower(name);
+        for (const entry of elementAttributeEntries(element))
+            if ((entry[1] === null ? entry[2] : entry[1] + ":" + entry[2]) === name) return entry;
+        return null;
+    }
+    // DOM #concept-element-attributes-get-by-namespace.
+    function attributeEntryByNamespace(element, namespace, localName) {
+        for (const entry of elementAttributeEntries(element))
+            if (entry[0] === namespace && entry[2] === localName) return entry;
+        return null;
+    }
     // DOM #concept-element-attributes-remove: the removed attribute's Attr
-    // keeps the value it had. The arena matches names ASCII case-insensitively.
-    function detachAttrNode(element, name) {
+    // keeps the value it had.
+    function detachAttrNode(element, namespace, localName) {
         const cache = internalsOf(element).attrNodes;
         if (!cache || !cache.size) return;
-        const lower = asciiLower(name);
-        for (const [key, attr] of cache) {
-            if (key !== name && asciiLower(key) !== lower) continue;
-            const state = internalsOf(attr).attrNode, value = __dom_get_attr(nodeIds.get(element), key);
-            if (value !== null) state.value = value;
-            state.element = null;
-            cache.delete(key);
-        }
+        const key = attrKey(namespace, localName), attr = cache.get(key);
+        if (!attr) return;
+        const state = internalsOf(attr).attrNode;
+        const value = __dom_attr_ns(nodeIds.get(element), "get", namespace, localName, null, null);
+        if (value !== null) state.value = value;
+        state.element = null;
+        cache.delete(key);
     }
     function htmlAttributeNames(element) {
         return element.namespaceURI === HTML_NS && element.ownerDocument.contentType === "text/html";
@@ -14101,9 +14237,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             attrValue(attrThis);
             node2 = attrThis.element;
             if (attrOther && node1 && node2 === node1) {
-                const names = elementAttributeNames(node2);
-                for (let i = 0; i < names.length; i++) {
-                    const attr = elementAttrNode(node2, names[i]);
+                for (const [namespace, prefix, localName] of elementAttributeEntries(node2)) {
+                    const attr = elementAttrNode(node2, namespace, prefix, localName);
                     if (attr === other) return 32 + 2;
                     if (attr === self) return 32 + 4;
                 }
@@ -14124,20 +14259,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // DOM #concept-element-attributes-get-by-name.
     function attributeNodeByName(element, name) {
-        const html = htmlAttributeNames(element);
-        if (html) name = asciiLower(name);
-        const names = elementAttributeNames(element);
-        for (let i = 0; i < names.length; i++)
-            if (names[i] === name || (html && asciiLower(names[i]) === name)) return elementAttrNode(element, names[i]);
-        return null;
+        const entry = attributeEntryByName(element, name);
+        return entry ? elementAttrNode(element, entry[0], entry[1], entry[2]) : null;
     }
     // DOM #concept-element-attributes-get-by-namespace.
     function attributeNodeByNamespace(element, namespace, localName) {
-        if (namespace !== null) return null;
-        const names = elementAttributeNames(element);
-        for (let i = 0; i < names.length; i++)
-            if (names[i] === localName) return elementAttrNode(element, names[i]);
-        return null;
+        const entry = attributeEntryByNamespace(element, namespace, localName);
+        return entry ? elementAttrNode(element, entry[0], entry[1], entry[2]) : null;
     }
     // DOM #concept-element-attributes-set.
     function setAttributeNode(element, attr) {
@@ -14147,22 +14275,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             throw new DOMException("The attribute is in use by another element.", "InUseAttributeError");
         const old = attributeNodeByNamespace(element, state.namespace, state.localName);
         if (old === attr) return attr;
-        if (old) detachAttrNode(element, internalsOf(old).attrNode.qualifiedName);
+        if (old) detachAttrNode(element, state.namespace, state.localName);
         const record = internalsFor(element);
         const cache = record.attrNodes || (record.attrNodes = new Map());
-        cache.set(state.qualifiedName, attr);
+        cache.set(attrKey(state.namespace, state.localName), attr);
         state.element = element;
         state.document = element.ownerDocument;
-        Reflect.apply(elementSetAttribute, element, [state.qualifiedName, state.value]);
-        // Keep the cache keyed by the stored spelling of the name.
-        const names = elementAttributeNames(element), lower = asciiLower(state.qualifiedName);
-        for (let i = 0; i < names.length; i++) {
-            if (names[i] !== state.qualifiedName && asciiLower(names[i]) === lower) {
-                cache.delete(state.qualifiedName);
-                cache.set(names[i], attr);
-                break;
-            }
-        }
+        writeAttrNode(state, state.value);
         return old;
     }
     // DOM #dom-element-removeattributenode.
@@ -14171,7 +14290,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         attrValue(state);
         if (state.element !== element)
             throw new DOMException("The attribute is not an attribute of this element.", "NotFoundError");
-        Reflect.apply(elementRemoveAttribute, element, [state.qualifiedName]);
+        Reflect.apply(elementRemoveAttributeNS, element, [state.namespace, state.localName]);
         return attr;
     }
     // WHATWG DOM puts the element-traversal accessors on the ParentNode mixin
@@ -14690,9 +14809,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         item(index) {
             const element = namedNodeMapElement(this);
             if (arguments.length < 1) throw new TypeError("1 argument required");
-            const names = elementAttributeNames(element);
-            index = index >>> 0;
-            return index < names.length ? elementAttrNode(element, names[index]) : null;
+            return elementAttrNodeAt(element, index >>> 0);
         }
         getNamedItem(qualifiedName) {
             const element = namedNodeMapElement(this);
@@ -14768,7 +14885,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const proxy = new Proxy(target, {
             get(t, property, receiver) {
                 const index = indexed(property);
-                if (index >= 0) return elementAttrNode(element, elementAttributeNames(element)[index]);
+                if (index >= 0) return elementAttrNodeAt(element, index);
                 const attr = named(t, property);
                 return attr || Reflect.get(t, property, receiver);
             },
@@ -14785,7 +14902,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             },
             getOwnPropertyDescriptor(t, property) {
                 const index = indexed(property);
-                if (index >= 0) return {value: elementAttrNode(element, elementAttributeNames(element)[index]),
+                if (index >= 0) return {value: elementAttrNodeAt(element, index),
                     writable: false, enumerable: true, configurable: true};
                 const attr = named(t, property);
                 if (attr) return {value: attr, writable: false, enumerable: false, configurable: true};
@@ -17859,8 +17976,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (isCL ? !opts.childList : isAttr ? !opts.attributes : !opts.characterData) continue;
                 const distance = ancestors.indexOf(opts.id);
                 if (distance < 0 || (distance !== 0 && !opts.subtree)) continue;
-                if (isAttr && opts.attributeFilter &&
-                    opts.attributeFilter.indexOf(rec.attributeName) < 0) continue;
+                // DOM #queue-a-mutation-record step 4.3.2: an attributeFilter
+                // never matches an attribute in a namespace.
+                if (isAttr && opts.attributeFilter && (rec.attributeNamespace != null ||
+                    opts.attributeFilter.indexOf(rec.attributeName) < 0)) continue;
                 matched = true;
                 if (distance < rank || (distance === rank && opts.order < order)) {
                     rank = distance; order = opts.order;
@@ -17888,7 +18007,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 previousSibling: rec.__sib !== undefined ? prevSib : (rec.previousSibling || null),
                 nextSibling: rec.__sib !== undefined ? nextSib : (rec.nextSibling || null),
                 attributeName: rec.attributeName || null,
-                attributeNamespace: null,
+                attributeNamespace: rec.attributeNamespace == null ? null : rec.attributeNamespace,
                 oldValue: entry.wantOld ? (rec.oldValue === undefined ? null : rec.oldValue) : null,
             });
             moPending.add(o);
@@ -17949,9 +18068,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!removed.length && !added.length) return;
         moNotify({ type: "childList", target, addedNodes: added, removedNodes: removed });
     }
-    function moAttr(target, name, oldValue) {
+    // DOM #queue-an-attribute-mutation-record: the attribute's local name and namespace.
+    function moAttr(target, name, oldValue, namespace = null) {
         if (!MO.length || !moHasAttributes) { moEnqueue(); return; }
-        moNotify({ type: "attributes", target, attributeName: name, oldValue });
+        moNotify({ type: "attributes", target, attributeName: name, attributeNamespace: namespace, oldValue });
     }
     function moCharData(target, oldValue) {
         if (!MO.length || !moHasCharacterData) { moEnqueue(); return; }

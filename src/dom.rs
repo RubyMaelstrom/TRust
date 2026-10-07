@@ -97,6 +97,102 @@ impl SvgImageMemo {
     }
 }
 
+/// The attribute a DOM attribute write or removal addresses.
+#[derive(Clone, Copy)]
+enum AttributeTarget<'a> {
+    /// DOM #concept-element-attributes-get-by-name: a qualified name.
+    Qualified(&'a str),
+    /// DOM #concept-element-attributes-get-by-namespace ("" is the null
+    /// namespace), with the prefix a newly appended attribute receives.
+    Namespaced {
+        namespace: &'a str,
+        prefix: Option<&'a str>,
+        local: &'a str,
+    },
+}
+
+/// An [`AttributeTarget`] with a qualified name already folded for its element.
+enum FoldedAttributeTarget<'a> {
+    Qualified(Cow<'a, str>),
+    Namespaced {
+        namespace: &'a str,
+        prefix: Option<&'a str>,
+        local: &'a str,
+    },
+}
+
+impl<'a> AttributeTarget<'a> {
+    /// The qualified name the renderer's name-based side effects observe.
+    fn qualified_name(&self) -> Cow<'a, str> {
+        match *self {
+            Self::Qualified(name) => Cow::Borrowed(name),
+            Self::Namespaced {
+                prefix: Some(prefix),
+                local,
+                ..
+            } => Cow::Owned(format!("{prefix}:{local}")),
+            Self::Namespaced { local, .. } => Cow::Borrowed(local),
+        }
+    }
+
+    /// Fold a qualified name to ASCII lowercase for an HTML element in an HTML
+    /// document (DOM #concept-element-attributes-get-by-name step 1).
+    fn folded(self, html: bool) -> FoldedAttributeTarget<'a> {
+        match self {
+            Self::Qualified(name) if html => {
+                FoldedAttributeTarget::Qualified(Cow::Owned(name.to_ascii_lowercase()))
+            }
+            Self::Qualified(name) => FoldedAttributeTarget::Qualified(Cow::Borrowed(name)),
+            Self::Namespaced {
+                namespace,
+                prefix,
+                local,
+            } => FoldedAttributeTarget::Namespaced {
+                namespace,
+                prefix,
+                local,
+            },
+        }
+    }
+
+    fn matches(&self, name: &QualName) -> bool {
+        match *self {
+            Self::Qualified(qualified) => attribute_name_matches(name, qualified),
+            Self::Namespaced {
+                namespace, local, ..
+            } => &*name.ns == namespace && &*name.local == local,
+        }
+    }
+}
+
+impl FoldedAttributeTarget<'_> {
+    fn matches(&self, name: &QualName) -> bool {
+        match self {
+            Self::Qualified(qualified) => attribute_name_matches(name, qualified),
+            Self::Namespaced {
+                namespace, local, ..
+            } => &*name.ns == *namespace && &*name.local == *local,
+        }
+    }
+
+    /// DOM #concept-create-attribute: setAttribute creates a null-namespace
+    /// attribute named by its qualified name; a namespaced write keeps its prefix.
+    fn new_name(&self) -> QualName {
+        match self {
+            Self::Qualified(qualified) => QualName::new(None, ns!(), qualified.as_ref().into()),
+            Self::Namespaced {
+                namespace,
+                prefix,
+                local,
+            } => QualName::new(
+                prefix.map(Prefix::from),
+                Namespace::from(*namespace),
+                (*local).into(),
+            ),
+        }
+    }
+}
+
 fn attribute_name_matches(name: &QualName, qualified: &str) -> bool {
     match name.prefix.as_deref() {
         Some(prefix) => {
@@ -3293,6 +3389,12 @@ impl Dom {
         self.new_node(NodeData::Comment(text.to_string()))
     }
 
+    /// DOM #dom-document-createcdatasection, after the caller's document-type
+    /// and data checks.
+    pub fn create_cdata_section(&mut self, data: &str) -> NodeId {
+        self.new_node(NodeData::CData(data.to_string()))
+    }
+
     /// DOM #create-a-processing-instruction-node, after the caller's target
     /// and data validation.
     pub fn create_processing_instruction(&mut self, target: &str, data: &str) -> NodeId {
@@ -3912,9 +4014,76 @@ impl Dom {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        self.write_attribute(id, AttributeTarget::Qualified(name), value);
+    }
+
+    /// DOM #concept-element-attributes-set-value: change the attribute with
+    /// `namespace` (None for the null namespace) and `local` name, or append
+    /// one with `prefix`. Callers validate the names (DOM #validate-and-extract).
+    pub fn set_attribute_ns(
+        &mut self,
+        id: NodeId,
+        namespace: Option<&str>,
+        prefix: Option<&str>,
+        local: &str,
+        value: &str,
+    ) {
+        let namespace = namespace.unwrap_or("");
+        let target = AttributeTarget::Namespaced {
+            namespace,
+            prefix,
+            local,
+        };
+        self.write_attribute(id, target, value);
+    }
+
+    /// DOM #concept-element-attributes-get-by-namespace; None is the null namespace.
+    pub fn get_attribute_ns(
+        &self,
+        id: NodeId,
+        namespace: Option<&str>,
+        local: &str,
+    ) -> Option<&str> {
+        let NodeData::Element { attrs, .. } = &self.nodes.get(id)?.data else {
+            return None;
+        };
+        let target = AttributeTarget::Namespaced {
+            namespace: namespace.unwrap_or(""),
+            prefix: None,
+            local,
+        };
+        attrs
+            .iter()
+            .find(|attr| target.matches(&attr.name))
+            .map(|attr| &*attr.value)
+    }
+
+    /// Each attribute's (namespace, prefix, local name), in attribute-list
+    /// order; None is the null namespace or no prefix.
+    pub fn attribute_entries(&self, id: NodeId) -> Vec<(Option<&str>, Option<&str>, &str)> {
+        let Some(NodeData::Element { attrs, .. }) = self.nodes.get(id).map(|node| &node.data)
+        else {
+            return Vec::new();
+        };
+        attrs
+            .iter()
+            .map(|attr| {
+                (
+                    (!attr.name.ns.is_empty()).then_some(&*attr.name.ns),
+                    attr.name.prefix.as_deref(),
+                    &*attr.name.local,
+                )
+            })
+            .collect()
+    }
+
+    fn write_attribute(&mut self, id: NodeId, target: AttributeTarget<'_>, value: &str) {
         if !self.is_valid(id) {
             return;
         }
+        // Renderer-side effects observe attributes by qualified name.
+        let qualified = target.qualified_name();
+        let name = qualified.as_ref();
         let old_class = name
             .eq_ignore_ascii_case("class")
             .then(|| self.attr(id, "class").unwrap_or("").to_owned());
@@ -3947,15 +4116,8 @@ impl Dom {
             // pushed a duplicate lowercase attr beside the parser's cased one
             // and left reads (case-insensitive, first match) on the stale
             // value — a D3-style `setAttribute("viewBox", …)` never took.
-            let name = if qname.ns == ns!(html) && html_document {
-                name.to_ascii_lowercase()
-            } else {
-                name.to_string()
-            };
-            if let Some(a) = attrs
-                .iter_mut()
-                .find(|a| attribute_name_matches(&a.name, &name))
-            {
+            let target = target.folded(qname.ns == ns!(html) && html_document);
+            if let Some(a) = attrs.iter_mut().find(|a| target.matches(&a.name)) {
                 // Idempotent writes are free: no dirty, no redraw.
                 if *a.value == *value && !canvas_reset && !cssom_reset && !input_reset {
                     return;
@@ -3963,7 +4125,7 @@ impl Dom {
                 a.value = StrTendril::from(value);
             } else {
                 attrs.push(Attribute {
-                    name: QualName::new(None, ns!(), name.into()),
+                    name: target.new_name(),
                     value: StrTendril::from(value),
                 });
             }
@@ -3982,9 +4144,49 @@ impl Dom {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        self.remove_attribute(id, AttributeTarget::Qualified(name));
+    }
+
+    /// DOM #concept-element-attributes-remove-by-namespace; None is the null
+    /// namespace.
+    pub fn remove_attribute_ns(&mut self, id: NodeId, namespace: Option<&str>, local: &str) {
+        let target = AttributeTarget::Namespaced {
+            namespace: namespace.unwrap_or(""),
+            prefix: None,
+            local,
+        };
+        self.remove_attribute(id, target);
+    }
+
+    /// The qualified name a removal's side effects observe: a by-name removal
+    /// keeps its argument (even when absent, as before); a namespaced one names
+    /// the attribute it removes, or None when there is none.
+    fn removed_attribute_name(&self, id: NodeId, target: AttributeTarget<'_>) -> Option<String> {
+        match target {
+            AttributeTarget::Qualified(name) => Some(name.to_owned()),
+            AttributeTarget::Namespaced { .. } => {
+                let NodeData::Element { attrs, .. } = &self.nodes[id].data else {
+                    return None;
+                };
+                attrs
+                    .iter()
+                    .find(|attr| target.matches(&attr.name))
+                    .map(|attr| match &attr.name.prefix {
+                        Some(prefix) => format!("{prefix}:{}", attr.name.local),
+                        None => attr.name.local.to_string(),
+                    })
+            }
+        }
+    }
+
+    fn remove_attribute(&mut self, id: NodeId, target: AttributeTarget<'_>) {
         if !self.is_valid(id) {
             return;
         }
+        let Some(name) = self.removed_attribute_name(id, target) else {
+            return;
+        };
+        let name = name.as_str();
         let old_class = name
             .eq_ignore_ascii_case("class")
             .then(|| self.attr(id, "class").unwrap_or("").to_owned());
@@ -4004,19 +4206,18 @@ impl Dom {
             name: qname, attrs, ..
         } = &mut self.nodes[id].data
         {
-            let before = attrs.len();
-            let folded;
-            let qualified = if qname.ns == ns!(html) && html_document {
-                folded = name.to_ascii_lowercase();
-                folded.as_str()
-            } else {
-                name
-            };
-            attrs.retain(|a| !attribute_name_matches(&a.name, qualified));
+            // DOM #concept-element-attributes-remove-by-name removes only the
+            // first attribute with the qualified name; other namespaces may
+            // repeat it.
+            let target = target.folded(qname.ns == ns!(html) && html_document);
+            let removed = attrs
+                .iter()
+                .position(|a| target.matches(&a.name))
+                .map(|index| attrs.remove(index));
             // Idempotent removes are free (like `set_attr`): a redundant
             // `removeAttribute` must not dirty the page or bust the epoch
             // caches — frameworks call it unconditionally per render pass.
-            if attrs.len() != before {
+            if removed.is_some() {
                 if sheet_el {
                     self.note_cssom_sheet_attribute(id, name);
                     self.touch_style_at(id);

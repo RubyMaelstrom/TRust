@@ -9070,6 +9070,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_document_quirks", 1, host_document_quirks),
     ("__dom_pi_target", 1, guarded_pi_target),
     ("__dom_create_comment", 2, guarded_create_comment),
+    ("__dom_create_cdata", 2, guarded_create_cdata),
     (
         "__dom_create_processing_instruction",
         3,
@@ -9116,6 +9117,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_set_attr", 3, guarded_set_attr),
     ("__dom_remove_attr", 2, guarded_remove_attr),
     ("__dom_attr_names", 1, guarded_attr_names),
+    ("__dom_attr_ns", 6, guarded_attr_ns),
     ("__dom_text", 1, guarded_text),
     ("__dom_set_text", 2, guarded_set_text),
     ("__dom_inner_html", 1, guarded_inner_html),
@@ -9814,6 +9816,7 @@ node_access_guards! {
     guarded_create_element_ns = host_create_element_ns, [3], Throw;
     guarded_create_text = host_create_text, [1], Throw;
     guarded_create_comment = host_create_comment, [1], Throw;
+    guarded_create_cdata = host_create_cdata, [1], Throw;
     guarded_create_processing_instruction = host_create_processing_instruction, [2], Throw;
     guarded_create_doctype = host_create_doctype, [3], Throw;
     guarded_doctype = host_doctype, [0], Invalidate;
@@ -9827,6 +9830,7 @@ node_access_guards! {
     guarded_set_attr = host_set_attr, [0], Invalidate;
     guarded_remove_attr = host_remove_attr, [0], Invalidate;
     guarded_attr_names = host_attr_names, [0], Invalidate;
+    guarded_attr_ns = host_attr_ns, [0], Invalidate;
     guarded_text = host_text, [0], Invalidate;
     guarded_set_text = host_set_text, [0], Invalidate;
     guarded_inner_html = host_inner_html, [0], Invalidate;
@@ -14928,6 +14932,18 @@ fn host_create_comment(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     Ok(host_id_value(Some(id)))
 }
 
+/// DOM #dom-document-createcdatasection; the prelude rejects HTML documents
+/// and data containing "]]>" first.
+fn host_create_cdata(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let data = host_arg_string(ctx, args, 0);
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let document = host_creation_document(&dom, args, 1);
+    let id = dom.create_cdata_section(&data);
+    dom.initialize_node_document(id, document);
+    Ok(host_id_value(Some(id)))
+}
+
 /// DOM #dom-document-createprocessinginstruction; the prelude validates the
 /// target and data first.
 fn host_create_processing_instruction(
@@ -15518,6 +15534,70 @@ fn host_remove_attr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         dom.remove_attr(id, &name);
     }
     Ok(Value::Undefined)
+}
+
+/// DOM namespace-aware attribute access for the Element `*NS` methods, Attr
+/// nodes and NamedNodeMap: `op` is "get" (#concept-element-attributes-get-by-
+/// namespace), "set" (#concept-element-attributes-set-value), "remove"
+/// (#concept-element-attributes-remove-by-namespace) or "entries" (each
+/// attribute's namespace, prefix and local name, flattened). Null namespace or
+/// prefix arguments are the null namespace and no prefix.
+fn host_attr_ns(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 1);
+    let optional = |ctx: &mut Ctx, index: usize| match args.get(index) {
+        None | Some(Value::Null | Value::Undefined) => None,
+        Some(_) => Some(host_arg_string(ctx, args, index)),
+    };
+    let namespace = optional(ctx, 2);
+    let local = host_arg_string(ctx, args, 3);
+    let dom = host_dom(ctx);
+    match op.as_str() {
+        "get" => {
+            let dom = dom.borrow();
+            Ok(host_arg_node(&dom, args, 0)
+                .and_then(|id| dom.get_attribute_ns(id, namespace.as_deref(), &local))
+                .map(|value| Value::from_engine_text(value.to_owned()))
+                .unwrap_or(Value::Null))
+        }
+        "set" => {
+            let prefix = optional(ctx, 4);
+            let value = host_arg_string(ctx, args, 5);
+            let mut dom = dom.borrow_mut();
+            if let Some(id) = host_arg_node(&dom, args, 0) {
+                dom.set_attribute_ns(id, namespace.as_deref(), prefix.as_deref(), &local, &value);
+            }
+            Ok(Value::Undefined)
+        }
+        "remove" => {
+            let mut dom = dom.borrow_mut();
+            if let Some(id) = host_arg_node(&dom, args, 0) {
+                dom.remove_attribute_ns(id, namespace.as_deref(), &local);
+            }
+            Ok(Value::Undefined)
+        }
+        "entries" => {
+            let values = {
+                let dom = dom.borrow();
+                host_arg_node(&dom, args, 0)
+                    .map(|id| {
+                        dom.attribute_entries(id)
+                            .into_iter()
+                            .flat_map(|(namespace, prefix, local)| {
+                                let text = |value: Option<&str>| {
+                                    value.map_or(Value::Null, |value| {
+                                        Value::from_engine_text(value.to_owned())
+                                    })
+                                };
+                                [text(namespace), text(prefix), text(Some(local))]
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            Ok(ctx.make_array(values))
+        }
+        _ => Ok(Value::Undefined),
+    }
 }
 
 fn host_attr_names(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -19903,6 +19983,93 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_attributes_follow_dom() {
+        // DOM #dom-element-getattributens, -setattributens, -removeattributens
+        // and -hasattributens over #concept-element-attributes-get-by-namespace,
+        // -set-value and -remove-by-namespace; #validate-and-extract; Attr and
+        // NamedNodeMap namespaces; #queue-a-mutation-record (attributeFilter
+        // never matches a namespaced attribute); and attributeChangedCallback's
+        // namespace argument (HTML #concept-element-attributes-change-ext).
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const XL = 'http://www.w3.org/1999/xlink';\n\
+                 const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 const el = document.createElement('div');\n\
+                 el.setAttributeNS(XL, 'xl:href', 'a');\n\
+                 el.setAttributeNS(null, 'viewBox', 'v');\n\
+                 const attr = el.getAttributeNodeNS(XL, 'href');\n\
+                 const get = [el.getAttributeNS(XL, 'href'), el.hasAttributeNS(XL, 'href'),\n\
+                   el.getAttribute('xl:href'), el.getAttributeNS('', 'viewBox'), el.getAttribute('viewbox'),\n\
+                   el.hasAttributeNS(null, 'viewbox'), attr.namespaceURI === XL, attr.prefix, attr.localName,\n\
+                   attr.name, el.attributes.getNamedItemNS(XL, 'href') === attr, el.getAttributeNS(XL, 'nope')];\n\
+                 el.setAttributeNS(XL, 'other:href', 'b');\n\
+                 const change = [el.getAttribute('xl:href'), el.getAttribute('other:href'), attr.value,\n\
+                   el.attributes.length];\n\
+                 const invalid = [err(() => el.setAttributeNS(null, 'p:x', '')),\n\
+                   err(() => el.setAttributeNS(XL, 'xml:x', '')), err(() => el.setAttributeNS(XL, 'xmlns', '')),\n\
+                   err(() => el.setAttributeNS(XL, 'a b', '')), err(() => el.getAttributeNS(XL))];\n\
+                 el.removeAttributeNS(XL, 'href');\n\
+                 const removed = [el.hasAttributeNS(XL, 'href'), attr.ownerElement, attr.value,\n\
+                   el.attributes.length];\n\
+                 const host = document.createElement('div');\n\
+                 host.innerHTML = '<svg><use xlink:href=\"#a\"/></svg>';\n\
+                 const use = host.querySelector('use'), useAttr = use.attributes[0];\n\
+                 const parsed = [use.getAttributeNS(XL, 'href'), useAttr.prefix, useAttr.namespaceURI === XL];\n\
+                 const xml = new DOMParser().parseFromString('<r xmlns:x=\"urn:x\" x:a=\"1\"/>', 'application/xml');\n\
+                 const root = xml.documentElement;\n\
+                 const xmlAttrs = [root.getAttributeNS('urn:x', 'a'),\n\
+                   root.getAttributeNS('http://www.w3.org/2000/xmlns/', 'x'), root.attributes[1].prefix];\n\
+                 const target = document.createElement('p');\n\
+                 const filtered = new MutationObserver(() => {}), all = new MutationObserver(() => {});\n\
+                 filtered.observe(target, {attributes: true, attributeFilter: ['href']});\n\
+                 all.observe(target, {attributes: true});\n\
+                 target.setAttributeNS(XL, 'xl:href', '1'); target.setAttribute('href', '2');\n\
+                 const f = filtered.takeRecords(), a = all.takeRecords();\n\
+                 const records = [f.length, f[0].attributeName, f[0].attributeNamespace, a.length,\n\
+                   a[0].attributeName, a[0].attributeNamespace === XL];\n\
+                 const calls = [];\n\
+                 customElements.define('ns-attr-probe', class extends HTMLElement {\n\
+                   static get observedAttributes() { return ['href']; }\n\
+                   attributeChangedCallback(...args) { calls.push(args.map(String).join(',')); }\n\
+                 });\n\
+                 const probe = document.createElement('ns-attr-probe');\n\
+                 probe.setAttributeNS(XL, 'xl:href', 'v'); probe.removeAttributeNS(XL, 'href');\n\
+                 probe.setAttribute('href', 'w');\n\
+                 [...get, ...change, ...invalid, ...removed, ...parsed, ...xmlAttrs, ...records,\n\
+                  calls.join(';')].join('|')"
+            ),
+            "a|true|a|v||false|true|xl|href|xl:href|true||b||b|2|NamespaceError|NamespaceError|\
+             NamespaceError|InvalidCharacterError|TypeError|false||b|1|#a|xlink|true|1|urn:x|x|\
+             1|href||2|href|true|href,null,v,http://www.w3.org/1999/xlink;\
+             href,v,null,http://www.w3.org/1999/xlink;href,null,w,null"
+        );
+    }
+
+    #[test]
+    fn cdata_sections_and_position_constants_follow_dom() {
+        // DOM #dom-document-createcdatasection and the Node interface's
+        // DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC constant (0x20).
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 const xml = document.implementation.createDocument(null, 'r', null);\n\
+                 const cdata = xml.createCDATASection('a<b');\n\
+                 xml.documentElement.appendChild(cdata);\n\
+                 [cdata instanceof CDATASection, cdata instanceof Text, cdata.nodeType, cdata.nodeName,\n\
+                  cdata.data, cdata.ownerDocument === xml, xml.documentElement.textContent,\n\
+                  err(() => document.createCDATASection('x')), err(() => xml.createCDATASection(']]>')),\n\
+                  Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC,\n\
+                  document.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC].join('|')"
+            ),
+            "true|true|4|#cdata-section|a<b|true|a<b|NotSupportedError|InvalidCharacterError|32|32"
+        );
+    }
+
+    #[test]
     fn doctypes_and_created_documents_follow_dom() {
         // DOM #interface-documenttype, #dom-document-doctype and
         // #dom-domimplementation-createdocumenttype / -createdocument: the
@@ -22424,7 +22591,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 200, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 202, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -22435,7 +22602,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 200);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 202);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
