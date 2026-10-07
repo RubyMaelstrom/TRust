@@ -7611,31 +7611,16 @@ fn function_body(value: &str) -> Option<&str> {
     (close > open).then_some(&value[open + 1..close])
 }
 
+/// The URL of a value that is exactly one `<url>`, with CSS escapes resolved
+/// (see [`crate::dom::css_url_prefix`]).
 fn css_url(value: &str) -> Option<String> {
-    let body = function_body(value)?;
-    value[..value.find('(')?]
-        .trim()
-        .eq_ignore_ascii_case("url")
-        .then(|| body.trim().trim_matches(['\'', '"']).to_string())
+    crate::dom::css_url_prefix(value).and_then(|(url, rest)| rest.trim().is_empty().then_some(url))
 }
 
+/// Split a computed list on top-level `separator`s. Separators and
+/// parentheses inside CSS strings (a quoted SVG data URL) are not structural.
 fn split_top_level(value: &str, separator: char) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0;
-    for (index, ch) in value.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ch if ch == separator && depth == 0 => {
-                result.push(&value[start..index]);
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    result.push(&value[start..]);
-    result
+    crate::dom::split_top_level(value, separator)
 }
 
 fn split_ws(value: &str) -> Vec<&str> {

@@ -1711,23 +1711,12 @@ fn split_css_cursor_list(value: &str) -> Vec<&str> {
 }
 
 fn parse_css_cursor_image(value: &str) -> Option<CssCursorImage> {
-    let value = value.trim();
-    let open = value.find('(')?;
-    if !value[..open].trim().eq_ignore_ascii_case("url") {
-        return None;
-    }
-    let close = value.rfind(')')?;
-    if close <= open {
-        return None;
-    }
-    let source = value[open + 1..close]
-        .trim()
-        .trim_matches(['\'', '"'])
-        .to_string();
+    // CSS UI 4 #cursor: `<url> [<x> <y>]?`; the URL's CSS escapes are resolved.
+    let (source, rest) = trust::dom::css_url_prefix(value)?;
     if source.is_empty() {
         return None;
     }
-    let coordinate_tokens = value[close + 1..].split_whitespace().collect::<Vec<_>>();
+    let coordinate_tokens = rest.split_whitespace().collect::<Vec<_>>();
     let hotspot = match coordinate_tokens.as_slice() {
         [] => None,
         [x, y] => {

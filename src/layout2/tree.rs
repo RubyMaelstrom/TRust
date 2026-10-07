@@ -1314,14 +1314,9 @@ impl Builder<'_> {
     /// permits other `<image>` functions; those are left to the normal marker
     /// fallback until the graphical image pipeline can rasterize them.
     fn list_style_image_url(value: &str) -> Option<String> {
-        let value = value.trim();
-        let open = value.find('(')?;
-        let close = value.rfind(')')?;
-        if close <= open || !value[..open].trim().eq_ignore_ascii_case("url") {
-            return None;
-        }
-        let source = value[open + 1..close].trim().trim_matches(['\'', '"']);
-        (!source.is_empty()).then(|| source.to_string())
+        crate::dom::css_url_prefix(value)
+            .filter(|(url, rest)| !url.is_empty() && rest.trim().is_empty())
+            .map(|(url, _)| url)
     }
 
     /// Build the box-level children of `id`, flattening `display:contents`
