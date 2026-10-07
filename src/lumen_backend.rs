@@ -26627,6 +26627,152 @@ mod tests {
     }
 
     #[test]
+    fn webassembly_memory_buffer_is_identified_with_the_memory_data_block() {
+        // JS API #memories: Memory.buffer's [[ArrayBufferData]] is "identified with" the
+        // memory ("create a fixed length memory buffer"), so a write on either side is a
+        // write to the other, at any address and inside imported-function callbacks.
+        // Growth ("refresh the Memory buffer") detaches the old buffer, also when a nested
+        // export grows the memory during an import or when Memory.grow(0) is called, and
+        // the replacement exposes the same bytes. Official snapshot 37d6b059 (2026-09-06).
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                    (import "env" "callback" (func $callback (param i32)))
+                    (import "env" "memory" (memory 1 8))
+                    (func (export "load") (param i32) (result i32)
+                        local.get 0 i32.load8_u)
+                    (func (export "store") (param i32 i32)
+                        local.get 0 local.get 1 i32.store8)
+                    (func (export "grow") (param i32) (result i32)
+                        local.get 0 memory.grow)
+                    (func (export "size") (result i32) memory.size)
+                    (func (export "roundTrip") (param i32) (result i32)
+                        local.get 0 i32.const 21 i32.store8
+                        i32.const 131071 i32.const 22 i32.store8
+                        local.get 0 call $callback
+                        local.get 0 i32.const 1 i32.add i32.load8_u
+                        i32.const 131070 i32.load8_u
+                        i32.add))
+            "#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                const results = [];
+                const memory = new WebAssembly.Memory({ initial: 2, maximum: 8 });
+                // Written before instantiation, read by Wasm through the imported memory.
+                new Uint8Array(memory.buffer)[70000] = 3;
+                let exports, inCallback = '', nestedDetached = '';
+                exports = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), { env: {
+                    memory,
+                    callback(address) {
+                        const bytes = new Uint8Array(memory.buffer);
+                        inCallback = [bytes[address], bytes[131071]].join(':');
+                        bytes[address + 1] = 30;
+                        new DataView(memory.buffer).setUint8(131070, 40);
+                        if (address === 9) {
+                            const before = memory.buffer;
+                            exports.grow(1);
+                            nestedDetached = [before.byteLength, memory.buffer.byteLength,
+                                new Uint8Array(memory.buffer)[address]].join(':');
+                        }
+                    }
+                }}).exports;
+                const first = memory.buffer;
+                const view = new Uint8Array(first);
+                const data = new DataView(first);
+                results.push(first === memory.buffer, exports.load(70000));
+                view[5] = 17; data.setUint8(131069, 18);
+                results.push(exports.load(5), exports.load(131069));
+                exports.store(6, 19); exports.store(131068, 20);
+                results.push(view[6], data.getUint8(131068));
+                results.push(exports.roundTrip(1), inCallback, view[2], view[131070]);
+                results.push(exports.roundTrip(9), inCallback, nestedDetached);
+                results.push(first.byteLength, view.length, memory.buffer !== first);
+                const second = memory.buffer;
+                results.push(second.byteLength, new Uint8Array(second)[6], exports.size());
+                results.push(memory.grow(0), second.byteLength, memory.buffer.byteLength);
+                const third = memory.buffer;
+                new Uint8Array(third)[196607] = 50;
+                results.push(exports.load(196607), third === memory.buffer);
+                const copy = third.slice(5, 7);
+                exports.store(5, 99);
+                results.push(new Uint8Array(copy).join(','), new Uint8Array(third)[5]);
+                let transferRejected = false;
+                try { third.transfer(); } catch (error) { transferRejected = error instanceof TypeError; }
+                results.push(transferRejected, third.byteLength);
+                globalThis.sharedDataBlockResult = results.join('|');
+            "#,
+                "Memory.buffer identified with the Wasm memory",
+            )
+            .unwrap_or_else(|error| panic!("{tier:?}: {error:?}"));
+            assert_eq!(
+                string_value(&mut engine, "sharedDataBlockResult"),
+                "true|3|17|18|19|20|70|21:22|30|40|70|21:22|0:196608:21|0|0|true|196608|19|3|3|0|196608|50|true|17,19|99|true|196608",
+                "tier {tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_memory_survives_resize_through_forged_getters() {
+        // ECMA-262 #sec-arraybuffer.prototype.resize reads [[ArrayBufferMaxByteLength]]
+        // (an internal slot) and throws for a fixed-length buffer such as Memory.buffer
+        // (JS API #memories). Even if forged `resizable`/`maxByteLength` getters reached
+        // the shared Data Block, Wasm must keep a memory-safe view: accesses stay bounds
+        // checked against the live bytes.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(
+                &mut engine,
+                r#"
+                (module
+                    (memory (export "memory") 1 4)
+                    (func (export "load") (param i32) (result i32)
+                        local.get 0 i32.load8_u)
+                    (func (export "store") (param i32 i32)
+                        local.get 0 local.get 1 i32.store8))
+            "#,
+            );
+            eval(
+                &mut engine,
+                r#"
+                const { memory, load, store } =
+                    new WebAssembly.Instance(new WebAssembly.Module(wasmFixture)).exports;
+                const buffer = memory.buffer;
+                new Uint8Array(buffer)[100] = 7;
+                const proto = ArrayBuffer.prototype;
+                Object.defineProperty(proto, 'resizable', { get() { return true; }, configurable: true });
+                Object.defineProperty(proto, 'maxByteLength', { get() { return 1 << 20; }, configurable: true });
+                let outcome;
+                try { proto.resize.call(buffer, 16); outcome = 'resized'; }
+                catch (error) { outcome = error.constructor.name; }
+                const accesses = [];
+                for (const address of [100, 20000, 65535]) {
+                    try { store(address, 9); accesses.push(load(address)); }
+                    catch (error) { accesses.push(error instanceof WebAssembly.RuntimeError ? 'trap' : 'other'); }
+                }
+                globalThis.forgedResizeResult = outcome === 'TypeError'
+                    ? 'rejected|' + accesses.join(',')
+                    : 'safe|' + accesses.map(v => v === 'trap' || v === 9).join(',');
+            "#,
+                "forged resize of Memory.buffer",
+            )
+            .unwrap_or_else(|error| panic!("{tier:?}: {error:?}"));
+            let result = string_value(&mut engine, "forgedResizeResult");
+            assert!(
+                result == "rejected|9,9,9" || result == "safe|true,true,true",
+                "tier {tier:?}: {result}"
+            );
+        }
+    }
+
+    #[test]
     fn webassembly_packed_stores_publish_their_exact_byte_width() {
         // Core #exec-store-pack writes N/8 bytes, independent of the operand's
         // i32/i64 width; JS API #memories identifies those bytes with Memory.buffer.

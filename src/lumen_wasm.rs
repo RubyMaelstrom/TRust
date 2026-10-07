@@ -2,15 +2,16 @@
 //!
 //! The observable classes and promise APIs live in the shared platform prelude. This module owns
 //! one wasmi store per JavaScript agent and translates the prelude's integer handles according to
-//! the WebAssembly JavaScript Interface. Memory uses a keyed ArrayBuffer mirror: synchronization
-//! happens at every JS/wasm transition, including imported-function callbacks, and growth detaches
-//! the previous object before a replacement is exposed. This avoids aliasing wasmi's reallocating
-//! storage through an unsafe raw ArrayBuffer while preserving the specified observable behavior.
+//! the WebAssembly JavaScript Interface. A memory's bytes are one Data Block shared by Wasmi and
+//! each fixed-length `Memory.buffer` (JS API #memories, "create a fixed length memory buffer"),
+//! so writes on either side are visible to the other without copying. Growth detaches the
+//! previous buffer at the next JS/wasm transition, before JavaScript can observe it
+//! ("refresh the Memory buffer"); the replacement is created on the next `buffer` access.
 
 use super::HostState;
 use lumen::embed::{
-    Ctx, HostGc, HostGcVisitor, HostRetainedMemoryVisitor, RetainedExternalAllocation,
-    RetainedExternalMemory, RetainedManagedAllocation, Value,
+    ArrayBufferBytes, Ctx, HostGc, HostGcVisitor, HostRetainedMemoryVisitor,
+    RetainedExternalAllocation, RetainedExternalMemory, RetainedManagedAllocation, Value,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -314,31 +315,26 @@ impl FunctionGroups {
 
 impl RetainedExternalMemory for PageWasm {
     fn retained_external_memory(&self, visit: &mut dyn FnMut(RetainedExternalAllocation)) {
-        let owner_identity = Rc::as_ptr(&self.state) as usize;
         let Ok(state) = self.state.try_borrow() else {
             return;
         };
         let Some(state) = state.as_ref() else {
             return;
         };
-        for (index, slot) in state.memories.iter().enumerate() {
-            visit(RetainedExternalAllocation::wasm_memory(
-                "trust.wasmi.memory",
-                owner_identity,
-                index as u64,
-                slot.memory.data(&state.store).len(),
-            ));
+        for slot in &state.memories {
+            // The Data Block identity lets Lumen count an exposed Memory.buffer only once.
+            visit(RetainedExternalAllocation::wasm_array_buffer(&slot.storage));
         }
     }
 }
 
 struct MemorySlot {
     memory: wasmi::Memory,
+    /// The memory's bytes, shared by Wasmi and every `Memory.buffer` of this memory.
+    storage: ArrayBufferBytes,
+    /// The memory size when its current `Memory.buffer` was created or last checked. A
+    /// different size means the memory grew and that buffer must be detached.
     buffer_pages: u64,
-    /// Last JS-side ArrayBuffer generation committed to Wasmi.
-    js_version: u64,
-    /// Last Wasmi-side memory generation exposed to the JS ArrayBuffer mirror.
-    wasm_version: u64,
 }
 
 #[derive(Default)]
@@ -407,25 +403,32 @@ impl WasmState {
         index
     }
 
-    fn register_memory(&mut self, value: wasmi::Memory) -> usize {
-        let pages = value.size(&self.store);
-        self.register_memory_with_pages(value, pages)
-    }
-
-    fn register_memory_with_pages(&mut self, value: wasmi::Memory, pages: u64) -> usize {
-        if let Some(index) = self
-            .memories
+    fn memory_id(&self, value: wasmi::Memory) -> Option<usize> {
+        self.memories
             .iter()
             .position(|candidate| candidate.memory == value)
-        {
-            return index;
+    }
+
+    fn register_memory(&mut self, value: wasmi::Memory) -> Option<usize> {
+        if let Some(index) = self.memory_id(value) {
+            return Some(index);
         }
+        let pages = value.size(&self.store);
+        let storage = share_memory(value, &mut self.store)?;
+        Some(self.push_memory(value, storage, pages))
+    }
+
+    fn push_memory(
+        &mut self,
+        value: wasmi::Memory,
+        storage: ArrayBufferBytes,
+        pages: u64,
+    ) -> usize {
         let index = self.memories.len();
         self.memories.push(MemorySlot {
             memory: value,
+            storage,
             buffer_pages: pages,
-            js_version: 0,
-            wasm_version: value.data_version(&self.store),
         });
         wasm_trace!(format!(
             "memory register id={index} pages={pages} bytes={}",
@@ -442,6 +445,27 @@ impl WasmState {
         self.tables.push(value);
         index
     }
+}
+
+/// Shares `memory`'s bytes as the Data Block of its `Memory.buffer` objects (JS API #memories:
+/// the buffer's [[ArrayBufferData]] is "identified with" the memory). `None` only for a memory
+/// over a static buffer, which this embedding never creates.
+fn share_memory(
+    memory: wasmi::Memory,
+    context: impl wasmi::AsContextMut<Data = StoreData>,
+) -> Option<ArrayBufferBytes> {
+    // SAFETY: wasmi::Memory::share's contract.
+    // - The store lives in this agent's `PageWasm` (an `Rc`, so it never leaves the agent
+    //   thread), and Lumen keeps the returned `Rc` in ArrayBuffers of the same agent.
+    // - Lumen touches the bytes only while JavaScript or a host operation runs: outside Wasm
+    //   execution, or inside an imported-function callback, after which Wasmi reloads its
+    //   view of memory 0 (other memories are resolved per access). This module never holds a
+    //   slice of Wasm memory across a call into Lumen.
+    let storage = unsafe { memory.share(context) };
+    if storage.is_none() {
+        wasm_trace!("memory share failed (static buffer)");
+    }
+    storage
 }
 
 fn page_wasm(ctx: &mut Ctx) -> Option<PageWasm> {
@@ -853,6 +877,19 @@ fn active_memory(index: usize) -> Option<wasmi::Memory> {
     with_active_state(|state| state.memories.get(index).map(|slot| slot.memory)).flatten()
 }
 
+/// [`WasmState::register_memory`] for the agent whose store is lent to the active Caller.
+fn register_active_memory(memory: wasmi::Memory) -> Option<usize> {
+    if let Some(id) = with_active_state(|state| state.memory_id(memory)).flatten() {
+        return Some(id);
+    }
+    let (storage, pages) = with_active_caller(|caller| {
+        let pages = memory.size(&*caller);
+        share_memory(memory, &mut *caller).map(|storage| (storage, pages))
+    })
+    .flatten()?;
+    with_active_state(|state| state.push_memory(memory, storage, pages))
+}
+
 fn active_instance(index: usize) -> Option<wasmi::Instance> {
     with_active_state(|state| state.instances.get(index).copied()).flatten()
 }
@@ -869,211 +906,40 @@ fn module_for_page(page: &PageWasm, id: Option<usize>) -> Option<wasmi::Module> 
     }
 }
 
-fn sync_store_from_buffers(ctx: &mut Ctx, state: &mut WasmState, buffers: &[Option<Value>]) {
-    for (index, slot) in state.memories.iter_mut().enumerate() {
-        let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
-            continue;
-        };
-        let version = ctx.array_buffer_version(buffer).unwrap_or(0);
-        if version == slot.js_version {
-            continue;
-        }
-        let dirty_ranges = ctx
-            .take_array_buffer_dirty_ranges(buffer)
-            .unwrap_or_default();
-        let data = slot.memory.data_mut(&mut state.store);
-        let mirrored = if dirty_ranges.is_empty() {
-            let Some(bytes) = ctx.buffer_source_bytes(buffer, false) else {
-                continue;
-            };
-            if data.len() != bytes.len() {
-                false
-            } else {
-                data.copy_from_slice(&bytes);
-                true
-            }
-        } else {
-            dirty_ranges.iter().all(|range| {
-                let Some(destination) = data.get_mut(range.clone()) else {
-                    return false;
-                };
-                let Some(length) = range.end.checked_sub(range.start) else {
-                    return false;
-                };
-                if !ctx.array_buffer_copy_range(buffer, range.start, length, destination) {
-                    return false;
-                }
-                true
-            })
-        };
-        if mirrored {
-            let _ = slot.memory.take_dirty_ranges(&mut state.store);
-            slot.js_version = version;
-            slot.wasm_version = slot.memory.data_version(&state.store);
-        }
-    }
-}
-
-fn sync_buffers_from_store(ctx: &mut Ctx, state: &mut WasmState, buffers: &mut [Option<Value>]) {
-    for index in 0..state.memories.len() {
-        let Some(slot) = state.memories.get_mut(index) else {
-            continue;
-        };
-        let memory = slot.memory;
-        let pages = memory.size(&state.store);
-        let dirty_ranges = memory.take_dirty_ranges(&mut state.store);
-        if pages != slot.buffer_pages {
-            wasm_trace!(format!(
-                "memory internal grow id={index} old_pages={} new_pages={pages}",
-                slot.buffer_pages
-            ));
-            slot.buffer_pages = pages;
-            slot.wasm_version = memory.data_version(&state.store);
-            if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
-                ctx.detach_array_buffer(&buffer);
-            }
+/// JS API #memories "refresh the Memory buffer": a fixed-length buffer of a memory that grew is
+/// detached ("WebAssembly.Memory" key); the next `buffer` access creates its replacement over the
+/// same, grown Data Block. Wasm `memory.grow` cannot run JavaScript, so performing this at each
+/// transition back to JavaScript is indistinguishable from doing it right after the instruction.
+fn refresh_buffers(
+    ctx: &mut Ctx,
+    memories: &mut [MemorySlot],
+    context: impl wasmi::AsContext<Data = StoreData>,
+    buffers: &mut [Option<Value>],
+) {
+    for (index, slot) in memories.iter_mut().enumerate() {
+        let pages = slot.memory.size(&context);
+        if pages == slot.buffer_pages {
             continue;
         }
-        let version = memory.data_version(&state.store);
-        if version == slot.wasm_version && dirty_ranges.is_empty() {
-            continue;
-        }
-        let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
-            slot.wasm_version = version;
-            continue;
-        };
-        let data = memory.data(&state.store);
-        let ranges = if dirty_ranges.is_empty() {
-            std::iter::once(0..data.len()).collect::<Vec<_>>()
-        } else {
-            dirty_ranges
-        };
-        let mirrored = ranges.iter().all(|range| {
-            let Some(bytes) = data.get(range.clone()) else {
-                return false;
-            };
-            ctx.array_buffer_set_range(buffer, range.start, bytes)
-        });
-        if mirrored {
-            slot.wasm_version = version;
-            slot.js_version = ctx.array_buffer_version(buffer).unwrap_or(slot.js_version);
-        } else if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
+        wasm_trace!(format!(
+            "memory grow id={index} old_pages={} new_pages={pages}",
+            slot.buffer_pages
+        ));
+        slot.buffer_pages = pages;
+        if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
             ctx.detach_array_buffer(&buffer);
         }
     }
 }
 
-fn sync_active_buffers_to_js(ctx: &mut Ctx) {
+/// [`refresh_buffers`] while the store is lent to an imported-function callback.
+fn refresh_active_buffers(ctx: &mut Ctx) {
     let Some(page) = page_wasm(ctx) else {
         return;
     };
     let mut buffers = page.buffers.borrow_mut();
     let _ = with_active_caller(|caller| {
-        let _ = with_active_state(|state| {
-            for index in 0..state.memories.len() {
-                let Some(slot) = state.memories.get_mut(index) else {
-                    continue;
-                };
-                let memory = slot.memory;
-                let pages = memory.size(&*caller);
-                let dirty_ranges = memory.take_dirty_ranges(&mut *caller);
-                if pages != slot.buffer_pages {
-                    wasm_trace!(format!(
-                        "memory active grow id={index} old_pages={} new_pages={pages}",
-                        slot.buffer_pages
-                    ));
-                    slot.buffer_pages = pages;
-                    slot.wasm_version = memory.data_version(&*caller);
-                    if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
-                        ctx.detach_array_buffer(&buffer);
-                    }
-                    continue;
-                }
-                let version = memory.data_version(&*caller);
-                if version == slot.wasm_version && dirty_ranges.is_empty() {
-                    continue;
-                }
-                let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
-                    slot.wasm_version = version;
-                    continue;
-                };
-                let data = memory.data(&*caller);
-                let ranges = if dirty_ranges.is_empty() {
-                    std::iter::once(0..data.len()).collect::<Vec<_>>()
-                } else {
-                    dirty_ranges
-                };
-                let mirrored = ranges.iter().all(|range| {
-                    let Some(bytes) = data.get(range.clone()) else {
-                        return false;
-                    };
-                    ctx.array_buffer_set_range(buffer, range.start, bytes)
-                });
-                if mirrored {
-                    slot.wasm_version = version;
-                    slot.js_version = ctx.array_buffer_version(buffer).unwrap_or(slot.js_version);
-                } else if let Some(buffer) = buffers.get_mut(index).and_then(Option::take) {
-                    ctx.detach_array_buffer(&buffer);
-                }
-            }
-        });
-    });
-}
-
-fn sync_active_buffers_to_wasm(ctx: &mut Ctx) {
-    let Some(page) = ctx
-        .op_state()
-        .get_mut::<HostState>()
-        .map(|state| state.wasm.clone())
-    else {
-        return;
-    };
-    let buffers = page.buffers.borrow();
-    let _ = with_active_caller(|caller| {
-        let _ = with_active_state(|state| {
-            for (index, slot) in state.memories.iter_mut().enumerate() {
-                let Some(buffer) = buffers.get(index).and_then(Option::as_ref) else {
-                    continue;
-                };
-                let version = ctx.array_buffer_version(buffer).unwrap_or(0);
-                if version == slot.js_version {
-                    continue;
-                }
-                let dirty_ranges = ctx
-                    .take_array_buffer_dirty_ranges(buffer)
-                    .unwrap_or_default();
-                let data = slot.memory.data_mut(&mut *caller);
-                let mirrored = if dirty_ranges.is_empty() {
-                    let Some(bytes) = ctx.buffer_source_bytes(buffer, false) else {
-                        continue;
-                    };
-                    if data.len() != bytes.len() {
-                        false
-                    } else {
-                        data.copy_from_slice(&bytes);
-                        true
-                    }
-                } else {
-                    dirty_ranges.iter().all(|range| {
-                        let Some(destination) = data.get_mut(range.clone()) else {
-                            return false;
-                        };
-                        let Some(length) = range.end.checked_sub(range.start) else {
-                            return false;
-                        };
-                        if !ctx.array_buffer_copy_range(buffer, range.start, length, destination) {
-                            return false;
-                        }
-                        true
-                    })
-                };
-                if mirrored {
-                    let _ = slot.memory.take_dirty_ranges(&mut *caller);
-                    slot.js_version = version;
-                    slot.wasm_version = slot.memory.data_version(&*caller);
-                }
-            }
-        });
+        with_active_state(|state| refresh_buffers(ctx, &mut state.memories, &*caller, &mut buffers))
     });
 }
 
@@ -1168,7 +1034,7 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
             return Err(wasm_trap());
         }
         let _caller_guard = CallerGuard::set(&mut caller);
-        sync_active_buffers_to_js(ctx);
+        refresh_active_buffers(ctx);
         let mut arguments = Vec::with_capacity(params.len());
         for value in params {
             let token = match value {
@@ -1214,7 +1080,6 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
                 ctx.error_diagnostic(error)
             ));
         }
-        sync_active_buffers_to_wasm(ctx);
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1728,19 +1593,22 @@ pub(super) fn host_instantiate(
     let result = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => {
             let state = state_slot.get_or_insert_with(WasmState::new);
-            sync_store_from_buffers(ctx, state, &page.buffers.borrow());
             let _state_guard = StateGuard::set(state);
             let result = instantiate_state(state, &module, token, &bindings);
-            sync_buffers_from_store(ctx, state, &mut page.buffers.borrow_mut());
+            refresh_buffers(
+                ctx,
+                &mut state.memories,
+                &state.store,
+                &mut page.buffers.borrow_mut(),
+            );
             result
         }
         Err(_) => {
             // WebAssembly Core §4.5 permits a host function to instantiate another
             // module. Reuse the active Caller so nested start functions and imports
             // execute in the same agent's associated store.
-            sync_active_buffers_to_wasm(ctx);
             let result = instantiate_active(&module, token, &bindings);
-            sync_active_buffers_to_js(ctx);
+            refresh_active_buffers(ctx);
             result
         }
     };
@@ -1830,7 +1698,7 @@ pub(super) fn host_instance_exports(
                         .map(|value| state.register_global(value)),
                     "memory" => instance
                         .get_memory(&state.store, &name)
-                        .map(|value| state.register_memory(value)),
+                        .and_then(|value| state.register_memory(value)),
                     "table" => instance
                         .get_table(&state.store, &name)
                         .map(|value| state.register_table(value)),
@@ -1875,23 +1743,25 @@ pub(super) fn host_instance_exports(
                 } else {
                     0
                 };
-                let registered = with_active_caller(|caller| match kind {
-                    "function" => instance
-                        .get_func(&*caller, &name)
-                        .and_then(|value| with_active_state(|state| state.register_func(value))),
-                    "global" => instance
-                        .get_global(&*caller, &name)
-                        .and_then(|value| with_active_state(|state| state.register_global(value))),
-                    "memory" => instance.get_memory(&*caller, &name).and_then(|value| {
-                        let pages = value.size(&*caller);
-                        with_active_state(|state| state.register_memory_with_pages(value, pages))
-                    }),
-                    "table" => instance
-                        .get_table(&*caller, &name)
-                        .and_then(|value| with_active_state(|state| state.register_table(value))),
-                    _ => None,
-                })
-                .flatten();
+                let registered = if kind == "memory" {
+                    with_active_caller(|caller| instance.get_memory(&*caller, &name))
+                        .flatten()
+                        .and_then(register_active_memory)
+                } else {
+                    with_active_caller(|caller| match kind {
+                        "function" => instance.get_func(&*caller, &name).and_then(|value| {
+                            with_active_state(|state| state.register_func(value))
+                        }),
+                        "global" => instance.get_global(&*caller, &name).and_then(|value| {
+                            with_active_state(|state| state.register_global(value))
+                        }),
+                        "table" => instance.get_table(&*caller, &name).and_then(|value| {
+                            with_active_state(|state| state.register_table(value))
+                        }),
+                        _ => None,
+                    })
+                    .flatten()
+                };
                 let Some(id) = registered else { continue };
                 let auxiliary = if kind == "function" {
                     function_arity.to_string()
@@ -1986,7 +1856,6 @@ pub(super) fn host_call_export(
     let call: Result<Vec<OutputToken>, (&'static str, String)> = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => (|| -> Result<Vec<OutputToken>, (&'static str, String)> {
             let state = state_slot.get_or_insert_with(WasmState::new);
-            sync_store_from_buffers(ctx, state, &page.buffers.borrow());
             let mut inputs = Vec::with_capacity(prepared.len());
             for value in prepared {
                 inputs.push(build_value(state, value).map_err(|()| {
@@ -2011,7 +1880,12 @@ pub(super) fn host_call_export(
             }));
             // JS API §§4.1, 5.6: publish the updated store before throwing. A trap
             // does not roll back writes or memory.grow (including buffer detachment).
-            sync_buffers_from_store(ctx, state, &mut page.buffers.borrow_mut());
+            refresh_buffers(
+                ctx,
+                &mut state.memories,
+                &state.store,
+                &mut page.buffers.borrow_mut(),
+            );
             let tokens = match result {
                 Ok(Ok(())) => {
                     let store = &state.store as *const wasmi::Store<StoreData>;
@@ -2030,9 +1904,6 @@ pub(super) fn host_call_export(
             Ok(tokens)
         })(),
         Err(_) => (|| -> Result<Vec<OutputToken>, (&'static str, String)> {
-            // A host callback may have mutated a live Memory.buffer before re-entering wasm.
-            // Commit those Data Block changes before the nested invocation (JS API §4.1).
-            sync_active_buffers_to_wasm(ctx);
             let function = function_id.and_then(active_func).ok_or((
                 "Runtime",
                 "WebAssembly: unavailable re-entrant function".to_string(),
@@ -2068,7 +1939,7 @@ pub(super) fn host_call_export(
             ))?;
             // The enclosing JS import may catch a nested trap and inspect Memory.buffer
             // immediately, before returning to the outer Wasm activation.
-            sync_active_buffers_to_js(ctx);
+            refresh_active_buffers(ctx);
             match invoked {
                 Ok(Ok(())) => {
                     let mut tokens = Vec::with_capacity(outputs.len());
@@ -2318,15 +2189,16 @@ pub(super) fn host_memory_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
             let state = state_slot.get_or_insert_with(WasmState::new);
             let memory = wasmi::Memory::new(&mut state.store, ty)
                 .map_err(|error| range_error(ctx, format!("WebAssembly.Memory: {error}")))?;
-            state.register_memory(memory)
+            state
+                .register_memory(memory)
+                .ok_or_else(|| range_error(ctx, "WebAssembly.Memory: unavailable memory"))?
         }
         Err(_) => {
             let memory = with_active_caller(|caller| wasmi::Memory::new(caller, ty))
                 .ok_or_else(|| range_error(ctx, "WebAssembly is unavailable"))?
                 .map_err(|error| range_error(ctx, format!("WebAssembly.Memory: {error}")))?;
-            let pages = with_active_caller(|caller| memory.size(&*caller)).unwrap_or(initial);
-            with_active_state(|state| state.register_memory_with_pages(memory, pages))
-                .ok_or_else(|| range_error(ctx, "WebAssembly is unavailable"))?
+            register_active_memory(memory)
+                .ok_or_else(|| range_error(ctx, "WebAssembly.Memory: unavailable memory"))?
         }
     };
     wasm_trace!(format!(
@@ -2381,7 +2253,6 @@ pub(super) fn host_memory_grow(
             let Some(state) = state_slot.as_mut() else {
                 return Err(range_error(ctx, "WebAssembly.Memory.grow: unknown memory"));
             };
-            sync_store_from_buffers(ctx, state, &page.buffers.borrow());
             id.and_then(|id| state.memories.get(id).map(|slot| slot.memory))
                 .map(|memory| {
                     let result = memory.grow(&mut state.store, delta as u64);
@@ -2394,23 +2265,20 @@ pub(super) fn host_memory_grow(
                     result
                 })
         }
-        Err(_) => {
-            sync_active_buffers_to_wasm(ctx);
-            id.and_then(active_memory).and_then(|memory| {
-                let result = with_active_caller(|caller| memory.grow(&mut *caller, delta as u64));
-                if result.as_ref().is_some_and(Result::is_ok)
-                    && let Some(id) = id
-                {
-                    let pages = with_active_caller(|caller| memory.size(&*caller)).unwrap_or(0);
-                    let _ = with_active_state(|state| {
-                        if let Some(slot) = state.memories.get_mut(id) {
-                            slot.buffer_pages = pages;
-                        }
-                    });
-                }
-                result
-            })
-        }
+        Err(_) => id.and_then(active_memory).and_then(|memory| {
+            let result = with_active_caller(|caller| memory.grow(&mut *caller, delta as u64));
+            if result.as_ref().is_some_and(Result::is_ok)
+                && let Some(id) = id
+            {
+                let pages = with_active_caller(|caller| memory.size(&*caller)).unwrap_or(0);
+                let _ = with_active_state(|state| {
+                    if let Some(slot) = state.memories.get_mut(id) {
+                        slot.buffer_pages = pages;
+                    }
+                });
+            }
+            result
+        }),
     };
     match result {
         Some(Ok(old)) => {
@@ -2418,6 +2286,7 @@ pub(super) fn host_memory_grow(
                 "memory grow id={} delta={delta} old_pages={old}",
                 id.unwrap_or(usize::MAX)
             ));
+            // JS API "grow the memory buffer" refreshes the buffer even for a zero delta.
             if let Some(id) = id {
                 detach_buffer(ctx, &mut page.buffers.borrow_mut(), id);
             }
@@ -2442,118 +2311,50 @@ pub(super) fn host_memory_buffer(
     let Some(id) = arg_id(args, 0) else {
         return Ok(Value::Undefined);
     };
-    let existing_buffer = {
-        page.buffers
-            .borrow()
-            .get(id)
-            .and_then(Option::as_ref)
-            .cloned()
+    // The memory's current size and Data Block. A size different from the current buffer's
+    // means a growth that no transition has published yet (the getter may run inside an
+    // imported-function callback): refresh first, so the old buffer is detached.
+    let current = |state: &mut WasmState, pages: u64| {
+        let slot = state.memories.get_mut(id)?;
+        let grew = slot.buffer_pages != pages;
+        slot.buffer_pages = pages;
+        Some((slot.storage.clone(), grew))
     };
-    if let Some(buffer) = existing_buffer {
-        let unchanged = match page.state.try_borrow() {
-            Ok(state) => state.as_ref().is_some_and(|state| {
-                state
-                    .memories
-                    .get(id)
-                    .is_some_and(|slot| slot.memory.data_version(&state.store) == slot.wasm_version)
-            }),
-            Err(_) => {
-                // A memory.buffer getter may run from an imported callback while the Wasmi store
-                // is active. Bring only changed Wasmi memory into the existing JS object; the
-                // helper also handles growth by detaching the old object.
-                sync_active_buffers_to_js(ctx);
-                page.buffers
-                    .borrow()
-                    .get(id)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|current| ctx.object_addr(current) == ctx.object_addr(&buffer))
-            }
-        };
-        if unchanged {
-            return Ok(buffer);
-        }
+    let current = match page.state.try_borrow_mut() {
+        Ok(mut state_slot) => state_slot.as_mut().and_then(|state| {
+            let pages = state.memories.get(id)?.memory.size(&state.store);
+            current(state, pages)
+        }),
+        Err(_) => active_memory(id).and_then(|memory| {
+            let pages = with_active_caller(|caller| memory.size(&*caller))?;
+            with_active_state(|state| current(state, pages)).flatten()
+        }),
+    };
+    let Some((storage, grew)) = current else {
+        return Ok(Value::Undefined);
+    };
+    if grew {
+        detach_buffer(ctx, &mut page.buffers.borrow_mut(), id);
     }
-    let bytes = match page.state.try_borrow_mut() {
-        Ok(mut state_slot) => {
-            let Some(state) = state_slot.as_mut() else {
-                return Ok(Value::Undefined);
-            };
-            let Some(memory) = state.memories.get(id).map(|slot| slot.memory) else {
-                return Ok(Value::Undefined);
-            };
-            let pages = memory.size(&state.store);
-            if state
-                .memories
-                .get(id)
-                .is_some_and(|slot| pages != slot.buffer_pages)
-            {
-                if let Some(slot) = state.memories.get_mut(id) {
-                    slot.buffer_pages = pages;
-                }
-                detach_buffer(ctx, &mut page.buffers.borrow_mut(), id);
-            }
-            memory.data(&state.store).to_vec()
-        }
-        Err(_) => {
-            let Some(memory) = active_memory(id) else {
-                return Ok(Value::Undefined);
-            };
-            let Some(bytes) = with_active_caller(|caller| memory.data(&*caller).to_vec()) else {
-                return Ok(Value::Undefined);
-            };
-            let pages = with_active_caller(|caller| memory.size(&*caller)).unwrap_or(0);
-            let changed = with_active_state(|state| {
-                let changed = state
-                    .memories
-                    .get(id)
-                    .is_some_and(|slot| slot.buffer_pages != pages);
-                if let Some(slot) = state.memories.get_mut(id) {
-                    slot.buffer_pages = pages;
-                }
-                changed
-            })
-            .unwrap_or(false);
-            if changed {
-                detach_buffer(ctx, &mut page.buffers.borrow_mut(), id);
-            }
-            bytes
-        }
-    };
-    wasm_trace!(format!("memory buffer id={id} bytes={}", bytes.len()));
-    if let Some(buffer) = page
+    let existing = page
         .buffers
         .borrow()
         .get(id)
         .and_then(Option::as_ref)
-        .cloned()
-        && ctx.array_buffer_set_bytes(&buffer, &bytes)
-    {
-        let version = ctx.array_buffer_version(&buffer).unwrap_or(0);
-        if let Ok(mut state) = page.state.try_borrow_mut()
-            && let Some(state) = state.as_mut()
-            && let Some(slot) = state.memories.get_mut(id)
-        {
-            let _ = slot.memory.take_dirty_ranges(&mut state.store);
-            slot.wasm_version = slot.memory.data_version(&state.store);
-            slot.js_version = version;
-        }
+        .cloned();
+    if let Some(buffer) = existing {
         return Ok(buffer);
     }
-    let buffer = ctx.make_host_keyed_array_buffer(&bytes)?;
+    // JS API "create a fixed length memory buffer": a fresh ArrayBuffer whose
+    // [[ArrayBufferData]] is the memory's Data Block and whose detach key is
+    // "WebAssembly.Memory" (author code cannot transfer or detach it).
+    wasm_trace!(format!("memory buffer id={id}"));
+    let buffer = ctx.make_host_keyed_array_buffer_from_storage(storage)?;
     let mut buffers = page.buffers.borrow_mut();
     if buffers.len() <= id {
         buffers.resize(id + 1, None);
     }
     buffers[id] = Some(buffer.clone());
-    let version = ctx.array_buffer_version(&buffer).unwrap_or(0);
-    if let Ok(mut state) = page.state.try_borrow_mut()
-        && let Some(state) = state.as_mut()
-        && let Some(slot) = state.memories.get_mut(id)
-    {
-        let _ = slot.memory.take_dirty_ranges(&mut state.store);
-        slot.wasm_version = slot.memory.data_version(&state.store);
-        slot.js_version = version;
-    }
     Ok(buffer)
 }
 

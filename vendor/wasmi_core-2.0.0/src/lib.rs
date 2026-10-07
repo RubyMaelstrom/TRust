@@ -45,7 +45,7 @@ pub use self::{
     host_error::HostError,
     index_ty::IndexType,
     limiter::{LimiterError, ResourceLimiter, ResourceLimiterRef},
-    memory::{Memory, MemoryError, MemoryType, MemoryTypeBuilder},
+    memory::{Memory, MemoryError, MemoryType, MemoryTypeBuilder, SharedBytes},
     raw::{RawVal, ReadAs, WriteAs},
     shift_amount::{IntoShiftAmount, ShiftAmount},
     table::{

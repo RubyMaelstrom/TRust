@@ -5,11 +5,17 @@ Local changes, carried over from TRust's Wasmi 1.1.0 fork and adapted to the
 2.0 register-machine IR, its byte-encoded operators and tail-call dispatch:
 
 wasmi_core
+- Memory: `share` (unsafe) moves the bytes into an `Rc<RefCell<Vec<u8>>>`
+  (`SharedBytes`, Lumen's ArrayBuffer Data Block type) without copying, so the
+  embedder's `Memory.buffer` is identified with the memory (WebAssembly JS API
+  #memories). A shared buffer reads the live `Vec` header on every access and
+  grows by resizing the shared `Vec`; it fails growth instead of aliasing a
+  borrow held by the other owner.
 - Memory: a mutation generation (`data_version`) and page-rounded dirty ranges
-  (`mark_dirty_range`, `take_dirty_ranges`) so the embedder mirrors only the
-  pages Wasm wrote into the JavaScript `Memory.buffer` (WebAssembly JS API
-  #memories). `data_mut` marks the whole memory; `data_mut_untracked` is for
-  callers that record the exact written extent. `write` and growth record theirs.
+  (`mark_dirty_range`, `take_dirty_ranges`) for embedders that mirror memory.
+  `data_mut` marks the whole memory; `data_mut_untracked` is for callers that
+  record the exact written extent. `write` and growth record theirs. A shared
+  memory records nothing.
 - `i8x16.shuffle` uses one table lookup per lane instead of a branch per lane;
   RawVal <-> V128 conversions are `#[inline]`.
 - `ValType::ExnRef`, `RefType::Exn`, `TrapCode::NullExceptionReference` and
@@ -50,7 +56,7 @@ wasmi
   suspended resumable call are pinned).
 - Dirty-range recording in every executor store, bulk memory and v128 lane
   store handler, and the cached default-memory pointer no longer marks memory.
-- Public API: `Memory::{data_version, take_dirty_ranges}`,
+- Public API: `Memory::{share, data_version, take_dirty_ranges}`, `SharedBytes`,
   `Store::visit_function_references` (conservative function-liveness groups
   and funcref roots, including stored exception fields, for an embedder's
   wrapper-identity GC), Eq/Hash on

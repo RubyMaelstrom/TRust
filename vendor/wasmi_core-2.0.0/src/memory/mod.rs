@@ -7,6 +7,7 @@ mod ty;
 mod tests;
 
 use self::buffer::ByteBuffer;
+pub use self::buffer::SharedBytes;
 pub use self::{
     access::{
         load,
@@ -297,8 +298,13 @@ impl Memory {
     }
 
     /// Records a write to linear memory, rounded to memory pages for efficient mirror updates.
+    ///
+    /// A shared memory (see [`Memory::share`]) has no mirror to update and records nothing.
     #[inline]
     pub fn mark_dirty_range(&mut self, start: usize, len: usize) {
+        if self.bytes.is_shared() {
+            return;
+        }
         let Some(end) = start.checked_add(len) else {
             return;
         };
@@ -356,14 +362,50 @@ impl Memory {
 
     /// Returns the base pointer, in the host’s address space, that the [`Memory`] is located at.
     pub fn data_ptr(&self) -> *mut u8 {
-        self.bytes.ptr
+        self.bytes.data_ptr()
     }
 
     /// Returns the byte length of this [`Memory`].
     ///
     /// The returned value will be a multiple of the wasm page size, 64k.
     pub fn data_size(&self) -> usize {
-        self.bytes.len
+        self.bytes.len()
+    }
+
+    /// TRust: shares the bytes of this linear memory with an embedder and returns their
+    /// shared owner; repeated calls return the same owner. The bytes are neither copied nor
+    /// moved, and growth reallocates the shared `Vec` in place of the private one.
+    ///
+    /// This identifies a JavaScript `ArrayBuffer` Data Block with the memory, as the
+    /// WebAssembly JS API requires for `Memory.buffer` (#memories, "create a fixed length
+    /// memory buffer"), so writes on either side are visible to the other without a copy.
+    /// A shared memory no longer records dirty ranges or advances its `data_version`.
+    ///
+    /// Returns `None` for a memory backed by a static buffer.
+    ///
+    /// # Safety
+    ///
+    /// - This memory, its store and every clone of the returned `Rc` must stay on the
+    ///   current thread.
+    /// - The bytes must not be accessed through the returned `Rc` while a slice or pointer
+    ///   obtained from this memory is in use. Wasm execution may call host functions that
+    ///   access them: it reloads its view of the memory after every host call.
+    ///
+    /// # Note
+    ///
+    /// Resizing the `Vec` other than by growing this memory is memory safe, since accesses
+    /// read the live `Vec` header, but the new length becomes the memory's size.
+    pub unsafe fn share(&mut self) -> Option<SharedBytes> {
+        // SAFETY: forwarded to the caller.
+        let shared = unsafe { self.bytes.share() }?;
+        // Writes recorded for a mirror are moot once there is none.
+        self.dirty_ranges = Vec::new();
+        Some(shared)
+    }
+
+    /// Returns `true` if [`Memory::share`] shared the bytes of this memory.
+    pub fn is_shared(&self) -> bool {
+        self.bytes.is_shared()
     }
 
     /// Returns the index span for the memory access at `start..(start+len)`.
