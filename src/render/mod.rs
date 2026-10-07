@@ -398,6 +398,14 @@ impl PagePaint {
             || self.top_layer.iter().any(|entry| has(&entry.primitives))
     }
 
+    /// The document timeline's current time (seconds) now, when a page actor
+    /// timed this paint's animations; `None` leaves the frontend to start a
+    /// timeline for a script-free document when it first presents it.
+    pub fn timeline_seconds(&self) -> Option<f32> {
+        let origin = self.timeline_origin_ms?;
+        Some(((crate::performance::now_ms() - origin) / 1000.0).max(0.0) as f32)
+    }
+
     /// How many seconds after `elapsed_seconds` on the document timeline the
     /// paint next changes: `Some(0.0)` while a CSS animation is in play or a
     /// marquee moves, the time until a delayed animation's active phase
@@ -406,10 +414,9 @@ impl PagePaint {
     /// Web Animations 1 #animation-effect-phases-and-states: only an effect
     /// in its active phase has an active time that changes each frame. In the
     /// after phase its value is constant (filled or absent), and a before
-    /// phase ends at the before-active boundary time. This retained model
-    /// plays each running animation at rate 1 from the start of the document
-    /// timeline and holds a paused one at time zero (see
-    /// `css_animation_progress`), so a paused animation never needs a frame.
+    /// phase ends at the before-active boundary time. Each running animation
+    /// plays at rate 1 from its own start time, and a paused one holds its
+    /// current time, so a paused animation never needs a frame.
     pub fn css_animation_wake(&self, elapsed_seconds: f32) -> Option<f32> {
         let mut wake: Option<f32> = None;
         let mut visit = |commands: &[Primitive]| {
@@ -455,11 +462,13 @@ impl PagePaint {
             canvas_images,
             scroll_containers,
             sticky_constraints,
+            timeline_origin_ms,
         } = self;
         let _ = (
             width,
             height,
             user_scroll_size,
+            timeline_origin_ms,
             background,
             fixed_interleaved,
         );
@@ -1230,6 +1239,14 @@ pub struct CssPaintAnimation {
     pub fill_mode: String,
     pub timing_function: String,
     pub running: bool,
+    /// Web Animations 1 #the-current-time-of-an-animation: the document
+    /// timeline time (seconds) at which this animation's current time was
+    /// zero. A page actor resolves it when the animation becomes ready (the
+    /// sample after it was created or resumed), not at the document's start.
+    pub start_seconds: f32,
+    /// The held current time while paused (CSS Animations 1
+    /// #animation-play-state), which the timeline does not advance.
+    pub hold_seconds: Option<f32>,
     /// Translation contributed by an animated inset such as `top`.
     pub position: Vec<CssAnimationPoint>,
     /// `transform` keyframes, which replace the element's static transform
@@ -1242,6 +1259,18 @@ pub struct CssPaintAnimation {
     /// Group opacity relative to the element's static opacity layer, in
     /// each point's `x`.
     pub opacity: Vec<CssAnimationPoint>,
+}
+
+impl CssPaintAnimation {
+    /// The current time (seconds) at `timeline` seconds on the document
+    /// timeline: the held time while paused, else measured from the start.
+    fn current_time(&self, timeline: f32) -> f32 {
+        match self.hold_seconds {
+            Some(hold) => hold,
+            None if self.running => timeline - self.start_seconds,
+            None => 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1531,6 +1560,11 @@ pub struct PagePaint {
     pub canvas_images: Vec<(usize, CanvasImage)>,
     pub scroll_containers: Vec<ScrollContainer>,
     pub sticky_constraints: Vec<StickyConstraint>,
+    /// Web Animations 1 #document-timelines: where the document timeline's
+    /// zero (the time origin) lies on the process-wide `performance::now_ms`
+    /// clock, when a page actor timed this paint's animations. Frontends
+    /// sample paint-composited animations on that same timeline.
+    pub timeline_origin_ms: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2984,10 +3018,10 @@ fn sample_css_animation_opacity(scope: &CssAnimationScope, elapsed_seconds: f32)
 /// effect without a positive duration or iteration count never applies, and
 /// the active interval spans `duration * iteration count` after the delay.
 fn css_animation_wake(animation: &CssPaintAnimation, elapsed_seconds: f32) -> Option<f32> {
-    if !animation.running || animation.duration_seconds <= 0.0 {
+    if !animation.running || animation.hold_seconds.is_some() || animation.duration_seconds <= 0.0 {
         return None;
     }
-    let local = elapsed_seconds - animation.delay_seconds;
+    let local = animation.current_time(elapsed_seconds) - animation.delay_seconds;
     if local < 0.0 {
         // Before phase: constant until the before-active boundary time.
         return Some(-local);
@@ -3004,15 +3038,7 @@ fn css_animation_progress(animation: &CssPaintAnimation, elapsed_seconds: f32) -
     if animation.duration_seconds <= 0.0 {
         return None;
     }
-    // A declaratively paused animation starts with a hold time of zero. Full
-    // script-driven playback state can later replace this clock without
-    // changing the retained paint contract.
-    let elapsed = if animation.running {
-        elapsed_seconds
-    } else {
-        0.0
-    };
-    let local = elapsed - animation.delay_seconds;
+    let local = animation.current_time(elapsed_seconds) - animation.delay_seconds;
     let fills_backwards = matches!(animation.fill_mode.as_str(), "backwards" | "both");
     let fills_forwards = matches!(animation.fill_mode.as_str(), "forwards" | "both");
     let (iteration, mut progress) = if local < 0.0 {
@@ -4639,6 +4665,8 @@ mod tests {
                 fill_mode: "none".into(),
                 timing_function: "linear".into(),
                 running: true,
+                start_seconds: 0.0,
+                hold_seconds: None,
                 opacity: Vec::new(),
                 position: Vec::new(),
                 transform: vec![
@@ -4678,6 +4706,8 @@ mod tests {
                     fill_mode: "none".into(),
                     timing_function: "linear".into(),
                     running: true,
+                    start_seconds: 0.0,
+                    hold_seconds: None,
                     opacity: Vec::new(),
                     position: vec![
                         CssAnimationPoint {
@@ -4702,6 +4732,8 @@ mod tests {
                     fill_mode: "none".into(),
                     timing_function: "linear".into(),
                     running: true,
+                    start_seconds: 0.0,
+                    hold_seconds: None,
                     opacity: Vec::new(),
                     position: Vec::new(),
                     transform: vec![
@@ -4732,6 +4764,112 @@ mod tests {
     }
 
     #[test]
+    fn css_animations_start_when_they_become_ready_not_at_document_start() {
+        // Web Animations 1 #playing-an-animation-section and
+        // #document-timelines, CSS Animations 1 #animation-play-state (local
+        // CSSWG snapshot 81c27f686901): an animation created (or resumed) at
+        // timeline time t gets its start time at the sample when it becomes
+        // ready, so its current time is ~0 at its first frame, not t. Paint
+        // sampled by a frontend must agree with the page actor's clock.
+        // reflection.ai's hero intro starts its `both`-filled animations
+        // about 2.3 s in and was presented part-way through.
+        let html = "<style>@keyframes slide { from { transform:translateX(0) } to { transform:translateX(400px) } } \
+                    #box { width:10px; height:10px } \
+                    .go { animation:slide 4s linear } \
+                    .delayed { animation:slide 4s linear 1s both } \
+                    .early { animation:slide 4s linear -1s } \
+                    .held { animation:slide 4s linear paused }</style><div id=box>x</div>";
+        let base = url::Url::parse("http://e.com/").unwrap();
+        let scope_of = |dom: &crate::dom::Dom| {
+            let (forms, controls) = crate::http::extract_forms_arena(dom, &base, None);
+            let layout = crate::layout2::lay_out_graphical(
+                dom,
+                &base,
+                crate::layout2::Viewport::new(800.0, 600.0),
+                &forms,
+                &controls,
+                &crate::layout2::ImageSizes::new(),
+            );
+            let scope = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    Primitive::BeginCssAnimation(scope) => Some(scope.clone()),
+                    _ => None,
+                })
+                .expect("the animated box has a paint scope");
+            (scope, layout.paint.timeline_origin_ms)
+        };
+        let x = |scope: &CssAnimationScope, timeline: f32| {
+            sample_css_animation_scope(scope, timeline)
+                .map_point(CssPoint::default())
+                .x
+        };
+        let close = |actual: f32, expected: f32| {
+            assert!((actual - expected).abs() < 0.01, "{actual} != {expected}");
+        };
+        let mut dom = crate::dom::Dom::parse_document(html);
+        let node = dom.get_by_id("box").unwrap();
+        dom.set_document_timeline_origin(12_345.0);
+        dom.update_css_animations(0.0);
+
+        // Added two seconds into the document: current time 0 at its first
+        // sample, a quarter of the way one second later.
+        dom.set_attr(node, "class", "go");
+        dom.update_css_animations(2.0);
+        let (scope, origin) = scope_of(&dom);
+        assert_eq!(origin, Some(12_345.0), "paint carries the actor's timeline");
+        assert_eq!(scope.animations[0].start_seconds, 2.0);
+        close(x(&scope, 2.0), 0.0);
+        close(x(&scope, 3.0), 100.0);
+        assert_eq!(dom.css_animation_clock(node, "slide", 0), Some((2.0, None)));
+
+        // CSS Animations 1 #animations: changed animation properties of the
+        // same-named animation apply as if specified from its start, keeping
+        // its start time; removing it and adding a new one starts afresh.
+        dom.set_attr(node, "class", "go delayed");
+        dom.update_css_animations(4.0);
+        assert_eq!(dom.css_animation_clock(node, "slide", 0), Some((2.0, None)));
+        dom.set_attr(node, "class", "");
+        dom.update_css_animations(4.5);
+        assert_eq!(dom.css_animation_clock(node, "slide", 0), None);
+
+        // A positive delay starts the active interval after the start time;
+        // `backwards` fill holds the first keyframe until then.
+        dom.set_attr(node, "class", "delayed");
+        dom.update_css_animations(5.0);
+        let (scope, _) = scope_of(&dom);
+        close(x(&scope, 5.5), 0.0);
+        close(x(&scope, 6.0), 0.0);
+        close(x(&scope, 8.0), 200.0);
+        assert_eq!(PagePaint::default().css_animation_wake(0.0), None);
+
+        // A negative delay starts part-way into the first iteration.
+        dom.set_attr(node, "class", "");
+        dom.update_css_animations(9.0);
+        dom.set_attr(node, "class", "early");
+        dom.update_css_animations(10.0);
+        let (scope, _) = scope_of(&dom);
+        close(x(&scope, 10.0), 100.0);
+
+        // A paused animation holds its current time; resuming resolves a new
+        // start time so that it continues from the held time.
+        dom.set_attr(node, "class", "");
+        dom.update_css_animations(19.0);
+        dom.set_attr(node, "class", "held");
+        dom.update_css_animations(20.0);
+        let (scope, _) = scope_of(&dom);
+        assert_eq!(scope.animations[0].hold_seconds, Some(0.0));
+        close(x(&scope, 25.0), 0.0);
+        dom.set_attr(node, "style", "animation-play-state:running");
+        dom.update_css_animations(30.0);
+        let (scope, _) = scope_of(&dom);
+        assert_eq!(scope.animations[0].hold_seconds, None);
+        close(x(&scope, 31.0), 100.0);
+    }
+
+    #[test]
     fn css_animation_wake_follows_the_effect_phases() {
         // Web Animations 1 #animation-effect-phases-and-states: only the
         // active phase changes each frame; a before phase ends at the
@@ -4748,6 +4886,8 @@ mod tests {
                 fill_mode: fill.into(),
                 timing_function: "ease".into(),
                 running,
+                start_seconds: 0.0,
+                hold_seconds: None,
                 opacity: vec![
                     CssAnimationPoint {
                         offset: 0.0,

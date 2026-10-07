@@ -442,7 +442,13 @@ pub(super) struct State {
     /// style changes cannot start an animation.
     keyframes: Cell<bool>,
     stamp: Option<(u64, u64, u64)>,
+    /// The document timeline's current time (seconds) at the last sample.
     now: f64,
+    /// Web Animations 1 #document-timelines: where the timeline's zero lies
+    /// on the process-wide `performance::now_ms` clock (the time origin), so
+    /// that frontends compositing paint-sampled animations read the same
+    /// timeline as this actor.
+    origin_ms: Option<f64>,
     events: Vec<PendingEvent>,
     /// The element whose underlying (non-animated) values are being read.
     excluded: Cell<Option<NodeId>>,
@@ -1073,6 +1079,41 @@ impl Dom {
             return false;
         }
         boxes.all(|(bx, by, bw, bh)| bx + bw < left || bx > right || by + bh < top || by > bottom)
+    }
+
+    /// Web Animations 1 #document-timelines: the time origin of this
+    /// document's default timeline on the `performance::now_ms` clock.
+    pub(crate) fn set_document_timeline_origin(&mut self, origin_ms: f64) {
+        if origin_ms.is_finite() {
+            self.animations.origin_ms = Some(origin_ms);
+        }
+    }
+
+    /// The default document timeline's origin, once a page actor drives it.
+    pub(crate) fn document_timeline_origin(&self) -> Option<f64> {
+        self.animations.origin_ms
+    }
+
+    /// The start time and held current time (document timeline seconds) of
+    /// `id`'s `occurrence`-th animation named `name`, as last sampled. Web
+    /// Animations 1 #playing-an-animation-section: a new or resumed
+    /// animation's start time is the ready time minus its hold time, which
+    /// this actor resolves at the sample after its style was computed; a
+    /// paused animation holds its current time instead.
+    pub(crate) fn css_animation_clock(
+        &self,
+        id: NodeId,
+        name: &str,
+        occurrence: usize,
+    ) -> Option<(f64, Option<f64>)> {
+        self.animations
+            .elements
+            .get(&id)?
+            .animations
+            .iter()
+            .filter(|animation| animation.name == name)
+            .nth(occurrence)
+            .map(|animation| (animation.start, animation.hold))
     }
 
     /// The next timeline time (seconds) at which a running animation changes
