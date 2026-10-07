@@ -1269,6 +1269,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         internalsFor(element).trustPrefix = prefix === undefined ? null : prefix;
         return element;
     }
+    // DOM #dom-element-tagname: the element's HTML-uppercased qualified
+    // name. Both strings are cached in its slots; whether the uppercase one
+    // applies is asked of the host on each read, since adoption can move
+    // the element between HTML and XML documents without renaming it.
+    function elementTagName(element) {
+        const id = elementIdentity(element);
+        if (id === undefined) throw new TypeError("Illegal invocation");
+        const slots = internalsFor(element);
+        let qualifiedName = slots.trustQN;
+        if (qualifiedName === undefined) {
+            if (slots.trustLN === undefined) cacheElementName(element);
+            qualifiedName = slots.trustPrefix === null
+                ? slots.trustLN
+                : slots.trustPrefix + ":" + slots.trustLN;
+            slots.trustQN = qualifiedName;
+        }
+        if (!__dom_html_uppercased(id)) return qualifiedName;
+        // DOM #element-html-uppercased-qualified-name: ASCII uppercase.
+        let upper = slots.trustQNUpper;
+        if (upper === undefined) {
+            upper = /[^\0-\x7f]/.test(qualifiedName)
+                ? qualifiedName.replace(/[a-z]+/g, letters => letters.toUpperCase())
+                : qualifiedName.toUpperCase();
+            slots.trustQNUpper = upper;
+        }
+        return upper;
+    }
     function cacheElementName(element) {
         const parts = __dom_element_name(nodeIds.get(element)) || ["", null, null];
         return seedElementName(element, parts[0], parts[1], parts[2]);
@@ -7067,29 +7094,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (slots.trustPrefix === undefined) cacheElementName(this);
             return slots.trustPrefix;
         }
-        get tagName() {
-            const slots = internalsFor(this);
-            let qualifiedName = slots.trustQN;
-            if (qualifiedName === undefined) {
-                qualifiedName = this.prefix === null
-                    ? this.localName
-                    : this.prefix + ":" + this.localName;
-                slots.trustQN = qualifiedName;
-            }
-            // Adoption can change HTMLness without changing the expanded name.
-            if (this.namespaceURI !== HTML_NS || this.ownerDocument.contentType !== "text/html")
-                return qualifiedName;
-            // DOM #element-html-uppercased-qualified-name: ASCII uppercase.
-            let upper = slots.trustQNUpper;
-            if (upper === undefined) {
-                upper = /[^\0-\x7f]/.test(qualifiedName)
-                    ? qualifiedName.replace(/[a-z]+/g, letters => letters.toUpperCase())
-                    : qualifiedName.toUpperCase();
-                slots.trustQNUpper = upper;
-            }
-            return upper;
-        }
-        get nodeName() { requireNodeReceiver(this); return this.tagName; }
+        get tagName() { return elementTagName(this); }
+        get nodeName() { return elementTagName(this); }
         // DOM Slottable.assignedSlot: finding a slot with the `open` flag
         // hides slots whose root is closed, while event dispatch uses the
         // unfiltered internal relation above.
