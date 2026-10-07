@@ -535,6 +535,16 @@ fn value_type(name: &str) -> Option<wasmi::ValType> {
     }
 }
 
+/// Returns `true` for the value types whose values never cross the JavaScript boundary.
+///
+/// WebAssembly JS API (local snapshot of the spec repository 37d6b059), "call an Exported
+/// Function" step 4, "run a host function" step 2, `GetGlobalValue`, the `value` setter of
+/// `Global` and `Table.get`/`Table.set`: signatures, globals and tables of type `v128` or
+/// `exnref` throw a `TypeError` instead.
+fn is_js_opaque(ty: wasmi::ValType) -> bool {
+    matches!(ty, wasmi::ValType::V128 | wasmi::ValType::ExnRef)
+}
+
 fn to_i32(number: f64) -> i32 {
     if number == 0.0 || !number.is_finite() {
         return 0;
@@ -651,6 +661,7 @@ fn build_ref<C: wasmi::AsContextMut<Data = StoreData>>(
 ) -> Result<wasmi::Val, ()> {
     match value {
         RefArg::Null(wasmi::ValType::FuncRef) => Ok(wasmi::Val::FuncRef(wasmi::Nullable::Null)),
+        RefArg::Null(wasmi::ValType::ExnRef) => Ok(wasmi::Val::ExnRef(wasmi::Nullable::Null)),
         RefArg::Null(_) => Ok(wasmi::Val::ExternRef(wasmi::Nullable::Null)),
         RefArg::Func(index) => funcs
             .get(index)
@@ -679,6 +690,7 @@ fn table_ref(value: wasmi::Val) -> wasmi::Ref {
     match value {
         wasmi::Val::ExternRef(reference) => wasmi::Ref::Extern(reference),
         wasmi::Val::FuncRef(function) => wasmi::Ref::Func(function),
+        wasmi::Val::ExnRef(reference) => wasmi::Ref::Exn(reference),
         // `prepare_ref`/`build_ref` only produce reference values.
         _ => wasmi::Ref::Func(wasmi::Nullable::Null),
     }
@@ -687,6 +699,7 @@ fn table_ref(value: wasmi::Val) -> wasmi::Ref {
 fn table_ref_type(element: wasmi::ValType) -> wasmi::RefType {
     match element {
         wasmi::ValType::ExternRef => wasmi::RefType::Extern,
+        wasmi::ValType::ExnRef => wasmi::RefType::Exn,
         _ => wasmi::RefType::Func,
     }
 }
@@ -1129,6 +1142,12 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
     index: u32,
 ) -> wasmi::Func {
     let result_types = ty.results().to_vec();
+    let opaque = ty
+        .params()
+        .iter()
+        .chain(ty.results())
+        .copied()
+        .any(is_js_opaque);
     wasmi::Func::new(context, ty, move |mut caller, params, output| {
         let context_pointer = ACTIVE_CTX.with(Cell::get);
         if context_pointer.is_null() {
@@ -1139,6 +1158,15 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
         // SAFETY: ContextGuard leaves the initiating `&mut Ctx` dormant while wasmi runs. This
         // callback is synchronous and executes on the same agent thread.
         let ctx = unsafe { &mut *context_pointer };
+        if opaque {
+            // "run a host function" step 2 throws before the JavaScript function runs.
+            let error = type_error(
+                ctx,
+                "WebAssembly: cannot call a host function whose signature contains v128 or exnref",
+            );
+            PENDING_THROW.with(|slot| *slot.borrow_mut() = Some(error));
+            return Err(wasm_trap());
+        }
         let _caller_guard = CallerGuard::set(&mut caller);
         sync_active_buffers_to_js(ctx);
         let mut arguments = Vec::with_capacity(params.len());
@@ -1940,14 +1968,10 @@ pub(super) fn host_call_export(
             results
         ));
     }
-    if parameters
-        .iter()
-        .chain(&results)
-        .any(|ty| matches!(ty, wasmi::ValType::V128))
-    {
+    if parameters.iter().chain(&results).copied().any(is_js_opaque) {
         return Err(type_error(
             ctx,
-            "WebAssembly: cannot call a function whose signature contains v128",
+            "WebAssembly: cannot call a function whose signature contains v128 or exnref",
         ));
     }
 
@@ -2145,11 +2169,37 @@ pub(super) fn host_global_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     Ok(Value::Num(id as f64))
 }
 
+/// Returns the value type and mutability of the registered global `id`.
+fn global_info(page: &PageWasm, id: Option<usize>) -> Option<(wasmi::ValType, wasmi::Mutability)> {
+    match page.state.try_borrow() {
+        Ok(state) => state.as_ref().and_then(|state| {
+            id.and_then(|id| state.globals.get(id)).map(|global| {
+                let ty = global.ty(&state.store);
+                (ty.content(), ty.mutability())
+            })
+        }),
+        Err(_) => id.and_then(|id| {
+            let global = with_active_state(|state| state.globals.get(id).copied()).flatten()?;
+            with_active_caller(|caller| {
+                let ty = global.ty(&*caller);
+                (ty.content(), ty.mutability())
+            })
+        }),
+    }
+}
+
 pub(super) fn host_global_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Undefined);
     };
     let id = arg_id(args, 0);
+    if global_info(&page, id).is_some_and(|(ty, _)| is_js_opaque(ty)) {
+        // `GetGlobalValue` step 4.
+        return Err(type_error(
+            ctx,
+            "WebAssembly.Global: a v128 or exnref value cannot be read from JavaScript",
+        ));
+    }
     let token = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => state_slot.as_mut().and_then(|state| {
             id.and_then(|id| state.globals.get(id))
@@ -2181,24 +2231,16 @@ pub(super) fn host_global_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
         return Ok(Value::Undefined);
     };
     let id = arg_id(args, 0);
-    let info = match page.state.try_borrow() {
-        Ok(state) => state.as_ref().and_then(|state| {
-            id.and_then(|id| state.globals.get(id)).map(|global| {
-                let ty = global.ty(&state.store);
-                (ty.content(), ty.mutability())
-            })
-        }),
-        Err(_) => id.and_then(|id| {
-            let global = with_active_state(|state| state.globals.get(id).copied()).flatten()?;
-            with_active_caller(|caller| {
-                let ty = global.ty(&*caller);
-                (ty.content(), ty.mutability())
-            })
-        }),
-    };
-    let Some((ty, mutability)) = info else {
+    let Some((ty, mutability)) = global_info(&page, id) else {
         return Ok(Value::Undefined);
     };
+    if is_js_opaque(ty) {
+        // The `value` setter, step 4.
+        return Err(type_error(
+            ctx,
+            "WebAssembly.Global: a v128 or exnref value cannot be written from JavaScript",
+        ));
+    }
     if matches!(mutability, wasmi::Mutability::Const) {
         return Err(type_error(
             ctx,
@@ -2598,6 +2640,14 @@ pub(super) fn host_table_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     let Some(page) = page_wasm(ctx) else {
         return Ok(Value::Null);
     };
+    let id = arg_id(args, 0);
+    if table_info(&page, id) == Some(wasmi::ValType::ExnRef) {
+        // `Table.get` step 4, before the index is converted.
+        return Err(type_error(
+            ctx,
+            "WebAssembly.Table.get: exnref elements cannot be read from JavaScript",
+        ));
+    }
     let index = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0);
     if index < 0.0 || !index.is_finite() || index.fract() != 0.0 {
         return Err(range_error(
@@ -2605,7 +2655,6 @@ pub(super) fn host_table_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
             "WebAssembly.Table.get: index is out of bounds",
         ));
     }
-    let id = arg_id(args, 0);
     let token = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => {
             let Some(state) = state_slot.as_mut() else {
@@ -2657,6 +2706,16 @@ pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         return Ok(Value::Undefined);
     };
     let id = arg_id(args, 0);
+    let Some(element) = table_info(&page, id) else {
+        return Err(range_error(ctx, "WebAssembly.Table.set: unknown table"));
+    };
+    if element == wasmi::ValType::ExnRef {
+        // `Table.set` step 4, before the index is converted.
+        return Err(type_error(
+            ctx,
+            "WebAssembly.Table.set: exnref elements cannot be written from JavaScript",
+        ));
+    }
     let index = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0);
     if index < 0.0 || !index.is_finite() || index.fract() != 0.0 {
         return Err(range_error(
@@ -2664,9 +2723,6 @@ pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
             "WebAssembly.Table.set: index is out of bounds",
         ));
     }
-    let Some(element) = table_info(&page, id) else {
-        return Err(range_error(ctx, "WebAssembly.Table.set: unknown table"));
-    };
     let prepared = prepare_ref(ctx, args.get(2).unwrap_or(&Value::Undefined), element)?;
     let result: Option<Result<(), String>> = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => {

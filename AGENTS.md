@@ -341,6 +341,14 @@ current behavior and limits; consult the governing standards before changing it.
   `AudioBuffer`. Keep its output deterministic; the compressor probe test pins
   it. `ScriptProcessorNode` renders silence offline without `audioprocess`;
   decoding, worklets, other node types, and playback are unimplemented.
+- WebAssembly exception handling runs both the legacy (`try`/`catch`/
+  `rethrow`/`delegate`) and the standardized (`try_table`, `throw_ref`,
+  `exnref`) instructions in the Wasmi fork; exceptions caught by reference
+  live in a collected per-store arena. exnref never crosses into JavaScript
+  (TypeError). Tag imports/exports, `WebAssembly.Tag`, `WebAssembly.Exception`
+  and `JSTag` are unimplemented: an uncaught Wasm exception reaches JavaScript
+  as a `LinkError` instead of an `Exception`, and JavaScript exceptions thrown
+  into Wasm trap instead of being catchable.
 - Import maps cover static/dynamic imports, scopes, blocked specifiers, and
   integrity metadata. Navigation parses nested declarative Shadow DOM and
   shadow-scoped styles; ordinary `innerHTML` and `DOMParser` keep declarations

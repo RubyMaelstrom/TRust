@@ -25569,6 +25569,65 @@ mod tests {
         assert_eq!(string_value(&mut engine, "exceptionResult"), "42|true");
     }
 
+    #[test]
+    fn webassembly_standard_exceptions_keep_exnref_out_of_javascript() {
+        // WebAssembly Core 3.0 `try_table`/`throw_ref` run inside Wasm, while the JS API keeps
+        // exnref values out of JavaScript: exported functions, host functions, globals and
+        // tables of that type throw a TypeError ("call an Exported Function" step 4, "run a
+        // host function" step 2, GetGlobalValue, Table.get/set), and Table.grow defaults to
+        // null.
+        let mut engine = platform_engine();
+        install_wasm_test_fixture(
+            &mut engine,
+            r#"
+            (module
+              (import "env" "takes" (func $takes (param exnref)))
+              (tag $tag (param i32))
+              (global (export "g") (mut exnref) (ref.null exn))
+              (table (export "t") 1 exnref)
+              (func (export "caught") (param i32) (result i32)
+                (block $h (result i32)
+                  (try_table (catch $tag $h)
+                    (throw_ref (block $r (result exnref)
+                      (try_table (catch_all_ref $r) (throw $tag (local.get 0)))
+                      (unreachable))))
+                  (unreachable)))
+              (func (export "returns") (result exnref) (ref.null exn))
+              (func (export "calls_import") (call $takes (ref.null exn))))
+            "#,
+        );
+        eval(
+            &mut engine,
+            r#"
+            let called = false;
+            const instance = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture),
+                { env: { takes() { called = true; } } });
+            const typeError = (f) => {
+                try { f(); return false; } catch (error) { return error instanceof TypeError; }
+            };
+            const exports = instance.exports;
+            globalThis.exnrefResult = [
+                exports.caught(5),
+                typeError(() => exports.returns()),
+                typeError(() => exports.g.value),
+                typeError(() => { exports.g.value = null; }),
+                typeError(() => exports.t.get(0)),
+                typeError(() => exports.t.set(0, null)),
+                exports.t.grow(1),
+                exports.t.length,
+                typeError(() => exports.calls_import()),
+                called
+            ].join('|');
+            "#,
+            "WebAssembly exnref boundary",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "exnrefResult"),
+            "5|true|true|true|true|true|1|2|true|false"
+        );
+    }
+
     fn install_wasm_test_fixture(engine: &mut lumen::Engine, source: &str) {
         let bytes = wat::parse_str(source).unwrap();
         let fixture = engine

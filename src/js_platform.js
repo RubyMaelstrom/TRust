@@ -26498,7 +26498,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (type === "i64") return 0n;
         if (type === "f32" || type === "f64" || type === "i32") return 0;
         if (type === "externref") return undefined;
-        if (type === "anyfunc") return null;
+        if (type === "anyfunc" || type === "exnref") return null;
         return undefined;
     }
 
@@ -26635,9 +26635,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return __wasm_table_length(wasmAddress(this, "wasmTable"));
         }
         get(index) {
+            // js-api Table.get step 4: exnref elements never reach JavaScript.
+            if (wasmAddress(this, "tableElement") === "exnref") {
+                throw new TypeError("WebAssembly.Table.get: exnref elements cannot be read");
+            }
             return __wasm_table_get(wasmAddress(this, "wasmTable"), addressU32(index));
         }
         set(index, value) {
+            if (wasmAddress(this, "tableElement") === "exnref") {
+                throw new TypeError("WebAssembly.Table.set: exnref elements cannot be written");
+            }
             if (arguments.length < 2) value = defaultWasmValue(wasmAddress(this, "tableElement"));
             return __wasm_table_set(wasmAddress(this, "wasmTable"), addressU32(index), value);
         }
