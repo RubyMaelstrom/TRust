@@ -5462,12 +5462,18 @@ impl Dom {
             };
             return Some(self.cssom_color(id, name, color));
         }
-        // Absolute box-edge lengths need no geometry flush. In particular,
-        // JS measuring a text area's line count must receive `16px`, not
-        // `calc(.25rem * 4)`. Percentage/auto edges still need used geometry;
-        // do not guess their containing-block basis from the element width.
-        // CSS Flexbox 1 #flex-basis-property likewise computes lengths to
-        // absolute ones (`flex: 1 1 0` reads back as `1 1 0px`).
+        // Computed lengths are absolute and need no geometry flush. In
+        // particular, JS measuring a text area's line count must receive
+        // `16px`, not `calc(.25rem * 4)`. CSS Flexbox 1 #flex-basis-property
+        // likewise computes lengths to absolute ones (`flex: 1 1 0` reads
+        // back as `1 1 0px`).
+        if let Some(computed) = value
+            .as_deref()
+            .and_then(|value| self.cssom_length_percentage(id, None, name, value))
+        {
+            return Some(computed);
+        }
+        // Legacy unitless lengths, which the typed grammar above rejects.
         if matches!(
             name,
             "padding-top"
@@ -5486,6 +5492,53 @@ impl Dom {
             return Some(cssom::css_px(px));
         }
         value
+    }
+
+    /// The computed value of a standard `<length-percentage>` property
+    /// (`length_percentage_minimum`) whose value is not a keyword, as CSSOM
+    /// #serialize-a-css-value writes it. CSS Values 4 #calc-computed-value
+    /// simplifies a math function with the computed-value-time metrics:
+    /// without a percentage it is one length, clamped to the property's
+    /// range (#calc-range) and to the largest length layout represents
+    /// (#calc-ieee: infinities clamp instead of escaping the calculation);
+    /// with one, it serializes as its sorted calculation (#calc-serialize,
+    /// `calc(10% + 1px)`). `fit-content(<length-percentage>)` (CSS Sizing 4
+    /// #sizing-values) computes its argument.
+    fn cssom_length_percentage(
+        &self,
+        id: NodeId,
+        pseudo: Option<PseudoEl>,
+        name: &str,
+        value: &str,
+    ) -> Option<String> {
+        let minimum = length_percentage_minimum(name)?;
+        let value = value.trim();
+        if minimum == 0.0
+            && let Some(argument) = value
+                .get(..12)
+                .filter(|head| head.eq_ignore_ascii_case("fit-content("))
+                .and_then(|_| value[12..].strip_suffix(')'))
+        {
+            let argument = self.cssom_length_percentage(id, pseudo, name, argument)?;
+            return Some(format!("fit-content({argument})"));
+        }
+        let computed =
+            properties::computed_length_percentage(&ComputeView(self), id, pseudo, value, minimum)?;
+        let single = computed
+            .strip_suffix("px")
+            .map(|number| (number, "px"))
+            .or_else(|| computed.strip_suffix('%').map(|number| (number, "%")))
+            .and_then(|(number, unit)| Some((number.parse::<f64>().ok()?, unit)));
+        let Some((number, unit)) = single else {
+            return Some(computed);
+        };
+        let limit = f64::from(crate::layout2::value::LENGTH_LIMIT);
+        let number = if crate::layout2::value::is_math_function(value) {
+            number.clamp(-limit, limit)
+        } else {
+            number
+        };
+        Some(format!("{}{unit}", cssom::css_number(number)))
     }
 
     /// A corner's computed radius pair: each component an absolute length
@@ -5585,6 +5638,12 @@ impl Dom {
                 };
             }
             return Some(self.cssom_color(id, name, color));
+        }
+        if let Some(computed) = value
+            .as_deref()
+            .and_then(|value| self.cssom_length_percentage(id, Some(which), name, value))
+        {
+            return Some(computed);
         }
         value
     }
@@ -19496,6 +19555,59 @@ fn split_supports_kw(cond: &str, keyword: &str) -> Vec<String> {
     }
     parts.push(cond[start..].trim().to_string());
     parts
+}
+
+/// The lower bound of the `<length-percentage>` (or `<length>`) range in
+/// the value grammar of a standard property whose computed value is that
+/// length-percentage beside keywords: CSS Position 3 #insets, CSS Box 4
+/// #margins and #paddings, CSS Sizing 3 #sizing-properties, CSS Flexbox 1
+/// #flex-basis-property, CSS Gaps 1 #column-row-gap, CSS Scroll Snap 1
+/// #scroll-padding and #scroll-margin, CSS UI 4 #outline-offset, CSS Shapes 1
+/// #shape-margin-property, CSS Transforms 2 #perspective-property, CSS
+/// Multicol 1 #cw and CSS Text 4 #letter-spacing-property,
+/// #word-spacing-property and #text-indent-property (whose `hanging` and
+/// `each-line` keywords keep the specified value). `None` for every other
+/// property.
+fn length_percentage_minimum(name: &str) -> Option<f64> {
+    match name {
+        "top"
+        | "right"
+        | "bottom"
+        | "left"
+        | "margin-top"
+        | "margin-right"
+        | "margin-bottom"
+        | "margin-left"
+        | "scroll-margin-top"
+        | "scroll-margin-right"
+        | "scroll-margin-bottom"
+        | "scroll-margin-left"
+        | "outline-offset"
+        | "letter-spacing"
+        | "word-spacing"
+        | "text-indent" => Some(f64::NEG_INFINITY),
+        "padding-top"
+        | "padding-right"
+        | "padding-bottom"
+        | "padding-left"
+        | "width"
+        | "height"
+        | "min-width"
+        | "min-height"
+        | "max-width"
+        | "max-height"
+        | "flex-basis"
+        | "column-gap"
+        | "row-gap"
+        | "scroll-padding-top"
+        | "scroll-padding-right"
+        | "scroll-padding-bottom"
+        | "scroll-padding-left"
+        | "shape-margin"
+        | "perspective"
+        | "column-width" => Some(0.0),
+        _ => None,
+    }
 }
 
 fn is_color_property(prop: &str) -> bool {
