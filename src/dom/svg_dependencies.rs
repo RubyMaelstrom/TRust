@@ -484,8 +484,7 @@ impl Dom {
 }
 
 fn css_may_reference_resource(value: &str) -> bool {
-    let mut input = cssparser::ParserInput::new(value);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value);
     while let Ok(token) = parser.next_including_whitespace_and_comments() {
         if matches!(
             token,
@@ -576,7 +575,7 @@ const RESOURCE_FREE_FUNCTIONS: &[&str] = &[
 /// through `<url>`; a color function cannot. Any other function, including an
 /// unresolved substitution function, remains a possible reference.
 fn resolved_css_may_reference_resource(value: &str) -> bool {
-    fn block(parser: &mut cssparser::Parser<'_, '_>) -> bool {
+    fn block(parser: &mut cssparser::Parser<'_>) -> bool {
         loop {
             let resource_free = match parser.next_including_whitespace_and_comments() {
                 Err(_) => return false,
@@ -595,17 +594,14 @@ fn resolved_css_may_reference_resource(value: &str) -> bool {
             };
             if !resource_free
                 || parser
-                    .parse_nested_block(|nested| {
-                        Ok::<_, cssparser::ParseError<'_, ()>>(block(nested))
-                    })
+                    .parse_nested_block(|nested| Ok::<_, cssparser::ParseError<()>>(block(nested)))
                     .unwrap_or(true)
             {
                 return true;
             }
         }
     }
-    let mut input = cssparser::ParserInput::new(value);
-    block(&mut cssparser::Parser::new(&mut input))
+    block(&mut cssparser::Parser::new(value))
 }
 
 #[cfg(test)]

@@ -113,8 +113,7 @@ fn content(raw: &str) -> Option<Vec<Token>> {
             if let Some(text) = unquote_css(token) {
                 return Some(Token::Text(text));
             }
-            let mut input = cssparser::ParserInput::new(token);
-            let mut parser = cssparser::Parser::new(&mut input);
+            let mut parser = cssparser::Parser::new(token);
             if let Ok(url) = parser.expect_url().map(|s| s.to_string())
                 && parser.is_exhausted()
             {

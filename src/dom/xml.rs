@@ -48,6 +48,10 @@ impl Dom {
         let mut expanded = 0usize;
         for event in reader {
             let event = event.map_err(|error| error.to_string())?;
+            // The builder creates no DocumentType node; don't buffer the markup.
+            if matches!(event, XmlEvent::Doctype { .. }) {
+                continue;
+            }
             expanded += match &event {
                 XmlEvent::Characters(text)
                 | XmlEvent::Whitespace(text)
@@ -138,7 +142,9 @@ impl Dom {
                     self.append(parent, node);
                     Some(node)
                 }
-                XmlEvent::StartDocument { .. } | XmlEvent::EndDocument => None,
+                XmlEvent::StartDocument { .. }
+                | XmlEvent::EndDocument
+                | XmlEvent::Doctype { .. } => None,
             };
             if node.is_some() {
                 count += 1;

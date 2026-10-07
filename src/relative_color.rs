@@ -14,12 +14,12 @@
 //! for the same reason.
 
 use color::{ColorSpaceTag as Space, DynamicColor, Flags, HueDirection, Missing};
-use cssparser::{ParseError, Parser, ParserInput, Token};
+use cssparser::{ParseError, Parser, Token};
 
 /// Nested relative origins and math nesting are bounded like other values.
 const MAX_DEPTH: usize = 16;
 
-type Res<'i, T> = Result<T, ParseError<'i, ()>>;
+type Res<T> = Result<T, ParseError<()>>;
 
 /// The channel grammar of one relative color function.
 struct Form {
@@ -144,8 +144,7 @@ pub(crate) enum MathValue {
 /// of numbers, percentages or angles (any `var()` already substituted).
 /// `None` for anything else, or for a sum mixing those types.
 pub(crate) fn math_value(text: &str) -> Option<MathValue> {
-    let mut input = ParserInput::new(text.trim());
-    let mut p = Parser::new(&mut input);
+    let mut p = Parser::new(text.trim());
     let name = p.expect_function().ok()?.to_ascii_lowercase();
     let typed = p
         .parse_nested_block(|p| math_function(p, &name, &[], 0))
@@ -161,8 +160,7 @@ pub(crate) fn math_value(text: &str) -> Option<MathValue> {
 }
 
 fn resolve_at(text: &str, depth: usize) -> Option<Option<String>> {
-    let mut input = ParserInput::new(text.trim());
-    let mut p = Parser::new(&mut input);
+    let mut p = Parser::new(text.trim());
     let name = p.expect_function().ok()?.to_ascii_lowercase();
     if name == "color-mix" {
         if depth > MAX_DEPTH {
@@ -178,7 +176,7 @@ fn resolve_at(text: &str, depth: usize) -> Option<Option<String>> {
         .parse_nested_block(|p| {
             let relative = p.try_parse(|p| p.expect_ident_matching("from")).is_ok();
             while p.next().is_ok() {}
-            Ok::<_, ParseError<'_, ()>>(relative)
+            Ok::<_, ParseError<()>>(relative)
         })
         .unwrap_or(false);
     if !relative {
@@ -188,8 +186,7 @@ fn resolve_at(text: &str, depth: usize) -> Option<Option<String>> {
         return Some(None);
     }
     // Re-tokenize: the probe above consumed the block.
-    let mut input = ParserInput::new(text.trim());
-    let mut p = Parser::new(&mut input);
+    let mut p = Parser::new(text.trim());
     if p.expect_function().is_err() {
         return Some(None);
     }
@@ -199,13 +196,14 @@ fn resolve_at(text: &str, depth: usize) -> Option<Option<String>> {
     Some(resolved.filter(|_| p.is_exhausted()))
 }
 
-fn relative_body<'i>(p: &mut Parser<'i, '_>, name: &str, depth: usize) -> Res<'i, String> {
+fn relative_body<'i>(p: &mut Parser<'i>, name: &str, depth: usize) -> Res<String> {
     p.expect_ident_matching("from")?;
     let origin_text = component_text(p)?;
-    let origin = origin_color(&origin_text, depth).ok_or_else(|| p.new_custom_error(()))?;
+    let origin =
+        origin_color(&origin_text, depth).ok_or_else(|| cssparser::ParseError::custom(()))?;
     let (form, space_name) = if name == "color" {
         let space = p.expect_ident_cloned()?.to_ascii_lowercase();
-        let form = color_function_form(&space).ok_or_else(|| p.new_custom_error(()))?;
+        let form = color_function_form(&space).ok_or_else(|| cssparser::ParseError::custom(()))?;
         // "xyz" is an alias; serialize the canonical name.
         let canonical = if space == "xyz" {
             "xyz-d65".to_string()
@@ -215,7 +213,7 @@ fn relative_body<'i>(p: &mut Parser<'i, '_>, name: &str, depth: usize) -> Res<'i
         (form, Some(canonical))
     } else {
         (
-            function_form(name).ok_or_else(|| p.new_custom_error(()))?,
+            function_form(name).ok_or_else(|| cssparser::ParseError::custom(()))?,
             None,
         )
     };
@@ -260,7 +258,7 @@ fn relative_body<'i>(p: &mut Parser<'i, '_>, name: &str, depth: usize) -> Res<'i
         None => result_missing.insert(3),
     }
     if !p.is_exhausted() || !components.iter().all(|value| value.is_finite()) {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     // The result is then clamped like a parsed absolute color (CSS Color 4
     // #the-hsl-notation, #specifying-lab-lch, #specifying-oklab-oklch): hues
@@ -297,20 +295,20 @@ fn relative_body<'i>(p: &mut Parser<'i, '_>, name: &str, depth: usize) -> Res<'i
 /// `color-mix( <color-interpolation-method>? , [ <color> && <percentage [0,100]>? ]# )`,
 /// mixed as #color-mix-result calculates it and serialized in the form
 /// #serial-color-mix gives for the mixing color space.
-fn mix_body<'i>(p: &mut Parser<'i, '_>, depth: usize) -> Res<'i, String> {
+fn mix_body<'i>(p: &mut Parser<'i>, depth: usize) -> Res<String> {
     // #color-mix-space: Oklab unless a method is given; polar hues default
     // to the `shorter` interpolation method.
     let (space, hue) = p
         .try_parse(|p| {
             let method = interpolation_method(p)?;
             p.expect_comma()?;
-            Ok::<_, ParseError<'_, ()>>(method)
+            Ok::<_, ParseError<()>>(method)
         })
         .unwrap_or((Space::Oklab, HueDirection::Shorter));
     let items = p.parse_comma_separated(|p| {
         let mut percentage = p.try_parse(|p| mix_percentage(p, depth)).ok();
         let text = component_text(p)?;
-        let color = origin_color(&text, depth).ok_or_else(|| p.new_custom_error(()))?;
+        let color = origin_color(&text, depth).ok_or_else(|| cssparser::ParseError::custom(()))?;
         if percentage.is_none() {
             percentage = p.try_parse(|p| mix_percentage(p, depth)).ok();
         }
@@ -353,7 +351,7 @@ fn mix_body<'i>(p: &mut Parser<'i, '_>, depth: usize) -> Res<'i, String> {
     }
     mixed.components[3] *= (1. - leftover / 100.) as f32;
     if !mixed.components.iter().all(|value| value.is_finite()) {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(match space {
         // Without missing components an HSL or HWB mix serializes as sRGB.
@@ -372,7 +370,7 @@ fn mix_body<'i>(p: &mut Parser<'i, '_>, depth: usize) -> Res<'i, String> {
 
 /// CSS Color 4 #color-interpolation-method:
 /// `in [ <rectangular-color-space> | <polar-color-space> <hue-interpolation-method>? ]`.
-fn interpolation_method<'i>(p: &mut Parser<'i, '_>) -> Res<'i, (Space, HueDirection)> {
+fn interpolation_method<'i>(p: &mut Parser<'i>) -> Res<(Space, HueDirection)> {
     p.expect_ident_matching("in")?;
     let name = p.expect_ident_cloned()?.to_ascii_lowercase();
     let space = [
@@ -393,7 +391,7 @@ fn interpolation_method<'i>(p: &mut Parser<'i, '_>) -> Res<'i, (Space, HueDirect
     ]
     .into_iter()
     .find(|&space| space_name(space) == name || (name == "xyz" && space == Space::XyzD65))
-    .ok_or_else(|| p.new_custom_error(()))?;
+    .ok_or_else(|| cssparser::ParseError::custom(()))?;
     let mut hue = HueDirection::Shorter;
     if matches!(space, Space::Hsl | Space::Hwb | Space::Lch | Space::Oklch)
         && let Ok(direction) = p.try_parse(|p| {
@@ -402,10 +400,10 @@ fn interpolation_method<'i>(p: &mut Parser<'i, '_>) -> Res<'i, (Space, HueDirect
                 "longer" => HueDirection::Longer,
                 "increasing" => HueDirection::Increasing,
                 "decreasing" => HueDirection::Decreasing,
-                _ => return Err(p.new_custom_error(())),
+                _ => return Err(cssparser::ParseError::custom(())),
             };
             p.expect_ident_matching("hue")?;
-            Ok::<_, ParseError<'_, ()>>(direction)
+            Ok::<_, ParseError<()>>(direction)
         })
     {
         hue = direction;
@@ -415,14 +413,14 @@ fn interpolation_method<'i>(p: &mut Parser<'i, '_>) -> Res<'i, (Space, HueDirect
 
 /// A mix item's `<percentage [0,100]>`; a math function's result is clamped
 /// to the range (CSS Values 4 #calc-range), a literal outside it is invalid.
-fn mix_percentage<'i>(p: &mut Parser<'i, '_>, depth: usize) -> Res<'i, f64> {
+fn mix_percentage<'i>(p: &mut Parser<'i>, depth: usize) -> Res<f64> {
     match p.next()?.clone() {
         Token::Percentage { unit_value, .. } => {
             let value = f64::from(unit_value) * 100.;
             if (0. ..=100.).contains(&value) {
                 Ok(value)
             } else {
-                Err(p.new_custom_error(()))
+                Err(cssparser::ParseError::custom(()))
             }
         }
         Token::Function(ref name) => {
@@ -431,10 +429,10 @@ fn mix_percentage<'i>(p: &mut Parser<'i, '_>, depth: usize) -> Res<'i, f64> {
             if typed.unit == Unit::Percent && typed.value.is_finite() {
                 Ok(typed.value.clamp(0., 100.))
             } else {
-                Err(p.new_custom_error(()))
+                Err(cssparser::ParseError::custom(()))
             }
         }
-        _ => Err(p.new_custom_error(())),
+        _ => Err(cssparser::ParseError::custom(())),
     }
 }
 
@@ -499,12 +497,12 @@ fn origin_color(text: &str, depth: usize) -> Option<DynamicColor> {
 }
 
 /// The source text of the next component value (a token or whole function).
-fn component_text<'i>(p: &mut Parser<'i, '_>) -> Res<'i, String> {
+fn component_text<'i>(p: &mut Parser<'i>) -> Res<String> {
     let start = p.position();
     if matches!(p.next()?, Token::Function(_)) {
         p.parse_nested_block(|p| {
             while p.next().is_ok() {}
-            Ok::<_, ParseError<'_, ()>>(())
+            Ok::<_, ParseError<()>>(())
         })?;
     }
     Ok(p.slice_from(start).to_string())
@@ -535,11 +533,11 @@ struct Typed {
 /// One channel argument, resolved to the processing space's number, or
 /// `None` for `none` (directly, or a keyword naming a missing component).
 fn channel_value<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     keywords: &[(&str, Option<f64>)],
     channel: Channel,
     depth: usize,
-) -> Res<'i, Option<f64>> {
+) -> Res<Option<f64>> {
     let state = p.state();
     if let Ok(name) = p.expect_ident_cloned() {
         if name.eq_ignore_ascii_case("none") {
@@ -547,7 +545,7 @@ fn channel_value<'i>(
         }
         return match keyword(keywords, &name) {
             Some(value) => Ok(value),
-            None => Err(p.new_custom_error(())),
+            None => Err(cssparser::ParseError::custom(())),
         };
     }
     p.reset(&state);
@@ -563,7 +561,7 @@ fn channel_value<'i>(
             Unit::Percent,
         ) => typed.value / 100. * percent,
         (Channel::Alpha, Unit::Percent) => typed.value / 100.,
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     Ok(Some(value))
 }
@@ -577,13 +575,9 @@ fn keyword(keywords: &[(&str, Option<f64>)], name: &str) -> Option<Option<f64>> 
 
 /// A primary value: a literal, a component keyword (missing ⇒ 0, CSS Color 5
 /// #relative-syntax), a math constant, or a math function / parenthesized sum.
-fn term<'i>(
-    p: &mut Parser<'i, '_>,
-    keywords: &[(&str, Option<f64>)],
-    depth: usize,
-) -> Res<'i, Typed> {
+fn term<'i>(p: &mut Parser<'i>, keywords: &[(&str, Option<f64>)], depth: usize) -> Res<Typed> {
     if depth > MAX_DEPTH {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     let token = p.next()?.clone();
     let number = |value: f64| Typed {
@@ -605,7 +599,7 @@ fn term<'i>(
                 "rad" => value.to_degrees(),
                 "grad" => value * 0.9,
                 "turn" => value * 360.,
-                _ => return Err(p.new_custom_error(())),
+                _ => return Err(cssparser::ParseError::custom(())),
             };
             Typed {
                 value: degrees,
@@ -617,7 +611,7 @@ fn term<'i>(
             None => match name.to_ascii_lowercase().as_str() {
                 "e" => number(std::f64::consts::E),
                 "pi" => number(std::f64::consts::PI),
-                _ => return Err(p.new_custom_error(())),
+                _ => return Err(cssparser::ParseError::custom(())),
             },
         },
         Token::ParenthesisBlock => p.parse_nested_block(|p| sum(p, keywords, depth + 1))?,
@@ -625,23 +619,23 @@ fn term<'i>(
             let name = name.to_ascii_lowercase();
             p.parse_nested_block(|p| math_function(p, &name, keywords, depth + 1))?
         }
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     })
 }
 
 fn math_function<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     name: &str,
     keywords: &[(&str, Option<f64>)],
     depth: usize,
-) -> Res<'i, Typed> {
+) -> Res<Typed> {
     let result = match name {
         "calc" => sum(p, keywords, depth)?,
         "min" | "max" | "clamp" => {
             let args = p.parse_comma_separated(|p| sum(p, keywords, depth))?;
             let unit = args[0].unit;
             if args.iter().any(|arg| arg.unit != unit) || name == "clamp" && args.len() != 3 {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             let value = match name {
                 "min" => args
@@ -656,20 +650,16 @@ fn math_function<'i>(
             };
             Typed { value, unit }
         }
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     if !p.is_exhausted() {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     Ok(result)
 }
 
 /// `<calc-sum>`: products joined by `+`/`-`, which must share a type.
-fn sum<'i>(
-    p: &mut Parser<'i, '_>,
-    keywords: &[(&str, Option<f64>)],
-    depth: usize,
-) -> Res<'i, Typed> {
+fn sum<'i>(p: &mut Parser<'i>, keywords: &[(&str, Option<f64>)], depth: usize) -> Res<Typed> {
     let mut left = product(p, keywords, depth)?;
     loop {
         let state = p.state();
@@ -683,7 +673,7 @@ fn sum<'i>(
         };
         let right = product(p, keywords, depth)?;
         if right.unit != left.unit {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         left.value += sign * right.value;
     }
@@ -691,11 +681,7 @@ fn sum<'i>(
 
 /// `<calc-product>`: a product needs a plain number on one side, and a
 /// quotient a plain number divisor (CSS Values 4 type checking).
-fn product<'i>(
-    p: &mut Parser<'i, '_>,
-    keywords: &[(&str, Option<f64>)],
-    depth: usize,
-) -> Res<'i, Typed> {
+fn product<'i>(p: &mut Parser<'i>, keywords: &[(&str, Option<f64>)], depth: usize) -> Res<Typed> {
     let mut left = term(p, keywords, depth)?;
     loop {
         let state = p.state();
@@ -714,7 +700,7 @@ fn product<'i>(
                     value: left.value * right.value,
                     unit,
                 },
-                _ => return Err(p.new_custom_error(())),
+                _ => return Err(cssparser::ParseError::custom(())),
             }
         } else if right.unit == Unit::Number {
             Typed {
@@ -722,7 +708,7 @@ fn product<'i>(
                 unit: left.unit,
             }
         } else {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         };
     }
 }

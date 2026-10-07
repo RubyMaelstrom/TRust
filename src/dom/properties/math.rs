@@ -240,11 +240,11 @@ impl Numeric {
 }
 
 pub(super) fn parse<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     kind: &Kind,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     parse_range(p, kind, ctx, depth, f64::NEG_INFINITY, f64::INFINITY)
 }
 
@@ -253,13 +253,13 @@ pub(super) fn parse<'i>(
 /// #functional-numeric and #calc-ieee). Unresolved percentages keep their
 /// calculation until the consuming property supplies a used-value basis.
 pub(super) fn parse_range<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     kind: &Kind,
     ctx: &Context<'_>,
     depth: usize,
     mut minimum: f64,
     maximum: f64,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     let hint = match kind {
         Kind::LengthPercentage => Some(LENGTH),
         Kind::AnglePercentage => Some(ANGLE),
@@ -284,27 +284,26 @@ pub(super) fn parse_range<'i>(
         Kind::Time => TIME,
         Kind::Resolution => RESOLUTION,
         Kind::Number | Kind::Integer => NUMBER,
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     if matches!(kind, Kind::Length | Kind::LengthPercentage)
         && value.dim == NUMBER
         && matches!(value.node, Node::Value(0., ""))
     {
         // Unitless zero is a length only as a literal, not calc(0).
-        let mut probe = ParserInput::new(p.slice_from(state.position()));
         if matches!(
-            Parser::new(&mut probe).next(),
+            Parser::new(p.slice_from(state.position())).next(),
             Ok(Token::Number { value: 0., .. })
         ) {
             value = Numeric::literal(0., LENGTH, "px");
         }
     }
     if value.dim != expected {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     if *kind == Kind::Integer {
         if !literal_integer && !calculation {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         if let Node::Value(n, u) = value.node {
             value.node = Node::Value((n + 0.5).floor(), u);
@@ -318,7 +317,7 @@ pub(super) fn parse_range<'i>(
             *n = 0.;
         }
         if !calculation && (*n < minimum || *n > maximum) {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         *n = n.clamp(minimum, maximum);
         let supported = f64::from(f32::MAX);
@@ -333,14 +332,14 @@ pub(super) fn parse_range<'i>(
 }
 
 fn value<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     ctx: &Context<'_>,
     hint: Option<Dim>,
     depth: usize,
     group: bool,
-) -> ParseResult<'i, Numeric> {
+) -> ParseResult<Numeric> {
     if depth > MAX_DEPTH {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     let value = match p.next()?.clone() {
         Token::Number { value, .. } => Numeric::literal(value.into(), NUMBER, ""),
@@ -365,7 +364,8 @@ fn value<'i>(
                 "khz" => (1000., [0, 0, 0, 1, 0, 0, 0], "Hz"),
                 "fr" => (1., [0, 0, 0, 0, 0, 1, 0], "fr"),
                 _ => (
-                    values::length_scale(&raw, ctx).ok_or_else(|| p.new_custom_error(()))?,
+                    values::length_scale(&raw, ctx)
+                        .ok_or_else(|| cssparser::ParseError::custom(()))?,
                     LENGTH,
                     "px",
                 ),
@@ -379,7 +379,7 @@ fn value<'i>(
                 "infinity" => f64::INFINITY,
                 "-infinity" => f64::NEG_INFINITY,
                 "nan" => f64::NAN,
-                _ => return Err(p.new_custom_error(())),
+                _ => return Err(cssparser::ParseError::custom(())),
             };
             Numeric::literal(n, NUMBER, "")
         }
@@ -389,17 +389,17 @@ fn value<'i>(
         Token::ParenthesisBlock if group => {
             p.parse_nested_block(|p| sum(p, ctx, hint, depth + 1))?
         }
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     Ok(value)
 }
 
 fn product<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     ctx: &Context<'_>,
     hint: Option<Dim>,
     depth: usize,
-) -> ParseResult<'i, Numeric> {
+) -> ParseResult<Numeric> {
     let mut result = value(p, ctx, hint, depth, true)?;
     let mut count = 0;
     loop {
@@ -414,22 +414,22 @@ fn product<'i>(
         };
         count += 1;
         if count > MAX_COMPONENTS {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         let rhs = value(p, ctx, hint, depth, true)?;
         result = result
             .product(rhs, divide, hint)
-            .ok_or_else(|| p.new_custom_error(()))?;
+            .ok_or_else(|| cssparser::ParseError::custom(()))?;
     }
     Ok(result)
 }
 
 fn sum<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     ctx: &Context<'_>,
     hint: Option<Dim>,
     depth: usize,
-) -> ParseResult<'i, Numeric> {
+) -> ParseResult<Numeric> {
     let mut result = product(p, ctx, hint, depth)?;
     let mut count = 0;
     loop {
@@ -447,27 +447,27 @@ fn sum<'i>(
             }
         };
         if !matches!(p.next_including_whitespace(), Ok(Token::WhiteSpace(_))) {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         count += 1;
         if count > MAX_COMPONENTS {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         let rhs = product(p, ctx, hint, depth)?;
         result = result
             .sum(rhs, subtract)
-            .ok_or_else(|| p.new_custom_error(()))?;
+            .ok_or_else(|| cssparser::ParseError::custom(()))?;
     }
     Ok(result)
 }
 
 fn function<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     name: &str,
     ctx: &Context<'_>,
     hint: Option<Dim>,
     depth: usize,
-) -> ParseResult<'i, Numeric> {
+) -> ParseResult<Numeric> {
     if name == "calc" {
         return sum(p, ctx, hint, depth);
     }
@@ -476,7 +476,7 @@ fn function<'i>(
         if let Ok(value) = p.try_parse(|p| {
             let value = p.expect_ident_cloned()?;
             p.expect_comma()?;
-            Ok::<_, cssparser::BasicParseError<'_>>(value)
+            Ok::<_, cssparser::BasicParseError>(value)
         }) {
             strategy = value.to_ascii_lowercase();
         }
@@ -484,7 +484,7 @@ fn function<'i>(
             strategy.as_str(),
             "nearest" | "up" | "down" | "to-zero" | "line-width"
         ) {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
     }
     let mut args = p.parse_comma_separated(|p| {
@@ -495,12 +495,12 @@ fn function<'i>(
         }
     })?;
     if args.is_empty() || args.len() > MAX_COMPONENTS {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     let none_bounds: Vec<_> = args.iter().map(Option::is_none).collect();
     if name == "clamp" {
         if args.len() != 3 || args[1].is_none() {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         let dim = args[1].as_ref().unwrap().dim;
         if args[0].is_none() {
@@ -513,13 +513,13 @@ fn function<'i>(
     let mut args: Vec<Numeric> = args
         .into_iter()
         .collect::<Option<_>>()
-        .ok_or_else(|| p.new_custom_error(()))?;
+        .ok_or_else(|| cssparser::ParseError::custom(()))?;
     let density = ctx
         .dom
         .map_or(1., |dom| f64::from(dom.device_pixel_ratio()).max(0.001));
     let line_width = name == "round" && strategy == "line-width";
     if line_width && args[0].dim != LENGTH {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     let snap_only = line_width && args.len() == 1;
     if snap_only {
@@ -543,7 +543,7 @@ fn function<'i>(
         "pow" if same && count == 2 && input_dim == NUMBER => NUMBER,
         "sqrt" | "exp" if count == 1 && input_dim == NUMBER => NUMBER,
         "log" if same && (count == 1 || count == 2) && input_dim == NUMBER => NUMBER,
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     let constants: Option<Vec<_>> = args.iter().map(|a| a.node.scalar().map(|v| v.0)).collect();
     if let Some(v) = constants

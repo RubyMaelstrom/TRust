@@ -6777,8 +6777,8 @@ fn conic_turns(token: &str) -> Option<f32> {
 /// `text` with each `<percentage>` token rewritten as the angle it is of a
 /// full turn (`25%` becomes `90deg`).
 fn percentages_as_degrees(text: &str) -> String {
-    use cssparser::{Parser, ParserInput, ToCss, Token};
-    fn rewrite<'i>(p: &mut Parser<'i, '_>, out: &mut String) {
+    use cssparser::{Parser, ToCss, Token};
+    fn rewrite<'i>(p: &mut Parser<'i>, out: &mut String) {
         while let Ok(token) = p.next_including_whitespace_and_comments() {
             match token.clone() {
                 Token::Percentage { unit_value, .. } => {
@@ -6788,7 +6788,7 @@ fn percentages_as_degrees(text: &str) -> String {
                     token.to_css(out).ok();
                     let _ = p.parse_nested_block(|p| {
                         rewrite(p, out);
-                        Ok::<_, cssparser::ParseError<'_, ()>>(())
+                        Ok::<_, cssparser::ParseError<()>>(())
                     });
                     out.push(')');
                 }
@@ -6798,9 +6798,8 @@ fn percentages_as_degrees(text: &str) -> String {
             }
         }
     }
-    let mut input = ParserInput::new(text);
     let mut out = String::new();
-    rewrite(&mut Parser::new(&mut input), &mut out);
+    rewrite(&mut Parser::new(text), &mut out);
     out
 }
 

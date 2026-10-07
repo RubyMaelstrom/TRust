@@ -16,11 +16,11 @@ pub(super) use resolution::State;
 pub(super) use resolution::{registry_bytes, substitute};
 
 use super::*;
-use cssparser::{Parser, ParserInput, Token};
+use cssparser::{Parser, Token};
 use std::sync::Arc;
 
 pub(super) type Registry = FxHashMap<String, Arc<Registration>>;
-pub(super) type ParseResult<'i, T> = Result<T, cssparser::ParseError<'i, ()>>;
+pub(super) type ParseResult<T> = Result<T, cssparser::ParseError<()>>;
 const MAX_DEPTH: usize = 64;
 const MAX_COMPONENTS: usize = 4096;
 
@@ -121,11 +121,11 @@ pub(in crate::dom) fn resolve_container_units<B: StyleBackend + ?Sized>(
         independent: false,
     };
     fn rewrite<'i>(
-        p: &mut Parser<'i, '_>,
+        p: &mut Parser<'i>,
         ctx: &Context<'_>,
         out: &mut String,
         changed: &mut bool,
-    ) -> ParseResult<'i, cssparser::SourcePosition> {
+    ) -> ParseResult<cssparser::SourcePosition> {
         let mut start = p.position();
         loop {
             let before = p.position();
@@ -160,8 +160,7 @@ pub(in crate::dom) fn resolve_container_units<B: StyleBackend + ?Sized>(
         out.push_str(p.slice_from(start));
         Ok(p.position())
     }
-    let mut input = ParserInput::new(value);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(value);
     let mut out = String::with_capacity(value.len());
     let mut changed = false;
     rewrite(&mut parser, &ctx, &mut out, &mut changed).ok()?;
@@ -205,8 +204,7 @@ fn system_color(text: &str) -> bool {
 }
 
 pub(super) fn ident(text: &str) -> Option<String> {
-    let mut input = ParserInput::new(text);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(text);
     let name = parser.expect_ident_cloned().ok()?.to_string();
     parser.expect_exhausted().ok()?;
     Some(name)
@@ -246,8 +244,7 @@ impl Syntax {
                 let end = rest.find('>')? + 1;
                 (Kind::data_type(&rest[..end])?, end)
             } else {
-                let mut input = ParserInput::new(rest);
-                let mut parser = Parser::new(&mut input);
+                let mut parser = Parser::new(rest);
                 // Syntax strings are code-point grammars: comments are not
                 // whitespace and must not silently disappear here.
                 let Token::Ident(name) = parser.next_including_whitespace_and_comments().ok()?
@@ -296,8 +293,7 @@ impl Syntax {
                 Some(text.to_owned())
             }
             Self::Alternatives(components) => components.iter().find_map(|component| {
-                let mut input = ParserInput::new(text);
-                let mut parser = Parser::new(&mut input);
+                let mut parser = Parser::new(text);
                 let mut parts = Vec::new();
                 loop {
                     if parts.len() >= MAX_COMPONENTS {
@@ -408,8 +404,7 @@ pub(super) fn transform_number(text: &str, angle: bool, percentage: bool) -> Opt
         return Some(0.);
     }
     let parse = |kind: Kind, suffix: &str| {
-        let mut input = ParserInput::new(text);
-        let mut parser = Parser::new(&mut input);
+        let mut parser = Parser::new(text);
         let computed = math::parse(&mut parser, &kind, &Context::validation(), 0).ok()?;
         parser.expect_exhausted().ok()?;
         computed
@@ -430,16 +425,16 @@ pub(super) fn transform_number(text: &str, angle: bool, percentage: bool) -> Opt
 /// Scan component values with the CSS Syntax tokenizer. Strings, escaped
 /// identifiers, URL tokens and nested blocks must not be searched as raw text.
 pub(super) fn valid_tokens(text: &str) -> bool {
-    fn scan<'i>(parser: &mut Parser<'i, '_>, depth: usize) -> ParseResult<'i, ()> {
+    fn scan<'i>(parser: &mut Parser<'i>, depth: usize) -> ParseResult<()> {
         if depth > MAX_DEPTH {
-            return Err(parser.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         while !parser.is_exhausted() {
             let token = parser.next()?.clone();
             if token.is_parse_error()
                 || depth == 0 && matches!(token, Token::Semicolon | Token::Delim('!'))
             {
-                return Err(parser.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             if matches!(
                 token,
@@ -453,11 +448,11 @@ pub(super) fn valid_tokens(text: &str) -> bool {
         }
         Ok(())
     }
-    scan(&mut Parser::new(&mut ParserInput::new(text)), 0).is_ok()
+    scan(&mut Parser::new(text), 0).is_ok()
 }
 
 fn has_substitution(text: &str) -> bool {
-    fn scan<'i>(p: &mut Parser<'i, '_>, depth: usize) -> ParseResult<'i, bool> {
+    fn scan<'i>(p: &mut Parser<'i>, depth: usize) -> ParseResult<bool> {
         if depth > MAX_DEPTH {
             return Ok(true);
         }
@@ -482,7 +477,7 @@ fn has_substitution(text: &str) -> bool {
         }
         Ok(found)
     }
-    scan(&mut Parser::new(&mut ParserInput::new(text)), 0).unwrap_or(true)
+    scan(&mut Parser::new(text), 0).unwrap_or(true)
 }
 
 pub(super) struct PropertyRule {
@@ -493,8 +488,7 @@ pub(super) struct PropertyRule {
 /// `after` starts immediately after the @ delimiter. Tokenization recognizes
 /// escaped/case-insensitive at-keywords and keeps strings in the prelude data.
 pub(super) fn consume_rule(after: &str) -> Option<(Option<PropertyRule>, &str)> {
-    let mut input = ParserInput::new(after);
-    let mut p = Parser::new(&mut input);
+    let mut p = Parser::new(after);
     if !p.expect_ident().ok()?.eq_ignore_ascii_case("property") {
         return None;
     }
@@ -516,15 +510,14 @@ pub(super) fn consume_rule(after: &str) -> Option<(Option<PropertyRule>, &str)> 
 
 impl PropertyRule {
     pub fn parse(prelude: &str, body: &str) -> Option<Self> {
-        let mut input = ParserInput::new(prelude);
-        let mut p = Parser::new(&mut input);
+        let mut p = Parser::new(prelude);
         let names = p
             .parse_comma_separated(|p| {
                 let name = p.expect_ident_cloned()?.to_string();
                 if name.starts_with("--") && name != "--" {
                     Ok(name)
                 } else {
-                    Err(p.new_custom_error::<_, ()>(()))
+                    Err(cssparser::ParseError::<()>::custom(()))
                 }
             })
             .ok()?;
@@ -546,8 +539,7 @@ impl PropertyRule {
             }
             match name.to_ascii_lowercase().as_str() {
                 "syntax" => {
-                    let mut input = ParserInput::new(value);
-                    let mut p = Parser::new(&mut input);
+                    let mut p = Parser::new(value);
                     if let Ok(value) = p.expect_string_cloned()
                         && p.expect_exhausted().is_ok()
                         && let Some(parsed) = Syntax::parse(&value)

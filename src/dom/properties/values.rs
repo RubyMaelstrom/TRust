@@ -4,13 +4,13 @@
 use super::*;
 
 pub(super) fn parse<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     kind: &Kind,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     if depth > MAX_DEPTH {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     match kind {
         Kind::Length
@@ -26,7 +26,7 @@ pub(super) fn parse<'i>(
         Kind::CustomIdent | Kind::Ident(_) => {
             let name = p.expect_ident_cloned()?.to_string();
             if !custom_ident(&name) || matches!(kind,Kind::Ident(expected) if expected != &name) {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             Ok(identifier_text(&name))
         }
@@ -38,7 +38,7 @@ pub(super) fn parse<'i>(
             let mut values = vec![parse_transform(p, ctx, depth)?];
             while !p.is_exhausted() {
                 if values.len() > MAX_COMPONENTS {
-                    return Err(p.new_custom_error(()));
+                    return Err(cssparser::ParseError::custom(()));
                 }
                 match p.try_parse(|p| parse_transform(p, ctx, depth)) {
                     Ok(value) => values.push(value),
@@ -234,7 +234,7 @@ fn text_style(
     }
 }
 
-fn parse_url<'i>(p: &mut Parser<'i, '_>, ctx: &Context<'_>) -> ParseResult<'i, String> {
+fn parse_url<'i>(p: &mut Parser<'i>, ctx: &Context<'_>) -> ParseResult<String> {
     let (name, url, modifiers) = match p.next()?.clone() {
         Token::UnquotedUrl(value) => ("url".to_string(), value.to_string(), String::new()),
         Token::Function(name)
@@ -249,7 +249,7 @@ fn parse_url<'i>(p: &mut Parser<'i, '_>, ctx: &Context<'_>) -> ParseResult<'i, S
                         Token::Function(_) => {
                             p.parse_nested_block(|p| p.expect_no_error_token().map_err(Into::into))?
                         }
-                        _ => return Err(p.new_custom_error(())),
+                        _ => return Err(cssparser::ParseError::custom(())),
                     }
                 }
                 Ok((
@@ -259,7 +259,7 @@ fn parse_url<'i>(p: &mut Parser<'i, '_>, ctx: &Context<'_>) -> ParseResult<'i, S
                 ))
             })?
         }
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     // CSS Values 4 #local-urls / #url-empty: preserve fragment-only URLs and
     // empty references, including their observable computed serialization.
@@ -282,12 +282,12 @@ fn parse_url<'i>(p: &mut Parser<'i, '_>, ctx: &Context<'_>) -> ParseResult<'i, S
 
 /// Consume exactly one component value, retaining its source for parsers that
 /// already implement the associated CSS type (notably the color library).
-fn component_text<'i>(p: &mut Parser<'i, '_>) -> ParseResult<'i, String> {
+fn component_text<'i>(p: &mut Parser<'i>) -> ParseResult<String> {
     p.skip_whitespace();
     let start = p.position();
     let token = p.next()?.clone();
     if token.is_parse_error() {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     if matches!(
         token,
@@ -421,8 +421,7 @@ fn modern_color(color: color::DynamicColor) -> Option<String> {
 /// The color conversion library intentionally accepts some non-CSS legacy
 /// mixtures. Enforce CSS Color 4's comma-form grammar at TRust's boundary.
 fn valid_legacy_color(text: &str) -> bool {
-    let mut input = ParserInput::new(text);
-    let mut p = Parser::new(&mut input);
+    let mut p = Parser::new(text);
     let Ok(name) = p.expect_function().map(|name| name.to_ascii_lowercase()) else {
         return true;
     };
@@ -467,7 +466,7 @@ fn valid_legacy_color(text: &str) -> bool {
                 matches(Kind::Percentage, text)
             }
         });
-        Ok::<_, cssparser::ParseError<'_, ()>>(
+        Ok::<_, cssparser::ParseError<()>>(
             channels
                 && parts.get(3).is_none_or(|alpha| {
                     matches(Kind::Number, alpha) || matches(Kind::Percentage, alpha)
@@ -478,39 +477,34 @@ fn valid_legacy_color(text: &str) -> bool {
 }
 
 pub(super) fn parse_color<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     let text = component_text(p)?;
     if let Some(color) = computed_color(&text) {
         return Ok(color);
     }
     // Color channels can themselves be math functions. Normalize each typed
     // numeric sub-expression without quantizing to a paint surface.
-    let mut input = ParserInput::new(&text);
-    let mut nested = Parser::new(&mut input);
+    let mut nested = Parser::new(&text);
     let name = nested
         .expect_function()
-        .map_err(|_| p.new_custom_error(()))?
+        .map_err(|_| cssparser::ParseError::custom(()))?
         .to_ascii_lowercase();
     if !matches!(
         name.as_str(),
         "rgb" | "rgba" | "hsl" | "hsla" | "hwb" | "lab" | "lch" | "oklab" | "oklch" | "color"
     ) {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     let computed = nested
         .parse_nested_block(|p| compute_components(p, ctx, depth + 1))
-        .map_err(|_| p.new_custom_error(()))?;
-    computed_color(&format!("{name}({computed})")).ok_or_else(|| p.new_custom_error(()))
+        .map_err(|_| cssparser::ParseError::custom(()))?;
+    computed_color(&format!("{name}({computed})")).ok_or_else(|| cssparser::ParseError::custom(()))
 }
 
-fn parse_transform<'i>(
-    p: &mut Parser<'i, '_>,
-    ctx: &Context<'_>,
-    depth: usize,
-) -> ParseResult<'i, String> {
+fn parse_transform<'i>(p: &mut Parser<'i>, ctx: &Context<'_>, depth: usize) -> ParseResult<String> {
     let name = p.expect_function()?.to_ascii_lowercase();
     let (types, min, max): (Vec<Kind>, usize, usize) = match name.as_str() {
         "matrix" => (vec![Kind::Number; 6], 6, 6),
@@ -535,13 +529,13 @@ fn parse_transform<'i>(
         "skew" => (vec![Kind::Angle; 2], 1, 2),
         "skewx" | "skewy" => (vec![Kind::Angle], 1, 1),
         "perspective" => (vec![Kind::Length], 1, 1),
-        _ => return Err(p.new_custom_error(())),
+        _ => return Err(cssparser::ParseError::custom(())),
     };
     let args = p.parse_nested_block(|p| {
         let mut args = Vec::new();
         loop {
             let Some(kind) = types.get(args.len()) else {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             };
             if name == "perspective" && p.try_parse(|p| p.expect_ident_matching("none")).is_ok() {
                 args.push("none".into());
@@ -560,7 +554,7 @@ fn parse_transform<'i>(
                         if n == 0. {
                             Ok(())
                         } else {
-                            Err(p.new_basic_unexpected_token_error(Token::Delim('?')))
+                            Err(cssparser::BasicParseError::unexpected_token())
                         }
                     })
                 })
@@ -574,7 +568,7 @@ fn parse_transform<'i>(
                     let number = value
                         .trim_end_matches('%')
                         .parse::<f64>()
-                        .map_err(|_| p.new_custom_error(()))?;
+                        .map_err(|_| cssparser::ParseError::custom(()))?;
                     args.push(math::number(number / 100.));
                 } else {
                     args.push(parse(p, kind, ctx, depth + 1)?);
@@ -588,7 +582,7 @@ fn parse_transform<'i>(
             p.expect_comma()?;
         }
         if args.len() < min || args.len() > max {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         Ok(args)
     })?;
@@ -609,22 +603,18 @@ fn parse_transform<'i>(
     Ok(format!("{name}({})", args.join(", ")))
 }
 
-fn parse_image<'i>(
-    p: &mut Parser<'i, '_>,
-    ctx: &Context<'_>,
-    depth: usize,
-) -> ParseResult<'i, String> {
+fn parse_image<'i>(p: &mut Parser<'i>, ctx: &Context<'_>, depth: usize) -> ParseResult<String> {
     image_value(p, ctx, depth, false)
 }
 
 fn image_value<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     ctx: &Context<'_>,
     depth: usize,
     in_set: bool,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     if depth > MAX_DEPTH {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     if let Ok(url) = p.try_parse(|p| parse_url(p, ctx)) {
         return Ok(url);
@@ -646,7 +636,7 @@ fn image_value<'i>(
         | "repeating-conic-gradient" => super::gradients::parse(p, &name, ctx, depth + 1),
         "image-set" => {
             if in_set {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             let options = p.parse_comma_separated(|p| {
                 let image = if let Ok(value) = p.try_parse(|p| p.expect_string_cloned()) {
@@ -667,14 +657,14 @@ fn image_value<'i>(
                         p.try_parse(|p| math::parse(p, &Kind::Resolution, ctx, depth + 1))
                     {
                         if resolution.replace(value).is_some() {
-                            return Err(p.new_custom_error(()));
+                            return Err(cssparser::ParseError::custom(()));
                         }
                     } else {
                         p.expect_function_matching("type")?;
                         let value =
                             p.parse_nested_block(|p| Ok(p.expect_string_cloned()?.to_string()))?;
                         if mime.replace(value).is_some() {
-                            return Err(p.new_custom_error(()));
+                            return Err(cssparser::ParseError::custom(()));
                         }
                     }
                 }
@@ -706,9 +696,9 @@ fn image_value<'i>(
                 let percentage = percentage
                     .map(|v| v.trim_end_matches('%').parse::<f64>())
                     .transpose()
-                    .map_err(|_| p.new_custom_error(()))?;
+                    .map_err(|_| cssparser::ParseError::custom(()))?;
                 if percentage.is_some_and(|v| !(0. ..=100.).contains(&v)) {
-                    return Err(p.new_custom_error(()));
+                    return Err(cssparser::ParseError::custom(()));
                 }
                 Ok((image, percentage))
             })?;
@@ -727,10 +717,10 @@ fn image_value<'i>(
         }
         "element" => match p.next()?.clone() {
             Token::IDHash(id) => Ok(format!("#{}", identifier_text(&id))),
-            _ => Err(p.new_custom_error(())),
+            _ => Err(cssparser::ParseError::custom(())),
         },
         "image" => parse_color(p, ctx, depth + 1),
-        _ => Err(p.new_custom_error(())),
+        _ => Err(cssparser::ParseError::custom(())),
     })?;
     Ok(format!("{name}({result})"))
 }
@@ -738,19 +728,19 @@ fn image_value<'i>(
 /// Compute numeric/color/URL components in image geometry and color functions.
 /// Function identity and separators are retained; nested values are tokenized.
 fn compute_components<'i>(
-    p: &mut Parser<'i, '_>,
+    p: &mut Parser<'i>,
     ctx: &Context<'_>,
     depth: usize,
-) -> ParseResult<'i, String> {
+) -> ParseResult<String> {
     if depth > MAX_DEPTH {
-        return Err(p.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     let mut out = String::new();
     let mut count = 0;
     while !p.is_exhausted() {
         count += 1;
         if count > MAX_COMPONENTS {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         if p.try_parse(|p| p.expect_comma()).is_ok() {
             out.push_str(", ");
@@ -787,7 +777,7 @@ fn compute_components<'i>(
                 Token::Ident(value) => identifier_text(&value),
                 Token::QuotedString(value) => string_text(&value),
                 Token::Delim('/') => "/".into(),
-                _ => return Err(p.new_custom_error(())),
+                _ => return Err(cssparser::ParseError::custom(())),
             }
         };
         if !out.is_empty() && !out.ends_with(' ') {

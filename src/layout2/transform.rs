@@ -205,8 +205,7 @@ fn rotate(radians: f32) -> Affine2d {
 
 /// Top-level component slices, retaining nested CSS math as one value.
 fn components(text: &str) -> Option<Vec<&str>> {
-    let mut input = cssparser::ParserInput::new(text);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(text);
     let mut parts = Vec::new();
     while !parser.is_exhausted() {
         parser.skip_whitespace();
@@ -266,8 +265,7 @@ fn individual_rotation(text: &str) -> Option<Affine2d> {
 }
 
 fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
-    let mut input = cssparser::ParserInput::new(text);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(text);
     let mut operations = Vec::new();
     while !parser.is_exhausted() {
         let name = parser.expect_function().ok()?.to_ascii_lowercase();
@@ -276,7 +274,7 @@ fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
                 p.parse_comma_separated(|p| {
                     let start = p.position();
                     while p.next().is_ok() {}
-                    Ok::<_, cssparser::ParseError<'_, ()>>(p.slice_from(start).trim())
+                    Ok::<_, cssparser::ParseError<()>>(p.slice_from(start).trim())
                 })
             })
             .ok()?;
@@ -356,8 +354,7 @@ pub(super) fn animation_steps(
     if none(text) {
         return Some(Vec::new());
     }
-    let mut input = cssparser::ParserInput::new(text);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(text);
     let x_length = |text: &str| length(text, units, viewport)?.resolve(Some(reference.width));
     let y_length = |text: &str| length(text, units, viewport)?.resolve(Some(reference.height));
     let mut steps = Vec::new();
@@ -368,7 +365,7 @@ pub(super) fn animation_steps(
                 p.parse_comma_separated(|p| {
                     let start = p.position();
                     while p.next().is_ok() {}
-                    Ok::<_, cssparser::ParseError<'_, ()>>(p.slice_from(start).trim())
+                    Ok::<_, cssparser::ParseError<()>>(p.slice_from(start).trim())
                 })
             })
             .ok()?;

@@ -553,18 +553,14 @@ impl Dom {
 
 /// Every var() edge, including nested and unused fallback arguments.
 fn variable_references(text: &str) -> Option<Vec<String>> {
-    fn scan<'i>(
-        p: &mut Parser<'i, '_>,
-        depth: usize,
-        refs: &mut Vec<String>,
-    ) -> ParseResult<'i, ()> {
+    fn scan<'i>(p: &mut Parser<'i>, depth: usize, refs: &mut Vec<String>) -> ParseResult<()> {
         if depth > MAX_DEPTH || refs.len() > MAX_COMPONENTS {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         while !p.is_exhausted() {
             let token = p.next()?.clone();
             if token.is_parse_error() {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             if let Token::Function(name) = &token
                 && name.eq_ignore_ascii_case("var")
@@ -572,7 +568,7 @@ fn variable_references(text: &str) -> Option<Vec<String>> {
                 p.parse_nested_block(|p| {
                     let name = p.expect_ident_cloned()?.to_string();
                     if !name.starts_with("--") || name == "--" {
-                        return Err(p.new_custom_error(()));
+                        return Err(cssparser::ParseError::custom(()));
                     }
                     refs.push(name);
                     if !p.is_exhausted() {
@@ -594,7 +590,7 @@ fn variable_references(text: &str) -> Option<Vec<String>> {
         Ok(())
     }
     let mut refs = Vec::new();
-    scan(&mut Parser::new(&mut ParserInput::new(text)), 0, &mut refs).ok()?;
+    scan(&mut Parser::new(text), 0, &mut refs).ok()?;
     refs.sort();
     refs.dedup();
     Some(refs)
@@ -608,14 +604,14 @@ pub(in crate::dom) fn substitute<B: StyleBackend + ?Sized>(
 ) -> Option<String> {
     use cssparser::TokenSerializationType;
     fn scan<'i, B: StyleBackend + ?Sized>(
-        p: &mut Parser<'i, '_>,
+        p: &mut Parser<'i>,
         dom: &ComputeView<'_, B>,
         id: NodeId,
         pseudo: Option<PseudoEl>,
         depth: usize,
-    ) -> ParseResult<'i, String> {
+    ) -> ParseResult<String> {
         if depth > MAX_DEPTH {
-            return Err(p.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         let mut out = String::new();
         let mut previous = TokenSerializationType::Nothing;
@@ -626,7 +622,7 @@ pub(in crate::dom) fn substitute<B: StyleBackend + ?Sized>(
             };
             let literal = p.slice_from(start).to_owned();
             if token.is_parse_error() {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             let text = if let Token::Function(name) = &token
                 && name.eq_ignore_ascii_case("var")
@@ -634,7 +630,7 @@ pub(in crate::dom) fn substitute<B: StyleBackend + ?Sized>(
                 p.parse_nested_block(|p| {
                     let name = p.expect_ident_cloned()?.to_string();
                     if !name.starts_with("--") || name == "--" {
-                        return Err(p.new_custom_error(()));
+                        return Err(cssparser::ParseError::custom(()));
                     }
                     let fallback = if p.is_exhausted() {
                         None
@@ -647,17 +643,12 @@ pub(in crate::dom) fn substitute<B: StyleBackend + ?Sized>(
                     match dom.registered_custom_value(id, pseudo, &name) {
                         VarResult::Resolved(v) => Ok(v),
                         VarResult::Undefined => {
-                            let fallback = fallback.ok_or_else(|| p.new_custom_error(()))?;
-                            scan(
-                                &mut Parser::new(&mut ParserInput::new(&fallback)),
-                                dom,
-                                id,
-                                pseudo,
-                                depth + 1,
-                            )
-                            .map_err(|_| p.new_custom_error(()))
+                            let fallback =
+                                fallback.ok_or_else(|| cssparser::ParseError::custom(()))?;
+                            scan(&mut Parser::new(&fallback), dom, id, pseudo, depth + 1)
+                                .map_err(|_| cssparser::ParseError::custom(()))
                         }
-                        VarResult::Cycle => Err(p.new_custom_error(())),
+                        VarResult::Cycle => Err(cssparser::ParseError::custom(())),
                     }
                 })?
             } else if matches!(
@@ -679,8 +670,7 @@ pub(in crate::dom) fn substitute<B: StyleBackend + ?Sized>(
             };
             // Substitution preserves token identity: var(--number)px cannot
             // accidentally turn a number followed by an ident into a length.
-            let mut input = ParserInput::new(&text);
-            let mut tokens = Parser::new(&mut input);
+            let mut tokens = Parser::new(&text);
             if let Ok(first) = tokens.next_including_whitespace_and_comments() {
                 let kind = first.serialization_type();
                 if previous.needs_separator_when_before(kind) {
@@ -693,19 +683,12 @@ pub(in crate::dom) fn substitute<B: StyleBackend + ?Sized>(
             }
             out.push_str(&text);
             if out.len() > 2 * 1024 * 1024 {
-                return Err(p.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
         }
         Ok(out)
     }
-    scan(
-        &mut Parser::new(&mut ParserInput::new(text)),
-        dom,
-        id,
-        pseudo,
-        0,
-    )
-    .ok()
+    scan(&mut Parser::new(text), dom, id, pseudo, 0).ok()
 }
 
 #[cfg(test)]
