@@ -24,6 +24,7 @@ use crate::{
     },
     instance::{InstanceEntity, ThinPtr},
     ir::{self, BoundedSlotSpan, Slot, SlotSpan},
+    store::{ExnEntity, ExnMarker},
 };
 use alloc::vec::Vec;
 use core::{cmp, marker::PhantomData, mem, ops, ptr, slice};
@@ -921,7 +922,7 @@ pub struct Stack {
     freg32: Freg32,
     /// The value of the `f64` register.
     freg64: Freg64,
-    /// TRust: legacy exception handlers, the pending and the caught exceptions.
+    /// TRust: exception handlers, the pending and the caught exceptions.
     exceptions: ExceptionState,
     /// TRust: native region entries observed by this execution.
     #[cfg(wasmi_native_jit)]
@@ -930,13 +931,18 @@ pub struct Stack {
 
 type ReturnCallHost = Control<(Ip, Sp, Inst), Sp>;
 
-/// TRust: a thrown legacy WebAssembly exception (exception-handling proposal, legacy
-/// instructions): its tag and fields.
+/// TRust: a thrown WebAssembly exception: its tag and fields.
 ///
 /// # Note
 ///
 /// The tag address of the specification is identified by the defining instance and the
 /// tag's index within it, since tags are neither imported nor exported by Wasmi.
+///
+/// An exception that was raised by `throw_ref`, or caught by reference before, also carries
+/// its exception reference: it is the exception instance at that address in the store, and
+/// catching it by reference again yields the same address (WebAssembly Core 3.0,
+/// `exec-throw_ref`). Exceptions raised by `throw` enter the store only when a `catch_ref` or
+/// `catch_all_ref` clause catches them.
 #[derive(Debug)]
 pub struct WasmException {
     /// The index of the tag within its defining instance.
@@ -945,6 +951,8 @@ pub struct WasmException {
     instance: usize,
     /// The tag fields in cells.
     fields: Vec<Cell>,
+    /// The reference of the exception instance in the store, if one exists.
+    exn: Option<RawRef>,
 }
 
 impl WasmException {
@@ -954,6 +962,7 @@ impl WasmException {
             tag,
             instance: instance.as_ptr().expose_provenance(),
             fields,
+            exn: None,
         }
     }
 
@@ -965,6 +974,32 @@ impl WasmException {
     /// Returns the tag fields of `self`.
     pub fn fields(&self) -> &[Cell] {
         &self.fields
+    }
+
+    /// Returns the reference of the exception instance of `self` in the store, if any.
+    pub fn exn(&self) -> Option<RawRef> {
+        self.exn
+    }
+
+    /// Returns an [`ExnEntity`] for the store holding the tag and fields of `self`.
+    pub fn into_entity(self) -> ExnEntity {
+        ExnEntity::new(self.tag, self.instance, self.fields)
+    }
+
+    /// Re-creates the exception instance `entity` at `exn` for raising it again.
+    pub fn from_entity(entity: &ExnEntity, exn: RawRef) -> Self {
+        Self {
+            tag: entity.tag(),
+            instance: entity.instance(),
+            fields: entity.fields().to_vec(),
+            exn: Some(exn),
+        }
+    }
+
+    /// Returns the cells of `self` that may hold exception references.
+    fn ref_cells(&self) -> impl Iterator<Item = u64> + '_ {
+        let exn = self.exn.map(|raw| u64::from(u32::from(raw)));
+        self.fields.iter().map(|cell| u64::from(*cell)).chain(exn)
     }
 }
 
@@ -996,7 +1031,7 @@ struct CaughtException {
     exception: WasmException,
 }
 
-/// TRust: the dynamic state of legacy WebAssembly exceptions of one execution.
+/// TRust: the dynamic state of WebAssembly exceptions of one execution.
 #[derive(Debug, Default)]
 struct ExceptionState {
     /// The installed handlers, in installation order.
@@ -1170,10 +1205,7 @@ impl Stack {
         };
         // Equal tags have equal types, so the fields fill exactly the `results` cells.
         debug_assert_eq!(exception.fields().len(), usize::from(results.len()));
-        let mut cells = sp.offset(results.span().head());
-        for &field in exception.fields() {
-            let _ = CellsWriter::next(&mut cells, field);
-        }
+        write_cells(sp, results, exception.fields());
         self.catch_exception(try_id, exception);
         true
     }
@@ -1186,8 +1218,9 @@ impl Stack {
         }
     }
 
-    /// TRust: takes the pending exception if it is of `tag` defined by `instance`.
-    fn take_pending_exception_if(
+    /// TRust: takes the pending exception if it is of `tag` defined by `instance`, or any
+    /// exception if `tag` is `None`.
+    pub fn take_pending_exception_if(
         &mut self,
         tag: Option<u32>,
         instance: Inst,
@@ -1231,7 +1264,87 @@ impl Stack {
             tag: exception.tag,
             instance: exception.instance,
             fields: exception.fields.clone(),
+            exn: exception.exn,
         })
+    }
+
+    /// TRust: returns `Some` if the pending exception is of `tag` defined by `instance`, or any
+    /// exception if `tag` is `None`, with the reference of its exception instance if it has one.
+    pub fn pending_exn(&self, tag: Option<u32>, instance: Inst) -> Option<Option<RawRef>> {
+        let pending = self.exceptions.pending.as_ref()?;
+        if let Some(tag) = tag {
+            if !pending.is_tag(tag, instance) {
+                return None;
+            }
+        }
+        Some(pending.exn())
+    }
+
+    /// TRust: catches the pending exception if it is of `tag` defined by `instance`, writing
+    /// its fields to the cells `results` of the frame at `sp`, for the `catch` clause of a
+    /// `try_table` (WebAssembly Core 3.0, `exec-throw_ref` step 15c).
+    ///
+    /// Returns `true` if the exception was caught.
+    #[inline(never)]
+    pub fn catch_pending_values(
+        &mut self,
+        tag: u32,
+        instance: Inst,
+        sp: Sp,
+        results: BoundedSlotSpan,
+    ) -> bool {
+        let Some(exception) = self.take_pending_exception_if(Some(tag), instance) else {
+            return false;
+        };
+        debug_assert_eq!(exception.fields().len(), usize::from(results.len()));
+        write_cells(sp, results, exception.fields());
+        true
+    }
+
+    /// TRust: drops the pending exception for the `catch_all` clause of a `try_table`.
+    #[inline(never)]
+    pub fn drop_pending(&mut self) {
+        self.exceptions.pending = None;
+    }
+
+    /// TRust: raises `exception` at `ip`, see [`Stack::throw_exception`].
+    #[inline(never)]
+    pub fn raise(&mut self, ip: Ip, exception: WasmException) -> bool {
+        self.raise_exception(ip, exception, None)
+    }
+
+    /// TRust: conservatively marks the exceptions referenced by the cells, the saved integer
+    /// register and the pending or caught exceptions of `self`, for the store's exception
+    /// collector.
+    pub fn trace_exns(&self, marker: &mut ExnMarker<'_>) {
+        marker.mark_cells(self.exn_ref_cells());
+    }
+
+    /// TRust: returns every cell of `self` that may hold an exception reference.
+    ///
+    /// # Note
+    ///
+    /// The value stack keeps the cells of returned frames until they are overwritten. Those
+    /// are scanned as well: retaining an exception is always safe.
+    pub fn exn_ref_cells(&self) -> impl Iterator<Item = u64> + '_ {
+        let cells = self.values.cells.iter().map(|cell| u64::from(*cell));
+        let regs = [u64::from(self.ireg)];
+        let exceptions = &self.exceptions;
+        let pending = exceptions.pending.iter().flat_map(WasmException::ref_cells);
+        let caught = exceptions
+            .caught
+            .iter()
+            .flat_map(|caught| caught.exception.ref_cells());
+        cells.chain(regs).chain(pending).chain(caught)
+    }
+}
+
+/// TRust: writes `values` to the cells `results` of the frame at `sp`.
+fn write_cells(sp: Sp, results: BoundedSlotSpan, values: &[Cell]) {
+    debug_assert!(values.len() <= usize::from(results.len()));
+    let mut cells = sp.offset(results.span().head());
+    for &value in values {
+        let _ = CellsWriter::next(&mut cells, value);
     }
 }
 

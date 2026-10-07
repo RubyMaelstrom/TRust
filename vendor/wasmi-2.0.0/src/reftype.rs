@@ -67,6 +67,8 @@ pub enum Ref {
     Func(Nullable<Func>),
     /// A Wasm `externref`.
     Extern(Nullable<ExternRef>),
+    /// TRust: a Wasm `exnref`.
+    Exn(Nullable<ExnRef>),
 }
 
 impl From<Nullable<Func>> for Ref {
@@ -81,12 +83,19 @@ impl From<Nullable<ExternRef>> for Ref {
     }
 }
 
+impl From<Nullable<ExnRef>> for Ref {
+    fn from(value: Nullable<ExnRef>) -> Self {
+        Self::Exn(value)
+    }
+}
+
 impl Ref {
     /// Create a [`Ref`] from its raw parts.
     pub(crate) fn from_raw_parts(val: RawRef, ty: RefType, store: impl AsStoreId) -> Self {
         match ty {
             RefType::Func => Ref::Func(<Nullable<Func>>::from_raw_parts(val, store)),
             RefType::Extern => Ref::Extern(<Nullable<ExternRef>>::from_raw_parts(val, store)),
+            RefType::Exn => Ref::Exn(<Nullable<ExnRef>>::from_raw_parts(val, store)),
         }
     }
 
@@ -96,6 +105,7 @@ impl Ref {
         match ty {
             RefType::Func => Self::from(<Nullable<Func>>::Null),
             RefType::Extern => Self::from(<Nullable<ExternRef>>::Null),
+            RefType::Exn => Self::from(<Nullable<ExnRef>>::Null),
         }
     }
 
@@ -105,6 +115,7 @@ impl Ref {
         match self {
             Self::Func(nullable) => nullable.is_null(),
             Self::Extern(nullable) => nullable.is_null(),
+            Self::Exn(nullable) => nullable.is_null(),
         }
     }
 
@@ -120,6 +131,7 @@ impl Ref {
         match ty {
             RefType::Extern => Self::Extern(Nullable::Null),
             RefType::Func => Self::Func(Nullable::Null),
+            RefType::Exn => Self::Exn(Nullable::Null),
         }
     }
 
@@ -129,6 +141,7 @@ impl Ref {
         match self {
             Self::Func(_) => RefType::Func,
             Self::Extern(_) => RefType::Extern,
+            Self::Exn(_) => RefType::Exn,
         }
     }
 
@@ -161,6 +174,17 @@ impl Ref {
     #[inline]
     pub fn as_extern(&self) -> Option<Nullable<&ExternRef>> {
         if let Self::Extern(nullable) = self {
+            return Some(nullable.as_ref());
+        }
+        None
+    }
+
+    /// TRust: returns `Some` if `self` is an `exnref`.
+    ///
+    /// Otherwise returns `None`.
+    #[inline]
+    pub fn as_exn(&self) -> Option<Nullable<&ExnRef>> {
+        if let Self::Exn(nullable) = self {
             return Some(nullable.as_ref());
         }
         None
@@ -231,6 +255,28 @@ impl ExternRef {
     pub fn data<'a, T: 'a>(&self, ctx: impl Into<StoreContext<'a, T>>) -> &'a dyn Any {
         ctx.into().store.inner.resolve_externref(self).data()
     }
+}
+
+/// TRust: the marker entity of an [`ExnRef`].
+///
+/// # Note
+///
+/// The exception instances themselves live in the store's exception arena, which also
+/// reclaims those that became unreachable (see `ExnStore`).
+#[derive(Debug)]
+pub struct ExnRefEntity;
+
+define_handle! {
+    /// TRust: a reference to an exception instance of a [`Store`](crate::Store) (`exnref`).
+    ///
+    /// WebAssembly Core 3.0, exec/runtime: an exception reference addresses an exception
+    /// instance, made of a tag and its field values, which `throw_ref` raises again.
+    ///
+    /// # Note
+    ///
+    /// Exception references are only handed out by Wasm results, host function parameters
+    /// and global or table reads. The exception they address stays alive as long as the store.
+    struct ExnRef(NonZero<u32>, Stored) => ExnRefEntity;
 }
 
 #[test]
@@ -320,6 +366,7 @@ macro_rules! impl_conversions {
 }
 impl_conversions! {
     ExternRef: Extern,
+    ExnRef: Exn,
     Func: Func,
 }
 
@@ -331,6 +378,7 @@ impl Ref {
         match self {
             Self::Func(value) => value.unwrap_raw(store),
             Self::Extern(value) => value.unwrap_raw(store),
+            Self::Exn(value) => value.unwrap_raw(store),
         }
     }
 }

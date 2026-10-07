@@ -358,6 +358,7 @@ impl From<ConstVal> for Val {
             ConstVal::V128(value) => value.into(),
             ConstVal::Null(RefType::Func) => Self::FuncRef(Nullable::Null),
             ConstVal::Null(RefType::Extern) => Self::ExternRef(Nullable::Null),
+            ConstVal::Null(RefType::Exn) => Self::ExnRef(Nullable::Null),
         }
     }
 }
@@ -376,6 +377,7 @@ impl Val {
             Self::V128(value) => value.into(),
             Self::FuncRef(Nullable::Null) => ConstVal::Null(RefType::Func),
             Self::ExternRef(Nullable::Null) => ConstVal::Null(RefType::Extern),
+            Self::ExnRef(Nullable::Null) => ConstVal::Null(RefType::Exn),
             _ => return None,
         };
         Some(value)
@@ -544,6 +546,11 @@ impl ConstExpr {
                             shared: false,
                             ty: AbstractHeapType::Extern,
                         } => ConstVal::null(RefType::Extern),
+                        // TRust: `ref.null exn` and `ref.null noexn` (exception handling).
+                        wasmparser::HeapType::Abstract {
+                            shared: false,
+                            ty: AbstractHeapType::Exn | AbstractHeapType::NoExn,
+                        } => ConstVal::null(RefType::Exn),
                         invalid => {
                             panic!(
                                 "invalid heap type for `ref.null`: {:?}",

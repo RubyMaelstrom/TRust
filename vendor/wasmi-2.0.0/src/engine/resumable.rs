@@ -371,11 +371,15 @@ impl ResumableCallHostTrap {
     ) -> Result<ResumableCall, Error> {
         self.validate_inputs(ctx.as_context(), inputs)?;
         self.common.prepare_outputs(ctx.as_context(), outputs)?;
-        self.common
+        let call = self
+            .common
             .engine
             .clone()
-            .resume_func_host_trap(ctx.as_context_mut(), self, inputs, outputs)
-            .map(ResumableCall::new)
+            .resume_func_host_trap(ctx.as_context_mut(), self, inputs, &mut *outputs)
+            .map(ResumableCall::new);
+        // TRust: the caller now holds the exception references among the results.
+        ctx.as_context().store.inner.pin_exn_vals(outputs);
+        call
     }
 }
 
@@ -444,11 +448,15 @@ impl ResumableCallOutOfFuel {
         outputs: &mut [Val],
     ) -> Result<ResumableCall, Error> {
         self.common.prepare_outputs(ctx.as_context(), outputs)?;
-        self.common
+        let call = self
+            .common
             .engine
             .clone()
-            .resume_func_out_of_fuel(ctx.as_context_mut(), self, outputs)
-            .map(ResumableCall::new)
+            .resume_func_out_of_fuel(ctx.as_context_mut(), self, &mut *outputs)
+            .map(ResumableCall::new);
+        // TRust: the caller now holds the exception references among the results.
+        ctx.as_context().store.inner.pin_exn_vals(outputs);
+        call
     }
 }
 

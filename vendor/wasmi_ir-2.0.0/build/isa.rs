@@ -85,7 +85,7 @@ pub fn wasmi_isa(config: &Config) -> Isa {
     isa
 }
 
-/// TRust: operators of the legacy WebAssembly exception-handling proposal.
+/// TRust: operators of WebAssembly exception handling, legacy and standardized.
 fn add_exception_ops(isa: &mut Isa) {
     let ops = [
         // Installs the handler of a `try` body. The body spans from this operator up to the
@@ -135,6 +135,42 @@ fn add_exception_ops(isa: &mut Isa) {
         Op::from(GenericOp::new(
             Ident::ExceptionDelegate,
             [Field::new(Ident::Target, FieldTy::U32)],
+        )),
+        // The catch clauses of a `try_table` (WebAssembly Core 3.0, `exec-throw_ref` step 15):
+        // they consume the pending exception and leave its values in `results` for the branch
+        // to their label, which the translator encodes after them.
+        //
+        // `catch x l`: on a match with `tag` the tag fields are written to `results`; otherwise
+        // execution continues at the next clause at `next`.
+        Op::from(GenericOp::new(
+            Ident::ExceptionTableCatch,
+            [
+                Field::new(Ident::Results, FieldTy::BoundedSlotSpan),
+                Field::new(Ident::Tag, FieldTy::U32),
+                Field::new(Ident::Next, FieldTy::BranchOffset),
+            ],
+        )),
+        // `catch_ref x l`: like `catch x l`, followed by the exception reference in the last
+        // cell of `results`.
+        Op::from(GenericOp::new(
+            Ident::ExceptionTableCatchRef,
+            [
+                Field::new(Ident::Results, FieldTy::BoundedSlotSpan),
+                Field::new(Ident::Tag, FieldTy::U32),
+                Field::new(Ident::Next, FieldTy::BranchOffset),
+            ],
+        )),
+        // `catch_all l`: consumes any pending exception.
+        Op::from(GenericOp::new(Ident::ExceptionTableCatchAll, [])),
+        // `catch_all_ref l`: consumes any pending exception and writes its reference to `result`.
+        Op::from(GenericOp::new(
+            Ident::ExceptionTableCatchAllRef,
+            [Field::new(Ident::Result, FieldTy::Slot)],
+        )),
+        // `throw_ref`: raises the exception referenced by `value`, or traps if it is null.
+        Op::from(GenericOp::new(
+            Ident::ExceptionThrowRef,
+            [Field::new(Ident::Value, FieldTy::Slot)],
         )),
     ];
     isa.push_ops(ops);

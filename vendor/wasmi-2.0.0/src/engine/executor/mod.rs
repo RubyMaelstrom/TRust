@@ -87,6 +87,12 @@ impl EngineInner {
         let store = ctx.store;
         let stack = self.stacks.lock().reuse_or_new();
         let (outcome, stack) = execute_root_func(store, stack, func, params, results);
+        if matches!(
+            outcome,
+            Err(ExecutionOutcome::Host(_) | ExecutionOutcome::OutOfFuel(_))
+        ) {
+            pin_suspended_exns(store, &stack);
+        }
         let value = match outcome {
             Ok(value) => value,
             Err(ExecutionOutcome::Host(error)) => {
@@ -139,13 +145,19 @@ impl EngineInner {
         Results: LiftFromCells,
     {
         let caller_results = invocation.caller_results();
-        let outcome = resume_func(ctx.store, &mut invocation.common, |store| {
+        let outcome = resume_func(&mut *ctx.store, &mut invocation.common, |store| {
             let value = resume_wasm_func_call(store)?
                 .provide_host_results(params, caller_results)
                 .execute()?
                 .write_results(results);
             Ok(value)
         });
+        if matches!(
+            outcome,
+            Err(ExecutionOutcome::Host(_) | ExecutionOutcome::OutOfFuel(_))
+        ) {
+            pin_suspended_exns(ctx.store, invocation.common.stack_mut());
+        }
         let results = match outcome {
             Ok(results) => results,
             Err(ExecutionOutcome::Host(error)) => {
@@ -184,12 +196,18 @@ impl EngineInner {
     where
         Results: LiftFromCells,
     {
-        let outcome = resume_func(ctx.store, &mut invocation.common, |store| {
+        let outcome = resume_func(&mut *ctx.store, &mut invocation.common, |store| {
             let value = resume_wasm_func_call(store)?
                 .execute()?
                 .write_results(results);
             Ok(value)
         });
+        if matches!(
+            outcome,
+            Err(ExecutionOutcome::Host(_) | ExecutionOutcome::OutOfFuel(_))
+        ) {
+            pin_suspended_exns(ctx.store, invocation.common.stack_mut());
+        }
         let results = match outcome {
             Ok(results) => results,
             Err(ExecutionOutcome::Host(error)) => {
@@ -226,6 +244,19 @@ fn resume_func<T, R>(
     let (outcome, stack) = with_stack(store, stack, |store| f(store));
     *handle.stack_mut() = stack;
     outcome
+}
+
+/// TRust: pins the exceptions that the suspended execution `stack` may reference.
+///
+/// # Note
+///
+/// A suspended [`Stack`] is owned by its resumable call instead of the store, so the store's
+/// exception collector cannot scan it: every exception it might reference stays alive.
+fn pin_suspended_exns<T>(store: &Store<T>, stack: &Stack) {
+    let exns = store.inner.exns();
+    if exns.live() != 0 {
+        exns.pin_cells(stack.exn_ref_cells());
+    }
 }
 
 /// Executes the given [`Func`] on `stack` using the given `params`.
@@ -308,9 +339,12 @@ fn with_stack<T, R>(
     impl<'a, T> Parked<'a, T> {
         fn revert(&mut self) -> ExecContext {
             let parked = mem::take(&mut self.context);
+            self.store.inner.leave_execution();
             mem::replace(self.store.inner.exec_mut(), parked)
         }
     }
+    // TRust: the store's exception collector must know whether a parked execution exists.
+    store.inner.enter_execution();
     let parked = mem::replace(store.inner.exec_mut(), ExecContext::new(stack));
     let guard = Parked {
         store,

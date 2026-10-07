@@ -223,7 +223,7 @@ pub use self::{
         ModuleImportsIter,
         Read,
     },
-    reftype::{ExternRef, Nullable, Ref},
+    reftype::{ExnRef, ExternRef, Nullable, Ref},
     store::{AsContext, AsContextMut, CallHook, Store, StoreContext, StoreContextMut},
     table::{Table, TableType},
     value::Val,

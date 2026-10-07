@@ -102,6 +102,7 @@ impl From<TypedRawRef> for TypedRawVal {
         let ty = match value.ty() {
             RefType::Func => ValType::FuncRef,
             RefType::Extern => ValType::ExternRef,
+            RefType::Exn => ValType::ExnRef,
         };
         Self::new(ty, val)
     }
@@ -112,6 +113,7 @@ impl From<TypedRawVal> for TypedRawRef {
         let ty = match value.ty() {
             ValType::FuncRef => RefType::Func,
             ValType::ExternRef => RefType::Extern,
+            ValType::ExnRef => RefType::Exn,
             non_ref => unreachable!("expected reference type but found: {non_ref:?}"),
         };
         let raw = RawRef::from(value.raw());

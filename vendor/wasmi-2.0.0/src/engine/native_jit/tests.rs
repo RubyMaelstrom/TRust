@@ -509,6 +509,39 @@ fn native_forward_branches_merge_slot_values() {
 }
 
 #[test]
+fn native_regions_end_at_exception_operators() {
+    // TRust: `try_table`, its catch clauses, `throw` and `throw_ref` are interpreter
+    // boundaries; hot code around them runs natively with the interpreter's results.
+    let source = r#"(module
+        (tag $e (param i32))
+        (func (export "run") (param $n i32) (param $v i32) (result i32)
+            (local $acc i32)
+            (loop $again
+                (local.set $acc (i32.add (local.get $acc)
+                    (block $h (result i32)
+                        (try_table (result i32) (catch $e $h)
+                            (if (i32.and (local.get $n) (i32.const 1))
+                                (then (throw $e (i32.xor (local.get $v) (local.get $n)))))
+                            (i32.mul (local.get $n) (i32.const 3))))))
+                (if (i32.eqz (i32.rem_u (local.get $n) (i32.const 7)))
+                    (then (local.set $acc (i32.add (local.get $acc)
+                        (block $h2 (result i32)
+                            (try_table (catch $e $h2)
+                                (throw_ref (block $r (result exnref)
+                                    (try_table (catch_all_ref $r) (throw $e (local.get $n)))
+                                    (unreachable))))
+                            (unreachable))))))
+                (br_if $again (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+            (local.get $acc)))"#;
+    for value in [0, -1, 12345] {
+        let expected = run(source, false, (5000, value)).0;
+        let (actual, engine) = run(source, true, (5000, value));
+        assert_eq!(actual, expected);
+        assert!(compiled_regions(&engine) > 0);
+    }
+}
+
+#[test]
 fn native_many_alternating_functions_keep_their_hotness() {
     // More simultaneously hot functions than the original direct-mapped
     // table could hold. Every function must eventually reach the compiler,

@@ -168,7 +168,11 @@ impl RegisterMap {
     /// Returns a `&mut` to the [`RegisterLink`] of the register for type `ty`.
     fn get_mut(&mut self, ty: ValType) -> &mut Option<RegisterLink> {
         match ty {
-            | ValType::I32 | ValType::FuncRef | ValType::ExternRef | ValType::I64 => &mut self.ireg,
+            | ValType::I32
+            | ValType::FuncRef
+            | ValType::ExternRef
+            | ValType::ExnRef
+            | ValType::I64 => &mut self.ireg,
             | ValType::F32 => &mut self.freg32,
             | ValType::F64 => &mut self.freg64,
             | ValType::V128 => unreachable!(),
@@ -208,7 +212,11 @@ impl RegisterMap {
     /// Returns the link of the register for type `ty` if any.
     pub fn get(&self, ty: ValType) -> Option<RegisterLink> {
         match ty {
-            | ValType::I32 | ValType::FuncRef | ValType::ExternRef | ValType::I64 => self.ireg,
+            | ValType::I32
+            | ValType::FuncRef
+            | ValType::ExternRef
+            | ValType::ExnRef
+            | ValType::I64 => self.ireg,
             | ValType::F32 => self.freg32,
             | ValType::F64 => self.freg64,
             | ValType::V128 => None,

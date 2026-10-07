@@ -18,6 +18,7 @@ use crate::{
     reftype::{ExternRef, ExternRefEntity},
     store::{
         AsStoreId as _,
+        ExnStore,
         Handle,
         RawHandle,
         Stored,
@@ -155,6 +156,10 @@ pub struct StoreInner {
     /// TRust: `true` if hot regions may run natively, copied from the [`Engine`]'s config.
     #[cfg(wasmi_native_jit)]
     native_jit: bool,
+    /// TRust: the exception instances addressed by exception references.
+    exns: ExnStore,
+    /// TRust: the number of executions on this store, including parked enclosing ones.
+    exec_depth: usize,
 }
 
 impl StoreInner {
@@ -181,12 +186,91 @@ impl StoreInner {
             features,
             #[cfg(wasmi_native_jit)]
             native_jit: config.native_jit_enabled(),
+            exns: ExnStore::default(),
+            exec_depth: 0,
         }
     }
 
     /// Returns the [`Engine`] that this store is associated with.
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// TRust: returns the exception instances of the store.
+    #[inline]
+    pub fn exns(&self) -> &ExnStore {
+        &self.exns
+    }
+
+    /// TRust: returns the exception instances of the store.
+    #[inline]
+    pub fn exns_mut(&mut self) -> &mut ExnStore {
+        &mut self.exns
+    }
+
+    /// TRust: pins the exceptions referenced by `values`, which the host received.
+    ///
+    /// # Note
+    ///
+    /// The host may keep exception references for as long as it likes, so the exceptions it
+    /// observes remain allocated as long as the store (see `ExnStore`).
+    pub fn pin_exn_vals(&self, values: &[crate::Val]) {
+        for value in values {
+            if let crate::Val::ExnRef(crate::Nullable::Val(exn)) = value {
+                if let Some(raw) = exn.unwrap_raw(self.id) {
+                    self.exns.pin(raw);
+                }
+            }
+        }
+    }
+
+    /// TRust: records that an execution starts on this store, parking any enclosing one.
+    #[inline]
+    pub fn enter_execution(&mut self) {
+        self.exec_depth += 1;
+    }
+
+    /// TRust: records that the innermost execution on this store ended.
+    #[inline]
+    pub fn leave_execution(&mut self) {
+        debug_assert!(self.exec_depth > 0);
+        self.exec_depth -= 1;
+    }
+
+    /// TRust: frees unreachable exception instances if enough were allocated since the last
+    /// collection (see `ExnStore`).
+    ///
+    /// # Note
+    ///
+    /// The roots are the `exnref` globals and tables and the installed execution [`Stack`].
+    /// Nothing is collected while an execution is parked behind a host function that re-entered
+    /// Wasm, since only the innermost [`Stack`] is reachable from the store.
+    ///
+    /// [`Stack`]: crate::engine::Stack
+    pub fn collect_exns_if_due(&mut self) {
+        if !self.exns.wants_collection() || self.exec_depth > 1 {
+            return;
+        }
+        let Self {
+            exns,
+            exec,
+            globals,
+            tables,
+            ..
+        } = self;
+        exns.collect(|marker| {
+            for (_, global) in globals.iter() {
+                if global.ty().content() == crate::ValType::ExnRef {
+                    marker.mark_cells([u64::from(*global.get_raw())]);
+                }
+            }
+            for (_, table) in tables.iter() {
+                if table.ty().element() == crate::RefType::Exn {
+                    marker.mark_refs(table.raw_elements().iter().copied());
+                }
+            }
+            exec.stack_mut().trace_exns(marker);
+        });
     }
 
     /// Returns the [`StoreId`] of `self`.
@@ -319,6 +403,21 @@ impl StoreInner {
             if element.ty() == crate::RefType::Func {
                 for value in element.items() {
                     reference(*value);
+                }
+            }
+        }
+        // TRust: the fields of stored exceptions, which may hold funcrefs. They are untyped
+        // cells, so every cell that addresses a function of this store counts.
+        for fields in self.exns.fields() {
+            for &field in fields {
+                let Ok(value) = u32::try_from(u64::from(field)) else {
+                    continue;
+                };
+                let function = crate::Nullable::<Func>::from_raw_parts(value.into(), self.id);
+                if let Some(function) = function.val() {
+                    if self.try_resolve_func(function).is_ok() {
+                        root(*function);
+                    }
                 }
             }
         }

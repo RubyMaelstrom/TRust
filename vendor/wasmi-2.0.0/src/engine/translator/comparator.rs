@@ -940,9 +940,11 @@ impl UpdateBranchOffset for Op {
                 debug_assert!(!offset.is_init());
                 *offset = new_offset;
             }
-            // TRust: legacy exception handler and catch clause targets.
+            // TRust: exception handler and catch clause targets.
             | Op::ExceptionTry { handler: offset, .. }
-            | Op::ExceptionCatch { next: offset, .. } => {
+            | Op::ExceptionCatch { next: offset, .. }
+            | Op::ExceptionTableCatch { next: offset, .. }
+            | Op::ExceptionTableCatchRef { next: offset, .. } => {
                 debug_assert!(!offset.is_init());
                 *offset = new_offset;
             }

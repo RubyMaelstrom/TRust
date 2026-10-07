@@ -1818,6 +1818,7 @@ pub(super) fn host_instance_exports(
                         .map(|table| match table.ty(&state.store).element() {
                             wasmi::RefType::Func => "anyfunc",
                             wasmi::RefType::Extern => "externref",
+                            wasmi::RefType::Exn => "exnref",
                         })
                         .unwrap_or("")
                         .to_string()
@@ -1872,6 +1873,7 @@ pub(super) fn host_instance_exports(
                             match table.ty(&*caller).element() {
                                 wasmi::RefType::Func => "anyfunc",
                                 wasmi::RefType::Extern => "externref",
+                                wasmi::RefType::Exn => "exnref",
                             }
                         })
                     })
@@ -2752,9 +2754,10 @@ mod tests {
     /// Wasmi 2.0's optimized interpreter only keeps a constant native stack while every
     /// handler reaches the next one with a sibling call (see the Wasmi profile overrides in
     /// Cargo.toml). A handler that loses it grows the stack once per executed operator, so
-    /// this loop over common operator families (including growth and legacy exception
-    /// unwinding) would overflow the small thread stack and abort the test binary under
-    /// `cargo test --release`. Debug builds use Wasmi's portable loop dispatch.
+    /// this loop over common operator families (including growth, legacy exception unwinding
+    /// and `try_table` catch clauses with `throw_ref`) would overflow the small thread stack
+    /// and abort the test binary under `cargo test --release`. Debug builds use Wasmi's
+    /// portable loop dispatch.
     #[test]
     fn wasm_interpreter_dispatch_keeps_a_constant_native_stack() {
         const MODULE: &str = r#"
@@ -2812,6 +2815,20 @@ mod tests {
                     end
                   catch $tag
                   end
+                  i64.extend_i32_u
+                  (local.set $acc (i64.add (local.get $acc)))
+                  (block $h (result i32)
+                    (try_table (result i32) (catch $tag $h)
+                      (throw_ref (block $r (result exnref)
+                        (try_table (catch_all_ref $r) (call $throw (local.get $n)))
+                        (unreachable)))))
+                  i64.extend_i32_u
+                  (local.set $acc (i64.add (local.get $acc)))
+                  (block $all (try_table (catch_all $all) (call $throw (local.get $n))))
+                  (block $ref (result i32 exnref)
+                    (try_table (catch_ref $tag $ref) (call $throw (local.get $n)))
+                    (unreachable))
+                  drop
                   i64.extend_i32_u
                   (local.set $acc (i64.add (local.get $acc)))
                   (br_if $again (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))

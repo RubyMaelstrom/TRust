@@ -127,6 +127,10 @@ impl Table {
     pub fn get(&self, ctx: impl AsContext, index: u64) -> Option<Ref> {
         let store = &ctx.as_context().store.inner;
         let raw = store.resolve_table(self).get(index)?;
+        if raw.ty() == crate::RefType::Exn {
+            // TRust: the host may keep the exception reference it reads.
+            store.exns().pin(raw.raw());
+        }
         Some(Ref::from_raw_parts(raw.raw(), raw.ty(), store))
     }
 

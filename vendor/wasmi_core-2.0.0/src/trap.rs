@@ -344,6 +344,11 @@ generate_trap_code! {
     /// This trap is raised when a WebAssembly operation demanded a memory
     /// allocation and the host system could not supply the requested amount.
     OutOfSystemMemory = 12,
+
+    /// TRust: `throw_ref` was executed with a null exception reference.
+    ///
+    /// WebAssembly Core 3.0, `exec-throw_ref` step 3.
+    NullExceptionReference = 13,
 }
 
 impl TrapCode {
@@ -367,6 +372,7 @@ impl TrapCode {
             Self::OutOfFuel => "all fuel consumed by WebAssembly",
             Self::GrowthOperationLimited => "growth operation limited",
             Self::OutOfSystemMemory => "out of system memory",
+            Self::NullExceptionReference => "null exception reference",
         }
     }
 }

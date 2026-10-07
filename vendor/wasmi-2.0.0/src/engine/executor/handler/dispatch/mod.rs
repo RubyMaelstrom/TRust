@@ -119,6 +119,7 @@ pub enum Break {
     OutOfFuel = TrapCode::OutOfFuel as _,
     GrowthOperationLimited = TrapCode::GrowthOperationLimited as _,
     OutOfSystemMemory = TrapCode::OutOfSystemMemory as _,
+    NullExceptionReference = TrapCode::NullExceptionReference as _,
     /// Signals that there must be a reason stored externally supplying the caller with more information.
     WithReason,
 }
@@ -139,6 +140,7 @@ impl From<TrapCode> for Break {
             TrapCode::OutOfFuel => Self::OutOfFuel,
             TrapCode::GrowthOperationLimited => Self::GrowthOperationLimited,
             TrapCode::OutOfSystemMemory => Self::OutOfSystemMemory,
+            TrapCode::NullExceptionReference => Self::NullExceptionReference,
         }
     }
 }
@@ -159,6 +161,7 @@ impl Break {
             Self::OutOfFuel => TrapCode::OutOfFuel,
             Self::GrowthOperationLimited => TrapCode::GrowthOperationLimited,
             Self::OutOfSystemMemory => TrapCode::OutOfSystemMemory,
+            Self::NullExceptionReference => TrapCode::NullExceptionReference,
             _ => return None,
         };
         Some(trap_code)
