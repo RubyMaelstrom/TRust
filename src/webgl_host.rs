@@ -5,6 +5,7 @@ use crate::webgl::{Attributes, Context, Reply};
 
 #[path = "webgl_host/fast.rs"]
 mod fast;
+pub(super) use fast::Cache as FastCache;
 
 pub(super) fn publish(ctx: &mut Ctx, present: bool, only: Option<usize>) {
     let Some(state) = ctx.host_mut::<HostState>() else {
@@ -140,6 +141,12 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let dom = host_dom(ctx);
     let id = host_arg_node(&dom.borrow(), args, 0)
         .ok_or_else(|| ctx.make_error("TypeError", "Invalid WebGL canvas"))?;
+    if op == "dispose" || op == "init" {
+        ctx.host_mut::<HostState>()
+            .unwrap()
+            .webgl_fast
+            .forget_contexts();
+    }
     if op == "dispose" {
         ctx.host_mut::<HostState>().unwrap().webgl.remove(&id);
         if let Some(canvas) = dom.borrow().canvases.borrow_mut().get_mut(&id) {
