@@ -30,9 +30,15 @@ pub(super) fn externref_allocations() -> usize {
     EXTERNREF_ALLOCATIONS.with(Cell::get)
 }
 
+/// `TRUST_WASM_TRACE`, read once: transitions run per call and must not take the environment lock.
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_WASM_TRACE").is_some())
+}
+
 macro_rules! wasm_trace {
     ($message:expr) => {
-        if std::env::var_os("TRUST_WASM_TRACE").is_some() {
+        if trace_enabled() {
             eprintln!("wasm: {}", $message);
         }
     };
@@ -111,6 +117,24 @@ impl PageWasm {
                                     .tables
                                     .capacity()
                                     .saturating_mul(std::mem::size_of::<wasmi::Table>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .func_ids
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<(wasmi::Func, usize)>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .global_ids
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<(wasmi::Global, usize)>()),
+                            )
+                            .saturating_add(
+                                state
+                                    .table_ids
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<(wasmi::Table, usize)>()),
                             )
                             .saturating_add(
                                 state.store.data().externrefs.capacity().saturating_mul(
@@ -351,12 +375,17 @@ struct WasmState {
     modules: Vec<wasmi::Module>,
     instances: Vec<wasmi::Instance>,
     funcs: Vec<wasmi::Func>,
+    /// Index of `funcs` (and of `globals` and `tables` below): Pyodide alone registers
+    /// thousands of functions and GOT globals, and every funcref crossing looks one up.
+    func_ids: HashMap<wasmi::Func, usize>,
     /// Strong handles accounted as internal cache edges by HostGc, not permanent roots.
     /// Native Store addresses themselves remain agent-lifetime allocations for now.
     function_cache: HashMap<usize, Value>,
     globals: Vec<wasmi::Global>,
+    global_ids: HashMap<wasmi::Global, usize>,
     memories: Vec<MemorySlot>,
     tables: Vec<wasmi::Table>,
+    table_ids: HashMap<wasmi::Table, usize>,
 }
 
 impl WasmState {
@@ -374,33 +403,22 @@ impl WasmState {
             modules: Vec::new(),
             instances: Vec::new(),
             funcs: Vec::new(),
+            func_ids: HashMap::new(),
             function_cache: HashMap::new(),
             globals: Vec::new(),
+            global_ids: HashMap::new(),
             memories: Vec::new(),
             tables: Vec::new(),
+            table_ids: HashMap::new(),
         }
     }
 
     fn register_func(&mut self, value: wasmi::Func) -> usize {
-        if let Some(index) = self.funcs.iter().position(|candidate| *candidate == value) {
-            return index;
-        }
-        let index = self.funcs.len();
-        self.funcs.push(value);
-        index
+        register(&mut self.funcs, &mut self.func_ids, value)
     }
 
     fn register_global(&mut self, value: wasmi::Global) -> usize {
-        if let Some(index) = self
-            .globals
-            .iter()
-            .position(|candidate| *candidate == value)
-        {
-            return index;
-        }
-        let index = self.globals.len();
-        self.globals.push(value);
-        index
+        register(&mut self.globals, &mut self.global_ids, value)
     }
 
     fn memory_id(&self, value: wasmi::Memory) -> Option<usize> {
@@ -438,13 +456,21 @@ impl WasmState {
     }
 
     fn register_table(&mut self, value: wasmi::Table) -> usize {
-        if let Some(index) = self.tables.iter().position(|candidate| *candidate == value) {
-            return index;
-        }
-        let index = self.tables.len();
-        self.tables.push(value);
-        index
+        register(&mut self.tables, &mut self.table_ids, value)
     }
+}
+
+/// Returns the agent-wide integer handle of a store object, assigning the next one on first
+/// sight. Handles are never reused, so a handle in a JS internal slot always names one object.
+fn register<T: Copy + Eq + std::hash::Hash>(
+    items: &mut Vec<T>,
+    ids: &mut HashMap<T, usize>,
+    value: T,
+) -> usize {
+    *ids.entry(value).or_insert_with(|| {
+        items.push(value);
+        items.len() - 1
+    })
 }
 
 /// Shares `memory`'s bytes as the Data Block of its `Memory.buffer` objects (JS API #memories:
@@ -679,7 +705,7 @@ fn prepare_value(ctx: &mut Ctx, value: &Value, ty: wasmi::ValType) -> Result<Pre
 }
 
 fn build_ref<C: wasmi::AsContextMut<Data = StoreData>>(
-    funcs: &[wasmi::Func],
+    func: impl FnOnce(usize) -> Option<wasmi::Func>,
     context: &mut C,
     value: RefArg,
 ) -> Result<wasmi::Val, ()> {
@@ -687,9 +713,7 @@ fn build_ref<C: wasmi::AsContextMut<Data = StoreData>>(
         RefArg::Null(wasmi::ValType::FuncRef) => Ok(wasmi::Val::FuncRef(wasmi::Nullable::Null)),
         RefArg::Null(wasmi::ValType::ExnRef) => Ok(wasmi::Val::ExnRef(wasmi::Nullable::Null)),
         RefArg::Null(_) => Ok(wasmi::Val::ExternRef(wasmi::Nullable::Null)),
-        RefArg::Func(index) => funcs
-            .get(index)
-            .copied()
+        RefArg::Func(index) => func(index)
             .map(|function| wasmi::Val::FuncRef(wasmi::Nullable::Val(function)))
             .ok_or(()),
         RefArg::Extern(id) => {
@@ -728,10 +752,26 @@ fn table_ref_type(element: wasmi::ValType) -> wasmi::RefType {
     }
 }
 
+/// [`build_ref`] against an idle agent store.
+fn build_state_ref(state: &mut WasmState, value: RefArg) -> Result<wasmi::Val, ()> {
+    let funcs = &state.funcs;
+    build_ref(|index| funcs.get(index).copied(), &mut state.store, value)
+}
+
+/// [`build_ref`] while the store is lent to the active Caller. The function handle is resolved
+/// before the Caller is borrowed, never by copying the agent's function table.
+fn build_active_ref(value: RefArg) -> Option<wasmi::Val> {
+    let func = match value {
+        RefArg::Func(index) => Some(active_func(index)?),
+        _ => None,
+    };
+    with_active_caller(|caller| build_ref(|_| func, caller, value)).and_then(Result::ok)
+}
+
 fn build_value(state: &mut WasmState, value: PreparedValue) -> Result<wasmi::Val, ()> {
     match value {
         PreparedValue::Numeric(value) => Ok(value),
-        PreparedValue::Reference(value) => build_ref(&state.funcs, &mut state.store, value),
+        PreparedValue::Reference(value) => build_state_ref(state, value),
     }
 }
 
@@ -959,12 +999,8 @@ fn import_results(
             let prepared = prepare_value(ctx, &returned, *ty)?;
             output[0] = match prepared {
                 PreparedValue::Numeric(value) => value,
-                PreparedValue::Reference(value) => {
-                    let funcs = with_active_state(|state| state.funcs.clone()).unwrap_or_default();
-                    with_active_caller(|caller| build_ref(&funcs, caller, value))
-                        .and_then(Result::ok)
-                        .ok_or_else(|| type_error(ctx, "WebAssembly: invalid reference result"))?
-                }
+                PreparedValue::Reference(value) => build_active_ref(value)
+                    .ok_or_else(|| type_error(ctx, "WebAssembly: invalid reference result"))?,
             };
             Ok(())
         }
@@ -985,15 +1021,8 @@ fn import_results(
                 let prepared = prepare_value(ctx, &value, ty)?;
                 output[index] = match prepared {
                     PreparedValue::Numeric(value) => value,
-                    PreparedValue::Reference(value) => {
-                        let funcs =
-                            with_active_state(|state| state.funcs.clone()).unwrap_or_default();
-                        with_active_caller(|caller| build_ref(&funcs, caller, value))
-                            .and_then(Result::ok)
-                            .ok_or_else(|| {
-                                type_error(ctx, "WebAssembly: invalid reference result")
-                            })?
-                    }
+                    PreparedValue::Reference(value) => build_active_ref(value)
+                        .ok_or_else(|| type_error(ctx, "WebAssembly: invalid reference result"))?,
                 };
             }
             Ok(())
@@ -1571,7 +1600,7 @@ pub(super) fn host_instantiate(
         token,
         import_types.len()
     ));
-    if std::env::var_os("TRUST_WASM_TRACE").is_some() {
+    if trace_enabled() {
         let mut function_index = 0;
         for import in module.imports() {
             if matches!(import.ty(), wasmi::ExternType::Func(_)) {
@@ -1822,7 +1851,7 @@ pub(super) fn host_call_export(
             "WebAssembly: call to an unknown exported function",
         ));
     };
-    let trace_enabled = std::env::var_os("TRUST_WASM_TRACE").is_some();
+    let trace_enabled = trace_enabled();
     let call_number = if trace_enabled {
         WASM_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
     } else {
@@ -1908,19 +1937,14 @@ pub(super) fn host_call_export(
                 "Runtime",
                 "WebAssembly: unavailable re-entrant function".to_string(),
             ))?;
-            let funcs = with_active_state(|state| state.funcs.clone()).unwrap_or_default();
             let mut inputs = Vec::with_capacity(prepared.len());
             for value in prepared {
                 inputs.push(match value {
                     PreparedValue::Numeric(value) => value,
-                    PreparedValue::Reference(value) => {
-                        with_active_caller(|caller| build_ref(&funcs, caller, value))
-                            .and_then(Result::ok)
-                            .ok_or((
-                                "Runtime",
-                                "WebAssembly: invalid reference argument".to_string(),
-                            ))?
-                    }
+                    PreparedValue::Reference(value) => build_active_ref(value).ok_or((
+                        "Runtime",
+                        "WebAssembly: invalid reference argument".to_string(),
+                    ))?,
                 });
             }
             let mut outputs: Vec<wasmi::Val> = results
@@ -2019,16 +2043,10 @@ pub(super) fn host_global_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
             state.register_global(global)
         }
         Err(_) => {
-            let funcs = with_active_state(|state| state.funcs.clone()).unwrap_or_default();
             let initial = match initial {
                 PreparedValue::Numeric(value) => value,
-                PreparedValue::Reference(value) => {
-                    with_active_caller(|caller| build_ref(&funcs, caller, value))
-                        .and_then(Result::ok)
-                        .ok_or_else(|| {
-                            type_error(ctx, "WebAssembly.Global: invalid initial value")
-                        })?
-                }
+                PreparedValue::Reference(value) => build_active_ref(value)
+                    .ok_or_else(|| type_error(ctx, "WebAssembly.Global: invalid initial value"))?,
             };
             let global =
                 with_active_caller(|caller| wasmi::Global::new(caller, initial, mutability))
@@ -2135,14 +2153,10 @@ pub(super) fn host_global_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
                 })
         }
         Err(_) => {
-            let funcs = with_active_state(|state| state.funcs.clone()).unwrap_or_default();
             let value = match prepared {
                 PreparedValue::Numeric(value) => value,
-                PreparedValue::Reference(value) => {
-                    with_active_caller(|caller| build_ref(&funcs, caller, value))
-                        .and_then(Result::ok)
-                        .ok_or_else(|| type_error(ctx, "WebAssembly.Global: invalid value"))?
-                }
+                PreparedValue::Reference(value) => build_active_ref(value)
+                    .ok_or_else(|| type_error(ctx, "WebAssembly.Global: invalid value"))?,
             };
             id.and_then(|id| {
                 let global = with_active_state(|state| state.globals.get(id).copied()).flatten()?;
@@ -2392,16 +2406,14 @@ pub(super) fn host_table_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     let id = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => {
             let state = state_slot.get_or_insert_with(WasmState::new);
-            let initial_value = build_ref(&state.funcs, &mut state.store, prepared)
+            let initial_value = build_state_ref(state, prepared)
                 .map_err(|()| type_error(ctx, "WebAssembly.Table: invalid initial value"))?;
             let table = wasmi::Table::new(&mut state.store, ty, table_ref(initial_value))
                 .map_err(|error| range_error(ctx, format!("WebAssembly.Table: {error}")))?;
             state.register_table(table)
         }
         Err(_) => {
-            let funcs = with_active_state(|state| state.funcs.clone()).unwrap_or_default();
-            let initial_value = with_active_caller(|caller| build_ref(&funcs, caller, prepared))
-                .and_then(Result::ok)
+            let initial_value = build_active_ref(prepared)
                 .ok_or_else(|| type_error(ctx, "WebAssembly.Table: invalid initial value"))?;
             let table = with_active_caller(|caller| {
                 wasmi::Table::new(caller, ty, table_ref(initial_value))
@@ -2530,7 +2542,7 @@ pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
             let Some(state) = state_slot.as_mut() else {
                 return Err(range_error(ctx, "WebAssembly.Table.set: unknown table"));
             };
-            let value = build_ref(&state.funcs, &mut state.store, prepared)
+            let value = build_state_ref(state, prepared)
                 .map_err(|()| type_error(ctx, "WebAssembly.Table.set: invalid funcref"))?;
             id.and_then(|id| state.tables.get(id))
                 .copied()
@@ -2540,17 +2552,15 @@ pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
                         .map_err(|error| error.to_string())
                 })
         }
-        Err(_) => {
-            let funcs = with_active_state(|state| state.funcs.clone()).unwrap_or_default();
-            id.and_then(active_table).and_then(|table| {
-                with_active_caller(|caller| match build_ref(&funcs, caller, prepared) {
-                    Ok(value) => table
-                        .set(caller, index as u64, table_ref(value))
-                        .map_err(|error| error.to_string()),
-                    Err(()) => Err("invalid funcref".to_string()),
-                })
+        Err(_) => id.and_then(active_table).and_then(|table| {
+            let value = build_active_ref(prepared);
+            with_active_caller(|caller| match value {
+                Some(value) => table
+                    .set(caller, index as u64, table_ref(value))
+                    .map_err(|error| error.to_string()),
+                None => Err("invalid funcref".to_string()),
             })
-        }
+        }),
     };
     match result {
         Some(Ok(())) => Ok(Value::Undefined),
@@ -2577,7 +2587,7 @@ pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
             let Some(state) = state_slot.as_mut() else {
                 return Err(range_error(ctx, "WebAssembly.Table.grow: unknown table"));
             };
-            let value = build_ref(&state.funcs, &mut state.store, prepared)
+            let value = build_state_ref(state, prepared)
                 .map_err(|()| type_error(ctx, "WebAssembly.Table.grow: invalid funcref"))?;
             id.and_then(|id| state.tables.get(id))
                 .copied()
@@ -2587,17 +2597,15 @@ pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
                         .map_err(|error| error.to_string())
                 })
         }
-        Err(_) => {
-            let funcs = with_active_state(|state| state.funcs.clone()).unwrap_or_default();
-            id.and_then(active_table).and_then(|table| {
-                with_active_caller(|caller| match build_ref(&funcs, caller, prepared) {
-                    Ok(value) => table
-                        .grow(caller, delta as u64, table_ref(value))
-                        .map_err(|error| error.to_string()),
-                    Err(()) => Err("invalid funcref".to_string()),
-                })
+        Err(_) => id.and_then(active_table).and_then(|table| {
+            let value = build_active_ref(prepared);
+            with_active_caller(|caller| match value {
+                Some(value) => table
+                    .grow(caller, delta as u64, table_ref(value))
+                    .map_err(|error| error.to_string()),
+                None => Err("invalid funcref".to_string()),
             })
-        }
+        }),
     };
     match result {
         Some(Ok(old)) => Ok(Value::Num(old as f64)),
