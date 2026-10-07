@@ -354,7 +354,10 @@ fn expanded(property: &str, value: &str) -> Vec<(String, String, bool)> {
 /// `expanded` for a declaration block whose Document is in quirks mode.
 fn expanded_in(property: &str, value: &str, quirks: bool) -> Vec<(String, String, bool)> {
     let value = strip_css_comments(value);
-    let value = value.trim();
+    // CSSOM #parse-a-css-value parses a list of component values, so the end
+    // of the value closes open blocks and strings as it does in a sheet.
+    let value = close_at_end_of_input(value.trim());
+    let value = value.as_ref();
     if !valid_value(value)
         || property_names(property).is_empty()
         || (!property.starts_with("--") && value.is_empty())
@@ -1630,6 +1633,27 @@ mod tests {
             Some("none")
         );
         assert_eq!(expanded("anchor-name", "NoNe")[0].1, "none");
+    }
+
+    #[test]
+    fn set_property_closes_values_at_end_of_input() {
+        // CSSOM #parse-a-css-value / CSS Syntax 3 #consume-function: EOF
+        // closes open functions and strings, so these values are valid.
+        assert_eq!(
+            expanded("width", "calc(1px * pow(2, sqrt(100))"),
+            [(
+                "width".into(),
+                "calc(1px * pow(2, sqrt(100)))".into(),
+                false
+            )]
+        );
+        assert_eq!(expanded("color", "rgb(1, 2, 3")[0].1, "rgb(1, 2, 3)");
+        assert_eq!(expanded("font-family", "\"Open")[0].1, "\"Open\"");
+        // A newline still makes a bad string, and a stray closer or a
+        // top-level `;` still invalidates the value.
+        assert!(expanded("font-family", "\"Open\nSans\"").is_empty());
+        assert!(expanded("width", "calc(1px])").is_empty());
+        assert!(expanded("width", "1px; color: red").is_empty());
     }
 
     #[test]
