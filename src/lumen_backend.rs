@@ -597,6 +597,7 @@ struct HostState {
     canvas_text_metrics_slots: Option<Value>,
     canvas_context_slots: Option<Value>,
     webgl_slots: Option<Value>,
+    webgl_fast: webgl_host::FastCache,
     webgl: HashMap<usize, crate::webgl::Context>,
     import_maps: HashMap<u64, crate::import_maps::Handle>,
     permission_slots: Option<Value>,
@@ -710,6 +711,7 @@ impl HostState {
             canvas_text_metrics_slots: None,
             canvas_context_slots: None,
             webgl_slots: None,
+            webgl_fast: Default::default(),
             webgl: HashMap::new(),
             import_maps: HashMap::from([(0, crate::import_maps::Handle::default())]),
             permission_slots: None,
@@ -926,6 +928,7 @@ impl RetainedMemory for HostState {
             canvas_text_metrics_slots,
             canvas_context_slots,
             webgl_slots,
+            webgl_fast,
             webgl,
             import_maps,
             permission_slots,
@@ -1299,6 +1302,14 @@ impl RetainedMemory for HostState {
                 map.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .retained_bytes(),
+            ));
+        }
+        if webgl_fast.retained_bytes() > 0 {
+            visitor.opaque_storage(); // Weakly referenced object allocations.
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.webgl_fast",
+                webgl_fast as *const _ as usize,
+                webgl_fast.retained_bytes(),
             ));
         }
         if !webgl.is_empty() {
