@@ -2611,6 +2611,21 @@ mod desktop {
                 immediate = Some(Wake::Idle(deadline));
             }
 
+            // HTML #rendering-opportunity: after an expensive frame the
+            // deferral reserves time for other task sources. When none of them
+            // is runnable, keeping the reservation would only idle the event
+            // loop and halve the frame rate, so end it; tasks that arrive later
+            // keep their preference over the next frame.
+            if immediate.is_none() && render_not_before > Instant::now() {
+                render_not_before = Instant::now();
+                let _ = call_trust(
+                    &mut page,
+                    "deferRenderingUntil",
+                    &[Value::Num(now)],
+                    "rendering opportunity",
+                );
+                continue 'event_loop;
+            }
             let timer_wait = deadline
                 .map(|deadline| Duration::from_secs_f64(((deadline - now).max(0.0)) / 1000.0));
             let render_wait = match (
