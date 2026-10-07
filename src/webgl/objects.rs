@@ -738,17 +738,17 @@ impl Context {
                 };
                 if matrix != 0. {
                     match width {
-                        4 => g.uniform_matrix_2_f32_slice(l, false, &v),
-                        9 => g.uniform_matrix_3_f32_slice(l, false, &v),
-                        16 => g.uniform_matrix_4_f32_slice(l, false, &v),
+                        4 => g.uniform_matrix_2_f32_slice(l, false, v),
+                        9 => g.uniform_matrix_3_f32_slice(l, false, v),
+                        16 => g.uniform_matrix_4_f32_slice(l, false, v),
                         _ => return self.error(gl::INVALID_OPERATION),
                     }
                 } else {
                     match width {
-                        1 => g.uniform_1_f32_slice(l, &v),
-                        2 => g.uniform_2_f32_slice(l, &v),
-                        3 => g.uniform_3_f32_slice(l, &v),
-                        4 => g.uniform_4_f32_slice(l, &v),
+                        1 => g.uniform_1_f32_slice(l, v),
+                        2 => g.uniform_2_f32_slice(l, v),
+                        3 => g.uniform_3_f32_slice(l, v),
+                        4 => g.uniform_4_f32_slice(l, v),
                         _ => return self.error(gl::INVALID_OPERATION),
                     }
                 }
