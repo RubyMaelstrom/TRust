@@ -14080,6 +14080,18 @@ fn unrendered_pseudo_element(name: &str, functional: bool) -> bool {
 /// escapes — `.md\:flex`, `.w-1\/2`, `.hover\:underline`, `.w-\[10px\]`
 /// are the classes `md:flex`, `w-1/2`, … — so a parser without them drops
 /// every responsive/state-variant rule on such sites.
+/// CSS Syntax 3 §4.2 ident code point, with the editor's draft's
+/// non-ASCII ident code points (aligned with HTML's valid custom element
+/// names).
+fn is_ident_code_point(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '-' | '_')
+        || matches!(c as u32,
+            0xB7 | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0x37D | 0x37F..=0x1FFF
+            | 0x200C | 0x200D | 0x203F | 0x2040 | 0x2070..=0x218F | 0x2C00..=0x2FEF
+            | 0x3001..=0xD7FF | 0xF900..=0xFDCF | 0xFDF0..=0xFFFD | 0x10000..)
+}
+
 fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
     let mut out = String::new();
     while let Some(&c) = chars.peek() {
@@ -14095,13 +14107,19 @@ fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String>
                 if chars.peek().is_some_and(|c| c.is_ascii_whitespace()) {
                     chars.next();
                 }
-                if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                    out.push(ch);
-                }
-            } else if let Some(lit) = chars.next() {
-                out.push(lit);
+                // CSS Syntax 3 #consume-escaped-code-point: zero, a
+                // surrogate or a value past U+10FFFF is U+FFFD.
+                let value = u32::from_str_radix(&hex, 16).unwrap_or(0);
+                out.push(
+                    char::from_u32(value)
+                        .filter(|_| value != 0)
+                        .unwrap_or('\u{FFFD}'),
+                );
+            } else {
+                // An escape at the end of the input is U+FFFD.
+                out.push(chars.next().unwrap_or('\u{FFFD}'));
             }
-        } else if c.is_alphanumeric() || matches!(c, '-' | '_' | '*') {
+        } else if is_ident_code_point(c) || c == '*' {
             out.push(c);
             chars.next();
         } else {
@@ -21108,6 +21126,32 @@ mod tests {
         );
         let (_bytes, _opaque, unavailable) = styled.retained_memory();
         assert_eq!(unavailable, 0);
+    }
+
+    #[test]
+    fn selector_names_use_css_ident_code_points() {
+        // CSS Syntax 3 §4.2 ident code points (non-ASCII ranges included,
+        // U+FFFD among them) and #consume-escaped-code-point (zero,
+        // surrogates and values past U+10FFFF escape to U+FFFD).
+        let dom = Dom::parse_document(
+            "<p id=\u{FFFD} class='caf\u{e9} \u{1F600}'>a</p><p id=x\u{d7}y>b</p>",
+        );
+        let p = dom.get_by_id("\u{FFFD}").unwrap();
+        for selector in [
+            "#\u{FFFD}",
+            "#\\FFFD",
+            "#\\0",
+            "#\\D800",
+            "#\\110000",
+            ".caf\u{e9}",
+            ".\u{1F600}",
+        ] {
+            let list = SelectorList::parse(selector).unwrap_or_else(|| panic!("{selector}"));
+            assert_eq!(dom.query(DOCUMENT, &list, false), [p], "{selector}");
+        }
+        // U+00D7 is not an ident code point, so it cannot continue a name.
+        assert!(SelectorList::parse("#x\u{d7}y").is_none());
+        assert!(selector_parses("#x\\D7y"));
     }
 
     #[test]
