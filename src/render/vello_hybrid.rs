@@ -1,11 +1,12 @@
-//! Thin Vello Hybrid/wgpu adapter.
+//! Thin Vello GPU (formerly Vello Hybrid)/wgpu adapter for TRust's Hybrid
+//! renderer.
 //!
 //! Browser, layout, and display-list code never see Vello or wgpu types.  The
-//! adapter retains the device, pipelines, glyph/image atlases and surface
-//! across frames; only Vello Hybrid's documented per-frame `Scene` packet is
-//! rebuilt.  The CPU backend remains the reference and clean fallback.
+//! adapter retains the device, pipelines, glyph/image atlases, depth buffer and
+//! surface across frames; only Vello GPU's documented per-frame `Scene` packet
+//! is rebuilt.  The CPU backend remains the reference and clean fallback.
 //!
-//! Vello Hybrid 0.2 limitations relevant to this adapter are intentionally
+//! Vello GPU 0.3 limitations relevant to this adapter are intentionally
 //! quarantined here: mask layers and complex filter graphs can panic, some
 //! non-isolated destructive blends are unsupported, glyph-atlas caching is
 //! still experimental, and several allocation failures panic instead of
@@ -22,21 +23,22 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vello_common::color::PremulRgba8;
 use vello_common::kurbo::{Affine, BezPath, Rect};
 use vello_common::paint::ImageSource;
 use vello_common::peniko::{ImageBrush, ImageQuality, ImageSampler};
-use vello_hybrid::{Pixmap, RenderSize, RenderTargetConfig, Resources, TextureBindings};
+use vello_gpu::{
+    ClearSettings, RenderSize, RenderTargetConfig, Resources, TargetInit, TextureBindings,
+};
 use wgpu::{CurrentSurfaceTexture, SurfaceConfiguration, TextureFormat, TextureView};
 use winit::window::Window;
 
 use super::vello_cpu::{
     ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, conic_transform,
     decoration_strokes, erase_blend, gradient_extend, inset_shadow_hole, inset_shadow_ring,
-    offset_shape, outside_shape_path, point_bounds, radial_aspect_transform, radial_gradient,
-    rect_is_visible, rect_path, shape_fill, shape_is_visible, shape_path, simple_rounded_rect,
-    text_shadow_blur, vello_affine, vello_blend, vello_color, vello_css_filter, vello_rect,
-    vello_stops, vello_stroke,
+    offset_shape, outside_shape_path, point_bounds, premultiplied_pixmap, premultiply_rgba,
+    radial_aspect_transform, radial_gradient, rect_is_visible, rect_path, shape_fill,
+    shape_is_visible, shape_path, simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend,
+    vello_color, vello_css_filter, vello_rect, vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
@@ -46,7 +48,7 @@ use super::{
 use crate::core::{CssPoint, PhysicalSize};
 
 const GPU_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
-// Vello Hybrid 0.2's default image atlas is 4096x4096. Keep uploads within
+// Vello GPU 0.3's default image atlases are 4096x4096. Keep uploads within
 // that allocation boundary even on devices advertising larger 2D textures.
 const HYBRID_IMAGE_ATLAS_LIMIT: u32 = 4096;
 
@@ -89,9 +91,12 @@ pub struct VelloHybridRenderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    renderer: vello_hybrid::Renderer,
+    renderer: vello_gpu::Renderer,
     resources: Resources,
     texture_bindings: TextureBindings,
+    /// Depth24Plus attachment for early-z rejection of overdrawn opaque strips,
+    /// recreated when the render size changes.
+    depth: Option<((u16, u16), TextureView)>,
     surface: Option<wgpu::Surface<'static>>,
     surface_config: Option<SurfaceConfiguration>,
     window: Option<Arc<Window>>,
@@ -202,12 +207,12 @@ impl VelloHybridRenderer {
         surface_copy_dst: bool,
     ) -> Result<Self, String> {
         ensure_device_size(&device, size)?;
-        let (renderer, resources) = vello_hybrid::Renderer::new(
+        let (renderer, resources) = vello_gpu::Renderer::new(
             &device,
             &RenderTargetConfig {
                 format,
-                width: size.width.max(1),
-                height: size.height.max(1),
+                width: vello_extent(size.width)?,
+                height: vello_extent(size.height)?,
             },
         );
         let failure = Arc::new(Mutex::new(None));
@@ -229,6 +234,7 @@ impl VelloHybridRenderer {
             renderer,
             resources,
             texture_bindings: TextureBindings::new(),
+            depth: None,
             surface,
             surface_config,
             window,
@@ -675,10 +681,24 @@ impl VelloHybridRenderer {
 
     fn render_to_view(
         &mut self,
-        scene: &vello_hybrid::Scene,
+        scene: &vello_gpu::Scene,
         view: &TextureView,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), String> {
+        let render_size = RenderSize {
+            width: scene.width(),
+            height: scene.height(),
+        };
+        let key = (render_size.width, render_size.height);
+        let depth = match &self.depth {
+            Some((size, view)) if *size == key => view.clone(),
+            _ => {
+                let view =
+                    vello_gpu::Renderer::create_depth_texture_view(&self.device, &render_size);
+                self.depth = Some((key, view.clone()));
+                view
+            }
+        };
         self.renderer
             .render(
                 scene,
@@ -686,12 +706,13 @@ impl VelloHybridRenderer {
                 &self.device,
                 &self.queue,
                 encoder,
-                &RenderSize {
-                    width: u32::from(scene.width()),
-                    height: u32::from(scene.height()),
-                },
+                &render_size,
                 view,
+                Some(&depth),
                 &self.texture_bindings,
+                TargetInit::Clear(ClearSettings::Viewport {
+                    color: vello_common::color::AlphaColor::TRANSPARENT,
+                }),
             )
             .map_err(|error| format!("Vello Hybrid render failed: {error}"))
     }
@@ -700,7 +721,7 @@ impl VelloHybridRenderer {
         &mut self,
         scene: &Scene,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<vello_hybrid::Scene, String> {
+    ) -> Result<vello_gpu::Scene, String> {
         let size = scene.viewport.physical;
         let width = u16::try_from(size.width)
             .map_err(|_| format!("framebuffer width {} exceeds Vello limit", size.width))?;
@@ -734,7 +755,7 @@ impl VelloHybridRenderer {
             }
         }
 
-        let mut target = vello_hybrid::Scene::new(width, height);
+        let mut target = vello_gpu::Scene::new(width, height);
         let device_transform = Affine::scale(scene.viewport.scale_factor.get());
         let mut transforms = vec![device_transform];
         let mut logical_transforms = vec![Affine2d::IDENTITY];
@@ -796,7 +817,7 @@ impl VelloHybridRenderer {
                 }
                 DisplayCommand::PopClip => {
                     if clips.pop() {
-                        target.pop_clip_path();
+                        target.pop_clip();
                     }
                 }
                 DisplayCommand::PushTransform(transform) => {
@@ -920,7 +941,7 @@ impl VelloHybridRenderer {
                         target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
                         target.fill_path(&inset_shadow_ring(shape, &hole));
                         target.set_fill_rule(vello_common::peniko::Fill::NonZero);
-                        target.pop_clip_path();
+                        target.pop_clip();
                     }
                 }
                 DisplayCommand::Shadow {
@@ -959,7 +980,7 @@ impl VelloHybridRenderer {
                         // same unblurred fallback as the CPU reference.
                         target.fill_path(&shape_path(&shifted));
                     }
-                    target.pop_clip_path();
+                    target.pop_clip();
                 }
                 DisplayCommand::HitRegion(_) => {}
                 Primitive::FillRect { rect, color } => {
@@ -1056,7 +1077,7 @@ impl VelloHybridRenderer {
                         *transforms.last().unwrap(),
                     );
                     if clip.is_some() {
-                        target.pop_clip_path();
+                        target.pop_clip();
                     }
                 }
                 Primitive::Image {
@@ -1088,7 +1109,7 @@ impl VelloHybridRenderer {
                         transforms.last().unwrap().as_coeffs(),
                     )?;
                     if clip.is_some() {
-                        target.pop_clip_path();
+                        target.pop_clip();
                     }
                 }
             }
@@ -1100,7 +1121,7 @@ impl VelloHybridRenderer {
     fn paint_image(
         &mut self,
         scene: &Scene,
-        target: &mut vello_hybrid::Scene,
+        target: &mut vello_gpu::Scene,
         encoder: &mut wgpu::CommandEncoder,
         handle: ImageHandle,
         rect: CssRect,
@@ -1151,8 +1172,7 @@ impl VelloHybridRenderer {
                         }
                     });
                     if let Some(id) = cached_id {
-                        let pixmap =
-                            Pixmap::from_parts_with_opacity(pixels, width, height, image.has_alpha);
+                        let pixmap = premultiplied_pixmap(pixels, width, height, image.has_alpha);
                         if self.renderer.update_image(
                             &self.resources,
                             &self.device,
@@ -1226,7 +1246,7 @@ impl VelloHybridRenderer {
                 target.fill_rect(&vello_rect(rect));
                 return Ok(());
             };
-            let pixmap = Pixmap::from_parts_with_opacity(pixels, width, height, image.has_alpha);
+            let pixmap = premultiplied_pixmap(pixels, width, height, image.has_alpha);
             let id = self.renderer.upload_image(
                 &mut self.resources,
                 &self.device,
@@ -1314,7 +1334,7 @@ impl VelloHybridRenderer {
         }
         target.fill_rect(&painted);
         if fit == ImageFit::Cover {
-            target.pop_clip_path();
+            target.pop_clip();
         }
         target.reset_paint_transform();
         Ok(())
@@ -1406,6 +1426,11 @@ fn preferred_surface_format(formats: &[TextureFormat]) -> Option<TextureFormat> 
         .or_else(|| formats.first().copied())
 }
 
+fn vello_extent(pixels: u32) -> Result<u16, String> {
+    u16::try_from(pixels.max(1))
+        .map_err(|_| format!("framebuffer extent {pixels} exceeds Vello's 16-bit scene limit"))
+}
+
 fn ensure_device_size(device: &wgpu::Device, size: PhysicalSize) -> Result<(), String> {
     if size.width > u16::MAX as u32 || size.height > u16::MAX as u32 {
         return Err(format!(
@@ -1445,7 +1470,7 @@ fn bounded_image_dimensions(width: u32, height: u32, limit: u32) -> Option<(u32,
     }
 }
 
-fn hybrid_image_pixels(image: &ImageResource, limit: u32) -> Option<(u16, u16, Vec<PremulRgba8>)> {
+fn hybrid_image_pixels(image: &ImageResource, limit: u32) -> Option<(u16, u16, Vec<u8>)> {
     let expected = usize::try_from(image.width)
         .ok()
         .and_then(|width| {
@@ -1481,24 +1506,7 @@ fn hybrid_image_pixels(image: &ImageResource, limit: u32) -> Option<(u16, u16, V
     ))
 }
 
-fn premultiply_rgba(rgba: &[u8]) -> Vec<PremulRgba8> {
-    rgba.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|pixel| {
-            let alpha = u16::from(pixel[3]);
-            let premul = |component| ((u16::from(component) * alpha) / 255) as u8;
-            PremulRgba8 {
-                r: premul(pixel[0]),
-                g: premul(pixel[1]),
-                b: premul(pixel[2]),
-                a: pixel[3],
-            }
-        })
-        .collect()
-}
-
-fn apply_clips(target: &mut vello_hybrid::Scene, clips: &mut RasterClips<'_>, transform: Affine) {
+fn apply_clips(target: &mut vello_gpu::Scene, clips: &mut RasterClips<'_>, transform: Affine) {
     if clips.apply(|shape, at| {
         target.set_transform(at);
         target.set_fill_rule(shape_fill(shape));
@@ -1509,7 +1517,7 @@ fn apply_clips(target: &mut vello_hybrid::Scene, clips: &mut RasterClips<'_>, tr
     }
 }
 
-fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
+fn set_brush(target: &mut vello_gpu::Scene, brush: &PaintBrush) {
     match brush {
         PaintBrush::Solid(color) => target.set_paint(vello_color(*color)),
         PaintBrush::LinearGradient {
@@ -1577,7 +1585,7 @@ fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
 }
 
 fn paint_glyphs(
-    target: &mut vello_hybrid::Scene,
+    target: &mut vello_gpu::Scene,
     resources: &mut Resources,
     origin: CssPoint,
     shaped: &crate::text::ShapedText,
@@ -1606,7 +1614,8 @@ fn paint_glyphs(
         if let Some(skew) = skew {
             fill = fill.glyph_transform(Affine::skew(skew, 0.0));
         }
-        fill.fill_glyphs(glyphs());
+        // Unrenderable glyphs are skipped; the rest of the run paints.
+        let _ = fill.fill_glyphs(glyphs());
         if run.synth_bold {
             target.set_stroke(super::vello_cpu::synthetic_bold_stroke(run.font_size));
             let mut stroke = target
@@ -1617,13 +1626,13 @@ fn paint_glyphs(
             if let Some(skew) = skew {
                 stroke = stroke.glyph_transform(Affine::skew(skew, 0.0));
             }
-            stroke.stroke_glyphs(glyphs());
+            let _ = stroke.stroke_glyphs(glyphs());
         }
     }
 }
 
 fn paint_decorations(
-    target: &mut vello_hybrid::Scene,
+    target: &mut vello_gpu::Scene,
     origin: CssPoint,
     shaped: &crate::text::ShapedText,
     decoration: &crate::render::TextDecorationPaint,
@@ -1726,7 +1735,7 @@ mod tests {
                     .count();
                 assert!(colored > 100, "missing color bitmap at {size}px: {colored}");
                 assert_eq!(
-                    hybrid.renderer.atlas_texture().size().depth_or_array_layers,
+                    hybrid.resources.image_atlas_count(),
                     1,
                     "temporary glyph images must release their atlas allocations"
                 );
@@ -1747,9 +1756,9 @@ mod tests {
         // Both already-aligned and padded CPU rows. A deliberately small
         // atlas forces growth without allocating a production-sized page.
         for width in [64, 65] {
-            let mut settings = vello_hybrid::RenderSettings::default();
+            let mut settings = vello_gpu::RenderSettings::default();
             settings.memory_settings.image_atlas_config.atlas_size = (96, 128);
-            (hybrid.renderer, hybrid.resources) = vello_hybrid::Renderer::new_with(
+            (hybrid.renderer, hybrid.resources) = vello_gpu::Renderer::new_with(
                 &hybrid.device,
                 &RenderTargetConfig {
                     format: hybrid.format,
@@ -1800,7 +1809,7 @@ mod tests {
             // existing allocation. The copy must not overwrite that update.
             scene.primitives = vec![command(second, 32.0), command(first, 0.0)];
             let frame = hybrid.render_rgba(&scene).unwrap();
-            assert!(hybrid.renderer.atlas_texture().size().depth_or_array_layers >= 2);
+            assert!(hybrid.resources.image_atlas_count() >= 2);
             for y in [1, 16, 30] {
                 assert_eq!(
                     &frame.pixels[(y * 64 + 16) * 4..][..4],
@@ -1911,7 +1920,7 @@ mod tests {
         };
         let (width, height, pixels) = hybrid_image_pixels(&image, 2).unwrap();
         assert_eq!((width, height), (2, 1));
-        assert_eq!(pixels.len(), 2);
+        assert_eq!(pixels.len(), 2 * 4, "two premultiplied RGBA8 pixels");
         assert_eq!((image.width, image.height), (4, 2));
     }
 }

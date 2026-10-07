@@ -194,7 +194,8 @@ fn draw_with_mode(
                 y: 24.0,
             }]
             .into_iter(),
-        );
+        )
+        .expect("test glyph renders");
     context.render(&mut pixmap, resources);
     OwnedRgbaFrame {
         size: PhysicalSize::new(64, 64),
