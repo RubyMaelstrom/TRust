@@ -216,6 +216,14 @@ pub struct DocumentTypeInfo {
     pub system_id: String,
 }
 
+/// The DOMException a failed DOM #concept-node-ensure-pre-insertion-validity
+/// check throws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreInsertError {
+    HierarchyRequest,
+    NotFound,
+}
+
 /// DOM strings (text, attributes, CSSOM values) live as Lumen engine text (see
 /// `lumen_backend::host_arg_string`): a character in U+10F800..=U+10FFFF is the pair of
 /// private-use scalars that encodes its surrogate pair, and a lone surrogate is one such scalar.
@@ -8425,6 +8433,104 @@ impl Dom {
             cur = self.parent_composed(p);
         }
         false
+    }
+
+    /// DOM #concept-node-ensure-pre-insertion-validity ("ensure pre-insert
+    /// validity") for `node` inserted into `parent` before `child`, where
+    /// `exclude` says whether a child is in the childrenToExclude list (the
+    /// replaced child of #concept-node-replace, or every child for
+    /// #dom-parentnode-replacechildren). The steps run in normative order, so
+    /// the first applicable error wins. Frame Documents stored as arena
+    /// children of their container are separate trees, not children.
+    pub fn ensure_pre_insert_validity(
+        &self,
+        node: NodeId,
+        parent: NodeId,
+        child: Option<NodeId>,
+        exclude: &dyn Fn(NodeId) -> bool,
+    ) -> Result<(), PreInsertError> {
+        use PreInsertError::{HierarchyRequest, NotFound};
+        // Step 1.
+        if !matches!(
+            self.nodes[parent].data,
+            NodeData::Document | NodeData::Fragment | NodeData::Element { .. }
+        ) {
+            return Err(HierarchyRequest);
+        }
+        // Steps 2–3.
+        if self.is_host_including_inclusive_ancestor(node, parent) {
+            return Err(HierarchyRequest);
+        }
+        if child.is_some_and(|child| self.nodes[child].parent != Some(parent)) {
+            return Err(NotFound);
+        }
+        // Step 4: a DocumentFragment, DocumentType, Element or CharacterData.
+        if matches!(self.nodes[node].data, NodeData::Document) {
+            return Err(HierarchyRequest);
+        }
+        // Step 5.
+        if !matches!(self.nodes[parent].data, NodeData::Document) {
+            return match self.nodes[node].data {
+                NodeData::Doctype(_) => Err(HierarchyRequest),
+                _ => Ok(()),
+            };
+        }
+        let tree_children = |id: NodeId| {
+            self.child_iter(id)
+                .filter(|&c| !matches!(self.nodes[c].data, NodeData::Document))
+        };
+        let is_element = |id: NodeId| matches!(self.nodes[id].data, NodeData::Element { .. });
+        let is_doctype = |id: NodeId| matches!(self.nodes[id].data, NodeData::Doctype(_));
+        let element_child_kept = || tree_children(parent).any(|c| is_element(c) && !exclude(c));
+        match self.nodes[node].data {
+            // Steps 6–7: Text (including CDATASection) cannot be a document
+            // child; other CharacterData can.
+            NodeData::Text(_) | NodeData::CData(_) => Err(HierarchyRequest),
+            NodeData::Comment(_) | NodeData::ProcessingInstruction { .. } => Ok(()),
+            // Steps 8–9.
+            NodeData::Fragment | NodeData::Element { .. } => {
+                if matches!(self.nodes[node].data, NodeData::Fragment) {
+                    let elements = tree_children(node).filter(|&c| is_element(c)).count();
+                    let text = tree_children(node).any(|c| {
+                        matches!(self.nodes[c].data, NodeData::Text(_) | NodeData::CData(_))
+                    });
+                    if elements > 1 || text {
+                        return Err(HierarchyRequest);
+                    }
+                    if elements == 0 {
+                        return Ok(());
+                    }
+                }
+                let doctype_follows = child.is_some_and(|child| {
+                    std::iter::successors(self.nodes[child].next_sibling, |&s| {
+                        self.nodes[s].next_sibling
+                    })
+                    .any(is_doctype)
+                });
+                let child_is_kept_doctype =
+                    child.is_some_and(|child| is_doctype(child) && !exclude(child));
+                if element_child_kept() || doctype_follows || child_is_kept_doctype {
+                    Err(HierarchyRequest)
+                } else {
+                    Ok(())
+                }
+            }
+            // Steps 10–11: a doctype.
+            _ => {
+                let doctype_kept = tree_children(parent).any(|c| is_doctype(c) && !exclude(c));
+                let element_precedes = child.is_some_and(|child| {
+                    std::iter::successors(self.nodes[child].prev_sibling, |&s| {
+                        self.nodes[s].prev_sibling
+                    })
+                    .any(is_element)
+                });
+                if doctype_kept || element_precedes || (child.is_none() && element_child_kept()) {
+                    Err(HierarchyRequest)
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     /// Document-order walk of the COMPOSED tree: light children plus
@@ -24740,6 +24846,76 @@ mod tests {
         assert_eq!(dom.epoch(), before_epoch + 1);
         assert_eq!(dom.style_epoch, before_style_epoch + 1);
         assert!(dom.take_dirty_targets().is_none());
+    }
+
+    #[test]
+    fn pre_insert_validity_follows_dom_order() {
+        // DOM #concept-node-ensure-pre-insertion-validity, steps in order.
+        use PreInsertError::{HierarchyRequest, NotFound};
+        let mut dom = Dom::new();
+        let doc = dom.create_document("application/xml");
+        let doctype = dom.create_doctype("r", "", "");
+        let root = dom.create_element_ns("", None, "r");
+        dom.append(doc, doctype);
+        dom.append(doc, root);
+        let text = dom.create_text("t");
+        let comment = dom.create_comment("c");
+        let element = dom.create_element_ns("", None, "e");
+        let other_doctype = dom.create_doctype("o", "", "");
+        let check = |dom: &Dom, node, parent, child, exclude: Option<NodeId>| {
+            dom.ensure_pre_insert_validity(node, parent, child, &|c| Some(c) == exclude)
+        };
+        // Step 1 precedes step 3: a Text parent is checked before the child.
+        assert_eq!(
+            check(&dom, element, text, Some(comment), None),
+            Err(HierarchyRequest)
+        );
+        assert_eq!(
+            check(&dom, element, root, Some(comment), None),
+            Err(NotFound)
+        );
+        assert_eq!(check(&dom, root, root, None, None), Err(HierarchyRequest));
+        assert_eq!(check(&dom, doc, root, None, None), Err(HierarchyRequest));
+        assert_eq!(
+            check(&dom, other_doctype, root, None, None),
+            Err(HierarchyRequest)
+        );
+        assert_eq!(check(&dom, text, doc, None, None), Err(HierarchyRequest));
+        assert_eq!(check(&dom, comment, doc, None, None), Ok(()));
+        // A second document element or doctype, or one out of order.
+        assert_eq!(check(&dom, element, doc, None, None), Err(HierarchyRequest));
+        assert_eq!(check(&dom, element, doc, Some(root), Some(root)), Ok(()));
+        assert_eq!(
+            check(&dom, element, doc, Some(doctype), Some(root)),
+            Err(HierarchyRequest)
+        );
+        assert_eq!(
+            check(&dom, other_doctype, doc, None, None),
+            Err(HierarchyRequest)
+        );
+        assert_eq!(
+            check(&dom, other_doctype, doc, Some(doctype), Some(doctype)),
+            Ok(())
+        );
+        assert_eq!(
+            check(&dom, other_doctype, doc, Some(root), Some(root)),
+            Err(HierarchyRequest)
+        );
+        // A fragment with two elements or a Text child cannot become one.
+        let fragment = dom.new_node(NodeData::Fragment);
+        dom.append(fragment, text);
+        assert_eq!(
+            check(&dom, fragment, doc, Some(root), Some(root)),
+            Err(HierarchyRequest)
+        );
+        dom.detach(text);
+        assert_eq!(check(&dom, fragment, doc, None, None), Ok(()));
+        dom.append(fragment, element);
+        assert_eq!(check(&dom, fragment, doc, Some(root), Some(root)), Ok(()));
+        assert_eq!(
+            check(&dom, fragment, doc, None, None),
+            Err(HierarchyRequest)
+        );
     }
 
     #[test]

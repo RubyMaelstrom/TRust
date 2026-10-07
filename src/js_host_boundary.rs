@@ -55,7 +55,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__dom_create_doctype", 4),
     ("__dom_doctype", 1),
     ("__dom_append", 2),
-    ("__dom_insert_before", 3),
+    ("__dom_insert_before", 4),
     ("__dom_detach", 1),
     ("__dom_owner_document", 1),
     ("__dom_adopt", 2),

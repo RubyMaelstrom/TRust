@@ -102,6 +102,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const nodeIds = __platform_slots("nodes", privateSlots());
     const internalSlots = __platform_slots("internals", privateSlots());
     const noInternals = Object.freeze(Object.create(null));
+    // Web IDL #dfn-attribute-getter: a regular attribute's getter throws a
+    // TypeError unless its receiver is a platform object implementing the
+    // interface. Prototype objects (Document.prototype, …) are not nodes, so
+    // duck-typing probes such as testharness's is_node() can tell them apart.
+    function requireNodeReceiver(object) {
+        if (nodeIds.get(object) === undefined) throw new TypeError("Illegal invocation");
+    }
     function internalsOf(object) {
         return internalSlots.get(object) || noInternals;
     }
@@ -1416,7 +1423,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HTML's already-started state belongs to the script object, not a global
     // forever-growing ID census. The native graph preserves a live wrapper.
     const SCRIPTS_STARTED = new WeakSet();
+    // DOM #concept-node-insert runs post-connection steps (preparing scripts)
+    // only after every node of a DocumentFragment is inserted, so a script
+    // that mutates the tree cannot interrupt that insertion.
+    let deferredScriptRuns = null;
+    function deferScriptRuns() {
+        if (deferredScriptRuns !== null) return false;
+        deferredScriptRuns = [];
+        return true;
+    }
+    function takeDeferredScriptRuns(owner) {
+        if (!owner) return [];
+        const nodes = deferredScriptRuns;
+        deferredScriptRuns = null;
+        return nodes;
+    }
     function maybeRunScript(node) {
+        if (deferredScriptRuns !== null) {
+            if (node) deferredScriptRuns.push(node);
+            return;
+        }
         if (!node || node.localName !== "script" || SCRIPTS_STARTED.has(node)) return;
         const ty = (node.getAttribute("type") || "").trim().toLowerCase();
         if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript" && ty !== "module" && ty !== "importmap") return;
@@ -5776,7 +5802,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             nodeIds.set(this, id);
         }
         // An Attr has no arena node (DOM #interface-attr): nodeType 2.
-        get nodeType() { return __dom_node_type(nodeIds.get(this)) || (internalsOf(this).attrNode ? 2 : 0); }
+        get nodeType() {
+            const id = nodeIds.get(this);
+            if (id !== undefined) return __dom_node_type(id);
+            if (internalsOf(this).attrNode) return 2;
+            throw new TypeError("Illegal invocation");
+        }
         get nodeName() {
             const t = __dom_tag(nodeIds.get(this));
             if (t) return t.toUpperCase();
@@ -5870,7 +5901,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // indistinguishable from a no-op.
         get ownerDocument() {
             const document = __dom_owner_document(this);
-            if (document === null && internalsOf(this).attrNode) return internalsOf(this).attrNode.document;
+            // DOM #concept-node-adopt: an element's attributes share its node
+            // document; a detached Attr keeps its own.
+            if (document === null && internalsOf(this).attrNode) {
+                const state = internalsOf(this).attrNode;
+                attrValue(state);
+                if (state.element) state.document = state.element.ownerDocument;
+                return state.document;
+            }
             return document && typeof document === "object" ? document : wrap(document);
         }
         get isConnected() {
@@ -5885,12 +5923,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Document.adoptNode is defined on Document, below.  Keeping the
         // operation there preserves the DOM's target-document semantics.
         appendChild(c) {
-            if (nodeIds.get(this) === undefined) rejectAttrParent(this);
-            if (c && c.nodeType === 11 && !internalsFor(c).host) { for (const k of Array.from(c.childNodes)) this.appendChild(k); return c; }
-            // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
-            // (returns false, unmutated) when `c` is an inclusive ancestor.
+            insertionArgument(this, c, null, "appendChild");
+            if (c.nodeType === 11) {
+                preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), null, 2), false);
+                const nodes = Array.from(c.childNodes);
+                if (!nodes.length) return c;
+                const previous = this.lastChild, owner = deferScriptRuns();
+                let scripts;
+                moSuppressed++;
+                try { for (const k of nodes) this.appendChild(k); }
+                finally { moSuppressed--; scripts = takeDeferredScriptRuns(owner); }
+                moFragmentInsert(this, c, nodes, previous, null);
+                for (const script of scripts) maybeRunScript(script);
+                return c;
+            }
+            // DOM #concept-node-ensure-pre-insertion-validity: the syscall
+            // refuses (unmutated) an insertion that is not valid.
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
-            if (!__dom_append(nodeIds.get(this), nodeIds.get(c))) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            if (oldParent && MO.length) moAdoptRemove(this, c, null, oldParent);
+            preInsertResult(__dom_append(nodeIds.get(this), nodeIds.get(c)), false);
             rangesRemove(c, oldParent, oldIndex);
             rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
             syncWrapperSubtreeRetention(nodeIds.get(c));
@@ -5904,12 +5955,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return c;
         }
         insertBefore(c, ref) {
-            if (nodeIds.get(this) === undefined) rejectAttrParent(this);
-            if (c && c.nodeType === 11 && !internalsFor(c).host) { for (const k of Array.from(c.childNodes)) this.insertBefore(k, ref); return c; }
+            if (arguments.length < 2) throw new TypeError("Failed to execute 'insertBefore' on 'Node': 2 arguments required.");
+            if (ref === undefined) ref = null;
+            if (ref !== null) nodeArgument(ref, "insertBefore", 2);
+            insertionArgument(this, c, ref, "insertBefore");
+            if (c.nodeType === 11) {
+                preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null, 2), false);
+                const nodes = Array.from(c.childNodes);
+                if (!nodes.length) return c;
+                const previous = ref ? ref.previousSibling : this.lastChild, owner = deferScriptRuns();
+                let scripts;
+                moSuppressed++;
+                try { for (const k of nodes) this.insertBefore(k, ref); }
+                finally { moSuppressed--; scripts = takeDeferredScriptRuns(owner); }
+                moFragmentInsert(this, c, nodes, previous, ref);
+                for (const script of scripts) maybeRunScript(script);
+                return c;
+            }
+            // DOM #concept-node-pre-insert steps 1–3: validate, then insert a
+            // node placed before itself before its next sibling.
+            if (ref === c) {
+                preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), nodeIds.get(ref), 2), false);
+                ref = c.nextSibling;
+            }
             const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
-            const insertion = __dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null);
-            if (insertion === -1) throw new DOMException("The reference node is not a child of this node.", "NotFoundError");
-            if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            if (oldParent && MO.length) moAdoptRemove(this, c, ref, oldParent);
+            preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null, 0), false);
             rangesRemove(c, oldParent, oldIndex);
             rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
             syncWrapperSubtreeRetention(nodeIds.get(c));
@@ -5923,9 +5994,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return c;
         }
         removeChild(c) {
+            nodeArgument(c, "removeChild", 1);
             // DOM §4.2.3 pre-remove: validate before mutation-observer or custom-element side
             // effects. A node belonging to some other parent is not silently detached.
-            if (!c || !rangeSame(rangeParent(c),this)) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
+            if (internalsOf(c).attrNode || !rangeSame(rangeParent(c),this)) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
             rangesRemove(c, this, rangeIndex(c));
             if (internalsFor(c).trustLN === "base") baseHrefCache = null;
             moChildRemove(this, c);
@@ -5937,19 +6009,39 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return c;
         }
         replaceChild(n, old) {
-            if (nodeIds.get(this) === undefined) rejectAttrParent(this);
-            if (n && n.nodeType === 11 && !internalsFor(n).host) return replaceWithFragment(this, n, old);
-            const prev = old.previousSibling, next = old.nextSibling;
+            if (arguments.length < 2) throw new TypeError("Failed to execute 'replaceChild' on 'Node': 2 arguments required.");
+            nodeArgument(old, "replaceChild", 2);
+            insertionArgument(this, n, old, "replaceChild");
+            // DOM #concept-node-replace: an Attr is never a child.
+            if (internalsOf(old).attrNode) {
+                const type = this.nodeType;
+                preInsertResult(type === 1 || type === 9 || type === 11 ? -1 : false, true);
+            }
+            if (n.nodeType === 11) {
+                preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(n), nodeIds.get(old), 3), true);
+                return replaceWithFragment(this, n, old);
+            }
+            // DOM #concept-node-replace steps 2–4: the record's siblings.
+            const prev = old.previousSibling;
+            let next = old.nextSibling;
+            if (next === n) next = n.nextSibling;
             const oldParent = rangeParent(n), oldIndex = oldParent ? rangeIndex(n) : 0;
-            // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
-            // syscall refuses (unmutated) when `n` is an inclusive ancestor.
-            const insertion = __dom_insert_before(nodeIds.get(this), nodeIds.get(n), nodeIds.get(old));
-            if (insertion === -1) throw new DOMException("The node to be replaced is not a child of this node.", "NotFoundError");
-            if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            // DOM #concept-node-replace adopts the node first, removing it
+            // from its parent (even this one) with that parent's record.
+            if (oldParent && MO.length) {
+                preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(n), nodeIds.get(old), 3), true);
+                moChildRemove(oldParent, n);
+            }
+            // Validity (DOM #concept-node-replace step 1) before any side
+            // effect: the insert syscall refuses an invalid replacement.
+            preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(n), nodeIds.get(old), 1), true);
             rangesRemove(n, oldParent, oldIndex);
             const replacementIndex = rangeIndex(n);
             if (n === old) {
                 rangesInsert(this,replacementIndex);
+                if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n], removedNodes: [],
+                    previousSibling: prev, nextSibling: next });
+                else moEnqueue();
                 return old;
             }
             // DOM #concept-node-replace removes the old child before the
@@ -5975,14 +6067,64 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return old;
         }
         remove() { const parent = rangeParent(this); if (parent) Node.prototype.removeChild.call(parent,this); }
-        append(...ns) { for (const n of ns) this.appendChild(n && typeof n === "object" ? n : g.document.createTextNode(String(n))); }
-        prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), f); }
+        // DOM #dom-parentnode-append / -prepend: pre-insert the result of
+        // converting the nodes into a node, so the whole set is validated
+        // before anything is inserted.
+        append(...ns) { this.appendChild(convertNodesIntoNode(ns, nodeDocumentOf(this))); }
+        prepend(...ns) { this.insertBefore(convertNodesIntoNode(ns, nodeDocumentOf(this)), this.firstChild); }
         // The ChildNode mixin: lit's svg templates go through
         // replaceWith in the Template constructor.
-        before(...ns) { const p = this.parentNode; if (!p) return; for (const n of ns) p.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), this); }
-        after(...ns) { const p = this.parentNode; if (!p) return; const r = this.nextSibling; for (const n of ns) p.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), r); }
-        replaceWith(...ns) { this.before(...ns); this.remove(); }
-        replaceChildren(...ns) { let c; while ((c = this.firstChild)) this.removeChild(c); this.append(...ns); }
+        // DOM #dom-childnode-before / -after / -replacewith: the viable
+        // sibling is the nearest one not among the nodes being inserted.
+        before(...ns) {
+            const parent = this.parentNode;
+            if (!parent) return;
+            let viable = this.previousSibling;
+            while (viable && ns.includes(viable)) viable = viable.previousSibling;
+            const node = convertNodesIntoNode(ns, nodeDocumentOf(this));
+            parent.insertBefore(node, viable === null ? parent.firstChild : viable.nextSibling);
+        }
+        after(...ns) {
+            const parent = this.parentNode;
+            if (!parent) return;
+            let viable = this.nextSibling;
+            while (viable && ns.includes(viable)) viable = viable.nextSibling;
+            parent.insertBefore(convertNodesIntoNode(ns, nodeDocumentOf(this)), viable);
+        }
+        replaceWith(...ns) {
+            const parent = this.parentNode;
+            if (!parent) return;
+            let viable = this.nextSibling;
+            while (viable && ns.includes(viable)) viable = viable.nextSibling;
+            const node = convertNodesIntoNode(ns, nodeDocumentOf(this));
+            if (this.parentNode === parent) parent.replaceChild(node, this);
+            else parent.insertBefore(node, viable);
+        }
+        // DOM #dom-parentnode-replacechildren: validate excluding every
+        // child, then #concept-node-replace-all, which queues one record.
+        replaceChildren(...ns) {
+            const node = convertNodesIntoNode(ns, nodeDocumentOf(this));
+            preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(node), null, 4), false);
+            const removed = Array.from(this.childNodes), fragment = node.nodeType === 11;
+            const added = fragment ? Array.from(node.childNodes) : [node];
+            const oldParent = fragment ? null : rangeParent(node);
+            // Adopting a node from another parent removes it with a record.
+            if (oldParent && !removed.includes(node) && MO.length) moChildRemove(oldParent, node);
+            const owner = deferScriptRuns();
+            let scripts;
+            moSuppressed++;
+            try {
+                for (const child of removed) this.removeChild(child);
+                if (added.length) this.appendChild(node);
+            } finally { moSuppressed--; scripts = takeDeferredScriptRuns(owner); }
+            if (MO.length && moHasChildList) {
+                if (fragment && added.length) moNotify({ type: "childList", target: node,
+                    removedNodes: added, previousSibling: null, nextSibling: null });
+                if (added.length || removed.length) moNotify({ type: "childList", target: this,
+                    addedNodes: added, removedNodes: removed, previousSibling: null, nextSibling: null });
+            } else if (added.length || removed.length) moEnqueue();
+            for (const script of scripts) maybeRunScript(script);
+        }
         cloneNode(deep) {
             const attr = internalsOf(this).attrNode;
             if (attr) return createAttrNode(attr.document, null, attr.namespace, attr.prefix, attr.localName, attrValue(attr));
@@ -5994,37 +6136,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         contains(o) { while (o) { if (o === this) return true; o = o.parentNode; } return false; }
         isSameNode(o) { return o === this; }
-        // WHATWG DOM §4.4 "equals": same interface (nodeType), the type's own
-        // fields equal (element: namespace/local-name/attributes; text/comment:
-        // data; doctype: name), and children equal pairwise in order. Attribute
-        // order does NOT matter (equal counts + each A-attr present-and-equal in
-        // B ⇒ sets match, names being unique). react-helmet dedupes head tags
-        // with `newTag.isEqualNode(oldTag)`, from a timer — a missing method
-        // aborted that reconciliation on every React-Helmet page.
+        // DOM #concept-node-equals: the same interfaces, the type's own fields
+        // (an element's namespace, prefix, local name and attribute count; an
+        // Attr's namespace, local name and value; a processing instruction's
+        // target and data; character data), each attribute of A equal to one
+        // of B's (order does not matter), and equal children pairwise.
+        // react-helmet dedupes head tags with `newTag.isEqualNode(oldTag)`.
         isEqualNode(o) {
-            if (!o) return false;
-            if (o === this) return true;
-            const t = this.nodeType;
-            if (t !== o.nodeType) return false;
-            if (t === 1) {
-                if (this.localName !== o.localName) return false;
-                if (this.namespaceURI !== o.namespaceURI) return false;
-                const an = this.getAttributeNames();
-                if (an.length !== o.getAttributeNames().length) return false;
-                for (let i = 0; i < an.length; i++)
-                    if (this.getAttribute(an[i]) !== o.getAttribute(an[i])) return false;
-            } else if (t === 3 || t === 8) {
-                if (this.nodeValue !== o.nodeValue) return false;
-            } else if (t === 10) {
-                if (this.nodeName !== o.nodeName || this.publicId !== o.publicId || this.systemId !== o.systemId) return false;
-            } else if (t === 2) {
-                return this.namespaceURI === o.namespaceURI && this.localName === o.localName && this.value === o.value;
-            }
-            const ac = this.childNodes, bc = o.childNodes;
-            if (ac.length !== bc.length) return false;
-            for (let i = 0; i < ac.length; i++)
-                if (!ac[i].isEqualNode(bc[i])) return false;
-            return true;
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            if (o === null || o === undefined) return false;
+            if (!(o instanceof Node) && nodeIds.get(o) === undefined && !internalsOf(o).attrNode)
+                throw new TypeError("Failed to execute 'isEqualNode': parameter 1 is not of type 'Node'");
+            return nodesEqual(this, o);
         }
         hasChildNodes() { return __dom_children(nodeIds.get(this)).length > 0; }
         // DOM §4.4: the position of `other` relative to this node, as a
@@ -6058,11 +6181,156 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return 1 + 32 + 4; // unreachable (both branches are children of a[i])
         }
-        normalize() {}
+        // DOM #dom-node-normalize, for each descendant exclusive Text node
+        // (not a CDATASection) in tree order.
+        normalize() {
+            const texts = [];
+            for (let node = this.firstChild, next; node; node = next) {
+                if (node.nodeType === 3) texts.push(node);
+                next = node.firstChild || node.nextSibling;
+                if (!next) {
+                    for (let up = node; up && up !== this && !next; up = rangeParent(up))
+                        next = up.nextSibling;
+                }
+            }
+            for (const node of texts) {
+                const parent = rangeParent(node);
+                // An earlier step merged this node into a preceding sibling.
+                if (!parent || !rangeContains(this, node)) continue;
+                let length = node.data.length;
+                if (length === 0) {
+                    Node.prototype.removeChild.call(parent, node);
+                    continue;
+                }
+                const contiguous = [];
+                for (let sibling = node.nextSibling; sibling && sibling.nodeType === 3; sibling = sibling.nextSibling)
+                    contiguous.push(sibling);
+                if (!contiguous.length) continue;
+                CharacterData.prototype.replaceData.call(node, length, 0,
+                    contiguous.map(text => text.data).join(""));
+                for (const current of contiguous) {
+                    const index = rangeIndex(current);
+                    updateLiveRanges((container, position) =>
+                        rangeSame(container, current) ? [node, position + length]
+                            : rangeSame(container, parent) && position === index ? [node, length]
+                                : [container, position]);
+                    length += current.data.length;
+                }
+                for (const current of contiguous) Node.prototype.removeChild.call(parent, current);
+            }
+        }
+        // DOM #dom-node-lookupprefix.
+        lookupPrefix(namespace) {
+            namespace = namespace === null || namespace === undefined ? null : domString(namespace);
+            if (namespace === null || namespace === "") return null;
+            const element = namespaceLookupElement(this);
+            return element ? locateNamespacePrefix(element, namespace) : null;
+        }
+        // DOM #dom-node-lookupnamespaceuri.
+        lookupNamespaceURI(prefix) {
+            prefix = prefix === null || prefix === undefined ? null : domString(prefix);
+            return locateNamespace(this, prefix === "" ? null : prefix);
+        }
+        // DOM #dom-node-isdefaultnamespace.
+        isDefaultNamespace(namespace) {
+            namespace = namespace === null || namespace === undefined ? null : domString(namespace);
+            return locateNamespace(this, null) === (namespace === "" ? null : namespace);
+        }
         // addEventListener/removeEventListener/dispatchEvent are inherited from
         // EventTarget.prototype now (Node extends EventTarget, per spec). Keeping
         // them solely there means a polyfill that augments EventTarget.prototype
         // (ShadyDOM's `__shady_*` accessors) is visible on every node too.
+    }
+    // An element's attributes as [namespace, prefix, localName, value] in
+    // attribute-list order (DOM #concept-element-attribute).
+    function elementAttributeList(element) {
+        const id = nodeIds.get(element), entries = __dom_attr_ns(id, "entries", null, "", null, null) || [];
+        const list = [];
+        for (let i = 0; i + 2 < entries.length; i += 3)
+            list.push([entries[i], entries[i + 1], entries[i + 2],
+                __dom_attr_ns(id, "get", entries[i], entries[i + 2], null, null)]);
+        return list;
+    }
+    function parentElementOf(node) {
+        const parent = rangeParent(node);
+        return parent && parent.nodeType === 1 ? parent : null;
+    }
+    // The element whose in-scope namespaces answer a lookup on `node`
+    // (DOM #locate-a-namespace and #dom-node-lookupprefix switch on the
+    // interface: an element, a document's document element, an Attr's
+    // element, nothing for a doctype or fragment, else the parent element).
+    function namespaceLookupElement(node) {
+        const attr = internalsOf(node).attrNode;
+        if (attr) return attr.element || null;
+        switch (node.nodeType) {
+            case 1: return node;
+            case 9: return documentElementOf(node);
+            case 10: case 11: return null;
+            default: return parentElementOf(node);
+        }
+    }
+    function documentElementOf(document) {
+        for (let child = document.firstChild; child; child = child.nextSibling)
+            if (child.nodeType === 1) return child;
+        return null;
+    }
+    // DOM #locate-a-namespace-prefix.
+    function locateNamespacePrefix(element, namespace) {
+        for (; element; element = parentElementOf(element)) {
+            if (element.namespaceURI === namespace && element.prefix !== null) return element.prefix;
+            for (const [, prefix, localName, value] of elementAttributeList(element))
+                if (prefix === "xmlns" && value === namespace) return localName;
+        }
+        return null;
+    }
+    // DOM #locate-a-namespace.
+    function locateNamespace(node, prefix) {
+        let element = namespaceLookupElement(node);
+        if (prefix === "xml" && element) return XML_NS;
+        if (prefix === "xmlns" && element) return XMLNS_NS;
+        for (; element; element = parentElementOf(element)) {
+            if (element.namespaceURI !== null && element.prefix === prefix) return element.namespaceURI;
+            for (const [namespace, attrPrefix, localName, value] of elementAttributeList(element)) {
+                if (namespace !== XMLNS_NS) continue;
+                if ((attrPrefix === "xmlns" && localName === prefix) ||
+                    (prefix === null && attrPrefix === null && localName === "xmlns"))
+                    return value === "" ? null : value;
+            }
+        }
+        return null;
+    }
+    // DOM #concept-node-equals.
+    function nodesEqual(a, b) {
+        if (a === b) return true;
+        const attrA = internalsOf(a).attrNode, attrB = internalsOf(b).attrNode;
+        if (attrA || attrB) {
+            return !!(attrA && attrB) && attrA.namespace === attrB.namespace &&
+                attrA.localName === attrB.localName && attrValue(attrA) === attrValue(attrB);
+        }
+        const type = a.nodeType;
+        if (type !== b.nodeType) return false;
+        if (type === 1) {
+            if (a.namespaceURI !== b.namespaceURI || a.prefix !== b.prefix || a.localName !== b.localName)
+                return false;
+            const listA = elementAttributeList(a), listB = elementAttributeList(b);
+            if (listA.length !== listB.length) return false;
+            for (const [namespace, , localName, value] of listA)
+                if (!listB.some(entry => entry[0] === namespace && entry[2] === localName && entry[3] === value))
+                    return false;
+        } else if (type === 3 || type === 4 || type === 8) {
+            if (__dom_text(nodeIds.get(a)) !== __dom_text(nodeIds.get(b))) return false;
+        } else if (type === 7) {
+            if (a.target !== b.target || __dom_text(nodeIds.get(a)) !== __dom_text(nodeIds.get(b))) return false;
+        } else if (type === 10) {
+            const infoA = doctypeInfo(a), infoB = doctypeInfo(b);
+            if (infoA[0] !== infoB[0] || infoA[1] !== infoB[1] || infoA[2] !== infoB[2]) return false;
+        }
+        const childrenA = __dom_children(nodeIds.get(a)).filter(id => __dom_node_type(id) !== 9);
+        const childrenB = __dom_children(nodeIds.get(b)).filter(id => __dom_node_type(id) !== 9);
+        if (childrenA.length !== childrenB.length) return false;
+        for (let i = 0; i < childrenA.length; i++)
+            if (!nodesEqual(wrap(childrenA[i]), wrap(childrenB[i]))) return false;
+        return true;
     }
     // DOM #interface-node constants; Web IDL #es-constants defines each on
     // the interface object and the interface prototype object.
@@ -6292,9 +6560,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         "rp", "rt", "ruby", "s", "samp", "section", "small", "strong", "sub",
         "summary", "sup", "u", "var", "wbr", "center", "acronym", "big", "nobr",
         "tt", "strike"]);
+    // HTML #element-interface: the interface follows the exact local name,
+    // so one with ASCII upper alphas (createElementNS) names no HTML element.
     function htmlInterfaceName(local) {
-        const t = String(local || "").toLowerCase();
-        if (!t) return "HTMLUnknownElement";
+        const t = String(local || "");
+        if (!t || /[A-Z]/.test(t)) return "HTMLUnknownElement";
         if (t.indexOf("-") >= 0 || HTML_IFACE_GENERIC.has(t)) return "HTMLElement";
         const irr = HTML_IFACE_IRREGULAR[t];
         if (irr) return "HTML" + irr + "Element";
@@ -6773,8 +7043,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // and lazily cache the tag — killing the per-access syscalls that
         // jQuery's `each`/`data`/`add` pound (profile-directed: `nodeType`/
         // `nodeName`/`tagName` getters were ~8% of Steam's settle phase; a
-        // getter-hammering micro-bench runs ~25% faster).
-        get nodeType() { return 1; }
+        // getter-hammering micro-bench runs ~25% faster). The Web IDL brand
+        // check is one internal-slot lookup, still no syscall.
+        get nodeType() { requireNodeReceiver(this); return 1; }
         // Cached localName. NAMESPACED `__trustLN` (not the obvious `__ln`)
         // because page code writes its OWN expandos onto our node wrappers and a
         // 2-char name collides: YouTube/Polymer stores a MutationObserver
@@ -6793,18 +7064,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return slots.trustPrefix;
         }
         get tagName() {
-            let qualifiedName = internalsFor(this).trustQN;
+            const slots = internalsFor(this);
+            let qualifiedName = slots.trustQN;
             if (qualifiedName === undefined) {
                 qualifiedName = this.prefix === null
                     ? this.localName
                     : this.prefix + ":" + this.localName;
-                internalsFor(this).trustQN = qualifiedName;
+                slots.trustQN = qualifiedName;
             }
             // Adoption can change HTMLness without changing the expanded name.
-            return this.namespaceURI === HTML_NS && this.ownerDocument.contentType === "text/html"
-                ? qualifiedName.toUpperCase() : qualifiedName;
+            if (this.namespaceURI !== HTML_NS || this.ownerDocument.contentType !== "text/html")
+                return qualifiedName;
+            // DOM #element-html-uppercased-qualified-name: ASCII uppercase.
+            let upper = slots.trustQNUpper;
+            if (upper === undefined) {
+                upper = /[^\0-\x7f]/.test(qualifiedName)
+                    ? qualifiedName.replace(/[a-z]+/g, letters => letters.toUpperCase())
+                    : qualifiedName.toUpperCase();
+                slots.trustQNUpper = upper;
+            }
+            return upper;
         }
-        get nodeName() { return this.tagName; }
+        get nodeName() { requireNodeReceiver(this); return this.tagName; }
         // DOM Slottable.assignedSlot: finding a slot with the `open` flag
         // hides slots whose root is closed, while event dispatch uses the
         // unfiltered internal relation above.
@@ -11485,8 +11766,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super(id);
             rememberWrapper(id, this);
         }
-        get nodeType() { return 3; }
-        get nodeName() { return "#text"; }
+        get nodeType() { requireNodeReceiver(this); return 3; }
+        get nodeName() { requireNodeReceiver(this); return "#text"; }
         splitText(offset) {
             // DOM §4.10: split at a UTF-16 boundary, retaining the original
             // node for the prefix and inserting the new node after it.
@@ -11671,8 +11952,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 documentURLs.set(this, "about:blank");
             }
         }
-        get nodeType() { return 9; }
-        get nodeName() { return "#document"; }
+        get nodeType() { requireNodeReceiver(this); return 9; }
+        get nodeName() { requireNodeReceiver(this); return "#document"; }
         get [Symbol.toStringTag]() { return "Document"; }
         // HTML #dom-document-all: [SameObject] HTMLAllCollection, one per
         // Document (see documentAllCollection). The cache lookup never tests
@@ -11697,6 +11978,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // scopes to its OWN subtree instead — `__dom_doc_element` only knows the
         // live tree's root.
         get documentElement() { return nodeIds.get(this) === 0 ? wrap(__dom_doc_element()) : this.firstElementChild; }
+        // SVG 2 #__svg__SVGDocument__rootElement (partial interface Document):
+        // the document element when it is an SVG svg element, otherwise null.
+        get rootElement() {
+            const root = this.documentElement;
+            return root && root.namespaceURI === SVG_NS && root.localName === "svg" ? root : null;
+        }
         // DOM #dom-document-doctype: the child of the document that is a doctype.
         get doctype() {
             const children = __dom_children(nodeIds.get(this));
@@ -11712,7 +11999,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get scrollingElement() { return this.documentElement; }
         get body() { return this.querySelector("body"); }
         get head() { return this.querySelector("head"); }
-        get readyState() { return trust.readyState; }
+        // HTML #current-document-readiness is initially "complete"; only the
+        // Window's document is loaded by a navigation's parser. DOMParser,
+        // createDocument and createHTMLDocument documents keep the default.
+        get readyState() { return this === g.document ? trust.readyState : "complete"; }
         get contentType() { return documentContentTypes.get(this) || __dom_document_content_type(nodeIds.get(this)); }
         get compatMode() { return __dom_document_quirks(nodeIds.get(this)) ? "BackCompat" : "CSS1Compat"; }
         // DOM #dom-document-characterset: the name of this document's
@@ -11871,11 +12161,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return el;
         }
+        // DOM #dom-document-createtextnode / #dom-document-createcomment:
+        // a required DOMString (undefined converts to "undefined").
         createTextNode(s) {
-            return wrap(__dom_create_text(s === undefined ? "" : String(s), nodeIds.get(this)));
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'createTextNode' on 'Document': 1 argument required.");
+            return wrap(__dom_create_text(domString(s), nodeIds.get(this)));
         }
         createComment(s) {
-            return wrap(__dom_create_comment(s === undefined ? "" : String(s), nodeIds.get(this)));
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'createComment' on 'Document': 1 argument required.");
+            return wrap(__dom_create_comment(domString(s), nodeIds.get(this)));
         }
         // DOM #dom-document-createcdatasection.
         createCDATASection(data) {
@@ -11964,8 +12258,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!arguments.length) throw new TypeError("getElementsByClassName requires class names");
             return classNameCollection(this, domString(names));
         }
-        createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
-        createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
+        // DOM #dom-document-createtreewalker / #dom-document-createnodeiterator:
+        // root is a required Node.
+        createTreeWalker(root, whatToShow, filter) {
+            nodeArgument(root, "createTreeWalker", 1);
+            return new TreeWalker(root, whatToShow, filter);
+        }
+        createNodeIterator(root, whatToShow, filter) {
+            nodeArgument(root, "createNodeIterator", 1);
+            return new NodeIterator(root, whatToShow, filter);
+        }
         createDocumentFragment() {
             return wrap(__dom_create_fragment(nodeIds.get(this)));
         }
@@ -12946,8 +13248,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super(created);
             rememberWrapper(created, this);
         }
-        get nodeType() { return 11; }
-        get nodeName() { return "#document-fragment"; }
+        get nodeType() { requireNodeReceiver(this); return 11; }
+        get nodeName() { requireNodeReceiver(this); return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "DocumentFragment"; }
         querySelector(s) { return wrapQueryResult(__dom_query(nodeIds.get(this), String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(nodeIds.get(this), String(s), false)); }
@@ -12961,7 +13263,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super(id);
             rememberWrapper(id, this);
         }
-        get nodeType() { return 8; } get nodeName() { return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; }
+        get nodeType() { requireNodeReceiver(this); return 8; } get nodeName() { requireNodeReceiver(this); return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; }
     }
     // Lit walks comment markers with one of these.
     // A spec-faithful DOM TreeWalker (https://dom.spec.whatwg.org/#interface-treewalker).
@@ -13215,8 +13517,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
     class ShadowRoot extends DocumentFragment {
-        get nodeType() { return 11; }
-        get nodeName() { return "#document-fragment"; }
+        get nodeType() { requireNodeReceiver(this); return 11; }
+        get nodeName() { requireNodeReceiver(this); return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "ShadowRoot"; }
         get host() { return internalsFor(this).host || null; }
         get mode() { return internalsFor(this).mode || "open"; }
@@ -14047,13 +14349,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
     });
     class CDATASection extends Text {
-        get nodeType() { return 4; }
-        get nodeName() { return "#cdata-section"; }
+        get nodeType() { requireNodeReceiver(this); return 4; }
+        get nodeName() { requireNodeReceiver(this); return "#cdata-section"; }
         get [Symbol.toStringTag]() { return "CDATASection"; }
     }
     class ProcessingInstruction extends CharacterData {
         get target() { return __dom_pi_target(nodeIds.get(this)); }
-        get nodeType() { return 7; }
+        get nodeType() { requireNodeReceiver(this); return 7; }
         get nodeName() { return this.target; }
         get [Symbol.toStringTag]() { return "ProcessingInstruction"; }
     }
@@ -14287,6 +14589,67 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return relation;
     }
     // DOM #concept-pre-insert / #concept-replace step 1: an Attr cannot be a parent.
+    // Web IDL #es-interface: a Node argument must be a platform object
+    // implementing Node.
+    function nodeArgument(value, operation, position) {
+        if (value === null || typeof value !== "object" ||
+            (nodeIds.get(value) === undefined && !internalsOf(value).attrNode))
+            throw new TypeError("Failed to execute '" + operation + "' on 'Node': parameter " + position + " is not of type 'Node'.");
+    }
+    // The node argument of an insertion, and the validity steps an Attr
+    // reaches without an arena node (DOM #concept-node-ensure-pre-insertion-
+    // validity): a parent of the wrong type (step 1), then a reference child
+    // of another parent (step 3), then the Attr itself (step 4).
+    function insertionArgument(parent, node, child, operation) {
+        nodeArgument(node, operation, 1);
+        if (nodeIds.get(parent) === undefined) rejectAttrParent(parent);
+        if (!internalsOf(node).attrNode) return;
+        const type = parent.nodeType;
+        if (type === 1 || type === 9 || type === 11) {
+            if (child !== null && (internalsOf(child).attrNode || !rangeSame(rangeParent(child), parent)))
+                preInsertResult(-1, operation === "replaceChild");
+        }
+        preInsertResult(false, false);
+    }
+    function nodeDocumentOf(node) { return node.nodeType === 9 ? node : node.ownerDocument; }
+    // DOM #converting-nodes-into-a-node: strings become Text nodes of
+    // `document`; several nodes become one DocumentFragment.
+    function convertNodesIntoNode(values, document) {
+        const nodes = values.map(value => value !== null && typeof value === "object" &&
+            (nodeIds.get(value) !== undefined || internalsOf(value).attrNode)
+            ? value : Document.prototype.createTextNode.call(document, domString(value)));
+        if (nodes.length === 1) return nodes[0];
+        const fragment = Document.prototype.createDocumentFragment.call(document);
+        for (const node of nodes) fragment.appendChild(node);
+        return fragment;
+    }
+    // DOM #concept-node-insert for a DocumentFragment: its children are
+    // removed with one record for the fragment, then inserted with one record
+    // for the parent.
+    function moFragmentInsert(parent, fragment, nodes, previousSibling, nextSibling) {
+        if (!MO.length || !moHasChildList) { moEnqueue(); return; }
+        moNotify({ type: "childList", target: fragment, removedNodes: nodes,
+            previousSibling: null, nextSibling: null });
+        moNotify({ type: "childList", target: parent, addedNodes: nodes,
+            previousSibling, nextSibling });
+    }
+    // DOM #concept-node-insert adopts the node, which removes it from its old
+    // parent with that parent's own mutation record, once the insertion is
+    // known to be valid.
+    function moAdoptRemove(parent, node, child, oldParent) {
+        preInsertResult(__dom_insert_before(nodeIds.get(parent), nodeIds.get(node),
+            child ? nodeIds.get(child) : null, 2), false);
+        moChildRemove(oldParent, node);
+    }
+    // A native insertion's validity result (see __dom_insert_before).
+    function preInsertResult(result, replacing) {
+        if (result === true) return;
+        if (result === -1) {
+            throw new DOMException(replacing ? "The node to be replaced is not a child of this node."
+                : "The reference node is not a child of this node.", "NotFoundError");
+        }
+        throw new DOMException("The node cannot be inserted at this position.", "HierarchyRequestError");
+    }
     function rejectAttrParent(node) {
         if (internalsOf(node).attrNode)
             throw new DOMException("An Attr node cannot have children.", "HierarchyRequestError");
@@ -18065,13 +18428,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!old || !rangeSame(rangeParent(old), parent))
             throw new DOMException("The node to be replaced is not a child of this node.", "NotFoundError");
         const nodes = Array.from(fragment.childNodes);
-        const previous = old.previousSibling, reference = old.nextSibling;
+        const previous = old.previousSibling, reference = old.nextSibling, owner = deferScriptRuns();
+        let scripts;
         moSuppressed++;
         try {
             parent.removeChild(old);
             for (const node of nodes) parent.insertBefore(node, reference);
         } finally {
             moSuppressed--;
+            scripts = takeDeferredScriptRuns(owner);
         }
         if (MO.length && moHasChildList) {
             if (nodes.length) moNotify({ type: "childList", target: fragment, removedNodes: nodes,
@@ -18079,6 +18444,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             moNotify({ type: "childList", target: parent, addedNodes: nodes, removedNodes: [old],
                 previousSibling: previous, nextSibling: reference });
         } else moEnqueue();
+        for (const script of scripts) maybeRunScript(script);
         return old;
     }
     function moChildInsert(parent, node) {        // call AFTER the insert
