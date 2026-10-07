@@ -8979,8 +8979,19 @@ impl Dom {
             }
         }
         let document = self.create_document(doc.document_content_type(DOCUMENT));
-        let new_html = self.transplant(doc, src_html);
-        self.append(document, new_html);
+        // The parsed Document's children in order: its doctype and the
+        // comments and processing instructions around the root element are
+        // part of the frame's document (DOM #concept-document, HTML
+        // #the-initial-insertion-mode), not only the root.
+        let mut new_html = None;
+        for child in doc.children(DOCUMENT) {
+            let copy = self.transplant(doc, child);
+            self.append(document, copy);
+            if child == src_html {
+                new_html = Some(copy);
+            }
+        }
+        let new_html = new_html?;
         self.append(frame, document);
         self.document_modes
             .insert(document, doc.document_mode(DOCUMENT));
@@ -24766,6 +24777,45 @@ mod tests {
         assert!(
             !html2.contains("HELLO FRAME"),
             "stale content kept: {html2}"
+        );
+    }
+
+    #[test]
+    fn frame_documents_keep_their_doctype_and_document_level_comments() {
+        // DOM #concept-document: a parsed frame Document's children are its
+        // doctype and the comments around its root, not only the root.
+        let mut dom = Dom::parse_document("<body><iframe></iframe></body>");
+        let frame = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.tag_name(n) == Some("iframe"))
+            .unwrap();
+        dom.install_frame_document(
+            frame,
+            "<!DOCTYPE html><!--before--><html><body><p>IN</p></body></html><!--after-->",
+            "http://h.test/",
+        )
+        .unwrap();
+        let document = dom.frame_document(frame).unwrap();
+        let kinds: Vec<_> = dom
+            .children(document)
+            .into_iter()
+            .map(|child| match &dom.nodes[child].data {
+                NodeData::Doctype(_) => "doctype".to_string(),
+                NodeData::Comment(text) => format!("comment:{text}"),
+                _ => dom.tag_name(child).unwrap_or("?").to_string(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["doctype", "comment:before", "html", "comment:after"]
+        );
+        // The flattened frame block still carries only the content.
+        let html = dom.serialize(frame);
+        assert!(html.contains("IN"), "{html}");
+        assert!(
+            !html.contains("DOCTYPE") && !html.contains("before") && !html.contains("after"),
+            "{html}"
         );
     }
 
