@@ -110,6 +110,11 @@ impl Stack {
         self.controls.is_empty()
     }
 
+    /// TRust: returns the number of [`ControlFrame`]s on the control stack.
+    pub fn control_height(&self) -> usize {
+        self.controls.height()
+    }
+
     /// Returns the current height of the [`Stack`].
     ///
     /// # Note

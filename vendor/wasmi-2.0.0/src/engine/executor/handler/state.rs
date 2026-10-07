@@ -968,6 +968,11 @@ impl WasmException {
     }
 }
 
+/// TRust: the `delegate` target of a legacy `try` whose label resolves to no enclosing `try`
+/// body, so that the exception continues at the callers. Function-unique `try` identities are
+/// allocated from zero and never reach this value.
+pub const NO_DELEGATE_TARGET: u32 = u32::MAX;
+
 /// TRust: the handler installed by a legacy `try` of the function frame at `depth`.
 ///
 /// # Note
@@ -1039,7 +1044,16 @@ impl Stack {
     /// Makes `exception` the pending exception and records the dispatch [`Ip`] of the selected
     /// handler and the [`Sp`] and [`Inst`] of its frame for [`Stack::take_unwind_target`].
     /// Returns `false`, leaving `self` unchanged, if no handler exists.
-    fn raise_exception(&mut self, ip: Ip, exception: WasmException) -> bool {
+    ///
+    /// With `delegate_to`, only the handler of that `try` may select the exception in the
+    /// current frame ([`NO_DELEGATE_TARGET`]: none), as for `delegate` (`exec-throw_ref` step
+    /// 16h, which leaves the handlers within the delegate's target label).
+    fn raise_exception(
+        &mut self,
+        ip: Ip,
+        exception: WasmException,
+        delegate_to: Option<u32>,
+    ) -> bool {
         let top = self.frames.frames.len();
         let mut target = None;
         'frames: for depth in (1..=top).rev() {
@@ -1049,6 +1063,9 @@ impl Stack {
                 false => self.frames.frames[depth - 1].ip.addr().wrapping_sub(1),
             };
             for handler in self.exceptions.handlers.iter().rev() {
+                if depth == top && delegate_to.is_some_and(|try_id| handler.try_id != try_id) {
+                    continue;
+                }
                 if handler.depth == depth && handler.start <= site && site < handler.end.addr() {
                     target = Some((depth, handler.end));
                     break 'frames;
@@ -1106,7 +1123,7 @@ impl Stack {
                 field
             })
             .collect();
-        self.raise_exception(ip, WasmException::new(tag, instance, fields))
+        self.raise_exception(ip, WasmException::new(tag, instance, fields), None)
     }
 
     /// TRust: re-raises the exception for `rethrow` of `try_id` at `ip`.
@@ -1115,7 +1132,18 @@ impl Stack {
     #[inline(never)]
     pub fn rethrow(&mut self, ip: Ip, try_id: u32) -> Option<bool> {
         let exception = self.rethrow_exception(try_id)?;
-        Some(self.raise_exception(ip, exception))
+        Some(self.raise_exception(ip, exception, None))
+    }
+
+    /// TRust: re-raises the pending exception at `ip` for the `delegate` of a legacy `try`
+    /// (`exec-try-delegate`): in the current frame only the handler of the `try` `target` may
+    /// select it, and none if `target` is [`NO_DELEGATE_TARGET`].
+    ///
+    /// Returns `None` if no exception is pending, otherwise whether a handler was selected.
+    #[inline(never)]
+    pub fn delegate(&mut self, ip: Ip, target: u32) -> Option<bool> {
+        let exception = self.exceptions.pending.take()?;
+        Some(self.raise_exception(ip, exception, Some(target)))
     }
 
     /// TRust: returns the target recorded by the last successful raise.

@@ -222,8 +222,10 @@ define_ident!(
     ExceptionCatchAll: exception_catch_all,
     ExceptionThrow: exception_throw,
     ExceptionRethrow: exception_rethrow,
+    ExceptionDelegate: exception_delegate,
     Tag: tag,
     TryId: try_id,
+    Target: target,
     Next: next,
     Handler: handler,
 

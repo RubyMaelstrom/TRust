@@ -12,6 +12,7 @@ pub use self::{
         LoadByVal,
         LoadFromCellsByValue,
         LowerToCells,
+        NO_DELEGATE_TARGET,
         Stack,
         StoreToCells,
         op_code_to_handler,

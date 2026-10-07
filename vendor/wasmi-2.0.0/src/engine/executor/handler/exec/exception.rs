@@ -3,7 +3,8 @@
 //! Exception handling proposal, `document/legacy/exceptions/core/exec.rst` (local snapshot
 //! af287a73): a `try` installs a handler for its body; a raised exception unwinds to the
 //! innermost handler, whose clauses are tested in order (`exec-throw_ref` step 16), and a
-//! catch clause makes the exception available to `rethrow` (`exec-rethrow`).
+//! catch clause makes the exception available to `rethrow` (`exec-rethrow`). A `delegate`
+//! re-raises the exception at the `try` its label targets (`exec-try-delegate`).
 
 use super::super::{
     Args,
@@ -147,6 +148,30 @@ execution_handler! {
             done!(
                 store,
                 DoneReason::error(Error::new("legacy rethrow without a caught exception"))
+            )
+        };
+        dispatch_raised!(store, args, raised)
+    }
+}
+
+execution_handler! {
+    fn exception_delegate(
+        store: &mut PrunedStore,
+        ip: Ip,
+        sp: Sp,
+        mem0: Mem0Ptr,
+        mem0_len: Mem0Len,
+        instance: Inst,
+        ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> Done = {
+        let mut args = Args::from_parts(ip, sp, mem0, mem0_len, instance, ireg, freg32, freg64);
+        let crate::ir::decode::ExceptionDelegate { target } = unsafe { args.decode_op() };
+        let Some(raised) = store.stack_mut().delegate(ip, target) else {
+            done!(
+                store,
+                DoneReason::error(Error::new("legacy delegate without a pending exception"))
             )
         };
         dispatch_raised!(store, args, raised)
