@@ -62,9 +62,11 @@
     const json = load(response('/json', 'application/json', [0x22, 0xC3, 0xA9, 0x22]));
     assert(json.characterSet === 'UTF-8' && json.body.textContent === '"é"', 'JSON is UTF-8');
     // XML MIME types follow XML: the declaration, else UTF-8 (never the container's).
+    const xhtml = '<html xmlns="http://www.w3.org/1999/xhtml"><body><p>', end = ascii('</p></body></html>');
     check(load(response('/xhtml', 'application/xhtml+xml',
-        [...ascii('<?xml version="1.0" encoding="koi8-r"?><p>'), 0xC1])), 'KOI8-R', 'а', 'XML declaration');
-    check(load(response('/xhtml-default', 'application/xhtml+xml', [...ascii('<p>'), 0xC3, 0xA9])),
+        [...ascii('<?xml version="1.0" encoding="koi8-r"?>' + xhtml), 0xC1, ...end])),
+        'KOI8-R', 'а', 'XML declaration');
+    check(load(response('/xhtml-default', 'application/xhtml+xml', [...ascii(xhtml), 0xC3, 0xA9, ...end])),
         'UTF-8', 'é', 'XML default');
     // A srcdoc document's source is already decoded text (HTML #charset).
     const srcdoc = document.createElement('iframe');
