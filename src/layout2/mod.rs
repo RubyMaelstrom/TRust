@@ -12683,6 +12683,102 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn resolved_margins_padding_and_insets_are_used_values() {
+        // CSSOM #resolved-values: a box's margins and padding, and a
+        // positioned box's insets, expose used values. Percentages resolve
+        // against the containing block layout used (CSS Box 4
+        // #margin-physical: its width), a relative `auto` inset negates its
+        // opposite (CSS Position 3 #relpos-insets), and an absolute one is the
+        // distance to the margin box (#resolving-inset-auto). Without a box,
+        // the computed value remains.
+        let dom = Dom::parse_document(
+            r#"<!doctype html><body style="margin:0">
+            <div style="width:200px;height:100px">
+              <div id="m" style="margin:10% calc(5% + 1px) 0 -10%;
+                padding:calc(10% - 40px) 20% 0 1em"></div>
+              <div id="r" style="position:relative;top:10%;right:calc(25% - 2px)"></div>
+              <div id="s" style="position:sticky;top:10%;left:auto"></div>
+              <div id="p" style="margin-left:30%;margin-right:calc(-infinity * 1%)"></div>
+            </div>
+            <div style="overflow:hidden;height:50px;border:3px solid">
+              <div id="t" style="position:sticky;bottom:calc(20% + 1px);left:50%"></div>
+            </div>
+            <div style="position:relative;width:400px;height:200px;padding:8px 16px;
+              border:2px solid">
+              <div id="a" style="position:absolute;bottom:3px;left:2px;width:50px;
+                height:20px;margin:1px 2px"></div>
+              <div id="b" style="position:absolute;width:10px;height:10px;
+                top:calc(50% - 8px);right:-10%"></div>
+              <div id="c" style="position:absolute;width:10px;height:10px"></div>
+            </div>
+            <div id="n" style="display:none;position:relative;margin:10%;top:10%"></div>
+            </body>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let layout = measure_retained_layout(
+            &dom,
+            &base,
+            Viewport::new(800., 600.),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+        );
+        let fragments = layout.fragments.expect("complete layout");
+        let value = |id: &str, name: &str| {
+            let node = node_by_id(&dom, id);
+            dom.cssom_used_value(node, name, Some(&fragments)).unwrap()
+        };
+        for (id, name, expected) in [
+            ("m", "margin-top", "20px"),
+            ("m", "margin-right", "11px"),
+            ("m", "margin-left", "-20px"),
+            ("m", "margin", "20px 11px 0px -20px"),
+            ("m", "margin-inline-start", "-20px"),
+            ("m", "padding-top", "0px"),
+            ("m", "padding", "0px 40px 0px 16px"),
+            ("r", "top", "10px"),
+            ("r", "bottom", "-10px"),
+            ("r", "right", "48px"),
+            ("r", "left", "-48px"),
+            ("r", "inset", "10px 48px -10px -48px"),
+            // Single-precision layout noise does not surface (60.000004).
+            ("p", "margin-left", "60px"),
+            ("p", "margin-right", "-33554432px"),
+            // Sticky percentages refer to the nearest scrollport (CSS
+            // Position 3 #stickypos-insets), else the viewport; auto stays.
+            ("s", "top", "60px"),
+            ("s", "left", "auto"),
+            ("t", "bottom", "11px"),
+            ("t", "left", "397px"),
+            // The padding box of the absolute containing block is 432×216.
+            ("a", "top", "191px"),
+            ("a", "bottom", "3px"),
+            ("a", "left", "2px"),
+            ("a", "right", "376px"),
+            ("b", "top", "100px"),
+            ("b", "right", "-43.2px"),
+            ("b", "left", "465.2px"),
+            ("b", "bottom", "106px"),
+            // Both insets auto: the static position.
+            ("c", "top", "8px"),
+            ("c", "left", "16px"),
+            ("c", "bottom", "198px"),
+            ("c", "right", "406px"),
+            ("n", "margin-top", "10%"),
+            ("n", "top", "10%"),
+        ] {
+            assert_eq!(value(id, name), expected, "#{id} {name}");
+        }
+        // Only percentages and positioned `auto` insets need layout.
+        let needs = |id: &str, name: &str| dom.cssom_needs_used_value(node_by_id(&dom, id), name);
+        assert!(needs("m", "margin-top") && needs("m", "margin") && needs("m", "padding"));
+        assert!(!needs("m", "margin-bottom") && !needs("m", "padding-left"));
+        assert!(!needs("m", "top") && !needs("s", "left") && !needs("a", "bottom"));
+        assert!(needs("s", "top"));
+        assert!(needs("r", "left") && needs("a", "top") && needs("a", "inset"));
+    }
+
+    #[test]
     fn geometry_reports_a_blocks_own_border_box() {
         let (dom, boxes) = measure(
             r#"<body style="margin:0"><div id="a" style="height:48px">x</div><div id="b" style="height:32px">y</div></body>"#,

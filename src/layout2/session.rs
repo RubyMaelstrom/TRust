@@ -45,6 +45,7 @@ pub(crate) struct LayoutFragments {
     single_boxes: OnceLock<measure::SingleBoxIndex>,
     layout_boxes: OnceLock<HashMap<NodeId, PxRect>>,
     client_metrics: OnceLock<rustc_hash::FxHashMap<NodeId, [f32; 4]>>,
+    used_bases: OnceLock<rustc_hash::FxHashMap<NodeId, super::UsedBasis>>,
     scroll_tree: OnceLock<spatial::ScrollTree>,
 }
 
@@ -76,6 +77,7 @@ impl LayoutFragments {
                 single_boxes: OnceLock::new(),
                 layout_boxes: OnceLock::new(),
                 client_metrics: OnceLock::new(),
+                used_bases: OnceLock::new(),
                 scroll_tree: OnceLock::new(),
             })
         })
@@ -119,6 +121,21 @@ impl LayoutFragments {
             .get_or_init(|| measure::client_metrics(&self.root, &self.fixed, &self.top_layer))
             .get(&node)
             .copied()
+    }
+
+    /// The bases of an element box's used margins, padding and insets
+    /// (CSSOM #resolved-values), from its first box fragment. `None` when
+    /// the element generates no box.
+    pub(crate) fn used_basis(&self, node: NodeId) -> Option<super::UsedBasis> {
+        self.used_bases
+            .get_or_init(|| measure::used_bases(&self.root, &self.fixed, &self.top_layer))
+            .get(&node)
+            .copied()
+    }
+
+    /// The viewport (initial containing block) this layout was laid in.
+    pub(crate) fn viewport(&self) -> Viewport {
+        self.viewport
     }
 
     pub(super) fn scroll_tree(&self, dom: &Dom) -> &spatial::ScrollTree {
@@ -181,6 +198,7 @@ impl LayoutFragments {
             single_boxes: OnceLock::new(),
             layout_boxes: OnceLock::new(),
             client_metrics: OnceLock::new(),
+            used_bases: OnceLock::new(),
             scroll_tree: OnceLock::new(),
         }))
     }
@@ -224,6 +242,9 @@ impl LayoutFragments {
                 .map_or(0, spatial::ScrollTree::retained_bytes)
             + self.client_metrics.get().map_or(0, |metrics| {
                 metrics.capacity() * std::mem::size_of::<(NodeId, [f32; 4])>()
+            })
+            + self.used_bases.get().map_or(0, |bases| {
+                bases.capacity() * std::mem::size_of::<(NodeId, super::UsedBasis)>()
             })
             + self.layout_boxes.get().map_or(0, |boxes| {
                 boxes.capacity() * std::mem::size_of::<(NodeId, PxRect)>()

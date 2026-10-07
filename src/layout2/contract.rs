@@ -175,6 +175,33 @@ pub struct PxRect {
     pub css_height: Option<f64>,
 }
 
+/// What a laid-out element box resolved against, for the CSSOM
+/// #resolved-values that are used values: margins, padding and the insets of
+/// a positioned box. Unknown components are NaN.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsedBasis {
+    /// Width and height of the containing block the box resolved its
+    /// percentages against (CSS 2 §10.1; NaN for an indefinite height).
+    /// Margin and padding percentages refer to the width (CSS Box 4
+    /// #margin-physical, #padding-physical), insets to their axis (CSS
+    /// Position 3 #insets).
+    pub cb: [f32; 2],
+    /// An absolutely positioned box's insets TRBL as layout resolved them:
+    /// an `auto` inset becomes the distance from its containing block's edge
+    /// to the margin box (CSS Position 3 #resolving-inset-auto and
+    /// #resolving-inset-overconstraint).
+    pub inset: [f32; 4],
+}
+
+impl Default for UsedBasis {
+    fn default() -> Self {
+        Self {
+            cb: [f32::NAN; 2],
+            inset: [f32::NAN; 4],
+        }
+    }
+}
+
 /// The context a CSS length resolves in: the element's computed font-size
 /// (`em`), the root's (`rem`), and the measured advance of U+0030 (`ch`).
 /// Terminal metrics deliberately do not appear here.

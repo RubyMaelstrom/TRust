@@ -1052,6 +1052,15 @@ pub(crate) fn css_px(px: f32) -> String {
     format!("{}px", css_number(widened))
 }
 
+/// A used length from layout's single-precision geometry, serialized at the
+/// stable layout precision of the other used-value lengths (four decimals,
+/// as `width`/`height`), so f32 noise does not surface: 30% of 200px is
+/// 60.000004 in f32, but reads back as `60px`.
+pub(crate) fn css_used_px(px: f32) -> String {
+    let rounded = (f64::from(px) * 10_000.0).round() / 10_000.0;
+    format!("{}px", css_number(rounded))
+}
+
 /// A complete `<number>` token: digits with an optional sign, fraction and
 /// exponent. Rust's float parser would also accept `inf` and `NaN`, which
 /// are not numbers in CSS.
