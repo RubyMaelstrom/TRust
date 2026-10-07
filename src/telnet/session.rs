@@ -55,7 +55,7 @@ impl CommandSender {
                 let cost = command_cost(&command);
                 if self
                     .queued
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                         n.checked_add(cost).filter(|&sum| sum <= QUEUED_INPUT_BYTES)
                     })
                     .is_err()
