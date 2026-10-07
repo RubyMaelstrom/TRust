@@ -262,6 +262,25 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             return Ok(Value::Undefined);
         }
         "created" => return Ok(created(ctx, args)),
+        // HTML #updating-the-image-data runs synchronously when an img is
+        // created, adopted or mutated; `created_images` defers some of those
+        // to the next microtask checkpoint. "queued" asks whether one is
+        // still pending; "retire" drops it once a later update has run.
+        "queued" => {
+            let id = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.) as usize;
+            let dom = super::host_dom(ctx);
+            let dom = dom.borrow();
+            return Ok(Value::Bool(dom.is_valid(id) && dom.image_update_queued(id)));
+        }
+        "retire" => {
+            let id = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.) as usize;
+            let dom = super::host_dom(ctx);
+            let mut dom = dom.borrow_mut();
+            if dom.has_created_images() {
+                dom.retire_queued_image_update(id);
+            }
+            return Ok(Value::Undefined);
+        }
         "lazy" => {
             expect(ctx, args);
             return Ok(Value::Undefined);
