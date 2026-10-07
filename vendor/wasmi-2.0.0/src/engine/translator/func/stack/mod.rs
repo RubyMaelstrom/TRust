@@ -380,6 +380,40 @@ impl Stack {
         Ok(())
     }
 
+    /// TRust: pushes a Wasm `try_table` onto the [`Stack`].
+    ///
+    /// # Note
+    ///
+    /// This inherits the `consume_fuel` [`Pos<BlockFuel>`] from the parent [`ControlFrame`].
+    ///
+    /// # Errors
+    ///
+    /// If the stack height exceeds the maximum height.
+    pub fn push_try_table(
+        &mut self,
+        ty: BlockType,
+        label: LabelRef,
+        handler: LabelRef,
+        try_id: u32,
+        catches: u32,
+    ) -> Result<(), Error> {
+        debug_assert!(!self.controls.is_empty());
+        let block_height = self.block_height(ty);
+        let branch_params = self.branch_params(ty, ControlFrameKind::Block)?;
+        let consume_fuel = self.fuel_pos();
+        self.controls.push_try_table(
+            ty,
+            block_height,
+            branch_params,
+            label,
+            handler,
+            try_id,
+            catches,
+            consume_fuel,
+        );
+        Ok(())
+    }
+
     /// Pushes the `catch` or `catch_all` `clause` of the legacy `try` `frame` onto the [`Stack`].
     pub fn push_catch(
         &mut self,

@@ -9,18 +9,9 @@
 //! legacy_exception_spec -- --ignored` runs the official scripts. Modules that import or
 //! export tags are skipped: Wasmi has no tag externs.
 
-use std::{collections::HashMap, path::Path};
+use super::wast_script::Runner;
+use std::path::Path;
 use wasmi::{Engine, Instance, Linker, Module, Store, Val};
-use wast::{
-    Wast,
-    WastArg,
-    WastDirective,
-    WastExecute,
-    WastInvoke,
-    WastRet,
-    core::{WastArgCore, WastRetCore},
-    parser::{self, ParseBuffer},
-};
 
 fn instantiate(wat: &str) -> (Store<()>, Instance) {
     let engine = Engine::default();
@@ -346,195 +337,6 @@ fn delegate_skips_handlers_of_enclosing_frames_only_in_its_own_frame() {
     assert_eq!(call_i32(&mut store, instance, "run", &[Val::I32(7)]), Ok(7));
 }
 
-#[test]
-fn unsupported_exception_operators_fail_translation() {
-    let mut config = wasmi::Config::default();
-    config.compilation_mode(wasmi::CompilationMode::Eager);
-    let engine = Engine::new(&config);
-    let wasm = wat::parse_str(
-        r#"
-        (module
-          (tag $e)
-          (func
-            block
-              try_table (catch_all 0)
-                throw $e
-              end
-            end))
-        "#,
-    )
-    .unwrap();
-    assert!(Module::new(&engine, wasm).is_err());
-}
-
-struct Runner {
-    store: Store<()>,
-    linker: Linker<()>,
-    last: Option<Instance>,
-    named: HashMap<String, Instance>,
-    skipped: usize,
-}
-
-impl Runner {
-    fn new() -> Self {
-        let engine = Engine::default();
-        Self {
-            store: Store::new(&engine, ()),
-            linker: Linker::new(&engine),
-            last: None,
-            named: HashMap::new(),
-            skipped: 0,
-        }
-    }
-
-    fn instance(&self, id: Option<wast::token::Id<'_>>) -> Option<Instance> {
-        match id {
-            Some(id) => self.named.get(id.name()).copied(),
-            None => self.last,
-        }
-    }
-
-    fn invoke(&mut self, invoke: &WastInvoke<'_>) -> Result<Vec<Val>, String> {
-        let instance = self.instance(invoke.module).ok_or("no module")?;
-        let func = instance
-            .get_func(&self.store, invoke.name)
-            .ok_or_else(|| format!("unknown export {}", invoke.name))?;
-        let args = invoke
-            .args
-            .iter()
-            .map(|arg| match arg {
-                WastArg::Core(WastArgCore::I32(value)) => Ok(Val::I32(*value)),
-                WastArg::Core(WastArgCore::I64(value)) => Ok(Val::I64(*value)),
-                WastArg::Core(WastArgCore::F32(value)) => Ok(Val::F32(f32::from_bits(value.bits).into())),
-                WastArg::Core(WastArgCore::F64(value)) => Ok(Val::F64(f64::from_bits(value.bits).into())),
-                _ => Err(String::from("unsupported argument")),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let ty = func.ty(&self.store);
-        let mut results: Vec<Val> = ty.results().iter().copied().map(Val::default_for_ty).collect();
-        func.call(&mut self.store, &args, &mut results)
-            .map_err(|error| format!("error: {error}"))?;
-        Ok(results)
-    }
-
-    fn run(&mut self, directive: &mut WastDirective<'_>) -> Result<(), String> {
-        match directive {
-            WastDirective::Module(module) => {
-                let name = module.name().map(|id| String::from(id.name()));
-                let bytes = module.encode().map_err(|e| e.to_string())?;
-                let instantiated = Module::new(self.store.engine(), &bytes[..])
-                    .map_err(|e| e.to_string())
-                    .and_then(|module| {
-                        self.linker
-                            .instantiate_and_start(&mut self.store, &module)
-                            .map_err(|e| e.to_string())
-                    });
-                match instantiated {
-                    Ok(instance) => {
-                        self.last = Some(instance);
-                        if let Some(name) = name {
-                            self.named.insert(name, instance);
-                        }
-                    }
-                    Err(_) => {
-                        // Tag imports and exports are unsupported: skip dependent assertions.
-                        self.last = None;
-                        self.skipped += 1;
-                    }
-                }
-                Ok(())
-            }
-            WastDirective::Register { name, module, .. } => {
-                if let Some(instance) = self.instance(*module) {
-                    let _ = self.linker.instance(&mut self.store, name, instance);
-                }
-                Ok(())
-            }
-            WastDirective::AssertReturn {
-                exec: WastExecute::Invoke(invoke),
-                results,
-                ..
-            } => {
-                if self.instance(invoke.module).is_none() || invoke.name == "catch-imported" {
-                    self.skipped += 1;
-                    return Ok(());
-                }
-                let actual = self.invoke(invoke)?;
-                let expected = results
-                    .iter()
-                    .map(|result| match result {
-                        WastRet::Core(WastRetCore::I32(value)) => Some(Val::I32(*value)),
-                        WastRet::Core(WastRetCore::I64(value)) => Some(Val::I64(*value)),
-                        WastRet::Core(WastRetCore::F32(wast::core::NanPattern::Value(value))) => {
-                            Some(Val::F32(f32::from_bits(value.bits).into()))
-                        }
-                        WastRet::Core(WastRetCore::F64(wast::core::NanPattern::Value(value))) => {
-                            Some(Val::F64(f64::from_bits(value.bits).into()))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if actual.len() != expected.len() {
-                    return Err(format!("{}: result arity mismatch", invoke.name));
-                }
-                for (actual, expected) in actual.iter().zip(&expected) {
-                    match (actual, expected) {
-                        (Val::I32(a), Some(Val::I32(e))) if a != e => {
-                            return Err(format!("{}: {a} != {e}", invoke.name));
-                        }
-                        (Val::I64(a), Some(Val::I64(e))) if a != e => {
-                            return Err(format!("{}: {a} != {e}", invoke.name));
-                        }
-                        (Val::F32(a), Some(Val::F32(e))) if a.to_bits() != e.to_bits() => {
-                            return Err(format!("{}: {a:?} != {e:?}", invoke.name));
-                        }
-                        (Val::F64(a), Some(Val::F64(e))) if a.to_bits() != e.to_bits() => {
-                            return Err(format!("{}: {a:?} != {e:?}", invoke.name));
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(())
-            }
-            WastDirective::AssertException {
-                exec: WastExecute::Invoke(invoke),
-                ..
-            } => {
-                if self.instance(invoke.module).is_none() {
-                    self.skipped += 1;
-                    return Ok(());
-                }
-                match self.invoke(invoke) {
-                    Err(error) if error.contains("uncaught WebAssembly exception") => Ok(()),
-                    other => Err(format!("{}: expected an exception: {other:?}", invoke.name)),
-                }
-            }
-            WastDirective::AssertTrap {
-                exec: WastExecute::Invoke(invoke),
-                ..
-            } => {
-                if self.instance(invoke.module).is_none() {
-                    self.skipped += 1;
-                    return Ok(());
-                }
-                match self.invoke(invoke) {
-                    Err(error) if !error.contains("uncaught WebAssembly exception") => Ok(()),
-                    other => Err(format!("{}: expected a trap: {other:?}", invoke.name)),
-                }
-            }
-            WastDirective::AssertInvalid { module, .. }
-            | WastDirective::AssertMalformed { module, .. } => match module.encode() {
-                Err(_) => Ok(()),
-                Ok(bytes) => match Module::new(self.store.engine(), &bytes[..]) {
-                    Err(_) => Ok(()),
-                    Ok(_) => Err("module unexpectedly validated".into()),
-                },
-            },
-            _ => Err("unsupported directive".into()),
-        }
-    }
-}
-
 /// A node of a WebAssembly text s-expression.
 enum Sexp {
     Atom(String),
@@ -663,7 +465,7 @@ fn print_sexps(items: &[Sexp], out: &mut String) {
     }
 }
 
-fn run_script(path: &Path) -> (usize, usize) {
+fn run_script(path: &Path) -> (usize, Vec<String>) {
     // Tags cannot be imported: give `try_catch.wast`'s main module a local tag instead, and
     // skip only the assertion that depends on the identity of the imported tag.
     let original = std::fs::read_to_string(path)
@@ -671,18 +473,7 @@ fn run_script(path: &Path) -> (usize, usize) {
         .replace(r#"(tag $imported-e0 (import "test" "e0"))"#, "(tag $imported-e0)");
     let mut source = String::new();
     print_sexps(&unfold_legacy_try(parse_sexps(&original)), &mut source);
-    let buffer = ParseBuffer::new(&source).unwrap();
-    let wast = parser::parse::<Wast>(&buffer).unwrap();
-    let mut runner = Runner::new();
-    let mut passed = 0;
-    for mut directive in wast.directives {
-        let (line, col) = directive.span().linecol_in(&source);
-        if let Err(error) = runner.run(&mut directive) {
-            panic!("{}:{}:{}: {error}", path.display(), line + 1, col + 1);
-        }
-        passed += 1;
-    }
-    (passed, runner.skipped)
+    Runner::new(&["catch-imported"]).run_script(&path.display().to_string(), &source)
 }
 
 #[test]
@@ -690,7 +481,10 @@ fn run_script(path: &Path) -> (usize, usize) {
 fn legacy_exception_spec() {
     let dir = std::env::var_os("WASMI_LEGACY_EH_DIR").expect("set WASMI_LEGACY_EH_DIR");
     for script in ["throw.wast", "try_catch.wast", "rethrow.wast", "try_delegate.wast"] {
-        let (passed, skipped) = run_script(&Path::new(&dir).join(script));
-        std::println!("{script}: {passed} directives, {skipped} skipped");
+        let (passed, skips) = run_script(&Path::new(&dir).join(script));
+        std::println!("{script}: {passed} directives, {} skipped", skips.len());
+        for skip in skips {
+            std::println!("  skipped {skip}");
+        }
     }
 }

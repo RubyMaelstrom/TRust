@@ -76,6 +76,9 @@ impl Global {
     pub fn get(&self, ctx: impl AsContext) -> Val {
         let store = &ctx.as_context().store.inner;
         let value = store.resolve_global(self).get();
-        Val::from_raw_parts(value.raw(), value.ty(), store)
+        let value = Val::from_raw_parts(value.raw(), value.ty(), store);
+        // TRust: the host may keep the exception reference it reads.
+        store.pin_exn_vals(core::slice::from_ref(&value));
+        value
     }
 }

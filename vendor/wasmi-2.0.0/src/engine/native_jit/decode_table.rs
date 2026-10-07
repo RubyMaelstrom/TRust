@@ -2407,6 +2407,12 @@ pub(super) fn skip_fields(code: OpCode, fields: &mut &[u8]) -> Option<()> {
         OpCode::ExceptionCatch => { dec::<ir::decode::ExceptionCatch>(fields)?; }
         OpCode::ExceptionCatchAll => { dec::<ir::decode::ExceptionCatchAll>(fields)?; }
         OpCode::ExceptionThrow => { dec::<ir::decode::ExceptionThrow>(fields)?; }
+        OpCode::ExceptionRethrow => { dec::<ir::decode::ExceptionRethrow>(fields)?; }
+        OpCode::ExceptionDelegate => { dec::<ir::decode::ExceptionDelegate>(fields)?; }
+        OpCode::ExceptionTableCatch => { dec::<ir::decode::ExceptionTableCatch>(fields)?; }
+        OpCode::ExceptionTableCatchRef => { dec::<ir::decode::ExceptionTableCatchRef>(fields)?; }
+        OpCode::ExceptionTableCatchAllRef => { dec::<ir::decode::ExceptionTableCatchAllRef>(fields)?; }
+        OpCode::ExceptionThrowRef => { dec::<ir::decode::ExceptionThrowRef>(fields)?; }
         _ => {}
     }
     Some(())

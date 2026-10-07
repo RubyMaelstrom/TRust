@@ -20,6 +20,7 @@ pub(crate) use self::{
     block_type::BlockType,
     code_map::{FuncEntry, FuncEntryPtr},
     executor::{
+        Cell,
         ExecContext,
         InOutParams,
         InOutResults,

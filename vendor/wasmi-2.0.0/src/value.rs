@@ -1,4 +1,5 @@
 use crate::{
+    ExnRef,
     ExternRef,
     F32,
     F64,
@@ -34,6 +35,8 @@ pub enum Val {
     FuncRef(Nullable<Func>),
     /// A nullable [`ExternRef`] reference.
     ExternRef(Nullable<ExternRef>),
+    /// TRust: a nullable [`ExnRef`] exception reference.
+    ExnRef(Nullable<ExnRef>),
 }
 
 impl Val {
@@ -54,6 +57,7 @@ impl Val {
             ValType::ExternRef => {
                 Self::ExternRef(<Nullable<ExternRef>>::from_raw_parts(val.into(), store))
             }
+            ValType::ExnRef => Self::ExnRef(<Nullable<ExnRef>>::from_raw_parts(val.into(), store)),
         }
     }
 
@@ -74,6 +78,7 @@ impl Val {
             }
             Self::FuncRef(value) => <Nullable<Func>>::unwrap_raw(&value, store)?.into(),
             Self::ExternRef(value) => <Nullable<ExternRef>>::unwrap_raw(&value, store)?.into(),
+            Self::ExnRef(value) => <Nullable<ExnRef>>::unwrap_raw(&value, store)?.into(),
         };
         Some(value)
     }
@@ -88,6 +93,7 @@ impl Val {
         let value = match *self {
             Self::FuncRef(value) => <Nullable<Func>>::unwrap_raw(&value, store)?,
             Self::ExternRef(value) => <Nullable<ExternRef>>::unwrap_raw(&value, store)?,
+            Self::ExnRef(value) => <Nullable<ExnRef>>::unwrap_raw(&value, store)?,
             _ => return None,
         };
         Some(value)
@@ -106,6 +112,7 @@ impl Val {
             Self::V128(value) => value.into(),
             Self::FuncRef(Nullable::Null) => RawRef::null().into(),
             Self::ExternRef(Nullable::Null) => RawRef::null().into(),
+            Self::ExnRef(Nullable::Null) => RawRef::null().into(),
             _ => return None,
         };
         Some(raw)
@@ -129,6 +136,7 @@ impl Val {
             ValType::V128 => Self::V128(V128::from(0_u128)),
             ValType::FuncRef => Self::from(<Nullable<Func>>::Null),
             ValType::ExternRef => Self::from(<Nullable<ExternRef>>::Null),
+            ValType::ExnRef => Self::from(<Nullable<ExnRef>>::Null),
         }
     }
 
@@ -143,6 +151,7 @@ impl Val {
             Self::V128(_) => ValType::V128,
             Self::FuncRef(_) => ValType::FuncRef,
             Self::ExternRef(_) => ValType::ExternRef,
+            Self::ExnRef(_) => ValType::ExnRef,
         }
     }
 
@@ -190,6 +199,14 @@ impl Val {
     pub fn externref(&self) -> Option<Nullable<&ExternRef>> {
         match self {
             Self::ExternRef(value) => Some(value.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// TRust: returns the underlying `exnref` if the type matches otherwise returns `None`.
+    pub fn exnref(&self) -> Option<Nullable<&ExnRef>> {
+        match self {
+            Self::ExnRef(value) => Some(value.as_ref()),
             _ => None,
         }
     }
@@ -242,6 +259,7 @@ impl From<Ref> for Val {
         match value {
             Ref::Func(nullable) => Self::FuncRef(nullable),
             Ref::Extern(nullable) => Self::ExternRef(nullable),
+            Ref::Exn(nullable) => Self::ExnRef(nullable),
         }
     }
 }
@@ -271,6 +289,13 @@ impl From<Nullable<ExternRef>> for Val {
     #[inline]
     fn from(externref: Nullable<ExternRef>) -> Self {
         Self::ExternRef(externref)
+    }
+}
+
+impl From<Nullable<ExnRef>> for Val {
+    #[inline]
+    fn from(exnref: Nullable<ExnRef>) -> Self {
+        Self::ExnRef(exnref)
     }
 }
 

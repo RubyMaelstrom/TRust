@@ -93,8 +93,8 @@ arithmetic, bitwise operations, comparisons, shifts, shuffle/swizzle,
 splat/extract/replace lane, narrowing/widening, conversions and v128
 loads/stores (full and lane stores; Wasmi lowers the extending, splatting,
 zeroing and lane loads to scalar loads and lane operators). Relaxed SIMD, scalar
-float arithmetic, integer division and remainder, calls, legacy exception
-operators, non-default memories and offsets above 4 GiB end a region.
+float arithmetic, integer division and remainder, calls, exception operators,
+non-default memories and offsets above 4 GiB end a region.
 Control-flow entries (branch targets, callee entries, return addresses and the
 start of each execution) are the region candidates. `WASMI_JIT_TRACE=1` reports
 compiled operator counts, region starts, native code sizes, compilation times,
@@ -148,7 +148,11 @@ linking and instantiation traps). The official legacy exception-handling
 scripts run with
 `WASMI_LEGACY_EH_DIR=/big/web-standards/repositories/WebAssembly/exception-handling/test/legacy/exceptions/core`
 in front of the command and `--test mod legacy_exception_spec -- --ignored`
-after it.
+after it; the standardized ones (`try_table`, `throw_ref`, `throw`, `tag`) with
+`WASMI_EH_DIR=/big/web-standards/repositories/WebAssembly/spec/test/core/exceptions`
+and `--test mod integration::exceptions::exception_spec -- --ignored --nocapture`,
+which lists the skipped directives (tag imports and typed references are
+unsupported).
 
 `vendor/wasmi-2.0.0/trust/gen_native_decode.py` regenerates the native
 operator table (`src/engine/native_jit/decode_table.rs`) from the executor's

@@ -284,14 +284,51 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
         self.translate_delegate(relative_depth)
     }
 
+    /// TRust: WebAssembly Core 3.0 exception handling (`exec-try_table`).
+    ///
+    /// # Note
+    ///
+    /// Like a legacy `try`, the body installs a handler covering its encoded operators, and the
+    /// handler resumes at the catch clause dispatch behind the body with the operands below the
+    /// `try_table` in their slots. See [`FuncTranslator::translate_end_try_table`].
     #[inline(never)]
-    fn visit_try_table(&mut self, _try_table: wasmparser::TryTable) -> Self::Output {
-        Err(Error::from(TranslationError::UnsupportedOperator("try_table")))
+    fn visit_try_table(&mut self, try_table: wasmparser::TryTable) -> Self::Output {
+        if !self.reachable {
+            self.stack.push_unreachable(ControlFrameKind::TryTable)?;
+            return Ok(());
+        }
+        let block_ty = BlockType::new(try_table.ty, &self.module);
+        let len_params = block_ty.len_params(self.engine());
+        self.preserve_all_locals(len_params.into())?;
+        self.preserve_temp_regs(len_params.into())?;
+        let end_label = self.instrs.new_label();
+        let handler_label = self.instrs.new_label();
+        let try_id = self.next_try_id;
+        self.next_try_id = try_id.wrapping_add(1);
+        self.encode_branch_op(handler_label, |offset| Op::exception_try(offset, try_id))?;
+        let Ok(catches) = u32::try_from(self.try_table_catches.len()) else {
+            return Err(Error::from(TranslationError::AllocatedTooManySlots));
+        };
+        self.try_table_catches.extend(try_table.catches);
+        self.stack
+            .push_try_table(block_ty, end_label, handler_label, try_id, catches)?;
+        Ok(())
     }
 
+    /// TRust: WebAssembly Core 3.0 exception handling (`exec-throw_ref`).
     #[inline(never)]
     fn visit_throw_ref(&mut self) -> Self::Output {
-        Err(Error::from(TranslationError::UnsupportedOperator("throw_ref")))
+        bail_unreachable!(self);
+        let exn = self.stack.pop();
+        if let Operand::Immediate(exn) = exn {
+            // Only `ref.null exn` is a constant exception reference.
+            debug_assert!(RawRef::from(exn.val().raw()).is_null());
+            return self.translate_trap(TrapCode::NullExceptionReference);
+        }
+        let exn = self.copy_operand_to_slot(exn)?;
+        self.instrs.encode_op(Op::exception_throw_ref(exn))?;
+        self.reachable = false;
+        Ok(())
     }
 
     #[inline(never)]
@@ -334,6 +371,7 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
             ControlFrame::Else(frame) => self.translate_end_else(frame),
             ControlFrame::Try(frame) => self.translate_end_try(frame),
             ControlFrame::Catch(frame) => self.translate_end_catch(frame),
+            ControlFrame::TryTable(frame) => self.translate_end_try_table(frame),
             ControlFrame::Unreachable(frame) => self.translate_end_unreachable(frame),
         }
     }
@@ -613,9 +651,11 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
             return Ok(());
         }
         let operator = match content {
-            ValType::I32 | ValType::I64 | ValType::FuncRef | ValType::ExternRef => {
-                Op::global_get_u64_r(global_addr)
-            }
+            ValType::I32
+            | ValType::I64
+            | ValType::FuncRef
+            | ValType::ExternRef
+            | ValType::ExnRef => Op::global_get_u64_r(global_addr),
             ValType::F32 => Op::global_get_f32_r(global_addr),
             ValType::F64 => Op::global_get_f64_r(global_addr),
             _ => unreachable!(),
@@ -635,9 +675,11 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
         let input = self.stack.pop();
         let op = match self.resolve_operand::<RawVal>(input)? {
             ResolvedOperand::Reg(ty) => match ty {
-                | ValType::I32 | ValType::I64 | ValType::FuncRef | ValType::ExternRef => {
-                    Op::global_set_u64_r(global_addr)
-                }
+                | ValType::I32
+                | ValType::I64
+                | ValType::FuncRef
+                | ValType::ExternRef
+                | ValType::ExnRef => Op::global_set_u64_r(global_addr),
                 | ValType::F32 => Op::global_set_f32_r(global_addr),
                 | ValType::F64 => Op::global_set_f64_r(global_addr),
                 | ValType::V128 => unreachable!(),
@@ -648,9 +690,11 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
                 _ => Op::global_set_u64_s(global_addr, value),
             },
             ResolvedOperand::Immediate(value) => match ty {
-                | ValType::I32 | ValType::F32 | ValType::FuncRef | ValType::ExternRef => {
-                    Op::global_set_u32_i(global_addr, u32::from(value))
-                }
+                | ValType::I32
+                | ValType::F32
+                | ValType::FuncRef
+                | ValType::ExternRef
+                | ValType::ExnRef => Op::global_set_u32_i(global_addr, u32::from(value)),
                 | ValType::I64 | ValType::F64 => {
                     Op::global_set_u64_i(global_addr, u64::from(value))
                 }
@@ -1662,6 +1706,7 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
         let null = match type_hint {
             ValType::FuncRef => TypedRawRef::null(RefType::Func),
             ValType::ExternRef => TypedRawRef::null(RefType::Extern),
+            ValType::ExnRef => TypedRawRef::null(RefType::Exn),
             ty => unreachable!("expected a Wasm `reftype` but found: {ty:?}"),
         };
         self.stack.push_immediate(null)?;
@@ -1677,7 +1722,10 @@ impl<'a> VisitOperator<'a> for FuncTranslator {
         let input = self.stack.peek(0);
         if let Operand::Immediate(input) = input {
             _ = self.stack.pop();
-            debug_assert!(matches!(input.ty(), ValType::FuncRef | ValType::ExternRef));
+            debug_assert!(matches!(
+                input.ty(),
+                ValType::FuncRef | ValType::ExternRef | ValType::ExnRef
+            ));
             let raw = input.val().raw();
             let is_null = RawRef::from(raw).is_null();
             self.stack.push_immediate(i32::from(is_null))?;

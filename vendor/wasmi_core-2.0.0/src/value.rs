@@ -26,6 +26,11 @@ pub enum ValType {
     FuncRef,
     /// A nullable external reference.
     ExternRef,
+    /// TRust: a nullable exception reference (`exnref`).
+    ///
+    /// WebAssembly Core 3.0, syntax/types (exception-handling, `exnref` abbreviates
+    /// `(ref null exn)`).
+    ExnRef,
 }
 
 impl ValType {
@@ -39,9 +44,9 @@ impl ValType {
 
     /// Returns `true` if [`ValType`] is a Wasm reference type.
     ///
-    /// This is `true` for [`ValType::FuncRef`] and [`ValType::ExternRef`].
+    /// This is `true` for [`ValType::FuncRef`], [`ValType::ExternRef`] and [`ValType::ExnRef`].
     pub fn is_ref(&self) -> bool {
-        matches!(self, Self::ExternRef | Self::FuncRef)
+        matches!(self, Self::ExternRef | Self::FuncRef | Self::ExnRef)
     }
 
     /// Returns the underlying [`RefType`], if `self` is a reference type.
@@ -49,6 +54,7 @@ impl ValType {
         let ty = match self {
             ValType::FuncRef => RefType::Func,
             ValType::ExternRef => RefType::Extern,
+            ValType::ExnRef => RefType::Exn,
             _ => return None,
         };
         Some(ty)
@@ -60,6 +66,7 @@ impl From<RefType> for ValType {
         match ty {
             RefType::Func => Self::FuncRef,
             RefType::Extern => Self::ExternRef,
+            RefType::Exn => Self::ExnRef,
         }
     }
 }

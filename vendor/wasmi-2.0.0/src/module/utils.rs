@@ -163,6 +163,11 @@ impl From<wasmparser::HeapType> for WasmiRefType {
                 shared: false,
                 ty: AbstractHeapType::Extern,
             } => Self::from(RefType::Extern),
+            // TRust: see `exn_ref_type` for the `exn` and `noexn` heap types.
+            wasmparser::HeapType::Abstract {
+                shared: false,
+                ty: AbstractHeapType::Exn | AbstractHeapType::NoExn,
+            } => Self::from(RefType::Exn),
             unsupported => {
                 panic!(
                     "encountered unsupported heap type: {:?}",
@@ -178,6 +183,7 @@ impl From<wasmparser::RefType> for WasmiRefType {
         match ref_type {
             wasmparser::RefType::FUNCREF => Self::from(RefType::Func),
             wasmparser::RefType::EXTERNREF => Self::from(RefType::Extern),
+            ref_type if is_exn_ref_type(ref_type) => Self::from(RefType::Exn),
             unsupported => {
                 panic!(
                     "encountered unsupported reference type: {:?}",
@@ -186,6 +192,25 @@ impl From<wasmparser::RefType> for WasmiRefType {
             }
         }
     }
+}
+
+/// TRust: returns `true` for the reference types of the `exn` hierarchy.
+///
+/// WebAssembly Core 3.0, syntax/types and valid/matching: `exnref` abbreviates `(ref null exn)`,
+/// and `(ref exn)`, `(ref null noexn)` (`nullexnref`) and `(ref noexn)` are its subtypes, which
+/// `wasmparser` admits with the exception-handling feature. Wasmi represents all of them as
+/// [`RefType::Exn`]: exception references share one encoding, validation has already checked
+/// every use against the precise types, and executing `throw_ref` checks for null at run time.
+/// Only the runtime equality of function types (`call_indirect`, import matching) is coarser:
+/// it does not tell these reference types apart, as Wasmi tracks no typed references.
+fn is_exn_ref_type(ref_type: wasmparser::RefType) -> bool {
+    matches!(
+        ref_type.heap_type(),
+        wasmparser::HeapType::Abstract {
+            shared: false,
+            ty: AbstractHeapType::Exn | AbstractHeapType::NoExn,
+        }
+    )
 }
 
 /// A Wasmi [`ValType`].

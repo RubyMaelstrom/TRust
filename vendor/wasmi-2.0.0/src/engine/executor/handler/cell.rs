@@ -1,4 +1,5 @@
 use crate::{
+    ExnRef,
     ExternRef,
     F32,
     F64,
@@ -178,7 +179,7 @@ macro_rules! impl_lower_and_lift_for_refs {
         )*
     };
 }
-impl_lower_and_lift_for_refs! { Func, ExternRef }
+impl_lower_and_lift_for_refs! { Func, ExternRef, ExnRef }
 
 impl LowerToCells for Ref {
     fn lower_to_cells(
@@ -189,6 +190,7 @@ impl LowerToCells for Ref {
         match self {
             Self::Func(nullable) => nullable.lower_to_cells(store, cells),
             Self::Extern(nullable) => nullable.lower_to_cells(store, cells),
+            Self::Exn(nullable) => nullable.lower_to_cells(store, cells),
         }
     }
 }
@@ -245,6 +247,7 @@ impl LowerToCells for &'_ Val {
             Val::V128(value) => value.lower_to_cells(store, cells),
             Val::FuncRef(value) => value.lower_to_cells(store, cells),
             Val::ExternRef(value) => value.lower_to_cells(store, cells),
+            Val::ExnRef(value) => value.lower_to_cells(store, cells),
         }
     }
 }
@@ -523,6 +526,7 @@ impl LiftFromCells for &'_ mut Val {
             Val::V128(value) => value.lift_from_cells(store, cells),
             Val::FuncRef(value) => value.lift_from_cells(store, cells),
             Val::ExternRef(value) => value.lift_from_cells(store, cells),
+            Val::ExnRef(value) => value.lift_from_cells(store, cells),
         }
     }
 }

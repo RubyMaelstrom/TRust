@@ -264,6 +264,8 @@ impl<T> HostFuncTrampolineEntity<T> {
                 .unwrap_or_else(|error| {
                     panic!("failed to decode host function parameters: {error}")
                 });
+            // TRust: the host function may keep the exception references it receives.
+            caller.as_context().store.inner.pin_exn_vals(params);
             func(caller, params, results)?;
             let results = inout
                 .encode_results(store_id, &results[..])
@@ -442,8 +444,10 @@ impl Func {
             ctx.as_context_mut(),
             self,
             inputs,
-            outputs,
+            &mut *outputs,
         )?;
+        // TRust: the caller now holds the exception references among the results.
+        ctx.as_context().store.inner.pin_exn_vals(outputs);
         Ok(())
     }
 
@@ -478,12 +482,16 @@ impl Func {
     ) -> Result<ResumableCall, Error> {
         self.verify_and_prepare_inputs_outputs(ctx.as_context(), inputs, outputs)?;
         // Note: Cloning an [`Engine`] is intentionally a cheap operation.
-        ctx.as_context()
+        let call = ctx
+            .as_context()
             .store
             .engine()
             .clone()
-            .execute_func_resumable(ctx.as_context_mut(), self, inputs, outputs)
-            .map(ResumableCall::new)
+            .execute_func_resumable(ctx.as_context_mut(), self, inputs, &mut *outputs)
+            .map(ResumableCall::new);
+        // TRust: the caller now holds the exception references among the results.
+        ctx.as_context().store.inner.pin_exn_vals(outputs);
+        call
     }
 
     /// Verify that the `inputs` and `outputs` value types match the function signature.

@@ -201,7 +201,11 @@ impl RegKind {
     /// Returns `None` if there is no register kind available to `ty`.
     pub fn new(ty: ValType) -> Option<Self> {
         let kind = match ty {
-            ValType::I32 | ValType::FuncRef | ValType::ExternRef | ValType::I64 => Self::Ireg,
+            ValType::I32
+            | ValType::FuncRef
+            | ValType::ExternRef
+            | ValType::ExnRef
+            | ValType::I64 => Self::Ireg,
             ValType::F32 => Self::Freg32,
             ValType::F64 => Self::Freg64,
             ValType::V128 => return None,
@@ -214,7 +218,11 @@ impl RegKind {
         match self {
             RegKind::Ireg => matches!(
                 ty,
-                ValType::I32 | ValType::FuncRef | ValType::ExternRef | ValType::I64
+                ValType::I32
+                    | ValType::FuncRef
+                    | ValType::ExternRef
+                    | ValType::ExnRef
+                    | ValType::I64
             ),
             RegKind::Freg32 => matches!(ty, ValType::F32),
             RegKind::Freg64 => matches!(ty, ValType::F64),
@@ -451,6 +459,41 @@ impl ControlStack {
             handler,
             try_id,
             clause: TryClause::Body,
+            catches: 0,
+        }));
+        self.fuel_pos = fuel_pos;
+    }
+
+    /// TRust: pushes a new Wasm `try_table` onto the [`ControlStack`].
+    ///
+    /// # Note
+    ///
+    /// Like a Wasm `block` the `try_table` body inherits the [`Op::ConsumeFuel`] of its parent.
+    /// Its catch clauses are kept by the translator from index `catches` on.
+    #[expect(clippy::too_many_arguments)]
+    pub fn push_try_table(
+        &mut self,
+        ty: BlockType,
+        height: usize,
+        branch_params: BranchParams,
+        label: LabelRef,
+        handler: LabelRef,
+        try_id: u32,
+        catches: u32,
+        fuel_pos: Option<Pos<ir::BlockFuel>>,
+    ) {
+        debug_assert!(!self.orphaned_else_operands);
+        self.frames.push(ControlFrame::TryTable(TryControlFrame {
+            ty,
+            height: StackHeight::from(height),
+            branch_params,
+            is_branched_to: false,
+            fuel_pos,
+            label,
+            handler,
+            try_id,
+            clause: TryClause::Table,
+            catches,
         }));
         self.fuel_pos = fuel_pos;
     }
@@ -476,7 +519,10 @@ impl ControlStack {
         let frame = self.frames.pop()?;
         if !matches!(
             frame,
-            ControlFrame::Block(_) | ControlFrame::Try(_) | ControlFrame::Unreachable(_)
+            ControlFrame::Block(_)
+                | ControlFrame::Try(_)
+                | ControlFrame::TryTable(_)
+                | ControlFrame::Unreachable(_)
         ) {
             // Need to replace the cached top-most `fuel_pos`.
             self.fuel_pos = self.get(0).fuel_pos();
@@ -623,6 +669,8 @@ pub enum ControlFrame {
     Try(TryControlFrame),
     /// A `catch` or `catch_all` clause of a legacy Wasm `try` control frame.
     Catch(TryControlFrame),
+    /// TRust: a Wasm `try_table` control frame.
+    TryTable(TryControlFrame),
     /// A generic unreachable control frame.
     Unreachable(ControlFrameKind),
 }
@@ -638,6 +686,7 @@ impl core::fmt::Debug for ControlFrame {
             Self::Else(_) => "Else(..)",
             Self::Try(_) => "Try(..)",
             Self::Catch(_) => "Catch(..)",
+            Self::TryTable(_) => "TryTable(..)",
             Self::Unreachable(_) => "Unreachable(..)",
         };
         f.write_str(variant)
@@ -710,7 +759,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.kind(),
             ControlFrame::If(frame) => frame.kind(),
             ControlFrame::Else(frame) => frame.kind(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.kind(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.kind(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrameBase::kind`")
             }
@@ -723,7 +774,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.ty(),
             ControlFrame::If(frame) => frame.ty(),
             ControlFrame::Else(frame) => frame.ty(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.ty(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.ty(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrameBase::ty`")
             }
@@ -736,7 +789,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.height(),
             ControlFrame::If(frame) => frame.height(),
             ControlFrame::Else(frame) => frame.height(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.height(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.height(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrameBase::height`")
             }
@@ -749,7 +804,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.branch_params(),
             ControlFrame::If(frame) => frame.branch_params(),
             ControlFrame::Else(frame) => frame.branch_params(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.branch_params(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.branch_params(),
             ControlFrame::Unreachable(_) => {
                 panic!(
                     "invalid query for unreachable control frame: `ControlFrameBase::branch_params`"
@@ -764,7 +821,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.label(),
             ControlFrame::If(frame) => frame.label(),
             ControlFrame::Else(frame) => frame.label(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.label(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.label(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrame::label`")
             }
@@ -777,7 +836,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.is_branched_to(),
             ControlFrame::If(frame) => frame.is_branched_to(),
             ControlFrame::Else(frame) => frame.is_branched_to(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.is_branched_to(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.is_branched_to(),
             ControlFrame::Unreachable(_) => {
                 panic!(
                     "invalid query for unreachable control frame: `ControlFrame::is_branched_to`"
@@ -792,7 +853,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.branch_to(),
             ControlFrame::If(frame) => frame.branch_to(),
             ControlFrame::Else(frame) => frame.branch_to(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.branch_to(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.branch_to(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrame::branch_to`")
             }
@@ -805,7 +868,9 @@ impl ControlFrameBase for ControlFrame {
             ControlFrame::Loop(frame) => frame.fuel_pos(),
             ControlFrame::If(frame) => frame.fuel_pos(),
             ControlFrame::Else(frame) => frame.fuel_pos(),
-            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame.fuel_pos(),
+            ControlFrame::Try(frame)
+            | ControlFrame::Catch(frame)
+            | ControlFrame::TryTable(frame) => frame.fuel_pos(),
             ControlFrame::Unreachable(_) => {
                 panic!("invalid query for unreachable control frame: `ControlFrame::fuel_pos`")
             }
@@ -1166,6 +1231,8 @@ pub enum ControlFrameKind {
     Catch,
     /// A legacy Wasm `catch_all` clause.
     CatchAll,
+    /// TRust: a Wasm `try_table`.
+    TryTable,
 }
 
 /// The current part of a legacy Wasm `try` control frame.
@@ -1180,6 +1247,8 @@ pub enum TryClause {
     },
     /// The final `catch_all` clause.
     CatchAll,
+    /// TRust: the body of a `try_table`, whose catch clauses branch to labels.
+    Table,
 }
 
 /// A legacy Wasm `try` control frame (exception-handling proposal, legacy instructions).
@@ -1209,6 +1278,8 @@ pub struct TryControlFrame {
     try_id: u32,
     /// The part of the `try` currently being translated.
     clause: TryClause,
+    /// TRust: the index of the first catch clause of a `try_table` kept by the translator.
+    catches: u32,
 }
 
 impl TryControlFrame {
@@ -1226,6 +1297,12 @@ impl TryControlFrame {
     pub fn clause(&self) -> TryClause {
         self.clause
     }
+
+    /// TRust: returns the index of the first catch clause of a `try_table` kept by the
+    /// translator.
+    pub fn catches(&self) -> u32 {
+        self.catches
+    }
 }
 
 impl ControlFrameBase for TryControlFrame {
@@ -1234,6 +1311,7 @@ impl ControlFrameBase for TryControlFrame {
             TryClause::Body => ControlFrameKind::Try,
             TryClause::Catch { .. } => ControlFrameKind::Catch,
             TryClause::CatchAll => ControlFrameKind::CatchAll,
+            TryClause::Table => ControlFrameKind::TryTable,
         }
     }
 

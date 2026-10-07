@@ -100,7 +100,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::{convert::identity, mem};
-use wasmparser::{MemArg, WasmFeatures};
+use wasmparser::{MemArg, VisitOperator as _, WasmFeatures};
 
 /// Type concerned with translating from Wasm bytecode to Wasmi bytecode.
 #[derive(Debug)]
@@ -139,8 +139,10 @@ pub struct FuncTranslator {
     immediates: Vec<TypedRawVal>,
     /// The costs of Wasm operators when fuel metering is enabled.
     operator_cost: OperatorCostStrategy,
-    /// The identity of the next legacy `try` in this function.
+    /// The identity of the next legacy `try` or `try_table` in this function.
     next_try_id: u32,
+    /// TRust: the catch clauses of the `try_table`s being translated.
+    try_table_catches: Vec<wasmparser::Catch>,
 }
 
 /// Heap allocated data structured used by the [`FuncTranslator`].
@@ -156,6 +158,8 @@ pub struct FuncTranslatorAllocations {
     instrs: OpEncoderAllocations,
     /// Temporary buffer for immediate values.
     immediates: Vec<TypedRawVal>,
+    /// TRust: buffer for the catch clauses of `try_table`s.
+    try_table_catches: Vec<wasmparser::Catch>,
 }
 
 impl Reset for FuncTranslatorAllocations {
@@ -165,6 +169,7 @@ impl Reset for FuncTranslatorAllocations {
         self.layout.reset();
         self.instrs.reset();
         self.immediates.clear();
+        self.try_table_catches.clear();
     }
 }
 
@@ -233,6 +238,7 @@ impl ReusableAllocations for FuncTranslator {
             layout: self.layout,
             instrs: self.instrs.into_allocations(),
             immediates: self.immediates,
+            try_table_catches: self.try_table_catches,
         }
     }
 }
@@ -256,6 +262,7 @@ impl FuncTranslator {
             layout,
             instrs,
             immediates,
+            try_table_catches,
         } = alloc.into_reset();
         let stack = Stack::new(&engine, stack);
         let instrs = OpEncoder::new(&engine, instrs);
@@ -272,6 +279,7 @@ impl FuncTranslator {
             immediates,
             operator_cost,
             next_try_id: 0,
+            try_table_catches,
         };
         translator.init_func_params()?;
         Ok(translator)
@@ -513,7 +521,7 @@ impl FuncTranslator {
     /// Returns `None` if `value` is already in its register.
     fn select_copy_rx_op(value: Operand, layout: &StackLayout) -> Result<Option<Op>, Error> {
         match value.ty() {
-            ValType::I32 | ValType::FuncRef | ValType::ExternRef => {
+            ValType::I32 | ValType::FuncRef | ValType::ExternRef | ValType::ExnRef => {
                 Self::select_u32_copy_rx_op(value, layout)
             }
             ValType::I64 => Self::select_u64_copy_rx_op(value, layout),
@@ -531,7 +539,7 @@ impl FuncTranslator {
             ResolvedOperand::Reg(ty) => {
                 debug_assert!(matches!(
                     ty,
-                    ValType::I32 | ValType::ExternRef | ValType::FuncRef
+                    ValType::I32 | ValType::ExternRef | ValType::ExnRef | ValType::FuncRef
                 ));
                 return Ok(None);
             }
@@ -634,9 +642,11 @@ impl FuncTranslator {
     /// Returns the [`Op`] to copy the register `value` into `result` for `ty`.
     fn select_copy_sr_op(result: Slot, ty: ValType) -> Op {
         match ty {
-            | ValType::I32 | ValType::I64 | ValType::FuncRef | ValType::ExternRef => {
-                Self::select_u64_copy_sr_op(result)
-            }
+            | ValType::I32
+            | ValType::I64
+            | ValType::FuncRef
+            | ValType::ExternRef
+            | ValType::ExnRef => Self::select_u64_copy_sr_op(result),
             | ValType::F32 => Self::select_f32_copy_sr_op(result),
             | ValType::F64 => Self::select_f64_copy_sr_op(result),
             | ValType::V128 => unreachable!(),
@@ -756,9 +766,11 @@ impl FuncTranslator {
     fn select_copy_si_op(result: Slot, value: TypedRawVal) -> Op {
         let raw = value.raw();
         match value.ty() {
-            | ValType::FuncRef | ValType::ExternRef | ValType::I32 | ValType::F32 => {
-                Op::u32_copy_si(result, u32::from(raw))
-            }
+            | ValType::FuncRef
+            | ValType::ExternRef
+            | ValType::ExnRef
+            | ValType::I32
+            | ValType::F32 => Op::u32_copy_si(result, u32::from(raw)),
             | ValType::I64 | ValType::F64 => Op::u64_copy_si(result, u64::from(raw)),
             #[cfg(feature = "simd")]
             | ValType::V128 => Op::v128_copy_si(result, V128::from(raw)),
@@ -1400,6 +1412,7 @@ impl FuncTranslator {
             TryClause::CatchAll => {
                 unreachable!("validation rejects clauses after `catch_all`")
             }
+            TryClause::Table => unreachable!("validation rejects `catch` in a `try_table`"),
         }
         self.stack.enter_catch(frame.height());
         let try_id = frame.try_id();
@@ -1475,7 +1488,8 @@ impl FuncTranslator {
         };
         let target = (depth..self.stack.control_height())
             .find_map(|depth| match self.stack.peek_control(depth) {
-                ControlFrame::Try(frame) => Some(frame.try_id()),
+                // TRust: a `try_table` handles the exceptions of its body, too.
+                ControlFrame::Try(frame) | ControlFrame::TryTable(frame) => Some(frame.try_id()),
                 _ => None,
             })
             .unwrap_or(NO_DELEGATE_TARGET);
@@ -1488,6 +1502,110 @@ impl FuncTranslator {
         self.instrs.encode_op(Op::exception_delegate(target))?;
         self.reachable = false;
         self.translate_end_try_construct(frame)
+    }
+
+    /// TRust: translates the end of a Wasm `try_table` (WebAssembly Core 3.0, `exec-try_table`
+    /// and `exec-throw_ref`).
+    ///
+    /// # Note
+    ///
+    /// Behind the body, the handler dispatches the pending exception to the catch clauses in
+    /// order (`exec-throw_ref` step 15): each clause tests and consumes it, leaves its fields
+    /// and, for `catch_ref` and `catch_all_ref`, its exception reference as fresh operands, and
+    /// branches to its label like a `br`. The labels count from outside the `try_table`
+    /// (`valid-try_table`), which is the control stack once its frame is popped. An exception
+    /// that no clause matches continues to the enclosing handlers (step 15g, eventually 14).
+    fn translate_end_try_table(&mut self, mut frame: TryControlFrame) -> Result<(), Error> {
+        if self.reachable {
+            self.copy_branch_params(frame.branch_params())?;
+            frame.branch_to();
+            self.encode_br(frame.label())?;
+        }
+        self.instrs.pin_label(frame.handler())?;
+        self.instrs.encode_consume_fuel_op()?;
+        let start = frame.catches() as usize;
+        let mut catches = mem::take(&mut self.try_table_catches);
+        let mut catches_all = false;
+        for &catch in &catches[start..] {
+            // An exception transfers control without the accumulator registers of its throw
+            // site, and so does a mismatching clause to the next one.
+            self.stack.enter_catch(frame.height());
+            self.reachable = true;
+            match catch {
+                wasmparser::Catch::One { tag, label } => {
+                    let results = self.push_catch_operands(Some(tag), false)?;
+                    let next = self.instrs.new_label();
+                    self.encode_branch_op(next, |offset| {
+                        Op::exception_table_catch(results, tag, offset)
+                    })?;
+                    self.visit_br(label)?;
+                    self.instrs.pin_label(next)?;
+                }
+                wasmparser::Catch::OneRef { tag, label } => {
+                    let results = self.push_catch_operands(Some(tag), true)?;
+                    let next = self.instrs.new_label();
+                    self.encode_branch_op(next, |offset| {
+                        Op::exception_table_catch_ref(results, tag, offset)
+                    })?;
+                    self.visit_br(label)?;
+                    self.instrs.pin_label(next)?;
+                }
+                wasmparser::Catch::All { label } => {
+                    self.instrs.encode_op(Op::exception_table_catch_all())?;
+                    self.visit_br(label)?;
+                    catches_all = true;
+                }
+                wasmparser::Catch::AllRef { label } => {
+                    let results = self.push_catch_operands(None, true)?;
+                    self.instrs
+                        .encode_op(Op::exception_table_catch_all_ref(results.span().head()))?;
+                    self.visit_br(label)?;
+                    catches_all = true;
+                }
+            }
+            if catches_all {
+                // Clauses after a catch-all clause are never reached.
+                break;
+            }
+        }
+        catches.truncate(start);
+        self.try_table_catches = catches;
+        self.stack.enter_catch(frame.height());
+        if !catches_all {
+            self.encode_rethrow_pending(&frame)?;
+        }
+        self.reachable = false;
+        self.translate_end_try_construct(frame)
+    }
+
+    /// TRust: pushes the operands that a `try_table` catch clause leaves for its label: the
+    /// fields of `tag`, if any, followed by an exception reference if `with_ref` is `true`.
+    ///
+    /// Returns the slots that hold them.
+    fn push_catch_operands(
+        &mut self,
+        tag: Option<u32>,
+        with_ref: bool,
+    ) -> Result<BoundedSlotSpan, Error> {
+        let results = self.stack.next_temp_slots();
+        let mut len_cells: u16 = 0;
+        let mut push = |this: &mut Self, ty: ValType| -> Result<(), Error> {
+            this.stack.push_temp(ty, Allocation::None)?;
+            len_cells = len_cells
+                .checked_add(required_cells_for_ty(ty))
+                .ok_or(TranslationError::AllocatedTooManySlots)?;
+            Ok(())
+        };
+        if let Some(tag) = tag {
+            let tag_type = self.resolve_tag_type(tag);
+            for ty in tag_type.params() {
+                push(self, *ty)?;
+            }
+        }
+        if with_ref {
+            push(self, ValType::ExnRef)?;
+        }
+        Ok(BoundedSlotSpan::new(results, len_cells))
     }
 
     /// Translates the end of the last `catch` or `catch_all` clause of a legacy Wasm `try`.
@@ -2239,7 +2357,7 @@ impl FuncTranslator {
             }
         }
         let operator = match ty {
-            ValType::I32 | ValType::FuncRef | ValType::ExternRef => {
+            ValType::I32 | ValType::FuncRef | ValType::ExternRef | ValType::ExnRef => {
                 self.i32_select_operator(condition, true_val, false_val)?
             }
             ValType::I64 => self.i64_select_operator(condition, true_val, false_val)?,
@@ -2264,11 +2382,11 @@ impl FuncTranslator {
         use ResolvedOperand as Opd;
         debug_assert!(matches!(
             true_val.ty(),
-            ValType::I32 | ValType::ExternRef | ValType::FuncRef
+            ValType::I32 | ValType::ExternRef | ValType::ExnRef | ValType::FuncRef
         ));
         debug_assert!(matches!(
             false_val.ty(),
-            ValType::I32 | ValType::ExternRef | ValType::FuncRef
+            ValType::I32 | ValType::ExternRef | ValType::ExnRef | ValType::FuncRef
         ));
         let true_val = self.resolve_operand::<RawVal>(true_val)?.map(u32::from);
         let false_val = self.resolve_operand::<RawVal>(false_val)?.map(u32::from);

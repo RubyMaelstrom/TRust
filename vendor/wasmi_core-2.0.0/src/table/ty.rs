@@ -10,6 +10,8 @@ pub enum RefType {
     Func,
     /// A Wasm `externref` reference type.
     Extern,
+    /// TRust: a Wasm `exnref` reference type (exception handling).
+    Exn,
 }
 
 /// A Wasm table descriptor.

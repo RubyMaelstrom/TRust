@@ -1,11 +1,15 @@
 mod context;
 mod error;
+mod exn;
 mod id;
 mod inner;
 mod pruned;
 mod typeid;
 
-pub(crate) use self::id::AsStoreId;
+pub(crate) use self::{
+    exn::{ExnEntity, ExnMarker, ExnStore},
+    id::AsStoreId,
+};
 use self::pruned::PrunedStoreVTable;
 pub use self::{
     context::{AsContext, AsContextMut, StoreContext, StoreContextMut},
@@ -89,8 +93,9 @@ impl<T> Store<T> {
     /// Visit native references needed by an embedding garbage collector's exported-function
     /// identity cache. Defined functions belonging to an instance form a conservative liveness
     /// group with outgoing edges to its imports (the second slice, NOT reverse edges).
-    /// Funcrefs in tables, globals and non-dropped element segments
-    /// are conservative roots. This does not collect or reuse native Store addresses.
+    /// Funcrefs in tables, globals and non-dropped element segments, and the fields of stored
+    /// exceptions that address functions, are conservative roots. This does not collect or
+    /// reuse native Store addresses.
     ///
     /// Call only while the Store is idle. During a re-entrant host callback the embedder must
     /// conservatively retain its cached wrappers: live Wasm operands are not enumerated here.

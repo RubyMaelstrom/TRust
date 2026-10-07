@@ -34,7 +34,7 @@ for line in open(ir_out + '/decode.rs'):
     m = re.match(r'pub struct (\w+) \{', line)
     if m:
         decode_types.setdefault(m.group(1), 'struct')
-op_codes = re.findall(r'^    (\w+),$', open(ir_out + '/op_code.rs').read().split('pub enum OpCode {')[1].split('}')[0], re.M)
+op_codes = re.findall(r'^    (\w+),?$', open(ir_out + '/op_code.rs').read().split('pub enum OpCode {')[1].split('}')[0], re.M)
 
 arms = {}
 simd_arms = {}

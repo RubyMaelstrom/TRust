@@ -179,6 +179,12 @@ impl Runner {
                 Err(error) => Err(error),
                 Ok(_) => Err("expected a trap".into()),
             },
+            // TRust: the exception-handling scripts (`test/core/exceptions`).
+            WastDirective::AssertException { exec, .. } => match self.execute(exec) {
+                Err(error) if error.contains("uncaught WebAssembly exception") => Ok(()),
+                Err(error) => Err(error),
+                Ok(_) => Err("expected an exception".into()),
+            },
             WastDirective::AssertInvalid { module, .. }
             | WastDirective::AssertMalformed { module, .. } => match module.encode() {
                 Err(_) => Ok(()),

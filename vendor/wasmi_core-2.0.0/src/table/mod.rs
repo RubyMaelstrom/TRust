@@ -193,6 +193,13 @@ impl Table {
         Ok(size_before)
     }
 
+    /// TRust: returns the raw element references of the [`Table`].
+    ///
+    /// The store's exception collector reads the `exnref` tables as roots.
+    pub fn raw_elements(&self) -> &[RawRef] {
+        &self.elements
+    }
+
     /// Returns the raw [`Table`] element reference at `index`.
     ///
     /// Returns `None` if `index` is out of bounds.

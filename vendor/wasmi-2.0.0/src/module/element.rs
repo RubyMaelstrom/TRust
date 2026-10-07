@@ -85,7 +85,8 @@ impl From<wasmparser::Element<'_>> for ElementSegment {
                 let ty = match ref_ty {
                     ty if ty.is_func_ref() => RefType::Func,
                     ty if ty.is_extern_ref() => RefType::Extern,
-                    _ => panic!("unsupported Wasm reference type"),
+                    // TRust: `exnref` element segments (exception handling).
+                    ty => super::utils::WasmiRefType::from(ty).into_inner(),
                 };
                 let items = items
                     .into_iter()
