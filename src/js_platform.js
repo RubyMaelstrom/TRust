@@ -6977,9 +6977,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         set slot(v) { this.setAttribute("slot", String(v)); }
         // `type`/`href`/`src` and the anchor URL components moved to their
         // owning interfaces (HTMLInputElement, HTMLAnchorElement, …) below.
-        get innerHTML() { return __dom_inner_html(nodeIds.get(this)); }
+        get innerHTML() { return fragmentMarkup(__dom_inner_html(nodeIds.get(this))); }
         set innerHTML(v) {
-            v = String(v);
+            v = v === null ? "" : String(v); // [LegacyNullToEmptyString]
             rangesReplaceChildren(this);
             const removedRoots = __dom_children(nodeIds.get(this));
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
@@ -7063,7 +7063,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 checkValidity() { return true; }, reportValidity() { return true; },
             };
         }
-        get outerHTML() { return __dom_outer_html(nodeIds.get(this)); }
+        get outerHTML() { return fragmentMarkup(__dom_outer_html(nodeIds.get(this))); }
         // HTML #dom-element-outerhtml setter steps: fragment-parse in the
         // parent's context and replace this element with the result. As with
         // innerHTML, the fragment parser leaves its script elements inert.
@@ -13164,20 +13164,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const s = domString(str), t = domString(type);
             if (!["text/html", "text/xml", "application/xml", "application/xhtml+xml", "image/svg+xml"].includes(t))
                 throw new TypeError("Unsupported DOMParser MIME type");
-            const doc = wrap(__dom_parse_document(s, t));
+            // HTML #dom-domparser-parsefromstring: "a new Document", not an
+            // XMLDocument, whichever parser the type selects.
+            const id = __dom_parse_document(s, t);
+            const doc = rememberWrapper(id, new Document(id), false);
             documentURLs.set(doc, g.document.URL);
             return doc;
         }
     }
-    // `new XMLSerializer().serializeToString(node)` — the inverse of DOMParser.
-    // Delegates to our HTML serializer (outerHTML); documents serialize their root.
+    // HTML #fragment-serializing-algorithm-steps: an XML document's markup is
+    // null when its XML serialization would not be well-formed.
+    function fragmentMarkup(markup) {
+        if (markup === null)
+            throw new DOMException("The node cannot be serialized as well-formed XML.", "InvalidStateError");
+        return markup;
+    }
+    // HTML #dom-xmlserializer-serializetostring: the XML serialization (DOM
+    // Parsing #dfn-xml-serialization) of root given require well-formed false.
     class XMLSerializer {
-        serializeToString(node) {
-            if (!node) return "";
-            if (node.outerHTML !== undefined && node.outerHTML !== null) return node.outerHTML;
-            if (node.documentElement) return node.documentElement.outerHTML || "";
-            if (node.nodeType === 3 || node.nodeType === 8) return String(node.nodeValue || "");
-            return node.innerHTML !== undefined ? node.innerHTML : "";
+        serializeToString(root) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            if (root !== null && typeof root === "object" && internalsOf(root).attrNode) return "";
+            const id = nodeIds.get(root);
+            if (typeof id !== "number") throw new TypeError("parameter 1 is not of type 'Node'");
+            return __dom_xml_serialize(id);
         }
     }
     class ShadowRoot extends DocumentFragment {
@@ -13191,9 +13201,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get clonable() { return !!internalsFor(this).clonable; }
         get slotAssignment() { return internalsFor(this).slotAssignment || "named"; }
         get activeElement() { return activeElementFor(this); }
-        get innerHTML() { return __dom_inner_html(nodeIds.get(this)); }
+        get innerHTML() { return fragmentMarkup(__dom_inner_html(nodeIds.get(this))); }
         set innerHTML(v) {
-            v = String(v);
+            v = v === null ? "" : String(v); // [LegacyNullToEmptyString]
             rangesReplaceChildren(this);
             const removedRoots = __dom_children(nodeIds.get(this));
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);

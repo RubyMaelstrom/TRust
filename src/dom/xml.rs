@@ -6,7 +6,7 @@
 //! CDATA boundaries and processing instructions which roxmltree coalesces.
 //! Neither parser resolves external resources; entity expansion is bounded.
 
-use super::{Attribute, Dom, Namespace, NodeData, NodeId, Prefix, QualName};
+use super::{Attribute, DocumentTypeInfo, Dom, Namespace, NodeData, NodeId, Prefix, QualName};
 use xml::reader::{ParserConfig, XmlEvent};
 
 const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
@@ -48,15 +48,12 @@ impl Dom {
         let mut expanded = 0usize;
         for event in reader {
             let event = event.map_err(|error| error.to_string())?;
-            // The builder creates no DocumentType node; don't buffer the markup.
-            if matches!(event, XmlEvent::Doctype { .. }) {
-                continue;
-            }
             expanded += match &event {
                 XmlEvent::Characters(text)
                 | XmlEvent::Whitespace(text)
                 | XmlEvent::CData(text)
-                | XmlEvent::Comment(text) => text.len(),
+                | XmlEvent::Comment(text)
+                | XmlEvent::Doctype { syntax: text } => text.len(),
                 XmlEvent::ProcessingInstruction { name, data } => {
                     name.len() + data.as_ref().map_or(0, String::len)
                 }
@@ -142,9 +139,14 @@ impl Dom {
                     self.append(parent, node);
                     Some(node)
                 }
-                XmlEvent::StartDocument { .. }
-                | XmlEvent::EndDocument
-                | XmlEvent::Doctype { .. } => None,
+                // The document's DocumentType child (DOM #concept-doctype).
+                XmlEvent::Doctype { syntax } => {
+                    let info = doctype_declaration(&syntax).ok_or("Malformed XML DOCTYPE")?;
+                    let node = self.create_doctype(&info.name, &info.public_id, &info.system_id);
+                    self.append(parent, node);
+                    Some(node)
+                }
+                XmlEvent::StartDocument { .. } | XmlEvent::EndDocument => None,
             };
             if node.is_some() {
                 count += 1;
@@ -155,6 +157,38 @@ impl Dom {
         }
         Ok(())
     }
+}
+
+/// XML 1.0 (Fifth Edition) [28] doctypedecl and [75] ExternalID: the
+/// DOCTYPE's name and its public and system literals (empty when absent).
+/// The internal subset contributes nothing to the DocumentType node.
+fn doctype_declaration(syntax: &str) -> Option<DocumentTypeInfo> {
+    // [3] S ::= (#x20 | #x9 | #xD | #xA)+
+    let space = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    // [11] SystemLiteral and [12] PubidLiteral: quoted, with no escapes.
+    let literal = |input: &str| -> Option<(String, usize)> {
+        let quote = input.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let end = input[1..].find(quote)? + 1;
+        Some((input[1..end].to_owned(), end + 1))
+    };
+    let rest = syntax.strip_prefix("<!DOCTYPE")?.trim_start_matches(space);
+    let name_end = rest
+        .find(|c: char| space(c) || matches!(c, '[' | '>'))
+        .unwrap_or(rest.len());
+    let mut info = DocumentTypeInfo {
+        name: rest[..name_end].to_owned(),
+        ..Default::default()
+    };
+    let rest = rest[name_end..].trim_start_matches(space);
+    if let Some(after) = rest.strip_prefix("SYSTEM") {
+        (info.system_id, _) = literal(after.trim_start_matches(space))?;
+    } else if let Some(after) = rest.strip_prefix("PUBLIC") {
+        let after = after.trim_start_matches(space);
+        let (public_id, used) = literal(after)?;
+        (info.system_id, _) = literal(after[used..].trim_start_matches(space))?;
+        info.public_id = public_id;
+    }
+    (!info.name.is_empty()).then_some(info)
 }
 
 // Preserve the author's prefixes, attribute order and *local* namespace
@@ -230,4 +264,40 @@ fn xml_attributes(
         });
     }
     Ok(attrs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::doctype_declaration;
+
+    #[test]
+    fn doctype_declarations_follow_xml_productions() {
+        // XML 1.0 (Fifth Edition) [28] doctypedecl, [75] ExternalID, [11]
+        // SystemLiteral and [12] PubidLiteral; the internal subset is ignored.
+        let parts = |syntax| {
+            doctype_declaration(syntax).map(|info| (info.name, info.public_id, info.system_id))
+        };
+        let owned = |name: &str, public: &str, system: &str| {
+            Some((name.to_owned(), public.to_owned(), system.to_owned()))
+        };
+        assert_eq!(parts("<!DOCTYPE note>"), owned("note", "", ""));
+        assert_eq!(
+            parts("<!DOCTYPE note SYSTEM \"a.dtd\">"),
+            owned("note", "", "a.dtd")
+        );
+        assert_eq!(
+            parts("<!DOCTYPE\nhtml\tPUBLIC '-//W3C//DTD XHTML 1.0 Strict//EN'\n'x.dtd' >"),
+            owned("html", "-//W3C//DTD XHTML 1.0 Strict//EN", "x.dtd")
+        );
+        assert_eq!(
+            parts("<!DOCTYPE r [<!ENTITY e \"SYSTEM\">]>"),
+            owned("r", "", "")
+        );
+        assert_eq!(
+            parts("<!DOCTYPE x:y SYSTEM 'it\"s'>"),
+            owned("x:y", "", "it\"s")
+        );
+        assert_eq!(parts("<!DOCTYPE note SYSTEM>"), None);
+        assert_eq!(parts("<!ELEMENT note>"), None);
+    }
 }
