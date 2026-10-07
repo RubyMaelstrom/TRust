@@ -846,7 +846,7 @@ fn render_fixed_layer(
                     continue; // past the rail's right edge
                 }
                 let key = crate::app::EncKey::for_item(url, it);
-                let Some(proto) = protocols.get(&key) else {
+                let Some((_, proto)) = crate::app::protocol_entry(protocols, &key) else {
                     continue;
                 };
                 let position = SignedPosition::from((it.col as i16, r as i16));
@@ -1047,7 +1047,7 @@ fn render_inline_images(
                 continue;
             }
             let key = crate::app::EncKey::for_item(url, item);
-            let Some(proto) = protocols.get(&key) else {
+            let Some((_, proto)) = crate::app::protocol_entry(protocols, &key) else {
                 continue;
             };
             let clip_top = image_anchor_clip_top(&g.doc.fixed, scol, inner.height);
@@ -1140,7 +1140,7 @@ fn render_region_images(
                     continue; // past the scrollport's right edge
                 }
                 let key = crate::app::EncKey::for_item(url, item);
-                let Some(proto) = protocols.get(&key) else {
+                let Some((_, proto)) = crate::app::protocol_entry(protocols, &key) else {
                     continue;
                 };
                 // Position relative to the visible band's top-left; the

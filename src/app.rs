@@ -362,6 +362,62 @@ impl EncKey {
     }
 }
 
+/// `canvas:<handle>/<generation>` → (`canvas:<handle>/`, generation): the
+/// terminal image key of one canvas presentation (`CanvasImage::terminal_url`).
+/// A canvas presents a new frame, under a new key, whenever it is redrawn.
+fn canvas_frame_id(url: &str) -> Option<(&str, u64)> {
+    let slash = url.strip_prefix("canvas:")?.find('/')? + "canvas:".len();
+    let generation = url[slash + 1..].parse().ok()?;
+    Some((&url[..=slash], generation))
+}
+
+/// Whether two image keys name presentations of the same canvas.
+fn same_canvas(a: &str, b: &str) -> bool {
+    matches!((canvas_frame_id(a), canvas_frame_id(b)), (Some((a, _)), Some((b, _))) if a == b)
+}
+
+impl EncKey {
+    /// Whether `other` is this box of another presentation of the same canvas.
+    fn same_canvas_box(&self, other: &EncKey) -> bool {
+        same_canvas(&self.url, &other.url)
+            && (
+                self.w,
+                self.h,
+                self.image_clip,
+                self.crop,
+                self.pixelated,
+                self.tint,
+            ) == (
+                other.w,
+                other.h,
+                other.image_clip,
+                other.crop,
+                other.pixelated,
+                other.tint,
+            )
+    }
+
+    fn canvas_generation(&self) -> Option<u64> {
+        canvas_frame_id(&self.url).map(|(_, generation)| generation)
+    }
+}
+
+/// The encoded image to draw for `key`: its own, or, while a canvas's newer
+/// frame is still being encoded, the newest encoded frame of that canvas box,
+/// so an animated canvas keeps showing its last frame instead of a gap.
+pub(crate) fn protocol_entry<'a>(
+    protocols: &'a HashMap<EncKey, SlicedProtocol>,
+    key: &EncKey,
+) -> Option<(&'a EncKey, &'a SlicedProtocol)> {
+    protocols.get_key_value(key).or_else(|| {
+        key.canvas_generation()?;
+        protocols
+            .iter()
+            .filter(|(other, _)| other.same_canvas_box(key))
+            .max_by_key(|(other, _)| other.canvas_generation())
+    })
+}
+
 /// The silhouette recolor for every SVG: a single flat WHITE over the UI
 /// background. We deliberately do NOT vary by role (link vs. body) — one neutral
 /// color keeps inline icons consistent and dodges the context-color mess (her
@@ -3911,6 +3967,9 @@ impl App {
                 !self.image_cache.contains_key(u)
                     && !self.imgs_in_flight.contains(u)
                     && !self.failed_images.contains(u)
+                    // One load per canvas at a time; its completion requests
+                    // the newest frame (`on_img_load`).
+                    && !self.imgs_in_flight.iter().any(|f| same_canvas(f, u))
             })
             .collect();
         if todo.is_empty() {
@@ -4008,10 +4067,44 @@ impl App {
             self.failed_images.insert(msg.url);
             return;
         };
+        if let Some((canvas, generation)) = canvas_frame_id(&msg.url) {
+            // Keep one decoded frame per canvas: frames are megabytes each, and
+            // a live page presents many between navigations.
+            let older = |url: &String| {
+                canvas_frame_id(url).is_some_and(|(c, g)| c == canvas && g < generation)
+            };
+            self.image_cache.retain(|url, _| !older(url));
+            self.image_sizes.retain(|url, _| !older(url));
+            self.image_alpha.retain(|url, _| !older(url));
+        }
+        let canvas =
+            canvas_frame_id(&msg.url).map(|(canvas, generation)| (canvas.to_string(), generation));
         self.pending_decoded_urls.push(msg.url.clone());
         self.image_sizes.insert(msg.url.clone(), decoded.intrinsic);
         self.image_alpha.insert(msg.url.clone(), decoded.has_alpha);
         self.image_cache.insert(msg.url, decoded);
+        if let Some((canvas, generation)) = canvas {
+            // Frames presented while this one loaded were skipped: load the
+            // canvas's newest frame the current document shows.
+            let Some((page, newest)) = self.browser.as_ref().and_then(|browser| {
+                let Link::Http(page) = &browser.doc.url else {
+                    return None;
+                };
+                let newest = browser
+                    .doc
+                    .image_urls
+                    .iter()
+                    .filter(|u| {
+                        canvas_frame_id(u).is_some_and(|(c, g)| c == canvas && g > generation)
+                    })
+                    .max_by_key(|u| canvas_frame_id(u).map(|(_, g)| g))?
+                    .clone();
+                Some((page.clone(), newest))
+            }) else {
+                return;
+            };
+            self.start_image_loads(page, vec![newest]);
+        }
     }
 
     /// Re-flow for the images decoded since the last run-loop turn — SCOPED to
@@ -4173,8 +4266,8 @@ impl App {
                     // leaving an icon-only modal close button permanently
                     // blank on terminal TRust.
                     if let Some(url) = &it.image {
-                        self.image_protocols
-                            .contains_key(&EncKey::for_item(url, it))
+                        protocol_entry(&self.image_protocols, &EncKey::for_item(url, it))
+                            .map(|(key, _)| &key.url)
                             .hash(&mut h);
                     }
                 }
@@ -4199,8 +4292,8 @@ impl App {
                 // A decoded image reveals when its protocol lands — the row text
                 // is unchanged across that transition, so hash readiness too.
                 if let Some(url) = &it.image {
-                    self.image_protocols
-                        .contains_key(&EncKey::for_item(url, it))
+                    protocol_entry(&self.image_protocols, &EncKey::for_item(url, it))
+                        .map(|(key, _)| &key.url)
                         .hash(&mut h);
                 }
             }
@@ -4227,6 +4320,13 @@ impl App {
         self.image_encoding.remove(&msg.key);
         match msg.protocol {
             Some(protocol) => {
+                // A canvas's older frames of this box are superseded.
+                if let Some(generation) = msg.key.canvas_generation() {
+                    self.image_protocols.retain(|key, _| {
+                        !key.same_canvas_box(&msg.key)
+                            || key.canvas_generation() >= Some(generation)
+                    });
+                }
                 self.image_protocols.insert(msg.key, protocol);
             }
             // Encode failed: remember it so it isn't re-requested every tick.
@@ -4309,8 +4409,10 @@ impl App {
             }
         }
         // Bound the caches: drop protocols/failures for boxes no longer in range
-        // (a re-scrolled box gets one fresh encode attempt).
-        self.image_protocols.retain(|k, _| live.contains(k));
+        // (a re-scrolled box gets one fresh encode attempt). A canvas's last
+        // encoded frame stays drawn until its next frame's encode lands.
+        self.image_protocols
+            .retain(|k, _| live.contains(k) || live.iter().any(|l| l.same_canvas_box(k)));
         self.failed_encodes.retain(|k| live.contains(k));
         let wanted: Vec<EncKey> = live
             .into_iter()
@@ -4318,6 +4420,10 @@ impl App {
                 !self.image_protocols.contains_key(k)
                     && !self.image_encoding.contains(k)
                     && !self.failed_encodes.contains(k)
+                    // One encode per canvas box at a time: a canvas presents
+                    // faster than frames encode, and the newest frame is
+                    // requested again once the running encode lands.
+                    && !self.image_encoding.iter().any(|e| e.same_canvas_box(k))
             })
             .collect();
         for key in wanted {
@@ -9742,6 +9848,7 @@ async fn load_page_image(
     if let Some(images) = images
         && !url.starts_with("data:")
         && !url.starts_with("blob:")
+        && !url.starts_with("canvas:")
     {
         match images.presentation(url).await {
             crate::page_images::Presentation::Image(image) => {
@@ -9760,6 +9867,17 @@ async fn load_page_image(
             crate::page_images::Presentation::Failed => return None,
             crate::page_images::Presentation::Unavailable => {}
         }
+    }
+    // A canvas presentation was handed over as raw pixels by the page's own
+    // rendering; its key names the canvas, not a resource.
+    if url.starts_with("canvas:") {
+        let raw = crate::img::registered_canvas_frame(url)?;
+        let (intrinsic, has_alpha) = decoded_intrinsic(raw.clone()).await?;
+        return Some(DecodedImage {
+            raw,
+            intrinsic,
+            has_alpha,
+        });
     }
     // A `data:` image (a rewritten inline SVG, or a page's own data image)
     // carries its bytes — decode locally, no fetch, no SSRF concern.
@@ -15876,6 +15994,77 @@ mod tests {
             sample_times.len(),
             "capture ended before +10s"
         );
+    }
+
+    #[tokio::test]
+    async fn canvas_frames_supersede_each_other_without_blank_gaps() {
+        use ratatui::layout::Size;
+        // A canvas presents a new frame under a new key each time it changes.
+        assert_eq!(
+            super::canvas_frame_id("canvas:1f/7"),
+            Some(("canvas:1f/", 7))
+        );
+        assert!(super::canvas_frame_id("https://ex.com/canvas:1/2").is_none());
+        assert!(super::same_canvas("canvas:1f/7", "canvas:1f/9"));
+        assert!(!super::same_canvas("canvas:1f/7", "canvas:2f/7"));
+        let key = |url: &str| super::EncKey {
+            url: url.to_string(),
+            w: 4,
+            h: 2,
+            image_clip: None,
+            crop: false,
+            pixelated: false,
+            tint: Some(super::svg_tint()),
+        };
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let encode = || {
+            let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                8,
+                8,
+                image::Rgba([1, 2, 3, 255]),
+            ));
+            crate::img::encode_sliced(&picker, image, Size::new(4, 2), false, false).unwrap()
+        };
+        let mut app = super::App::new(None, 23);
+        let (old, new) = (key("canvas:1f/7"), key("canvas:1f/9"));
+        // While the newer frame encodes, the older one stays drawn.
+        app.image_protocols.insert(old.clone(), encode());
+        let drawn = super::protocol_entry(&app.image_protocols, &new).map(|(k, _)| k.url.clone());
+        assert_eq!(drawn.as_deref(), Some("canvas:1f/7"));
+        // Another canvas or another box never stands in.
+        assert!(super::protocol_entry(&app.image_protocols, &key("canvas:2f/9")).is_none());
+        assert!(
+            super::protocol_entry(
+                &app.image_protocols,
+                &super::EncKey {
+                    w: 5,
+                    ..new.clone()
+                }
+            )
+            .is_none()
+        );
+        // Its encode supersedes the older frame of the box.
+        app.image_encoding.insert(new.clone());
+        app.on_enc(super::EncMsg {
+            key: new.clone(),
+            protocol: Some(encode()),
+            epoch: app.enc_epoch,
+        });
+        assert!(app.image_protocols.contains_key(&new));
+        assert!(!app.image_protocols.contains_key(&old));
+        // Decoded frames are megabytes: only a canvas's newest is kept.
+        for generation in [7, 9] {
+            app.on_img_load(super::ImgLoadMsg {
+                url: format!("canvas:1f/{generation}"),
+                decoded: Some(super::DecodedImage {
+                    raw: crate::img::canvas_frame(1, 1, false, &[1, 2, 3, 255]),
+                    intrinsic: (1, 1),
+                    has_alpha: false,
+                }),
+            });
+        }
+        assert!(app.image_cache.contains_key("canvas:1f/9"));
+        assert!(!app.image_cache.contains_key("canvas:1f/7"));
     }
 
     /// The core of the `SlicedProtocol` switch: a box encodes ONCE and every

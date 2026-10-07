@@ -960,15 +960,15 @@ pub fn adapt_terminal(
     let mut root = cache.root.clone();
     let mut fixed = cache.fixed.clone();
     let mut top_layer = cache.top_layer.clone();
-    // Terminal graphics still consume PNG URLs, but only the terminal adapter
-    // serializes them. The shared fragments and graphical paint remain native
-    // immutable bitmaps; adapting an old page cannot read a newer canvas.
+    // Terminal graphics consume image keys, but only the terminal adapter
+    // names canvas frames. The shared fragments and graphical paint remain
+    // native immutable bitmaps.
     if !layout.paint.canvas_images.is_empty() {
         let canvases: HashMap<_, _> = layout
             .paint
             .canvas_images
             .iter()
-            .filter_map(|(node, image)| image.data_url().map(|url| (*node, url)))
+            .map(|(node, image)| (*node, image.terminal_url()))
             .collect();
         fn attach(fragment: &mut flow::Frag, canvases: &HashMap<NodeId, String>) {
             if let flow::FragKind::Line(line) = &mut fragment.kind {

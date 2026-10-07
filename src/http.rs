@@ -772,13 +772,12 @@ pub fn adapt_rendered_terminal(
     let deferred_images = rendered.deferred_images.clone();
     let output = crate::layout2::adapt_terminal(&rendered.layout, viewport, alpha);
     for (_, canvas) in &rendered.layout.paint.canvas_images {
-        if let Some(url) = canvas.data_url() {
-            if !rendered.image_urls.contains(&url) {
-                rendered.image_urls.push(url.clone());
-            }
-            if !rendered.eager_image_urls.contains(&url) {
-                rendered.eager_image_urls.push(url);
-            }
+        let url = canvas.terminal_url();
+        if !rendered.image_urls.contains(&url) {
+            rendered.image_urls.push(url.clone());
+        }
+        if !rendered.eager_image_urls.contains(&url) {
+            rendered.eager_image_urls.push(url);
         }
     }
     let hover_ids = if rendered.direct_actor_nodes {
