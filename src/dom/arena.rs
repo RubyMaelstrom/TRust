@@ -140,17 +140,25 @@ impl Relocations {
                 return;
             }
         } else {
+            // Grow geometrically toward lower identities too. Sweeping the
+            // nursery relocates surviving nodes into freed slots in no
+            // particular identity order; an exact prepend copied the whole
+            // table for every identity below the current base.
             let grow = self.base - id;
-            if Self::dense_enough(self.table.len() + grow, self.live + 1)
-                && self.clear_of_sparse(id, self.base - 1)
-            {
-                let mut table = vec![0; grow];
-                table.extend_from_slice(&self.table);
-                table[0] = entry;
-                self.table = table;
-                self.base = id;
-                self.live += 1;
-                return;
+            for extra in [self.table.len().min(id), 0] {
+                let low = id - extra;
+                if Self::dense_enough(self.table.len() + grow + extra, self.live + 1)
+                    && self.clear_of_sparse(low, self.base - 1)
+                {
+                    let mut table = Vec::with_capacity(self.table.len() + grow + extra);
+                    table.resize(grow + extra, 0);
+                    table.extend_from_slice(&self.table);
+                    table[extra] = entry;
+                    self.table = table;
+                    self.base = low;
+                    self.live += 1;
+                    return;
+                }
             }
         }
         self.insert_sparse(id, slot);
