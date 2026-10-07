@@ -15,7 +15,6 @@ use crate::{
     errors::MemoryError,
     store::Stored,
 };
-use alloc::vec::Vec;
 
 define_handle! {
     /// A Wasm linear memory reference.
@@ -179,19 +178,6 @@ impl Memory {
             .data_size()
     }
 
-    /// Returns the mutation generation of this linear memory for embedder mirror invalidation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `ctx` does not own this [`Memory`].
-    pub fn data_version(&self, ctx: impl AsContext) -> u64 {
-        ctx.as_context()
-            .store
-            .inner
-            .resolve_memory(self)
-            .data_version()
-    }
-
     /// TRust: shares the bytes of this memory with the embedder, see
     /// [`CoreMemory::share`](crate::core::CoreMemory::share).
     ///
@@ -210,19 +196,6 @@ impl Memory {
         let memory = ctx.as_context_mut().store.inner.resolve_memory_mut(self);
         // SAFETY: forwarded to the caller.
         unsafe { memory.share() }
-    }
-
-    /// Takes the page-aligned ranges written since the previous call.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `ctx` does not own this [`Memory`].
-    pub fn take_dirty_ranges(&self, mut ctx: impl AsContextMut) -> Vec<core::ops::Range<usize>> {
-        ctx.as_context_mut()
-            .store
-            .inner
-            .resolve_memory_mut(self)
-            .take_dirty_ranges()
     }
 
     /// Reads `n` bytes from `memory[offset..offset+n]` into `buffer`

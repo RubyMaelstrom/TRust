@@ -611,9 +611,8 @@ fn memory_copy_within(
     consume_fuel!(store, ip, args, fuel, |costs| costs
         .fuel_for_copying_values::<u8>(len as u64));
     memory
-        .data_mut_untracked()
+        .data_mut()
         .copy_within(src_index..src_index.wrapping_add(len), dst_index);
-    memory.mark_dirty_range(dst_index, len);
     Control::Continue(())
 }
 
@@ -2432,9 +2431,8 @@ macro_rules! handler_store_ix {
                     let address = args.get(address);
                     let value: $hint = args.get(value);
                     let memory = args.fetch_memory(store, memory);
-                    let bytes = memory.data_mut_untracked();
+                    let bytes = memory.data_mut();
                     $store(bytes, usize::from(address), value.into()).into_control()?;
-                    memory.mark_dirty_range(usize::from(address), ::core::mem::size_of::<$hint>());
                     dispatch!(store, args)
                 }
             }

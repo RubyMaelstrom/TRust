@@ -149,14 +149,6 @@ impl Args {
     ///
     /// # Note
     ///
-    /// TRust: the JS API exposes linear memory as `Memory.buffer`; the embedder mirrors only
-    /// the pages written since its last synchronization.
-    #[inline]
-    pub fn mark_mem0_dirty(&mut self, store: &mut PrunedStore, address: u64, len: usize) {
-        let memory = self.fetch_memory(store, ir::MemoryAddr::from(0_u16));
-        utils::mark_memory_dirty(memory, address, len);
-    }
-
     /// Returns an exclusive reference to the memory at `index`.
     #[inline]
     pub fn fetch_memory<'a, Addr>(

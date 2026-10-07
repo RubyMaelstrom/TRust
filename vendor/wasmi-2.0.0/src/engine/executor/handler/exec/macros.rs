@@ -236,10 +236,8 @@ macro_rules! handler_store {
                     let offset = args.get(offset);
                     let value: $hint = args.get(value);
                     let memory = args.fetch_memory(store, memory);
-                    let bytes = memory.data_mut_untracked();
+                    let bytes = memory.data_mut();
                     $store(bytes, ptr, offset, value.into()).into_control()?;
-                    let address = u64::wrapping_add(ptr, offset);
-                    utils::mark_memory_dirty(memory, address, ::core::mem::size_of::<$hint>());
                     dispatch!(store, args)
                 }
             }
@@ -273,8 +271,6 @@ macro_rules! handler_store_mem0_offset16 {
                     let value: $hint = args.get(value);
                     let bytes = args.fetch_default_memory_bytes(store);
                     $store(bytes, ptr, u64::from(offset), value.into()).into_control()?;
-                    let address = u64::wrapping_add(ptr, u64::from(offset));
-                    args.mark_mem0_dirty(store, address, ::core::mem::size_of::<$hint>());
                     dispatch!(store, args)
                 }
             }

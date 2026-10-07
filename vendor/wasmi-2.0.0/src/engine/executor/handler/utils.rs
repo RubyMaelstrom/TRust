@@ -576,9 +576,7 @@ pub fn extract_mem0(inst: Inst) -> (Mem0Ptr, Mem0Len) {
     let mem0 = unsafe { mem0.as_ref() };
     let mem0 = mem0.entity();
     // SAFETY: entity cache is ensured to have warmed at instantiation.
-    // TRust: the executor only needs the base pointer here; writes through it record their
-    //        exact extent via `mark_mem0_dirty`.
-    let mem0 = unsafe { &mut *mem0.as_ptr() }.data_mut_untracked();
+    let mem0 = unsafe { &mut *mem0.as_ptr() }.data_mut();
     let mem0_ptr = mem0.as_mut_ptr();
     let mem0_len = mem0.len();
     (Mem0Ptr::from(mem0_ptr), Mem0Len::from(mem0_len))
@@ -592,33 +590,16 @@ pub fn memory_slice(memory: &MemoryEntity, pos: usize, len: usize) -> Result<&[u
         .ok_or(TrapCode::MemoryOutOfBounds)
 }
 
-/// Returns the bytes `memory[pos..pos+len]` that the caller is about to overwrite.
-///
-/// # Note
-///
-/// TRust: every caller writes the whole returned span, so it is recorded as dirty for the
-/// embedder's `Memory.buffer` mirror (WebAssembly JS API #memories).
 pub fn memory_slice_mut(
     memory: &mut MemoryEntity,
     pos: usize,
     len: usize,
 ) -> Result<&mut [u8], TrapCode> {
-    let in_bounds = pos
-        .checked_add(len)
-        .is_some_and(|end| end <= memory.data().len());
-    if !in_bounds {
-        return Err(TrapCode::MemoryOutOfBounds);
-    }
-    memory.mark_dirty_range(pos, len);
-    Ok(&mut memory.data_mut_untracked()[pos..pos + len])
-}
-
-/// Records a completed write of `len` bytes at the effective `address` of `memory`.
-#[inline]
-pub fn mark_memory_dirty(memory: &mut MemoryEntity, address: u64, len: usize) {
-    if let Ok(address) = usize::try_from(address) {
-        memory.mark_dirty_range(address, len);
-    }
+    memory
+        .data_mut()
+        .get_mut(pos..)
+        .and_then(|memory| memory.get_mut(..len))
+        .ok_or(TrapCode::MemoryOutOfBounds)
 }
 
 /// Extension trait for [`Inst`] to load typed entries from their addresses.

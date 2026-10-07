@@ -23,7 +23,6 @@ pub use self::{
     ty::{MemoryType, MemoryTypeBuilder},
 };
 use crate::{Fuel, FuelError, ResourceLimiterRef};
-use alloc::vec::Vec;
 use core::ops::Range;
 
 #[cfg(feature = "simd")]
@@ -36,11 +35,6 @@ pub struct Memory {
     bytes: ByteBuffer,
     /// The underlying type of the memory.
     memory_type: MemoryType,
-    /// Monotonic generation of mutable memory access. Embedders use this to avoid copying an
-    /// unchanged linear-memory mirror across host callbacks.
-    data_version: u64,
-    /// Page-aligned ranges written since the last embedder synchronization.
-    dirty_ranges: Vec<Range<usize>>,
 }
 
 impl Memory {
@@ -119,12 +113,7 @@ impl Memory {
                 return Err(error);
             }
         };
-        Ok(Self {
-            bytes,
-            memory_type,
-            data_version: 0,
-            dirty_ranges: Vec::new(),
-        })
+        Ok(Self { bytes, memory_type })
     }
 
     /// Returns the memory type of the linear memory.
@@ -266,7 +255,6 @@ impl Memory {
         if let Err(error) = self.bytes.grow(desired_byte_size) {
             return notify_limiter(limiter, error);
         }
-        self.mark_dirty_range(current_byte_size, desired_byte_size - current_byte_size);
         Ok(current_size)
     }
 
@@ -277,87 +265,7 @@ impl Memory {
 
     /// Returns an exclusive slice to the bytes underlying to the byte buffer.
     pub fn data_mut(&mut self) -> &mut [u8] {
-        let len = self.bytes.len();
-        self.mark_dirty_range(0, len);
-        self.data_mut_untracked()
-    }
-
-    /// Returns an exclusive slice without recording a dirty range.
-    ///
-    /// This is used internally when the caller records the exact write span separately, and when
-    /// Wasmi only needs a mutable pointer for its cached linear-memory fast path.
-    pub fn data_mut_untracked(&mut self) -> &mut [u8] {
         self.bytes.data_mut()
-    }
-
-    /// Returns the mutation generation of this linear memory. The generation is an embedder
-    /// optimization only; it is not observable by WebAssembly code and may wrap after `u64::MAX`
-    /// mutable accesses.
-    pub fn data_version(&self) -> u64 {
-        self.data_version
-    }
-
-    /// Records a write to linear memory, rounded to memory pages for efficient mirror updates.
-    ///
-    /// A shared memory (see [`Memory::share`]) has no mirror to update and records nothing.
-    #[inline]
-    pub fn mark_dirty_range(&mut self, start: usize, len: usize) {
-        if self.bytes.is_shared() {
-            return;
-        }
-        let Some(end) = start.checked_add(len) else {
-            return;
-        };
-        if len == 0 || start >= self.bytes.len() || end > self.bytes.len() {
-            return;
-        }
-        self.data_version = self.data_version.wrapping_add(1);
-        // WebAssembly JS API §4.1 identifies Memory.buffer with the store's Data Block.
-        // Repeated writes still advance the generation, but an already-covered span
-        // needs no rounding or Vec removal/insertion. This is the hot path for Wasm
-        // loops rewriting stack slots between calls into JavaScript.
-        if self
-            .dirty_ranges
-            .last()
-            .is_some_and(|range| range.start <= start && end <= range.end)
-        {
-            return;
-        }
-        self.insert_dirty_range(start, end);
-    }
-
-    // Keep the range-merging slow path out of each interpreted store instruction.
-    // Most writes are already covered until the next JS/wasm synchronization.
-    #[inline(never)]
-    fn insert_dirty_range(&mut self, start: usize, end: usize) {
-        let page_size = self.memory_type.page_size() as usize;
-        let mut start = start / page_size * page_size;
-        let mut end = end
-            .saturating_add(page_size - 1)
-            .checked_div(page_size)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(page_size)
-            .min(self.bytes.len());
-        let mut index = 0;
-        while index < self.dirty_ranges.len() {
-            let range = &self.dirty_ranges[index];
-            if range.end < start {
-                index += 1;
-                continue;
-            }
-            if range.start > end {
-                break;
-            }
-            start = start.min(range.start);
-            end = end.max(range.end);
-            self.dirty_ranges.remove(index);
-        }
-        self.dirty_ranges.insert(index, start..end);
-    }
-
-    /// Takes the page-aligned ranges written since the previous call.
-    pub fn take_dirty_ranges(&mut self) -> Vec<Range<usize>> {
-        core::mem::take(&mut self.dirty_ranges)
     }
 
     /// Returns the base pointer, in the host’s address space, that the [`Memory`] is located at.
@@ -379,7 +287,6 @@ impl Memory {
     /// This identifies a JavaScript `ArrayBuffer` Data Block with the memory, as the
     /// WebAssembly JS API requires for `Memory.buffer` (#memories, "create a fixed length
     /// memory buffer"), so writes on either side are visible to the other without a copy.
-    /// A shared memory no longer records dirty ranges or advances its `data_version`.
     ///
     /// Returns `None` for a memory backed by a static buffer.
     ///
@@ -397,10 +304,7 @@ impl Memory {
     /// read the live `Vec` header, but the new length becomes the memory's size.
     pub unsafe fn share(&mut self) -> Option<SharedBytes> {
         // SAFETY: forwarded to the caller.
-        let shared = unsafe { self.bytes.share() }?;
-        // Writes recorded for a mirror are moot once there is none.
-        self.dirty_ranges = Vec::new();
-        Some(shared)
+        unsafe { self.bytes.share() }
     }
 
     /// Returns `true` if [`Memory::share`] shared the bytes of this memory.
@@ -441,11 +345,10 @@ impl Memory {
     pub fn write(&mut self, offset: usize, buffer: &[u8]) -> Result<(), MemoryError> {
         let span = Self::access_span(offset, buffer.len())?;
         let slice = self
-            .data_mut_untracked()
+            .data_mut()
             .get_mut(span)
             .ok_or(MemoryError::OutOfBoundsAccess)?;
         slice.copy_from_slice(buffer);
-        self.mark_dirty_range(offset, buffer.len());
         Ok(())
     }
 }

@@ -684,12 +684,10 @@ fn native_simd_memory_accesses_match_interpreter_and_trap_in_place() {
         let memory = instance.get_memory(&store, "memory").unwrap();
         let mut outcome = Vec::new();
         outcome.push(format!("{:?}", run.call(&mut store, (20_000, 7))));
-        memory.take_dirty_ranges(&mut store);
         // The v128.store at ptr+3 fits until ptr = 65517; the 16-byte load at
         // ptr+1 still fits, but the earlier store faults at ptr = 65518.
         let error = run.call(&mut store, (100, 65_500)).unwrap_err();
         outcome.push(format!("{:?}", error.as_trap_code()));
-        outcome.push(format!("{:?}", memory.take_dirty_ranges(&mut store)));
         outcome.push(format!("{:?}", &memory.data(&store)[65_400..]));
         if enabled {
             assert_loops_native(&engine, 1);
