@@ -23488,7 +23488,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 206, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 207, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -23499,7 +23499,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 206);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 207);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
