@@ -620,6 +620,54 @@ async fn navigate_and_settle(options: &Options) -> Result<bool, Box<dyn Error>> 
     Ok(settled != Settle::Timeout)
 }
 
+/// The images one snapshot round presents: eager, painted and near-viewport
+/// lazy images not yet `settled` (decoded or failed), at most
+/// [`SNAPSHOT_IMAGE_LIMIT`].
+///
+/// HTML #lazy-loading-attributes: a live document's `loading=lazy` image
+/// requests wait for its lazy load resumption steps, which only its lazy load
+/// intersection observer (or a switch to the Eager state) runs. Presentation
+/// waits for the document's own response, so a painted lazy image the page
+/// will not resume at this viewport would hold the snapshot until its deadline.
+/// As in the desktop frontend, live lazy images come only from the deferred
+/// images within two viewport heights, inside the page's own lazy load scroll
+/// margin. A page that is no longer live runs no observer and is presented
+/// from direct fetches, so its painted requests are all taken.
+fn snapshot_image_sources(
+    rendered: &trust::http::RenderedPage,
+    viewport_height: f32,
+    live: bool,
+    settled: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let near = viewport_height * 2.0;
+    let mut sources: Vec<String> = Vec::new();
+    for source in rendered
+        .eager_image_urls
+        .iter()
+        .chain(
+            rendered
+                .layout
+                .paint
+                .image_requests
+                .iter()
+                .filter(|request| !live || !rendered.lazy_image_handles.contains(&request.handle))
+                .map(|request| &request.source),
+        )
+        .chain(
+            rendered
+                .deferred_images
+                .iter()
+                .filter(|image| image.fixed || image.rect.y < near)
+                .map(|image| &image.source),
+        )
+    {
+        if !settled(source) && !sources.contains(source) && sources.len() < SNAPSHOT_IMAGE_LIMIT {
+            sources.push(source.clone());
+        }
+    }
+    sources
+}
+
 /// Images one snapshot round may start, and how long all rounds may take.
 const SNAPSHOT_IMAGE_LIMIT: usize = 200;
 const SNAPSHOT_IMAGE_DEADLINE: Duration = Duration::from_secs(20);
@@ -649,35 +697,12 @@ async fn snapshot_with_images(
             break;
         };
         let rendered = relaid.as_ref().or(page.rendered_page())?;
-        let near = options.height * 2.0;
-        let mut sources: Vec<String> = Vec::new();
-        for source in rendered
-            .eager_image_urls
-            .iter()
-            .chain(
-                rendered
-                    .layout
-                    .paint
-                    .image_requests
-                    .iter()
-                    .map(|r| &r.source),
-            )
-            .chain(
-                rendered
-                    .deferred_images
-                    .iter()
-                    .filter(|image| image.fixed || image.rect.y < near)
-                    .map(|image| &image.source),
-            )
-        {
-            if !decoded.contains_key(source)
-                && !failed.contains(source)
-                && !sources.contains(source)
-                && sources.len() < SNAPSHOT_IMAGE_LIMIT
-            {
-                sources.push(source.clone());
-            }
-        }
+        let sources = snapshot_image_sources(
+            rendered,
+            options.height,
+            controller.page_is_live(),
+            |source| decoded.contains_key(source) || failed.contains(source),
+        );
         let remaining = deadline.saturating_duration_since(Instant::now());
         if sources.is_empty() || remaining.is_zero() {
             break;
@@ -1169,9 +1194,65 @@ fn semantic_text(tree: &SemanticTree, links: &mut Vec<String>) -> String {
 mod tests {
     use super::{
         Run, cap_to_chars, describe_fetch, finish_lines, lines_of_runs, reported_link,
-        resolve_reference,
+        resolve_reference, snapshot_image_sources,
     };
     use trust::core::FetchedDocument;
+
+    #[test]
+    fn snapshots_present_lazy_images_only_inside_the_documents_lazy_margin() {
+        // HTML #lazy-loading-attributes: a live document's lazy image request
+        // waits for its resumption steps, which run only near the viewport.
+        // Asking for a far lazy image would hold the snapshot until its
+        // deadline; a page without a running observer loads it eagerly.
+        let response = trust::http::Response {
+            url: Url::parse("https://images.example/page").unwrap(),
+            status: 200,
+            content_type: String::from("text/html"),
+            headers: Vec::new(),
+            body: br#"<body style="margin:0">
+                <img src="eager.png" width="10" height="10">
+                <img loading="lazy" src="near.png" width="10" height="10">
+                <div style="height:5000px"></div>
+                <img loading="lazy" src="far.png" width="10" height="10">
+                <div style="width:10px;height:10px;background-image:url(far-css.png)"></div>
+            </body>"#
+                .to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            images: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+            timing: None,
+        };
+        let rendered = trust::http::render_html_for_environment(
+            &response,
+            trust::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        let names = |live| {
+            let mut names: Vec<_> = snapshot_image_sources(&rendered, 600.0, live, |_| false)
+                .into_iter()
+                .map(|source| source.rsplit('/').next().unwrap().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(true), ["eager.png", "far-css.png", "near.png"]);
+        assert_eq!(
+            names(false),
+            ["eager.png", "far-css.png", "far.png", "near.png"]
+        );
+        let settled = snapshot_image_sources(&rendered, 600.0, true, |source| {
+            source.ends_with("eager.png")
+        });
+        assert!(!settled.iter().any(|source| source.ends_with("eager.png")));
+    }
 
     #[test]
     fn a_document_reports_the_verdict_its_protocol_gave() {
