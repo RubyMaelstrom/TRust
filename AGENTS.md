@@ -110,7 +110,7 @@ The project favors:
   headless clients.
 - `src/bin/trust-desktop.rs`: winit window, native input, and presentation loop.
 - `src/render/`: renderer-neutral display list, Parley-shaped text, Vello CPU
-  reference renderer, Vello Hybrid/wgpu backend, and windowless
+  reference renderer, Hybrid wgpu backend (Vello GPU), and windowless
   `trust::render::headless` pipeline. See module comments for backend limits.
 - `src/telnet.rs`, `src/gopher.rs`, `src/gemini.rs`, `src/oneshot.rs`,
   `src/tls.rs`, and `src/ws.rs`: protocol implementations.

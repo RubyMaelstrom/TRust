@@ -827,7 +827,8 @@ impl Canvas {
                         x: glyph.x,
                         y: glyph.y - text.shaped.baseline,
                     });
-                    builder.fill_glyphs(glyphs);
+                    // Unrenderable glyphs are skipped; the rest of the run paints.
+                    let _ = builder.fill_glyphs(glyphs);
                 }
                 let mut pixels = vello_common::pixmap::Pixmap::new(w, h);
                 context.render(&mut pixels, &mut resources);

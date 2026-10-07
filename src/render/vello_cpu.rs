@@ -12,9 +12,9 @@ use vello_cpu::color::palette::css::{
 };
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Ellipse, Join, Rect, Shape as _, Stroke};
 use vello_cpu::peniko::{
-    ColorStop, Compose, Gradient, ImageBrush, ImageQuality, ImageSampler, Mix,
+    ColorStop, Compose, Gradient, ImageAlphaType, ImageBrush, ImageQuality, ImageSampler, Mix,
 };
-use vello_cpu::{ImageSource, Pixmap, RenderContext, Resources};
+use vello_cpu::{ImageSource, PixelMetadata, Pixmap, RenderContext, Resources};
 
 use super::{
     Affine2d, BlendMode, CompositeOperator, CssFilter, CssRect, DecorationStyle, DisplayCommand,
@@ -237,7 +237,7 @@ impl VelloCpuRenderer {
                 }
                 DisplayCommand::PopClip => {
                     if clips.pop() {
-                        self.context.pop_clip_path();
+                        self.context.pop_clip();
                     }
                 }
                 DisplayCommand::PushTransform(transform) => {
@@ -400,7 +400,7 @@ impl VelloCpuRenderer {
                         self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
                         self.context.fill_path(&inset_shadow_ring(shape, &hole));
                         self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
-                        self.context.pop_clip_path();
+                        self.context.pop_clip();
                     }
                 }
                 DisplayCommand::Shadow {
@@ -439,7 +439,7 @@ impl VelloCpuRenderer {
                         // rounded rectangles, not arbitrary paths.
                         self.context.fill_path(&shape_path(&shifted));
                     }
-                    self.context.pop_clip_path();
+                    self.context.pop_clip();
                 }
                 DisplayCommand::HitRegion(_) => {}
                 Primitive::FillRect { rect, color } => {
@@ -542,7 +542,7 @@ impl VelloCpuRenderer {
                         *transforms.last().unwrap(),
                     );
                     if clip.is_some() {
-                        self.context.pop_clip_path();
+                        self.context.pop_clip();
                     }
                 }
                 Primitive::Image {
@@ -572,7 +572,7 @@ impl VelloCpuRenderer {
                         transforms.last().unwrap().as_coeffs(),
                     )?;
                     if clip.is_some() {
-                        self.context.pop_clip_path();
+                        self.context.pop_clip();
                     }
                 }
             }
@@ -760,24 +760,8 @@ impl VelloCpuRenderer {
                 self.context.fill_rect(&vello_rect(rect));
                 return Ok(());
             }
-            let pixels = image
-                .rgba
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|pixel| {
-                    let alpha = u16::from(pixel[3]);
-                    let premul = |component| ((u16::from(component) * alpha) / 255) as u8;
-                    vello_cpu::color::PremulRgba8 {
-                        r: premul(pixel[0]),
-                        g: premul(pixel[1]),
-                        b: premul(pixel[2]),
-                        a: pixel[3],
-                    }
-                })
-                .collect();
-            let pixmap = Arc::new(Pixmap::from_parts_with_opacity(
-                pixels,
+            let pixmap = Arc::new(premultiplied_pixmap(
+                premultiply_rgba(&image.rgba),
                 width,
                 height,
                 image.has_alpha,
@@ -857,7 +841,7 @@ impl VelloCpuRenderer {
         }
         self.context.fill_rect(&painted);
         if fit == ImageFit::Cover {
-            self.context.pop_clip_path();
+            self.context.pop_clip();
         }
         self.context.reset_paint_transform();
         Ok(())
@@ -913,7 +897,8 @@ fn paint_glyphs(
         if let Some(skew) = skew {
             fill = fill.glyph_transform(Affine::skew(skew, 0.0));
         }
-        fill.fill_glyphs(glyphs.into_iter());
+        // Unrenderable glyphs are skipped; the rest of the run paints.
+        let _ = fill.fill_glyphs(glyphs.into_iter());
         if let Some(glyphs) = bold {
             context.set_stroke(synthetic_bold_stroke(run.font_size));
             let mut stroke = context
@@ -924,7 +909,7 @@ fn paint_glyphs(
             if let Some(skew) = skew {
                 stroke = stroke.glyph_transform(Affine::skew(skew, 0.0));
             }
-            stroke.stroke_glyphs(glyphs.into_iter());
+            let _ = stroke.stroke_glyphs(glyphs.into_iter());
         }
     }
 }
@@ -1190,6 +1175,40 @@ pub(super) fn vello_css_filter(filter: &CssFilter) -> vello_common::filter_effec
             edge_mode: EdgeMode::None,
         },
     })
+}
+
+/// Premultiply straight RGBA8 pixels, truncating each scaled component.
+pub(super) fn premultiply_rgba(rgba: &[u8]) -> Vec<u8> {
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|pixel| {
+            let alpha = u16::from(pixel[3]);
+            let premul = |component| ((u16::from(component) * alpha) / 255) as u8;
+            [
+                premul(pixel[0]),
+                premul(pixel[1]),
+                premul(pixel[2]),
+                pixel[3],
+            ]
+        })
+        .collect()
+}
+
+/// A Vello pixmap from already premultiplied RGBA8 bytes. `may_have_transparency`
+/// is the caller's opacity hint; the pixels are not rescanned.
+pub(super) fn premultiplied_pixmap(
+    premultiplied: Vec<u8>,
+    width: u16,
+    height: u16,
+    may_have_transparency: bool,
+) -> Pixmap {
+    Pixmap::from_parts(
+        premultiplied,
+        width,
+        height,
+        PixelMetadata::new(ImageAlphaType::AlphaPremultiplied, may_have_transparency),
+    )
 }
 
 pub(super) fn vello_affine(affine: Affine2d) -> Affine {

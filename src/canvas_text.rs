@@ -257,7 +257,8 @@ impl PreparedText {
             if let Some(skew) = run.synthetic_oblique_skew() {
                 builder = builder.glyph_transform(Affine::skew(skew, 0.));
             }
-            builder.fill_glyphs(run.glyphs.iter().map(|glyph| glifo::Glyph {
+            // Unrenderable glyphs are skipped; the rest of the run paints.
+            let _ = builder.fill_glyphs(run.glyphs.iter().map(|glyph| glifo::Glyph {
                 id: glyph.id,
                 x: glyph.x,
                 y: glyph.y - self.shaped.baseline,
@@ -358,17 +359,17 @@ impl<'a, R: glifo::GlyphRenderer> glifo::GlyphRunBackend<'a> for GlyphBackend<'a
         self,
         run: glifo::GlyphRun<'a>,
         glyphs: G,
-    ) {
+    ) -> Result<(), glifo::GlyphRenderError> {
         run.build(glyphs, self.cache.as_mut(), glifo::AtlasCacher::Disabled)
-            .fill_glyphs(self.renderer);
+            .fill_glyphs(self.renderer)
     }
     fn stroke_glyphs<G: Iterator<Item = glifo::Glyph> + Clone>(
         self,
         run: glifo::GlyphRun<'a>,
         glyphs: G,
-    ) {
+    ) -> Result<(), glifo::GlyphRenderError> {
         run.build(glyphs, self.cache.as_mut(), glifo::AtlasCacher::Disabled)
-            .stroke_glyphs(self.renderer);
+            .stroke_glyphs(self.renderer)
     }
     fn render_decoration<G: Iterator<Item = glifo::Glyph> + Clone>(
         self,
@@ -417,7 +418,8 @@ pub(crate) fn stroke_run(
     if let Some(skew) = run.synthetic_oblique_skew() {
         builder = builder.glyph_transform(Affine::skew(skew, 0.));
     }
-    builder.stroke_glyphs(run.glyphs.iter().map(|glyph| glifo::Glyph {
+    // Unrenderable glyphs are skipped; the rest of the run paints.
+    let _ = builder.stroke_glyphs(run.glyphs.iter().map(|glyph| glifo::Glyph {
         id: glyph.id,
         x: glyph.x,
         y: glyph.y - baseline,
@@ -458,7 +460,7 @@ impl glifo::DrawSink for StrokeRenderer<'_> {
         self.context.pop_layer();
     }
     fn pop_clip_path(&mut self) {
-        self.context.pop_clip_path();
+        self.context.pop_clip();
     }
     fn width(&self) -> u16 {
         self.context.width()

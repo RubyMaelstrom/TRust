@@ -408,6 +408,61 @@ mod tests {
     }
 
     #[test]
+    fn css_cross_channel_color_filters_match_on_both_backends() {
+        // Filter Effects 1 #sepiaEquivalent and #grayscaleEquivalent (local
+        // csswg-drafts 81c27f68): every color row mixes all three channels, so
+        // these exercise the off-diagonal matrix entries that brightness,
+        // invert and opacity leave at zero. The GPU pass must read the same
+        // row-major 4-by-5 matrix as the CPU reference.
+        let html = r#"<!doctype html><style>
+            body{margin:0;background:white} .tile{position:absolute;top:0;width:32px;height:32px;background:rgb(200,100,50)}
+            #sepia{left:0;filter:sepia(1)}
+            #gray{left:40px;filter:grayscale(1)}
+            #hue{left:80px;filter:hue-rotate(90deg)}
+            #sat{left:120px;filter:saturate(.3)}
+            #mixed{left:160px;filter:sepia(.5) hue-rotate(200deg);background:rgba(40,160,220,.6)}
+        </style><div class=tile id=sepia></div><div class=tile id=gray></div><div class=tile id=hue></div><div class=tile id=sat></div><div class=tile id=mixed></div>"#;
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(html);
+        let scene = scene_for_dom(
+            &dom,
+            &base,
+            CssSize::new(200., 40.),
+            &[],
+            &Default::default(),
+            &ImageSizes::new(),
+            ImageStore::default(),
+        );
+        let cpu = VelloCpuRenderer::new().render_rgba(&scene).unwrap();
+        let pixel = |frame: &OwnedRgbaFrame, x: usize, y: usize| {
+            frame.pixels[(y * 200 + x) * 4..(y * 200 + x + 1) * 4].to_vec()
+        };
+        for (x, expected) in [(4, [165, 147, 114, 255]), (44, [118, 118, 118, 255])] {
+            let actual = pixel(&cpu, x, 4);
+            assert!(
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2),
+                "CPU pixel ({x},4): {actual:?}, expected {expected:?}"
+            );
+        }
+        let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) else {
+            eprintln!("Cross-channel GPU color matrix not exercised: no Hybrid adapter");
+            return;
+        };
+        let gpu = hybrid.render_rgba(&scene).unwrap();
+        for x in [4, 44, 84, 124, 164] {
+            let (cpu, gpu) = (pixel(&cpu, x, 4), pixel(&gpu, x, 4));
+            assert!(
+                cpu.iter().zip(&gpu).all(|(a, b)| a.abs_diff(*b) <= 2),
+                "pixel ({x},4): CPU {cpu:?}, GPU {gpu:?}"
+            );
+        }
+        let difference = compare_rgba(&cpu, &gpu, 2).unwrap();
+        assert!(difference.fraction_over_tolerance < 0.01, "{difference:?}");
+    }
+
+    #[test]
     fn css_drop_shadow_and_blur_filters_paint_on_both_backends() {
         // Filter Effects 1 #FilterFunction: drop-shadow() paints the
         // offset alpha in its color under the element, blur() spreads it.
