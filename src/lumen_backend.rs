@@ -7530,6 +7530,202 @@ mod desktop {
             assert!(loaded.1.contains("loaded:true:4"), "{}", loaded.1);
         }
 
+        #[tokio::test]
+        async fn image_decode_settles_with_the_current_request() {
+            // WHATWG HTML #dom-img-decode (local snapshot e5071a20): decode()
+            // resolves with undefined once the current request is completely
+            // available, and rejects with an "EncodingError" DOMException when
+            // the request is broken, when the current request changes before
+            // it settles, or when the image's node document is not fully
+            // active. The cases follow WPT's the-img-element/decode tests.
+            // reflection.ai's hero awaited `img.decode()` on parser images and
+            // crashed into its error boundary when the method was missing.
+            use futures::FutureExt as _;
+            let html = r#"<!doctype html><html><body>
+                <button id="keep">keep actor resident</button>
+                <img id="parsed" src="/good.png">
+                <iframe id="frame"></iframe>
+                <output id="result">pending</output>
+                <script>
+                    document.getElementById("keep").addEventListener("click", () => {});
+                    const results = {};
+                    const tests = [];
+                    const settle = (name, promise) => tests.push(promise.then(
+                        value => { results[name] = "resolved:" + String(value); },
+                        // A frame's image rejects with its own Realm's DOMException.
+                        error => { results[name] = Object.prototype.toString.call(error) === "[object DOMException]" ? error.name : "other:" + error; }));
+                    results.method = typeof HTMLImageElement.prototype.decode + ":" +
+                        HTMLImageElement.prototype.decode.length;
+
+                    // Parser-created image, and the reflection.ai pattern.
+                    const parsed = document.getElementById("parsed");
+                    settle("parsed", parsed.decode());
+                    settle("all", Promise.all([parsed].map(e => e.decode().catch(() => "caught")))
+                        .then(values => values.map(String).join()));
+
+                    let img = new Image();
+                    img.src = "/good.png";
+                    settle("src", img.decode());
+                    img = new Image();
+                    img.srcset = "/good.png 100w";
+                    settle("srcset", img.decode());
+                    settle("no-src-legacy", new Image().decode());
+                    settle("no-src", document.createElement("img").decode());
+                    img = new Image();
+                    img.src = "/missing.png";
+                    settle("missing", img.decode());
+                    img = new Image();
+                    img.src = "data:image/png;base64,iVBO00PDR0BADBEEF00KGg";
+                    settle("corrupt", img.decode());
+
+                    // The current request changes before it settles.
+                    img = new Image();
+                    img.src = "/good.png?first";
+                    const replaced = img.decode();
+                    img.src = "/good.png?second";
+                    settle("changed", replaced);
+                    settle("after-change", img.decode());
+                    img = new Image();
+                    img.src = "/good.png?gone";
+                    const removed = img.decode();
+                    img.removeAttribute("src");
+                    settle("src-removed", removed);
+
+                    // A Document without a browsing context is not fully active.
+                    const inactive = document.implementation.createHTMLDocument();
+                    img = inactive.createElement("img");
+                    img.src = "/good.png";
+                    settle("inactive", img.decode());
+                    img = document.createElement("img");
+                    img.src = "/good.png";
+                    const adoptedAway = img.decode();
+                    inactive.body.appendChild(img);
+                    settle("adopted-inactive", adoptedAway);
+                    img = inactive.createElement("img");
+                    img.src = "/good.png";
+                    document.body.appendChild(img);
+                    settle("adopted-active", img.decode());
+
+                    img = new Image();
+                    img.src = "/good.png";
+                    const first = img.decode(), second = img.decode();
+                    results.distinct = first !== second && first instanceof Promise;
+                    settle("multiple-1", first);
+                    settle("multiple-2", second);
+
+                    // An already completely available request resolves, and the
+                    // same URL assigned again keeps it (WPT path-changes).
+                    tests.push(new Promise(done => {
+                        const same = new Image();
+                        same.onload = () => {
+                            same.onload = null;
+                            const before = same.decode();
+                            same.src = "/good.png?same";
+                            settle("same-1", before);
+                            settle("same-2", same.decode());
+                            done();
+                        };
+                        same.src = "/good.png?same";
+                    }));
+
+                    // An image of a frame that is removed before it settles.
+                    const frame = document.getElementById("frame");
+                    img = frame.contentDocument.createElement("img");
+                    img.src = "/good.png?frame";
+                    const framed = img.decode();
+                    frame.remove();
+                    settle("frame-removed", framed);
+
+                    settle("brand", HTMLImageElement.prototype.decode.call(document.body)
+                        .catch(error => { throw error instanceof TypeError ? new DOMException("", "TypeError") : error; }));
+
+                    Promise.all(tests).then(() => Promise.all(tests)).then(() => {
+                        document.getElementById("result").textContent = "done " + JSON.stringify(results);
+                    });
+                </script>
+            </body></html>"#;
+            let cache = Arc::new(crate::http::PageCache::default());
+            let seed = |path: &str, status: u16, content_type: &str, body: Vec<u8>| {
+                let url = format!("https://example.com{path}");
+                let response = Arc::new(crate::http::CachedResp {
+                    status,
+                    content_type: String::from(content_type),
+                    headers: Vec::new(),
+                    body,
+                    url_list: vec![url::Url::parse(&url).unwrap()],
+                    timing: None,
+                });
+                cache.seed_pending(url, futures::future::ready(Ok(response)).boxed().shared());
+            };
+            for path in [
+                "/good.png",
+                "/good.png?first",
+                "/good.png?second",
+                "/good.png?gone",
+                "/good.png?same",
+                "/good.png?frame",
+            ] {
+                seed(path, 200, "image/png", crate::img::red_png());
+            }
+            seed("/missing.png", 404, "text/plain", b"not found".to_vec());
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.cache = cache;
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+
+            let html = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("done {") => {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("image decode fixture failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before decode() settled"),
+                    }
+                }
+            })
+            .await
+            .expect("decode() promises did not settle");
+            let start = html.find("done {").unwrap() + 5;
+            let end = html[start..].find("</output>").unwrap() + start;
+            let json = html[start..end].replace("&quot;", "\"");
+            let results: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("results were not JSON ({e}): {json}");
+            });
+            let expect = |name: &str, value: &str| {
+                assert_eq!(
+                    results[name].as_str(),
+                    Some(value),
+                    "decode() case {name}: {results}"
+                );
+            };
+            expect("method", "function:0");
+            expect("parsed", "resolved:undefined");
+            expect("all", "resolved:undefined");
+            expect("src", "resolved:undefined");
+            expect("srcset", "resolved:undefined");
+            expect("no-src-legacy", "EncodingError");
+            expect("no-src", "EncodingError");
+            expect("missing", "EncodingError");
+            expect("corrupt", "EncodingError");
+            expect("changed", "EncodingError");
+            expect("after-change", "resolved:undefined");
+            expect("src-removed", "EncodingError");
+            expect("inactive", "EncodingError");
+            expect("adopted-inactive", "EncodingError");
+            expect("adopted-active", "resolved:undefined");
+            expect("multiple-1", "resolved:undefined");
+            expect("multiple-2", "resolved:undefined");
+            expect("same-1", "resolved:undefined");
+            expect("same-2", "resolved:undefined");
+            expect("frame-removed", "EncodingError");
+            expect("brand", "TypeError");
+            assert_eq!(results["distinct"].as_bool(), Some(true), "{results}");
+        }
+
         #[test]
         fn terminal_actors_report_geometry_in_the_cell_font_they_paint() {
             // CSSOM View geometry comes from the layout fragments. A terminal

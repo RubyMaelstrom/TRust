@@ -9776,6 +9776,22 @@ impl Dom {
         !self.created_images.is_empty()
     }
 
+    /// Whether `id` was created or adopted and still awaits the "update the
+    /// image data" that HTML runs synchronously at that point (see
+    /// `created_images`): its current request is about to be replaced.
+    pub(crate) fn image_update_queued(&self, id: NodeId) -> bool {
+        self.created_images.iter().any(|&(queued, _)| queued == id)
+    }
+
+    /// A later "update the image data" for `id` ran synchronously. HTML ran
+    /// the queued one first, and "only the last instance takes effect", so
+    /// the queued update is retired rather than run after it.
+    pub(crate) fn retire_queued_image_update(&mut self, id: NodeId) {
+        if self.image_update_queued(id) {
+            self.created_images.retain(|&(queued, _)| queued != id);
+        }
+    }
+
     /// First element (document order) whose id attribute matches.
     pub fn get_by_id(&self, target: &str) -> Option<NodeId> {
         self.descendants(DOCUMENT)

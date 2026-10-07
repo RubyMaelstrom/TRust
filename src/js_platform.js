@@ -2225,7 +2225,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // A container inserted again gets a new navigable and record.
         if (internalsFor(frame).navigableRecord) internalsFor(frame).navigableRecord.closed = true;
         internalsFor(frame).navigableRecord = undefined;
-        trust.detachChildWindow(internalsOf(frame).contentRealmWindow);
+        const discardedWindow = internalsOf(frame).contentRealmWindow;
+        trust.detachChildWindow(discardedWindow);
         if (internalsOf(frame).contentDoc) internalsFor(internalsOf(frame).contentDoc).destroyed = true;
         // HTML #destroy-a-child-navigable / #discard-a-document severs the browsing-context
         // association, not the retained Document's own DOM tree. Drop the presentation edge.
@@ -2239,6 +2240,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         internalsFor(frame).trustParentWindow = undefined;
         internalsFor(frame).trustTopWindow = undefined;
         internalsFor(frame).trustAnimationFrameMethods = undefined;
+        // HTML #dom-img-decode: a waiting decode() rejects once its image's
+        // node document stops being fully active.
+        rejectImageDecodesAfterDiscard(discardedWindow);
     }
     function destroyFrameNavigableDescendantsIn(root) {
         if (!root || typeof nodeIds.get(root) !== "number") return;
@@ -10591,12 +10595,104 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const imageSlots = imageNative("slots", new WeakMap());
     delete g.__image_binding;
     const imageApply = Reflect.apply, imageGet = WeakMap.prototype.get, imageSet = WeakMap.prototype.set;
+    const imageDelete = WeakMap.prototype.delete;
     const imageThen = Promise.prototype.then;
     const imageCheckpoint = Promise.resolve();
     const imageMicrotask = fn => imageApply(imageThen, imageCheckpoint, [fn]);
     const imageDefine = Object.defineProperty;
+    const ImagePromise = Promise;
     let imageTask; // Captured after the event-loop binding below.
     function imageState(image) { return imageApply(imageGet, imageSlots, [image]); }
+    // HTML #dom-img-decode settles against the element's *current request*.
+    // A record's `current`/`pending` fold the current and pending requests
+    // together, so the record also keeps the current request's state as HTML
+    // #img-req-state names it: `request` is "unavailable", "available"
+    // (completely available) or "broken", and `decodes` lists the decode()
+    // calls waiting for it to settle.
+    //
+    // Every unsettled call is also kept here (HTML: the node document holds a
+    // strong reference to an element while its image algorithms run), so a
+    // Document that stops being fully active can reject it: the tasks and
+    // microtasks of a discarded child Window no longer run.
+    const imageDecodePending = new Set();
+    // Calls for an element whose "update the image data" for its creation or
+    // adoption has not run yet. HTML runs that update synchronously when the
+    // element is created or adopted; this Document starts parser-created,
+    // cloned and adopted images at its next microtask checkpoint instead, so
+    // a decode() called before then belongs to the request that update makes.
+    const imageEarlyDecodes = new WeakMap();
+    function imageEncodingError() {
+        return new DOMException("The image could not be decoded", "EncodingError");
+    }
+    function finishImageDecode(waiter, decoded) {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        imageDecodePending.delete(waiter);
+        if (decoded) waiter.resolve(undefined);
+        else waiter.reject(imageEncodingError());
+    }
+    // "Queue a global task on the DOM manipulation task source" to settle.
+    function settleImageDecode(waiter, decoded) {
+        imageTask(function () {
+            finishImageDecode(waiter, decoded && imageDocumentFullyActive(waiter.image));
+        }, 0);
+    }
+    function waitForImageRequest(waiter, state) {
+        if (waiter.settled) return;
+        if (!state || state.request === "broken") finishImageDecode(waiter, false);
+        // A request that is already completely available needs no further
+        // wait (the "becomes completely available" case).
+        else if (state.request === "available") settleImageDecode(waiter, true);
+        else (state.decodes || (state.decodes = [])).push(waiter);
+    }
+    function settleImageDecodes(state, decoded) {
+        const waiters = state.decodes;
+        if (!waiters) return;
+        state.decodes = null;
+        for (const waiter of waiters) if (!waiter.settled) settleImageDecode(waiter, decoded);
+    }
+    // The current request changed, or was mutated: every call waiting on the
+    // request it replaced is rejected.
+    function replaceImageCurrentRequest(state, request) {
+        state.request = request;
+        settleImageDecodes(state, false);
+    }
+    // The update the early calls expected has run (or will not run): they
+    // wait on the current request it left.
+    function attachEarlyImageDecodes(image, state) {
+        const early = imageApply(imageGet, imageEarlyDecodes, [image]);
+        if (!early) return;
+        imageApply(imageDelete, imageEarlyDecodes, [image]);
+        for (const waiter of early) waitForImageRequest(waiter, state);
+    }
+    // HTML #fully-active, through #dom-document-location: a Document's
+    // location is null exactly when it is not fully active (a DOMParser or
+    // createHTMLDocument document, or one whose navigable was destroyed).
+    function imageDocumentFullyActive(image) {
+        try {
+            let document = __dom_owner_document(image);
+            document = document && typeof document === "object" ? document : wrap(document);
+            return !!document && imageApply(documentLocation, document, []) !== null;
+        } catch (e) {
+            return false;
+        }
+    }
+    // Reject, at once, the decode() calls of elements whose node document
+    // stopped being fully active: its tasks will not run to settle them.
+    function rejectInactiveImageDecodes() {
+        if (!imageDecodePending.size) return;
+        for (const waiter of Array.from(imageDecodePending))
+            if (!imageDocumentFullyActive(waiter.image)) finishImageDecode(waiter, false);
+    }
+    trust.rejectInactiveImageDecodes = rejectInactiveImageDecodes;
+    // After a child navigable's Document was destroyed: images of that
+    // Document may be wrapped in this Realm or in the child's own.
+    function rejectImageDecodesAfterDiscard(childWindow) {
+        rejectInactiveImageDecodes();
+        const childTrust = childWindow && trustOf(childWindow);
+        if (childTrust && typeof childTrust.rejectInactiveImageDecodes === "function")
+            childTrust.rejectInactiveImageDecodes();
+    }
     function imageRelevantAttribute(name) {
         return name === "src" || name === "srcset" || name === "sizes" || name === "width" ||
             name === "crossorigin" || name === "referrerpolicy";
@@ -10664,10 +10760,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function updateImageData(image, environment = false) {
         let state = imageState(image);
         if (!state) {
-            state = { generation: 0, current: null, url: "", pending: false, broken: false, lazy: null };
+            state = {
+                generation: 0, current: null, url: "", pending: false, broken: false, lazy: null,
+                request: "unavailable", decodes: null, selecting: 0,
+            };
             imageApply(imageSet, imageSlots, [image, state]);
         }
         const generation = ++state.generation;
+        // A creation, adoption or insertion update still queued for the next
+        // checkpoint would have run before this one. `selecting` names the
+        // update whose source selection microtask is still to run.
+        if (!environment) {
+            imageNative("retire", nodeIds.get(image));
+            state.selecting = generation;
+        }
         if (state.lazy) {
             lazyImages.delete(image);
             state.lazy = null;
@@ -10675,11 +10781,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         state.pending = true;
         imageMicrotask(function () {
             if (state.generation !== generation) return;
+            state.selecting = 0;
             const id = nodeIds.get(image);
             const source = __image_current_src(id);
             if (environment && (!source || source === state.url)) {
                 state.pending = false;
                 return;
+            }
+            // HTML #update-the-image-data: a null selection breaks the current
+            // request at once; a new request replaces a current request that
+            // is unavailable or broken, and otherwise waits as the pending
+            // request until it completes. Promises that waited for this
+            // update then see the current request it left.
+            if (!environment) {
+                if (!source) replaceImageCurrentRequest(state, "broken");
+                else if (!state.current) replaceImageCurrentRequest(state, "unavailable");
+                attachEarlyImageDecodes(image, state);
             }
             const hasSource = __dom_get_attr(id, "src") !== null ||
                 __dom_get_attr(id, "srcset") !== null || imageInPicture(image);
@@ -10698,6 +10815,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                             state.current = result;
                             state.url = source;
                             state.broken = !result;
+                            // This request is now the current request, either
+                            // all along or by "upgrade the pending request to
+                            // the current request", in its final state.
+                            state.request = result ? "available" : "broken";
+                            settleImageDecodes(state, !!result);
                             if (result || hasSource) dispatch(image,
                                 createTrustedEvent(Event, result ? "load" : "error"), false);
                         }
@@ -10745,9 +10867,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const id = ids[i];
             const relevant = !!(adopted && adopted[i]);
             const image = wrap(id);
-            if (!image || (!relevant && imageState(image))) continue;
-            if (!relevant && __dom_get_attr(id, "src") === null &&
-                __dom_get_attr(id, "srcset") === null && !imageInPicture(image)) continue;
+            if (!image) continue;
+            if ((!relevant && imageState(image)) || (!relevant && __dom_get_attr(id, "src") === null &&
+                __dom_get_attr(id, "srcset") === null && !imageInPicture(image))) {
+                // No update: an element without a source has a broken request.
+                attachEarlyImageDecodes(image, imageState(image));
+                continue;
+            }
             try { updateImageData(image); }
             catch (e) { trust.errors.push("update the image data: " + ((e && e.message) || e)); }
         }
@@ -10812,6 +10938,61 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         set crossOrigin(value) { if (value === null) this.removeAttribute("crossorigin"); else this.setAttribute("crossorigin", String(value)); }
         get referrerPolicy() { return this.getAttribute("referrerpolicy") || ""; }
         set referrerPolicy(value) { this.setAttribute("referrerpolicy", String(value)); }
+        // HTML #dom-img-decode (local WHATWG snapshot e5071a20). The steps
+        // run in a microtask so that `img.src = url; img.decode()` waits for
+        // the request that src assignment's own microtask creates.
+        //
+        // "Decode the image": this Document's realm never holds decoded media
+        // data. A request is completely available once its whole resource
+        // was fetched and its natural dimensions determined (image_host's
+        // probe; anything else is broken), and each frontend decodes the
+        // shared response for presentation itself, so there is no decoding
+        // left to perform here: the promise settles as the load or error
+        // event would.
+        decode() {
+            const image = this;
+            let resolve, reject;
+            const promise = new ImagePromise(function (res, rej) { resolve = res; reject = rej; });
+            // Web IDL #dfn-create-operation-function: a promise-returning
+            // operation reports its brand check as a rejection.
+            if (htmlElementName(image) !== "img") {
+                reject(new TypeError("Illegal invocation"));
+                return promise;
+            }
+            const waiter = { image, resolve, reject, settled: false };
+            // The tasks and microtasks of a Document that is not fully active
+            // do not run, so its decode() rejects now rather than from the
+            // microtask below (which would make the same decision).
+            if (!imageDocumentFullyActive(image)) {
+                finishImageDecode(waiter, false);
+                return promise;
+            }
+            imageDecodePending.add(waiter);
+            // HTML would already have run the update for this element's
+            // creation, adoption or insertion; when this Document has queued
+            // it for the next checkpoint instead, the call waits for it.
+            const id = nodeIds.get(image);
+            const updatePending = imageNative("queued", id) || (!imageState(image) &&
+                (__dom_get_attr(id, "src") !== null || __dom_get_attr(id, "srcset") !== null ||
+                    imageInPicture(image)));
+            imageMicrotask(function () {
+                if (waiter.settled) return;
+                if (!imageDocumentFullyActive(image)) { finishImageDecode(waiter, false); return; }
+                const state = imageState(image);
+                if (updatePending && (imageNative("queued", id) || (state ? state.selecting !== 0 :
+                    __dom_get_attr(id, "src") !== null || __dom_get_attr(id, "srcset") !== null ||
+                    imageInPicture(image)))) {
+                    const early = imageApply(imageGet, imageEarlyDecodes, [image]);
+                    if (early) early.push(waiter);
+                    else imageApply(imageSet, imageEarlyDecodes, [image, [waiter]]);
+                    return;
+                }
+                // HTML runs "update the image data" when an img is created:
+                // without a source its request is broken (no record here).
+                waitForImageRequest(waiter, state);
+            });
+            return promise;
+        }
     }
     // HTMLHyperlinkElementUtils (the create-an-<a>-to-parse-URLs trick;
     // router-slot reads m.pathname) lives on <a> and <area>; href + the URL
