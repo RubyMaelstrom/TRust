@@ -1090,6 +1090,7 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
         .attribute("viewBox")
         .and_then(view_box_ratio)
         .or_else(|| Some(width? / height?));
+    let natural = width.zip(height);
     let (width, height) = concrete_object_size(width, height, ratio)?;
     let (width, height) = viewport.unwrap_or((width, height));
     let mut original_root = text[root.range()].to_string();
@@ -1111,6 +1112,26 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
                 edits.push((attr.range(), format!("{name}=\"{value}\"")));
             } else {
                 edits.push((name_end..name_end, format!(" {name}=\"{value}\"")));
+            }
+        }
+        // An image document without a viewBox still scales to the concrete
+        // object size: CSS Images 3 #object-negotiation step 3 lets the object
+        // adjust itself, and engines synthesize `viewBox="0 0 w h"` from the
+        // natural dimensions for an SVG document used as an image (Blink and
+        // Gecko `ShouldSynthesizeViewBox`). Without it the artwork would be
+        // drawn at natural scale and clipped to the box. A specified viewBox,
+        // including a zero-sized one that disables rendering (SVG 2 #ViewBoxAttribute),
+        // is kept; an invalid one is treated as unspecified.
+        let view_box = root
+            .attributes()
+            .find(|a| a.name() == "viewBox" && a.namespace().is_none());
+        if let Some((natural_width, natural_height)) = natural
+            && !view_box.is_some_and(|a| view_box_specified(a.value()))
+        {
+            let synthesized = format!("viewBox=\"0 0 {natural_width} {natural_height}\"");
+            match view_box {
+                Some(attr) => edits.push((attr.range(), synthesized)),
+                None => edits.push((name_end..name_end, format!(" {synthesized}"))),
             }
         }
         // usvg honors root CSS over presentation attributes as well.
@@ -1271,6 +1292,18 @@ fn svg_length_px(value: &str) -> Option<f32> {
         Unit::Percent => return None,
     };
     (px.is_finite() && px > 0.0).then_some(px)
+}
+
+/// Whether a `viewBox` value counts as specified: four numbers whose width and
+/// height are not negative. SVG 2 #ViewBoxAttribute treats a negative size as
+/// an error ("as if it had not been specified"); zero disables rendering.
+fn view_box_specified(value: &str) -> bool {
+    let values: Result<Vec<f32>, _> = value
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|v| !v.is_empty())
+        .map(str::parse)
+        .collect();
+    values.is_ok_and(|v| v.len() == 4 && v[2] >= 0.0 && v[3] >= 0.0)
 }
 
 pub(crate) fn view_box_ratio(value: &str) -> Option<f32> {
@@ -2566,6 +2599,42 @@ mod tests {
         let raster = size.rasterize(source).unwrap();
         assert_eq!(&raster.rgba[(20 * 80 + 30) * 4..][..4], &[255, 0, 0, 255]);
         assert_eq!(&raster.rgba[(20 * 80 + 50) * 4..][..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn svg_images_without_a_viewbox_scale_to_the_concrete_object_size() {
+        use crate::render::{CssRect, ImageFit};
+        let identity = [1., 0., 0., 1., 0., 0.];
+        let pixel = |raster: &crate::render::ImageResource, x: usize, y: usize| {
+            raster.rgba[(y * raster.width as usize + x) * 4..][..4].to_vec()
+        };
+        // Natural 512x512, no viewBox: the bottom-right quadrant is red. Drawn
+        // into a 160x160 box it scales (a synthesized viewBox="0 0 512 512")
+        // instead of painting at natural scale and clipping to the top-left.
+        let rasterize = |view_box: &str| {
+            let source = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"{view_box}><rect x="256" y="256" width="256" height="256" fill="red"/></svg>"#
+            );
+            SvgRasterSize::new(
+                512,
+                512,
+                CssRect::new(0., 0., 160., 160.),
+                ImageFit::Contain,
+                identity,
+            )
+            .rasterize(source.as_bytes())
+            .unwrap()
+        };
+        for view_box in ["", r#" viewBox="0 0 -1 512""#, r#" viewBox="junk""#] {
+            let raster = rasterize(view_box);
+            assert_eq!(pixel(&raster, 120, 120), [255, 0, 0, 255], "{view_box:?}");
+            assert_eq!(pixel(&raster, 40, 40), [0, 0, 0, 0], "{view_box:?}");
+        }
+        // A specified viewBox is kept, and a zero-sized one disables rendering.
+        let raster = rasterize(r#" viewBox="256 256 256 256""#);
+        assert_eq!(pixel(&raster, 40, 40), [255, 0, 0, 255]);
+        let raster = rasterize(r#" viewBox="0 0 0 512""#);
+        assert_eq!(pixel(&raster, 120, 120), [0, 0, 0, 0]);
     }
 
     #[test]
