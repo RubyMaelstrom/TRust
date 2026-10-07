@@ -1,0 +1,509 @@
+use super::{EnforcedLimits, StackConfig};
+use crate::{
+    CustomFuelCosts,
+    core::FuelCostsProvider,
+    engine::{OperatorCost, OperatorCostStrategy},
+};
+use wasmparser::WasmFeatures;
+
+/// Configuration for an [`Engine`].
+///
+/// [`Engine`]: [`crate::Engine`]
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// The limits set on the value stack and call stack.
+    pub(crate) stack: StackConfig,
+    /// The Wasm features used when validating or translating functions.
+    #[cfg(feature = "validate")]
+    features: WasmFeatures,
+    /// Is `true` if Wasmi executions shall consume fuel.
+    consume_fuel: bool,
+    /// Whether the optional native compiler may accelerate hot instruction regions.
+    native_jit: bool,
+    /// Is `true` if Wasmi shall ignore Wasm custom sections when parsing Wasm modules.
+    ignore_custom_sections: bool,
+    /// Is `true` if Wasmi allows `start` functions in Wasm modules.
+    allow_start_fn: bool,
+    /// The configured fuel costs of all Wasmi bytecode instructions.
+    fuel_costs: FuelCostsProvider,
+    /// The configured fuel costs for all Wasm operators.
+    operator_cost: OperatorCostStrategy,
+    /// The mode of Wasm to Wasmi bytecode compilation.
+    compilation_mode: CompilationMode,
+    /// Enforced limits for Wasm module parsing and compilation.
+    limits: EnforcedLimits,
+}
+
+/// The chosen mode of Wasm to Wasmi bytecode compilation.
+///
+/// Can be configured using [`Config::compilation_mode`].
+#[derive(Debug, Default, Copy, Clone)]
+pub enum CompilationMode {
+    /// The Wasm code is compiled eagerly to Wasmi bytecode.
+    Eager,
+    /// The Wasm code is validated eagerly and translated lazily on first use.
+    #[default]
+    LazyTranslation,
+    /// The Wasm code is validated and translated lazily on first use.
+    ///
+    /// # Note
+    ///
+    /// This mode must not be used if the result of Wasm execution
+    /// must be deterministic amongst multiple Wasm implementations.
+    Lazy,
+}
+
+// Note: without the `validate` feature there is no `features` field, so every
+//       field equals its default; clippy then suggests deriving `Default`, but
+//       the manual impl is still required for the `validate`-enabled build.
+#[cfg_attr(not(feature = "validate"), allow(clippy::derivable_impls))]
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            stack: StackConfig::default(),
+            #[cfg(feature = "validate")]
+            features: Self::default_features(),
+            consume_fuel: false,
+            native_jit: cfg!(feature = "native-jit"),
+            ignore_custom_sections: false,
+            allow_start_fn: true,
+            fuel_costs: FuelCostsProvider::default(),
+            operator_cost: OperatorCostStrategy::default(),
+            compilation_mode: CompilationMode::default(),
+            limits: EnforcedLimits::default(),
+        }
+    }
+}
+
+impl Config {
+    /// Enables native compilation of hot regions on supported hosts.
+    ///
+    /// Requires the `native-jit` Cargo feature. Fuel-metered engines always use
+    /// the interpreter, preserving their exact accounting and resumability.
+    pub fn native_jit(&mut self, enabled: bool) -> &mut Self {
+        self.native_jit = enabled;
+        self
+    }
+
+    /// Returns `true` if hot regions may be compiled natively.
+    #[cfg(wasmi_native_jit)]
+    pub(crate) fn native_jit_enabled(&self) -> bool {
+        self.native_jit && !self.consume_fuel
+    }
+
+    /// Returns the default [`WasmFeatures`].
+    #[cfg(feature = "validate")]
+    fn default_features() -> WasmFeatures {
+        let mut features = WasmFeatures::empty();
+        features.set(WasmFeatures::MUTABLE_GLOBAL, true);
+        features.set(WasmFeatures::MULTI_VALUE, true);
+        features.set(WasmFeatures::MULTI_MEMORY, true);
+        features.set(WasmFeatures::SATURATING_FLOAT_TO_INT, true);
+        features.set(WasmFeatures::SIGN_EXTENSION, true);
+        features.set(WasmFeatures::BULK_MEMORY, true);
+        features.set(WasmFeatures::REFERENCE_TYPES, true);
+        features.set(WasmFeatures::GC_TYPES, true); // required by reference-types
+        features.set(WasmFeatures::TAIL_CALL, true);
+        features.set(WasmFeatures::EXTENDED_CONST, true);
+        features.set(WasmFeatures::FLOATS, true);
+        features.set(WasmFeatures::CUSTOM_PAGE_SIZES, false);
+        features.set(WasmFeatures::MEMORY64, cfg!(feature = "memory64"));
+        // The legacy exception proposal is still emitted by browser-targeted
+        // toolchains (including the .NET runtime used by some Blazor apps).
+        // Keep both the tag section and the legacy try/catch instruction set
+        // enabled; wasmparser gates the former on EXCEPTIONS.
+        features.set(WasmFeatures::EXCEPTIONS, true);
+        features.set(WasmFeatures::LEGACY_EXCEPTIONS, true);
+        features.set(WasmFeatures::WIDE_ARITHMETIC, false);
+        features.set(WasmFeatures::SIMD, cfg!(feature = "simd"));
+        features.set(WasmFeatures::RELAXED_SIMD, cfg!(feature = "simd"));
+        features
+    }
+
+    /// Sets the maximum recursion depth of the [`Engine`]'s stack during execution.
+    ///
+    /// # Note
+    ///
+    /// An execution traps if it exceeds this limits.
+    ///
+    /// [`Engine`]: [`crate::Engine`]
+    pub fn set_max_recursion_depth(&mut self, value: usize) -> &mut Self {
+        self.stack.set_max_recursion_depth(value);
+        self
+    }
+
+    /// Sets the minimum (or initial) height of the [`Engine`]'s value stack in bytes.
+    ///
+    /// # Note
+    ///
+    /// - Lower initial heights may improve memory consumption.
+    /// - Higher initial heights may improve cold start times.
+    ///
+    /// # Panics
+    ///
+    /// If `value` is greater than the current maximum height of the value stack.
+    ///
+    /// [`Engine`]: [`crate::Engine`]
+    pub fn set_min_stack_height(&mut self, value: usize) -> &mut Self {
+        if self.stack.set_min_stack_height(value).is_err() {
+            let max = self.stack.max_stack_height();
+            panic!("minimum stack height exceeds maximum: min={value}, max={max}");
+        }
+        self
+    }
+
+    /// Sets the maximum height of the [`Engine`]'s value stack in bytes.
+    ///
+    /// # Note
+    ///
+    /// An execution traps if it exceeds this limits.
+    ///
+    /// # Panics
+    ///
+    /// If `value` is less than the current minimum height of the value stack.
+    ///
+    /// [`Engine`]: [`crate::Engine`]
+    pub fn set_max_stack_height(&mut self, value: usize) -> &mut Self {
+        if self.stack.set_max_stack_height(value).is_err() {
+            let min = self.stack.min_stack_height();
+            panic!("maximum stack height is lower than minimum: min={min}, max={value}");
+        }
+        self
+    }
+
+    /// Sets the maximum number of cached stacks for reuse for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// - A higher value may improve execution performance.
+    /// - A lower value may improve memory consumption.
+    pub fn set_max_cached_stacks(&mut self, value: usize) -> &mut Self {
+        self.stack.set_max_cached_stacks(value);
+        self
+    }
+
+    /// Enable or disable the [`mutable-global`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`mutable-global`]: https://github.com/WebAssembly/mutable-global
+    #[cfg(feature = "validate")]
+    pub fn wasm_mutable_global(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::MUTABLE_GLOBAL, enable);
+        self
+    }
+
+    /// Enable or disable the [`sign-extension`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`sign-extension`]: https://github.com/WebAssembly/sign-extension-ops
+    #[cfg(feature = "validate")]
+    pub fn wasm_sign_extension(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::SIGN_EXTENSION, enable);
+        self
+    }
+
+    /// Enable or disable the [`saturating-float-to-int`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`saturating-float-to-int`]:
+    /// https://github.com/WebAssembly/nontrapping-float-to-int-conversions
+    #[cfg(feature = "validate")]
+    pub fn wasm_saturating_float_to_int(&mut self, enable: bool) -> &mut Self {
+        self.features
+            .set(WasmFeatures::SATURATING_FLOAT_TO_INT, enable);
+        self
+    }
+
+    /// Enable or disable the [`multi-value`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`multi-value`]: https://github.com/WebAssembly/multi-value
+    #[cfg(feature = "validate")]
+    pub fn wasm_multi_value(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::MULTI_VALUE, enable);
+        self
+    }
+
+    /// Enable or disable the [`multi-memory`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`multi-memory`]: https://github.com/WebAssembly/multi-memory
+    #[cfg(feature = "validate")]
+    pub fn wasm_multi_memory(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::MULTI_MEMORY, enable);
+        self
+    }
+
+    /// Enable or disable the [`bulk-memory`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`bulk-memory`]: https://github.com/WebAssembly/bulk-memory-operations
+    #[cfg(feature = "validate")]
+    pub fn wasm_bulk_memory(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::BULK_MEMORY, enable);
+        self
+    }
+
+    /// Enable or disable the [`reference-types`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`reference-types`]: https://github.com/WebAssembly/reference-types
+    #[cfg(feature = "validate")]
+    pub fn wasm_reference_types(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::REFERENCE_TYPES, enable);
+        self.features.set(WasmFeatures::GC_TYPES, enable);
+        self
+    }
+
+    /// Enable or disable the [`tail-call`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`tail-call`]: https://github.com/WebAssembly/tail-call
+    #[cfg(feature = "validate")]
+    pub fn wasm_tail_call(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::TAIL_CALL, enable);
+        self
+    }
+
+    /// Enable or disable the [`extended-const`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default.
+    ///
+    /// [`extended-const`]: https://github.com/WebAssembly/extended-const
+    #[cfg(feature = "validate")]
+    pub fn wasm_extended_const(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::EXTENDED_CONST, enable);
+        self
+    }
+
+    /// Enable or disable the [`custom-page-sizes`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Disabled by default.
+    ///
+    /// [`custom-page-sizes`]: https://github.com/WebAssembly/custom-page-sizes
+    #[cfg(feature = "validate")]
+    pub fn wasm_custom_page_sizes(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::CUSTOM_PAGE_SIZES, enable);
+        self
+    }
+
+    /// Enable or disable the [`memory64`] Wasm proposal for the [`Config`].
+    ///
+    /// # Note
+    ///
+    /// Enabled by default. (if `memory64` crate feature is enabled)
+    ///
+    /// [`memory64`]: https://github.com/WebAssembly/memory64
+    #[cfg(all(feature = "memory64", feature = "validate"))]
+    pub fn wasm_memory64(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::MEMORY64, enable);
+        self
+    }
+
+    /// Enable or disable the [`wide-arithmetic`] Wasm proposal for the [`Config`].
+    ///
+    /// Disabled by default.
+    ///
+    /// [`wide-arithmetic`]: https://github.com/WebAssembly/wide-arithmetic
+    #[cfg(feature = "validate")]
+    pub fn wasm_wide_arithmetic(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::WIDE_ARITHMETIC, enable);
+        self
+    }
+
+    /// Enable or disable the [`simd`] Wasm proposal for the [`Config`].
+    ///
+    /// Enabled by default.
+    ///
+    /// [`simd`]: https://github.com/WebAssembly/simd
+    #[cfg(all(feature = "simd", feature = "validate"))]
+    pub fn wasm_simd(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::SIMD, enable);
+        self
+    }
+
+    /// Enable or disable the [`relaxed-simd`] Wasm proposal for the [`Config`].
+    ///
+    /// Enabled by default.
+    ///
+    /// [`relaxed-simd`]: https://github.com/WebAssembly/relaxed-simd
+    #[cfg(all(feature = "simd", feature = "validate"))]
+    pub fn wasm_relaxed_simd(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::RELAXED_SIMD, enable);
+        self
+    }
+
+    /// Enable or disable Wasm floating point (`f32` and `f64`) instructions and types.
+    ///
+    /// Enabled by default.
+    #[cfg(feature = "validate")]
+    pub fn floats(&mut self, enable: bool) -> &mut Self {
+        self.features.set(WasmFeatures::FLOATS, enable);
+        self
+    }
+
+    /// Configures whether Wasmi will consume fuel during execution to either halt execution as desired.
+    ///
+    /// # Note
+    ///
+    /// This configuration can be used to make Wasmi instrument its internal bytecode
+    /// so that it consumes fuel as it executes. Once an execution runs out of fuel
+    /// a [`TrapCode::OutOfFuel`](crate::TrapCode::OutOfFuel) trap is raised.
+    /// This way users can deterministically halt or yield the execution of WebAssembly code.
+    ///
+    /// - Use [`Store::set_fuel`](crate::Store::set_fuel) to set the remaining fuel of the [`Store`] before
+    ///   executing some code as the [`Store`] start with no fuel.
+    /// - Use [`Caller::set_fuel`](crate::Caller::set_fuel) to update the remaining fuel when executing host functions.
+    ///
+    /// Disabled by default.
+    ///
+    /// [`Store`]: crate::Store
+    /// [`Engine`]: crate::Engine
+    pub fn consume_fuel(&mut self, enable: bool) -> &mut Self {
+        self.consume_fuel = enable;
+        self
+    }
+
+    /// Returns `true` if the [`Config`] enables fuel consumption by the [`Engine`].
+    ///
+    /// [`Engine`]: crate::Engine
+    pub(crate) fn get_consume_fuel(&self) -> bool {
+        self.consume_fuel
+    }
+
+    /// Configures whether Wasmi allows Wasm modules with `start` functions.
+    ///
+    /// Enabled by default.
+    pub fn allow_start_fn(&mut self, allow: bool) -> &mut Self {
+        self.allow_start_fn = allow;
+        self
+    }
+
+    /// Returns `true` if the [`Config`] allows Wasm modules with `start` functions.
+    ///
+    /// [`Engine`]: crate::Engine
+    pub(crate) fn get_allow_start_fn(&self) -> bool {
+        self.allow_start_fn
+    }
+
+    /// Configures whether Wasmi will ignore custom sections when parsing Wasm modules.
+    ///
+    /// Default value: `false`
+    pub fn ignore_custom_sections(&mut self, enable: bool) -> &mut Self {
+        self.ignore_custom_sections = enable;
+        self
+    }
+
+    /// Returns `true` if the [`Config`] mandates to ignore Wasm custom sections when parsing Wasm modules.
+    pub(crate) fn get_ignore_custom_sections(&self) -> bool {
+        self.ignore_custom_sections
+    }
+
+    /// Configures the fuel cost of each WebAssembly operator.
+    ///
+    /// This is only relevant when [`Config::consume_fuel`] is enabled.
+    pub fn operator_cost(&mut self, cost: OperatorCost) -> &mut Self {
+        self.operator_cost = OperatorCostStrategy::table(cost);
+        self
+    }
+
+    /// Returns the [`OperatorCostStrategy`] of `self`.
+    pub(crate) fn get_operator_cost(&self) -> &OperatorCostStrategy {
+        &self.operator_cost
+    }
+
+    /// Configures the dynamic fuel cost.
+    ///
+    /// This affects the following areas:
+    ///
+    /// - Lazy translation and validation of functions.
+    ///     - For example if [`CompilationMode::Lazy`] or [`CompilationMode::LazyTranslation`] is used.
+    /// - Copying bytes or values in the following Wasm operator executions:
+    ///     - `memory.{grow,copy,fill,init}`
+    ///     - `table.{grow,copy,fill,init}`
+    ///
+    /// This is only relevant when [`Config::consume_fuel`] is enabled.
+    pub fn fuel_cost(&mut self, cost: CustomFuelCosts) -> &mut Self {
+        self.fuel_costs = FuelCostsProvider::custom(cost);
+        self
+    }
+
+    /// Returns the configured [`FuelCostsProvider`].
+    pub(crate) fn get_fuel_costs(&self) -> &FuelCostsProvider {
+        &self.fuel_costs
+    }
+
+    /// Sets the [`CompilationMode`] used for the [`Engine`].
+    ///
+    /// By default [`CompilationMode::LazyTranslation`] is used.
+    ///
+    /// [`Engine`]: crate::Engine
+    pub fn compilation_mode(&mut self, mode: CompilationMode) -> &mut Self {
+        self.compilation_mode = mode;
+        self
+    }
+
+    /// Returns the [`CompilationMode`] used for the [`Engine`].
+    ///
+    /// [`Engine`]: crate::Engine
+    pub(super) fn get_compilation_mode(&self) -> CompilationMode {
+        self.compilation_mode
+    }
+
+    /// Sets the [`EnforcedLimits`] enforced by the [`Engine`] for Wasm module parsing and compilation.
+    ///
+    /// By default no limits are enforced.
+    ///
+    /// [`Engine`]: crate::Engine
+    pub fn enforced_limits(&mut self, limits: EnforcedLimits) -> &mut Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Returns the [`EnforcedLimits`] used for the [`Engine`].
+    ///
+    /// [`Engine`]: crate::Engine
+    pub(crate) fn get_enforced_limits(&self) -> &EnforcedLimits {
+        &self.limits
+    }
+
+    /// Returns the [`WasmFeatures`] represented by the [`Config`].
+    #[cfg(feature = "validate")]
+    pub(crate) fn wasm_features(&self) -> WasmFeatures {
+        self.features
+    }
+
+    /// Returns the [`WasmFeatures`] represented by the [`Config`].
+    #[cfg(not(feature = "validate"))]
+    pub(crate) fn wasm_features(&self) -> WasmFeatures {
+        WasmFeatures::default()
+    }
+}

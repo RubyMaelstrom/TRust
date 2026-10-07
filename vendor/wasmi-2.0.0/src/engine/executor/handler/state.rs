@@ -1,0 +1,2072 @@
+use crate::{
+    Error,
+    Func,
+    TrapCode,
+    core::RawRef,
+    engine::{
+        ResumableHostTrapError,
+        ResumableOutOfFuelError,
+        StackConfig,
+        executor::{
+            Cell,
+            CellError,
+            CellsReader,
+            CellsWriter,
+            InOutParams,
+            LoadFromCellsByValue,
+            StoreToCells,
+            handler::{
+                dispatch::{Control, ExecutionOutcome},
+                utils::extract_mem0,
+            },
+        },
+        utils::unreachable_unchecked,
+    },
+    instance::{InstanceEntity, ThinPtr},
+    ir::{self, BoundedSlotSpan, Slot, SlotSpan},
+};
+use alloc::vec::Vec;
+use core::{cmp, marker::PhantomData, mem, ops, ptr, slice};
+
+/// The execution context of a [`Store`](crate::Store).
+///
+/// # Note
+///
+/// This is stored inline in the [`StoreInner`](crate::store::StoreInner) so that execution
+/// handlers reach both the store and the [`Stack`] with a single load from their `state`
+/// parameter. Its contents are private to the executor.
+#[derive(Debug)]
+pub struct ExecContext {
+    /// The value and call stack of the currently running execution.
+    stack: Stack,
+    /// The reason why the current execution halted, if any.
+    done_reason: Option<DoneReason>,
+}
+
+impl Default for ExecContext {
+    #[inline]
+    fn default() -> Self {
+        Self::new(Stack::empty())
+    }
+}
+
+// # Safety
+//
+// `ExecContext` is neither automatically `Send` nor `Sync` because of the raw pointers
+// reachable from its fields:
+//
+// - `Stack`'s `CallStack` stores `Frame`s holding an `Ip`, a raw pointer into an `Op`
+//   buffer owned by the [`Engine`]. The `StoreInner` owning this `ExecContext` owns the
+//   [`Engine`] as well, thus those buffers cannot be outlived and are immutable.
+// - `DoneReason` may hold an `Sp`, a raw pointer into the cells of this very `Stack`.
+//   Those cells are heap allocated and thus travel along with the `ExecContext`.
+//
+// Both fields are private and only ever handed out via `&mut self`, so a shared reference
+// to an `ExecContext` provides no access to either of them.
+//
+// This mirrors the reasoning behind the `Send`/`Sync` of `ResumableCallCommon`, which owns
+// a `Stack` for the same reasons.
+//
+// [`Engine`]: crate::Engine
+unsafe impl Send for ExecContext {}
+// # Safety
+//
+// See the `Send` impl above.
+unsafe impl Sync for ExecContext {}
+
+impl ExecContext {
+    /// Creates a new [`ExecContext`] with the `stack`.
+    #[inline]
+    pub fn new(stack: Stack) -> Self {
+        Self {
+            stack,
+            done_reason: None,
+        }
+    }
+
+    /// Returns an exclusive reference to the [`Stack`].
+    #[inline]
+    pub fn stack_mut(&mut self) -> &mut Stack {
+        &mut self.stack
+    }
+
+    /// Consumes `self` and returns its [`Stack`].
+    #[inline]
+    pub fn into_stack(self) -> Stack {
+        self.stack
+    }
+
+    /// Halts the current execution with `reason`.
+    ///
+    /// # Note
+    ///
+    /// Must be inlined: every `done!` site sits on the cold arm of a hot handler, and an
+    /// out-of-line call there forces the handler to spill all of its argument registers on
+    /// entry. Only `err` below is meant to stay out of line.
+    #[inline]
+    pub fn done_with(&mut self, reason: impl FnOnce() -> DoneReason) {
+        #[cold]
+        #[inline(never)]
+        fn err(prev: &DoneReason, reason: impl FnOnce() -> DoneReason) -> ! {
+            panic!(
+                "\
+                tried to done with reason while reason already exists:\n\
+                \t- new reason: {:?},\n\
+                \t- old reason: {:?},\
+                ",
+                reason(),
+                prev,
+            )
+        }
+
+        if let Some(prev) = &self.done_reason {
+            err(prev, reason)
+        }
+        self.done_reason = Some(reason());
+    }
+
+    #[inline]
+    pub fn take_done_reason(&mut self) -> DoneReason {
+        let Some(reason) = self.done_reason.take() else {
+            panic!("missing break reason")
+        };
+        reason
+    }
+
+    #[inline]
+    pub fn execution_outcome(&mut self) -> Result<Sp, ExecutionOutcome> {
+        self.take_done_reason().into_execution_outcome()
+    }
+}
+
+/// The reason why a Wasmi execution has halted.
+///
+/// # Note
+///
+/// This type lives in the [`PrunedStore`] type and in case of a halt needs to be
+/// updated manually which is a bit costly which is why the most common reason
+/// which is a raised [`TrapCode`] is not included in this `enum` and was put
+/// into the return type of execution handlers directly, instead.
+///
+/// [`PrunedStore`]: crate::store::PrunedStore
+#[derive(Debug)]
+pub enum DoneReason {
+    /// The execution finished successfully with a result found at the [`Sp`].
+    Return(Sp),
+    /// A resumable error indicating an error returned by a called host function.
+    Host(ResumableHostTrapError),
+    /// A resumable error indicating that the execution ran out of fuel.
+    OutOfFuel(ResumableOutOfFuelError),
+    /// A non-resumable error.
+    Error(Error),
+}
+
+impl DoneReason {
+    /// The execution halted due to a generic [`Error`].
+    #[cold]
+    #[inline]
+    pub fn error(error: Error) -> Self {
+        Self::Error(error)
+    }
+
+    /// The executed halted because a called host function yielded an error.
+    ///
+    /// # Note
+    ///
+    /// This needs special treatment due to resumable function calls.
+    #[cold]
+    #[inline]
+    pub fn host_error(error: Error, func: Func, results: SlotSpan) -> Self {
+        Self::Host(ResumableHostTrapError::new(error, func, results))
+    }
+
+    /// The executed halted because the execution ran out of fuel.
+    ///
+    /// # Note
+    ///
+    /// This needs special treatment due to resumable function calls.
+    #[cold]
+    #[inline]
+    pub fn out_of_fuel(required_fuel: u64) -> Self {
+        Self::OutOfFuel(ResumableOutOfFuelError::new(required_fuel))
+    }
+
+    /// Converts `self` into an [`ExecutionOutcome`].
+    #[inline]
+    pub fn into_execution_outcome(self) -> Result<Sp, ExecutionOutcome> {
+        let outcome = match self {
+            DoneReason::Return(sp) => return Ok(sp),
+            DoneReason::Host(error) => error.into(),
+            DoneReason::OutOfFuel(error) => error.into(),
+            DoneReason::Error(error) => error.into(),
+        };
+        Err(outcome)
+    }
+}
+
+/// A thin-wrapper around a non-owned [`InstanceEntity`].
+///
+/// # Validity
+///
+/// Every `Inst` is created from a live [`InstanceEntity`] that the [`Store`] currently owns,
+/// and the executor keeps that instance alive and warmed up for as long as the `Inst` is
+/// reachable — it is stored in [`Args`], in the [`CallStack`] frames of the very execution
+/// that owns the [`Store`], and in the [`WasmFuncEntity`]s of the instance's own functions.
+/// Since the entity is boxed, allocating further instances (e.g. from a host call) does not
+/// move it, and the [`Store`] never removes an instance.
+///
+/// [`WasmFuncEntity`]: crate::func::WasmFuncEntity
+///
+/// The `unsafe` methods of [`ThinPtr<InstanceEntity>`] therefore hold for any `Inst` reached
+/// through [`Inst::as_ptr`], and call sites need only justify the *kind* of the address they
+/// pass, not the liveness of the instance.
+///
+/// [`Store`]: crate::Store
+/// [`Args`]: super::Args
+/// [`ThinPtr<InstanceEntity>`]: ThinPtr
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+pub struct Inst {
+    /// The underlying reference to the [`InstanceEntity`], represented as [`InstRepr`].
+    value: InstRepr,
+    /// Marks `Inst` as logically containing a shared raw pointer.
+    marker: PhantomData<ThinPtr<InstanceEntity>>,
+}
+
+/// The underlying representation of `Inst` on targets with spare integer argument registers.
+///
+/// A handler takes 6 integer arguments besides `instance`, so targets with 8 integer argument
+/// registers (`x0`-`x7`, `a0`-`a7`) can pass `Inst` in a general purpose register and skip the
+/// integer-float roundtrip on every access.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "loongarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "wasm32",
+    target_arch = "wasm64",
+))]
+type InstRepr = usize;
+
+/// The underlying representation of `Inst` on targets short on integer argument registers.
+///
+/// Notably `x86_64`, whose `sysv64` ABI has just 6: a 7th integer argument would spill to the
+/// stack on every dispatch, so `Inst` travels in a float register instead. [`Inst`] is only
+/// accessed by operators that are considered "slow" anyways, thus the additional conversion
+/// between integer and float is not a terrible trade-off.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "loongarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "wasm32",
+    target_arch = "wasm64",
+)))]
+type InstRepr = InstReprFloat;
+
+/// The float representation of `Inst` for 64-bit platforms.
+#[cfg(target_pointer_width = "64")]
+type InstReprFloat = f64;
+
+/// The float representation of `Inst` for 32-bit platforms.
+#[cfg(target_pointer_width = "32")]
+type InstReprFloat = f32;
+
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<InstRepr>() == size_of::<usize>());
+    assert!(size_of::<InstReprFloat>() == size_of::<usize>());
+};
+
+impl From<&'_ InstanceEntity> for Inst {
+    #[inline]
+    fn from(entity: &'_ InstanceEntity) -> Self {
+        Self::from(ThinPtr::from_ref(entity))
+    }
+}
+
+impl From<ThinPtr<InstanceEntity>> for Inst {
+    #[inline]
+    fn from(entity: ThinPtr<InstanceEntity>) -> Self {
+        let value = InstRepr::from_ne_bytes(entity.expose_provenance().to_ne_bytes());
+        Self {
+            value,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl PartialEq for Inst {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ptr() == other.as_ptr()
+    }
+}
+impl Eq for Inst {}
+
+impl Inst {
+    /// Returns the thin pointer to the referenced [`InstanceEntity`].
+    ///
+    /// # Note
+    ///
+    /// This cannot be a `NonNull<InstanceEntity>` since [`InstanceEntity`] is dynamically
+    /// sized. Its thin-pointer API is provided by [`ThinPtr<InstanceEntity>`].
+    ///
+    /// [`ThinPtr<InstanceEntity>`]: ThinPtr
+    #[inline]
+    pub fn as_ptr(&self) -> ThinPtr<InstanceEntity> {
+        let addr = usize::from_ne_bytes(self.value.to_ne_bytes());
+        // Safety: `Inst` can only ever be created from a `ThinPtr<InstanceEntity>` whose
+        //         provenance has been exposed.
+        unsafe { ThinPtr::with_exposed_provenance(addr) }
+    }
+}
+
+/// # Safety
+///
+/// It is safe to send `Inst` to another thread because:
+/// - The `InstanceEntity` behind the pointer is itself `Send`.
+/// - `Inst` only allows shared (`&`) access to the `InstanceEntity` through its API.
+/// - There is no interior mutability that could cause data races.
+unsafe impl Send for Inst {}
+
+/// # Safety
+///
+/// It is safe to share `&Inst` across threads because:
+/// - All access to the `InstanceEntity` through `Inst` is immutable.
+/// - `InstanceEntity` is `Sync`.
+/// - The pointer will not be mutated, preventing data races.
+unsafe impl Sync for Inst {}
+
+mod inst_tests {
+    // Note: the `Send` and `Sync` impl for `Inst` is only valid if
+    //       `InstanceEntity` is `Send` and `Sync`.
+    //
+    // Below are compile-time tests, thus they are not just run with
+    // `cargo test` but with any compilation of the `wasmi` crate.
+    // Compilation would fail if `InstanceEntity` no longer implements
+    // `Send` or `Sync`.
+    use super::*;
+
+    const _: fn() = || {
+        fn assert_send<T: ?Sized + Send>() {}
+        fn assert_sync<T: ?Sized + Sync>() {}
+
+        assert_send::<InstanceEntity>();
+        assert_sync::<InstanceEntity>();
+        assert_send::<Inst>();
+        assert_sync::<Inst>();
+    };
+}
+
+/// The data pointer to the default Wasm linear memory at index 0.
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+pub struct Mem0Ptr(*mut u8);
+
+impl Mem0Ptr {
+    /// TRust: returns the raw data pointer of the default memory.
+    #[inline]
+    pub fn as_ptr(self) -> *mut u8 {
+        self.0
+    }
+}
+
+impl From<*mut u8> for Mem0Ptr {
+    fn from(value: *mut u8) -> Self {
+        Self(value)
+    }
+}
+
+/// The length in bytes of the default Wasm linear memory at index 0.
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+pub struct Mem0Len(usize);
+
+impl Mem0Len {
+    /// TRust: returns the length of the default memory in bytes.
+    #[inline]
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for Mem0Len {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+
+/// Construct the default linear memory slice of bytes from its raw parts.
+pub fn mem0_bytes<'a>(mem0: Mem0Ptr, mem0_len: Mem0Len) -> &'a mut [u8] {
+    unsafe { slice::from_raw_parts_mut(mem0.0, mem0_len.0) }
+}
+
+/// The instruction pointer.
+///
+/// This always points to the currently executed instruction (or operator).
+///
+/// # Note
+///
+/// The pointer points to a `u8` since [`Op`](crate::ir::Op)s in Wasmi are
+/// encoded and need to be decoded prior to execution.
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+pub struct Ip {
+    value: *const u8,
+}
+
+impl<'a> From<&'a [u8]> for Ip {
+    fn from(ops: &'a [u8]) -> Self {
+        Self {
+            value: ops.as_ptr(),
+        }
+    }
+}
+
+impl Ip {
+    /// Decodes a value of type `T` from the instruction stream at the [`Ip`].
+    ///
+    /// # Returns
+    ///
+    /// - This returns the advanced [`Ip`] together with the decoded value of type `T`.
+    /// - The returned [`Ip`] points to the first byte immediately following the decoded value.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that [`Ip`] points to the start of a valid
+    /// encoding of `T` and that the underlying instruction sequence remains
+    /// readable for the full duration of the decode, including any bytes consumed
+    /// by `T`.
+    ///
+    /// The behavior of this operation is undefined if:
+    ///
+    /// - The instruction sequence does not contain a valid encoding of `T` at [`Ip`].
+    /// - Decoding `T` would read past the end of the instruction sequence.
+    /// - The underlying memory is invalid, or no longer alive while decoding.
+    #[inline]
+    pub unsafe fn decode<T: ir::Decode>(self) -> (Ip, T) {
+        struct IpDecoder(Ip);
+        impl ir::Decoder for IpDecoder {
+            #[inline(always)]
+            fn read_bytes(&mut self, buffer: &mut [u8]) -> Result<(), ir::DecodeError> {
+                let src = self.0.value;
+                let dst = buffer.as_mut_ptr();
+                let len = buffer.len();
+                unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+                self.0 = unsafe { self.0.add(len) };
+                Ok(())
+            }
+        }
+
+        let mut ip = IpDecoder(self);
+        let decoded = match <T as ir::Decode>::decode(&mut ip) {
+            Ok(decoded) => decoded,
+            Err(error) => unsafe {
+                crate::engine::utils::unreachable_unchecked!(
+                    "failed to decode `OpCode` or op-handler: {error}"
+                )
+            },
+        };
+        (ip.0, decoded)
+    }
+
+    /// Advances [`Ip`] past a value of type `T` without decoding it.
+    ///
+    /// # Note
+    ///
+    /// This is equivalent to calling [`Self::decode`] and discarding the decoded value,
+    /// and may be used when the value is not needed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that offsetting [`Ip`] by `delta` bytes does
+    /// not move it outside the valid bounds of the instruction sequence
+    /// and that any subsequent use of the returned [`Ip`] only reads from valid,
+    /// alive memory.
+    #[inline]
+    pub unsafe fn skip<T: ir::Decode>(self) -> Ip {
+        let (ip, _) = unsafe { self.decode::<T>() };
+        ip
+    }
+
+    /// Returns a new [`Ip`] offset by `delta` bytes from this one.
+    ///
+    /// # Note
+    ///
+    /// - This method performs no bounds checking.
+    /// - A positive `delta` moves the pointer forward, a negative `delta` moves it backward.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that offsetting [`Ip`] by `delta` bytes does
+    /// not move it outside the valid bounds of the instruction sequence
+    /// and that any subsequent use of the returned [`Ip`] only reads from valid,
+    /// alive memory.
+    #[inline]
+    pub unsafe fn offset(self, delta: isize) -> Self {
+        let value = unsafe { self.value.byte_offset(delta) };
+        Self { value }
+    }
+
+    /// Returns a new [`Ip`] advanced by `delta` bytes.
+    ///
+    /// # Note
+    ///
+    /// This method performs no bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that advancing [`Ip`] by `delta` bytes does
+    /// not move it outside the valid bounds of the instruction sequence
+    /// and that any subsequent use of the returned [`Ip`] only reads from valid,
+    /// alive memory.
+    #[inline]
+    pub unsafe fn add(self, delta: usize) -> Self {
+        let value = unsafe { self.value.byte_add(delta) };
+        Self { value }
+    }
+
+    /// TRust: returns the address of the operator byte `self` points to.
+    #[inline]
+    pub fn addr(self) -> usize {
+        self.value.addr()
+    }
+
+    /// Aligns `self` relative to `base`.
+    #[inline(always)]
+    pub fn align_relative_to(self, base: Ip) -> Self {
+        const ALIGN: usize = core::mem::align_of::<usize>();
+        if cfg!(feature = "indirect-dispatch") {
+            return self;
+        }
+        let base_addr = base.value as usize;
+        let offset = (self.value as usize) - base_addr;
+        let aligned_offset = offset.next_multiple_of(ALIGN);
+        Self {
+            value: (base_addr + aligned_offset) as *mut u8,
+        }
+    }
+}
+
+/// # Safety
+///
+/// [`Ip`] (instruction pointer) is a new-type thin wrapper to `*const u8`.
+///
+/// Moving the pointer to another thread does not by itself create aliasing or
+/// data races. All methods that dereference or advance the pointer are marked as
+/// `unsafe` and require the caller to guarantee that the underlying instruction
+/// sequence remains valid for the duration of use, including across threads.
+///
+/// # Note
+///
+/// [`Ip`] is not [`Sync`] because concurrent access to the same [`Ip`] value
+/// could lead to unsynchronized mutation of the instructions.
+unsafe impl Send for Ip {}
+
+mod ip_tests {
+    use super::*;
+    const _: fn() = || {
+        // Note: this module contains type defs to assert that `Ip` is `Send`.
+        fn assert_send<T: Send>() {}
+        assert_send::<Ip>();
+    };
+
+    const _: fn() = || {
+        // Note: this module contains type defs to assert that `Ip` is not `Sync`.
+        // Blanket impl for all types.
+        trait AmbiguousIfSync<A> {
+            fn some_item() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        // Specialized impl that only exists for `Sync` types.
+        struct Invalid;
+        impl<T: ?Sized + Sync> AmbiguousIfSync<Invalid> for T {}
+
+        // This becomes ambiguous *iff* `Ip: Sync`.
+        let _ = <Ip as AmbiguousIfSync<_>>::some_item;
+    };
+}
+
+/// The cells window of a host function call frame on the value stack.
+///
+/// # Note
+///
+/// Produced by [`Stack::prepare_host_frame`] and [`Stack::return_prepare_host_frame`] and turned
+/// into the [`InOutParams`] of the call by [`Stack::host_inout`].
+///
+/// Both steps are separate so that the [`InOutParams`] can be derived _after_ the caller wrote the
+/// call parameters into the frame through its [`Sp`]: writing through an [`Sp`] that was obtained
+/// before the [`InOutParams`] invalidates the latter's pointer.
+#[derive(Debug, Copy, Clone)]
+pub struct HostFrame {
+    /// The start offset of the frame's cells.
+    start: SpOffset,
+    /// The end offset of the frame's cells.
+    end: SpOffset,
+    /// The number of cells used for parameters.
+    len_params: usize,
+    /// The number of cells used for results.
+    len_results: usize,
+}
+
+impl HostFrame {
+    /// Creates a new [`HostFrame`] spanning `cells[start..end]`.
+    fn new(start: SpOffset, end: SpOffset, len_params: usize, len_results: usize) -> Self {
+        Self {
+            start,
+            end,
+            len_params,
+            len_results,
+        }
+    }
+
+    /// Creates a [`HostFrame`] that spans no cells.
+    fn empty() -> Self {
+        Self::new(SpOffset::from(0), SpOffset::from(0), 0, 0)
+    }
+
+    /// Returns `true` if `self` spans no cells.
+    fn is_empty(&self) -> bool {
+        self.len_params == 0 && self.len_results == 0
+    }
+}
+
+/// The stack pointer.
+///
+/// # Note
+///
+/// This always points to the beginning of the stack area reserved for the
+/// currently executed function frame.
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+pub struct Sp {
+    value: *mut Cell,
+}
+
+impl CellsWriter for Sp {
+    #[inline]
+    fn next(&mut self, value: Cell) -> Result<(), CellError> {
+        // SAFETY: todo
+        unsafe {
+            ptr::write(self.value, value);
+            self.value = self.value.add(1);
+        };
+        Ok(())
+    }
+}
+
+impl CellsReader for Sp {
+    #[inline]
+    fn next(&mut self) -> Result<Cell, CellError> {
+        // SAFETY: todo
+        let value = unsafe {
+            let value = ptr::read(self.value);
+            self.value = self.value.add(1);
+            value
+        };
+        Ok(value)
+    }
+}
+
+impl Sp {
+    /// Creates a new [`Sp`].
+    #[inline]
+    pub fn new(value: *mut Cell) -> Self {
+        Self { value }
+    }
+
+    /// TRust: returns the raw pointer to the first cell of the frame.
+    #[inline]
+    pub fn as_ptr(self) -> *mut Cell {
+        self.value
+    }
+
+    /// Creates a new dangling [`Sp`].
+    ///
+    /// # Note
+    ///
+    /// The [`Sp`] returned by this method must never be dereferenced.
+    /// This is used for cases where there are no frames on the call stack.
+    pub fn dangling() -> Self {
+        Self {
+            value: ptr::dangling_mut(),
+        }
+    }
+
+    /// Offsets `self` by `slot` to access the [`Cell`] associated to it.
+    pub fn offset(self, slot: Slot) -> Self {
+        let delta = slot.byte_offset();
+        let value = unsafe { self.value.cast::<u8>().add(delta).cast::<Cell>() };
+        Self { value }
+    }
+
+    /// Returns a value of type `T` at `slot`.
+    pub unsafe fn get<T>(self, slot: Slot) -> T
+    where
+        T: LoadFromCellsByValue,
+    {
+        let mut sp = self.offset(slot);
+        let Ok(value) = <T as LoadFromCellsByValue>::load_from_cells_by_value(&mut sp) else {
+            // SAFETY: todo
+            unsafe { unreachable_unchecked!() }
+        };
+        value
+    }
+
+    /// Writes a `value` of type `T` at `slot`.
+    pub unsafe fn set<T>(self, slot: Slot, value: T)
+    where
+        T: StoreToCells,
+    {
+        let mut sp = self.offset(slot);
+        let Ok(_) = <T as StoreToCells>::store_to_cells(value, &mut sp) else {
+            // SAFETY: todo
+            unsafe { unreachable_unchecked!() }
+        };
+    }
+}
+
+/// The 64-bits of a general purpose register (GPR).
+///
+/// # Note
+///
+/// We use `f64` as underlying type for bytes for technical reasons.
+/// Using `f64` makes the compiler put values of this type into the floating
+/// point or vector registers on common platforms which is important since
+/// caller-saved general purpose registers (e.g. integer registers) are limited
+/// and already occupied by other execution handler parameters.
+#[derive(Debug, Copy, Clone, Default)]
+#[repr(transparent)]
+pub struct Bits64(u64);
+
+impl Bits64 {
+    /// Constructs `Self` from `bytes` in native-endian order.
+    #[inline]
+    pub fn from_ne_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_ne_bytes(bytes))
+    }
+
+    /// Converts `self` to its bytes in native-endian order.
+    #[inline]
+    pub fn to_ne_bytes(self) -> [u8; 8] {
+        self.0.to_ne_bytes()
+    }
+}
+
+/// A generic typed register.
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+pub struct Reg<T>(T);
+
+/// A general purpose register (GPR).
+pub type Ireg = Reg<Bits64>;
+
+/// A single-precision `f32` register.
+pub type Freg32 = Reg<f32>;
+
+/// A double-precision `f64` register.
+pub type Freg64 = Reg<f64>;
+
+/// Types implementing this trait act as registers in the Wasmi executor.
+trait Register {
+    /// The underlying base type of the register.
+    type Base;
+
+    /// The underlying array of bytes representing the register.
+    type Bytes;
+
+    /// Converts an array of `bytes` to a value of `Self`.
+    fn from_bytes(bytes: Self::Bytes) -> Self;
+
+    /// Converts `self` to its array of bytes representation.
+    fn to_bytes(self) -> Self::Bytes;
+}
+
+macro_rules! impl_register_for {
+    ( $( $ty:ty as $base:ty ),* $(,)? ) => {
+        $(
+            impl Register for $ty {
+                type Base = $base;
+                type Bytes = [u8; core::mem::size_of::<$base>()];
+
+                #[inline]
+                fn from_bytes(bytes: Self::Bytes) -> Self {
+                    Self(<Self::Base>::from_ne_bytes(bytes))
+                }
+
+                #[inline]
+                fn to_bytes(self) -> Self::Bytes {
+                    self.0.to_ne_bytes()
+                }
+            }
+
+            const _: () = {
+                assert!(mem::size_of::<$ty>() == mem::size_of::<$base>());
+                assert!(mem::align_of::<$ty>() == mem::align_of::<$base>());
+            };
+
+            impl Default for $ty {
+                #[inline]
+                fn default() -> Self {
+                    Self(<$base>::default())
+                }
+            }
+        )*
+    };
+}
+impl_register_for! {
+    Ireg as Bits64,
+    Freg32 as f32,
+    Freg64 as f64,
+}
+
+macro_rules! impl_reg_lossless_conversions {
+    ( $( ($ty:ty, $reg:ty) ),* $(,)? ) => {
+        $(
+            impl From<$reg> for $ty {
+                #[inline]
+                fn from(value: $reg) -> Self {
+                    <$ty>::from_ne_bytes(<$reg as Register>::to_bytes(value))
+                }
+            }
+
+            impl From<$ty> for $reg {
+                #[inline]
+                fn from(value: $ty) -> Self {
+                    Self::from_bytes(value.to_ne_bytes())
+                }
+            }
+        )*
+    };
+}
+impl_reg_lossless_conversions! {
+    (u64, Ireg),
+    (i64, Ireg),
+    (f32, Freg32),
+    (f64, Freg64),
+}
+
+macro_rules! impl_reg_lossy_conversions {
+    ( $($ty:ty as $reg:ty: $base:ty = $extend:expr),* $(,)? ) => {
+        $(
+            impl From<$ty> for $reg {
+                #[inline]
+                fn from(value: $ty) -> Self {
+                    Self::from($extend(value))
+                }
+            }
+
+            impl From<$reg> for $ty {
+                #[inline]
+                fn from(value: $reg) -> Self {
+                    <$base>::from(value) as Self
+                }
+            }
+        )*
+    };
+}
+impl_reg_lossy_conversions! {
+    // unsigned
+    u8 as Ireg: u64 = u64::from,
+    u16 as Ireg: u64 = u64::from,
+    u32 as Ireg: u64 = u64::from,
+    // signed
+    i8 as Ireg: u64 = |v| u64::from(v as u8),
+    i16 as Ireg: u64 = |v| u64::from(v as u16),
+    i32 as Ireg: u64 = |v| u64::from(v as u32),
+}
+
+impl From<bool> for Ireg {
+    #[inline]
+    fn from(value: bool) -> Self {
+        Self::from(u64::from(value))
+    }
+}
+
+impl From<Ireg> for bool {
+    #[inline]
+    fn from(value: Ireg) -> Self {
+        u64::from(value) != 0
+    }
+}
+
+impl From<RawRef> for Ireg {
+    #[inline]
+    fn from(value: RawRef) -> Self {
+        Ireg::from(u32::from(value))
+    }
+}
+
+impl From<Ireg> for RawRef {
+    #[inline]
+    fn from(value: Ireg) -> Self {
+        RawRef::from(u32::from(value))
+    }
+}
+
+/// The Wasmi stack.
+///
+/// This combines both value stack and call stack and provides a common API
+/// to interact with both.
+#[derive(Debug)]
+pub struct Stack {
+    /// The underlying value stack.
+    values: ValueStack,
+    /// The underlying call stack.
+    frames: CallStack,
+    /// The value of the integer register (GPR).
+    ireg: Ireg,
+    /// The value of the `f32` register.
+    freg32: Freg32,
+    /// The value of the `f64` register.
+    freg64: Freg64,
+    /// TRust: legacy exception handlers, the pending and the caught exceptions.
+    exceptions: ExceptionState,
+    /// TRust: native region entries observed by this execution.
+    #[cfg(wasmi_native_jit)]
+    native: super::native::NativeState,
+}
+
+type ReturnCallHost = Control<(Ip, Sp, Inst), Sp>;
+
+/// TRust: a thrown legacy WebAssembly exception (exception-handling proposal, legacy
+/// instructions): its tag and fields.
+///
+/// # Note
+///
+/// The tag address of the specification is identified by the defining instance and the
+/// tag's index within it, since tags are neither imported nor exported by Wasmi.
+#[derive(Debug)]
+pub struct WasmException {
+    /// The index of the tag within its defining instance.
+    tag: u32,
+    /// The exposed address of the instance defining the tag.
+    instance: usize,
+    /// The tag fields in cells.
+    fields: Vec<Cell>,
+}
+
+impl WasmException {
+    /// Creates a new [`WasmException`] of `tag` defined by `instance`.
+    pub fn new(tag: u32, instance: Inst, fields: Vec<Cell>) -> Self {
+        Self {
+            tag,
+            instance: instance.as_ptr().expose_provenance(),
+            fields,
+        }
+    }
+
+    /// Returns `true` if `self` is an exception of `tag` defined by `instance`.
+    pub fn is_tag(&self, tag: u32, instance: Inst) -> bool {
+        self.tag == tag && self.instance == instance.as_ptr().expose_provenance()
+    }
+
+    /// Returns the tag fields of `self`.
+    pub fn fields(&self) -> &[Cell] {
+        &self.fields
+    }
+}
+
+/// TRust: the handler installed by a legacy `try` of the function frame at `depth`.
+///
+/// # Note
+///
+/// The handler only covers the encoded `try` body `start..end`. Validating the throw site
+/// against it makes handlers whose body was left by a branch, return or tail call inert
+/// without bookkeeping on those paths.
+#[derive(Debug, Copy, Clone)]
+struct ExceptionHandler {
+    depth: usize,
+    try_id: u32,
+    start: usize,
+    end: Ip,
+}
+
+/// TRust: the exception caught by the catch clause of `try_id` in the frame at `depth`.
+#[derive(Debug)]
+struct CaughtException {
+    depth: usize,
+    try_id: u32,
+    exception: WasmException,
+}
+
+/// TRust: the dynamic state of legacy WebAssembly exceptions of one execution.
+#[derive(Debug, Default)]
+struct ExceptionState {
+    /// The installed handlers, in installation order.
+    handlers: Vec<ExceptionHandler>,
+    /// The caught exceptions of active catch clauses, for `rethrow`.
+    caught: Vec<CaughtException>,
+    /// The exception being dispatched to the clauses of a handler.
+    pending: Option<WasmException>,
+    /// The dispatch [`Ip`], [`Sp`] and [`Inst`] of the handler selected by the last raise.
+    unwind: Option<(Ip, Sp, Inst)>,
+}
+
+impl ExceptionState {
+    /// Resets `self` for reuse.
+    fn reset(&mut self) {
+        self.handlers.clear();
+        self.caught.clear();
+        self.pending = None;
+        self.unwind = None;
+    }
+}
+
+impl Stack {
+    /// TRust: installs the handler of the `try` `try_id` whose body spans `start..end`.
+    ///
+    /// # Note
+    ///
+    /// Re-entering a `try` replaces its previous handler, and handlers of frames that
+    /// have since returned are dropped, which bounds the number of handlers.
+    pub fn install_exception_handler(&mut self, try_id: u32, start: Ip, end: Ip) {
+        let depth = self.frames.frames.len();
+        let handlers = &mut self.exceptions.handlers;
+        handlers.retain(|h| h.depth < depth || (h.depth == depth && h.try_id != try_id));
+        handlers.push(ExceptionHandler {
+            depth,
+            try_id,
+            start: start.addr(),
+            end,
+        });
+    }
+
+    /// TRust: unwinds to the innermost handler covering the throw site `ip` of the current
+    /// frame or the call sites of its callers.
+    ///
+    /// Makes `exception` the pending exception and records the dispatch [`Ip`] of the selected
+    /// handler and the [`Sp`] and [`Inst`] of its frame for [`Stack::take_unwind_target`].
+    /// Returns `false`, leaving `self` unchanged, if no handler exists.
+    fn raise_exception(&mut self, ip: Ip, exception: WasmException) -> bool {
+        let top = self.frames.frames.len();
+        let mut target = None;
+        'frames: for depth in (1..=top).rev() {
+            let site = match depth == top {
+                true => ip.addr(),
+                // Note: callers hold the address after their call operator.
+                false => self.frames.frames[depth - 1].ip.addr().wrapping_sub(1),
+            };
+            for handler in self.exceptions.handlers.iter().rev() {
+                if handler.depth == depth && handler.start <= site && site < handler.end.addr() {
+                    target = Some((depth, handler.end));
+                    break 'frames;
+                }
+            }
+        }
+        let Some((depth, handler)) = target else {
+            return false;
+        };
+        while self.frames.frames.len() > depth {
+            if self.frames.pop().is_none() {
+                unsafe { unreachable_unchecked!("handler frame must remain on the call stack") }
+            }
+        }
+        let Some(frame) = self.frames.top() else {
+            unsafe { unreachable_unchecked!("handler frame must remain on the call stack") }
+        };
+        let start = frame.start;
+        let Some(instance) = self.frames.instance else {
+            unsafe { unreachable_unchecked!("an executing frame must have an instance") }
+        };
+        let sp = self.values.sp(start);
+        let state = &mut self.exceptions;
+        state.handlers.retain(|h| h.depth <= depth);
+        state.caught.retain(|c| c.depth <= depth);
+        state.pending = Some(exception);
+        state.unwind = Some((handler, sp, instance));
+        true
+    }
+
+    /// TRust: raises a new exception of `tag` defined by `instance` at `ip`, with the tag fields
+    /// in the cells `values` of the frame at `sp`.
+    ///
+    /// Returns `true` if a handler was selected, see [`Stack::take_unwind_target`].
+    ///
+    /// # Note
+    ///
+    /// Takes and returns only scalars so that the calling handler keeps its sibling call.
+    #[inline(never)]
+    pub fn throw_exception(
+        &mut self,
+        ip: Ip,
+        sp: Sp,
+        instance: Inst,
+        values: BoundedSlotSpan,
+        tag: u32,
+    ) -> bool {
+        let len = usize::from(values.len());
+        let mut cells = sp.offset(values.span().head());
+        let fields = (0..len)
+            .map(|_| {
+                let Ok(field) = CellsReader::next(&mut cells) else {
+                    unreachable!("reading stack cells is infallible")
+                };
+                field
+            })
+            .collect();
+        self.raise_exception(ip, WasmException::new(tag, instance, fields))
+    }
+
+    /// TRust: re-raises the exception for `rethrow` of `try_id` at `ip`.
+    ///
+    /// Returns `None` if no exception exists, otherwise whether a handler was selected.
+    #[inline(never)]
+    pub fn rethrow(&mut self, ip: Ip, try_id: u32) -> Option<bool> {
+        let exception = self.rethrow_exception(try_id)?;
+        Some(self.raise_exception(ip, exception))
+    }
+
+    /// TRust: returns the target recorded by the last successful raise.
+    #[inline(always)]
+    pub fn take_unwind_target(&mut self) -> Option<(Ip, Sp, Inst)> {
+        self.exceptions.unwind.take()
+    }
+
+    /// TRust: catches the pending exception if it is of `tag` defined by `instance`, writing
+    /// its fields to the cells `results` of the frame at `sp`.
+    ///
+    /// Returns `true` if the exception was caught by the clause of `try_id`.
+    #[inline(never)]
+    pub fn catch_pending(
+        &mut self,
+        tag: u32,
+        instance: Inst,
+        try_id: u32,
+        sp: Sp,
+        results: BoundedSlotSpan,
+    ) -> bool {
+        let Some(exception) = self.take_pending_exception_if(Some(tag), instance) else {
+            return false;
+        };
+        // Equal tags have equal types, so the fields fill exactly the `results` cells.
+        debug_assert_eq!(exception.fields().len(), usize::from(results.len()));
+        let mut cells = sp.offset(results.span().head());
+        for &field in exception.fields() {
+            let _ = CellsWriter::next(&mut cells, field);
+        }
+        self.catch_exception(try_id, exception);
+        true
+    }
+
+    /// TRust: catches any pending exception with the `catch_all` clause of `try_id`.
+    #[inline(never)]
+    pub fn catch_pending_all(&mut self, try_id: u32, instance: Inst) {
+        if let Some(exception) = self.take_pending_exception_if(None, instance) {
+            self.catch_exception(try_id, exception);
+        }
+    }
+
+    /// TRust: takes the pending exception if it is of `tag` defined by `instance`.
+    fn take_pending_exception_if(
+        &mut self,
+        tag: Option<u32>,
+        instance: Inst,
+    ) -> Option<WasmException> {
+        let pending = self.exceptions.pending.as_ref()?;
+        if let Some(tag) = tag {
+            if !pending.is_tag(tag, instance) {
+                return None;
+            }
+        }
+        self.exceptions.pending.take()
+    }
+
+    /// TRust: records `exception` as caught by the catch clause of `try_id` in the current frame.
+    fn catch_exception(&mut self, try_id: u32, exception: WasmException) {
+        let depth = self.frames.frames.len();
+        let caught = &mut self.exceptions.caught;
+        caught.retain(|c| c.depth < depth || (c.depth == depth && c.try_id != try_id));
+        caught.push(CaughtException {
+            depth,
+            try_id,
+            exception,
+        });
+    }
+
+    /// TRust: returns the exception to re-raise for `rethrow` of `try_id` in the current frame.
+    ///
+    /// This is the pending exception if no clause of the `try` matched it, otherwise the
+    /// exception caught by its active catch clause.
+    fn rethrow_exception(&mut self, try_id: u32) -> Option<WasmException> {
+        if let Some(pending) = self.exceptions.pending.take() {
+            return Some(pending);
+        }
+        let depth = self.frames.frames.len();
+        let caught = &self.exceptions.caught;
+        let index = caught
+            .iter()
+            .rposition(|c| c.depth == depth && c.try_id == try_id)?;
+        let exception = &caught[index].exception;
+        Some(WasmException {
+            tag: exception.tag,
+            instance: exception.instance,
+            fields: exception.fields.clone(),
+        })
+    }
+}
+
+impl Stack {
+    /// Creates a new [`Stack`] with the given [`StackConfig`] limits.
+    pub fn new(config: &StackConfig) -> Self {
+        Self {
+            values: ValueStack::new(config.min_stack_height(), config.max_stack_height()),
+            frames: CallStack::new(config.max_recursion_depth()),
+            ireg: Ireg::default(),
+            freg32: Freg32::default(),
+            freg64: Freg64::default(),
+            exceptions: ExceptionState::default(),
+            #[cfg(wasmi_native_jit)]
+            native: super::native::NativeState::default(),
+        }
+    }
+
+    /// Creates a new [`Stack`] without heap allocations.
+    pub fn empty() -> Self {
+        Self {
+            values: ValueStack::empty(),
+            frames: CallStack::empty(),
+            ireg: Ireg::default(),
+            freg32: Freg32::default(),
+            freg64: Freg64::default(),
+            exceptions: ExceptionState::default(),
+            #[cfg(wasmi_native_jit)]
+            native: super::native::NativeState::default(),
+        }
+    }
+
+    /// Resets `self` for reuse.
+    pub fn reset(&mut self) {
+        self.values.reset();
+        self.frames.reset();
+        self.ireg = Ireg::default();
+        self.freg32 = Freg32::default();
+        self.freg64 = Freg64::default();
+        self.exceptions.reset();
+        #[cfg(wasmi_native_jit)]
+        self.native.reset();
+    }
+
+    /// TRust: returns the native region entries observed by this execution.
+    #[cfg(wasmi_native_jit)]
+    #[inline]
+    pub fn native_mut(&mut self) -> &mut super::native::NativeState {
+        &mut self.native
+    }
+
+    /// Returns the state of all registers.
+    pub fn regs(&self) -> (Ireg, Freg32, Freg64) {
+        (self.ireg, self.freg32, self.freg64)
+    }
+
+    /// Returns the total number of heap allocated bytes of `self`.
+    pub fn bytes_allocated(&self) -> usize {
+        // Note: we use saturating add since this API is only used to separate
+        //       heap allocating from non-heap allocating instances.
+        self.values
+            .bytes_allocated()
+            .saturating_add(self.frames.bytes_allocated())
+    }
+
+    /// Synchronizes the [`Ip`] of the top-most function frame.
+    ///
+    /// # Note
+    ///
+    /// - Usually the current [`Ip`] is stored outside of the [`Stack`].
+    /// - Synchronization is required when calling another function or when
+    ///   finishing a resumable call in order to be able to resume execution
+    ///   at that point later.
+    pub fn sync_ip(&mut self, ip: Ip) {
+        self.frames.sync_ip(ip);
+    }
+
+    /// Synchronizes the register states of the top-most function frame.
+    pub fn sync_regs(&mut self, ireg: Ireg, freg32: Freg32, freg64: Freg64) {
+        self.ireg = ireg;
+        self.freg32 = freg32;
+        self.freg64 = freg64;
+    }
+
+    /// Restores the top-most function frame and its [`Ip`], [`Sp`] and [`Inst`].
+    ///
+    /// # Note
+    ///
+    /// This is useful and required to resume a function execution that yielded back to the host.
+    pub fn restore_frame(&mut self) -> (Ip, Sp, Inst, Ireg, Freg32, Freg64) {
+        let Some((ip, start, instance)) = self.frames.restore_frame() else {
+            panic!("restore_frame: missing top-frame")
+        };
+        let sp = self.values.sp(start);
+        (ip, sp, instance, self.ireg, self.freg32, self.freg64)
+    }
+
+    /// Prepares `self` for a host function tail call.
+    ///
+    /// Use [`Stack::host_inout`] on the returned [`HostFrame`] to obtain the [`InOutParams`]
+    /// of the call.
+    pub fn return_prepare_host_frame(
+        &mut self,
+        callee_params: BoundedSlotSpan,
+        results_len: u16,
+        caller_instance: Inst,
+    ) -> Result<(ReturnCallHost, HostFrame), TrapCode> {
+        let (callee_start, caller) = self.frames.return_prepare_host_frame(caller_instance);
+        self.values
+            .return_prepare_host_frame(caller, callee_start, callee_params, results_len)
+    }
+
+    /// Prepares `self` for a host function call.
+    ///
+    /// Use [`Stack::host_inout`] on the returned [`HostFrame`] to obtain the [`InOutParams`]
+    /// of the call.
+    pub fn prepare_host_frame(
+        &mut self,
+        caller_ip: Option<Ip>,
+        callee_params: BoundedSlotSpan,
+        results_len: u16,
+    ) -> Result<(Sp, HostFrame), TrapCode> {
+        let caller_start = self.frames.prepare_host_frame(caller_ip);
+        self.values
+            .prepare_host_frame(caller_start, callee_params, results_len)
+    }
+
+    /// Returns the [`InOutParams`] of the host function call `frame`.
+    ///
+    /// # Warning
+    ///
+    /// The returned [`InOutParams`] aliases the cells of `self` without borrowing them. Until it
+    /// has been consumed the caller must neither
+    ///
+    /// - mutate `self` in any way, since growing the value stack may reallocate its cells, nor
+    /// - write to the `frame`'s cells through an [`Sp`] that was obtained before this call, since
+    ///   that invalidates the pointer of the returned [`InOutParams`].
+    ///
+    /// The latter is why creating the [`HostFrame`] and turning it into [`InOutParams`] are two
+    /// steps: callers that still have to write the call parameters via their [`Sp`] must do so
+    /// before calling this method.
+    pub fn host_inout(&mut self, frame: HostFrame) -> InOutParams {
+        self.values.host_inout(frame)
+    }
+
+    /// Returns an [`Sp`] pointing at the base of the value stack.
+    ///
+    /// # Note
+    ///
+    /// Only valid as the `caller_sp` of the very first frame pushed onto an empty [`Stack`].
+    pub fn base_sp(&mut self) -> Sp {
+        self.values.base_sp()
+    }
+
+    /// Adjusts `self` for a normal function call.
+    ///
+    /// # Note
+    ///
+    /// `caller_sp` must be the [`Sp`] of the currently executing frame. The callee's [`Sp`]
+    /// is derived from it by pointer arithmetic instead of being re-loaded from the frame
+    /// table, which keeps it off the call's dependent-load chain.
+    #[inline(always)]
+    #[expect(clippy::too_many_arguments)]
+    pub fn push_frame(
+        &mut self,
+        caller_sp: Sp,
+        caller_ip: Option<Ip>,
+        callee_ip: Ip,
+        callee_params: BoundedSlotSpan,
+        callee_locals: u16,
+        callee_slots: u16,
+        callee_instance: Option<Inst>,
+    ) -> Result<Sp, TrapCode> {
+        // Note: the callee's frame starts with its first parameter and its stack pointer
+        //       can be inferred from its parameter slot span and its caller's stack pointer.
+        let callee_sp = caller_sp.offset(callee_params.span().head());
+        let start = self
+            .frames
+            .push(caller_ip, callee_ip, callee_params, callee_instance)?;
+        self.values.push(
+            callee_sp,
+            start,
+            callee_locals,
+            callee_slots,
+            callee_params.len(),
+        )
+    }
+
+    /// Adjusts `self` after returning from a function.
+    ///
+    /// # Note
+    ///
+    /// The cached `(memory 0)` is only re-extracted if the returned-to frame uses a
+    /// different [`Inst`]. This is sound because every operation that can grow a memory
+    /// refreshes the cache at the growth site instead: the `memory.grow` handler and
+    /// each of the host call paths.
+    #[inline(always)]
+    pub fn pop_frame(
+        &mut self,
+        mem0: Mem0Ptr,
+        mem0_len: Mem0Len,
+        instance: Inst,
+    ) -> Option<(Ip, Sp, Mem0Ptr, Mem0Len, Inst)> {
+        let (ip, start, changed_instance) = self.frames.pop()?;
+        let sp = self.values.sp(start);
+        let (mem0, mem0_len, instance) = match changed_instance {
+            Some(instance) => {
+                let (mem0, mem0_len) = extract_mem0(instance);
+                (mem0, mem0_len, instance)
+            }
+            None => (mem0, mem0_len, instance),
+        };
+        Some((ip, sp, mem0, mem0_len, instance))
+    }
+
+    /// Adjusts `self` for a function tail call.
+    ///
+    /// # Note
+    ///
+    /// A tail call reuses the caller's frame, so the callee's [`Sp`] is `caller_sp` itself.
+    /// See [`Stack::push_frame`] for why it is threaded through instead of re-loaded.
+    #[inline(always)]
+    pub fn replace_frame(
+        &mut self,
+        caller_sp: Sp,
+        callee_ip: Ip,
+        callee_params: BoundedSlotSpan,
+        callee_locals: u16,
+        callee_slots: u16,
+        callee_instance: Option<Inst>,
+    ) -> Result<Sp, TrapCode> {
+        let start = self.frames.replace(callee_ip, callee_instance)?;
+        self.values
+            .replace(caller_sp, start, callee_locals, callee_slots, callee_params)
+    }
+}
+
+/// The value stack.
+///
+/// The Wasmi value stack is organized in 64-bit cells
+/// where each is associated to a single function frame.
+///
+/// Cells can be read from and written to via [`Slot`]s.
+///
+/// # Note
+///
+/// - A [`ValueStack`] has a maximum height which it cannot exceed.
+/// - A [`ValueStack`] can only grow (via [`ValueStack::grow_if_needed`]) and never shrink.
+#[derive(Debug)]
+pub struct ValueStack {
+    /// The cells of the value stack.
+    cells: Vec<Cell>,
+    /// The number of cells that fit without reallocating, capped by [`Self::max_height`].
+    ///
+    /// # Note
+    ///
+    /// Kept in sync with `cells` so that the hot path of [`ValueStack::grow_if_needed`]
+    /// is a single comparison: `Vec::try_reserve` may over-allocate past `max_height`,
+    /// so `cells.capacity()` alone is not a sound bound to test against.
+    usable: usize,
+    /// The maximum height of the value stack.
+    max_height: usize,
+}
+
+impl ValueStack {
+    /// Create a new [`ValueStack`] with the minimum and maximum height limits.
+    fn new(min_height: usize, max_height: usize) -> Self {
+        debug_assert!(min_height <= max_height);
+        // We need to convert from `size_of<Cell>`` to `size_of<u8>`:
+        let sizeof_cell = mem::size_of::<Cell>();
+        let min_height = min_height / sizeof_cell;
+        let max_height = max_height / sizeof_cell;
+        let cells = Vec::with_capacity(min_height);
+        let usable = cmp::min(cells.capacity(), max_height);
+        Self {
+            cells,
+            usable,
+            max_height,
+        }
+    }
+
+    /// Create an empty [`ValueStack`] which uses no heap allocations.
+    fn empty() -> Self {
+        Self {
+            cells: Vec::new(),
+            usable: 0,
+            max_height: 0,
+        }
+    }
+
+    /// Reset `self` for reuse.
+    fn reset(&mut self) {
+        self.cells.clear();
+    }
+
+    /// Returns an [`Sp`] pointing at the base of the value stack.
+    ///
+    /// # Note
+    ///
+    /// Only used to seed the very first frame, where `start` is 0. If the buffer has
+    /// not been allocated yet the returned [`Sp`] is dangling, but pushing that frame
+    /// then reallocates and re-derives it.
+    fn base_sp(&mut self) -> Sp {
+        Sp::new(self.cells.as_mut_ptr())
+    }
+
+    /// Returns the number of heap allocated bytes of `self`.
+    ///
+    /// # Note
+    ///
+    /// This is mostly used to separate instances with and without heap allocations for caching.
+    fn bytes_allocated(&self) -> usize {
+        let bytes_per_frame = mem::size_of::<Cell>();
+        self.cells.capacity() * bytes_per_frame
+    }
+
+    /// Returns an [`Sp`] pointing to the cell at the `start` index.
+    ///
+    /// # Note
+    ///
+    /// This is the single definition of a frame's [`Sp`]: every one of them equals
+    /// `cells.as_ptr().add(start)`, including on an empty stack where `start` is 0 and the
+    /// result is the (never dereferenced) base pointer.
+    fn sp(&mut self, start: SpOffset) -> Sp {
+        let offset = start.into_inner();
+        debug_assert!(
+            // Note: it is fine to use <= here because for zero sized frames
+            //       we sometimes end up with `start == cells.len()` which isn't
+            //       bad since in those cases `Sp` is never used.
+            offset <= self.cells.len(),
+            "start = {}, cells.len() = {}",
+            offset,
+            self.cells.len()
+        );
+        let value = unsafe { self.cells.as_mut_ptr().add(offset) };
+        Sp::new(value)
+    }
+
+    /// Grows the number of cells to `new_len` if the current number is less than `new_len`.
+    ///
+    /// Does nothing if the number of cells is already at least `new_len`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the underlying buffer was reallocated, which invalidates every [`Sp`]
+    /// derived from it before the call.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`TrapCode::OutOfSystemMemory`] if the machine ran out of memory.
+    /// - Returns [`TrapCode::StackOverflow`] if this exceeds the stack's predefined limits.
+    #[inline(always)]
+    fn grow_if_needed(&mut self, new_len: SpOffset) -> Result<bool, TrapCode> {
+        let new_len = new_len.into_inner();
+        if new_len > self.usable {
+            self.grow_cold(new_len)?;
+            return Ok(true);
+        }
+        if new_len > self.cells.len() {
+            // Safety: `new_len <= self.usable <= self.cells.capacity()`. There is no need to
+            //         initialize the cells since we are operating on `Cell` which only has
+            //         valid bit patterns.
+            // Note: non-security related initialization of function parameters
+            //       and zero-initialization of function locals happens elsewhere.
+            unsafe { self.cells.set_len(new_len) };
+        }
+        Ok(false)
+    }
+
+    /// Reallocates the value stack so that it holds at least `new_len` cells.
+    ///
+    /// # Note
+    ///
+    /// Split out of [`ValueStack::grow_if_needed`] and marked `#[cold]` so that the
+    /// common no-growth path stays a single comparison and keeps its caller's [`Sp`]
+    /// valid in a register.
+    #[cold]
+    #[inline(never)]
+    fn grow_cold(&mut self, new_len: usize) -> Result<(), TrapCode> {
+        if new_len > self.max_height {
+            return Err(TrapCode::StackOverflow);
+        }
+        let len = self.cells.len();
+        debug_assert!(
+            len <= self.cells.capacity(),
+            "capacity must always be larger or equal to the actual number of the cells"
+        );
+        if new_len > self.cells.capacity() {
+            let additional = new_len - len;
+            self.cells
+                .try_reserve(additional)
+                .map_err(|_| TrapCode::OutOfSystemMemory)?;
+            debug_assert!(
+                self.cells.capacity() >= new_len,
+                "capacity must now be at least as large as `new_len` ({new_len}) but found {}",
+                self.cells.capacity()
+            );
+        }
+        self.usable = cmp::min(self.cells.capacity(), self.max_height);
+        // Safety: see `grow_if_needed`.
+        unsafe { self.cells.set_len(cmp::max(new_len, len)) };
+        Ok(())
+    }
+
+    /// Prepares `self` for a host function tail call.
+    ///
+    /// # Note
+    ///
+    /// In the following code, `callee` represents the called host function frame
+    /// and `caller` represents the caller of the caller of the host function, a.k.a.
+    /// the caller's caller.
+    fn return_prepare_host_frame(
+        &mut self,
+        caller: Option<(Ip, SpOffset, Inst)>,
+        callee_start: SpOffset,
+        callee_params: BoundedSlotSpan,
+        results_len: u16,
+    ) -> Result<(ReturnCallHost, HostFrame), TrapCode> {
+        let caller_start = caller.map(|(_, start, _)| start).unwrap_or_default();
+        let params_offset = usize::from(u16::from(callee_params.span().head()));
+        let params_len = usize::from(callee_params.len());
+        let results_len = usize::from(results_len);
+        let callee_size = params_len.max(results_len);
+        if callee_size == 0 {
+            let sp = match caller {
+                Some(_) if caller_start != callee_start => self.sp(caller_start),
+                _ => Sp::dangling(),
+            };
+            let control = match caller {
+                Some((ip, _, instance)) => ReturnCallHost::Continue((ip, sp, instance)),
+                None => ReturnCallHost::Break(sp),
+            };
+            return Ok((control, HostFrame::empty()));
+        }
+        let params_start = callee_start.add(params_offset)?;
+        let params_end = params_start.add(params_len)?;
+        self.cells_copy_within(params_start..params_end, callee_start);
+        let callee_end = callee_start.add(callee_size)?;
+        self.grow_if_needed(callee_end)?;
+        let caller_sp = self.sp(caller_start);
+        let frame = HostFrame::new(callee_start, callee_end, params_len, results_len);
+        let control = match caller {
+            Some((ip, _, instance)) => ReturnCallHost::Continue((ip, caller_sp, instance)),
+            None => ReturnCallHost::Break(caller_sp),
+        };
+        Ok((control, frame))
+    }
+
+    /// Prepares `self` for a host function call.
+    fn prepare_host_frame(
+        &mut self,
+        caller_start: SpOffset,
+        callee_params: BoundedSlotSpan,
+        results_len: u16,
+    ) -> Result<(Sp, HostFrame), TrapCode> {
+        let params_offset = usize::from(u16::from(callee_params.span().head()));
+        let params_len = usize::from(callee_params.len());
+        let results_len = usize::from(results_len);
+        let callee_size = params_len.max(results_len);
+        let callee_start = caller_start.add(params_offset)?;
+        let callee_end = callee_start.add(callee_size)?;
+        self.grow_if_needed(callee_end)?;
+        let sp = self.sp(caller_start);
+        let frame = HostFrame::new(callee_start, callee_end, params_len, results_len);
+        Ok((sp, frame))
+    }
+
+    /// Returns the [`InOutParams`] for the host function call `frame`.
+    ///
+    /// # Warning
+    ///
+    /// See [`Stack::host_inout`] for what the caller has to uphold.
+    fn host_inout(&mut self, frame: HostFrame) -> InOutParams {
+        let HostFrame {
+            start,
+            end,
+            len_params,
+            len_results,
+        } = frame;
+        if frame.is_empty() {
+            // Note: zero-sized host frames may start past the end of the value stack cells
+            //       since `grow_if_needed` was a no-op for them.
+            return InOutParams::empty();
+        }
+        debug_assert_eq!(
+            end.into_inner() - start.into_inner(),
+            len_params.max(len_results)
+        );
+        let Some(cells) = self.cells_from_to(start, end) else {
+            unsafe { unreachable_unchecked!("must fit slice after `grow_if_needed` operation") }
+        };
+        // SAFETY: the cells are heap allocated by `self.cells` and thus travel along with `self`
+        //         and its owning `Stack`. `Stack::host_inout` requires its caller to leave both
+        //         the cells and the `Stack` alone until the returned `InOutParams` is consumed,
+        //         which happens before the host function call returns.
+        let inout_or_err = unsafe { InOutParams::new(cells, len_params, len_results) };
+        let Ok(inout) = inout_or_err else {
+            unsafe {
+                unreachable_unchecked!("host frame cells are sized as max(len_params, len_results)")
+            }
+        };
+        inout
+    }
+
+    /// Adjusts `self` for a normal function call.
+    #[inline(always)]
+    fn push(
+        &mut self,
+        callee_sp: Sp,
+        start: SpOffset,
+        len_local_slots: u16,
+        len_stack_slots: u16,
+        len_params: u16,
+    ) -> Result<Sp, TrapCode> {
+        debug_assert!(
+            len_params <= len_stack_slots,
+            "number of parameter slots must be smaller than or equal to the number of total stack slots but found: \
+            #params = {len_params}, #slots = {len_stack_slots}",
+        );
+        debug_assert!(
+            len_params <= len_local_slots,
+            "number of parameter slots must be smaller than or equal to the number of total local slots but found: \
+            #params = {len_params}, #locals = {len_local_slots}",
+        );
+        debug_assert!(
+            len_local_slots <= len_stack_slots,
+            "number of local slots must be smaller than or equal to the number of total slots but found: \
+            #locals = {len_local_slots}, #slots = {len_stack_slots}",
+        );
+        let len_local_slots = usize::from(len_local_slots);
+        let len_stack_slots = usize::from(len_stack_slots);
+        let len_params = usize::from(len_params);
+        if len_stack_slots == 0 {
+            // Note: a callee without stack slots also has no parameters, so the translator
+            //       encodes a zero `params` head and `callee_sp == caller_sp`. Propagate it
+            //       rather than a fresh dangling pointer, so that any call this frame goes on
+            //       to make can still derive its callee's `Sp` from this one.
+            return Ok(callee_sp);
+        }
+        let end = start.add(len_stack_slots)?;
+        // Note: `callee_sp` was derived from the caller's `Sp` register, so it only survives
+        //       if the buffer was not reallocated. Re-deriving is confined to the cold path.
+        let sp = match self.grow_if_needed(end)? {
+            true => self.sp(start),
+            false => callee_sp,
+        };
+        let start_locals = start.into_inner().wrapping_add(len_params);
+        let end_locals = start.into_inner().wrapping_add(len_local_slots);
+        let Some(local_cells) = self.cells.get_mut(start_locals..end_locals) else {
+            unsafe { unreachable_unchecked!() }
+        };
+        local_cells.fill_with(Cell::default);
+        Ok(sp)
+    }
+
+    /// Adjusts `self` for a function tail call.
+    #[inline(always)]
+    fn replace(
+        &mut self,
+        callee_sp: Sp,
+        callee_start: SpOffset,
+        callee_locals: u16,
+        callee_slots: u16,
+        callee_params: BoundedSlotSpan,
+    ) -> Result<Sp, TrapCode> {
+        debug_assert!(callee_locals <= callee_slots);
+        let callee_locals = usize::from(callee_locals);
+        let callee_size = usize::from(callee_slots);
+        let params_len = usize::from(callee_params.len());
+        let params_start = usize::from(u16::from(callee_params.span().head()));
+        let params_end = params_start.wrapping_add(params_len);
+        if callee_size == 0 {
+            // Note: see `ValueStack::push` — the frame is reused, so this is the caller's `Sp`.
+            return Ok(callee_sp);
+        }
+        let callee_end = callee_start.add(callee_size)?;
+        // Note: a tail call reuses the caller's frame, so `callee_sp` is the caller's `Sp`
+        //       unchanged and only needs re-deriving if the buffer was reallocated.
+        let sp = match self.grow_if_needed(callee_end)? {
+            true => self.sp(callee_start),
+            false => callee_sp,
+        };
+        let Some(callee_cells) = self.cells_from(callee_start) else {
+            unsafe { unreachable_unchecked!("ValueStack::replace: out of bounds callee cells") }
+        };
+        callee_cells.copy_within(params_start..params_end, 0);
+        let Some(local_cells) = callee_cells.get_mut(params_len..callee_locals) else {
+            unsafe { unreachable_unchecked!() }
+        };
+        local_cells.fill_with(Cell::default);
+        Ok(sp)
+    }
+
+    /// Returns cells as slice: `cells[start..]`
+    fn cells_from(&mut self, start: SpOffset) -> Option<&mut [Cell]> {
+        let start = start.into_inner();
+        self.cells.get_mut(start..)
+    }
+
+    /// Returns cells as slice: `cells[start..end]`
+    fn cells_from_to(&mut self, start: SpOffset, end: SpOffset) -> Option<&mut [Cell]> {
+        let start = start.into_inner();
+        let end = end.into_inner();
+        self.cells.get_mut(start..end)
+    }
+
+    /// Copies cells from one part of the slice to another part of itself, using a `memmove`.
+    ///
+    /// # Panics
+    ///
+    /// If either `range` exceeds the end of the slice, or if the end of src is before the start.
+    fn cells_copy_within(&mut self, range: ops::Range<SpOffset>, dest: SpOffset) {
+        let start = range.start.into_inner();
+        let end = range.end.into_inner();
+        let dest = dest.into_inner();
+        self.cells.copy_within(start..end, dest);
+    }
+}
+
+/// The Wasmi call stack.
+///
+/// This holds all the information about function frames that are on the call stack.
+/// Additionally it keeps track of the [`Inst`] that is currently in use.
+///
+/// # Note
+///
+/// - A [`CallStack`] has a maximum height which it cannot exceed.
+#[derive(Debug)]
+pub struct CallStack {
+    /// The stack of function frames.
+    frames: Vec<Frame>,
+    /// The currently used [`Inst`] if any.
+    ///
+    /// This may be `None`, for example if the [`CallStack`] is empty.
+    instance: Option<Inst>,
+    /// The maximum height of the call stack.
+    max_height: usize,
+}
+
+impl CallStack {
+    /// Creates a new [`CallStack`] with the given maximum height.
+    fn new(max_height: usize) -> Self {
+        Self {
+            frames: Vec::new(),
+            instance: None,
+            max_height,
+        }
+    }
+
+    /// Returns the number of heap allocated bytes of `self`.
+    ///
+    /// # Note
+    ///
+    /// This is mostly used to separate instances with and without heap allocations for caching.
+    fn bytes_allocated(&self) -> usize {
+        let bytes_per_frame = mem::size_of::<Frame>();
+        self.frames.capacity() * bytes_per_frame
+    }
+
+    /// Creates an empty [`CallStack`] which uses no heap allocations.
+    fn empty() -> Self {
+        Self::new(0)
+    }
+
+    /// Resets `self` for reuse.
+    fn reset(&mut self) {
+        self.frames.clear();
+        self.instance = None;
+    }
+
+    /// Returns the `start` index of the top-most function frame.
+    ///
+    /// Returns 0 if `self` is empty.
+    fn top_start(&self) -> SpOffset {
+        let Some(top) = self.top() else {
+            return SpOffset::default();
+        };
+        top.start
+    }
+
+    /// Returns a shared reference to the top-most function frame if any.
+    ///
+    /// Returns `None` if `self` is empty.
+    fn top(&self) -> Option<&Frame> {
+        self.frames.last()
+    }
+
+    /// Synchronizes the [`Ip`] of the top-most function frame.
+    ///
+    /// # Note
+    ///
+    /// - Usually the current [`Ip`] is stored outside of the [`CallStack`].
+    /// - Synchronization is required when calling another function or when
+    ///   finishing a resumable call in order to be able to resume execution
+    ///   at that point later.
+    fn sync_ip(&mut self, ip: Ip) {
+        let Some(top) = self.frames.last_mut() else {
+            panic!("must have top call frame")
+        };
+        top.ip = ip;
+    }
+
+    /// Restores the top-most function frame and its [`Ip`], `start` index and [`Inst`].
+    ///
+    /// # Note
+    ///
+    /// This is useful and required to resume a function execution that yielded back to the host.
+    fn restore_frame(&self) -> Option<(Ip, SpOffset, Inst)> {
+        let instance = self.instance?;
+        let top = self.top()?;
+        Some((top.ip, top.start, instance))
+    }
+
+    /// Prepares `self` for a host function call.
+    fn prepare_host_frame(&mut self, caller_ip: Option<Ip>) -> SpOffset {
+        if let Some(caller_ip) = caller_ip {
+            self.sync_ip(caller_ip);
+        }
+        self.top_start()
+    }
+
+    /// Prepares `self` for a host function tail call.
+    ///
+    /// # Note
+    ///
+    /// In the following code, `callee` represents the called host function frame
+    /// and `caller` represents the caller of the caller of the host function, a.k.a.
+    /// the caller's caller.
+    pub fn return_prepare_host_frame(
+        &mut self,
+        callee_instance: Inst,
+    ) -> (SpOffset, Option<(Ip, SpOffset, Inst)>) {
+        let callee_start = self.top_start();
+        let caller = match self.pop() {
+            Some((ip, start, instance)) => {
+                let instance = instance.unwrap_or(callee_instance);
+                Some((ip, start, instance))
+            }
+            None => None,
+        };
+        (callee_start, caller)
+    }
+
+    /// Adjusts `self` for a normal function call.
+    #[inline(always)]
+    fn push(
+        &mut self,
+        caller_ip: Option<Ip>,
+        callee_ip: Ip,
+        callee_params: BoundedSlotSpan,
+        instance: Option<Inst>,
+    ) -> Result<SpOffset, TrapCode> {
+        if self.frames.len() == self.max_height {
+            return Err(TrapCode::StackOverflow);
+        }
+        match caller_ip {
+            Some(caller_ip) => self.sync_ip(caller_ip),
+            None => debug_assert!(self.frames.is_empty()),
+        }
+        let prev_instance = match instance {
+            Some(instance) if self.instance != Some(instance) => self.instance.replace(instance),
+            _ => None,
+        };
+        let params_offset = usize::from(u16::from(callee_params.span().head()));
+        let start = self.top_start().add(params_offset)?;
+        self.frames.push(Frame {
+            ip: callee_ip,
+            start,
+            instance: prev_instance,
+        });
+        Ok(start)
+    }
+
+    /// Adjusts `self` after returning from a function.
+    #[inline(always)]
+    fn pop(&mut self) -> Option<(Ip, SpOffset, Option<Inst>)> {
+        let Some(popped) = self.frames.pop() else {
+            unsafe { unreachable_unchecked!("call stack must not be empty") }
+        };
+        let top = self.top()?;
+        let ip = top.ip;
+        let start = top.start;
+        if let Some(instance) = popped.instance {
+            self.instance = Some(instance);
+        }
+        Some((ip, start, popped.instance))
+    }
+
+    /// Adjusts `self` for a function tail call.
+    ///
+    /// # Note
+    ///
+    /// - If `instance` is `Some` it refers to the _callee_ instance of the tail call.
+    ///   Only an actual instance change creates a restoration obligation.
+    /// - If `instance` is `None` the callee shares the currently used instance.
+    ///
+    /// This mirrors the contract of [`CallStack::push`].
+    #[inline(always)]
+    fn replace(&mut self, callee_ip: Ip, instance: Option<Inst>) -> Result<SpOffset, TrapCode> {
+        let Some(caller_frame) = self.frames.last_mut() else {
+            unsafe { unreachable_unchecked!("missing caller frame on the call stack") }
+        };
+        let start = caller_frame.start;
+        caller_frame.ip = callee_ip;
+        if let Some(callee_instance) = instance {
+            // The replaced frame's restoration obligation is carried over unchanged.
+            // However, if the replaced frame has no such obligation yet, its caller
+            // runs in the currently used instance which must be restored when the
+            // new frame returns since the callee continues in a different instance.
+            if caller_frame.instance.is_none() && self.instance != Some(callee_instance) {
+                caller_frame.instance = self.instance;
+            }
+            self.instance = Some(callee_instance);
+        }
+        Ok(start)
+    }
+}
+
+/// The state of a single function frame.
+#[derive(Debug)]
+pub struct Frame {
+    /// The functions [`Ip`].
+    ///
+    /// # Note
+    ///
+    /// This needs to be kept in sync for example when calling another function
+    /// or yielding back to the host in for resumable calls.
+    pub ip: Ip,
+    /// The start index on the value stack for this function frame.
+    start: SpOffset,
+    /// The [`Inst`] used if any.
+    ///
+    /// # Note
+    ///
+    /// This is only `Some` if [`Frame`] and its caller originate from different
+    /// Wasm instances and thus execution needs to change the currently used [`Inst`].
+    instance: Option<Inst>,
+}
+
+/// The offset of an [`Sp`] of a [`Stack`].
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct SpOffset(usize);
+
+impl From<usize> for SpOffset {
+    #[inline]
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+
+impl SpOffset {
+    /// Return `self` offset by `delta` cells.
+    #[inline]
+    fn add(self, delta: usize) -> Result<Self, TrapCode> {
+        match self.0.checked_add(delta) {
+            Some(new_sp) => Ok(Self::from(new_sp)),
+            None => Err(TrapCode::StackOverflow),
+        }
+    }
+
+    /// Returns the underlying `usize` index.
+    #[inline]
+    fn into_inner(self) -> usize {
+        self.0
+    }
+}

@@ -224,8 +224,11 @@ softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "
 # `simd` is enabled because the SIMD proposal is finalized and the crate is
 # pure-Rust (v128 still cannot cross the JS boundary — that throws TypeError per
 # the JS-API spec — but a module may use SIMD internally). The production
-# `WebAssembly.*` JS<->wasm bridge is in `src/lumen_wasm.rs`.
-wasmi = { version = "1", default-features = false, features = ["std", "simd", "native-jit"] }
+# `WebAssembly.*` JS<->wasm bridge is in `src/lumen_wasm.rs`. Wasmi 2 gates
+# validation and memory64 behind features that its defaults enable; keep both.
+# `auto-dispatch` uses tail-call dispatch only in optimized builds, where LLVM
+# performs the sibling calls it depends on, and a loop otherwise.
+wasmi = { version = "2", default-features = false, features = ["std", "simd", "validate", "memory64", "auto-dispatch", "native-jit"] }
 webpki-roots = "1.0.9"
 # CSS Fonts web resources commonly use WOFF or WOFF2 containers. `wuff`
 # decodes both to the SFNT bytes consumed by Fontique/Skrifa, entirely in
@@ -283,14 +286,15 @@ vello_gpu = { path = "vendor/vello_gpu-0.3.0" }
 vello_common = { path = "vendor/vello_common-0.3.0" }
 vello_cpu = { path = "vendor/vello_cpu-0.3.0" }
 vello_gpu_shaders = { path = "vendor/vello_gpu_shaders-0.3.0" }
-# TRust's owned Wasmi 1.1.0 forks provide the pure-Rust WebAssembly interpreter.
+# TRust's owned Wasmi 2.0.0 forks provide the pure-Rust WebAssembly interpreter.
 # Local changes include JavaScript memory synchronization and reference tracing,
-# exception support, and interpreter cache and dirty-range optimizations.
+# legacy exception support, dirty-range tracking and the native hot-region
+# compiler; see vendor/wasmi-2.0.0/README.trust.txt.
 # (`wasmparser`/`spin`/`libm` are third-party deps left on crates.io.)
-wasmi = { path = "vendor/wasmi-1.1.0" }
-wasmi_core = { path = "vendor/wasmi_core-1.1.0" }
-wasmi_ir = { path = "vendor/wasmi_ir-1.1.0" }
-wasmi_collections = { path = "vendor/wasmi_collections-1.1.0" }
+wasmi = { path = "vendor/wasmi-2.0.0" }
+wasmi_core = { path = "vendor/wasmi_core-2.0.0" }
+wasmi_ir = { path = "vendor/wasmi_ir-2.0.0" }
+wasmi_collections = { path = "vendor/wasmi_collections-2.0.0" }
 # TRust's vendored ratatui-image fork, rebased onto 11.1.0 (2026-10-07; first
 # vendored from 11.0.6). We own it to memoize the per-image sixel byte-string:
 # `SlicedSixelData::to_sequence` (`bands().join()`) rebuilt every visible image's
@@ -324,6 +328,19 @@ lto = false
 codegen-units = 64
 incremental = true
 strip = "none"
+
+# Wasmi 2.0's optimized interpreter dispatches each operator handler to the next
+# with a sibling call, which LLVM emits only when the handler's small Wasmi
+# helpers are inlined. Incremental builds disable rustc's cross-crate inlining
+# inference, so these vendored path crates would grow the native stack with
+# every operator. Build them like any crates.io dependency; the
+# `wasm_interpreter_dispatch_keeps_a_constant_native_stack` test guards this.
+[profile.release.package.wasmi]
+incremental = false
+[profile.release.package.wasmi_core]
+incremental = false
+[profile.release.package.wasmi_ir]
+incremental = false
 
 # Public, numbered releases only. This deliberately pays the expensive final
 # optimization/link cost; routine local promotions continue to use `--release`.

@@ -650,16 +650,16 @@ fn build_ref<C: wasmi::AsContextMut<Data = StoreData>>(
     value: RefArg,
 ) -> Result<wasmi::Val, ()> {
     match value {
-        RefArg::Null(wasmi::ValType::FuncRef) => Ok(wasmi::Val::FuncRef(wasmi::Ref::Null)),
-        RefArg::Null(_) => Ok(wasmi::Val::ExternRef(wasmi::Ref::Null)),
+        RefArg::Null(wasmi::ValType::FuncRef) => Ok(wasmi::Val::FuncRef(wasmi::Nullable::Null)),
+        RefArg::Null(_) => Ok(wasmi::Val::ExternRef(wasmi::Nullable::Null)),
         RefArg::Func(index) => funcs
             .get(index)
             .copied()
-            .map(|function| wasmi::Val::FuncRef(wasmi::Ref::Val(function)))
+            .map(|function| wasmi::Val::FuncRef(wasmi::Nullable::Val(function)))
             .ok_or(()),
         RefArg::Extern(id) => {
             if let Some(reference) = context.as_context().data().externrefs.get(&id) {
-                return Ok(wasmi::Val::ExternRef(wasmi::Ref::Val(*reference)));
+                return Ok(wasmi::Val::ExternRef(wasmi::Nullable::Val(*reference)));
             }
             #[cfg(test)]
             EXTERNREF_ALLOCATIONS.with(|count| count.set(count.get() + 1));
@@ -669,8 +669,25 @@ fn build_ref<C: wasmi::AsContextMut<Data = StoreData>>(
                 .data_mut()
                 .externrefs
                 .insert(id, reference);
-            Ok(wasmi::Val::ExternRef(wasmi::Ref::Val(reference)))
+            Ok(wasmi::Val::ExternRef(wasmi::Nullable::Val(reference)))
         }
+    }
+}
+
+/// Wasmi 2 types table elements as references rather than general values.
+fn table_ref(value: wasmi::Val) -> wasmi::Ref {
+    match value {
+        wasmi::Val::ExternRef(reference) => wasmi::Ref::Extern(reference),
+        wasmi::Val::FuncRef(function) => wasmi::Ref::Func(function),
+        // `prepare_ref`/`build_ref` only produce reference values.
+        _ => wasmi::Ref::Func(wasmi::Nullable::Null),
+    }
+}
+
+fn table_ref_type(element: wasmi::ValType) -> wasmi::RefType {
+    match element {
+        wasmi::ValType::ExternRef => wasmi::RefType::Extern,
+        _ => wasmi::RefType::Func,
     }
 }
 
@@ -693,13 +710,12 @@ fn extract_output<C: wasmi::AsContext<Data = StoreData>>(
     value: &wasmi::Val,
 ) -> OutputToken {
     match value {
-        wasmi::Val::FuncRef(wasmi::Ref::Null) | wasmi::Val::ExternRef(wasmi::Ref::Null) => {
-            OutputToken::Value(Value::Null)
-        }
-        wasmi::Val::FuncRef(wasmi::Ref::Val(function)) => {
+        wasmi::Val::FuncRef(wasmi::Nullable::Null)
+        | wasmi::Val::ExternRef(wasmi::Nullable::Null) => OutputToken::Value(Value::Null),
+        wasmi::Val::FuncRef(wasmi::Nullable::Val(function)) => {
             OutputToken::Func(state.register_func(*function))
         }
-        wasmi::Val::ExternRef(wasmi::Ref::Val(reference)) => OutputToken::Extern(
+        wasmi::Val::ExternRef(wasmi::Nullable::Val(reference)) => OutputToken::Extern(
             reference
                 .data(context)
                 .downcast_ref::<usize>()
@@ -1128,11 +1144,11 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
         let mut arguments = Vec::with_capacity(params.len());
         for value in params {
             let token = match value {
-                wasmi::Val::FuncRef(wasmi::Ref::Val(function)) => {
+                wasmi::Val::FuncRef(wasmi::Nullable::Val(function)) => {
                     let id = with_active_state(|state| state.register_func(*function)).unwrap_or(0);
                     make_exported_func(ctx, id)
                 }
-                wasmi::Val::ExternRef(wasmi::Ref::Val(reference)) => {
+                wasmi::Val::ExternRef(wasmi::Nullable::Val(reference)) => {
                     let id = reference
                         .data(&caller)
                         .downcast_ref::<usize>()
@@ -1140,9 +1156,8 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
                         .unwrap_or(0);
                     extern_get(ctx, id)
                 }
-                wasmi::Val::FuncRef(wasmi::Ref::Null) | wasmi::Val::ExternRef(wasmi::Ref::Null) => {
-                    Ok(Value::Null)
-                }
+                wasmi::Val::FuncRef(wasmi::Nullable::Null)
+                | wasmi::Val::ExternRef(wasmi::Nullable::Null) => Ok(Value::Null),
                 value => numeric_wasm_to_js(ctx, value),
             };
             match token {
@@ -1801,9 +1816,8 @@ pub(super) fn host_instance_exports(
                         .tables
                         .get(id)
                         .map(|table| match table.ty(&state.store).element() {
-                            wasmi::ValType::FuncRef => "anyfunc",
-                            wasmi::ValType::ExternRef => "externref",
-                            _ => "",
+                            wasmi::RefType::Func => "anyfunc",
+                            wasmi::RefType::Extern => "externref",
                         })
                         .unwrap_or("")
                         .to_string()
@@ -1856,9 +1870,8 @@ pub(super) fn host_instance_exports(
                     with_active_caller(|caller| {
                         instance.get_table(&*caller, &name).map(|table| {
                             match table.ty(&*caller).element() {
-                                wasmi::ValType::FuncRef => "anyfunc",
-                                wasmi::ValType::ExternRef => "externref",
-                                _ => "",
+                                wasmi::RefType::Func => "anyfunc",
+                                wasmi::RefType::Extern => "externref",
                             }
                         })
                     })
@@ -1961,8 +1974,11 @@ pub(super) fn host_call_export(
                 .and_then(|id| state.funcs.get(id))
                 .copied()
                 .ok_or(("Runtime", "WebAssembly: function went away".to_string()))?;
-            let mut outputs: Vec<wasmi::Val> =
-                results.iter().copied().map(wasmi::Val::default).collect();
+            let mut outputs: Vec<wasmi::Val> = results
+                .iter()
+                .copied()
+                .map(wasmi::Val::default_for_ty)
+                .collect();
             let _state_guard = StateGuard::set(state);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 function.call(&mut state.store, &inputs, &mut outputs)
@@ -2010,8 +2026,11 @@ pub(super) fn host_call_export(
                     }
                 });
             }
-            let mut outputs: Vec<wasmi::Val> =
-                results.iter().copied().map(wasmi::Val::default).collect();
+            let mut outputs: Vec<wasmi::Val> = results
+                .iter()
+                .copied()
+                .map(wasmi::Val::default_for_ty)
+                .collect();
             let invoked = with_active_caller(|caller| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     function.call(&mut *caller, &inputs, &mut outputs)
@@ -2524,13 +2543,13 @@ pub(super) fn host_table_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     let Some(page) = page_wasm(ctx) else {
         return Err(range_error(ctx, "WebAssembly is unavailable"));
     };
-    let ty = wasmi::TableType::new(element, initial, maximum);
+    let ty = wasmi::TableType::new(table_ref_type(element), initial, maximum);
     let id = match page.state.try_borrow_mut() {
         Ok(mut state_slot) => {
             let state = state_slot.get_or_insert_with(WasmState::new);
             let initial_value = build_ref(&state.funcs, &mut state.store, prepared)
                 .map_err(|()| type_error(ctx, "WebAssembly.Table: invalid initial value"))?;
-            let table = wasmi::Table::new(&mut state.store, ty, initial_value)
+            let table = wasmi::Table::new(&mut state.store, ty, table_ref(initial_value))
                 .map_err(|error| range_error(ctx, format!("WebAssembly.Table: {error}")))?;
             state.register_table(table)
         }
@@ -2539,9 +2558,11 @@ pub(super) fn host_table_new(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
             let initial_value = with_active_caller(|caller| build_ref(&funcs, caller, prepared))
                 .and_then(Result::ok)
                 .ok_or_else(|| type_error(ctx, "WebAssembly.Table: invalid initial value"))?;
-            let table = with_active_caller(|caller| wasmi::Table::new(caller, ty, initial_value))
-                .ok_or_else(|| range_error(ctx, "WebAssembly is unavailable"))?
-                .map_err(|error| range_error(ctx, format!("WebAssembly.Table: {error}")))?;
+            let table = with_active_caller(|caller| {
+                wasmi::Table::new(caller, ty, table_ref(initial_value))
+            })
+            .ok_or_else(|| range_error(ctx, "WebAssembly is unavailable"))?
+            .map_err(|error| range_error(ctx, format!("WebAssembly.Table: {error}")))?;
             with_active_state(|state| state.register_table(table))
                 .ok_or_else(|| range_error(ctx, "WebAssembly is unavailable"))?
         }
@@ -2590,7 +2611,8 @@ pub(super) fn host_table_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
             };
             let value = id
                 .and_then(|id| state.tables.get(id))
-                .and_then(|table| table.get(&state.store, index as u64));
+                .and_then(|table| table.get(&state.store, index as u64))
+                .map(wasmi::Val::from);
             value.map(|value| {
                 let store = &state.store as *const wasmi::Store<StoreData>;
                 // SAFETY: immutable extraction only.
@@ -2600,6 +2622,7 @@ pub(super) fn host_table_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         Err(_) => id.and_then(active_table).and_then(|table| {
             with_active_caller(|caller| {
                 table.get(&*caller, index as u64).and_then(|value| {
+                    let value = wasmi::Val::from(value);
                     with_active_state(|state| extract_output(state, &*caller, &value))
                 })
             })
@@ -2619,11 +2642,11 @@ fn table_info(page: &PageWasm, id: Option<usize>) -> Option<wasmi::ValType> {
     match page.state.try_borrow() {
         Ok(state) => state.as_ref().and_then(|state| {
             id.and_then(|id| state.tables.get(id))
-                .map(|table| table.ty(&state.store).element())
+                .map(|table| wasmi::ValType::from(table.ty(&state.store).element()))
         }),
-        Err(_) => id
-            .and_then(active_table)
-            .and_then(|table| with_active_caller(|caller| table.ty(&*caller).element())),
+        Err(_) => id.and_then(active_table).and_then(|table| {
+            with_active_caller(|caller| wasmi::ValType::from(table.ty(&*caller).element()))
+        }),
     }
 }
 
@@ -2654,7 +2677,7 @@ pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
                 .copied()
                 .map(|table| {
                     table
-                        .set(&mut state.store, index as u64, value)
+                        .set(&mut state.store, index as u64, table_ref(value))
                         .map_err(|error| error.to_string())
                 })
         }
@@ -2663,7 +2686,7 @@ pub(super) fn host_table_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
             id.and_then(active_table).and_then(|table| {
                 with_active_caller(|caller| match build_ref(&funcs, caller, prepared) {
                     Ok(value) => table
-                        .set(caller, index as u64, value)
+                        .set(caller, index as u64, table_ref(value))
                         .map_err(|error| error.to_string()),
                     Err(()) => Err("invalid funcref".to_string()),
                 })
@@ -2701,7 +2724,7 @@ pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
                 .copied()
                 .map(|table| {
                     table
-                        .grow(&mut state.store, delta as u64, value)
+                        .grow(&mut state.store, delta as u64, table_ref(value))
                         .map_err(|error| error.to_string())
                 })
         }
@@ -2710,7 +2733,7 @@ pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
             id.and_then(active_table).and_then(|table| {
                 with_active_caller(|caller| match build_ref(&funcs, caller, prepared) {
                     Ok(value) => table
-                        .grow(caller, delta as u64, value)
+                        .grow(caller, delta as u64, table_ref(value))
                         .map_err(|error| error.to_string()),
                     Err(()) => Err("invalid funcref".to_string()),
                 })
@@ -2721,5 +2744,107 @@ pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
         Some(Ok(old)) => Ok(Value::Num(old as f64)),
         Some(Err(error)) => Err(range_error(ctx, format!("WebAssembly.Table.grow: {error}"))),
         None => Err(range_error(ctx, "WebAssembly.Table.grow: unknown table")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Wasmi 2.0's optimized interpreter only keeps a constant native stack while every
+    /// handler reaches the next one with a sibling call (see the Wasmi profile overrides in
+    /// Cargo.toml). A handler that loses it grows the stack once per executed operator, so
+    /// this loop over common operator families (including growth and legacy exception
+    /// unwinding) would overflow the small thread stack and abort the test binary under
+    /// `cargo test --release`. Debug builds use Wasmi's portable loop dispatch.
+    #[test]
+    fn wasm_interpreter_dispatch_keeps_a_constant_native_stack() {
+        const MODULE: &str = r#"
+            (module
+              (memory 1)
+              (global $g (mut i64) (i64.const 0))
+              (type $t (func (param i64) (result i64)))
+              (table 2 funcref)
+              (elem (i32.const 0) $inc $dec)
+              (func $inc (type $t) (i64.add (local.get 0) (i64.const 1)))
+              (func $dec (type $t) (i64.sub (local.get 0) (i64.const 1)))
+              (tag $tag (param i32))
+              (func $throw (param i32) (throw $tag (local.get 0)))
+              (func (export "run") (param $n i32) (result i64)
+                (local $acc i64) (local $f f64) (local $v v128)
+                (loop $again
+                  (i32.store8 offset=7 (i32.and (local.get $n) (i32.const 255)) (local.get $n))
+                  (i64.store offset=16 (i32.const 8) (local.get $acc))
+                  (local.set $acc (i64.add (local.get $acc)
+                    (i64.load8_u offset=7 (i32.and (local.get $n) (i32.const 255)))))
+                  (local.set $acc (i64.xor (local.get $acc) (i64.load offset=16 (i32.const 8))))
+                  (memory.copy (i32.const 64) (i32.const 0) (i32.const 16))
+                  (local.set $f (f64.add (f64.mul (local.get $f) (f64.const 0.5))
+                    (f64.convert_i32_u (local.get $n))))
+                  (local.set $acc (i64.add (local.get $acc)
+                    (i64.trunc_f64_u (f64.sqrt (local.get $f)))))
+                  (local.set $v (i32x4.add (local.get $v) (i32x4.splat (local.get $n))))
+                  (v128.store offset=32 (i32.const 0) (local.get $v))
+                  (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u
+                    (i32x4.extract_lane 2 (v128.load offset=32 (i32.const 0))))))
+                  (local.set $acc (i64.add (local.get $acc)
+                    (i64.extend_i32_u (i8x16.bitmask (local.get $v)))))
+                  (global.set $g (i64.add (global.get $g) (local.get $acc)))
+                  (local.set $acc (call $inc (local.get $acc)))
+                  (local.set $acc (call_indirect (type $t) (local.get $acc)
+                    (i32.and (local.get $n) (i32.const 1))))
+                  (block $b2
+                    (block $b1
+                      (block $b0
+                        (br_table $b0 $b1 $b2 (i32.rem_u (local.get $n) (i32.const 3))))
+                      (local.set $acc (i64.rotl (local.get $acc) (i64.const 3)))
+                      (br $b2))
+                    (local.set $acc (select (local.get $acc) (i64.const 1)
+                      (i32.eqz (local.get $n)))))
+                  (local.set $acc (i64.add (local.get $acc)
+                    (i64.extend_i32_u (ref.is_null (table.get (i32.const 1))))))
+                  (drop (memory.grow (i32.const 0)))
+                  (drop (table.grow (ref.null func) (i32.const 0)))
+                  try (result i32)
+                    try (result i32)
+                      (call $throw (local.get $n))
+                      i32.const 0
+                    catch $tag
+                      rethrow 0
+                    end
+                  catch $tag
+                  end
+                  i64.extend_i32_u
+                  (local.set $acc (i64.add (local.get $acc)))
+                  (br_if $again (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
+                (i64.add (local.get $acc) (global.get $g))))
+        "#;
+        let run = |native_jit: bool| {
+            std::thread::Builder::new()
+                .stack_size(1 << 20)
+                .spawn(move || {
+                    let mut config = wasmi::Config::default();
+                    config.native_jit(native_jit);
+                    let engine = wasmi::Engine::new(&config);
+                    let module = wasmi::Module::new(&engine, wat::parse_str(MODULE).unwrap())
+                        .expect("valid module");
+                    let mut store = wasmi::Store::new(&engine, ());
+                    let instance = wasmi::Linker::new(&engine)
+                        .instantiate_and_start(&mut store, &module)
+                        .expect("instantiable module");
+                    instance
+                        .get_typed_func::<i32, i64>(&store, "run")
+                        .expect("exported run")
+                        .call(&mut store, 50_000)
+                        .expect("completes without a trap")
+                })
+                .expect("spawn interpreter thread")
+                .join()
+                .expect("interpreter thread")
+        };
+        let interpreted = run(false);
+        assert_eq!(
+            run(true),
+            interpreted,
+            "native regions agree with the interpreter"
+        );
     }
 }

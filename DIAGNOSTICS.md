@@ -84,25 +84,31 @@ rejects a browser.
 Compare native WebAssembly execution against the interpreter with the same
 release artifact: `TRUST_WASM_NATIVE_JIT=0` (or `false`) disables the optional
 native compiler. It is enabled by default on little-endian AArch64 and x86-64;
-unsupported instructions and fuel-metered engines use the interpreter. Native
-regions cover scalar integer arithmetic, globals, branches, selects and
-default-memory loads/stores, plus v128 instructions: lane-wise integer and
-float arithmetic, bitwise operations, comparisons, shifts, shuffle/swizzle,
+unsupported operators and fuel-metered engines use the interpreter. Native
+regions cover scalar integer arithmetic, comparisons and bit counts, data
+movement of all scalar types (copies, selects, reinterpretations and the
+accumulator registers of Wasmi's register machine), globals, branches and
+default-memory loads/stores, plus v128 operators: lane-wise integer and float
+arithmetic, bitwise operations, comparisons, shifts, shuffle/swizzle,
 splat/extract/replace lane, narrowing/widening, conversions and v128
-loads/stores (full, lane, splat, zero and extending forms). Relaxed SIMD, scalar
-float instructions, calls, non-default memories and offsets above 4 GiB end a
-region. `WASMI_JIT_TRACE=1` reports compiled instruction counts, region starts,
-native code sizes, compilation times, declined regions, and the instruction that
-ended each region, with a histogram of those stops every 64 attempts.
-`WASMI_JIT_DUMP=1` prints each region's Cranelift IR and machine code.
-`WASMI_JIT_EAGER=1` is a conformance stress mode only: it compiles every
-control-flow entry at its first visit, including one-instruction regions, without
-the region and candidate caps. The per-engine cache accepts at most 128 native
-regions of 256 Wasmi instruction words each and 2,048 candidate addresses. Native code
-allocations are released when the engine and its active calls are dropped.
-Compilation counters persist across host/JavaScript calls. The bounded cache
-recycles cold counters so one-shot startup code cannot exclude later hot functions;
-compiled regions and checked fallbacks retain their cache entries.
+loads/stores (full and lane stores; Wasmi lowers the extending, splatting,
+zeroing and lane loads to scalar loads and lane operators). Relaxed SIMD, scalar
+float arithmetic, integer division and remainder, calls, legacy exception
+operators, non-default memories and offsets above 4 GiB end a region.
+Control-flow entries (branch targets, callee entries, return addresses and the
+start of each execution) are the region candidates. `WASMI_JIT_TRACE=1` reports
+compiled operator counts, region starts, native code sizes, compilation times,
+declined regions, and the operator that ended each region, with a histogram of
+those stops every 64 attempts. `WASMI_JIT_DUMP=1` prints each region's Cranelift
+IR and machine code. `WASMI_JIT_EAGER=1` is a conformance stress mode only: it
+compiles every control-flow entry at its first visit, including one-operator
+regions, without the region and candidate caps. The per-engine cache accepts at
+most 128 native regions of 256 Wasmi operators each and 2,048 candidate
+addresses. Native code allocations are released when the engine and its active
+calls are dropped. Compilation counters persist across host/JavaScript calls.
+The bounded cache recycles cold counters so one-shot startup code cannot exclude
+later hot functions; compiled regions and checked fallbacks retain their cache
+entries.
 `TRUST_WASM_TRACE=1` logs page WebAssembly imports and exported calls (the first 64,
 then every 1,000th) as `wasm:` lines on stderr.
 
@@ -118,15 +124,15 @@ TRUST_WASM_NATIVE_JIT=1 /usr/bin/time -v target/release/trust-headless --settle 
 stat -c '%s bytes' target/release/trust
 ```
 
-Run the owned Wasmi compiler regressions, including interpreter comparisons,
-with its local dependency patches:
+Run the owned Wasmi regressions, including native-versus-interpreter
+comparisons and legacy exception handling, with its local dependency patches:
 
 ```sh
-cargo test --manifest-path vendor/wasmi-1.1.0/Cargo.toml \
+cargo test --manifest-path vendor/wasmi-2.0.0/Cargo.toml \
   --target-dir target/wasmi-tests --features simd,native-jit \
-  --config "patch.crates-io.wasmi_core.path='$PWD/vendor/wasmi_core-1.1.0'" \
-  --config "patch.crates-io.wasmi_ir.path='$PWD/vendor/wasmi_ir-1.1.0'" \
-  --config "patch.crates-io.wasmi_collections.path='$PWD/vendor/wasmi_collections-1.1.0'"
+  --config "patch.crates-io.wasmi_core.path='$PWD/vendor/wasmi_core-2.0.0'" \
+  --config "patch.crates-io.wasmi_ir.path='$PWD/vendor/wasmi_ir-2.0.0'" \
+  --config "patch.crates-io.wasmi_collections.path='$PWD/vendor/wasmi_collections-2.0.0'"
 ```
 
 The same command also compiles every SIMD test region for baseline x86-64,
@@ -134,7 +140,31 @@ x86-64-v2, x86-64-v3 and AArch64. Run the official SIMD scripts with the
 interpreter and with every region compiled natively by adding
 `WASMI_SPEC_DIR=/big/web-standards/repositories/WebAssembly/spec/test/core/simd`
 in front of it and `--release --lib native_simd_spec -- --ignored --nocapture`
-after it; the test fails on any native-only failure.
+after it; the test fails on any native-only failure. With
+`WASMI_SPEC_DIR=.../spec/test/core WASMI_SPEC_PREFIX= RUST_MIN_STACK=268435456`
+the same runner compares every core script; failures that also occur in the
+interpreter are limitations of that small script runner (reference results,
+linking and instantiation traps). The official legacy exception-handling
+scripts run with
+`WASMI_LEGACY_EH_DIR=/big/web-standards/repositories/WebAssembly/exception-handling/test/legacy/exceptions/core`
+in front of the command and `--test mod legacy_exception_spec -- --ignored`
+after it.
+
+`vendor/wasmi-2.0.0/trust/gen_native_decode.py` regenerates the native
+operator table (`src/engine/native_jit/decode_table.rs`) from the executor's
+handler tables and the generated `wasmi_ir` decoding types; rerun it whenever
+the Wasmi IR or its handlers change.
+
+Wasmi's optimized interpreter passes control between operator handlers with
+sibling calls; a handler that loses one grows the native stack with every
+operator it executes until the page thread overflows. TRust's release profile
+therefore builds the vendored Wasmi crates non-incrementally (see `Cargo.toml`),
+and fork changes to handlers must not take the address of a handler local: pass
+scalars to out-of-line helpers and keep their state in the store.
+`cargo test --release --lib wasm_interpreter_dispatch_keeps_a_constant_native_stack`
+aborts with a stack overflow when this regresses. In a release binary's
+disassembly, such a handler dispatches with an indirect call followed by a
+return instead of an indirect jump.
 
 Trace a normal Lumen page load and its network requests:
 

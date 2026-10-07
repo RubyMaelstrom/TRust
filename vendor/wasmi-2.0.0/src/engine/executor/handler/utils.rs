@@ -1,0 +1,1088 @@
+use super::state::{Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp};
+#[cfg(feature = "simd")]
+use crate::core::simd::ImmLaneIdx;
+#[cfg(doc)]
+use crate::instance::{InstanceEntity, ThinPtr};
+use crate::{
+    DataSegment,
+    ElementSegment,
+    Error,
+    Func,
+    Global,
+    Handle,
+    Memory,
+    Nullable,
+    RefType,
+    Table,
+    TrapCode,
+    V128,
+    core::{CoreMemory as MemoryEntity, CoreTable as TableEntity, RawVal, ShiftAmount},
+    engine::{
+        FuncEntry,
+        InOutParams,
+        executor::{
+            LoadFromCellsByValue,
+            StoreToCells,
+            handler::{Break, Control, DoneReason, args::Args},
+        },
+        utils::unreachable_unchecked,
+    },
+    func::{FuncEntity, HostFuncEntity, Trampoline},
+    instance::{DataAddr, ElemAddr, FuncAddr, GlobalAddr, HandleAndEntity, MemoryAddr, TableAddr},
+    ir::{
+        self,
+        Address,
+        BoundedSlotSpan,
+        Local,
+        Offset,
+        Offset16,
+        Slot,
+        SlotAndReg,
+        SlotSpan,
+        Table0,
+    },
+    store::{CallHooks, PrunedStore, StoreError},
+};
+use core::{num::NonZero, ptr::NonNull};
+
+macro_rules! out_of_fuel {
+    ($store:expr, $args:expr, $required_fuel:expr) => {{
+        $store.stack_mut().sync_ip($args.ip);
+        $store
+            .stack_mut()
+            .sync_regs($args.ireg, $args.freg32, $args.freg64);
+        done!(
+            $store,
+            $crate::engine::executor::handler::DoneReason::out_of_fuel($required_fuel),
+        )
+    }};
+}
+
+macro_rules! consume_fuel {
+    ($state:expr, $ip:expr, $args:expr, $fuel:expr, $eval:expr $(,)? ) => {{
+        if let ::core::result::Result::Err($crate::errors::FuelError::OutOfFuel { required_fuel }) =
+            $fuel.consume_fuel_if($eval)
+        {
+            $args.set_ip($ip);
+            out_of_fuel!($state, $args, required_fuel)
+        }
+    }};
+}
+
+pub fn compile_or_get_func_entry(
+    store: &mut PrunedStore,
+    func: &FuncEntry,
+) -> Result<(Ip, u16, u16), Error> {
+    let (fuel, features) = store.inner_mut().fuel_and_features();
+    let compiled_func = func.get_or_compile(Some(fuel), features)?;
+    let ip = Ip::from(compiled_func.ops());
+    let len_local_slots = compiled_func.len_local_slots();
+    let len_stack_slots = compiled_func.len_stack_slots();
+    Ok((ip, len_local_slots, len_stack_slots))
+}
+
+macro_rules! compile_or_get_func_entry {
+    ($state:expr, $func:expr) => {{
+        match $crate::engine::executor::handler::utils::compile_or_get_func_entry($state, $func) {
+            Ok((ip, len_local_slots, len_stack_slots)) => (ip, len_local_slots, len_stack_slots),
+            Err(error) => done!($state, DoneReason::error(error)),
+        }
+    }};
+}
+
+/// TRust: observes a control-flow entry of the interpreter for native regions.
+///
+/// Expands to nothing without the native region compiler.
+macro_rules! native_entry {
+    ($store:expr, $args:expr) => {{
+        #[cfg(wasmi_native_jit)]
+        $crate::engine::executor::handler::native::enter($store, &mut $args);
+    }};
+}
+
+macro_rules! trap {
+    ($trap_code:expr) => {{
+        return $crate::engine::executor::handler::Control::Break(
+            $crate::engine::executor::handler::Break::from($trap_code),
+        );
+    }};
+}
+
+macro_rules! done {
+    ($store:expr, $reason:expr $(,)? ) => {{
+        $store.inner_mut().exec_mut().done_with(move || {
+            <_ as ::core::convert::Into<$crate::engine::executor::handler::DoneReason>>::into(
+                $reason,
+            )
+        });
+        return $crate::engine::executor::handler::dispatch::control_break();
+    }};
+}
+
+pub trait IntoControl {
+    type Value;
+
+    fn into_control(self) -> Control<Self::Value, Break>;
+}
+
+impl<T> IntoControl for Result<T, TrapCode> {
+    type Value = T;
+
+    fn into_control(self) -> Control<Self::Value, Break> {
+        match self {
+            Ok(value) => Control::Continue(value),
+            Err(trap_code) => Control::Break(Break::from(trap_code)),
+        }
+    }
+}
+
+macro_rules! impl_into_control {
+    ( $($ty:ty),* $(,)? ) => {
+        $(
+            impl IntoControl for $ty {
+                type Value = Self;
+
+                fn into_control(self) -> Control<Self::Value, Break> {
+                    Control::Continue(self)
+                }
+            }
+        )*
+    };
+}
+impl_into_control! {
+    bool,
+    u8, u16, u32, u64, usize,
+    i8, i16, i32, i64, isize,
+    f32, f64,
+    V128,
+    RawVal,
+}
+
+pub trait GetValue<T> {
+    fn get_value(src: Self, sp: Sp, ireg: Ireg, freg32: Freg32, freg64: Freg64) -> T;
+}
+
+macro_rules! impl_get_value {
+    ( $($ty:ty),* $(,)? ) => {
+        $(
+            impl GetValue<$ty> for $ty {
+                #[inline(always)]
+                fn get_value(src: Self, _sp: Sp, _ireg: Ireg, _freg32: Freg32, _freg64: Freg64) -> $ty {
+                    src
+                }
+            }
+        )*
+    };
+}
+impl_get_value!(
+    u8,
+    u16,
+    u32,
+    u64,
+    i8,
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    NonZero<i32>,
+    NonZero<i64>,
+    NonZero<u32>,
+    NonZero<u64>,
+    Address,
+    Offset16,
+    ShiftAmount,
+    V128,
+);
+#[cfg(feature = "simd")]
+impl_get_value!([ImmLaneIdx<32>; 16]);
+
+impl GetValue<u64> for Offset {
+    #[inline(always)]
+    fn get_value(src: Self, _sp: Sp, _ireg: Ireg, _freg32: Freg32, _freg64: Freg64) -> u64 {
+        u64::from(src)
+    }
+}
+
+macro_rules! impl_get_value_for_ireg {
+    ( $($prim:ty),* $(,)? ) => {
+        $(
+            impl GetValue<$prim> for ir::Reg<i64> {
+                #[inline]
+                fn get_value(_src: Self, _sp: Sp, ireg: Ireg, _freg32: Freg32, _freg64: Freg64) -> $prim {
+                    <$prim as From<Ireg>>::from(ireg)
+                }
+            }
+        )*
+    };
+}
+impl_get_value_for_ireg!(bool, i8, i16, i32, i64, u8, u16, u32, u64, ShiftAmount);
+
+impl From<Ireg> for ShiftAmount {
+    #[inline]
+    fn from(value: Ireg) -> Self {
+        Self::from(u8::from(value))
+    }
+}
+
+impl GetValue<f32> for ir::Reg<f32> {
+    #[inline]
+    fn get_value(_src: Self, _sp: Sp, _ireg: Ireg, freg32: Freg32, _freg64: Freg64) -> f32 {
+        f32::from(freg32)
+    }
+}
+
+impl GetValue<f64> for ir::Reg<f64> {
+    #[inline]
+    fn get_value(_src: Self, _sp: Sp, _ireg: Ireg, _freg32: Freg32, freg64: Freg64) -> f64 {
+        f64::from(freg64)
+    }
+}
+
+impl<const N: u16, T> GetValue<T> for Local<N>
+where
+    T: LoadFromCellsByValue,
+{
+    #[inline]
+    fn get_value(_src: Self, sp: Sp, ireg: Ireg, freg32: Freg32, freg64: Freg64) -> T {
+        <Slot as GetValue<T>>::get_value(Slot::from(N), sp, ireg, freg32, freg64)
+    }
+}
+
+impl<T> GetValue<T> for Slot
+where
+    T: LoadFromCellsByValue,
+{
+    #[inline]
+    fn get_value(src: Self, sp: Sp, _ireg: Ireg, _freg32: Freg32, _freg64: Freg64) -> T {
+        // # Safety
+        //
+        // This implementation's correctness relies on the caller's inputs.
+        //
+        // - The caller needs to make sure that the offset `sp` via `src` yields
+        //   a memory region that is alive and belonging to the same memory region
+        //   as `sp` itself.
+        // - This method (or trait) was not marked `unsafe` for ergonomic reasons
+        //   since practically any direct callers of this methods cannot enforce or
+        //   assert those invariants themselves.
+        // - In essence the use of this method relies on the correct `decode` implementation
+        //   and the correct use of `decode` implementation in all execution handlers and
+        //   their callers, e.g. the interpreter loop as well as the setup routine.
+        // - Marking all execution handlers as `unsafe` was another option that has been
+        //   ruled out because it would yield `unsafe` blocks way too large to be effective.
+        // - Therefore: this method not being marked `unsafe` was a design trade-off.
+        unsafe { sp.get::<T>(src) }
+    }
+}
+
+/// Returns the value at `sp[src]`.
+#[inline]
+pub fn get_slot_value<L>(src: Slot, sp: Sp) -> L
+where
+    Slot: GetValue<L>,
+{
+    <Slot as GetValue<L>>::get_value(
+        src,
+        sp,
+        Ireg::default(),
+        Freg32::default(),
+        Freg64::default(),
+    )
+}
+
+/// Returns the `src` value from its destination:
+///
+/// - `sp[src]` if `src` is `Slot`
+/// - `src` if `src` is a primitive type, such as `i32`
+/// - `ireg` if `src` is `Ireg`
+/// - `freg32` if `src` is `Freg32`
+/// - `freg64` if `src` is `Freg64`
+#[inline]
+pub fn get_value<T, L>(src: T, sp: Sp, ireg: Ireg, freg32: Freg32, freg64: Freg64) -> L
+where
+    T: GetValue<L>,
+{
+    <T as GetValue<L>>::get_value(src, sp, ireg, freg32, freg64)
+}
+
+pub trait SetValue<T> {
+    #[must_use]
+    fn set_value(
+        dst: Self,
+        src: T,
+        sp: Sp,
+        ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64);
+}
+
+impl<T> SetValue<T> for ir::Reg<i64>
+where
+    T: Into<Ireg>,
+{
+    #[inline]
+    fn set_value(
+        _dst: Self,
+        src: T,
+        _sp: Sp,
+        _ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        (src.into(), freg32, freg64)
+    }
+}
+
+impl<T> SetValue<T> for ir::Reg<f32>
+where
+    T: Into<Freg32>,
+{
+    #[inline]
+    fn set_value(
+        _dst: Self,
+        src: T,
+        _sp: Sp,
+        ireg: Ireg,
+        _freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        (ireg, src.into(), freg64)
+    }
+}
+
+impl<T> SetValue<T> for ir::Reg<f64>
+where
+    T: Into<Freg64>,
+{
+    #[inline]
+    fn set_value(
+        _dst: Self,
+        src: T,
+        _sp: Sp,
+        ireg: Ireg,
+        freg32: Freg32,
+        _freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        (ireg, freg32, src.into())
+    }
+}
+
+impl<const N: u16, T> SetValue<T> for Local<N>
+where
+    T: StoreToCells,
+{
+    #[inline]
+    fn set_value(
+        _dst: Self,
+        src: T,
+        sp: Sp,
+        ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        <Slot as SetValue<T>>::set_value(Slot::from(N), src, sp, ireg, freg32, freg64)
+    }
+}
+
+impl<T> SetValue<T> for SlotAndReg<i64>
+where
+    T: StoreToCells + Into<Ireg> + Copy,
+{
+    #[inline]
+    fn set_value(
+        dst: Self,
+        src: T,
+        sp: Sp,
+        ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        let (ireg, freg32, freg64) = set_value(dst.slot, src, sp, ireg, freg32, freg64);
+        set_value(dst.reg, src, sp, ireg, freg32, freg64)
+    }
+}
+
+impl<T> SetValue<T> for SlotAndReg<f32>
+where
+    T: StoreToCells + Into<Freg32> + Copy,
+{
+    #[inline]
+    fn set_value(
+        dst: Self,
+        src: T,
+        sp: Sp,
+        ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        let (ireg, freg32, freg64) = set_value(dst.slot, src, sp, ireg, freg32, freg64);
+        set_value(dst.reg, src, sp, ireg, freg32, freg64)
+    }
+}
+
+impl<T> SetValue<T> for SlotAndReg<f64>
+where
+    T: StoreToCells + Into<Freg64> + Copy,
+{
+    #[inline]
+    fn set_value(
+        dst: Self,
+        src: T,
+        sp: Sp,
+        ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        let (ireg, freg32, freg64) = set_value(dst.slot, src, sp, ireg, freg32, freg64);
+        set_value(dst.reg, src, sp, ireg, freg32, freg64)
+    }
+}
+
+impl<T> SetValue<T> for Slot
+where
+    T: StoreToCells,
+{
+    #[inline]
+    fn set_value(
+        dst: Self,
+        src: T,
+        sp: Sp,
+        ireg: Ireg,
+        freg32: Freg32,
+        freg64: Freg64,
+    ) -> (Ireg, Freg32, Freg64) {
+        // # Safety
+        //
+        // This implementation's correctness relies on the caller's inputs.
+        //
+        // - The caller needs to make sure that the offset `sp` via `src` yields
+        //   a memory region that is alive and belonging to the same memory region
+        //   as `sp` itself.
+        // - This method (or trait) was not marked `unsafe` for ergonomic reasons
+        //   since practically any direct callers of this methods cannot enforce or
+        //   assert those invariants themselves.
+        // - In essence the use of this method relies on the correct `decode` implementation
+        //   and the correct use of `decode` implementation in all execution handlers and
+        //   their callers, e.g. the interpreter loop as well as the setup routine.
+        // - Marking all execution handlers as `unsafe` was another option that has been
+        //   ruled out because it would yield `unsafe` blocks way too large to be effective.
+        // - Therefore: this method not being marked `unsafe` was a design trade-off.
+        unsafe { sp.set::<T>(dst, src) };
+        (ireg, freg32, freg64)
+    }
+}
+
+/// Sets the value at `sp` at offset `dst` to `value`: `sp[dst] = src`
+#[inline]
+pub fn set_slot_value<T, V>(dst: T, src: V, sp: Sp)
+where
+    T: SetValue<V>,
+{
+    // Note: safe to drop the return value here immediate in this case.
+    _ = <T as SetValue<V>>::set_value(
+        dst,
+        src,
+        sp,
+        Ireg::default(),
+        Freg32::default(),
+        Freg64::default(),
+    );
+}
+
+/// Sets the value at `sp` at offset `dst` to `value`: `sp[dst] = src`
+#[inline]
+#[must_use]
+pub fn set_value<T, V>(
+    dst: T,
+    src: V,
+    sp: Sp,
+    ireg: Ireg,
+    freg32: Freg32,
+    freg64: Freg64,
+) -> (Ireg, Freg32, Freg64)
+where
+    T: SetValue<V>,
+{
+    <T as SetValue<V>>::set_value(dst, src, sp, ireg, freg32, freg64)
+}
+
+pub fn exec_copy_span(sp: Sp, dst: SlotSpan, src: SlotSpan, len: u16) {
+    debug_assert_ne!(dst, src);
+    debug_assert!(len > 0);
+    let op = match dst.head() <= src.head() {
+        true => exec_copy_span_asc,
+        false => exec_copy_span_des,
+    };
+    op(sp, dst, src, len)
+}
+
+pub fn exec_copy_span_asc(sp: Sp, dst: SlotSpan, src: SlotSpan, len: u16) {
+    debug_assert!(dst.head() < src.head());
+    debug_assert!(len > 0);
+    let mut dst = dst.head();
+    let mut src = src.head();
+    let dst_end = dst.next_n(len);
+    while dst != dst_end {
+        let value: u64 = get_slot_value(src, sp);
+        set_slot_value(dst, value, sp);
+        dst = dst.next();
+        src = src.next();
+    }
+}
+
+pub fn exec_copy_span_des(sp: Sp, dst: SlotSpan, src: SlotSpan, len: u16) {
+    debug_assert!(dst.head() > src.head());
+    debug_assert!(len > 0);
+    let dst_end = dst.head();
+    let mut dst = dst.head().next_n(len);
+    let mut src = src.head().next_n(len);
+    while dst != dst_end {
+        dst = dst.prev();
+        src = src.prev();
+        let value: u64 = get_slot_value(src, sp);
+        set_slot_value(dst, value, sp);
+    }
+}
+
+/// Returns `true` if `memory` addresses the default linear memory (Wasm index 0).
+#[inline]
+pub fn is_default_memory(_instance: Inst, memory: ir::MemoryAddr) -> bool {
+    // Note: this returns `true` even if the instance does not contain a memory.
+    //       It is guaranteed that linear memories are placed first in an instance's
+    //       handle buffer, therefore `MemoryAddr(0)` always refers to the default
+    //       memory if one exists.
+    u32::from(memory) == 0
+}
+
+/// Extracts the data pointer and length of `(memory 0)`.
+///
+/// # Note (Safety)
+///
+/// The caller must ensure that `inst` refers to a live instance
+/// that contains a linear memory and thus `(memory 0)`.
+pub fn extract_mem0(inst: Inst) -> (Mem0Ptr, Mem0Len) {
+    // SAFETY: `inst` refers to a live instance for the duration of the call.
+    let Some(addr) = (unsafe { inst.as_ptr().layout() }).memory_addr(0) else {
+        return (Mem0Ptr::from([].as_mut_ptr()), Mem0Len::from(0));
+    };
+    // SAFETY: `addr` stems from the instance layout and thus addresses a memory entry
+    //         whose cache was warmed at instantiation.
+    let Some(mem0) = (unsafe { inst.as_ptr().get_memory(addr) }) else {
+        unsafe { unreachable_unchecked!("missing memory at: {addr:?}") }
+    };
+    // SAFETY: the entry stems from the instance layout and is thus in bounds; the reference
+    //         does not outlive this function.
+    let mem0 = unsafe { mem0.as_ref() };
+    let mem0 = mem0.entity();
+    // SAFETY: entity cache is ensured to have warmed at instantiation.
+    // TRust: the executor only needs the base pointer here; writes through it record their
+    //        exact extent via `mark_mem0_dirty`.
+    let mem0 = unsafe { &mut *mem0.as_ptr() }.data_mut_untracked();
+    let mem0_ptr = mem0.as_mut_ptr();
+    let mem0_len = mem0.len();
+    (Mem0Ptr::from(mem0_ptr), Mem0Len::from(mem0_len))
+}
+
+pub fn memory_slice(memory: &MemoryEntity, pos: usize, len: usize) -> Result<&[u8], TrapCode> {
+    memory
+        .data()
+        .get(pos..)
+        .and_then(|memory| memory.get(..len))
+        .ok_or(TrapCode::MemoryOutOfBounds)
+}
+
+/// Returns the bytes `memory[pos..pos+len]` that the caller is about to overwrite.
+///
+/// # Note
+///
+/// TRust: every caller writes the whole returned span, so it is recorded as dirty for the
+/// embedder's `Memory.buffer` mirror (WebAssembly JS API #memories).
+pub fn memory_slice_mut(
+    memory: &mut MemoryEntity,
+    pos: usize,
+    len: usize,
+) -> Result<&mut [u8], TrapCode> {
+    let in_bounds = pos
+        .checked_add(len)
+        .is_some_and(|end| end <= memory.data().len());
+    if !in_bounds {
+        return Err(TrapCode::MemoryOutOfBounds);
+    }
+    memory.mark_dirty_range(pos, len);
+    Ok(&mut memory.data_mut_untracked()[pos..pos + len])
+}
+
+/// Records a completed write of `len` bytes at the effective `address` of `memory`.
+#[inline]
+pub fn mark_memory_dirty(memory: &mut MemoryEntity, address: u64, len: usize) {
+    if let Ok(address) = usize::try_from(address) {
+        memory.mark_dirty_range(address, len);
+    }
+}
+
+/// Extension trait for [`Inst`] to load typed entries from their addresses.
+trait LoadEntry<Addr> {
+    /// The type of the loaded entry.
+    type Entry;
+
+    /// Returns a pointer to the entry at `addr` of the instance cache.
+    ///
+    /// # Safety
+    ///
+    /// In addition to the requirements of [`ThinPtr::as_ref`] the caller must ensure that
+    /// `addr` is in bounds of `self` and that the entry it addresses stores a handle of the
+    /// associated kind. Wasmi's translation guarantees both for every address encoded into a
+    /// Wasmi IR operator.
+    ///
+    /// The returned pointer is only sound to dereference while `self` refers to a live
+    /// [`InstanceEntity`].
+    unsafe fn load_entry_ptr(self, addr: Addr) -> NonNull<Self::Entry>;
+}
+
+macro_rules! impl_load_entry_for_inst {
+    (
+        $(
+            ir::$addr:ident -> $handle:ident = $getter:ident
+        );* $(;)?
+    ) => {
+        $(
+            impl LoadEntry<ir::$addr> for Inst {
+                type Entry = HandleAndEntity<$handle>;
+
+                #[inline]
+                unsafe fn load_entry_ptr(self, addr: ir::$addr) -> NonNull<Self::Entry> {
+                    let addr = <$addr>::from(::core::primitive::u32::from(addr));
+                    // SAFETY: `addr` addresses an entry of this kind by translation invariant.
+                    let Some(entry) = (unsafe { self.as_ptr().$getter(addr) }) else {
+                        unsafe {
+                            $crate::engine::utils::unreachable_unchecked!(
+                                ::core::concat!("missing ", ::core::stringify!($handle), " at: {:?}"),
+                                addr,
+                            )
+                        }
+                    };
+                    entry
+                }
+            }
+        )*
+    };
+}
+impl_load_entry_for_inst! {
+    ir::GlobalAddr -> Global = get_global;
+    ir::MemoryAddr -> Memory = get_memory;
+    ir::TableAddr -> Table = get_table;
+    ir::FuncAddr -> Func = get_func;
+    ir::DataAddr -> DataSegment = get_data;
+    ir::ElemAddr -> ElementSegment = get_elem;
+}
+
+/// Extension trait for [`Inst`] to load entities from their addresses.
+pub trait LoadEntity<Addr> {
+    /// The type of the loaded handle entity.
+    type Entity;
+
+    /// Returns a pointer to the entity at `addr` of the warmed up instance cache.
+    ///
+    /// Unlike [`LoadEntity::load_entity_mut`] this returns a raw [`NonNull`] instead of a
+    /// reference tied to the store. This lets the caller hold several entity pointers (or an
+    /// entity pointer alongside a `&mut` borrow of `fuel`) at once and materialize a reference
+    /// only in the narrow scope where the entity is actually accessed.
+    ///
+    /// # Safety
+    ///
+    /// Same as for [`LoadEntry::load_entry_ptr`]. Additionally the entry's cache must have been
+    /// warmed up, and the returned pointer must not be turned into a reference that aliases a
+    /// concurrent store mutation or another live reference to the same entity.
+    unsafe fn load_entity_ptr(self, addr: Addr) -> NonNull<Self::Entity>;
+
+    /// Returns an exclusive reference to the entity at `addr` of the warmed up instance cache.
+    ///
+    /// The `store` borrow is not read; it ties the returned reference so that it
+    /// cannot alias a concurrent store mutation.
+    ///
+    /// # Safety
+    ///
+    /// Same as for [`LoadEntity::load_entity_ptr`]. The `store` borrow rules out store mutations
+    /// for the lifetime of the returned reference but not a second reference to the same entity
+    /// loaded from `self`.
+    unsafe fn load_entity_mut(self, _store: &mut PrunedStore, addr: Addr) -> &mut Self::Entity;
+}
+
+macro_rules! impl_load_entity_for_inst {
+    (
+        $(
+            ir::$addr:ident -> $handle:ident
+         );* $(;)?
+    ) => {
+        $(
+            impl LoadEntity<ir::$addr> for Inst {
+                type Entity = <$handle as Handle>::Entity;
+
+                #[inline]
+                unsafe fn load_entity_ptr(self, addr: ir::$addr) -> NonNull<Self::Entity> {
+                    // SAFETY: guaranteed by the caller; the reference does not outlive the call
+                    //         and the returned pointer is a copy of the cached entity pointer,
+                    //         so it does not derive its provenance from that reference.
+                    unsafe { self.load_entry_ptr(addr).as_ref() }.entity()
+                }
+
+                #[inline]
+                unsafe fn load_entity_mut(self, _store: &mut PrunedStore, addr: ir::$addr) -> &mut Self::Entity {
+                    // SAFETY: guaranteed by the caller; the `_store` borrow scopes the returned
+                    //         reference against a concurrent store mutation.
+                    unsafe { self.load_entity_ptr(addr).as_mut() }
+                }
+            }
+        )*
+    };
+}
+impl_load_entity_for_inst! {
+    ir::GlobalAddr -> Global;
+    ir::MemoryAddr -> Memory;
+    ir::TableAddr -> Table;
+    ir::FuncAddr -> Func;
+    ir::ElemAddr -> ElementSegment;
+    ir::DataAddr -> DataSegment;
+}
+
+impl LoadEntity<Table0> for Inst {
+    type Entity = TableEntity;
+
+    #[inline]
+    unsafe fn load_entity_ptr(self, _addr: Table0) -> NonNull<Self::Entity> {
+        // SAFETY: guaranteed by the caller; an instance with a `(table 0)` caches its entity
+        //         pointer in its header at instantiation.
+        let Some(entity) = (unsafe { self.as_ptr().get_table0() }) else {
+            unsafe { unreachable_unchecked!("missing table entity for table 0") }
+        };
+        entity
+    }
+
+    #[inline]
+    unsafe fn load_entity_mut(self, _store: &mut PrunedStore, addr: Table0) -> &mut Self::Entity {
+        // SAFETY: guaranteed by the caller; the `_store` borrow scopes the returned reference
+        //         against a concurrent store mutation.
+        unsafe { self.load_entity_ptr(addr).as_mut() }
+    }
+}
+
+/// Extension trait for [`Inst`] to load handles from their addresses.
+pub trait LoadHandle<Addr> {
+    /// The type of the loaded handle.
+    type Handle;
+
+    /// Returns the handle at `addr` of the instance.
+    ///
+    /// Unlike the [`LoadEntity`] methods this does not touch the entity cache and therefore
+    /// does not require it to be warmed up.
+    ///
+    /// # Safety
+    ///
+    /// Same as for [`LoadEntry::load_entry_ptr`].
+    unsafe fn load_handle(self, addr: Addr) -> Self::Handle;
+}
+
+macro_rules! impl_load_handle_for_inst {
+    (
+        $(
+            ir::$addr:ident -> $handle:ident
+         );* $(;)?
+    ) => {
+        $(
+            impl LoadHandle<ir::$addr> for Inst {
+                type Handle = $handle;
+
+                #[inline]
+                unsafe fn load_handle(self, addr: ir::$addr) -> Self::Handle {
+                    // SAFETY: guaranteed by the caller; the reference does not outlive the call.
+                    let entry_ref = unsafe { self.load_entry_ptr(addr).as_ref() };
+                    entry_ref.handle()
+                }
+            }
+        )*
+    };
+}
+impl_load_handle_for_inst! {
+    // ir::GlobalAddr -> Global;
+    ir::MemoryAddr -> Memory;
+    ir::TableAddr -> Table;
+    ir::FuncAddr -> Func;
+    // ir::ElemAddr -> ElementSegment;
+    // ir::DataAddr -> DataSegment;
+}
+
+/// Resolves the [`Func`] handle and its warmed up cached [`FuncEntity`] pointer from `inst`.
+///
+/// The returned pointer is only sound to dereference while the instance cache remains warmed up
+/// and must not be turned into a reference that aliases a concurrent store mutation.
+#[inline]
+pub fn load_func_entry(inst: Inst, func: ir::FuncAddr) -> (Func, NonNull<FuncEntity>) {
+    // SAFETY: `func` addresses a func entry by translation invariant and its cache was
+    //         warmed at instantiation; the reference does not outlive this function.
+    let entry_ref = unsafe { inst.load_entry_ptr(func).as_ref() };
+    let handle = entry_ref.handle();
+    let entity = entry_ref.entity();
+    (handle, entity)
+}
+
+#[inline]
+pub fn resolve_indirect_func<Idx, Table>(
+    index: Idx,
+    table: Table,
+    func_type: ir::FuncType,
+    store: &mut PrunedStore,
+    args: &mut Args,
+) -> Result<(Func, NonNull<FuncEntity>), TrapCode>
+where
+    Idx: GetValue<u64>,
+    Inst: LoadEntity<Table, Entity = TableEntity>,
+{
+    let index = get_value(index, args.sp, args.ireg, args.freg32, args.freg64);
+    let table = args.fetch_table(store, table);
+    let rawref = table.get(index).ok_or(TrapCode::TableOutOfBounds)?;
+    debug_assert!(matches!(rawref.ty(), RefType::Func));
+    let funcref = <Nullable<Func>>::from_raw_parts(rawref.raw(), &*store);
+    let func = funcref.val().ok_or(TrapCode::IndirectCallToNull)?;
+    let func_entity = store.inner_mut().resolve_func_ptr(func);
+    // SAFETY: freshly resolved from the store; only read here for the signature check.
+    let actual_fnty = unsafe { func_entity.as_ref() }.ty_dedup().repr_entity();
+    // Note: `func_type` already stores the resolved deduplicated function type, thus the
+    //       engine association dropped by `repr_entity` is implied by both operands
+    //       belonging to the very engine that is executing them.
+    if actual_fnty != u32::from(func_type) {
+        return Err(TrapCode::BadSignature);
+    }
+    Ok((*func, func_entity))
+}
+
+pub fn update_instance(
+    instance: Inst,
+    new_instance: Inst,
+    mem0: Mem0Ptr,
+    mem0_len: Mem0Len,
+) -> (Inst, Mem0Ptr, Mem0Len) {
+    if new_instance == instance {
+        return (instance, mem0, mem0_len);
+    }
+    let (mem0, mem0_len) = extract_mem0(new_instance);
+    (new_instance, mem0, mem0_len)
+}
+
+#[inline(always)]
+pub fn call_func_entry(
+    store: &mut PrunedStore,
+    caller_ip: Ip,
+    caller_sp: Sp,
+    params: BoundedSlotSpan,
+    func: &FuncEntry,
+    instance: Option<Inst>,
+) -> Control<(Ip, Sp), Break> {
+    let (callee_ip, len_local_slots, len_stack_slots) = compile_or_get_func_entry!(store, func);
+    let callee_sp = store
+        .stack_mut()
+        .push_frame(
+            caller_sp,
+            Some(caller_ip),
+            callee_ip,
+            params,
+            len_local_slots,
+            len_stack_slots,
+            instance,
+        )
+        .into_control()?;
+    Control::Continue((callee_ip, callee_sp))
+}
+
+#[inline(always)]
+pub fn return_call_func_entry(
+    store: &mut PrunedStore,
+    caller_sp: Sp,
+    params: BoundedSlotSpan,
+    func: &FuncEntry,
+    instance: Option<Inst>,
+) -> Control<(Ip, Sp), Break> {
+    let (callee_ip, len_local_slots, len_stack_slots) = compile_or_get_func_entry!(store, func);
+    let callee_sp = store
+        .stack_mut()
+        .replace_frame(
+            caller_sp,
+            callee_ip,
+            params,
+            len_local_slots,
+            len_stack_slots,
+            instance,
+        )
+        .into_control()?;
+    Control::Continue((callee_ip, callee_sp))
+}
+
+/// Invokes the host function behind `trampoline`.
+///
+/// Returns the host provided error if the host function trapped.
+///
+/// [`Stack`]: crate::engine::executor::Stack
+#[inline]
+fn invoke_host(
+    store: &mut PrunedStore,
+    trampoline: Trampoline,
+    instance: Option<Inst>,
+    inout: InOutParams,
+    call_hooks: CallHooks,
+) -> Result<(), Error> {
+    match store.call_host_func(trampoline, instance, inout, call_hooks) {
+        Ok(()) => {}
+        Err(StoreError::External(error)) => return Err(error),
+        Err(StoreError::Internal(error)) => unsafe {
+            unreachable_unchecked!(
+                "internal interpreter error while executing host function: {error}"
+            )
+        },
+    }
+    Ok(())
+}
+
+pub fn call_host(
+    store: &mut PrunedStore,
+    func: Func,
+    caller_ip: Option<Ip>,
+    host_func: HostFuncEntity,
+    params: BoundedSlotSpan,
+    instance: Option<Inst>,
+    call_hooks: CallHooks,
+) -> Control<Sp, Break> {
+    debug_assert_eq!(params.len(), host_func.len_param_cells());
+    let trampoline = *host_func.trampoline();
+    let (sp, frame) = store
+        .stack_mut()
+        .prepare_host_frame(caller_ip, params, host_func.len_result_cells())
+        .into_control()?;
+    // Note: the parameters have already been written by the caller's frame, so the `InOutParams`
+    //       can be derived right away.
+    let inout = store.stack_mut().host_inout(frame);
+    if let Err(error) = invoke_host(store, trampoline, instance, inout, call_hooks) {
+        done!(store, DoneReason::host_error(error, func, params.span()))
+    }
+    Control::Continue(sp)
+}
+
+pub fn return_call_host(
+    store: &mut PrunedStore,
+    func: Func,
+    host_func: HostFuncEntity,
+    params: BoundedSlotSpan,
+    instance: Inst,
+) -> Control<(Ip, Sp, Inst), Break> {
+    debug_assert_eq!(params.len(), host_func.len_param_cells());
+    let trampoline = *host_func.trampoline();
+    let (control, frame) = store
+        .stack_mut()
+        .return_prepare_host_frame(params, host_func.len_result_cells(), instance)
+        .into_control()?;
+    // Note: the parameters have already been moved into place by `return_prepare_host_frame`,
+    //       so the `InOutParams` can be derived right away.
+    let inout = store.stack_mut().host_inout(frame);
+    if let Err(error) = invoke_host(store, trampoline, Some(instance), inout, CallHooks::Call) {
+        // Note: we won't allow resumption in case the execution would
+        //       have returned with this the host function tail call.
+        let reason = match control {
+            Control::Continue(_) => DoneReason::host_error(error, func, params.span()),
+            Control::Break(_) => DoneReason::error(error),
+        };
+        done!(store, reason)
+    }
+    match control {
+        Control::Continue((ip, sp, instance)) => Control::Continue((ip, sp, instance)),
+        Control::Break(sp) => done!(store, DoneReason::Return(sp)),
+    }
+}
+
+#[inline]
+#[expect(clippy::too_many_arguments)]
+pub fn call_wasm_or_host(
+    store: &mut PrunedStore,
+    caller_ip: Ip,
+    caller_sp: Sp,
+    func: Func,
+    func_entity: NonNull<FuncEntity>,
+    params: BoundedSlotSpan,
+    mem0: Mem0Ptr,
+    mem0_len: Mem0Len,
+    instance: Inst,
+) -> Control<(Ip, Sp, Mem0Ptr, Mem0Len, Inst), Break> {
+    // SAFETY: the pointer is warmed up at instantiation (imported calls) or freshly resolved
+    //         (indirect calls); the reference is only used to copy out the callee data below,
+    //         before any store mutation, so it never aliases a `&mut` into the funcs arena.
+    let func_entity = unsafe { func_entity.as_ref() };
+    let wasm_func = match func_entity {
+        FuncEntity::Wasm(wasm_func) => wasm_func,
+        FuncEntity::Host(host_func) => {
+            let sp = call_host(
+                store,
+                func,
+                Some(caller_ip),
+                *host_func,
+                params,
+                Some(instance),
+                CallHooks::Call,
+            )?;
+            // Note: host functions may grow memories, invalidating the cached `(memory 0)`.
+            //       Therefore, it is required to re-extract `(memory 0)` to avoid a stale cache.
+            let (mem0, mem0_len) = extract_mem0(instance);
+            return Control::Continue((caller_ip, sp, mem0, mem0_len, instance));
+        }
+    };
+    // Hot path: calling a Wasm function. Uses the cached `FuncEntry` and the same inlined
+    // machinery as `call_internal`, differing only in the possible instance switch.
+    let callee_instance: Inst = wasm_func.instance();
+    let (callee_ip, callee_sp) = call_func_entry(
+        store,
+        caller_ip,
+        caller_sp,
+        params,
+        wasm_func.func_entry(),
+        Some(callee_instance),
+    )?;
+    let (instance, mem0, mem0_len) = update_instance(instance, callee_instance, mem0, mem0_len);
+    Control::Continue((callee_ip, callee_sp, mem0, mem0_len, instance))
+}
+
+/// Tail-call (`return_call`) twin of [`call_wasm_or_host`].
+#[inline]
+#[expect(clippy::too_many_arguments)]
+pub fn return_call_wasm_or_host(
+    store: &mut PrunedStore,
+    caller_sp: Sp,
+    func: Func,
+    func_entity: NonNull<FuncEntity>,
+    params: BoundedSlotSpan,
+    mem0: Mem0Ptr,
+    mem0_len: Mem0Len,
+    instance: Inst,
+) -> Control<(Ip, Sp, Mem0Ptr, Mem0Len, Inst), Break> {
+    // SAFETY: see `call_wasm_or_host`.
+    let func_entity = unsafe { func_entity.as_ref() };
+    let wasm_func = match func_entity {
+        FuncEntity::Wasm(wasm_func) => wasm_func,
+        FuncEntity::Host(host_func) => {
+            let (callee_ip, sp, new_instance) =
+                return_call_host(store, func, *host_func, params, instance)?;
+            // Note: host functions may grow memories, invalidating the cached `(memory 0)`.
+            //       Therefore, it is required to re-extract `(memory 0)` to avoid a stale
+            //       cache - even if the tail call returned into the very same instance.
+            let (mem0, mem0_len) = extract_mem0(new_instance);
+            return Control::Continue((callee_ip, sp, mem0, mem0_len, new_instance));
+        }
+    };
+    // Hot path: tail-calling a Wasm function. See `call_wasm_or_host` for the shape.
+    let callee_instance: Inst = wasm_func.instance();
+    let (callee_ip, callee_sp) = return_call_func_entry(
+        store,
+        caller_sp,
+        params,
+        wasm_func.func_entry(),
+        Some(callee_instance),
+    )?;
+    let (instance, mem0, mem0_len) = update_instance(instance, callee_instance, mem0, mem0_len);
+    Control::Continue((callee_ip, callee_sp, mem0, mem0_len, instance))
+}
