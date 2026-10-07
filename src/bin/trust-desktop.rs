@@ -1564,6 +1564,9 @@ struct DesktopApp {
     last_vertical_heart_fraction: Option<f32>,
     loading_started: Option<Instant>,
     chrome_tick_scheduled: bool,
+    /// When the earliest scheduled `ChromeTick` fires, if `schedule_chrome_tick`
+    /// set it. A request for an earlier tick schedules another.
+    chrome_tick_deadline: Option<Instant>,
     /// winit/Softbuffer may deliver platform exposure/redraw notifications
     /// after a present. Only browser/UI invalidation is allowed to consume CPU
     /// and build a new frame; this latch prevents an idle presentation loop.
@@ -1917,6 +1920,7 @@ impl DesktopApp {
             last_vertical_heart_fraction: None,
             loading_started: None,
             chrome_tick_scheduled: false,
+            chrome_tick_deadline: None,
             redraw_pending: false,
             presented_image_revisions: HashMap::new(),
             force_full_raster: true,
@@ -2170,10 +2174,16 @@ impl DesktopApp {
     }
 
     fn schedule_chrome_tick(&mut self, delay: Duration) {
-        if self.chrome_tick_scheduled {
+        let deadline = Instant::now() + delay;
+        if self.chrome_tick_scheduled
+            && self
+                .chrome_tick_deadline
+                .is_none_or(|scheduled| scheduled <= deadline)
+        {
             return;
         }
         self.chrome_tick_scheduled = true;
+        self.chrome_tick_deadline = Some(deadline);
         let proxy = self.event_proxy.clone();
         self.runtime.spawn(async move {
             tokio::time::sleep(delay).await;
@@ -2181,12 +2191,22 @@ impl DesktopApp {
         });
     }
 
-    fn css_animations_active(&self) -> bool {
-        self.window_focused
-            && self
-                .page_layout
-                .as_ref()
-                .is_some_and(|page| page.layout.paint.has_css_animations())
+    /// When the page's CSS animations next change what it paints: zero while
+    /// one is in play, the remaining delay of one that has yet to start, and
+    /// `None` once every animation is paused or finished. Composition then
+    /// stops sampling the timeline instead of presenting identical frames.
+    fn css_animation_wake(&mut self) -> Option<Duration> {
+        if !self.window_focused || self.page_layout.is_none() {
+            return None;
+        }
+        let elapsed = self.css_animation_elapsed();
+        let wake = self
+            .page_layout
+            .as_ref()?
+            .layout
+            .paint
+            .css_animation_wake(elapsed)?;
+        Duration::try_from_secs_f32(wake.clamp(0.0, 86_400.0)).ok()
     }
 
     fn css_animation_elapsed(&mut self) -> f32 {
@@ -3537,17 +3557,27 @@ impl DesktopApp {
             };
             window.set_title(&title);
         }
-        let css_animations_active = self.css_animations_active();
-        if self.chrome_loading(&snapshot) || self.heart_glide.is_some() || css_animations_active {
-            // Glides and CSS animations need every frame. The loading heart
+        let css_wake = self.css_animation_wake();
+        let loading = self.chrome_loading(&snapshot);
+        if loading || self.heart_glide.is_some() || css_wake.is_some() {
+            // Glides and CSS animations in play need every frame; a delayed
+            // animation needs the frame at which it starts. The loading heart
             // needs every frame only while it beats; between beats a slower
             // tick still keeps the other loading chrome current.
-            let delay = if self.heart_glide.is_some() || css_animations_active {
+            let delay = if self.heart_glide.is_some() {
                 CSS_ANIMATION_FRAME_DELAY
             } else {
-                self.loading_started.map_or(LOADING_TICK_DELAY, |started| {
-                    heartbeat_tick_delay(started.elapsed())
-                })
+                let loading_delay = loading.then(|| {
+                    self.loading_started.map_or(LOADING_TICK_DELAY, |started| {
+                        heartbeat_tick_delay(started.elapsed())
+                    })
+                });
+                let css_delay = css_wake.map(|wake| wake.max(CSS_ANIMATION_FRAME_DELAY));
+                loading_delay
+                    .into_iter()
+                    .chain(css_delay)
+                    .min()
+                    .unwrap_or(CSS_ANIMATION_FRAME_DELAY)
             };
             self.schedule_chrome_tick(delay);
         }
@@ -7476,10 +7506,12 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             }
             DesktopEvent::ChromeTick => {
                 self.chrome_tick_scheduled = false;
+                self.chrome_tick_deadline = None;
                 let snapshot = self.browser.snapshot();
+                let css_wake = self.css_animation_wake();
                 if self.chrome_loading(&snapshot)
                     || self.heart_glide.is_some()
-                    || self.css_animations_active()
+                    || css_wake.is_some_and(|wake| wake <= CSS_ANIMATION_FRAME_DELAY)
                     || (self.window_focused
                         && self
                             .terminal
@@ -7487,6 +7519,9 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                             .is_some_and(|terminal| terminal.view.animation_delay().is_some()))
                 {
                     self.request_redraw();
+                } else if let Some(wake) = css_wake {
+                    // A delayed animation starts later than this tick.
+                    self.schedule_chrome_tick(wake);
                 }
             }
             DesktopEvent::DownloadFinished { path, result, open } => {
