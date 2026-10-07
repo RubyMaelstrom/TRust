@@ -3536,6 +3536,16 @@ impl Dom {
         }
     }
 
+    /// DOM #element-html-uppercased-qualified-name's condition: `id` is an
+    /// element in the HTML namespace whose node document is an HTML
+    /// document. Adoption can change it without changing the element's name.
+    pub(crate) fn is_html_element_in_html_document(&self, id: NodeId) -> bool {
+        self.nodes.get(id).is_some_and(|node| {
+            matches!(&node.data, NodeData::Element { name, .. } if name.ns == ns!(html))
+                && !self.is_xml_document(node.owner_document)
+        })
+    }
+
     /// DOM #xml-document: a Document whose type is "xml", which is one whose
     /// content type is an XML MIME type (MIME Sniffing #xml-mime-type);
     /// text documents are HTML documents.

@@ -453,16 +453,19 @@ struct DomGcOwner {
 
 #[derive(Default)]
 struct DomGcRegistry {
-    owners: HashMap<usize, DomGcOwner>,
+    /// Keyed by wrapper/owner identity (an object address), which page
+    /// script cannot choose, so the fast hasher is safe: every wrapper-to-
+    /// node lookup (`ownerDocument`, host argument conversion) probes it.
+    owners: rustc_hash::FxHashMap<usize, DomGcOwner>,
     /// Web IDL #interface-to-js: one object represents each native node.
     /// This reverse index borrows the mixed-heap owner table's identities;
     /// it adds no JavaScript owner or collector root.
     wrappers: rustc_hash::FxHashMap<usize, usize>,
     /// Canonical Document wrappers cross Window realms during adoption. Pointer identities
     /// borrow the existing owner records; this index adds no strong JavaScript references.
-    documents: HashMap<usize, usize>,
+    documents: rustc_hash::FxHashMap<usize, usize>,
     /// Every inserted/replaced logical owner since the last successful native collection.
-    young_owners: std::collections::HashSet<usize>,
+    young_owners: rustc_hash::FxHashSet<usize>,
     pending_resources: Rc<RefCell<HashMap<usize, usize>>>,
     traced: Cell<bool>,
     traced_minor: Cell<bool>,
@@ -9155,6 +9158,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_prev", 1, host_prev),
     ("__dom_node_type", 1, host_node_type),
     ("__dom_tag", 1, host_tag),
+    ("__dom_html_uppercased", 1, host_html_uppercased),
     ("__dom_namespace", 1, host_namespace),
     ("__dom_element_name", 1, host_element_name),
     ("__dom_get_attr", 2, guarded_get_attr),
@@ -15610,6 +15614,16 @@ fn host_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     )
 }
 
+/// Whether an element's `tagName` is its HTML-uppercased qualified name
+/// (DOM #dom-element-tagname): see [`Dom::is_html_element_in_html_document`].
+fn host_html_uppercased(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::Bool(host_arg_node(&dom, args, 0).is_some_and(
+        |id| dom.is_html_element_in_html_document(id),
+    )))
+}
+
 fn host_namespace(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -18393,6 +18407,52 @@ mod tests {
                 records[0].removedNodes[0] !== old[0] || nodes.length !== 1) return 'observer snapshot';
             source.innerHTML = '<strong id=new></strong>';
             if (elements.length !== 1 || elements.namedItem('new') !== source.firstChild) return 'replace';
+            return 'ok';
+        })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn tag_name_uppercases_only_html_elements_of_html_documents() {
+        // DOM #dom-element-tagname / #element-html-uppercased-qualified-name:
+        // ASCII-uppercase the qualified name of an HTML-namespace element whose
+        // node document is an HTML document; adoption can change that answer.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><body><div id=a></div></body>",
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const HTML = 'http://www.w3.org/1999/xhtml', SVG = 'http://www.w3.org/2000/svg';
+            const div = document.getElementById('a');
+            if (div.tagName !== 'DIV' || div.nodeName !== 'DIV') return 'html element';
+            const prefixed = document.createElementNS(HTML, 'x:Foo');
+            if (prefixed.tagName !== 'X:FOO' || prefixed.nodeName !== 'X:FOO') return 'prefixed';
+            const unicode = document.createElement('bétı');
+            if (unicode.tagName !== 'BéTı') return 'ASCII uppercase only: ' + unicode.tagName;
+            const svg = document.createElementNS(SVG, 'linearGradient');
+            if (svg.tagName !== 'linearGradient' || svg.nodeName !== 'linearGradient') return 'foreign';
+            const xml = document.implementation.createDocument(null, 'root');
+            xml.documentElement.appendChild(div);
+            if (div.tagName !== 'div' || div.nodeName !== 'div') return 'adopted into XML: ' + div.tagName;
+            document.body.appendChild(div);
+            if (div.tagName !== 'DIV') return 'adopted back';
+            const html = document.implementation.createHTMLDocument('');
+            const other = html.createElement('section');
+            if (other.tagName !== 'SECTION') return 'second HTML document';
+            const tagName = Object.getOwnPropertyDescriptor(Element.prototype, 'tagName').get;
+            const nodeName = Object.getOwnPropertyDescriptor(Element.prototype, 'nodeName');
+            for (const receiver of [document.createTextNode('x'), Element.prototype, {}]) {
+                let threw = false;
+                try { tagName.call(receiver); } catch (e) { threw = e instanceof TypeError; }
+                if (!threw) return 'tagName brand check';
+            }
+            if (nodeName && nodeName.get.call(div) !== 'DIV') return 'nodeName getter';
             return 'ok';
         })()"#
             ),
