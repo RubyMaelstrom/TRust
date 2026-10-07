@@ -21047,6 +21047,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const viewBuffer = getOwn(Object.getPrototypeOf(Bytes.prototype), "buffer").get;
     const viewOffset = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteOffset").get;
     const viewLength = getOwn(Object.getPrototypeOf(Bytes.prototype), "byteLength").get;
+    // ECMA-262 #sec-get-%typedarray%.prototype-%symbol.tostringtag%: the
+    // TypedArray name, and undefined (never an exception) for any other value.
+    const typedArrayName = getOwn(Object.getPrototypeOf(Bytes.prototype), Symbol.toStringTag).get;
     const dataViewBuffer = getOwn(DataView.prototype, "buffer").get;
     const dataViewOffset = getOwn(DataView.prototype, "byteOffset").get;
     const dataViewLength = getOwn(DataView.prototype, "byteLength").get;
@@ -21079,10 +21082,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Web IDL AllowSharedBufferSource: a view of an (optionally shared)
     // ArrayBuffer, or such a buffer itself, as a byte view.
     function bufferSourceBytes(input) {
+        // An ArrayBufferView is a TypedArray or a DataView. Tell them apart
+        // without a throwing brand check: streaming decoders (React Flight
+        // decodes every response chunk) convert a view per call.
         if (isView(input)) {
-            let isDataView = true;
-            try { apply(dataViewBuffer, input, []); } catch (_) { isDataView = false; }
-            return isDataView
+            return apply(typedArrayName, input, []) === undefined
                 ? new Bytes(apply(dataViewBuffer, input, []), apply(dataViewOffset, input, []), apply(dataViewLength, input, []))
                 : new Bytes(apply(viewBuffer, input, []), apply(viewOffset, input, []), apply(viewLength, input, []));
         }
