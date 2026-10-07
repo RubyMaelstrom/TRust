@@ -52,6 +52,7 @@ use std::{
     sync::{
         Arc,
         Mutex,
+        OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -65,10 +66,19 @@ const MIN_OPERATORS: usize = 4;
 pub(crate) const MAX_GLOBALS: usize = 16;
 const BACKEDGE_BUDGET: i64 = 16_384;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Native region invocations on this thread, for tests.
+    pub(crate) static REGION_RUNS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 /// The engine-wide native compiler state: compiled regions and their hotness.
 #[derive(Debug)]
 pub(crate) struct NativeJit {
     regions: Mutex<HashMap<usize, Candidate>>,
+    /// The compiled regions, published once [`MAX_REGIONS`] exist. No further region can be
+    /// compiled then, so control-flow entries need neither hotness nor the locked map.
+    final_regions: OnceLock<FinalRegions>,
     trace: bool,
     /// Diagnostic stress mode (`WASMI_JIT_EAGER`): compile every control-flow
     /// entry at its first visit, including single-operator regions, without
@@ -91,6 +101,7 @@ impl NativeJit {
     pub fn new() -> Self {
         Self {
             regions: Mutex::new(HashMap::new()),
+            final_regions: OnceLock::new(),
             trace: std::env::var_os("WASMI_JIT_TRACE").is_some(),
             eager: AtomicBool::new(std::env::var_os("WASMI_JIT_EAGER").is_some()),
             stops: Mutex::new(BTreeMap::new()),
@@ -124,6 +135,12 @@ impl NativeJit {
             return None;
         }
         Some(self.compile_candidate(code_map, address, &mut regions))
+    }
+
+    /// Returns the final set of compiled regions once the region cap is reached.
+    #[inline]
+    pub fn final_regions(&self) -> Option<&FinalRegions> {
+        self.final_regions.get()
     }
 
     pub fn get_or_compile(&self, code_map: &CodeMap, address: usize) -> Option<Arc<NativeRegion>> {
@@ -171,6 +188,10 @@ impl NativeJit {
                 .filter(|candidate| candidate.region.is_some())
                 .count()
                 >= MAX_REGIONS;
+        if full {
+            // Attempted regions are never evicted, so the compiled set is final.
+            self.final_regions.get_or_init(|| FinalRegions::new(regions));
+        }
         let candidate = regions.entry(address).or_default();
         candidate.attempted = true;
         if full {
@@ -243,6 +264,52 @@ impl NativeJit {
             .values()
             .filter(|candidate| candidate.region.is_some())
             .count()
+    }
+}
+
+/// The compiled regions after the region cap, with a bit filter that rejects most other
+/// control-flow entries before the interpreter leaves its handler.
+#[derive(Debug)]
+pub(crate) struct FinalRegions {
+    regions: rustc_hash::FxHashMap<usize, Arc<NativeRegion>>,
+    filter: [u64; FINAL_FILTER_BITS / 64],
+}
+
+/// 4096 filter bits keep the false-positive rate near 3% for [`MAX_REGIONS`] regions.
+const FINAL_FILTER_BITS: usize = 4096;
+
+impl FinalRegions {
+    fn new(candidates: &HashMap<usize, Candidate>) -> Self {
+        let mut filter = [0; FINAL_FILTER_BITS / 64];
+        let mut regions = rustc_hash::FxHashMap::default();
+        for (&address, candidate) in candidates {
+            if let Some(region) = &candidate.region {
+                let bit = Self::filter_bit(address);
+                filter[bit / 64] |= 1 << (bit % 64);
+                regions.insert(address, region.clone());
+            }
+        }
+        Self { regions, filter }
+    }
+
+    #[inline(always)]
+    fn filter_bit(address: usize) -> usize {
+        // Fibonacci hashing: the high product bits depend on every address bit.
+        (address as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize
+            >> (usize::BITS - FINAL_FILTER_BITS.trailing_zeros())
+    }
+
+    /// Returns `false` if no region starts at `address`; `true` may be a false positive.
+    #[inline(always)]
+    pub fn may_contain(&self, address: usize) -> bool {
+        let bit = Self::filter_bit(address);
+        self.filter[bit / 64] & (1 << (bit % 64)) != 0
+    }
+
+    /// Returns the region starting at `address`.
+    #[inline]
+    pub fn get(&self, address: usize) -> Option<&Arc<NativeRegion>> {
+        self.regions.get(&address)
     }
 }
 

@@ -291,6 +291,15 @@ impl StoreInner {
         self.native_jit
     }
 
+    /// TRust: returns the final native regions of the [`Engine`] once no more can be compiled.
+    #[cfg(wasmi_native_jit)]
+    #[inline(always)]
+    pub(crate) fn native_jit_final_regions(
+        &self,
+    ) -> Option<&crate::engine::native_jit::FinalRegions> {
+        self.engine.native_jit().0.final_regions()
+    }
+
     /// TRust: returns the [`ExecContext`] together with the [`Engine`].
     #[cfg(wasmi_native_jit)]
     #[inline]

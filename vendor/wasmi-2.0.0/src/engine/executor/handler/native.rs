@@ -64,6 +64,13 @@ impl NativeState {
 #[inline(always)]
 pub fn enter(store: &mut PrunedStore, args: &mut Args) {
     if store.inner().native_jit_enabled() {
+        // Once the region set is final, most entries have no region: reject them here,
+        // without leaving the handler, instead of in a hash lookup per branch.
+        if let Some(regions) = store.inner().native_jit_final_regions()
+            && !regions.may_contain(args.ip.addr())
+        {
+            return;
+        }
         store.stack_mut().native_mut().args = Some(EntryArgs(*args));
         enter_native(store);
         if let Some(EntryArgs(updated)) = store.stack_mut().native_mut().args.take() {
@@ -105,6 +112,10 @@ fn enter_regions(store: &mut PrunedStore, args: &mut Args) {
 fn lookup(store: &mut PrunedStore, address: usize) -> Option<*const NativeRegion> {
     let (exec, engine) = store.inner_mut().exec_and_engine_mut();
     let (jit, code_map) = engine.native_jit();
+    if let Some(regions) = jit.final_regions() {
+        // The final regions are owned by the engine and outlive this execution.
+        return regions.get(address).map(Arc::as_ptr);
+    }
     let entries = &mut exec.stack_mut().native_mut().entries;
     let entry = if entries.len() >= MAX_CANDIDATES {
         entries.get_mut(&address)?
@@ -130,6 +141,8 @@ fn lookup(store: &mut PrunedStore, address: usize) -> Option<*const NativeRegion
 
 /// Runs `region` on the state of `args` and returns the address of the next operator.
 fn run(store: &mut PrunedStore, args: &mut Args, region: &NativeRegion) -> usize {
+    #[cfg(test)]
+    crate::engine::native_jit::REGION_RUNS.with(|runs| runs.set(runs.get() + 1));
     let mut globals = [core::ptr::null_mut::<u64>(); MAX_GLOBALS];
     for (ptr, global) in globals.iter_mut().zip(&region.globals) {
         // SAFETY: the global addresses stem from operators of the executing instance, whose

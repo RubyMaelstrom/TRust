@@ -466,6 +466,71 @@ fn native_cache_limit_falls_back_without_changing_results() {
 }
 
 #[test]
+fn native_final_regions_keep_running_after_the_cap() {
+    // Once MAX_REGIONS regions exist no candidate can compile, so control-flow entries
+    // consult the published final set. It must contain every compiled region (the filter
+    // has no false negatives) and those regions must still run natively.
+    use super::MAX_REGIONS;
+    use super::REGION_RUNS;
+    let mut source = std::string::String::from("(module (global $g (mut i32) (i32.const 0))");
+    for i in 0..MAX_REGIONS + 4 {
+        source.push_str(&std::format!(
+            r#"
+            (func (export "run{i}") (param $n i32) (result i32)
+                i32.const 0 global.set $g
+                (loop $again
+                    global.get $g local.get $n i32.xor global.set $g
+                    local.get $n i32.const 1 i32.sub local.tee $n br_if $again)
+                global.get $g)"#
+        ));
+    }
+    source.push(')');
+    let engine = Engine::default();
+    let bytes = wat::parse_str(source).unwrap();
+    let module = WasmModule::new(&engine, bytes).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine)
+        .instantiate_and_start(&mut store, &module)
+        .unwrap();
+    let call = |store: &mut Store<()>, i: usize, n: i32| {
+        instance
+            .get_typed_func::<i32, i32>(&*store, &std::format!("run{i}"))
+            .unwrap()
+            .call(store, n)
+            .unwrap()
+    };
+    let jit = &engine.inner.native_jit;
+    for i in 0..MAX_REGIONS {
+        assert_eq!(call(&mut store, i, 1_000), 1_000);
+    }
+    assert!(jit.final_regions().is_none(), "the cap is not exceeded yet");
+    for i in MAX_REGIONS..MAX_REGIONS + 4 {
+        assert_eq!(call(&mut store, i, 1_000), 1_000);
+    }
+    let final_regions = jit.final_regions().expect("published at the cap");
+    let compiled: std::vec::Vec<usize> = jit
+        .regions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, candidate)| candidate.region.is_some())
+        .map(|(&address, _)| address)
+        .collect();
+    assert_eq!(compiled.len(), MAX_REGIONS);
+    assert_eq!(final_regions.regions.len(), MAX_REGIONS);
+    for address in compiled {
+        assert!(final_regions.may_contain(address));
+        assert!(final_regions.get(address).is_some());
+    }
+    for i in [0, MAX_REGIONS / 2, MAX_REGIONS + 3] {
+        let before = REGION_RUNS.with(core::cell::Cell::get);
+        assert_eq!(call(&mut store, i, 2_000), 2_000);
+        let runs = REGION_RUNS.with(core::cell::Cell::get) - before;
+        assert_eq!(runs > 0, i < MAX_REGIONS, "run{i} executed {runs} regions");
+    }
+}
+
+#[test]
 fn native_hot_leaf_calls_compile_without_an_inner_loop() {
     let source = r#"(module
         (func $leaf (param $x i32) (result i32)

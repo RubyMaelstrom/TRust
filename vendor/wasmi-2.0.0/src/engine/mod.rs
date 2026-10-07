@@ -9,7 +9,7 @@ mod executor;
 mod func_types;
 mod limits;
 #[cfg(wasmi_native_jit)]
-mod native_jit;
+pub(crate) mod native_jit;
 mod resumable;
 mod translator;
 mod utils;

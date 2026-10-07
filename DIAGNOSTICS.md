@@ -108,7 +108,10 @@ addresses. Native code allocations are released when the engine and its active
 calls are dropped. Compilation counters persist across host/JavaScript calls.
 The bounded cache recycles cold counters so one-shot startup code cannot exclude
 later hot functions; compiled regions and checked fallbacks retain their cache
-entries.
+entries. Once 128 regions exist no further region can compile, so control-flow
+entries then test a bit filter of the final regions inside the interpreter
+handler instead of updating counters (large modules such as Pyodide reach the
+cap early in start-up).
 `TRUST_WASM_TRACE=1` logs page WebAssembly imports and exported calls (the first 64,
 then every 1,000th) as `wasm:` lines on stderr.
 
