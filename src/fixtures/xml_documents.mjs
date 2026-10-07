@@ -8,8 +8,10 @@
     }
     const parser = new DOMParser();
     const doc = parser.parseFromString('<?xml version="1.0" encoding="UTF-16"?><?game load?><Root xmlns:p="urn:game"><p:Title Code="x">Zork &amp; more</p:Title><![CDATA[<raw>]]><!--note--></Root>', 'application/xml');
-    assert(doc instanceof XMLDocument && doc instanceof Document && !(document instanceof XMLDocument), 'XML document interface');
-    assert(Object.prototype.toString.call(doc) === '[object XMLDocument]', 'XML document tag');
+    // HTML #dom-domparser-parsefromstring creates "a new Document" for every
+    // type (WPT DOMParser-parseFromString-xml: "Should not be XMLDocument").
+    assert(doc instanceof Document && !(doc instanceof XMLDocument) && !(document instanceof XMLDocument), 'XML document interface');
+    assert(Object.prototype.toString.call(doc) === '[object Document]', 'XML document tag');
     assert(doc.contentType === 'application/xml' && doc.defaultView === null, 'XML MIME and no window');
     assert(doc.documentElement.nodeName === 'Root' && doc.documentElement.namespaceURI === null, 'XML root/case/namespace: ' + doc.documentElement.nodeName + ' ' + doc.documentElement.namespaceURI + ' ' + doc.documentElement.textContent);
     assert(doc.body === null && doc.head === null && doc.children.length === 1, 'no HTML wrappers');
@@ -43,7 +45,7 @@
     throws(() => parser.parseFromString('<root/>', 'text/plain'), 'unsupported MIME');
     for (const text of ['<root>', '<a/><b/>', '<a><b></a>', '<p:a/>', '<a x="1" x="2"/>', '<a xmlns:p="urn:x" xmlns:q="urn:x" p:v="1" q:v="2"/>', '<a>&unknown;</a>']) {
         const broken = parser.parseFromString(text, 'text/xml');
-        assert(broken instanceof XMLDocument && broken.documentElement.localName === 'parsererror' && broken.documentElement.namespaceURI === 'http://www.mozilla.org/newlayout/xml/parsererror.xml', 'XML parse error: ' + text);
+        assert(broken instanceof Document && !(broken instanceof XMLDocument) && broken.documentElement.localName === 'parsererror' && broken.documentElement.namespaceURI === 'http://www.mozilla.org/newlayout/xml/parsererror.xml', 'XML parse error: ' + text);
     }
     const entity = parser.parseFromString('<!DOCTYPE root [<!ENTITY game "Zork">]><root>&game;</root>', 'text/xml');
     assert(entity.documentElement.textContent === 'Zork', 'bounded internal entities');
