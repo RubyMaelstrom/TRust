@@ -3643,6 +3643,9 @@ struct ImageLayer<'a> {
 /// Paint `layer`, returning whether it painted anything: an unloaded or
 /// failed image (CSS Images 3 #invalid-image) still counts as a layer but
 /// draws nothing.
+/// The most tiles one background layer paints; see `paint_image_layer`.
+const MAX_BACKGROUND_TILES: usize = 65_536;
+
 fn paint_image_layer(builder: &mut Builder<'_>, layer: ImageLayer<'_>) -> bool {
     let ImageLayer {
         image,
@@ -3708,6 +3711,31 @@ fn paint_image_layer(builder: &mut Builder<'_>, layer: ImageLayer<'_>) -> bool {
         tile_h = positioning.height / ny;
         (start_x, start_y) = background_position(position, positioning, (tile_w, tile_h), lengths);
         repeat = BackgroundRepeat::Repeat;
+    }
+    // CSS repeats an image without limit, but here each tile is a display
+    // command. A layer that would need more than MAX_BACKGROUND_TILES of them
+    // (a tiny tile over a large area) paints nothing instead of building a
+    // display list of millions of commands that every frame then copies.
+    let tiles_along = |extent: f32, tile: f32, repeated: bool| {
+        if repeated {
+            (extent / tile).ceil() + 1.0
+        } else {
+            1.0
+        }
+    };
+    let tiles = match repeat {
+        BackgroundRepeat::Space => {
+            (positioning.width / tile_w).floor().max(1.0)
+                * (positioning.height / tile_h).floor().max(1.0)
+        }
+        _ => {
+            let x = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX);
+            let y = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY);
+            tiles_along(clip.width, tile_w, x) * tiles_along(clip.height, tile_h, y)
+        }
+    };
+    if tiles.is_nan() || tiles > MAX_BACKGROUND_TILES as f32 {
+        return false;
     }
     let tile = match handle {
         Some(handle) => LayerTile::Image(handle),
@@ -4154,7 +4182,9 @@ fn background_length(value: &str, basis: f32, lengths: LengthBasis) -> Option<f3
     if value.eq_ignore_ascii_case("auto") {
         return None;
     }
-    lengths.resolve(value, basis).map(|value| value.max(0.01))
+    // CSS Backgrounds 3 #background-size: a width or height that resolves
+    // to zero means the image is not displayed, as if transparent.
+    lengths.resolve(value, basis).map(|value| value.max(0.0))
 }
 
 fn background_position(
@@ -10029,6 +10059,56 @@ mod tests {
                 assert_eq!(pixel, [0, 255, 0], "({x}, {y})");
             }
         }
+    }
+
+    #[test]
+    fn zero_and_unbounded_background_tilings_paint_nothing() {
+        // CSS Backgrounds 3 #background-size: a size resolving to zero is not
+        // displayed (daisyUI's `calc(var(--noise,0)*100%)` noise layer). A tile
+        // too small to repeat within the tile budget paints nothing either,
+        // instead of millions of commands; ordinary tilings are unaffected.
+        let render = |layer: &str| {
+            let dom = Dom::parse_document(&format!(
+                "<body style='margin:0'><div style='width:400px;height:200px;\
+                 background:black {layer}'></div>"
+            ));
+            let layout = crate::layout2::lay_out_graphical(
+                &dom,
+                &Url::parse("https://page.test/").unwrap(),
+                crate::layout2::Viewport::new(400., 200.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            let primitives = layout.paint.primitives.len();
+            let pixels =
+                crate::render::headless::render_paint(&layout.paint, CssSize::new(400., 200.))
+                    .unwrap()
+                    .pixels;
+            (primitives, pixels[(100 * 400 + 200) * 4..][..3].to_vec())
+        };
+        let (baseline, _) = render("");
+        for layer in [
+            "linear-gradient(lime,lime) 0 0/0% auto",
+            "linear-gradient(lime,lime) 0 0/calc(0 * 100%)",
+            "linear-gradient(lime,lime) 0 0/10px 0px",
+            "repeating-linear-gradient(to right,lime 0%,lime 50%) 0 0/0% auto",
+            "linear-gradient(lime,lime) 0 0/0.05px 0.05px",
+            "linear-gradient(lime,lime) 0 0/0.05px 0.05px space",
+        ] {
+            let (primitives, pixel) = render(layer);
+            assert_eq!(pixel, [0, 0, 0], "{layer}");
+            assert!(
+                primitives <= baseline + 8,
+                "{layer}: {primitives} primitives"
+            );
+        }
+        let (primitives, pixel) = render("linear-gradient(lime,lime) 0 0/10px 10px");
+        assert_eq!(pixel, [0, 255, 0]);
+        assert!(
+            primitives > baseline + 800,
+            "each tile is a primitive: {primitives}"
+        );
     }
 
     #[test]
