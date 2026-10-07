@@ -26552,21 +26552,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     class Memory {
         constructor(descriptor) {
-            if (typeof descriptor !== "object" || descriptor === null) {
+            // WebIDL #js-dictionary converts each MemoryDescriptor member
+            // once, in lexicographic order. The WebAssembly JS API's
+            // MemoryDescriptor is { initial, maximum, address }: `shared`
+            // belongs to the threads proposal, which this engine does not
+            // implement, so like any unknown member it is never read and the
+            // memory is unshared.
+            if (
+                descriptor !== undefined &&
+                descriptor !== null &&
+                typeof descriptor !== "object" &&
+                typeof descriptor !== "function"
+            ) {
                 throw new TypeError("WebAssembly.Memory: descriptor must be an object");
             }
-            if (descriptor.initial === undefined) {
-                throw new TypeError("WebAssembly.Memory: initial is required");
-            }
-            if (descriptor.address !== undefined && descriptor.address !== "i32") {
+            const member = (name) => (descriptor == null ? undefined : descriptor[name]);
+            const address = member("address");
+            if (address !== undefined && String(address) !== "i32") {
                 throw new TypeError("WebAssembly.Memory: unsupported address type");
             }
-            if (descriptor.shared === true) {
-                throw new TypeError("WebAssembly.Memory: shared memory is not supported");
+            const initialValue = member("initial");
+            if (initialValue === undefined) {
+                throw new TypeError("WebAssembly.Memory: initial is required");
             }
-            const initial = addressU32(descriptor.initial);
-            const maximum =
-                descriptor.maximum === undefined ? -1 : addressU32(descriptor.maximum);
+            const initial = addressU32(initialValue);
+            const maximumValue = member("maximum");
+            const maximum = maximumValue === undefined ? -1 : addressU32(maximumValue);
             const id = __wasm_memory_new(initial, maximum);
             setWasmAddress(this, "wasmMemory", id);
             memoryWrappers.set(id, this);

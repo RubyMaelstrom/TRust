@@ -25297,6 +25297,42 @@ mod tests {
     }
 
     #[test]
+    fn webassembly_memory_descriptor_follows_webidl_dictionary_conversion() {
+        // WebAssembly JS API #memories: MemoryDescriptor is { initial, maximum, address }.
+        // WebIDL #js-dictionary reads those members once, in lexicographic order, and never
+        // reads an unknown member such as the threads proposal's `shared`, so Pyodide's
+        // `new WebAssembly.Memory({shared: true, initial: 1, maximum: 1})` probe gets an
+        // ordinary memory and its Atomics.wait fallback instead of a TypeError.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const reads = [];
+            const descriptor = {};
+            for (const [name, value] of [["shared", true], ["maximum", 2], ["initial", 1], ["address", "i32"]]) {
+                Object.defineProperty(descriptor, name, { get() { reads.push(name); return value; } });
+            }
+            const memory = new WebAssembly.Memory(descriptor);
+            const view = new Int32Array(new WebAssembly.Memory({ shared: true, initial: 1, maximum: 1 }).buffer);
+            let wait = "none";
+            try { Atomics.wait(view, 0, 0, 0); } catch (error) { wait = error.constructor.name; }
+            let required = "none";
+            try { new WebAssembly.Memory(null); } catch (error) { required = error.constructor.name; }
+            globalThis.memoryDescriptorResult = [
+                reads.join(","), memory.buffer.byteLength, memory.grow(1), memory.buffer.byteLength,
+                view.buffer instanceof ArrayBuffer, view.length, wait, required
+            ].join("|");
+            "#,
+            "WebAssembly.Memory descriptor",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "memoryDescriptorResult"),
+            "address,initial,maximum|65536|1|131072|true|16384|TypeError|TypeError"
+        );
+    }
+
+    #[test]
     fn webassembly_large_import_array_keeps_late_bindings() {
         // hCaptcha currently instantiates a module with 168 consecutive function imports. Keep
         // this boundary-sized fixture here so Array construction/push fast paths cannot silently
