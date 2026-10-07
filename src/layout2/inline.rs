@@ -107,12 +107,11 @@ pub(crate) struct Piece {
     /// Blockified controls already have an outer fragment and use their child
     /// form piece only for the label.
     pub(crate) paint_control_box: bool,
-    /// An inline-level replaced element's border and padding outside its
-    /// content box (top, right, bottom, left), when this piece paints that
-    /// box's background and border (CSS 2 Appendix E step 7.2.1). Layout
-    /// carries those edges as inline space; block-level and stacking-context
-    /// replaced boxes paint them on their own fragment instead.
-    pub(crate) replaced_edges: Option<[f32; 4]>,
+    /// The box of an inline-level replaced element or form control that
+    /// this piece stands for, which CSSOM View measures and paint decorates.
+    /// Block-level and stacking-context replaced boxes have their own
+    /// fragment instead.
+    pub(crate) replaced_box: Option<ReplacedBox>,
     /// A multiline text control's (`<textarea>`) laid-out value. When
     /// present, graphical paint draws its line runs instead of `shaped`,
     /// which remains the single-run label for the other consumers.
@@ -124,6 +123,40 @@ pub(crate) struct Piece {
     /// relatively positioned replaced element's own offset. The line box
     /// and the pieces after it are laid as if it were zero.
     pub(crate) shift: [f32; 2],
+}
+
+/// The box of an inline-level replaced element or form control, as edge
+/// widths in CSS px (top, right, bottom, left).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ReplacedBox {
+    /// An image-like replaced element whose piece is its content box. Layout
+    /// carries the border and padding as inline space around it, and the
+    /// piece paints that box's background and border (CSS 2 Appendix E step
+    /// 7.2.1).
+    Content { border: [f32; 4], padding: [f32; 4] },
+    /// A form control whose piece is its border box, painted by the control.
+    Border { border: [f32; 4] },
+}
+
+impl ReplacedBox {
+    /// The border and padding box edges as outsets of the piece box: the
+    /// border box's, then the padding box's.
+    pub(crate) fn outsets(self) -> ([f32; 4], [f32; 4]) {
+        match self {
+            ReplacedBox::Content { border, padding } => (
+                std::array::from_fn(|side| border[side] + padding[side]),
+                padding,
+            ),
+            ReplacedBox::Border { border } => ([0.0; 4], border.map(|width| -width)),
+        }
+    }
+
+    /// The used border widths.
+    pub(crate) fn border(self) -> [f32; 4] {
+        match self {
+            ReplacedBox::Content { border, .. } | ReplacedBox::Border { border } => border,
+        }
+    }
 }
 
 /// A multiline control's laid-out content.
@@ -456,7 +489,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
-            replaced_edges: None,
+            replaced_box: None,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
@@ -487,7 +520,7 @@ impl Piece {
             space_before: false,
             atom_box: false,
             paint_control_box: false,
-            replaced_edges: None,
+            replaced_box: None,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
@@ -1944,7 +1977,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box: false,
             paint_control_box: false,
-            replaced_edges: None,
+            replaced_box: None,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
@@ -2654,25 +2687,26 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // (#margin-properties / #inline-replaced-height). Pre-laid atomic
         // placeholders already contain their margins; block-level atoms
         // receive these edges from their enclosing flow fragment.
-        let (vertical_edges, replaced_edges) =
+        let (vertical_edges, replaced_box) =
             if self.position_inline_atoms && !atom_box && item.node != NO_NODE {
                 let style = BoxStyle::of(self.dom, item.node, self.vp);
+                let sides = |f: &dyn Fn(usize) -> f32| [f(TOP), f(RIGHT), f(BOTTOM), f(LEFT)];
+                let border = sides(&|side| style.border[side]);
                 if paint_control_box {
                     (
                         [self.margin_px(&style, TOP), self.margin_px(&style, BOTTOM)],
-                        None,
+                        Some(ReplacedBox::Border { border }),
                     )
                 } else {
-                    let inner = |side: usize| {
-                        style.border[side]
-                            + style.padding[side]
-                                .resolve(Some(self.cb_w_px))
-                                .unwrap_or(0.0)
-                    };
+                    let padding = sides(&|side| {
+                        style.padding[side]
+                            .resolve(Some(self.cb_w_px))
+                            .unwrap_or(0.0)
+                    });
                     (
                         [self.edge_px(&style, TOP), self.edge_px(&style, BOTTOM)],
                         (item.kind == ItemKind::Image && item.style_node == item.node)
-                            .then(|| [inner(TOP), inner(RIGHT), inner(BOTTOM), inner(LEFT)]),
+                            .then_some(ReplacedBox::Content { border, padding }),
                     )
                 }
             } else {
@@ -2713,7 +2747,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             space_before: space,
             atom_box,
             paint_control_box,
-            replaced_edges,
+            replaced_box,
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
