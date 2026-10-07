@@ -1,6 +1,5 @@
 use super::context::*;
 use glow::{self as gl, HasContext};
-use std::collections::HashMap;
 
 fn texture_target(target: u32) -> Option<(u32, usize)> {
     match target {
@@ -65,6 +64,15 @@ impl Texture {
             .then_some(base)
     }
     pub(super) fn complete(&self) -> bool {
+        if let Some(complete) = self.completeness.get() {
+            return complete;
+        }
+        let complete = self.compute_complete();
+        self.completeness.set(Some(complete));
+        complete
+    }
+
+    fn compute_complete(&self) -> bool {
         let Some(base) = self.base() else {
             return false;
         };
@@ -114,11 +122,12 @@ impl Context {
                                 Texture {
                                     handle,
                                     target: 0,
-                                    images: HashMap::new(),
+                                    images: Default::default(),
                                     deleted: false,
                                     min_filter: gl::NEAREST_MIPMAP_LINEAR,
                                     wrap_s: gl::REPEAT,
                                     wrap_t: gl::REPEAT,
+                                    completeness: std::cell::Cell::new(None),
                                 },
                             );
                             id.into()
@@ -247,7 +256,9 @@ impl Context {
                             return Some(self.error(e));
                         }
                         self.resources = bytes;
-                        self.textures.get_mut(&id).unwrap().images = images;
+                        let texture = self.textures.get_mut(&id).unwrap();
+                        texture.images = images;
+                        texture.completeness.set(None);
                         Reply::Null
                     } else {
                         if !matches!(
@@ -283,6 +294,7 @@ impl Context {
                             }
                             self.driver.gl.tex_parameter_i32(u(0), u(1), i(2));
                             let texture = self.textures.get_mut(&id).unwrap();
+                            texture.completeness.set(None);
                             match u(1) {
                                 gl::TEXTURE_MIN_FILTER => texture.min_filter = u(2),
                                 gl::TEXTURE_WRAP_S => texture.wrap_s = u(2),
@@ -305,7 +317,7 @@ impl Context {
                                 id,
                                 Framebuffer {
                                     handle,
-                                    attachments: HashMap::new(),
+                                    attachments: Default::default(),
                                 },
                             );
                             id.into()
@@ -884,7 +896,9 @@ impl Context {
         }
         if !sub {
             self.resources = self.resources - old_bytes + new_bytes;
-            self.textures.get_mut(&id).unwrap().images.insert(
+            let texture = self.textures.get_mut(&id).unwrap();
+            texture.completeness.set(None);
+            texture.images.insert(
                 (u(0), i(1)),
                 TexImage {
                     width: w,

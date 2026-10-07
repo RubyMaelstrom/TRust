@@ -1,6 +1,9 @@
 use super::driver::Driver;
 use glow::{self as gl, HasContext};
-use std::collections::{HashMap, VecDeque};
+// Object names are small sequential integers chosen by this context, so a
+// fast non-randomized hash suffices for every per-call lookup.
+use rustc_hash::FxHashMap as HashMap;
+use std::{cell::Cell, collections::VecDeque};
 
 pub(super) const MAX_BYTES: usize = 256 * 1024 * 1024;
 pub(super) const MAX_OBJECTS: usize = 16384;
@@ -59,6 +62,9 @@ pub(super) struct Buffer {
     pub target: u32,
     pub usage: u32,
     pub bytes: Vec<u8>,
+    /// The largest index of each validated `drawElements` range, keyed by
+    /// (type, byte offset, count), until the bytes change.
+    pub index_ranges: HashMap<(u32, usize, usize), usize>,
 }
 pub(super) struct Shader {
     pub handle: gl::Shader,
@@ -75,7 +81,14 @@ pub(super) struct Program {
     pub deleted: bool,
     pub serial: u32,
     pub active: Vec<u32>,
-    pub samplers: Vec<(gl::UniformLocation, u32)>,
+    pub samplers: Vec<Sampler>,
+}
+/// A sampler uniform of a linked program and the texture unit it selects,
+/// mirrored from the program so that draws need not query it.
+pub(super) struct Sampler {
+    pub location: gl::UniformLocation,
+    pub kind: u32,
+    pub unit: i32,
 }
 pub(super) struct Uniform {
     pub location: gl::UniformLocation,
@@ -110,6 +123,9 @@ pub(super) struct Texture {
     pub min_filter: u32,
     pub wrap_s: u32,
     pub wrap_t: u32,
+    /// The cached result of `complete()`; reset whenever an image or a
+    /// sampling parameter changes.
+    pub completeness: Cell<Option<bool>>,
 }
 #[derive(Clone, Copy)]
 pub(super) struct TexImage {
@@ -253,16 +269,16 @@ impl Context {
                 default_fb,
                 color,
                 depth,
-                buffers: HashMap::new(),
-                shaders: HashMap::new(),
-                programs: HashMap::new(),
-                uniforms: HashMap::new(),
-                textures: HashMap::new(),
-                renderbuffers: HashMap::new(),
-                framebuffers: HashMap::new(),
+                buffers: HashMap::default(),
+                shaders: HashMap::default(),
+                programs: HashMap::default(),
+                uniforms: HashMap::default(),
+                textures: HashMap::default(),
+                renderbuffers: HashMap::default(),
+                framebuffers: HashMap::default(),
                 current_attribs: vec![[0., 0., 0., 1.]; attribs.len()],
                 attribs,
-                vertex_arrays: HashMap::from([(
+                vertex_arrays: HashMap::from_iter([(
                     0,
                     VertexArray {
                         handle: None,
