@@ -324,6 +324,8 @@ impl Context {
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
         self.driver.make_current()?;
+        // The allocation below is judged by the driver's error flags.
+        self.drain_native_errors();
         unsafe {
             let g = &self.driver.gl;
             let max = g
@@ -514,6 +516,10 @@ impl Context {
         if self.lost || self.driver.make_current().is_err() {
             return None;
         }
+        self.drain_native_errors();
+        if self.lost {
+            return None;
+        }
         let mut pixels = vec![0; self.width as usize * self.height as usize * 4];
         unsafe {
             let g = &self.driver.gl;
@@ -579,11 +585,15 @@ impl Context {
     }
 
     pub fn execute(&mut self, op: &str, n: &[f64], bytes: Option<&[u8]>, text: &str) -> Reply {
-        if op == "getError" {
-            return self.errors.pop_front().unwrap_or(gl::NO_ERROR).into();
-        }
-        if op == "isContextLost" {
-            return Reply::Bool(self.lost);
+        if matches!(op, "getError" | "isContextLost") {
+            if !self.lost && self.driver.make_current().is_ok() {
+                self.drain_native_errors();
+            }
+            return if op == "getError" {
+                self.errors.pop_front().unwrap_or(gl::NO_ERROR).into()
+            } else {
+                Reply::Bool(self.lost)
+            };
         }
         if self.lost {
             return Reply::Null;
@@ -591,6 +601,22 @@ impl Context {
         if self.driver.make_current().is_err() {
             self.lose();
             return Reply::Null;
+        }
+        // These operations read the driver's error flags to learn whether
+        // they themselves succeeded; earlier flags must not be mistaken for
+        // theirs.
+        if matches!(
+            op,
+            "bufferData"
+                | "bufferSubData"
+                | "attachShader"
+                | "detachShader"
+                | "generateMipmap"
+                | "renderbufferStorage"
+                | "texImage2D"
+                | "texSubImage2D"
+        ) {
+            self.drain_native_errors();
         }
         let value = self.dispatch(op, n, bytes, text);
         if !self.retired_buffers.is_empty()
@@ -646,7 +672,15 @@ impl Context {
                 keep
             });
         }
-        // Preserve native and browser validation errors in the same set.
+        value
+    }
+
+    /// Moves the driver's error flags into the WebGL error set, which holds
+    /// native and validation errors alike (WebGL 1.0 §5.14.13 `getError`).
+    /// GL error flags stay set until read, so they are collected lazily: when
+    /// the page asks, before operations that check their own driver errors,
+    /// and at each presentation, where a lost context is also noticed.
+    pub(super) fn drain_native_errors(&mut self) {
         unsafe {
             for _ in 0..8 {
                 let e = self.driver.gl.get_error();
@@ -660,7 +694,6 @@ impl Context {
                 }
             }
         }
-        value
     }
     fn dispatch(&mut self, op: &str, n: &[f64], bytes: Option<&[u8]>, text: &str) -> Reply {
         if let Some(result) = self.vertex_array_call(op, n.first().copied().unwrap_or(0.) as u32) {
