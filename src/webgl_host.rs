@@ -35,11 +35,11 @@ pub(super) fn publish(ctx: &mut Ctx, present: bool, only: Option<usize>) {
         }
         allocated += context.allocated_bytes();
         if (!present || context.dirty)
-            && let Some(pixels) = context.snapshot(present)
+            && let Some((pixels, opaque)) = context.snapshot(present)
             && canvas.width > 0
             && canvas.height > 0
         {
-            canvas.publish_webgl(context.width, context.height, pixels, present);
+            canvas.publish_webgl(context.width, context.height, pixels, opaque, present);
         }
     }
 }
@@ -143,7 +143,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     if op == "dispose" {
         ctx.host_mut::<HostState>().unwrap().webgl.remove(&id);
         if let Some(canvas) = dom.borrow().canvases.borrow_mut().get_mut(&id) {
-            canvas.publish_webgl(0, 0, vec![], true);
+            canvas.publish_webgl(0, 0, vec![], true, true);
         }
         return Ok(Value::Undefined);
     }
