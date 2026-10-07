@@ -22,6 +22,7 @@ pub(super) fn parse<'i>(
         | Kind::AnglePercentage
         | Kind::Time
         | Kind::Resolution
+        | Kind::Flex
         | Kind::NumberPercentage => math::parse(p, kind, ctx, depth),
         Kind::String => Ok(string_text(&p.expect_string_cloned()?)),
         Kind::CustomIdent | Kind::Ident(_) => {

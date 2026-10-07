@@ -490,6 +490,13 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
     if property == "anchor-name" {
         return anchor_name_value(value).is_some();
     }
+    // CSS Values 4 #calc-type-checking: a math function must resolve to one
+    // of the property's numeric productions (`parse_decl_in` checks whole
+    // declarations; this also covers longhands expanded from shorthands).
+    // The literal grammar below then checks the value it stands for.
+    let Ok(value) = properties::numeric::specified_literals(property, value) else {
+        return false;
+    };
     let lower = value.to_ascii_lowercase();
     let value = lower.as_str();
     let one_of = |values: &str| values.split_ascii_whitespace().any(|v| v == value);

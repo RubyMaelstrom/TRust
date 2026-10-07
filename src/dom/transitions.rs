@@ -194,7 +194,12 @@ impl Easing {
     }
 }
 
+/// A <time> in seconds: a literal, or a math function resolving to <time>
+/// (CSS Values 4 #calc-type-checking), as the shorthand classifies it.
 fn time(value: &str) -> Option<f64> {
+    if let Some(seconds) = properties::numeric::math_seconds(value) {
+        return Some(seconds);
+    }
     let value = value.trim().to_ascii_lowercase();
     let (n, scale) = if let Some(n) = value.strip_suffix("ms") {
         (n, 0.001)
@@ -221,7 +226,9 @@ pub(super) fn expand(value: &str) -> Vec<(String, String)> {
         for token in split_top_level_ws(segment) {
             if let Some(t) = time(token) {
                 if duration.is_none() {
-                    if t < 0. {
+                    // A negative literal is invalid; a calculation clamps
+                    // (CSS Values 4 #calc-range).
+                    if t < 0. && !crate::layout2::value::is_math_function(token) {
                         return vec![];
                     }
                     duration = Some(token);
@@ -265,7 +272,10 @@ pub(super) fn valid_longhand(name: &str, value: &str) -> bool {
     if wide_keyword(value).is_some() || find_var_function(value).is_some() {
         return true;
     }
-    let parts = split_top_level_commas(value)
+    let Ok(value) = properties::numeric::specified_literals(name, value) else {
+        return false;
+    };
+    let parts = split_top_level_commas(&value)
         .into_iter()
         .map(str::trim)
         .collect::<Vec<_>>();

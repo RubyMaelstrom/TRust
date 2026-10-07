@@ -297,7 +297,12 @@ impl Segment {
     }
 }
 
+/// A <time> in seconds: a literal, or a math function resolving to <time>
+/// (CSS Values 4 #calc-type-checking).
 fn time(value: &str) -> Option<f64> {
+    if let Some(seconds) = properties::numeric::math_seconds(value) {
+        return Some(seconds);
+    }
     let value = value.trim().to_ascii_lowercase();
     let (number, scale) = if let Some(number) = value.strip_suffix("ms") {
         (number, 0.001)
