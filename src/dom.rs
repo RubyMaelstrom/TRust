@@ -18124,6 +18124,48 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     parse_decl_in(decl, false)
 }
 
+/// CSS Syntax 3 #consume-function, #consume-simple-block and
+/// #consume-string-token: the end of the input closes every open function
+/// and block, and ends an open string, as a parse error rather than an
+/// invalid declaration (`width: calc(1px + 2px` is `calc(1px + 2px)`). Only a
+/// matching closer ends a block; a newline already ended a string as a
+/// bad-string token, which the property grammar then rejects.
+fn close_at_end_of_input(value: &str) -> Cow<'_, str> {
+    let mut open = Vec::new();
+    let mut quote = None;
+    let mut dangling_escape = false;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            // An escape consumes the next code point, in or out of a string.
+            (_, '\\') => {
+                dangling_escape = chars.next().is_none() && quote.is_some();
+            }
+            (Some(q), c) if c == q || c == '\n' => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(') => open.push(')'),
+            (None, '[') => open.push(']'),
+            (None, '{') => open.push('}'),
+            (None, ')' | ']' | '}') if open.last() == Some(&c) => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    if quote.is_none() && open.is_empty() {
+        return Cow::Borrowed(value);
+    }
+    let mut closed = value.to_string();
+    if dangling_escape {
+        // A string's escape at the end of input contributes nothing.
+        closed.pop();
+    }
+    closed.extend(quote);
+    closed.extend(open.into_iter().rev());
+    Cow::Owned(closed)
+}
+
 /// `parse_decl` for a sheet or style attribute of a document in `quirks`
 /// mode, which also accepts CSS Values 4 #deprecated-quirky-length.
 fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
@@ -18146,7 +18188,8 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
         let lower = k.to_ascii_lowercase();
         legacy_name_alias(&lower).map_or(lower, str::to_string)
     };
-    let v = v.trim();
+    let closed = close_at_end_of_input(v.trim());
+    let v = closed.as_ref();
     // CSS Syntax 3 #consume-declaration: only top-level trailing tokens
     // can be the priority. A bang inside a string/function is ordinary data.
     let priority = split_top_level(v, '!');
@@ -26033,6 +26076,46 @@ mod tests {
         assert!(
             dom.serialize(c).contains("min-width:16rem"),
             "undefined --cell uses the fallback"
+        );
+    }
+
+    #[test]
+    fn declarations_close_open_blocks_at_end_of_input() {
+        // CSS Syntax 3 #consume-function / #consume-simple-block /
+        // #consume-string-token: EOF closes, rather than invalidates.
+        for (value, expected) in [
+            ("calc(1px + 2px", "calc(1px + 2px)"),
+            ("min(10px, calc(20px", "min(10px, calc(20px))"),
+            ("[a (b", "[a (b)]"),
+            ("\"open", "\"open\""),
+            ("'it\\'s", "'it\\'s'"),
+            ("\"tail\\", "\"tail\""),
+            ("f(\")\"", "f(\")\")"),
+            ("f(\\)", "f(\\))"),
+            ("[)]", "[)]"),
+            ("calc(1px)", "calc(1px)"),
+        ] {
+            assert_eq!(close_at_end_of_input(value), expected, "{value}");
+        }
+        assert_eq!(
+            parse_decl("width: calc(1px + 2px"),
+            Some(("width".into(), "calc(1px + 2px)".into(), false))
+        );
+        // The function swallows the `!important`: it is not a priority.
+        assert!(!matches!(
+            parse_decl("width: calc(1px !important"),
+            Some((_, _, true))
+        ));
+        let mut dom = Dom::parse_document("<div id=t style='width:round(up, 21px, 10px'></div>");
+        let t = dom.get_by_id("t").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(t, "width").as_deref(),
+            Some("round(up, 21px, 10px)")
+        );
+        dom.set_attr(t, "style", "color: rgb(1, 2, 3");
+        assert_eq!(
+            dom.computed_value_resolved(t, "color").as_deref(),
+            Some("rgb(1, 2, 3)")
         );
     }
 
