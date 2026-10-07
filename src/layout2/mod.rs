@@ -4252,7 +4252,7 @@ mod tests {
     fn list_style_image_creates_an_image_marker() {
         let svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='4' height='4'/%3E%3C/svg%3E";
         let html = format!(
-            r#"<body style="margin:0"><ul style="margin:0;padding:0;list-style-image:url('{svg}')"><li>heart</li></ul></body>"#
+            r#"<body style="margin:0"><ul style="margin:0;padding:0;list-style-image:url(&quot;{svg}&quot;)"><li>heart</li></ul></body>"#
         );
         let layout = lay_graphical(&html, 320.0, &HashMap::new());
         let image = layout

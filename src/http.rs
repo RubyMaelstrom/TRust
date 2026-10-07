@@ -8100,25 +8100,13 @@ fn collect_image_urls_for_boxes(
     }
 }
 
+/// Every non-empty `<url>` in a computed image value, with CSS escapes
+/// resolved and quoted URLs kept whole (see [`crate::dom::css_urls`]).
 fn css_image_sources(value: &str) -> Vec<String> {
-    let lower = value.to_ascii_lowercase();
-    let mut sources = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(relative) = lower[cursor..].find("url(") {
-        let open = cursor + relative + 4;
-        let Some(close) = value[open..].find(')') else {
-            break;
-        };
-        let source = value[open..open + close]
-            .trim()
-            .trim_matches(['\'', '"'])
-            .to_string();
-        if !source.is_empty() {
-            sources.push(source);
-        }
-        cursor = open + close + 1;
-    }
-    sources
+    crate::dom::css_urls(value)
+        .into_iter()
+        .filter(|source| !source.is_empty())
+        .collect()
 }
 
 fn resolve_css_image_source(base: &Url, source: &str) -> Option<String> {
@@ -9828,6 +9816,57 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    #[test]
+    fn css_image_urls_resolve_string_escapes_and_keep_quoted_delimiters() {
+        // CSS Values 4 #urls: the URL is the string token's value, so CSS
+        // Syntax 3 #consume-string-token resolves `\"` (also how computed
+        // values serialize quotes). Commas and an unbalanced `)` inside the
+        // string are not structural (MediaWiki's Vector chevron icons).
+        let base = Url::parse("https://images.example/").unwrap();
+        let chevron = r#"data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\" viewBox=\"0 0 20 20\"><path d=\"M2 2h16v16z\"/><text>:)</text></svg>"#;
+        let expected = chevron.replace(r#"\""#, "\"");
+        let dom = crate::dom::Dom::parse_document(&format!(
+            r#"<style>
+              div {{ width:20px; height:20px }}
+              #mask {{ mask-image:url("{chevron}"); background:navy }}
+              #background {{ background-image:url("{chevron}"), url(plain\(1\).png) }}
+            </style><div id=mask></div><div id=background></div>"#
+        ));
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(200.0, 100.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        assert!(
+            rendered.image_urls.contains(&expected),
+            "{:?}",
+            rendered.image_urls
+        );
+        assert!(
+            rendered
+                .image_urls
+                .contains(&base.join("plain(1).png").unwrap().to_string()),
+            "{:?}",
+            rendered.image_urls
+        );
+        let painted: Vec<_> = rendered
+            .layout
+            .paint
+            .image_requests
+            .iter()
+            .map(|request| request.source.as_str())
+            .collect();
+        assert_eq!(
+            painted.iter().filter(|&&source| source == expected).count(),
+            1
+        );
+        let bytes = crate::img::decode_data_url(&expected).unwrap();
+        assert!(crate::img::decode_graphical(&bytes).is_ok());
     }
 
     #[test]

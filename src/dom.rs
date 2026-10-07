@@ -12589,6 +12589,79 @@ impl Complex {
     }
 }
 
+/// Parse the `<url>` that `text` starts with and return its URL string and the
+/// unparsed remainder (for example a cursor's hotspot coordinates).
+///
+/// CSS Values 4 #urls: `<url> = url( <string> <url-modifier>* ) | <url-token>`
+/// or `src( <string> <url-modifier>* )`. The URL is the string or url token's
+/// value, so CSS Syntax 3 #consume-string-token / #consume-url-token escapes
+/// are resolved: computed values serialize quotes inside strings as `\"`.
+pub fn css_url_prefix(text: &str) -> Option<(String, &str)> {
+    let mut parser = cssparser::Parser::new(text);
+    parser.skip_whitespace();
+    let url = parse_css_url(&mut parser).ok()?;
+    let rest = &text[parser.position().byte_index()..];
+    Some((url, rest))
+}
+
+/// Every `<url>` in a CSS value, in order, including those nested in other
+/// functions such as `image-set()`. See [`css_url_prefix`].
+pub(crate) fn css_urls(text: &str) -> Vec<String> {
+    fn collect<'i>(parser: &mut cssparser::Parser<'i>, urls: &mut Vec<String>) {
+        while !parser.is_exhausted() {
+            if let Ok(url) = parser.try_parse(parse_css_url) {
+                urls.push(url);
+                continue;
+            }
+            let Ok(token) = parser.next() else {
+                return;
+            };
+            if matches!(
+                token,
+                cssparser::Token::Function(_)
+                    | cssparser::Token::ParenthesisBlock
+                    | cssparser::Token::SquareBracketBlock
+                    | cssparser::Token::CurlyBracketBlock
+            ) {
+                let _ = parser.parse_nested_block(|nested| {
+                    collect(nested, urls);
+                    Ok::<_, cssparser::ParseError<()>>(())
+                });
+            }
+        }
+    }
+    let mut urls = Vec::new();
+    collect(&mut cssparser::Parser::new(text), &mut urls);
+    urls
+}
+
+fn parse_css_url<'i>(
+    parser: &mut cssparser::Parser<'i>,
+) -> Result<String, cssparser::ParseError<()>> {
+    match parser.next()?.clone() {
+        cssparser::Token::UnquotedUrl(url) => Ok(url.to_string()),
+        cssparser::Token::Function(name)
+            if name.eq_ignore_ascii_case("url") || name.eq_ignore_ascii_case("src") =>
+        {
+            parser.parse_nested_block(|nested| {
+                let url = nested.expect_string_cloned()?.to_string();
+                // <url-modifier> = <ident> | <function-token> <any-value>? )
+                while !nested.is_exhausted() {
+                    match nested.next()? {
+                        cssparser::Token::Ident(_) => {}
+                        cssparser::Token::Function(_) => nested.parse_nested_block(|block| {
+                            block.expect_no_error_token().map_err(Into::into)
+                        })?,
+                        _ => return Err(cssparser::ParseError::custom(())),
+                    }
+                }
+                Ok(url)
+            })
+        }
+        _ => Err(cssparser::ParseError::custom(())),
+    }
+}
+
 /// Split on `sep` outside parens, brackets, and quotes — `:not(.a, .b)`
 /// and `[title="x,y"]` must survive list splitting.
 pub(crate) fn split_top_level(input: &str, sep: char) -> Vec<&str> {
@@ -20288,6 +20361,48 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_urls_follow_css_syntax_token_values() {
+        // CSS Values 4 #urls with CSS Syntax 3 #consume-string-token,
+        // #consume-url-token and #consume-escaped-code-point.
+        let cases = [
+            (r#"url("a\"b.svg")"#, r#"a"b.svg"#),
+            (r#"url('it\'s.png')"#, "it's.png"),
+            (r"url(a\)b.png)", "a)b.png"),
+            (r#"url("\31 x.png")"#, "1x.png"),
+            (r#"url( "spaced.png" )"#, "spaced.png"),
+            (r#"src("from-src.png")"#, "from-src.png"),
+            (
+                r#"url("modified.png" crossorigin(anonymous))"#,
+                "modified.png",
+            ),
+            (r#"URL("upper.png")"#, "upper.png"),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                css_url_prefix(text).map(|(url, rest)| (url, rest.trim().is_empty())),
+                Some((expected.to_string(), true)),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            css_url_prefix(r#" url("c.png") 4 6"#),
+            Some((String::from("c.png"), " 4 6"))
+        );
+        for invalid in [
+            "none",
+            "linear-gradient(red, blue)",
+            r#""bare.png""#,
+            "url(a b)",
+        ] {
+            assert_eq!(css_url_prefix(invalid), None, "{invalid}");
+        }
+        assert_eq!(
+            css_urls(r#"url("a,(.png"), image-set(url("b\".png") 1x, url(c.png) 2x), none"#),
+            ["a,(.png", r#"b".png"#, "c.png"]
+        );
+    }
 
     #[test]
     fn display_text_shows_plane_16_characters_stored_as_engine_text() {
