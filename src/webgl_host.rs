@@ -229,12 +229,17 @@ fn execute(
 ) -> Reply {
     let dom = host_dom(ctx);
     let state = ctx.host_mut::<HostState>().unwrap();
-    let other = state
-        .webgl
-        .iter()
-        .filter(|(key, _)| **key != id)
-        .map(|(_, c)| c.allocated_bytes())
-        .sum::<usize>();
+    // The page budget is shared; a lone context has it all.
+    let other = if state.webgl.len() > 1 {
+        state
+            .webgl
+            .iter()
+            .filter(|(key, _)| **key != id)
+            .map(|(_, c)| c.allocated_bytes())
+            .sum::<usize>()
+    } else {
+        0
+    };
     let Some(context) = state.webgl.get_mut(&id) else {
         return Reply::Null;
     };
