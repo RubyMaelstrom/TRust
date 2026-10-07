@@ -128,6 +128,10 @@
 //!   `--no-default-features --features image-defaults,crossterm` or a variation thereof.
 //!
 //! Note: The chafa features are mutually exclusive - enable only one at a time.
+//! There is *NO* compiler error for enabling both features at the same time, because some tools
+//! (like cargo-semver-checks) need to build with all features enabled. If both features are
+//! enabled, then `chafa-dyn` takes precedence, because that one makes it easier for running such
+//! tools in CI.
 //!
 //! ### Others
 //!
@@ -413,8 +417,8 @@ impl Resize {
         size: Size,
         background_color: Option<Rgba<u8>>,
     ) -> DynamicImage {
-        let width = (size.width * font_size.width) as u32;
-        let height = (size.height * font_size.height) as u32;
+        let width = u32::from(size.width) * u32::from(font_size.width);
+        let height = u32::from(size.height) * u32::from(font_size.height);
 
         // Resize/Crop/etc., fitting a multiple of font-size, but not necessarily the `size`.
         let mut image = self.resize_pixels(image, width, height);
@@ -470,8 +474,8 @@ impl Resize {
             && desired.height <= target.height
             && (current.is_none() || current == Some(desired))
         {
-            let width = (desired.width * font_size.width) as u32;
-            let height = (desired.height * font_size.height) as u32;
+            let width = u32::from(desired.width) * u32::from(font_size.width);
+            let height = u32::from(desired.height) * u32::from(font_size.height);
             if image.width() == width || image.height() == height {
                 return None;
             }

@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "ratatui-image"
-version = "11.0.6"
+version = "11.1.0"
 authors = ["Benjamin Große <ste3ls@gmail.com>"]
 build = "build.rs"
 exclude = ["assets/*"]
@@ -101,6 +101,9 @@ harness = false
 
 [dependencies.base64-simd]
 version = "0.8"
+
+[dependencies.flate2]
+version = "^1.0"
 
 [dependencies.icy_sixel]
 version = "^0.5.0"
