@@ -2081,6 +2081,7 @@ mod desktop {
             scripted_frames: env.scripted_frames,
             last_modified: env.last_modified,
             document_encoding: env.document_encoding,
+            content_type: env.content_type.clone(),
         };
         let mut page = match load_page(
             html,
@@ -3176,7 +3177,15 @@ mod desktop {
         );
         let document_creation_time = crate::performance::now_ms();
         // The decoded document is Rust text; the DOM keeps engine text (see `dom_text_in`).
-        let dom = Rc::new(RefCell::new(Dom::parse_document(&dom_text_in(html))));
+        // HTML #loading-a-document: an XML MIME type (application/xhtml+xml
+        // included) loads an XML document through the XML parser (#read-xml).
+        let dom = Rc::new(RefCell::new(
+            if crate::js::is_xml_mime_type(&env.content_type) {
+                Dom::parse_xml_page(&dom_text_in(html), &env.content_type)
+            } else {
+                Dom::parse_document(&dom_text_in(html))
+            },
+        ));
         {
             let mut dom = dom.borrow_mut();
             dom.set_viewport_px(viewport.width, viewport.height);
@@ -9157,10 +9166,10 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_text", 1, guarded_text),
     ("__dom_set_text", 2, guarded_set_text),
     ("__dom_inner_html", 1, guarded_inner_html),
-    ("__dom_set_inner_html", 2, guarded_set_inner_html),
+    ("__dom_set_inner_html", 4, guarded_set_inner_html),
     ("__dom_outer_html", 1, guarded_outer_html),
     ("__dom_xml_serialize", 1, guarded_xml_serialize),
-    ("__dom_insert_adjacent", 3, guarded_insert_adjacent),
+    ("__dom_insert_adjacent", 4, guarded_insert_adjacent),
     ("__dom_query", 3, guarded_query),
     ("__dom_elements_by_tag", 3, guarded_elements_by_tag),
     ("__dom_elements_by_class", 3, guarded_elements_by_class),
@@ -9871,7 +9880,7 @@ node_access_guards! {
     guarded_text = host_text, [0], Invalidate;
     guarded_set_text = host_set_text, [0], Invalidate;
     guarded_inner_html = host_inner_html, [0], Invalidate;
-    guarded_set_inner_html = host_set_inner_html, [0], Invalidate;
+    guarded_set_inner_html = host_set_inner_html, [0, 3], Invalidate;
     guarded_outer_html = host_outer_html, [0], Invalidate;
     guarded_xml_serialize = host_xml_serialize, [0], Invalidate;
     guarded_insert_adjacent = host_insert_adjacent, [0], Invalidate;
@@ -14951,8 +14960,10 @@ fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     let id = if content_type == "text/html" {
         dom.borrow_mut().parse_document_into(&html)
     } else {
+        // The XML parser reads the DOMString's scalar values: a lone
+        // surrogate becomes U+FFFD (HTML #dom-domparser-parsefromstring).
         dom.borrow_mut()
-            .parse_xml_document_into(&html, &content_type)
+            .parse_xml_document_into(&crate::dom::replace_lone_surrogates(&html), &content_type)
     };
     dom.borrow_mut().set_document_encoding(id, encoding);
     Ok(host_id_value(Some(id)))
@@ -15896,18 +15907,33 @@ fn host_xml_serialize(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 
 /// HTML §13.5 fragment parsing with the target element as the context. Template markup is directed
 /// into its template-contents fragment, matching HTML's template insertion mode.
+/// `__dom_set_inner_html(node, markup, checkOnly, context)` replaces the
+/// children of `node` with `markup` parsed in the context of the element
+/// `context` (default `node`; DOM Parsing #dom-range-createcontextualfragment
+/// passes its own). It returns false, without mutating, when an XML
+/// document's markup is not well-formed (a SyntaxError); `checkOnly`
+/// validates without replacing.
 fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let html = host_arg_string(ctx, args, 1);
+    let check_only = matches!(args.get(2), Some(Value::Bool(true)));
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     if let Some(id) = host_arg_node(&dom, args, 0) {
         let target = dom.content_target(id);
+        let context = match args.get(3) {
+            None | Some(Value::Undefined) => Some(id),
+            Some(_) => host_arg_node(&dom, args, 3),
+        };
         // HTML's innerHTML setter parses first, then DOM's replace-all
         // operation removes the old children and inserts the parsed fragment.
-        let nodes = dom.parse_fragment_in(Some(id), &html);
-        dom.replace_all_children(target, nodes);
+        let Some(nodes) = dom.fragment_parse(id, context, &html, check_only) else {
+            return Ok(Value::Bool(false));
+        };
+        if !check_only {
+            dom.replace_all_children(target, nodes);
+        }
     }
-    Ok(Value::Undefined)
+    Ok(Value::Bool(true))
 }
 
 /// HTML #dom-element-outerhtml: fragment serializing a fictional parent
@@ -15926,9 +15952,12 @@ fn host_outer_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     })
 }
 
+/// `__dom_insert_adjacent(node, position, markup, checkOnly)`: false, without
+/// mutating, when an XML document's markup is not well-formed.
 fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let position = host_arg_string(ctx, args, 1);
     let html = host_arg_string(ctx, args, 2);
+    let check_only = matches!(args.get(3), Some(Value::Bool(true)));
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
     let Some(id) = host_arg_node(&dom, args, 0) else {
@@ -15937,11 +15966,25 @@ fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     // HTML #dom-element-insertadjacenthtml (and the outerHTML setter, which
     // inserts before the element): the context is the parent or the element
     // itself, namespace included, so SVG and MathML parse as foreign content.
+    // A non-element context, or an HTML document's html element, becomes a
+    // new body element.
     let context = match position.as_str() {
         "beforebegin" | "afterend" => dom.node(id).parent,
         _ => Some(id),
+    }
+    .filter(|&context| {
+        let document = dom.owner_document(context).unwrap_or(context);
+        matches!(dom.node(context).data, crate::dom::NodeData::Element { .. })
+            && !(!dom.is_xml_document(document)
+                && dom.tag_name(context) == Some("html")
+                && dom.namespace_uri(context) == Some("http://www.w3.org/1999/xhtml"))
+    });
+    let Some(nodes) = dom.fragment_parse(id, context, &html, check_only) else {
+        return Ok(Value::Bool(false));
     };
-    let nodes = dom.parse_fragment_in(context, &html);
+    if check_only {
+        return Ok(Value::Bool(true));
+    }
     match position.as_str() {
         "afterbegin" => {
             let first = dom.node(id).first_child;
@@ -15970,7 +16013,7 @@ fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
             }
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::Bool(true))
 }
 
 fn host_elements_by_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -17373,8 +17416,22 @@ fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let encoding = host_arg_encoding(ctx, args, 4);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
+    // The fourth argument selects the document loader (HTML #loading-a-document):
+    // true for a text document, an XML MIME type for an XML document, and
+    // otherwise an HTML document.
+    let xml_type = match args.get(3) {
+        Some(value @ Value::Str(_)) => value.as_text().map(|text| text.into_owned()),
+        _ => None,
+    };
     if let Some(frame) = host_arg_node(&dom, args, 0) {
-        if matches!(args.get(3), Some(Value::Bool(true))) {
+        if let Some(content_type) = xml_type {
+            dom.install_frame_xml_document(
+                frame,
+                &crate::dom::replace_lone_surrogates(&html),
+                &base,
+                &content_type,
+            );
+        } else if matches!(args.get(3), Some(Value::Bool(true))) {
             dom.install_frame_text_document(frame, &html, &base);
         } else {
             dom.install_frame_document(frame, &html, &base);
@@ -20502,6 +20559,51 @@ mod tests {
              HierarchyRequestError,HierarchyRequestError,HierarchyRequestError,HierarchyRequestError,\
              TypeError,TypeError,none,HierarchyRequestError,HierarchyRequestError,none|\
              false,false,true,false,true,false|3|abcd|true|3|true|1"
+        );
+    }
+
+    #[test]
+    fn xml_documents_parse_fragments_as_xml_and_domparser_disables_scripting() {
+        // HTML #fragment-parsing-algorithm-steps: an XML document's innerHTML,
+        // outerHTML, insertAdjacentHTML and createContextualFragment use the
+        // XML fragment parsing algorithm (in-scope namespaces, SyntaxError
+        // before any change); HTML #dom-domparser-parsefromstring documents
+        // have no browsing context, so scripting is disabled for them
+        // (#concept-n-noscript) and their URL is this's relevant document's.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 const doc = new DOMParser().parseFromString(\n\
+                   '<r xmlns=\"urn:d\" xmlns:p=\"urn:p\"><c>old</c></r>', 'application/xml');\n\
+                 const r = doc.documentElement, c = r.firstChild;\n\
+                 c.innerHTML = '<e/><p:e/>t<![CDATA[<]]>';\n\
+                 const parsed = Array.from(c.childNodes, n => n.nodeType + (n.namespaceURI || '')).join();\n\
+                 const bad = [err(() => { c.innerHTML = '<q:e/>'; }), err(() => { c.innerHTML = '&nbsp;'; }),\n\
+                   err(() => c.insertAdjacentHTML('beforeend', '<a>')), err(() => { c.outerHTML = '</c>'; }),\n\
+                   err(() => r.insertAdjacentHTML('afterend', '<x/>')),\n\
+                   err(() => document.createElement('p').insertAdjacentHTML('beforebegin', ''))];\n\
+                 c.insertAdjacentHTML('afterbegin', '<p:first/>');\n\
+                 const range = doc.createRange(); range.setStart(c, 0);\n\
+                 const fragment = range.createContextualFragment('<n/>');\n\
+                 const html = new DOMParser().parseFromString(\n\
+                   '<base href=\"/sub/\"><noscript><p>a</p></noscript>', 'text/html');\n\
+                 const noscript = html.querySelector('noscript');\n\
+                 noscript.innerHTML = '<i>&lt;</i>';\n\
+                 const live = document.createElement('noscript');\n\
+                 live.innerHTML = '<i>x</i>';\n\
+                 [parsed, bad.join(), c.childNodes.length, c.firstChild.namespaceURI,\n\
+                  fragment.firstChild.namespaceURI, fragment.firstChild.ownerDocument === doc,\n\
+                  noscript.firstChild.localName, noscript.innerHTML, live.firstChild.nodeType,\n\
+                  html.URL === document.URL, html.baseURI === new URL('/sub/', document.URL).href,\n\
+                  doc.baseURI === document.URL, html.readyState,\n\
+                  new DOMParser().parseFromString('<a>\\uD83C</a>', 'text/xml').documentElement.textContent === '\\uFFFD',\n\
+                  new DOMParser().parseFromString('<style>p{}</style>', 'text/html').styleSheets.length].join('|')"
+            ),
+            "1urn:d,1urn:p,3,4|SyntaxError,SyntaxError,SyntaxError,SyntaxError,\
+             NoModificationAllowedError,NoModificationAllowedError|5|urn:p|urn:d|true|i|<i>&lt;</i>|3|\
+             true|true|true|complete|true|1"
         );
     }
 
@@ -24131,6 +24233,43 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn iframe_xml_documents_use_the_xml_parser() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                include_str!("fixtures/frame_xml_documents.mjs")
+            ),
+            "frame-xml-documents-ok"
+        );
+    }
+
+    #[test]
+    fn xhtml_pages_are_xml_documents() {
+        // HTML #loading-a-document: application/xhtml+xml navigates to an XML
+        // document (#read-xml), so `<iframe/>` is empty and scripts see the
+        // XML parser's tree; scripts still run (XML scripting support).
+        let html = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>X</title></head>\
+            <body><iframe id=\"a\"/><p id=\"b\">b</p><pre id=\"o\"/>\
+            <script><![CDATA[\
+              const p = document.getElementById('b');\
+              document.getElementById('o').textContent = [document.contentType,\
+                p.previousSibling.localName, document.createElement('i').namespaceURI,\
+                p.tagName, document.documentElement.lastChild.nodeType < 4].join(',');\
+            ]]></script></body></html>";
+        let env = crate::js::PageEnv {
+            content_type: String::from("application/xhtml+xml"),
+            ..crate::js::PageEnv::bare(DEFAULT_URL)
+        };
+        let (output, outcome) = crate::js::transform(html, &env);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            output.contains("application/xhtml+xml,iframe,http://www.w3.org/1999/xhtml,p,true"),
+            "{output}"
+        );
     }
 
     #[test]

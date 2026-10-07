@@ -260,6 +260,42 @@ pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Engine text (see `display_text`) with every lone surrogate replaced by
+/// U+FFFD and each surrogate pair kept in its engine encoding: the scalar
+/// values an XML parser reads from a DOMString (Encoding #utf-8-encode, as
+/// for Web IDL #idl-USVString).
+pub(crate) fn replace_lone_surrogates(text: &str) -> std::borrow::Cow<'_, str> {
+    const HIGH: std::ops::RangeInclusive<u32> = 0x10F800..=0x10FBFF;
+    const LOW: std::ops::RangeInclusive<u32> = 0x10FC00..=0x10FFFF;
+    if !text.as_bytes().contains(&0xF4) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut changed = false;
+    while let Some(c) = chars.next() {
+        let scalar = c as u32;
+        if HIGH.contains(&scalar)
+            && let Some(&next) = chars.peek()
+            && LOW.contains(&(next as u32))
+        {
+            chars.next();
+            out.push(c);
+            out.push(next);
+        } else if HIGH.contains(&scalar) || LOW.contains(&scalar) {
+            out.push('\u{FFFD}');
+            changed = true;
+        } else {
+            out.push(c);
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 pub enum NodeData {
     Document,
     /// A document fragment: template contents, fragment-parse roots.
@@ -3216,11 +3252,23 @@ impl Dom {
     }
 
     fn parse_html_document(html: &str, allow_declarative_shadow_roots: bool) -> Self {
+        Self::parse_html_document_with(html, allow_declarative_shadow_roots, true)
+    }
+
+    /// HTML #parsing with the parser's scripting mode Normal (`scripting`)
+    /// or Disabled.
+    fn parse_html_document_with(
+        html: &str,
+        allow_declarative_shadow_roots: bool,
+        scripting: bool,
+    ) -> Self {
         let sink = Sink {
             dom: RefCell::new(Dom::new()),
             allow_declarative_shadow_roots,
         };
-        html5ever::parse_document(sink, ParseOpts::default()).one(StrTendril::from(html))
+        let mut opts = ParseOpts::default();
+        opts.tree_builder.scripting_enabled = scripting;
+        html5ever::parse_document(sink, opts).one(StrTendril::from(html))
     }
 
     /// HTML §7.5.5 “Loading text documents”: a no-quirks HTML document with
@@ -3312,6 +3360,21 @@ impl Dom {
     /// The document that owns `id` (DOM §4.5's *node document*).
     pub fn owner_document(&self, id: NodeId) -> Option<NodeId> {
         self.nodes.get(id).map(|node| node.owner_document)
+    }
+
+    /// HTML #concept-n-script: scripting is enabled for a node only when its
+    /// node document has a browsing context, which here is the top-level
+    /// Document or the active Document of a child navigable (installed as
+    /// the arena child of its container). DOMParser, createDocument and
+    /// createHTMLDocument documents have none (#concept-n-noscript).
+    pub(crate) fn scripting_enabled_for(&self, id: NodeId) -> bool {
+        let Some(document) = self.owner_document(id) else {
+            return false;
+        };
+        document == DOCUMENT
+            || self.nodes[document].parent.is_some_and(|container| {
+                matches!(self.tag_name(container), Some("iframe" | "frame"))
+            })
     }
 
     /// Whether `id`'s node document is in quirks mode (DOM #concept-document-quirks).
@@ -3471,6 +3534,13 @@ impl Dom {
         } else {
             self.document_encodings.insert(doc, encoding);
         }
+    }
+
+    /// DOM #xml-document: a Document whose type is "xml", which is one whose
+    /// content type is an XML MIME type (MIME Sniffing #xml-mime-type);
+    /// text documents are HTML documents.
+    pub(crate) fn is_xml_document(&self, doc: NodeId) -> bool {
+        crate::js::is_xml_mime_type(self.document_content_type(doc))
     }
 
     pub fn document_mode(&self, doc: NodeId) -> QuirksMode {
@@ -9067,6 +9137,38 @@ impl Dom {
         self.install_parsed_frame_document(frame, &doc, base)
     }
 
+    /// HTML #read-xml ("Loading XML documents"): a navigation response with
+    /// an XML MIME type becomes a Document of that content type built by the
+    /// XML parser (an XML parse error yields its parsererror document), and
+    /// is installed as the frame's active document.
+    pub(crate) fn install_frame_xml_document(
+        &mut self,
+        frame: NodeId,
+        source: &str,
+        base: &str,
+        content_type: &str,
+    ) {
+        let document = self.parse_xml_document_into(source, content_type);
+        for c in self.children(frame) {
+            if matches!(self.nodes[c].data, NodeData::Document) {
+                self.detach(c);
+            }
+        }
+        self.append(frame, document);
+        if let Ok(base_url) = url::Url::parse(base) {
+            let root = self
+                .child_iter(document)
+                .find(|&c| matches!(self.nodes[c].data, NodeData::Element { .. }));
+            if let Some(root) = root {
+                self.absolutize_subtree_urls(root, &base_url);
+            }
+            self.properties
+                .document_bases
+                .insert(document, base_url.clone());
+            self.properties.document_bases.insert(frame, base_url);
+        }
+    }
+
     fn install_parsed_frame_document(
         &mut self,
         frame: NodeId,
@@ -9427,7 +9529,7 @@ impl Dom {
     /// this arena, detached).
     pub fn parse_fragment_into(&mut self, context_tag: &str, html: &str) -> Vec<NodeId> {
         let context = QualName::new(None, ns!(html), context_tag.to_ascii_lowercase().into());
-        self.parse_fragment_with(context, Vec::new(), html)
+        self.parse_fragment_with(context, Vec::new(), html, true)
     }
 
     /// HTML #html-fragment-parsing-algorithm with `context` as the fragment
@@ -9439,13 +9541,64 @@ impl Dom {
     /// (a DocumentFragment or ShadowRoot parent) parses in an HTML flow
     /// content context.
     pub fn parse_fragment_in(&mut self, context: Option<NodeId>, html: &str) -> Vec<NodeId> {
+        let scripting = context.is_none_or(|id| self.scripting_enabled_for(id));
+        self.parse_html_fragment_for(context, html, scripting)
+    }
+
+    /// The HTML fragment parsing algorithm with the given scripting state;
+    /// without a context element, the context is an HTML body element
+    /// (HTML #dom-element-insertadjacenthtml).
+    fn parse_html_fragment_for(
+        &mut self,
+        context: Option<NodeId>,
+        html: &str,
+        scripting: bool,
+    ) -> Vec<NodeId> {
         match context.map(|id| &self.nodes[id].data) {
             Some(NodeData::Element { name, attrs, .. }) => {
                 let (name, attrs) = (name.clone(), attrs.clone());
-                self.parse_fragment_with(name, attrs, html)
+                self.parse_fragment_with(name, attrs, html, scripting)
             }
-            _ => self.parse_fragment_into("div", html),
+            _ => {
+                let context = QualName::new(None, ns!(html), "body".into());
+                self.parse_fragment_with(context, Vec::new(), html, scripting)
+            }
         }
+    }
+
+    /// HTML #fragment-parsing-algorithm-steps for markup inserted relative to
+    /// `target`, whose node document chooses the parser: the XML fragment
+    /// parsing algorithm in an XML document, otherwise the HTML one. The
+    /// context is `context` (an element), or a new body element when None.
+    /// A ShadowRoot or template-contents target parses in its host's context.
+    /// `None` reports an XML well-formedness error (a SyntaxError); with
+    /// `check_only` no nodes are created.
+    pub(crate) fn fragment_parse(
+        &mut self,
+        target: NodeId,
+        context: Option<NodeId>,
+        markup: &str,
+        check_only: bool,
+    ) -> Option<Vec<NodeId>> {
+        let context = context.and_then(|id| match self.nodes[id].data {
+            NodeData::Element { .. } => Some(id),
+            NodeData::Fragment => self.shadow_hosts.get(&id).copied(),
+            _ => None,
+        });
+        let document = self.owner_document(target).unwrap_or(target);
+        if self.is_xml_document(document) {
+            if check_only {
+                return self
+                    .xml_fragment_well_formed(context, markup)
+                    .then(Vec::new);
+            }
+            return self.parse_xml_fragment(context, markup);
+        }
+        if check_only {
+            return Some(Vec::new());
+        }
+        let scripting = self.scripting_enabled_for(target);
+        Some(self.parse_html_fragment_for(context, markup, scripting))
     }
 
     fn parse_fragment_with(
@@ -9453,6 +9606,7 @@ impl Dom {
         context: QualName,
         context_attrs: Vec<Attribute>,
         html: &str,
+        scripting: bool,
     ) -> Vec<NodeId> {
         let sink = Sink {
             dom: RefCell::new(Dom::new()),
@@ -9460,9 +9614,14 @@ impl Dom {
             // disallowing declarative roots, unlike navigation parsing.
             allow_declarative_shadow_roots: false,
         };
-        let frag: Dom =
-            html5ever::parse_fragment(sink, ParseOpts::default(), context, context_attrs, false)
-                .one(StrTendril::from(html));
+        // HTML #html-fragment-parsing-algorithm steps 10–12: the scripting
+        // mode is Inert, or Disabled when scripting is disabled for the
+        // context's node document; a noscript context starts in RAWTEXT
+        // unless it is Disabled.
+        let mut opts = ParseOpts::default();
+        opts.tree_builder.scripting_enabled = scripting;
+        let frag: Dom = html5ever::parse_fragment(sink, opts, context, context_attrs, scripting)
+            .one(StrTendril::from(html));
         // The fragment's children land under <html> under the document.
         let html_el = frag
             .child_iter(DOCUMENT)
@@ -9480,8 +9639,11 @@ impl Dom {
     /// which breaks any consumer that reads `newDocument.head`/`.body` separately
     /// (a view-transitions swap, most notably).
     pub fn parse_document_into(&mut self, html: &str) -> NodeId {
-        // DOMParser's new Document keeps allow declarative shadow roots false.
-        let src = Dom::parse_html_document(html, false);
+        // DOMParser's new Document keeps allow declarative shadow roots false,
+        // and has no browsing context, so its parser's scripting mode is
+        // Disabled (HTML #dom-domparser-parsefromstring, #scripting-mode):
+        // noscript content parses as markup.
+        let src = Dom::parse_html_document_with(html, false, false);
         let doc = self.new_node(NodeData::Document);
         self.nodes[doc].owner_document = doc;
         self.document_modes.insert(doc, src.document_mode(DOCUMENT));
@@ -10534,22 +10696,19 @@ impl Dom {
                 // is observable through `script.innerHTML`; template engines
                 // commonly store markup in `<script type="text/template">`
                 // and expect the getter to return markup, not `&lt;...&gt;`.
+                // A noscript parent counts only while scripting is enabled for
+                // the node (HTML #serialising-html-fragments).
                 let raw_text_parent = js_serialization
-                    && self.nodes[id].parent.is_some_and(|parent| {
-                        matches!(
-                            self.tag_name(parent),
+                    && self.nodes[id]
+                        .parent
+                        .is_some_and(|parent| match self.tag_name(parent) {
                             Some(
-                                "style"
-                                    | "script"
-                                    | "xmp"
-                                    | "iframe"
-                                    | "noembed"
-                                    | "noframes"
-                                    | "plaintext"
-                                    | "noscript"
-                            )
-                        )
-                    });
+                                "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes"
+                                | "plaintext",
+                            ) => true,
+                            Some("noscript") => self.scripting_enabled_for(id),
+                            _ => false,
+                        });
                 if raw_text_parent {
                     out.push_str(t);
                 } else {
@@ -24916,6 +25075,42 @@ mod tests {
             check(&dom, fragment, doc, None, None),
             Err(HierarchyRequest)
         );
+    }
+
+    #[test]
+    fn scripting_flag_follows_the_node_document() {
+        // HTML #concept-n-noscript: a document without a browsing context
+        // (DOMParser) parses noscript content as markup (#scripting-mode
+        // Disabled) and serializes its text escaped; the window's document
+        // keeps noscript content raw (#html-fragment-parsing-algorithm).
+        let mut dom = Dom::parse_document("<body><noscript id=live></noscript>");
+        let detached = dom.parse_document_into("<body><noscript><p>a</p></noscript>");
+        let noscript = dom
+            .descendants(detached)
+            .into_iter()
+            .find(|&n| dom.tag_name(n) == Some("noscript"))
+            .unwrap();
+        assert_eq!(
+            dom.tag_name(dom.node(noscript).first_child.unwrap()),
+            Some("p")
+        );
+        assert!(!dom.scripting_enabled_for(noscript));
+        let nodes = dom
+            .fragment_parse(noscript, Some(noscript), "<b>&lt;</b>", false)
+            .unwrap();
+        assert_eq!(dom.tag_name(nodes[0]), Some("b"));
+        let text = dom.create_text("<x>");
+        dom.append(noscript, text);
+        assert!(dom.inner_html(noscript).ends_with("&lt;x&gt;"));
+        let live = dom.get_by_id("live").unwrap();
+        assert!(dom.scripting_enabled_for(live));
+        let nodes = dom
+            .fragment_parse(live, Some(live), "<b>x</b>", false)
+            .unwrap();
+        assert!(matches!(dom.node(nodes[0]).data, NodeData::Text(_)));
+        let text = dom.create_text("<x>");
+        dom.append(live, text);
+        assert_eq!(dom.inner_html(live), "<x>");
     }
 
     #[test]

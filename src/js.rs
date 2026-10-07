@@ -123,6 +123,12 @@ pub(crate) fn response_body_is_binary(content_type: &str) -> bool {
     false
 }
 
+/// MIME Sniffing #xml-mime-type: a MIME type whose subtype ends in "+xml",
+/// or whose essence is "text/xml" or "application/xml".
+pub(crate) fn is_xml_mime_type(essence: &str) -> bool {
+    essence == "text/xml" || essence == "application/xml" || essence.ends_with("+xml")
+}
+
 pub(crate) fn headers_to_blob(headers: &[(String, String)]) -> String {
     let mut blob = String::new();
     for (name, value) in headers {
@@ -169,6 +175,9 @@ pub struct PageEnv {
     /// HTML #documentEncoding: the encoding the document's bytes were
     /// decoded with (`document.characterSet`).
     pub(crate) document_encoding: &'static encoding_rs::Encoding,
+    /// The response's MIME type essence: an XML MIME type makes the page an
+    /// XML document built by the XML parser (HTML #read-xml).
+    pub(crate) content_type: String,
 }
 
 impl PageEnv {
@@ -192,6 +201,7 @@ impl PageEnv {
             scripted_frames: false,
             last_modified: None,
             document_encoding: encoding_rs::UTF_8,
+            content_type: String::from("text/html"),
         }
     }
 }

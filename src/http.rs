@@ -5588,6 +5588,7 @@ async fn execute_js_with_presentation(
         scripted_frames,
         last_modified: document_last_modified(&response.url, &response.headers),
         document_encoding,
+        content_type: media.clone(),
     };
     // The page actor owns the engine on its own dedicated stack. Its first
     // event is `Static`
