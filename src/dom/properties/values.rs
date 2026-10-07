@@ -21,7 +21,8 @@ pub(super) fn parse<'i>(
         | Kind::Angle
         | Kind::AnglePercentage
         | Kind::Time
-        | Kind::Resolution => math::parse(p, kind, ctx, depth),
+        | Kind::Resolution
+        | Kind::NumberPercentage => math::parse(p, kind, ctx, depth),
         Kind::String => Ok(string_text(&p.expect_string_cloned()?)),
         Kind::CustomIdent | Kind::Ident(_) => {
             let name = p.expect_ident_cloned()?.to_string();

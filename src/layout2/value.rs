@@ -119,17 +119,18 @@ impl Node {
                 let mut values = args.iter();
                 let first = values.next()?.eval(basis)?;
                 values.try_fold(first, |value, arg| {
-                    let arg = arg.eval(basis)?;
+                    let (value, arg) = (f64::from(value), f64::from(arg.eval(basis)?));
                     Some(if min {
                         css_min(value, arg)
                     } else {
                         css_max(value, arg)
-                    })
+                    } as f32)
                 })
             }
             Node::Clamp(lo, val, hi) => {
-                let v = val.eval(basis)?;
-                Some(css_max(lo.eval(basis)?, css_min(v, hi.eval(basis)?)))
+                let v = f64::from(val.eval(basis)?);
+                let (lo, hi) = (f64::from(lo.eval(basis)?), f64::from(hi.eval(basis)?));
+                Some(css_clamp(lo, v, hi) as f32)
             }
             Node::Sum(a, b, sign) => Some(a.eval(basis)? + sign * b.eval(basis)?),
             Node::Scale(a, f) => Some(a.eval(basis)? * f),
@@ -155,9 +156,9 @@ impl Node {
 }
 
 /// CSS Values 4 #calc-ieee: NaN wins any comparison, and 0⁻ is less than 0⁺.
-fn css_min(a: f32, b: f32) -> f32 {
+pub(crate) fn css_min(a: f64, b: f64) -> f64 {
     if a.is_nan() || b.is_nan() {
-        f32::NAN
+        f64::NAN
     } else if a < b || a == b && a.is_sign_negative() {
         a
     } else {
@@ -165,14 +166,20 @@ fn css_min(a: f32, b: f32) -> f32 {
     }
 }
 
-fn css_max(a: f32, b: f32) -> f32 {
+pub(crate) fn css_max(a: f64, b: f64) -> f64 {
     if a.is_nan() || b.is_nan() {
-        f32::NAN
+        f64::NAN
     } else if a > b || a == b && b.is_sign_negative() {
         a
     } else {
         b
     }
+}
+
+/// CSS Values 4 #funcdef-clamp: `max(min, min(val, max))`, so a minimum
+/// above the maximum wins, and `clamp(0⁺, 0⁻, 1)` is 0⁺.
+pub(crate) fn css_clamp(min: f64, value: f64, max: f64) -> f64 {
+    css_max(min, css_min(value, max))
 }
 
 /// The largest length magnitude a calculation resolves to: 2²⁵ CSS px, the
