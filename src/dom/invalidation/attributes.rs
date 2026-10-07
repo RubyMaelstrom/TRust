@@ -7,6 +7,16 @@
 //! from changed membership to inclusive siblings before resuming the outer path.
 //! See https://drafts.csswg.org/selectors-4/#match-a-selector-against-an-element
 //! (local CSSWG snapshot 81c27f68690138345b2b3b6af8ccc42dad3dca1d).
+//!
+//! Selectors stay within one tree, so these paths follow light-tree axes,
+//! except where CSS Shadow 1 (formerly CSS Scoping 1, same snapshot) lets a
+//! shadow tree's rules reach a host or its slottables: `:host()` tests the
+//! host in its own context while its compound's combinators continue inside
+//! the shadow tree (#host-element-in-tree, #host-selector), and
+//! `::slotted()` represents the elements assigned, after flattening, to a
+//! slot (#slotted-pseudo). Inheritance follows the flat tree (#flattening);
+//! `Dom::apply_style_invalidations` restyles flat-tree descendants of every
+//! subject, so these paths need only name the subjects themselves.
 
 use super::*;
 
@@ -22,7 +32,14 @@ enum Axis {
     Previous,
     Preceding,
     InclusiveSiblings,
+    /// Inherited state: the node and its shadow-including descendants.
     InclusiveDescendants,
+    /// A shadow host as `:host()` sees it: the host, every element of its
+    /// shadow tree (where the compound's combinators continue), and its
+    /// light children, the slottables a `::slotted()` subject can name.
+    HostScope,
+    /// From a slot to the elements assigned to it after flattening.
+    Assigned,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -138,8 +155,9 @@ pub(super) struct Dependencies {
     /// author attribute name can alias a state.
     states: [FxHashSet<Route>; 3],
     broad: FxHashSet<String>,
-    /// A state inside `:host()`/`::slotted()` needs a scope-bearing route,
-    /// which these paths do not express. Indexed by `LiveState`.
+    /// A state inside an argument these paths cannot follow (such as a
+    /// `:has()` in `:host()`), which takes the complete fallback. Indexed by
+    /// `LiveState`.
     broad_states: [bool; 3],
     overflow: bool,
     routes: usize,
@@ -208,17 +226,35 @@ impl Dependencies {
     }
 
     fn complex(&mut self, selector: &Complex, outer: &[Step], broad: bool) {
+        // `::slotted()` is a pseudo-element of the subject slot: the elements
+        // it represents, not the slot, are the rule's real subjects. It has
+        // no meaning inside a nested selector argument; keep the fallback.
+        let slotted = selector
+            .0
+            .last()
+            .and_then(|(_, compound)| compound.slotted.as_deref());
+        let broad = broad || (slotted.is_some() && !outer.is_empty());
         for (index, (_, compound)) in selector.0.iter().enumerate() {
             let mut path: Vec<_> = selector.0[index + 1..]
                 .iter()
                 .map(|(combinator, compound)| Step::forward(combinator, compound))
                 .collect();
+            if let Some(slotted) = slotted {
+                path.push(Step::compound(Axis::Assigned, slotted));
+            }
             path.extend_from_slice(outer);
             self.compound(compound, &path, broad);
         }
     }
 
     fn compound(&mut self, compound: &Compound, path: &[Step], broad: bool) {
+        // A `:host` compound matches the host, whose combinators lead into
+        // its shadow tree rather than along the host's own light tree.
+        let host_scope = [Step::new(Axis::HostScope, &None)];
+        let path = if compound.host { &host_scope[..] } else { path };
+        // `:host:has()` reads the shadow tree as the host's children, which
+        // the reverse light-tree axes below cannot climb back out of.
+        let broad = broad || (compound.host && !compound.has.is_empty());
         let mut guarded_path = vec![Step::compound(Axis::SelfOnly, compound)];
         guarded_path.extend_from_slice(path);
         let path = guarded_path.as_slice();
@@ -242,7 +278,7 @@ impl Dependencies {
             inert_pseudo_element: _,
             scope: _,
             root: _,
-            host: _,
+            host,
             pseudo: _,
             pseudos: _,
             relative_anchor: _,
@@ -297,10 +333,17 @@ impl Dependencies {
                 }
             }
         }
-        for inner in [host_inner, slotted].into_iter().flatten() {
-            // Tree-scoped matching requires a scope-bearing route. The caller
-            // also protects implicit slot and inherited flat-tree dependencies.
-            self.compound(inner, path, true);
+        if let Some(inner) = host_inner {
+            // CSS Shadow 1 #host-selector: the argument tests the host "in
+            // its normal context". A `:has()` there could look past the
+            // light-tree axes these paths walk; keep its fallback.
+            debug_assert!(*host);
+            self.compound(inner, &host_scope, broad || !inner.has.is_empty());
+        }
+        if let Some(inner) = slotted {
+            // CSS Shadow 1 #slotted-pseudo: the argument tests the assigned
+            // element itself, which is then the subject.
+            self.compound(inner, &[], broad || !inner.has.is_empty());
         }
         for state in states {
             let (names, inherited): (&[&str], bool) = match state {
@@ -483,12 +526,45 @@ impl Dependencies {
                                 visit(id)?;
                             }
                         }
-                        Axis::Descendant | Axis::InclusiveDescendants => {
-                            if step.axis == Axis::InclusiveDescendants {
-                                visit(node)?;
-                            }
+                        Axis::Descendant => {
                             for id in dom.descendants(node) {
                                 visit(id)?;
+                            }
+                        }
+                        Axis::InclusiveDescendants => {
+                            // Inherited states (lang, disabled, editability):
+                            // `:lang()` reads the flat tree, which reaches a
+                            // host's shadow tree and a slot's assigned nodes.
+                            // Visiting both trees over-approximates either.
+                            let mut stack = vec![node];
+                            let mut seen = FxHashSet::default();
+                            while let Some(id) = stack.pop() {
+                                if !seen.insert(id) {
+                                    continue;
+                                }
+                                visit(id)?;
+                                dom.push_composed_children(id, &mut stack);
+                                if dom.tag_name(id) == Some("slot") {
+                                    stack.extend(dom.slot_assigned_nodes(id));
+                                }
+                            }
+                        }
+                        Axis::HostScope => {
+                            visit(node)?;
+                            if let Some(shadow) = dom.shadow_root(node) {
+                                for id in dom.descendants(shadow) {
+                                    visit(id)?;
+                                }
+                            }
+                            for id in dom.child_iter(node) {
+                                visit(id)?;
+                            }
+                        }
+                        Axis::Assigned => {
+                            if dom.tag_name(node) == Some("slot") {
+                                for id in dom.flat_slot_nodes(node) {
+                                    visit(id)?;
+                                }
                             }
                         }
                         Axis::Parent => {

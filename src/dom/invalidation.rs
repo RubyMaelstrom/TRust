@@ -4,9 +4,11 @@
 //! conditions. Attribute writes invalidate the selector subjects reachable
 //! through compiled dependency paths, not every element merely because the
 //! DOM revision changed. Dependency proofs are owned by a Document, including
-//! its shadow trees, rather than the whole presentation arena. Cross-shadow
-//! and untracked state associations retain an explicit full fallback;
-//! optional cache budgets never truncate content.
+//! its shadow trees, rather than the whole presentation arena. Shadow rules
+//! reach across trees only through `:host()` and `::slotted()` routes, and
+//! restyling follows the flat tree; slot reassignment, hover and focus state
+//! in shadow-including trees, and untracked state associations retain an
+//! explicit full fallback. Optional cache budgets never truncate content.
 
 use super::*;
 
@@ -891,13 +893,25 @@ impl SelectorDependencies {
             states,
             scope: _,
             root: _,
-            host: _,
+            host,
             host_inner,
             slotted,
             pseudo: _,
             pseudos: _,
             relative_anchor: _,
         } = compound;
+        // CSS Shadow 1 #host-element-in-tree: for its own shadow tree's
+        // selectors the host stands in for the shadow root, so a `:has()` on
+        // `:host` reads that tree, beyond the anchors found by climbing
+        // selector parents (which stop at the shadow root).
+        if *host
+            && (!has.is_empty()
+                || host_inner
+                    .as_ref()
+                    .is_some_and(|inner| !inner.has.is_empty()))
+        {
+            self.structure_global = true;
+        }
         for selector in nots
             .iter()
             .flatten()
@@ -1062,7 +1076,10 @@ impl Dom {
             self.invalidate_style_subtree(root, true);
             return Some(Vec::new());
         }
-        if subjects.is_none() || self.shadow_style_dependencies(node) {
+        // Shadow rules are in this Document's routes: `:host()` and
+        // `::slotted()` reach the host, its shadow tree and its slottables,
+        // and restyling a subject restyles its flat-tree descendants.
+        if subjects.is_none() {
             if casc_diag_on() {
                 eprintln!(
                     "DIAGINVALID attribute node={node} tag={:?} id={:?} name={name} impact=All shadow={}",
@@ -1343,6 +1360,24 @@ impl Dom {
                 }
             }
             pending.extend(self.child_iter(node).map(|child| (child, selectors)));
+            // CSS Shadow 1 #flattening: inherited values follow the flat
+            // tree, which puts a host's shadow-tree children under the host
+            // and a slot's assigned nodes (after flattening) under the slot.
+            // The shadow root itself is included: values that propagate
+            // along the composed tree (decorations) are cached on it too.
+            if let Some(shadow) = self.shadow_root(node) {
+                pending.push((shadow, selectors));
+            }
+            // A slot's flat-tree children are its assigned nodes; an assigned
+            // slot is itself a flat-tree element and expands in turn. (Its
+            // fallback children are its light children, already queued.)
+            if self.tag_name(node) == Some("slot") {
+                pending.extend(
+                    self.slot_assigned_nodes(node)
+                        .into_iter()
+                        .map(|assigned| (assigned, selectors)),
+                );
+            }
         }
         #[cfg(test)]
         self.pending_style_invalidations
@@ -1409,12 +1444,34 @@ impl Dom {
         false
     }
 
+    /// DOM #find-slotables and CSS Shadow 1 #flattening, #slotted-pseudo: a
+    /// child-list change can reassign slottables, which changes `::slotted()`
+    /// matches and the flat-tree parent their inherited values come from.
+    /// Only a shadow host's children are slottables, and only inserting or
+    /// removing a `<slot>` changes which slot receives them. The changed
+    /// subtrees themselves are restyled by the tree operation.
+    fn child_list_may_reassign_slots(&self, parent: NodeId, changed: &[NodeId]) -> bool {
+        if !self.shadow_style_dependencies(parent) {
+            return false;
+        }
+        if self.shadow_root(parent).is_some() || changed.is_empty() {
+            return true;
+        }
+        changed.iter().any(|&node| {
+            self.nodes.get(node).is_some()
+                && (self.tag_name(node) == Some("slot")
+                    || self
+                        .descendants(node)
+                        .any(|descendant| self.tag_name(descendant) == Some("slot")))
+        })
+    }
+
     /// `changed` names the inserted/removed children (empty when unknown).
     pub(super) fn invalidate_structure(&mut self, parent: NodeId, changed: &[NodeId]) {
         // Detached construction uses the same dependency proof. Recursively
         // invalidating its entire growing root on each append would make a
         // fragment-building loop quadratic even without structural selectors.
-        let local = (!self.shadow_style_dependencies(parent))
+        let local = (!self.child_list_may_reassign_slots(parent, changed))
             .then(|| {
                 let index = self.style_cache.borrow();
                 index.as_ref().and_then(|(epoch, index)| {
@@ -1444,10 +1501,10 @@ impl Dom {
             if casc_diag_on() {
                 let index = self.style_cache.borrow();
                 eprintln!(
-                    "DIAGINVALID structure node={parent} tag={:?} id={:?} shadow={} dependencies={:?}",
+                    "DIAGINVALID structure node={parent} tag={:?} id={:?} slots={} dependencies={:?}",
                     self.tag_name(parent),
                     self.attr(parent, "id"),
-                    self.shadow_style_dependencies(parent),
+                    self.child_list_may_reassign_slots(parent, changed),
                     index.as_ref().map(|(epoch, index)| {
                         let dependencies = index.selector_dependencies.for_node(self, parent);
                         (
@@ -1548,7 +1605,8 @@ impl Dom {
         character_data: Option<NodeId>,
     ) {
         let stable_shadow_text = character_data.is_some() && !empty_changed && !direction_changed;
-        let independent = (!self.shadow_style_dependencies(parent) || stable_shadow_text) && {
+        // A shadow host's Text children are slottables (DOM #find-slotables).
+        let independent = (self.shadow_root(parent).is_none() || stable_shadow_text) && {
             let index = self.style_cache.borrow();
             index.as_ref().is_some_and(|(epoch, index)| {
                 let dependencies = index.selector_dependencies.for_node(self, parent);
@@ -1582,7 +1640,8 @@ impl Dom {
     /// Selectors 4 #the-dir-pseudo and HTML #contained-text-auto-directionality:
     /// text only affects directionality inside an automatic-direction subtree.
     /// Explicit ltr/rtl and excluded descendants stop the upward dependency.
-    /// Shadow/slot dependencies have already taken the conservative fallback.
+    /// The walk follows the flat tree (`style_parent`), as directionality does
+    /// through slots and shadow roots.
     fn text_may_change_direction(&self, parent: NodeId) -> bool {
         let mut current = Some(parent);
         while let Some(node) = current {
@@ -1751,11 +1810,20 @@ mod tests {
         };
         let warm = values(dom);
         dom.mark();
-        assert_eq!(
-            warm,
-            values(dom),
-            "local invalidation differs from full recascade"
-        );
+        let cold = values(dom);
+        if warm != cold {
+            for (w, c) in warm.iter().zip(&cold) {
+                if w != c {
+                    eprintln!(
+                        "DIFF {:?} parent={:?} flat={:?}\n  warm {w:?}\n  cold {c:?}",
+                        dom.tag_name(w.0),
+                        dom.nodes[w.0].parent,
+                        dom.parent_flat(w.0)
+                    );
+                }
+            }
+        }
+        assert_eq!(warm, cold, "local invalidation differs from full recascade");
     }
 
     #[test]
@@ -2198,6 +2266,258 @@ mod tests {
             Some("purple")
         );
         assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn shadow_rules_invalidate_only_their_hosts_and_slottables() {
+        // CSS Shadow 1 #host-selector, #slotted-pseudo and #flattening (local
+        // CSSWG snapshot 81c27f686901): `:host()` tests the host and continues
+        // inside its shadow tree, `::slotted()` names elements assigned to a
+        // slot, and inheritance follows the flat tree. A document with a
+        // shadow root (reflection.ai's consent banner, every Next.js route
+        // announcer) used to restyle every element on any mutation.
+        let mut dom = Dom::parse_document(
+            "<style>.wide {font-size:30px} .tone {color:green}</style>\
+             <body><main id=stable class=tone>stable<span id=stable_child>s</span></main>\
+             <div id=toggler>toggle</div>\
+             <x-host id=host class=one><span id=slotted class=s>slotted<b id=deep>deep</b></span></x-host></body>",
+        );
+        let id = |dom: &Dom, name: &str| dom.get_by_id(name).unwrap();
+        let (stable, toggler, host, slotted, deep) = (
+            id(&dom, "stable"),
+            id(&dom, "toggler"),
+            id(&dom, "host"),
+            id(&dom, "slotted"),
+            id(&dom, "deep"),
+        );
+        let root = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        let css = dom.create_text(
+            ":host(.dark) .inner {color:rgb(255, 0, 0)} :host(.dark) {font-size:20px} \
+             ::slotted(.s.big) {font-size:31px} .wrap.blue {color:rgb(0, 0, 255)} \
+             slot.loud::slotted(*) {padding-left:7px} :host(.tall) {line-height:3}",
+        );
+        dom.append(style, css);
+        dom.append(root, style);
+        let wrap = dom.create_element("div");
+        dom.set_attr(wrap, "class", "wrap");
+        let inner = dom.create_element("span");
+        dom.set_attr(inner, "class", "inner");
+        let text = dom.create_text("inner");
+        dom.append(inner, text);
+        let slot = dom.create_element("slot");
+        dom.append(wrap, inner);
+        dom.append(wrap, slot);
+        dom.append(root, wrap);
+        let value = |dom: &Dom, node, property| dom.computed_value_resolved(node, property);
+        let retained = |dom: &Dom, before: &std::rc::Rc<CascadedMaps>| {
+            std::rc::Rc::ptr_eq(before, &dom.cascaded_maps(stable))
+        };
+        assert_style_values_match_cold(&mut dom);
+
+        // An unrelated light-tree class change stays local.
+        let (before, epoch) = (dom.cascaded_maps(stable), dom.style_value_epoch);
+        dom.set_attr(toggler, "class", "wide");
+        assert_eq!(dom.font_px(toggler), 30.);
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a light class change expired every style"
+        );
+        assert!(retained(&dom, &before));
+        assert_style_values_match_cold(&mut dom);
+
+        // :host() reaches the host and its shadow tree; inherited values
+        // reach the slotted element through the slot.
+        let (before, epoch) = (dom.cascaded_maps(stable), dom.style_value_epoch);
+        dom.set_attr(host, "class", "one dark");
+        assert_eq!(
+            value(&dom, inner, "color").as_deref(),
+            Some("rgb(255, 0, 0)")
+        );
+        assert_eq!(dom.font_px(host), 20.);
+        assert_eq!(dom.font_px(slotted), 20.);
+        assert_eq!(dom.font_px(deep), 20.);
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a host class change expired every style"
+        );
+        assert!(retained(&dom, &before));
+        assert_style_values_match_cold(&mut dom);
+
+        // ::slotted() names the assigned element itself.
+        let before = dom.cascaded_maps(stable);
+        dom.set_attr(slotted, "class", "s big");
+        assert_eq!(dom.font_px(slotted), 31.);
+        assert_eq!(dom.font_px(deep), 31.);
+        assert!(retained(&dom, &before));
+        assert_style_values_match_cold(&mut dom);
+
+        // A shadow-tree change reaches the slotted content it passes values to.
+        let before = dom.cascaded_maps(stable);
+        dom.set_attr(wrap, "class", "wrap blue");
+        assert_eq!(
+            value(&dom, slotted, "color").as_deref(),
+            Some("rgb(0, 0, 255)")
+        );
+        assert_eq!(
+            value(&dom, deep, "color").as_deref(),
+            Some("rgb(0, 0, 255)")
+        );
+        assert!(retained(&dom, &before));
+        assert_style_values_match_cold(&mut dom);
+
+        // A slot's own class selects which elements ::slotted() represents.
+        dom.set_attr(slot, "class", "loud");
+        assert_eq!(value(&dom, slotted, "padding-left").as_deref(), Some("7px"));
+        assert_style_values_match_cold(&mut dom);
+
+        // An inline style on the host is inherited through the flat tree.
+        let before = dom.cascaded_maps(stable);
+        dom.set_attr(host, "style", "font-size:13px");
+        assert_eq!(dom.font_px(wrap), 13.);
+        assert_eq!(dom.font_px(inner), 13.);
+        dom.set_attr(host, "class", "one dark tall");
+        assert_eq!(
+            value(&dom, wrap, "line-height").as_deref(),
+            value(&dom, host, "line-height").as_deref()
+        );
+        assert!(retained(&dom, &before));
+        assert_style_values_match_cold(&mut dom);
+
+        // Child-list changes outside a host's children stay local; a host's
+        // children are slottables, and a moved slot reassigns them.
+        let (before, epoch) = (dom.cascaded_maps(stable), dom.style_value_epoch);
+        let probe = dom.create_element("span");
+        dom.append(toggler, probe);
+        dom.set_attr(probe, "class", "wide");
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a light insertion expired every style"
+        );
+        assert!(retained(&dom, &before));
+        assert_style_values_match_cold(&mut dom);
+        let extra = dom.create_element("em");
+        dom.set_attr(extra, "class", "s big");
+        dom.append(host, extra);
+        assert_eq!(dom.font_px(extra), 31.);
+        assert_style_values_match_cold(&mut dom);
+        let first = dom.create_element("slot");
+        dom.insert_before(wrap, first, Some(inner));
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn random_mutations_across_shadow_trees_match_full_recascade() {
+        for seed in [
+            0x2545_f491_4f6c_dd1du64,
+            0x9e37_79b9_7f4a_7c15,
+            0xdead_beef_cafe_f00d,
+        ] {
+            random_shadow_mutations(seed, 600);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn stress_random_shadow_mutations() {
+        for seed in 1..=60u64 {
+            random_shadow_mutations(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, 800);
+        }
+    }
+
+    fn random_shadow_mutations(seed: u64, steps: usize) {
+        // Incremental invalidation must never be less correct than a full
+        // recascade (CSS Shadow 1 #host-selector, #slotted-pseudo,
+        // #flattening; Selectors 4 #lang-pseudo). A forwarding slot, nested
+        // hosts, `:host()`, `::slotted()`, inherited `:lang()` and `:has()`
+        // inside the shadow tree, mutated in a fixed pseudo-random order.
+        let mut dom = Dom::parse_document(
+            "<style>.a .x {color:rgb(1, 0, 0)} .c + .x {font-size:11px} .e > .x {padding-left:3px} \
+             .b {line-height:2} .d .y {color:rgb(0, 1, 0)} \
+             .a ~ .y {height:4px} [slot=named] {width:6px} :nth-child(2 of .x) {padding-left:8px} \
+             .b:has(> .c) {font-size:15px}</style>\
+             <body><div id=l0 class=x><span id=l1 class=y>t</span></div>\
+             <x-outer id=outer><p id=s0 class=x>one</p><p id=s1 class=y>two</p></x-outer>\
+             <section id=l2><i id=l3 class=x>i</i></section></body>",
+        );
+        let outer = dom.get_by_id("outer").unwrap();
+        let outer_root = dom.attach_shadow(outer);
+        let shadow_css = ":host(.a) .x {color:rgb(2, 0, 0)} :host(.b) {font-size:21px} \
+             :host(:not(.c)) .y {padding-left:5px} ::slotted(.d) {line-height:3} \
+             slot.e::slotted(*) {color:rgb(0, 0, 2)} .f .x {font-size:13px} \
+             :lang(fr) {text-decoration:underline} .x:has(.g) {width:7px} :host .h {height:9px} \
+             slot[name=named]::slotted(*) {line-height:4} :host([lang]) .y {width:2px} \
+             .x > .y {color:rgb(3, 3, 3)} :not(:host(.h)) .x {height:5px} .f + .y {display:block}";
+        let mut elements = vec![
+            dom.get_by_id("l0").unwrap(),
+            dom.get_by_id("l1").unwrap(),
+            dom.get_by_id("l2").unwrap(),
+            dom.get_by_id("l3").unwrap(),
+            dom.get_by_id("s0").unwrap(),
+            dom.get_by_id("s1").unwrap(),
+            outer,
+        ];
+        let build = |dom: &mut Dom, root: NodeId, css: &str, elements: &mut Vec<NodeId>| {
+            let style = dom.create_element("style");
+            let text = dom.create_text(css);
+            dom.append(style, text);
+            dom.append(root, style);
+            let wrap = dom.create_element("div");
+            dom.set_attr(wrap, "class", "x");
+            let leaf = dom.create_element("span");
+            dom.set_attr(leaf, "class", "y");
+            let text = dom.create_text("leaf");
+            dom.append(leaf, text);
+            let slot = dom.create_element("slot");
+            dom.append(wrap, leaf);
+            dom.append(wrap, slot);
+            dom.append(root, wrap);
+            elements.extend([wrap, leaf, slot]);
+            (wrap, slot)
+        };
+        let (outer_wrap, _) = build(&mut dom, outer_root, shadow_css, &mut elements);
+        // A nested host forwards the outer slot's content through its own.
+        let inner = dom.create_element("x-inner");
+        dom.append(outer_wrap, inner);
+        let forward = dom.create_element("slot");
+        dom.append(inner, forward);
+        let inner_root = dom.attach_shadow(inner);
+        build(&mut dom, inner_root, shadow_css, &mut elements);
+        elements.extend([inner, forward]);
+        assert_style_values_match_cold(&mut dom);
+
+        let mut state = seed;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let classes = ["a", "b", "c", "d", "e", "f", "g", "h", "x", "y"];
+        let shadow_parents = elements.clone();
+        for _ in 0..steps {
+            let node = elements[next(elements.len())];
+            match next(9) {
+                0 => dom.set_attr(node, "lang", ["fr", "en"][next(2)]),
+                1 => dom.set_attr(node, "style", &format!("font-size:{}px", 10 + next(8))),
+                2 => {
+                    // Light or shadow insertion, possibly of a slot.
+                    let parent = shadow_parents[next(shadow_parents.len())];
+                    let child = dom.create_element(["span", "slot", "b"][next(3)]);
+                    dom.set_attr(child, "class", classes[next(classes.len())]);
+                    dom.append(parent, child);
+                    elements.push(child);
+                }
+                3 if node != outer && node != inner => dom.detach(node),
+                4 => dom.set_attr(node, "slot", ["", "named"][next(2)]),
+                5 => dom.set_attr(node, "name", ["", "named"][next(2)]),
+                _ => {
+                    let tokens: Vec<_> = classes.iter().filter(|_| next(3) == 0).copied().collect();
+                    dom.set_attr(node, "class", &tokens.join(" "));
+                }
+            }
+            assert_style_values_match_cold(&mut dom);
+        }
     }
 
     #[test]
