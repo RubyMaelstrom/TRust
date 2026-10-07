@@ -2305,8 +2305,11 @@ impl Dom {
         self.epoch = self.epoch.wrapping_add(1);
         // Diagnostic: record WHEN the DOM last changed, so we can size the
         // gap between DOM-stability and load-finish (the telemetry/idle
-        // tail). Gated on the trace flag.
-        if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        // tail). Gated on the trace flag, read once: every tree mutation
+        // passes here, and an environment lookup per mutation was a fifth
+        // of a native append/remove.
+        static NET_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NET_TRACE.get_or_init(|| std::env::var_os("TRUST_NET_TRACE").is_some()) {
             LAST_MUTATION_MS.with(|c| c.set(crate::http::trace_ms()));
         }
     }
