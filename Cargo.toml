@@ -153,7 +153,7 @@ ratatui = "0.30.2"
 # `av1::Decoder`'s containment, plus later Rust-path optimizations and a
 # T.35 metadata underflow fix. Move to a crates.io release that has the Rust API.
 rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "d3d1cd67059f47803919be8276650e5870c9fd02", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
-ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 # FxHash for the DOM's hot maps (per-epoch caches, rule buckets, winner
 # maps). Pure Rust; SipHash's HashDoS
 # resistance buys nothing for arena-internal keys.
@@ -290,14 +290,13 @@ wasmi = { path = "vendor/wasmi-1.1.0" }
 wasmi_core = { path = "vendor/wasmi_core-1.1.0" }
 wasmi_ir = { path = "vendor/wasmi_ir-1.1.0" }
 wasmi_collections = { path = "vendor/wasmi_collections-1.1.0" }
-# TRust's vendored ratatui-image fork (updated 11.0.4 -> 11.0.6 before vendoring:
-# the 11.0.5 large-image multiply-overflow fix + the 11.0.6 chafa '\0' control-
-# char filter; the sixel/sliced path is otherwise byte-identical to 11.0.4). We
-# own it to memoize the per-image sixel byte-string: `SlicedSixelData::to_sequence`
-# (`bands().join()`) rebuilt every visible image's whole sixel string on every
-# full-frame redraw — the dominant at-rest main-thread cost on sixel terminals. The
-# `SlicedProtocol::Sixel` variant now carries a 1-entry `SixelSeqCache` so an
-# unchanged on-screen image is reused instead of rebuilt. See src/sliced.rs.
+# TRust's vendored ratatui-image fork, rebased onto 11.1.0 (2026-10-07; first
+# vendored from 11.0.6). We own it to memoize the per-image sixel byte-string:
+# `SlicedSixelData::to_sequence` (`bands().join()`) rebuilt every visible image's
+# whole sixel string on every full-frame redraw — the dominant at-rest
+# main-thread cost on sixel terminals. The `SlicedProtocol::Sixel` variant now
+# carries a 1-entry `SixelSeqCache` so an unchanged on-screen image is reused
+# instead of rebuilt. See src/sliced.rs.
 # 2026-07-03: both sixel sequence builders (`sixel::encode`, `to_sequence`) wrap
 # the payload DECSC … DECRC+CUF1 so the cursor lands at anchor+1 — the position
 # the ratatui backend assumes when it elides MoveTo for an adjacent next cell.
@@ -307,8 +306,10 @@ wasmi_collections = { path = "vendor/wasmi_collections-1.1.0" }
 # 2026-08-28: icy_sixel 0.5.1 began declaring the full source height with the
 # DEC raster-attributes command. SlicedSixel now rewrites Pv to the retained
 # vertical slice, so a viewport-clipped image cannot advertise off-screen rows
-# and scroll/corrupt the surrounding terminal frame.
-ratatui-image = { path = "vendor/ratatui-image-11.0.6" }
+# and scroll/corrupt the surrounding terminal frame. Upstream 11.0.7 added its
+# own Pv rewrite (whole bands times six); the fork keeps the version above, which
+# clamps to the source height and emits only the bands between skip and drop.
+ratatui-image = { path = "vendor/ratatui-image-11.1.0" }
 
 [lints.clippy]
 # Assertions may disappear in release builds; runtime mutations must not.

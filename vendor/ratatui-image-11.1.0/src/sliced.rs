@@ -235,9 +235,10 @@ impl SlicedProtocol {
             ProtocolType::Sixel => {
                 let font_size = picker.font_size();
 
-                let dyn_img = resize.resize(&dyn_img, font_size, size, None);
+                let actual_size = resize.size_for(&dyn_img, font_size, size);
+                let dyn_img = resize.resize(&dyn_img, font_size, actual_size, None);
 
-                let sixel = Sixel::new(dyn_img, size, picker.is_tmux)?;
+                let sixel = Sixel::new(dyn_img, actual_size, picker.is_tmux)?;
 
                 let sliced = SlicedSixel::from_sixel(sixel, font_size.height, picker.is_tmux);
 
@@ -318,8 +319,8 @@ impl SlicedProtocol {
 /// So this only is used for Iterm2.
 fn slice_rows(image: DynamicImage, font_size: FontSize, size: Size) -> (Vec<DynamicImage>, Size) {
     let image = image.resize(
-        (size.width * font_size.width).into(),
-        (size.height * font_size.height).into(),
+        u32::from(size.width) * u32::from(font_size.width),
+        u32::from(size.height) * u32::from(font_size.height),
         image::imageops::FilterType::Nearest,
     );
 
@@ -864,7 +865,7 @@ mod sixel_slice {
             // ceil(225 / 6) = 38, full image, no matter what font-size
             assert_eq!(38, sliced.bands(0, 0).len());
 
-            // one row is 20px, so 3 bands make 18px
+            // one row is 20px, 20/6 = 3 bands
             assert_eq!(3, sliced.bands(0, 11).len());
         }
 
