@@ -1740,7 +1740,7 @@ impl Flow<'_> {
             kind: FragKind::Block,
             children,
         };
-        let (dx, dy) = self.paint_offset(&b.style, cb.0, cb.1, frag.w, frag.h);
+        let (dx, dy) = self.paint_offset(&b.style, cb.0, cb.1, &mut frag);
         frag.flow.offset_y = dy;
         if dx != 0.0 || dy != 0.0 {
             Self::offset_frag(&mut frag, dx, dy);
@@ -1754,15 +1754,20 @@ impl Flow<'_> {
     /// The layout offset of a box: §9.4.3 relative positioning. CSS transforms
     /// are retained separately in paint state. Sticky offsets are scroll-driven and
     /// contribute zero at the initial scroll position (css-position-3 §3.4).
+    ///
+    /// Every element box is placed through here against its containing block
+    /// (`cb_w` × `cb_h`), the basis it also resolved its margin and padding
+    /// percentages against; its fragment records that basis for the used
+    /// values CSSOM #resolved-values exposes.
     pub(super) fn paint_offset(
         &self,
         s: &BoxStyle,
         cb_w: f32,
         cb_h: Option<f32>,
-        w: f32,
-        h: f32,
+        frag: &mut Frag,
     ) -> (f32, f32) {
-        s.paint_offset(cb_w, cb_h, w, h)
+        frag.flow.used.cb = [cb_w, cb_h.unwrap_or(f32::NAN)];
+        s.paint_offset(cb_w, cb_h, frag.w, frag.h)
     }
 
     /// Placeholders for a flex/grid container's out-of-flow children. Their
@@ -3123,7 +3128,7 @@ impl Flow<'_> {
             let mut frag = it.frag.take().expect("laid above");
             // §9.4.3 relative offset + transform translation — a flex item's
             // containing block is the container's content box.
-            let (rx, ry) = self.paint_offset(&it.b.style, content_w, def_ch, frag.w, frag.h);
+            let (rx, ry) = self.paint_offset(&it.b.style, content_w, def_ch, &mut frag);
             let dx = content_x + it.border_x + rx;
             let dy = content_top + it.border_y + ry;
             Self::offset_frag(&mut frag, dx, dy);
@@ -3503,7 +3508,7 @@ impl Flow<'_> {
         let mut frags: Vec<Frag> = Vec::with_capacity(fi.len());
         for it in &mut fi {
             let mut frag = it.frag.take().expect("laid above");
-            let (rx, ry) = self.paint_offset(&it.b.style, content_w, def_ch, frag.w, frag.h);
+            let (rx, ry) = self.paint_offset(&it.b.style, content_w, def_ch, &mut frag);
             let dx = content_x + it.border_x + rx;
             let dy = content_top + it.border_y + ry;
             Self::offset_frag(&mut frag, dx, dy);
@@ -4774,7 +4779,17 @@ impl Flow<'_> {
         };
         // The box's own transform translation (an abspos box is never also
         // relative, so this is the whole paint offset).
-        let (dx, dy) = self.paint_offset(s, cb.w, Some(cb.h), frag.w, frag.h);
+        let (dx, dy) = self.paint_offset(s, cb.w, Some(cb.h), &mut frag);
+        // CSS Position 3 #resolving-inset-auto: the insets that placed the
+        // margin box, an `auto` one being its distance from the containing
+        // block's edge (#resolving-inset-overconstraint). Auto margins are
+        // zero whenever an inset is auto (CSS 2 §10.3.7, §10.6.4).
+        frag.flow.used.inset = [
+            top_used,
+            cb.w - lx - ml - frag.w - m[RIGHT],
+            cb.h - top_used - mt_used - frag.h - m[BOTTOM],
+            lx,
+        ];
         let x = cb.x + lx + ml + dx;
         let y = cb.y + top_used + mt_used + dy;
         Self::offset_frag(&mut frag, x, y);
@@ -4928,7 +4943,7 @@ impl Flow<'_> {
         // position), while its fragment, descendants, and anchors receive the
         // same paint offset as an ordinary block. `item_frag` intentionally
         // returns unshifted geometry for its other flex/grid/oof callers.
-        let (dx, dy) = self.paint_offset(s, cb_w, cb_h, frag.w, frag.h);
+        let (dx, dy) = self.paint_offset(s, cb_w, cb_h, &mut frag);
         if dx != 0.0 || dy != 0.0 {
             Self::offset_frag(&mut frag, dx, dy);
             for anchor in &mut anchors {
@@ -5067,7 +5082,7 @@ impl Flow<'_> {
         // descendants, and anchors, but not its margin-box space on the line.
         // `item_frag` returns unshifted geometry, just as for flex items and
         // floats. Apply the same offset here before placing it on its line.
-        let (dx, dy) = self.paint_offset(s, cb_w, cb_h, frag.w, frag.h);
+        let (dx, dy) = self.paint_offset(s, cb_w, cb_h, &mut frag);
         if dx != 0.0 || dy != 0.0 {
             Self::offset_frag(&mut frag, dx, dy);
             for anchor in &mut anchors {

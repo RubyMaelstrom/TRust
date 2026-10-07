@@ -543,6 +543,37 @@ pub(super) fn layout_boxes(
     project(dom, root, fixed, top_layer, false).0
 }
 
+/// Each element's first box fragment's `UsedBasis` (CSSOM #resolved-values).
+/// Elements without a box fragment (display:none or contents, inline boxes)
+/// have no entry, and keep their computed values.
+pub(super) fn used_bases(
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+) -> rustc_hash::FxHashMap<NodeId, crate::layout2::UsedBasis> {
+    let mut result = rustc_hash::FxHashMap::default();
+    for root in std::iter::once(root)
+        .chain(fixed)
+        .chain(top_layer.iter().map(|top| &top.fragment))
+    {
+        let mut pending = vec![std::slice::from_ref(root).iter()];
+        while let Some(children) = pending.last_mut() {
+            let Some(frag) = children.next() else {
+                pending.pop();
+                continue;
+            };
+            if frag.node != NO_NODE && matches!(frag.kind, FragKind::Block | FragKind::TableCell(_))
+            {
+                result.entry(frag.node).or_insert(frag.flow.used);
+            }
+            if !frag.children.is_empty() {
+                pending.push(frag.children.iter());
+            }
+        }
+    }
+    result
+}
+
 /// CSSOM View client* consumes unscaled padding/border edges, not a visual
 /// bounding rectangle or frontend-reported, quantized scroll-region size.
 /// Non-replaced inline boxes deliberately have no entry.

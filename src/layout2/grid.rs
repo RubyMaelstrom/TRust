@@ -2437,8 +2437,7 @@ impl Flow<'_> {
             };
             // §9.4.3 relative offset + transform translation — a grid item's
             // containing block is its grid area (css-grid §9.1).
-            let (rx, ry) =
-                self.paint_offset(&g.it.style, g.area_w, Some(area_h), g.frag.w, g.frag.h);
+            let (rx, ry) = self.paint_offset(&g.it.style, g.area_w, Some(area_h), &mut g.frag);
             let dx = content_x + g.border_x + rx;
             let dy = content_top + area_y + shift + g.m[TOP] + ry;
             let mut frag = std::mem::replace(&mut g.frag, Frag::empty());

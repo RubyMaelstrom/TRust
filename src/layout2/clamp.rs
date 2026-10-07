@@ -31,6 +31,9 @@ pub(super) struct FlowInfo {
     /// in-flow content's, rather than those of the nearest fragment ancestor
     /// that establishes a containing block.
     pub inline_cb: bool,
+    /// CSSOM #resolved-values: the bases of this element box's used margins,
+    /// padding and insets, recorded where layout places it.
+    pub used: crate::layout2::UsedBasis,
 }
 
 struct Budget {

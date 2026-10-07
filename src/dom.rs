@@ -5466,7 +5466,9 @@ impl Dom {
         // particular, JS measuring a text area's line count must receive
         // `16px`, not `calc(.25rem * 4)`. CSS Flexbox 1 #flex-basis-property
         // likewise computes lengths to absolute ones (`flex: 1 1 0` reads
-        // back as `1 1 0px`).
+        // back as `1 1 0px`). The used values that replace percentages and
+        // `auto` for a box's margins, padding and positioned insets (CSSOM
+        // #resolved-values) come from its layout, `cssom_used_value`.
         if let Some(computed) = value
             .as_deref()
             .and_then(|value| self.cssom_length_percentage(id, None, name, value))
@@ -5492,6 +5494,157 @@ impl Dom {
             return Some(cssom::css_px(px));
         }
         value
+    }
+
+    /// Whether `name`'s resolved value on `id` depends on layout through
+    /// `cssom_used_value`: a margin or padding percentage, an inset
+    /// percentage on a positioned element, or an `auto` inset on a
+    /// relatively, absolutely or fixed positioned one. Absolute lengths need
+    /// no layout; `getComputedStyle` reads of them must not flush geometry.
+    pub(crate) fn cssom_needs_used_value(&self, id: NodeId, name: &str) -> bool {
+        let Some(longhands) = used_value_longhands(name) else {
+            return false;
+        };
+        let position = self.computed_value_resolved(id, "position");
+        let position = position.as_deref().map_or("static", str::trim);
+        let percentage = |longhand: &str| {
+            self.computed_value_resolved(id, longhand)
+                .is_some_and(|value| value.contains('%'))
+        };
+        let auto = |longhand: &str| {
+            self.computed_value_resolved(id, longhand)
+                .is_none_or(|value| value.trim().eq_ignore_ascii_case("auto"))
+        };
+        longhands.iter().any(|longhand| {
+            let physical = self.logical_property(id, None, longhand);
+            let longhand = physical.as_deref().unwrap_or(longhand);
+            if !matches!(longhand, "top" | "right" | "bottom" | "left") {
+                return percentage(longhand);
+            }
+            match position {
+                // An auto inset is the negation of its opposite (relative)
+                // or follows from placement (absolute), but only for an
+                // element with a box.
+                "relative" | "absolute" | "fixed" => percentage(longhand) || auto(longhand),
+                // Sticky percentages refer to the scrollport.
+                "sticky" => percentage(longhand),
+                _ => false,
+            }
+        })
+    }
+
+    /// CSSOM #resolved-values with a completed `layout` (`None` when none
+    /// is available: every resolved value is then the computed value, as
+    /// for an element without a box). Margins and padding are "resolved
+    /// value special case properties like height": their used values (CSS
+    /// Box 4 #margin-physical and #padding-physical: percentages of the
+    /// containing block's width, padding never negative). Insets are "like
+    /// top": on a positioned box, the used value unless over-constrained,
+    /// when it is the computed value with its percentage resolved (CSS
+    /// Position 3 #insets). A relatively positioned box's `auto` inset is the
+    /// negation of its opposite (#relpos-insets), an absolutely positioned
+    /// box's comes from its placement (#resolving-inset-auto), and a sticky
+    /// box's percentages refer to its scrollport (#stickypos-insets), where
+    /// `auto` stays. Auto margins keep their computed value. Shorthands
+    /// combine their longhands' values.
+    pub(crate) fn cssom_used_value(
+        &self,
+        id: NodeId,
+        name: &str,
+        layout: Option<&crate::layout2::LayoutFragments>,
+    ) -> Option<String> {
+        if let Some(value) =
+            cssom::resolved_shorthand(name, |longhand| self.cssom_used_value(id, longhand, layout))
+        {
+            return Some(value);
+        }
+        if let Some(physical) = self.logical_property(id, None, name) {
+            return self.cssom_used_value(id, &physical, layout);
+        }
+        layout
+            .and_then(|layout| self.cssom_used_length(id, name, layout))
+            .or_else(|| self.cssom_resolved_value(id, name))
+    }
+
+    fn cssom_used_length(
+        &self,
+        id: NodeId,
+        name: &str,
+        layout: &crate::layout2::LayoutFragments,
+    ) -> Option<String> {
+        use crate::layout2::value::{Len, Vp};
+        let used = layout.used_basis(id)?;
+        let (w, h) = self.viewport_px();
+        let units = crate::layout2::Units::of(self, id);
+        let length = |property: &str| {
+            let value = self
+                .computed_value_resolved(id, property)
+                .or_else(|| cssom_initial_value(property).map(str::to_string))?;
+            Len::parse(&value, units, Vp { w, h })
+        };
+        let basis = |size: f32| (!size.is_nan()).then_some(size);
+        let side = |property: &str| match property {
+            "top" => Some((0, "bottom")),
+            "right" => Some((1, "left")),
+            "bottom" => Some((2, "top")),
+            "left" => Some((3, "right")),
+            _ => None,
+        };
+        let px = if name.starts_with("margin-") {
+            length(name)?.resolve(basis(used.cb[0]))?
+        } else if name.starts_with("padding-") {
+            length(name)?.resolve(basis(used.cb[0]))?.max(0.0)
+        } else if let Some((index, opposite)) = side(name) {
+            let vertical = index % 2 == 0;
+            let axis = basis(used.cb[usize::from(vertical)]);
+            let position = self.computed_value_resolved(id, "position");
+            match position.as_deref().map(str::trim) {
+                // CSS 2 §9.4.3, as layout applies it (`BoxStyle::paint_offset`).
+                Some("relative") => length(name)
+                    .and_then(|own| own.resolve(axis))
+                    .or_else(|| {
+                        length(opposite)
+                            .and_then(|other| other.resolve(axis))
+                            .map(|other| -other)
+                    })
+                    .unwrap_or(0.0),
+                Some("absolute" | "fixed") => match length(name)? {
+                    Len::Auto => Some(used.inset[index]).filter(|inset| !inset.is_nan())?,
+                    own => own.resolve(axis)?,
+                },
+                Some("sticky") => {
+                    let scrollport = self.cssom_scrollport(id, layout);
+                    length(name)?.resolve(Some(scrollport[usize::from(vertical)]))?
+                }
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        Some(cssom::css_used_px(px))
+    }
+
+    /// The size of the scrollport a sticky box's insets refer to (CSS
+    /// Position 3 #stickypos-insets): its nearest ancestor scroll container's
+    /// (CSS Overflow 3 #scroll-container), else the viewport's. The root
+    /// element and body propagate `overflow` to the viewport
+    /// (#overflow-propagation).
+    fn cssom_scrollport(&self, id: NodeId, layout: &crate::layout2::LayoutFragments) -> [f32; 2] {
+        let mut ancestor = self.style_parent(id);
+        while let Some(node) = ancestor.filter(|&node| node != DOCUMENT) {
+            if !matches!(self.tag_name(node), Some("html" | "body"))
+                && self
+                    .overflow_axes(node)
+                    .iter()
+                    .any(|axis| axis.scrollable())
+                && let Some([_, _, width, height]) = layout.client_metrics(node)
+            {
+                return [width, height];
+            }
+            ancestor = self.style_parent(node);
+        }
+        let viewport = layout.viewport();
+        [viewport.width, viewport.height]
     }
 
     /// The computed value of a standard `<length-percentage>` property
@@ -19555,6 +19708,39 @@ fn split_supports_kw(cond: &str, keyword: &str) -> Vec<String> {
     }
     parts.push(cond[start..].trim().to_string());
     parts
+}
+
+/// The margin, padding and inset longhands whose used values `name` (one of
+/// them, a logical equivalent, or a shorthand of them) exposes through
+/// `Dom::cssom_used_value`. `None` for every other property.
+fn used_value_longhands(name: &str) -> Option<&'static [&'static str]> {
+    static FAMILIES: [(&str, [&str; 4]); 3] = [
+        (
+            "margin",
+            ["margin-top", "margin-right", "margin-bottom", "margin-left"],
+        ),
+        (
+            "padding",
+            [
+                "padding-top",
+                "padding-right",
+                "padding-bottom",
+                "padding-left",
+            ],
+        ),
+        ("inset", ["top", "right", "bottom", "left"]),
+    ];
+    FAMILIES.iter().find_map(|(family, sides)| {
+        if let Some(index) = sides.iter().position(|side| *side == name) {
+            return Some(&sides[index..=index]);
+        }
+        // A shorthand, or a flow-relative longhand whose physical side
+        // depends on the writing mode: consider every side.
+        let logical = name.strip_prefix(family).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with("-block") || rest.starts_with("-inline")
+        });
+        logical.then_some(&sides[..])
+    })
 }
 
 /// The lower bound of the `<length-percentage>` (or `<length>`) range in

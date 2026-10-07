@@ -16795,6 +16795,23 @@ fn host_resolved_box_size(ctx: &mut Ctx, args: &[Value], width: bool) -> Option<
     Some(crate::js_host_boundary::serialize_css_px(value))
 }
 
+/// CSSOM #resolved-values for margins, padding and insets whose used values depend on layout
+/// (`Dom::cssom_needs_used_value`), from the retained fragments of a complete layout. `None`
+/// leaves every other read to the cascade without a geometry flush.
+fn host_resolved_used_value(ctx: &mut Ctx, args: &[Value], name: &str) -> Option<String> {
+    let id = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let id = host_arg_node(&dom, args, 0)?;
+        dom.cssom_needs_used_value(id, name).then_some(id)?
+    };
+    let cache = ensure_host_geom_cache(ctx, "computed-used-value");
+    let fragments = cache.borrow().fragments.clone();
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    dom.cssom_used_value(id, name, fragments.as_deref())
+}
+
 /// CSSOM §7.2/§9 resolved-value backing. Grid track lists are used values captured by the same
 /// layout pass; all other properties come from the canonical DOM cascade.
 fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -16815,6 +16832,9 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     if (name == "grid-template-columns" || name == "grid-template-rows")
         && let Some(value) = host_resolved_grid_tracks(ctx, args, name == "grid-template-columns")
     {
+        return Ok(Value::from_engine_text(value));
+    }
+    if let Some(value) = host_resolved_used_value(ctx, args, &name) {
         return Ok(Value::from_engine_text(value));
     }
     Ok(read_layout_dependent_style(

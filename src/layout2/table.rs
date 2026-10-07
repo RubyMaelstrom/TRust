@@ -305,8 +305,7 @@ impl Flow<'_> {
             let dy_valign = self.cell_valign_offset(cell.b.node, l.content_h, span_h);
             // §9.4.3 relative offset / transform translation — a cell's CB for
             // percentages is its own box.
-            let (rx, ry) =
-                self.paint_offset(&cell.b.style, l.cell_w, Some(span_h), l.frag.w, l.frag.h);
+            let (rx, ry) = self.paint_offset(&cell.b.style, l.cell_w, Some(span_h), &mut l.frag);
             let x = content_x + col_x[cell.col] + rx;
             let y = content_top + row_y[cell.row] + ry;
             // Vertical alignment moves content, not the cell's background
