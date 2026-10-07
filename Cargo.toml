@@ -268,6 +268,8 @@ aes-gcm = { path = "vendor/aes-gcm-0.11.1" }
 # Expose Glifo's light hinting policy to both desktop raster backends. Native
 # TrueType hints round fractional ppem and visibly stretch small terminal text.
 glifo = { path = "vendor/glifo-0.4.0" }
+# fontique synthesizes bold only for bold (600+) requests against non-bold
+# faces, as browsers do (vendor/fontique-0.11.1/README.trust.txt).
 fontique = { path = "vendor/fontique-0.11.1" }
 crossterm = { path = "vendor/crossterm-0.29.0" }
 # image-webp 0.2.4 indexes an always-RGBA animation canvas with a three-byte
