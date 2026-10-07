@@ -2231,17 +2231,20 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                 let content_clip = radii
                     .filter(|r| r.corners.iter().any(|&(x, y)| x > 0. && y > 0.))
                     .map(|r| rounded_shape(content, inset_radii(r, border, content)));
-                let natural_size_known = piece
+                let source = piece
                     .item
                     .graphical_image
                     .as_ref()
-                    .or(piece.item.image.as_ref())
-                    .is_some_and(|source| {
-                        [source.clone(), resolve_image_source(builder.base, source)]
-                            .iter()
-                            .filter_map(|source| builder.images.get(source))
-                            .any(|&(w, h)| w > 0 && h > 0 && (w, h) != (u32::MAX, u32::MAX))
-                    });
+                    .or(piece.item.image.as_ref());
+                // HTML #the-canvas-element: a canvas's natural dimensions are
+                // its bitmap's, which layout already fitted (`replaced::size`).
+                let natural_size_known = match source {
+                    Some(source) => [source.clone(), resolve_image_source(builder.base, source)]
+                        .iter()
+                        .filter_map(|source| builder.images.get(source))
+                        .any(|&(w, h)| w > 0 && h > 0 && (w, h) != (u32::MAX, u32::MAX)),
+                    None => node != NO_NODE && builder.dom.canvas_size(node).is_some(),
+                };
                 if let Some(handle) = handle {
                     builder.push_clipped_marquee_content(
                         node,
@@ -9443,6 +9446,42 @@ mod tests {
                     _ => None,
                 });
             assert_eq!(fit, Some(expected), "known={known}");
+        }
+    }
+
+    #[test]
+    fn canvases_stretch_their_bitmap_over_the_box() {
+        // HTML #the-canvas-element: the natural dimensions are the bitmap's,
+        // and the initial object-fit, fill, stretches it like an image's
+        // (css-images-3 §5.5); a canvas has no image source to wait for.
+        for display in ["inline", "block"] {
+            let mut dom = Dom::parse_document(&format!(
+                r#"<body style="margin:0"><canvas id=c width=100 height=100 style="display:{display};width:200px;height:100px"></canvas></body>"#
+            ));
+            let canvas = dom.get_by_id("c").unwrap();
+            dom.canvases
+                .borrow_mut()
+                .insert(canvas, crate::canvas::Canvas::new(100, 100, true).unwrap());
+            dom.set_render_clickables(Default::default(), true);
+            let layout = crate::layout2::lay_out_graphical(
+                &dom,
+                &Url::parse("https://example.test/").unwrap(),
+                crate::layout2::Viewport::new(800., 600.),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            );
+            let image = layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    DisplayCommand::Image { fit, rect, .. } => {
+                        Some((*fit, rect.width, rect.height))
+                    }
+                    _ => None,
+                });
+            assert_eq!(image, Some((ImageFit::Fill, 200.0, 100.0)), "{display}");
         }
     }
 
