@@ -363,7 +363,8 @@ current behavior and limits; consult the governing standards before changing it.
   sniffing (BOM, `Content-Type` charset, `<meta>` prescan, a same-origin
   container's encoding, then the en-US default windows-1252), re-decoding from
   memory when the tree builder finds a later declaration. Only local files are
-  autodetected, and only as UTF-8. That encoding is `document.characterSet`.
+  autodetected, and only as UTF-8. That encoding is `document.characterSet` and
+  the fallback for classic scripts and style sheets; module scripts are UTF-8.
   Form submission and URL query strings still encode as UTF-8.
 
 ### Local files and persistent state
