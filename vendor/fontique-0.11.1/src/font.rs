@@ -101,7 +101,12 @@ impl FontInfo {
             if self.has_weight_axis() {
                 synth.vars[len] = (Tag::new(b"wght"), weight.value());
                 len += 1;
-            } else if weight.value() > self.weight.value() {
+            } else if weight.value() >= 600.0 && self.weight.value() < 600.0 {
+                // TRust: CSS Fonts 4 #font-weight-prop synthesizes bold faces
+                // "for families that lack actual bold faces". Font matching
+                // has already picked the nearest face, so only a bold request
+                // (600 and up, as in Blink and Gecko) emboldens a non-bold
+                // one; a medium (500) request draws the regular face.
                 synth.embolden = true;
             }
         }

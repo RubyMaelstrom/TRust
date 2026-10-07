@@ -1679,6 +1679,9 @@ mod tests {
         assert_eq!(synthesis(false, 400.), (None, false));
         assert!(synthesis(true, 400.).0.is_some_and(|skew| skew > 0.));
         assert!(synthesis(false, 700.).1);
+        assert!(synthesis(false, 600.).1);
+        // A medium request is not bold: the regular face draws it as is.
+        assert_eq!(synthesis(false, 500.), (None, false));
     }
 
     #[test]
