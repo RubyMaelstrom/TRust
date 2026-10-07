@@ -72,6 +72,25 @@ impl Dom {
         self.shadow_hosts.contains_key(&self.tree_scope(node))
     }
 
+    /// Whether a tree mutation at `node` can change slot assignment (DOM
+    /// #assign-slottables-for-a-tree and #signal-a-slot-change): `node` is a
+    /// shadow root or a shadow host, or its root is a shadow root. The root
+    /// follows parent edges and stops at a Document, as the platform's
+    /// `getRootNode()` walk does. A mutation anywhere else cannot reach a slot.
+    pub(crate) fn may_affect_slot_assignment(&self, node: NodeId) -> bool {
+        if self.shadow_hosts.contains_key(&node) || self.shadow_roots.contains_key(&node) {
+            return true;
+        }
+        let mut root = node;
+        while !matches!(self.nodes[root].data, NodeData::Document) {
+            let Some(parent) = self.nodes[root].parent else {
+                break;
+            };
+            root = parent;
+        }
+        self.shadow_hosts.contains_key(&root)
+    }
+
     /// DOM attachment can reclaim a declarative root exactly once, preserving
     /// its identity and options while removing its children in tree order.
     pub(crate) fn attach_shadow_with_options(

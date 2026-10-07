@@ -1226,7 +1226,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // Synchronize only wrappers that already exist; never materialize a whole
     // inserted subtree merely for cache bookkeeping. The Rust walk includes
-    // light descendants, each attached shadow root, and its descendants.
+    // light descendants, each attached shadow root, and its descendants, and
+    // reports only nodes whose wrapper was given an event-listener list (DOM
+    // #concept-event-listener): connectedness changes listener discovery for
+    // those wrappers alone, so a subtree without one costs no per-node work.
+    const NO_LISTENER_IDS = Object.freeze([]);
     function syncKnownWrapperRetention(ids, connected) {
         if (!nativeWrapperCache && typeof g.WeakRef !== "function") return;
         for (let i = 0; i < ids.length; i++) {
@@ -1240,7 +1244,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function syncWrapperSubtreeRetention(rootId) {
         if (!nativeWrapperCache && typeof g.WeakRef !== "function") return;
-        syncKnownWrapperRetention(__dom_wrapper_subtree(rootId), __dom_is_connected(rootId));
+        const ids = __dom_listener_subtree(rootId);
+        if (ids !== null) syncKnownWrapperRetention(ids, __dom_is_connected(rootId));
     }
     // HTML innerHTML and DOM textContent both use DOM "replace all". Snapshot
     // the old child subtrees in one arena traversal before the replacement so
@@ -1248,18 +1253,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // element's own shadow tree is not among its children, so fall back to the
     // explicit old roots when the replacement target is itself a shadow host.
     function snapshotRemovedWrapperSubtrees(target, removedRoots) {
-        if ((!nativeWrapperCache && typeof g.WeakRef !== "function") || !removedRoots.length) return [];
+        if ((!nativeWrapperCache && typeof g.WeakRef !== "function") || !removedRoots.length) return NO_LISTENER_IDS;
         const canWalkInclusiveTarget = internalsFor(target).trustLN !== "template"
             && __dom_shadow_root(nodeIds.get(target)) == null;
         if (canWalkInclusiveTarget) {
-            const ids = __dom_wrapper_subtree(nodeIds.get(target));
+            const ids = __dom_listener_subtree(nodeIds.get(target));
+            if (ids === null) return NO_LISTENER_IDS;
             if (ids.length && ids[0] === nodeIds.get(target)) ids.shift();
             return ids;
         }
         const ids = [];
         for (let i = 0; i < removedRoots.length; i++) {
-            const subtree = __dom_wrapper_subtree(removedRoots[i]);
-            for (let j = 0; j < subtree.length; j++) ids.push(subtree[j]);
+            const subtree = __dom_listener_subtree(removedRoots[i]);
+            if (subtree !== null) for (let j = 0; j < subtree.length; j++) ids.push(subtree[j]);
         }
         return ids;
     }
@@ -1556,6 +1562,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Inserting a detached wrapper/clone must start its frames just as inserting
     // an iframe directly does; no contentDocument getter or later sweep is needed.
     function maybeProcessInsertedFrames(root, parent) {
+        // Most insertions hold no navigable container at all.
+        if (!__dom_has_frames(nodeIds.get(root))) return;
         if (!parent.isConnected) return;
         for (const id of __dom_rendering_frames(nodeIds.get(root))) {
             const frame = wrap(id);
@@ -2246,6 +2254,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function destroyFrameNavigableDescendantsIn(root) {
         if (!root || typeof nodeIds.get(root) !== "number") return;
+        if (!__dom_has_frames(nodeIds.get(root))) return;
         // HTML's navigable destruction is an internal tree operation. Do not
         // call author-overridable querySelectorAll/contains during textContent
         // or child replacement (forms may also have named-property collisions).
@@ -2258,6 +2267,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function destroyFrameNavigablesIn(root) {
         if (!root) return;
+        // HTML's iframe removing steps have nothing to destroy in a subtree
+        // without a navigable container.
+        const rootId = nodeIds.get(root);
+        if (typeof rootId === "number" && !__dom_has_frames(rootId)) return;
         if (internalsFor(root).trustLN === "iframe" || internalsFor(root).trustLN === "frame") {
             destroyFrameNavigable(root);
             return;
@@ -2285,6 +2298,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             m.lifetime = { id: undefined, nodeId: null, captures: 0 };
             registerListenerLifetime(registryTarget, m.lifetime, m.lifetime);
             setListenerMap(registryTarget, m);
+            // Connecting or disconnecting this node's subtree now updates its
+            // listener discovery (see syncKnownWrapperRetention).
+            const listenerNode = nodeIds.get(registryTarget);
+            if (listenerNode !== undefined) __dom_note_listener_node(listenerNode);
         }
         let l = m.get(type);
         if (!l) {
@@ -5809,6 +5826,63 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return dispatch(this, ev, false);
         }
     }
+    // DOM #concept-node-insert: the remaining steps for one inserted
+    // (non-DocumentFragment) node, after the arena inserted it into `parent`.
+    // `oldParent`/`oldIndex` describe its removal from a previous parent.
+    // One arena query tells which of the steps can do anything: whether a
+    // live Range may exist, the subtree holds a listener-bearing node, the
+    // parent can change slot assignment, and which element the node is (its
+    // local name never changes). Each answer reflects the tree when its step
+    // runs: only internal bookkeeping precedes the last of them.
+    const INSERT_RANGES = 1, INSERT_LISTENERS = 2, INSERT_SLOTS = 4,
+        INSERT_SCRIPT = 8, INSERT_LINK = 16, INSERT_BASE = 32;
+    function insertedNodeSteps(parent, node, oldParent, oldIndex) {
+        const id = nodeIds.get(node);
+        const effects = __dom_insertion_effects(id, nodeIds.get(parent));
+        if (effects & INSERT_RANGES) {
+            rangesRemove(node, oldParent, oldIndex);
+            rangesInsert(parent, node);
+        }
+        if (effects & INSERT_LISTENERS) syncWrapperSubtreeRetention(id);
+        if (effects & INSERT_SLOTS) slotQueueCheck(parent);
+        moChildInsert(parent, node);
+        if (CE.defs.size) ceScan(node);
+        // HTML's script, link and base insertion steps.
+        if (deferredScriptRuns !== null || (effects & INSERT_SCRIPT)) maybeRunScript(node);
+        if (effects & INSERT_LINK) maybeLoadStylesheet(node);
+        if (effects & INSERT_BASE) baseHrefCache = null;
+        maybeProcessInsertedFrames(node, parent);
+    }
+    // The index a node had before being adopted into a new parent, needed
+    // only to adjust live Ranges (DOM #concept-node-remove steps 4–7). Without
+    // a live Range nothing reads it, and none can be created before the
+    // insertion completes.
+    function adoptedRangeIndex(node) {
+        return liveRangesExist() ? rangeIndex(node) : 0;
+    }
+    // DOM #concept-node-remove for a validated child of `parent`. After the
+    // arena removal one query tells which remaining steps have work; with a
+    // navigable container in the subtree, whose destruction can run author
+    // code, each later step asks again as before.
+    const REMOVE_FRAMES = 1, REMOVE_LISTENERS = 2, REMOVE_SLOTS = 4;
+    function removeChildSteps(parent, c) {
+        rangesRemove(c, parent, c);
+        if (internalsOf(c).trustLN === "base") baseHrefCache = null;
+        moChildRemove(parent, c);
+        if (CE.defs.size) ceDisconnect(c);
+        const id = nodeIds.get(c);
+        __dom_detach(id);
+        const effects = __dom_removal_effects(id, nodeIds.get(parent));
+        if (effects & REMOVE_FRAMES) {
+            destroyFrameNavigablesIn(c);
+            syncWrapperSubtreeRetention(id);
+            slotQueueCheck(parent);
+            return c;
+        }
+        if (effects & REMOVE_LISTENERS) syncWrapperSubtreeRetention(id);
+        if (effects & REMOVE_SLOTS) slotQueueCheck(parent);
+        return c;
+    }
     class Node extends EventTarget {
         constructor(id) {
             super();
@@ -5889,13 +5963,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (t !== 1 && t !== 11) return;
             rangesReplaceChildren(this);
             if (!MO.length) {
-                const removedRoots = __dom_children(nodeIds.get(this));
-                for (let i = 0; i < removedRoots.length; i++)
-                    destroyFrameNavigablesIn(wrap(removedRoots[i]));
-                __dom_set_text(nodeIds.get(this), v);
+                const id = nodeIds.get(this);
+                const removedRoots = __dom_children(id);
+                // Only children holding a navigable container need a wrapper
+                // for HTML's iframe removing steps.
+                if (removedRoots.length && __dom_has_frames(id)) {
+                    for (let i = 0; i < removedRoots.length; i++)
+                        if (__dom_has_frames(removedRoots[i])) destroyFrameNavigablesIn(wrap(removedRoots[i]));
+                }
+                // Listener discovery changes only below a listener-bearing wrapper.
+                const listenerIds = removedRoots.length ? __dom_listener_subtree(id) : null;
+                __dom_set_text(id, v);
                 if (removedRoots.length || v) moEnqueue();
-                for (let i = 0; i < removedRoots.length; i++)
-                    syncWrapperSubtreeRetention(removedRoots[i]);
+                if (listenerIds !== null) {
+                    for (let i = 0; i < removedRoots.length; i++)
+                        syncWrapperSubtreeRetention(removedRoots[i]);
+                }
                 slotQueueCheck(this);
                 return;
             }
@@ -5959,7 +6042,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // operation there preserves the DOM's target-document semantics.
         appendChild(c) {
             insertionArgument(this, c, null, "appendChild");
-            if (c.nodeType === 11) {
+            if (__dom_node_type(nodeIds.get(c)) === 11) {
                 preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), null, 2), false);
                 const nodes = Array.from(c.childNodes);
                 if (!nodes.length) return c;
@@ -5974,19 +6057,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             // DOM #concept-node-ensure-pre-insertion-validity: the syscall
             // refuses (unmutated) an insertion that is not valid.
-            const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
+            const oldParent = rangeParent(c), oldIndex = oldParent ? adoptedRangeIndex(c) : 0;
             if (oldParent && MO.length) moAdoptRemove(this, c, null, oldParent);
             preInsertResult(__dom_append(nodeIds.get(this), nodeIds.get(c)), false);
-            rangesRemove(c, oldParent, oldIndex);
-            rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
-            syncWrapperSubtreeRetention(nodeIds.get(c));
-            slotQueueCheck(this);
-            moChildInsert(this, c);
-            if (CE.defs.size) ceScan(c);
-            maybeRunScript(c);
-            maybeLoadStylesheet(c);
-            if (internalsFor(c).trustLN === "base") baseHrefCache = null; // maybeRunScript already read .localName
-            maybeProcessInsertedFrames(c, this);
+            insertedNodeSteps(this, c, oldParent, oldIndex);
             return c;
         }
         insertBefore(c, ref) {
@@ -5994,7 +6068,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (ref === undefined) ref = null;
             if (ref !== null) nodeArgument(ref, "insertBefore", 2);
             insertionArgument(this, c, ref, "insertBefore");
-            if (c.nodeType === 11) {
+            if (__dom_node_type(nodeIds.get(c)) === 11) {
                 preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null, 2), false);
                 const nodes = Array.from(c.childNodes);
                 if (!nodes.length) return c;
@@ -6013,19 +6087,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), nodeIds.get(ref), 2), false);
                 ref = c.nextSibling;
             }
-            const oldParent = rangeParent(c), oldIndex = oldParent ? rangeIndex(c) : 0;
+            const oldParent = rangeParent(c), oldIndex = oldParent ? adoptedRangeIndex(c) : 0;
             if (oldParent && MO.length) moAdoptRemove(this, c, ref, oldParent);
             preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null, 0), false);
-            rangesRemove(c, oldParent, oldIndex);
-            rangesInsert(this, nativeDomTraversal ? c : rangeIndex(c));
-            syncWrapperSubtreeRetention(nodeIds.get(c));
-            slotQueueCheck(this);
-            moChildInsert(this, c);
-            if (CE.defs.size) ceScan(c);
-            maybeRunScript(c);
-            maybeLoadStylesheet(c);
-            if (internalsFor(c).trustLN === "base") baseHrefCache = null;
-            maybeProcessInsertedFrames(c, this);
+            insertedNodeSteps(this, c, oldParent, oldIndex);
             return c;
         }
         removeChild(c) {
@@ -6033,15 +6098,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // DOM §4.2.3 pre-remove: validate before mutation-observer or custom-element side
             // effects. A node belonging to some other parent is not silently detached.
             if (internalsOf(c).attrNode || !rangeSame(rangeParent(c),this)) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
-            rangesRemove(c, this, rangeIndex(c));
-            if (internalsFor(c).trustLN === "base") baseHrefCache = null;
-            moChildRemove(this, c);
-            if (CE.defs.size) ceDisconnect(c);
-            __dom_detach(nodeIds.get(c));
-            destroyFrameNavigablesIn(c);
-            syncWrapperSubtreeRetention(nodeIds.get(c));
-            slotQueueCheck(this);
-            return c;
+            return removeChildSteps(this, c);
         }
         replaceChild(n, old) {
             if (arguments.length < 2) throw new TypeError("Failed to execute 'replaceChild' on 'Node': 2 arguments required.");
@@ -6101,7 +6158,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             maybeProcessInsertedFrames(n, this);
             return old;
         }
-        remove() { const parent = rangeParent(this); if (parent) Node.prototype.removeChild.call(parent,this); }
+        // DOM #dom-childnode-remove: remove this from its parent, if any. The
+        // node is then that parent's child, so pre-remove validation holds.
+        remove() { const parent = rangeParent(this); if (parent) removeChildSteps(parent, this); }
         // DOM #dom-parentnode-append / -prepend: pre-insert the result of
         // converting the nodes into a node, so the whole set is validated
         // before anything is inserted.
@@ -13849,6 +13908,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return internalsOf(node).sr || null;
     }
     function slotQueueCheck(node) {
+        // Only a shadow root, a node in a shadow tree, or a shadow host can
+        // change slot assignment; the arena answers that without walking to
+        // the root through wrappers.
+        const id = node ? nodeIds.get(node) : undefined;
+        if (id !== undefined && !__dom_slot_scope(id)) return;
         const root = slotAffectedRoot(node);
         if (!root) return;
         if (!slotCheckRoots.includes(root)) slotCheckRoots.push(root);
@@ -18233,30 +18297,55 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             rangeUpdate.call(range);
         }
     }
-    function rangesReplaceData(node, offset, count, length) {
-        updateLiveRanges((container, position) => [container, !rangeSame(container,node) || position <= offset
-            ? position : position <= offset + count ? offset : position + length - count]);
+    // Each adjustment below first takes the snapshot: with no live Range
+    // there is nothing to adjust, and neither a tree index nor a boundary
+    // closure is computed. The closures live in separate functions so the
+    // common no-Range call stays a plain call without a captured activation.
+    function liveRangesExist() {
+        return snapshotLiveRanges() !== undefined;
     }
+    function rangesReplaceData(node, offset, count, length) {
+        const ranges = snapshotLiveRanges();
+        if (ranges) replaceDataInRanges(ranges, node, offset, count, length);
+    }
+    function replaceDataInRanges(ranges, node, offset, count, length) {
+        updateLiveRanges((container, position) => [container, !rangeSame(container,node) || position <= offset
+            ? position : position <= offset + count ? offset : position + length - count], ranges);
+    }
+    // DOM #concept-node-remove steps 4–7. `index` is the removed node's
+    // index, or the node itself while it is still in `parent`.
     function rangesRemove(node, parent, index) {
         if (!parent) return;
-        updateLiveRanges((container, position) => rangeContains(node,container) ? [parent, index]
-            : [container, rangeSame(container,parent) && position > index ? position - 1 : position]);
+        const ranges = snapshotLiveRanges();
+        if (!ranges) return;
+        removeFromRanges(ranges, node, parent, typeof index === "number" ? index : rangeIndex(index));
     }
-    function rangesInsert(parent, index, count = 1) {
+    function removeFromRanges(ranges, node, parent, index) {
+        updateLiveRanges((container, position) => rangeContains(node,container) ? [parent, index]
+            : [container, rangeSame(container,parent) && position > index ? position - 1 : position], ranges);
+    }
+    function rangesInsert(parent, index, count) {
         // DOM #concept-node-insert's live range adjustments only need
         // a position when a live Range exists. Append-heavy construction must
         // not rescan an ever-growing sibling list for an empty observer set.
         const ranges = snapshotLiveRanges();
         if (!ranges) return;
-        if (typeof index !== "number") index = rangeIndex(index);
+        insertIntoRanges(ranges, parent, typeof index === "number" ? index : rangeIndex(index),
+            count === undefined ? 1 : count);
+    }
+    function insertIntoRanges(ranges, parent, index, count) {
         updateLiveRanges((container, position) => [container,
             rangeSame(container,parent) && position > index ? position + count : position], ranges);
     }
     function rangesReplaceChildren(parent) {
         // DOM string/fragment replace-all removes each old child before
         // inserting the replacement. Every old child boundary becomes zero.
+        const ranges = snapshotLiveRanges();
+        if (ranges) replaceChildrenInRanges(ranges, parent);
+    }
+    function replaceChildrenInRanges(ranges, parent) {
         updateLiveRanges((container, position) => rangeContains(parent,container)
-            ? [parent, 0] : [container, position]);
+            ? [parent, 0] : [container, position], ranges);
     }
     function rangeCharacterData(node) { return [3, 4, 7, 8].includes(node.nodeType); }
     function rangeLength(node) {
