@@ -303,7 +303,7 @@ impl Dom {
                 else {
                     continue;
                 };
-                if name.local.as_ref() != "use" {
+                if &*name.local != "use" {
                     // Paint-server/template/text-path URL semantics may be
                     // interpreted inside the isolated SVG renderer. Until its
                     // complete provenance is exposed, watch the source scope.
