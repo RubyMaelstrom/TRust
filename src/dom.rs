@@ -5505,12 +5505,49 @@ impl Dom {
     /// requires `getComputedStyle()` to return its resolved value. Materialize
     /// initial values for the implemented positioning, sizing and interaction
     /// surface so script does not mistake an empty sentinel for a CSS value.
+    /// CSS Display 3 #transformations: whether `id`'s computed `display` is
+    /// blockified, as for a float or an absolutely positioned box (CSS 2
+    /// #dis-pos-flo) or an item of a flex or grid container (CSS Flexbox 1
+    /// #flex-items, CSS Grid 2 #grid-item-display). The container is the
+    /// nearest ancestor that generates a box.
+    fn display_is_blockified(&self, id: NodeId) -> bool {
+        if self
+            .computed_value(id, "float")
+            .is_some_and(|float| !float.trim().eq_ignore_ascii_case("none"))
+            || self
+                .computed_value(id, "position")
+                .is_some_and(|position| matches!(position.trim(), "absolute" | "fixed"))
+        {
+            return true;
+        }
+        let mut parent = self.style_parent(id);
+        while let Some(node) = parent {
+            match self.effective_display(node).as_deref() {
+                Some("contents") => parent = self.style_parent(node),
+                Some(display) => {
+                    return matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid")
+                        || display
+                            .split_ascii_whitespace()
+                            .any(|word| matches!(word, "flex" | "grid"));
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
     pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
         if let Some(physical) = self.logical_property(id, None, name) {
             return self.cssom_resolved_value(id, &physical);
         }
         if name == "display" {
-            return self.effective_display(id);
+            return self.effective_display(id).map(|display| {
+                if !self.is_document_element(id) && self.display_is_blockified(id) {
+                    blockified_display(&display)
+                } else {
+                    display
+                }
+            });
         }
         if let Some(value) =
             cssom::resolved_shorthand(name, |longhand| self.cssom_resolved_value(id, longhand))
@@ -20455,6 +20492,41 @@ pub(crate) fn text_stroke_width_px(
     (length.is_finite() && (length >= 0. || calculation)).then_some(length.max(0.))
 }
 
+/// CSS Display 3 #blockify: the outer display type becomes `block`. For
+/// legacy reasons an inline block becomes a plain `block`, and a
+/// layout-internal box becomes a block container. `none` and `contents`
+/// generate no box and are unchanged.
+fn blockified_display(display: &str) -> String {
+    let display = display.trim();
+    match display.to_ascii_lowercase().as_str() {
+        "inline"
+        | "inline-block"
+        | "run-in"
+        | "inline flow"
+        | "inline flow-root"
+        | "run-in flow"
+        | "run-in flow-root"
+        | "table-row-group"
+        | "table-header-group"
+        | "table-footer-group"
+        | "table-row"
+        | "table-cell"
+        | "table-column-group"
+        | "table-column"
+        | "table-caption"
+        | "ruby-base"
+        | "ruby-text"
+        | "ruby-base-container"
+        | "ruby-text-container" => "block".to_owned(),
+        "inline-flex" | "inline flex" => "flex".to_owned(),
+        "inline-grid" | "inline grid" => "grid".to_owned(),
+        "inline-table" | "inline table" => "table".to_owned(),
+        "inline list-item" | "inline flow list-item" => "list-item".to_owned(),
+        "ruby" | "inline ruby" => "block ruby".to_owned(),
+        _ => display.to_owned(),
+    }
+}
+
 pub(crate) fn supports_color_value(value: &str) -> bool {
     wide_keyword(value).is_some()
         || value.eq_ignore_ascii_case("currentcolor")
@@ -25793,6 +25865,37 @@ mod tests {
             "li::marker()",
         ] {
             assert!(!selector_parses(selector), "{selector}");
+        }
+    }
+
+    #[test]
+    fn computed_display_is_blockified_for_floats_positioned_boxes_and_flex_items() {
+        // CSS Display 3 #transformations: blockification changes the
+        // computed `display`, which getComputedStyle reports (an inline
+        // block becomes `block`, for legacy reasons).
+        let dom = Dom::parse_document(
+            "<body><div style='display:flex'>\
+               <span id=a>x</span><span id=b style='display:inline-block'>x</span>\
+               <span id=c style='display:inline-flex'>x</span><span id=d style='display:none'>x</span>\
+               <div style='display:contents'><i id=e style='display:inline-grid'>x</i></div>\
+             </div><div style='display:grid'><span id=f style='display:inline-table'>x</span></div>\
+             <p><span id=g style='float:left'>x</span><span id=h style='position:absolute'>x</span>\
+             <span id=i>x</span><span id=j style='display:contents'>x</span></p>",
+        );
+        let display = |name| dom.cssom_resolved_value(dom.get_by_id(name).unwrap(), "display");
+        for (name, expected) in [
+            ("a", "block"),
+            ("b", "block"),
+            ("c", "flex"),
+            ("d", "none"),
+            ("e", "grid"),
+            ("f", "table"),
+            ("g", "block"),
+            ("h", "block"),
+            ("i", "inline"),
+            ("j", "contents"),
+        ] {
+            assert_eq!(display(name).as_deref(), Some(expected), "#{name}");
         }
     }
 
