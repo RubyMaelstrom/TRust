@@ -57,6 +57,12 @@ impl Registry {
         self.young.push(range);
     }
 
+    /// Whether any Range may still be live. A dead handle not yet pruned
+    /// answers true; the caller then takes the snapshot, which prunes it.
+    pub(super) fn may_have_ranges(&self) -> bool {
+        !self.old.is_empty() || !self.young.is_empty()
+    }
+
     pub(super) fn snapshot(&mut self) -> Vec<Value> {
         // All upgraded handles are owned before JS resumes. In particular a
         // mutation's reentrant collection cannot invalidate its in-flight

@@ -466,6 +466,12 @@ struct DomGcRegistry {
     documents: rustc_hash::FxHashMap<usize, usize>,
     /// Every inserted/replaced logical owner since the last successful native collection.
     young_owners: rustc_hash::FxHashSet<usize>,
+    /// Nodes whose wrapper has been given an event-listener list (DOM
+    /// #concept-event-listener). Only their wrappers take part in listener
+    /// discovery when a subtree is connected or disconnected, so the platform
+    /// asks for these instead of every wrapper below a mutation. A superset:
+    /// an entry stays while its node lives, even after the list empties.
+    listener_nodes: rustc_hash::FxHashSet<usize>,
     pending_resources: Rc<RefCell<HashMap<usize, usize>>>,
     traced: Cell<bool>,
     traced_minor: Cell<bool>,
@@ -978,6 +984,7 @@ impl RetainedMemory for HostState {
                 + dom_gc.documents.capacity() * std::mem::size_of::<(usize, usize)>()
                 + dom_gc.wrappers.capacity() * std::mem::size_of::<(usize, usize)>()
                 + dom_gc.young_owners.capacity() * std::mem::size_of::<usize>()
+                + dom_gc.listener_nodes.capacity() * std::mem::size_of::<usize>()
                 + dom_gc
                     .owners
                     .values()
@@ -1623,6 +1630,7 @@ impl HostGc for HostState {
         for node in &removed {
             self.dom_gc.documents.remove(node);
             self.dom_gc.wrappers.remove(node);
+            self.dom_gc.listener_nodes.remove(node);
             if let Some(token) = self.element_image_payloads.remove(node) {
                 self.image_payloads.remove(&token);
             }
@@ -1639,6 +1647,10 @@ impl HostGc for HostState {
             self.dom_gc
                 .wrappers
                 .shrink_to(self.dom_gc.wrappers.len().saturating_mul(2));
+        }
+        let listener_nodes = &mut self.dom_gc.listener_nodes;
+        if listener_nodes.capacity() > listener_nodes.len().saturating_mul(4).max(64) {
+            listener_nodes.shrink_to(listener_nodes.len().saturating_mul(2));
         }
         if self.dom_gc.young_owners.capacity() > 64 {
             self.dom_gc.young_owners = Default::default();
@@ -9546,8 +9558,13 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_get_by_id", 1, guarded_get_by_id),
     ("__dom_upgrade_candidates", 2, guarded_upgrade_candidates),
     ("__dom_ce_candidates", 1, guarded_ce_candidates),
-    ("__dom_wrapper_subtree", 1, host_wrapper_subtree),
+    ("__dom_listener_subtree", 1, host_listener_subtree),
+    ("__dom_note_listener_node", 1, host_note_listener_node),
     ("__dom_rendering_frames", 1, host_rendering_frames),
+    ("__dom_has_frames", 1, host_has_frames),
+    ("__dom_slot_scope", 1, host_slot_scope),
+    ("__dom_insertion_effects", 2, host_insertion_effects),
+    ("__dom_removal_effects", 2, host_removal_effects),
     ("__dom_clone", 2, guarded_clone),
     ("__dom_doc_element", 0, guarded_doc_element),
     ("__html_all_collection", 5, host_html_all_collection),
@@ -16505,15 +16522,137 @@ fn host_ce_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     Ok(host_ids_array(ctx, ids))
 }
 
-fn host_wrapper_subtree(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let dom = host_dom(ctx);
-    let ids = {
-        let dom = dom.borrow();
-        host_arg_node(&dom, args, 0)
-            .map(|root| dom.shadow_including_subtree(root))
-            .unwrap_or_default()
-    };
+/// The nodes of `root`'s shadow-including inclusive subtree, in that order, whose wrapper has been
+/// given an event-listener list, or `null` when there are none. Connecting or disconnecting a
+/// subtree changes listener discovery (click and hover targets) only for those wrappers, so every
+/// other node needs no per-node work on insertion or removal.
+fn host_listener_subtree(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    if state.dom_gc.listener_nodes.is_empty() {
+        return Ok(Value::Null);
+    }
+    let mut ids = Vec::new();
+    {
+        let dom = state.dom.borrow();
+        if let Some(root) = host_arg_node(&dom, args, 0) {
+            let listener_nodes = &state.dom_gc.listener_nodes;
+            dom.visit_shadow_including_subtree(root, |id| {
+                if listener_nodes.contains(&id) {
+                    ids.push(id);
+                }
+                true
+            });
+        }
+    }
+    if ids.is_empty() {
+        return Ok(Value::Null);
+    }
     Ok(host_ids_array(ctx, ids))
+}
+
+/// Record that the node's wrapper now owns an event-listener list (see `host_listener_subtree`).
+fn host_note_listener_node(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let node = host_arg_node(&state.dom.borrow(), args, 0);
+    if let Some(node) = node {
+        state.dom_gc.listener_nodes.insert(node);
+    }
+    Ok(Value::Undefined)
+}
+
+/// Whether `root`'s shadow-including inclusive subtree holds an iframe or frame element, so the
+/// navigable insertion/removal steps have work to do. An unknown node answers true: the caller
+/// then takes its general path.
+fn host_has_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::Bool(host_arg_node(&dom, args, 0).is_none_or(
+        |root| dom.shadow_including_subtree_has_frames(root),
+    )))
+}
+
+/// Which of DOM #concept-node-insert's remaining steps can have an effect after the arena inserted
+/// `node` (argument 0) into `parent` (argument 1), as bits the platform shares with this function:
+/// 1 a live Range may exist, 2 the node's subtree holds a listener-bearing node (see
+/// `host_listener_subtree`), 4 the parent can change slot assignment (see `host_slot_scope`), and
+/// 8/16/32 the node is a `script`, `link` or `base` element. One crossing replaces a query per
+/// step for the common insertion. An unknown node or parent answers every bit.
+fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let dom = state.dom.borrow();
+    let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
+    else {
+        return Ok(Value::Num(63.0));
+    };
+    let mut effects = 0u32;
+    if state.live_ranges.may_have_ranges() {
+        effects |= 1;
+    }
+    if subtree_has_listener_node(&dom, &state.dom_gc.listener_nodes, node) {
+        effects |= 2;
+    }
+    if dom.may_affect_slot_assignment(parent) {
+        effects |= 4;
+    }
+    if matches!(dom.node(node).data, NodeData::Element { .. }) {
+        effects |= match dom.tag_name(node) {
+            Some("script") => 8,
+            Some("link") => 16,
+            Some("base") => 32,
+            _ => 0,
+        };
+    }
+    Ok(Value::Num(effects as f64))
+}
+
+/// Which of DOM #concept-node-remove's remaining steps can have an effect once the arena removed
+/// `node` (argument 0) from `parent` (argument 1): 1 the node's subtree holds a navigable container
+/// (see `host_has_frames`), 2 a listener-bearing node, and 4 the parent can change slot assignment.
+/// An unknown node or parent answers every bit.
+fn host_removal_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let dom = state.dom.borrow();
+    let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
+    else {
+        return Ok(Value::Num(7.0));
+    };
+    let mut effects = 0u32;
+    if dom.shadow_including_subtree_has_frames(node) {
+        effects |= 1;
+    }
+    if subtree_has_listener_node(&dom, &state.dom_gc.listener_nodes, node) {
+        effects |= 2;
+    }
+    if dom.may_affect_slot_assignment(parent) {
+        effects |= 4;
+    }
+    Ok(Value::Num(effects as f64))
+}
+
+fn subtree_has_listener_node(
+    dom: &Dom,
+    listener_nodes: &rustc_hash::FxHashSet<usize>,
+    root: usize,
+) -> bool {
+    if listener_nodes.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    dom.visit_shadow_including_subtree(root, |id| {
+        found = listener_nodes.contains(&id);
+        !found
+    });
+    found
+}
+
+/// Whether a tree mutation at the node can change slot assignment (DOM #signal-a-slot-change).
+/// An unknown node answers true: the caller then takes its general path.
+fn host_slot_scope(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::Bool(
+        host_arg_node(&dom, args, 0).is_none_or(|node| dom.may_affect_slot_assignment(node)),
+    ))
 }
 
 /// HTML #update-the-rendering orders child Documents by their containers'
@@ -22056,6 +22195,208 @@ mod tests {
         );
     }
 
+    /// Mutation fast paths skip work only when nothing observes it. With live
+    /// Ranges present, every insertion and removal path still adjusts them
+    /// (DOM #concept-node-insert, #concept-node-remove, #concept-node-replace-all),
+    /// including adoption from another parent and removal of a boundary's ancestor.
+    #[test]
+    fn mutation_fast_paths_keep_adjusting_live_ranges() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const out = [];
+                const p = document.createElement('p'); body.appendChild(p);
+                const k = []; for (let i = 0; i < 5; i++) { const s = document.createElement('span'); p.appendChild(s); k.push(s); }
+                const range = document.createRange(); range.setStart(p, 4); range.setEnd(p, 5);
+                const r = (x) => [x.startContainer === p ? 'p' : x.startContainer.nodeName, x.startOffset, x.endOffset].join(',');
+                k[1].remove(); out.push(r(range));
+                p.removeChild(k[0]); out.push(r(range));
+                const other = document.createElement('div'); body.appendChild(other);
+                other.appendChild(k[2]); out.push(r(range));
+                const r2 = document.createRange(); r2.setStart(other, 0); r2.setEnd(other, 1);
+                p.insertBefore(document.createElement('i'), p.firstChild); out.push(r(range));
+                p.appendChild(k[0]); out.push(r(range));
+                p.insertBefore(k[4], k[3]); out.push(r(range));
+                const t = document.createTextNode('abc'); k[3].appendChild(t);
+                const r3 = document.createRange(); r3.setStart(t, 1); r3.setEnd(t, 2);
+                k[3].remove(); out.push(r(range), r(r3));
+                other.appendChild(document.createElement('u')); out.push(r2.startOffset + ',' + r2.endOffset);
+                k[2].remove(); out.push(r2.startOffset + ',' + r2.endOffset);
+                p.textContent = ''; out.push(r(range), r(r3));
+                const frag = document.createDocumentFragment(); frag.append('x', document.createElement('a'), 'y');
+                p.appendChild(frag); out.push(r(range), p.childNodes.length);
+                const sel = getSelection(); sel.collapse(p, 3);
+                p.insertBefore(document.createElement('hr'), p.firstChild); out.push(sel.focusOffset);
+                p.lastChild.remove(); out.push(sel.focusOffset);
+                out.join('|');
+            "#
+                ),
+                "p,3,4|p,2,3|p,1,2|p,2,3|p,2,3|p,3,3|p,2,2|p,2,2|0,1|0,0|p,0,0|p,0,0|p,0,0|3|4|3",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// Connecting or disconnecting a subtree updates click/hover listener
+    /// discovery for exactly the listener-bearing nodes inside it (DOM
+    /// #concept-event-listener), however deep, on every insertion and removal
+    /// path; subtrees without listeners are skipped.
+    #[test]
+    fn mutation_fast_paths_keep_listener_discovery_for_inserted_subtrees() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const state = () => __trust.listenerRegistryState().slice(1).join(',');
+                const out = [];
+                const outer = document.createElement('div'), inner = document.createElement('span'), leaf = document.createElement('b');
+                inner.appendChild(leaf); outer.appendChild(inner);
+                leaf.addEventListener('click', () => {});
+                inner.addEventListener('mouseover', () => {});
+                out.push(state());
+                body.appendChild(outer); out.push(state());
+                outer.remove(); out.push(state());
+                body.insertBefore(outer, null); out.push(state());
+                body.removeChild(outer); out.push(state());
+                body.appendChild(outer); body.textContent = ''; out.push(state());
+                body.appendChild(outer); body.innerHTML = ''; out.push(state());
+                const frag = document.createDocumentFragment(); frag.appendChild(outer);
+                body.appendChild(frag); out.push(state());
+                const plain = document.createElement('p'); plain.appendChild(document.createElement('i'));
+                body.appendChild(plain); plain.remove(); out.push(state());
+                const host = document.createElement('div'); const shadowLeaf = document.createElement('a');
+                host.attachShadow({ mode: 'open' }).appendChild(shadowLeaf);
+                shadowLeaf.addEventListener('click', () => {});
+                body.appendChild(host); out.push(state());
+                host.remove(); out.push(state());
+                outer.replaceWith(document.createElement('hr')); out.push(state());
+                out.join('|');
+            "#
+                ),
+                "0,0|1,1|0,0|1,1|0,0|0,0|0,0|1,1|1,1|2,1|1,1|0,0",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// Slot assignment checks are skipped only outside shadow trees and shadow
+    /// hosts: a light child inserted into or removed from a host, and a slot
+    /// inserted deeper inside a shadow tree, still signal slotchange (DOM
+    /// #signal-a-slot-change). Mutation observers still receive every
+    /// childList record, and custom elements every connection reaction.
+    #[test]
+    fn mutation_fast_paths_keep_slot_observer_and_custom_element_steps() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                globalThis.fastPathLog = [];
+                const log = fastPathLog;
+                const host = document.createElement('div'); body.appendChild(host);
+                const root = host.attachShadow({ mode: 'open' });
+                const wrapper = document.createElement('section'); root.appendChild(wrapper);
+                const slot = document.createElement('slot'); wrapper.appendChild(slot);
+                slot.addEventListener('slotchange', () => log.push('s1:' + slot.assignedNodes().length));
+                const child = document.createElement('b');
+                const target = document.createElement('div'); body.appendChild(target);
+                new MutationObserver(records => {
+                    for (const r of records) log.push('mo:' + r.addedNodes.length + '/' + r.removedNodes.length + ':'
+                        + (r.previousSibling ? r.previousSibling.nodeName : '-') + ':' + (r.nextSibling ? r.nextSibling.nodeName : '-'));
+                }).observe(target, { childList: true, subtree: true });
+                customElements.define('x-fast-probe', class extends HTMLElement {
+                    connectedCallback() { log.push('c'); }
+                    disconnectedCallback() { log.push('d'); }
+                });
+                globalThis.fastPathSteps = [
+                    () => host.appendChild(child),
+                    () => child.remove(),
+                    () => { host.textContent = 'x'; },
+                    () => { const named = document.createElement('i'); named.slot = 'n'; host.appendChild(named); },
+                    () => { const s2 = document.createElement('slot'); s2.name = 'n';
+                        s2.addEventListener('slotchange', () => log.push('s2:' + s2.assignedNodes().length));
+                        wrapper.insertBefore(s2, slot); },
+                    () => host.lastChild.remove(),
+                    () => { const plain = document.createElement('p'); body.appendChild(plain);
+                        plain.appendChild(document.createElement('i')); plain.remove(); },
+                    () => { const a = document.createElement('a'); target.appendChild(a);
+                        target.insertBefore(document.createElement('em'), a); a.remove(); },
+                    () => { target.removeChild(target.firstChild); target.append('t', document.createElement('u')); },
+                    () => { target.textContent = ''; },
+                    () => { const el = document.createElement('x-fast-probe'); body.appendChild(el); el.remove();
+                        body.insertBefore(el, null); body.removeChild(el);
+                        const holder = document.createElement('div'); holder.appendChild(el);
+                        body.appendChild(holder); holder.remove(); },
+                ];
+            "#,
+            "fast path observer setup",
+        )
+        .unwrap();
+        let steps: usize = string_value(&mut engine, "fastPathSteps.length")
+            .parse()
+            .unwrap();
+        for step in 0..steps {
+            eval(
+                &mut engine,
+                &format!("fastPathSteps[{step}](); fastPathLog.push('|');"),
+                "fast path step",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "fastPathLog.join(',')"),
+            "|,s1:1,|,s1:0,|,s1:1,|,|,s2:1,|,s2:0,|,|,mo:1/0:-:-,mo:1/0:-:A,mo:0/1:EM:-,|,\
+             mo:0/1:-:-,mo:2/0:-:-,|,mo:0/2:-:-,c,d,c,d,c,d,|"
+        );
+    }
+
+    /// HTML's iframe insertion and removing steps run whenever a navigable
+    /// container is in the inserted or removed subtree, at any depth and on
+    /// every path; the frame-free fast path never skips them.
+    #[test]
+    fn mutation_fast_paths_keep_frame_insertion_and_removal_steps() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const box = document.createElement('div'), frame = document.createElement('iframe');
+                box.appendChild(frame);
+                const states = [frame.contentWindow === null];
+                body.appendChild(box); states.push(frame.contentWindow !== null);
+                box.remove(); states.push(frame.contentWindow === null);
+                body.appendChild(box); states.push(frame.contentWindow !== null);
+                body.removeChild(box); states.push(frame.contentWindow === null);
+                body.appendChild(box); box.textContent = ''; states.push(frame.contentWindow === null);
+                box.appendChild(frame); body.appendChild(box); box.innerHTML = ''; states.push(frame.contentWindow === null);
+                const deep = document.createElement('div');
+                deep.appendChild(document.createElement('p')).appendChild(frame);
+                body.insertBefore(deep, null); states.push(frame.contentWindow !== null);
+                deep.firstChild.remove(); states.push(frame.contentWindow === null);
+                states.join(',');
+            "#
+            ),
+            "true,true,true,true,true,true,true,true,true"
+        );
+    }
+
     #[test]
     fn node_constructors_create_nodes_and_windows_index_child_navigables() {
         // DOM #dom-text-text, #dom-comment-comment and
@@ -23593,7 +23934,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 207, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 212, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -23604,7 +23945,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 207);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 212);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

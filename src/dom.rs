@@ -8751,16 +8751,31 @@ impl Dom {
     /// This is the DOM Standard's shadow-including traversal, with the shadow
     /// root node itself included as well as its children. Resource discovery
     /// must reach declarative roots while excluding inert template contents.
-    /// The JavaScript binding also uses this when subtree connectedness changes
-    /// to retain connected wrappers and release detached wrappers to weak storage.
     pub(crate) fn shadow_including_subtree(&self, root: NodeId) -> Vec<NodeId> {
-        if !self.is_valid(root) {
-            return Vec::new();
-        }
         let mut out = Vec::new();
+        self.visit_shadow_including_subtree(root, |id| {
+            out.push(id);
+            true
+        });
+        out
+    }
+
+    /// Visit `root`'s shadow-including inclusive subtree in the order of
+    /// [`Self::shadow_including_subtree`] without collecting it. The visit
+    /// stops as soon as `visit` returns false.
+    pub(crate) fn visit_shadow_including_subtree(
+        &self,
+        root: NodeId,
+        mut visit: impl FnMut(NodeId) -> bool,
+    ) {
+        if !self.is_valid(root) {
+            return;
+        }
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
-            out.push(id);
+            if !visit(id) {
+                return;
+            }
 
             let start = stack.len();
             let mut child = self.nodes[id].first_child;
@@ -8776,7 +8791,19 @@ impl Dom {
                 stack.push(shadow);
             }
         }
-        out
+    }
+
+    /// Whether `root`'s shadow-including inclusive subtree holds an `iframe`
+    /// or `frame` element: the navigable containers whose insertion creates
+    /// and whose removal destroys a child navigable (HTML #the-iframe-element
+    /// insertion and removing steps). Every other subtree can skip that work.
+    pub(crate) fn shadow_including_subtree_has_frames(&self, root: NodeId) -> bool {
+        let mut found = false;
+        self.visit_shadow_including_subtree(root, |id| {
+            found = matches!(self.tag_name(id), Some("iframe" | "frame"));
+            !found
+        });
+        found
     }
 
     pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
