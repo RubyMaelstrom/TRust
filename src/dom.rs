@@ -3599,6 +3599,7 @@ impl Dom {
         n.next_sibling = None;
         if let Some(parent) = parent {
             self.child_collection_changed(parent, id, false);
+            self.note_picture_child_change(parent, id);
             self.clear_modal_disconnected();
         }
     }
@@ -3620,6 +3621,7 @@ impl Dom {
         self.invalidate_style_subtree(child, true);
         self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
+        self.note_picture_child_change(parent, child);
     }
 
     /// Link a newly-created, detached node while constructing another detached
@@ -3894,6 +3896,7 @@ impl Dom {
         self.invalidate_style_subtree(child, true);
         self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
+        self.note_picture_child_change(parent, child);
     }
 
     /// Implement the DOM Standard's adopt algorithm (DOM §4.5): remove the
@@ -9727,6 +9730,44 @@ impl Dom {
             }
         }
         copy
+    }
+
+    /// HTML #reacting-to-dom-mutations, through the `img` and `source` HTML
+    /// element insertion and removing steps: an `img` inserted into or
+    /// removed from a `picture` parent, and every `img` child of a `picture`
+    /// that gained or lost a `source` child, has a relevant mutation (its
+    /// source set changed). `child` is the inserted or removed subtree root.
+    fn note_picture_child_change(&mut self, parent: NodeId, child: NodeId) {
+        let html_name = |dom: &Self, id: NodeId| match &dom.nodes[id].data {
+            NodeData::Element { name, .. } if name.ns == ns!(html) => Some(name.local.clone()),
+            _ => None,
+        };
+        if html_name(self, parent).as_deref() != Some("picture") {
+            return;
+        }
+        match html_name(self, child).as_deref() {
+            Some("img") => self.note_relevant_image_mutation(child),
+            Some("source") => {
+                let mut next = self.nodes[parent].first_child;
+                while let Some(sibling) = next {
+                    next = self.nodes[sibling].next_sibling;
+                    if html_name(self, sibling).as_deref() == Some("img") {
+                        self.note_relevant_image_mutation(sibling);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Queue an `img`'s relevant mutation for the page actor's next "update
+    /// the image data" (see `created_images`). A creation or adoption already
+    /// queued for it runs the same update.
+    fn note_relevant_image_mutation(&mut self, id: NodeId) {
+        if !self.created_images.iter().any(|&(queued, _)| queued == id) {
+            self.created_images.push((id, true));
+            self.created_images_generation = self.created_images_generation.wrapping_add(1);
+        }
     }
 
     /// HTML #when-to-obtain-images: a created `img` updates its image data.
