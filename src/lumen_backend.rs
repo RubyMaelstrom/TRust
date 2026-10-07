@@ -26719,6 +26719,66 @@ mod tests {
     }
 
     #[test]
+    fn webassembly_reentrant_funcrefs_keep_their_function_addresses() {
+        // JS API §5.6 ToWebAssemblyValue: a funcref is the [[FunctionAddress]] of an Exported
+        // Function. While an import callback has the store lent to Wasm, Table.set/grow,
+        // Global construction/assignment, a funcref import result and a funcref argument of a
+        // nested export call must each resolve to that same function.
+        let mut engine = platform_engine();
+        install_wasm_test_fixture(
+            &mut engine,
+            r#"
+            (module
+                (import "env" "callback" (func $callback))
+                (import "env" "pick" (func $pick (result funcref)))
+                (table (export "table") 1 8 funcref)
+                (type $t (func (result i32)))
+                (func (export "one") (result i32) i32.const 1)
+                (func (export "two") (result i32) i32.const 2)
+                (func (export "run") (result i32)
+                    call $callback
+                    (table.set (i32.const 2) (call $pick))
+                    (i32.add
+                        (call_indirect (type $t) (i32.const 0))
+                        (i32.add
+                            (i32.mul (call_indirect (type $t) (i32.const 1)) (i32.const 10))
+                            (i32.mul (call_indirect (type $t) (i32.const 2)) (i32.const 100)))))
+                (func (export "takes") (param funcref) (result i32)
+                    (table.set (i32.const 3) (local.get 0))
+                    (call_indirect (type $t) (i32.const 3))))
+        "#,
+        );
+        eval(
+            &mut engine,
+            r#"
+            let exports, nested = -1, global, globalIdentity = false;
+            exports = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), { env: {
+                callback() {
+                    exports.table.set(0, exports.two);
+                    exports.table.grow(3, exports.one);
+                    nested = exports.takes(exports.two);
+                    global = new WebAssembly.Global({ value: 'anyfunc', mutable: true }, exports.one);
+                    globalIdentity = global.value === exports.one;
+                    global.value = exports.two;
+                },
+                pick() { return exports.one; }
+            }}).exports;
+            globalThis.reentrantFuncrefResult = [
+                exports.run(), nested, globalIdentity, global.value === exports.two,
+                exports.table.get(0) === exports.two, exports.table.get(2) === exports.one,
+                exports.table.get(3) === exports.two, exports.table.length
+            ].join('|');
+        "#,
+            "re-entrant funcref conversions",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "reentrantFuncrefResult"),
+            "112|2|true|true|true|true|true|4"
+        );
+    }
+
+    #[test]
     fn webassembly_memory_survives_resize_through_forged_getters() {
         // ECMA-262 #sec-arraybuffer.prototype.resize reads [[ArrayBufferMaxByteLength]]
         // (an internal slot) and throws for a fixed-length buffer such as Memory.buffer
