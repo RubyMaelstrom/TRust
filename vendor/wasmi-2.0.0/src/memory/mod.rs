@@ -11,7 +11,7 @@ use crate::{
     Error,
     StoreContext,
     StoreContextMut,
-    core::CoreMemory,
+    core::{CoreMemory, SharedBytes},
     errors::MemoryError,
     store::Stored,
 };
@@ -190,6 +190,26 @@ impl Memory {
             .inner
             .resolve_memory(self)
             .data_version()
+    }
+
+    /// TRust: shares the bytes of this memory with the embedder, see
+    /// [`CoreMemory::share`](crate::core::CoreMemory::share).
+    ///
+    /// Returns `None` for a memory created with [`Memory::new_static`].
+    ///
+    /// # Safety
+    ///
+    /// See [`CoreMemory::share`](crate::core::CoreMemory::share): the store and every clone
+    /// of the returned `Rc` stay on the current thread, and the bytes are not accessed
+    /// through the `Rc` while a slice obtained from this memory is in use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ctx` does not own this [`Memory`].
+    pub unsafe fn share(&self, mut ctx: impl AsContextMut) -> Option<SharedBytes> {
+        let memory = ctx.as_context_mut().store.inner.resolve_memory_mut(self);
+        // SAFETY: forwarded to the caller.
+        unsafe { memory.share() }
     }
 
     /// Takes the page-aligned ranges written since the previous call.
