@@ -5,7 +5,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_SYMBOLS: usize = 1024;
 const MAX_BYTES: usize = 4096;
-pub(super) type Styles = FxHashMap<String, (u64, CounterStyle)>;
+pub(super) type Styles = FxHashMap<String, (u128, CounterStyle)>;
 #[derive(Clone, Debug, Default)]
 pub(super) struct CounterStyle {
     descriptors: FxHashMap<String, String>,
