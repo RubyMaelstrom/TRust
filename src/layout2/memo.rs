@@ -160,6 +160,12 @@ pub(super) fn len_bytes(len: &Len) -> usize {
             }
             Node::Sum(a, b, _) => 2 * size_of::<Node>() + node_bytes(a) + node_bytes(b),
             Node::Scale(a, _) => size_of::<Node>() + node_bytes(a),
+            Node::Mul(a, b) | Node::Div(a, b) => {
+                2 * size_of::<Node>() + node_bytes(a) + node_bytes(b)
+            }
+            Node::Math(_, args) => {
+                args.capacity() * size_of::<Node>() + args.iter().map(node_bytes).sum::<usize>()
+            }
         }
     }
     match len {

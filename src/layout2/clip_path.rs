@@ -446,7 +446,7 @@ fn lengths(parts: &[&str], units: Units, vp: Vp, nonnegative: bool) -> Option<[L
                 return None;
             }
             if nonnegative
-                && !part.starts_with("calc(")
+                && !super::value::is_math_function(part)
                 && length.resolve(Some(100.)).is_some_and(|n| n < 0.)
             {
                 return None;
