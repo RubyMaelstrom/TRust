@@ -1,0 +1,137 @@
+use crate::{
+    Error,
+    ExternRef,
+    ValType,
+    core::{RawVal, Typed, TypedRawVal},
+    engine::TranslationError,
+};
+use core::convert::identity;
+
+/// Returns the number of Wasmi engine cell slots required to represent a [`ValType`] `ty`.
+#[inline]
+pub fn required_cells_for_ty(ty: ValType) -> u16 {
+    match ty {
+        #[cfg(feature = "simd")]
+        ValType::V128 => 2,
+        _ => 1,
+    }
+}
+
+/// Returns the number of Wasmi engine cell slots required to represent a slice of [`ValType`] `tys`.
+#[inline]
+pub fn required_cells_for_tys(tys: &[ValType]) -> Result<u16, Error> {
+    let len_cells: usize = tys
+        .iter()
+        .copied()
+        .map(required_cells_for_ty)
+        .map(usize::from)
+        .sum();
+    len_cells
+        .try_into()
+        .map_err(|_| Error::from(TranslationError::SlotAccessOutOfBounds))
+}
+
+impl Typed for ExternRef {
+    const TY: ValType = ValType::ExternRef;
+}
+
+/// A WebAssembly integer. Either `i32` or `i64`.
+///
+/// # Note
+///
+/// This trait provides some utility methods useful for translation.
+pub trait WasmInteger:
+    Copy + Eq + Typed + From<TypedRawVal> + Into<TypedRawVal> + From<RawVal> + Into<RawVal>
+{
+    /// Returns `true` if `self` is equal to zero (0).
+    fn is_zero(self) -> bool;
+}
+
+macro_rules! impl_wasm_integer {
+    ($($ty:ty),*) => {
+        $(
+            impl WasmInteger for $ty {
+                fn is_zero(self) -> bool {
+                    self == 0
+                }
+            }
+        )*
+    };
+}
+impl_wasm_integer!(i32, u32, i64, u64);
+
+/// Implemented by integer types to wrap them to another (smaller) integer type.
+pub trait Wrap<T> {
+    /// Wraps `self` into a value of type `T`.
+    fn wrap(self) -> T;
+}
+
+impl<T> Wrap<T> for T {
+    #[inline]
+    fn wrap(self) -> T {
+        self
+    }
+}
+
+macro_rules! impl_wrap_for {
+    ( $($from_ty:ty => $to_ty:ty),* $(,)? ) => {
+        $(
+            impl Wrap<$to_ty> for $from_ty {
+                #[inline]
+                fn wrap(self) -> $to_ty { self as _ }
+            }
+        )*
+    };
+}
+impl_wrap_for! {
+    // signed
+    i16 => i8,
+    i32 => i8,
+    i32 => i16,
+    i64 => i8,
+    i64 => i16,
+    i64 => i32,
+    // unsigned
+    u16 => u8,
+    u32 => u8,
+    u32 => u16,
+    u64 => u8,
+    u64 => u16,
+    u64 => u32,
+}
+
+/// Types that can be converted into bits.
+pub trait ToBits {
+    /// The output bits type of [`ToBits`].
+    type Out: Copy;
+
+    /// Converts `self` into a 32-bit `u32` value.
+    fn to_bits(self) -> Self::Out;
+}
+
+macro_rules! impl_to_bits {
+    ( $($ty:ty as $bits_ty:ty = $expr:expr),* $(,)? ) => {
+        $(
+            impl ToBits for $ty {
+                type Out = $bits_ty;
+                fn to_bits(self) -> Self::Out {
+                    $expr(self)
+                }
+            }
+        )*
+    };
+}
+impl_to_bits! {
+    u8 as u8 = identity,
+    u16 as u16 = identity,
+    u32 as u32 = identity,
+    u64 as u64 = identity,
+
+    f32 as u32 = f32::to_bits,
+    f64 as u64 = f64::to_bits,
+
+    i8 as u8 = |v: i8| u8::from_ne_bytes(v.to_ne_bytes()),
+    i16 as u16 = |v: i16| u16::from_ne_bytes(v.to_ne_bytes()),
+    i32 as u32 = |v: i32| u32::from_ne_bytes(v.to_ne_bytes()),
+    i64 as u64 = |v: i64| u64::from_ne_bytes(v.to_ne_bytes()),
+}

@@ -1,0 +1,454 @@
+use crate::build::op::Wrapped;
+use core::fmt::{self, Display};
+
+#[derive(Copy, Clone)]
+pub enum Layout {
+    Bits8,
+    Bits16,
+    Bits32,
+    Bits64,
+    Bits128,
+    Bits8x8,
+    Bits16x4,
+    Bits32x2,
+}
+
+impl From<Wrapped> for Layout {
+    fn from(value: Wrapped) -> Self {
+        match value {
+            Wrapped::I8 => Self::Bits8,
+            Wrapped::I16 => Self::Bits16,
+            Wrapped::I32 => Self::Bits32,
+        }
+    }
+}
+
+impl From<LaneWidth> for Layout {
+    fn from(value: LaneWidth) -> Self {
+        match value {
+            LaneWidth::W8 => Self::Bits8,
+            LaneWidth::W16 => Self::Bits16,
+            LaneWidth::W32 => Self::Bits32,
+            LaneWidth::W64 => Self::Bits64,
+        }
+    }
+}
+
+impl From<Wrapped> for FieldTy {
+    fn from(value: Wrapped) -> Self {
+        match value {
+            Wrapped::I8 => Self::I8,
+            Wrapped::I16 => Self::I16,
+            Wrapped::I32 => Self::I32,
+        }
+    }
+}
+
+impl From<Layout> for FieldTy {
+    fn from(value: Layout) -> Self {
+        match value {
+            Layout::Bits8 => Self::U8,
+            Layout::Bits16 => Self::U16,
+            Layout::Bits32 => Self::U32,
+            Layout::Bits64 => Self::U64,
+            Layout::Bits128 => Self::V128,
+            Layout::Bits8x8 => Self::U64,
+            Layout::Bits16x4 => Self::U64,
+            Layout::Bits32x2 => Self::U64,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Ty {
+    /// A generic 8-bit value.
+    Bits8,
+    /// A generic 16-bit value.
+    Bits16,
+    /// A generic 32-bit value.
+    Bits32,
+    /// A generic 64-bit value.
+    Bits64,
+    /// A generic 64-bit `8x8` array-like value.
+    Bits8x8,
+    /// A generic 64-bit `16x4` array-like value.
+    Bits16x4,
+    /// A generic 64-bit `32x2` array-like value.
+    Bits32x2,
+    /// A general 32-bit integer type.
+    I32,
+    /// A general 64-bit integer type.
+    I64,
+    /// A unsigned 8-bit integer type.
+    U8,
+    /// A unsigned 16-bit integer type.
+    U16,
+    /// A unsigned 32-bit integer type.
+    U32,
+    /// A unsigned 64-bit integer type.
+    U64,
+    /// A non-zero signed 32-bit integer type.
+    NonZeroI32,
+    /// A non-zero signed 64-bit integer type.
+    NonZeroI64,
+    /// A non-zero unsigned 32-bit integer type.
+    NonZeroU32,
+    /// A non-zero unsigned 64-bit integer type.
+    NonZeroU64,
+    /// A 32-bit float type.
+    F32,
+    /// A 64-bit float type.
+    F64,
+    /// A 32-bit float type sign.
+    SignF32,
+    /// A 64-bit float type sign.
+    SignF64,
+    /// A generic `simd` vector type.
+    V128,
+    /// A `i8x16` vector type for `simd`.
+    I8x16,
+    /// A `i16x8` vector type for `simd`.
+    I16x8,
+    /// A `i32x4` vector type for `simd`.
+    I32x4,
+    /// A `i64x2` vector type for `simd`.
+    I64x2,
+    /// A `u8x16` vector type for `simd`.
+    U8x16,
+    /// A `u16x8` vector type for `simd`.
+    U16x8,
+    /// A `u32x4` vector type for `simd`.
+    U32x4,
+    /// A `u64x2` vector type for `simd`.
+    U64x2,
+    /// A `f32x4` vector type for `simd`.
+    F32x4,
+    /// A `f64x2` vector type for `simd`.
+    F64x2,
+    /// A shift amount for shift operators.
+    ShiftAmount,
+}
+
+impl Ty {
+    /// Returns `true` if `self` is a `v128` type.
+    pub fn is_v128(&self) -> bool {
+        matches!(self, |Self::V128| Self::I8x16
+            | Self::I16x8
+            | Self::I32x4
+            | Self::I64x2
+            | Self::U8x16
+            | Self::U16x8
+            | Self::U32x4
+            | Self::U64x2
+            | Self::F32x4
+            | Self::F64x2)
+    }
+
+    /// Returns `true` if `self` is a scalar value type.
+    pub fn is_scalar(&self) -> bool {
+        matches!(self, |Self::Bits8| Self::Bits16
+            | Self::Bits32
+            | Self::Bits64
+            | Self::I32
+            | Self::I64
+            | Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::U64
+            | Self::NonZeroI32
+            | Self::NonZeroI64
+            | Self::NonZeroU32
+            | Self::NonZeroU64
+            | Self::F32
+            | Self::F64)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum FieldTy {
+    Slot,
+    SlotSpan,
+    SlotAndRegInt,
+    SlotAndRegF32,
+    SlotAndRegF64,
+    RegInt,
+    RegF32,
+    RegF64,
+    BoundedSlotSpan,
+    FixedSlotSpan2,
+    U8,
+    U16,
+    U32,
+    U64,
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+    NonZeroI32,
+    NonZeroI64,
+    NonZeroU32,
+    NonZeroU64,
+    SignF32,
+    SignF64,
+    Address,
+    Offset,
+    Offset16,
+    BranchOffset,
+    Table0,
+    MemoryAddr,
+    TableAddr,
+    GlobalAddr,
+    FuncAddr,
+    FuncType,
+    InternalFunc,
+    ElemAddr,
+    DataAddr,
+    TrapCode,
+    BlockFuel,
+    Array16ImmLaneIdx32,
+    ImmLaneIdx16,
+    ImmLaneIdx8,
+    ImmLaneIdx4,
+    ImmLaneIdx2,
+    Bytes16,
+    V128,
+    ShiftAmount,
+    EmptyTuple,
+    Local(u16),
+}
+
+impl FieldTy {
+    pub fn is_reg(&self) -> bool {
+        matches!(self, Self::RegInt | Self::RegF32 | Self::RegF64)
+    }
+
+    /// Returns `true` if the field type is like a unit type and
+    /// doesn't need to provide a value for construction.
+    pub fn is_unit(&self) -> bool {
+        matches!(
+            self,
+            Self::Local(_) | Self::Table0 | Self::RegInt | Self::RegF32 | Self::RegF64
+        )
+    }
+}
+
+impl From<Ty> for FieldTy {
+    fn from(ty: Ty) -> Self {
+        match ty {
+            | Ty::Bits8 => FieldTy::U8,
+            | Ty::Bits16 => FieldTy::U16,
+            | Ty::Bits32 => FieldTy::U32,
+            | Ty::Bits64 => FieldTy::U64,
+            | Ty::Bits8x8 => FieldTy::U64,
+            | Ty::Bits16x4 => FieldTy::U64,
+            | Ty::Bits32x2 => FieldTy::U64,
+            | Ty::I32 => FieldTy::I32,
+            | Ty::I64 => FieldTy::I64,
+            | Ty::U8 => FieldTy::U8,
+            | Ty::U16 => FieldTy::U16,
+            | Ty::U32 => FieldTy::U32,
+            | Ty::U64 => FieldTy::U64,
+            | Ty::NonZeroI32 => FieldTy::NonZeroI32,
+            | Ty::NonZeroI64 => FieldTy::NonZeroI64,
+            | Ty::NonZeroU32 => FieldTy::NonZeroU32,
+            | Ty::NonZeroU64 => FieldTy::NonZeroU64,
+            | Ty::F32 => FieldTy::F32,
+            | Ty::F64 => FieldTy::F64,
+            | Ty::SignF32 => FieldTy::SignF32,
+            | Ty::SignF64 => FieldTy::SignF64,
+            | Ty::V128
+            | Ty::I8x16
+            | Ty::I16x8
+            | Ty::I32x4
+            | Ty::I64x2
+            | Ty::U8x16
+            | Ty::U16x8
+            | Ty::U32x4
+            | Ty::U64x2
+            | Ty::F32x4
+            | Ty::F64x2 => FieldTy::V128,
+            | Ty::ShiftAmount => FieldTy::ShiftAmount,
+        }
+    }
+}
+
+impl Display for FieldTy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Slot => "Slot",
+            Self::SlotSpan => "SlotSpan",
+            Self::SlotAndRegInt => "SlotAndReg<i64>",
+            Self::SlotAndRegF32 => "SlotAndReg<f32>",
+            Self::SlotAndRegF64 => "SlotAndReg<f64>",
+            Self::RegInt => "Reg<i64>",
+            Self::RegF32 => "Reg<f32>",
+            Self::RegF64 => "Reg<f64>",
+            Self::BoundedSlotSpan => "BoundedSlotSpan",
+            Self::FixedSlotSpan2 => "FixedSlotSpan<2>",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::NonZeroI32 => "NonZero<i32>",
+            Self::NonZeroI64 => "NonZero<i64>",
+            Self::NonZeroU32 => "NonZero<u32>",
+            Self::NonZeroU64 => "NonZero<u64>",
+            Self::SignF32 => "Sign<f32>",
+            Self::SignF64 => "Sign<f64>",
+            Self::Address => "Address",
+            Self::Offset => "Offset",
+            Self::Offset16 => "Offset16",
+            Self::BranchOffset => "BranchOffset",
+            Self::Table0 => "Table0",
+            Self::MemoryAddr => "MemoryAddr",
+            Self::TableAddr => "TableAddr",
+            Self::GlobalAddr => "GlobalAddr",
+            Self::FuncAddr => "FuncAddr",
+            Self::FuncType => "FuncType",
+            Self::InternalFunc => "InternalFunc",
+            Self::ElemAddr => "ElemAddr",
+            Self::DataAddr => "DataAddr",
+            Self::TrapCode => "TrapCode",
+            Self::BlockFuel => "BlockFuel",
+            Self::Array16ImmLaneIdx32 => "[ImmLaneIdx<32>; 16]",
+            Self::ImmLaneIdx16 => "ImmLaneIdx<16>",
+            Self::ImmLaneIdx8 => "ImmLaneIdx<8>",
+            Self::ImmLaneIdx4 => "ImmLaneIdx<4>",
+            Self::ImmLaneIdx2 => "ImmLaneIdx<2>",
+            Self::Bytes16 => "[u8; 16]",
+            Self::V128 => "V128",
+            Self::ShiftAmount => "ShiftAmount",
+            Self::EmptyTuple => "()",
+            Self::Local(index) => return write!(f, "Local<{index}>"),
+        };
+        f.write_str(s)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum LaneWidth {
+    W8,
+    W16,
+    W32,
+    W64,
+}
+
+impl From<LaneWidth> for FieldTy {
+    fn from(value: LaneWidth) -> Self {
+        match value {
+            LaneWidth::W8 => FieldTy::ImmLaneIdx16,
+            LaneWidth::W16 => FieldTy::ImmLaneIdx8,
+            LaneWidth::W32 => FieldTy::ImmLaneIdx4,
+            LaneWidth::W64 => FieldTy::ImmLaneIdx2,
+        }
+    }
+}
+
+impl Display for LaneWidth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let width = u8::from(*self);
+        let len_lanes = self.len_lanes();
+        write!(f, "{width}x{len_lanes}")
+    }
+}
+
+impl From<LaneWidth> for u8 {
+    fn from(width: LaneWidth) -> Self {
+        match width {
+            LaneWidth::W8 => 8,
+            LaneWidth::W16 => 16,
+            LaneWidth::W32 => 32,
+            LaneWidth::W64 => 64,
+        }
+    }
+}
+
+impl LaneWidth {
+    pub fn len_lanes(self) -> u8 {
+        match self {
+            Self::W8 => 16,
+            Self::W16 => 8,
+            Self::W32 => 4,
+            Self::W64 => 2,
+        }
+    }
+
+    pub fn to_laneidx(self) -> FieldTy {
+        match self {
+            Self::W8 => FieldTy::ImmLaneIdx16,
+            Self::W16 => FieldTy::ImmLaneIdx8,
+            Self::W32 => FieldTy::ImmLaneIdx4,
+            Self::W64 => FieldTy::ImmLaneIdx2,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum SimdTy {
+    I8x16,
+    U8x16,
+    I16x8,
+    U16x8,
+    U32x4,
+    U64x2,
+    F32x4,
+    F64x2,
+}
+
+impl From<SimdTy> for Ty {
+    fn from(value: SimdTy) -> Self {
+        match value {
+            SimdTy::I8x16 => Self::I8x16,
+            SimdTy::U8x16 => Self::U8x16,
+            SimdTy::I16x8 => Self::I16x8,
+            SimdTy::U16x8 => Self::U16x8,
+            SimdTy::U32x4 => Self::U32x4,
+            SimdTy::U64x2 => Self::U64x2,
+            SimdTy::F32x4 => Self::F32x4,
+            SimdTy::F64x2 => Self::F64x2,
+        }
+    }
+}
+
+impl From<SimdTy> for LaneWidth {
+    fn from(value: SimdTy) -> Self {
+        match value {
+            | SimdTy::I8x16 | SimdTy::U8x16 => Self::W8,
+            | SimdTy::I16x8 | SimdTy::U16x8 => Self::W16,
+            | SimdTy::U32x4 | SimdTy::F32x4 => Self::W32,
+            | SimdTy::U64x2 | SimdTy::F64x2 => Self::W64,
+        }
+    }
+}
+
+impl SimdTy {
+    pub fn lane_ty(self) -> FieldTy {
+        match self {
+            | SimdTy::I8x16 | SimdTy::U8x16 => FieldTy::ImmLaneIdx16,
+            | SimdTy::I16x8 | SimdTy::U16x8 => FieldTy::ImmLaneIdx8,
+            | SimdTy::U32x4 | SimdTy::F32x4 => FieldTy::ImmLaneIdx4,
+            | SimdTy::U64x2 | SimdTy::F64x2 => FieldTy::ImmLaneIdx2,
+        }
+    }
+
+    pub fn item_ty(self) -> FieldTy {
+        match self {
+            SimdTy::I8x16 => FieldTy::I8,
+            SimdTy::U8x16 => FieldTy::U8,
+            SimdTy::I16x8 => FieldTy::I16,
+            SimdTy::U16x8 => FieldTy::U16,
+            SimdTy::U32x4 => FieldTy::U32,
+            SimdTy::U64x2 => FieldTy::U64,
+            SimdTy::F32x4 => FieldTy::F32,
+            SimdTy::F64x2 => FieldTy::F64,
+        }
+    }
+}

@@ -1,0 +1,445 @@
+use super::FuncTranslator;
+
+mod op;
+mod visit;
+
+use crate::{
+    Error,
+    TrapCode,
+    V128,
+    ValType,
+    core::{IntoShiftAmount, RawVal, ShiftAmount, Typed, TypedRawVal, simd::IntoLaneIdx},
+    engine::translator::{
+        func::{
+            Operand,
+            op::LoadOp,
+            stack::{Location, ResolvedOperand},
+        },
+        utils::{ToBits, Wrap},
+    },
+    ir::{self, Offset, Offset16, Op, Slot},
+};
+use wasmparser::MemArg;
+
+impl FuncTranslator {
+    /// Converts the `operand` into the associated [`Slot`].
+    ///
+    /// # Note
+    ///
+    /// Forwards to [`StackLayout::local_to_slot`] if possible.
+    ///
+    ///
+    /// # Errors
+    ///
+    /// If the forwarded method returned an error.
+    ///
+    /// # Panics
+    ///
+    /// If `operand` is an [`ImmediateOperand`].
+    ///
+    /// [`ImmediateOperand`]: crate::engine::translator::func::ImmediateOperand
+    /// [`StackLayout::local_to_slot`]: crate::engine::translator::func::StackLayout::local_to_slot
+    pub fn operand_to_slot(&mut self, operand: Operand) -> Result<Slot, Error> {
+        let value = match operand {
+            Operand::Local(operand) => self.layout.local_to_slot(operand),
+            Operand::Temp(operand) if !operand.in_reg() => Ok(operand.temp_slots().head()),
+            _ => {
+                panic!("cannot convert operand to stack `Slot` without copy: {operand:?}")
+            }
+        }?;
+        Ok(value)
+    }
+
+    /// Generically translate any of the Wasm `simd` splat instructions.
+    #[inline(never)]
+    fn translate_simd_splat<T, Wrapped>(
+        &mut self,
+        op_sr: fn(result: Slot) -> Op,
+        op_ss: fn(result: Slot, value: Slot) -> Op,
+        op_si: fn(result: Slot, value: <Wrapped as ToBits>::Out) -> Op,
+    ) -> Result<(), Error>
+    where
+        T: From<RawVal> + Wrap<Wrapped>,
+        Wrapped: ToBits,
+    {
+        bail_unreachable!(self);
+        let value = self.stack.pop();
+        let value = self.resolve_operand::<RawVal>(value)?;
+        self.push_op_with_result_slot(ValType::V128, |result| match value {
+            ResolvedOperand::Reg(_) => op_sr(result),
+            ResolvedOperand::Slot(value) => op_ss(result, value),
+            ResolvedOperand::Immediate(value) => {
+                let value = T::from(value).wrap().to_bits();
+                op_si(result, value)
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Generically translate any of the Wasm `simd` extract lane instructions.
+    #[inline(never)]
+    fn translate_extract_lane<T: IntoLaneIdx, R>(
+        &mut self,
+        lane: u8,
+        make_instr: fn(input: Slot, lane: T::LaneIdx) -> Op,
+        const_eval: fn(input: V128, lane: T::LaneIdx) -> R,
+    ) -> Result<(), Error>
+    where
+        R: Into<TypedRawVal> + Typed,
+    {
+        bail_unreachable!(self);
+        let Ok(lane) = <T::LaneIdx>::try_from(lane) else {
+            panic!("encountered out of bounds lane index: {lane}")
+        };
+        let input = self.stack.pop();
+        if let Operand::Immediate(input) = input {
+            let result = const_eval(input.val().into(), lane);
+            self.stack.push_immediate(result)?;
+            return Ok(());
+        };
+        let input = self.operand_to_slot(input)?;
+        self.push_op_with_result_reg(<R as Typed>::TY, make_instr(input, lane))?;
+        Ok(())
+    }
+
+    /// Generically translate a Wasm SIMD replace lane instruction.
+    #[inline(never)]
+    fn translate_replace_lane<T: op::SimdReplaceLane>(&mut self, lane: u8) -> Result<(), Error>
+    where
+        T::Item: IntoLaneIdx + From<RawVal> + Copy,
+        T::Immediate: Copy,
+    {
+        bail_unreachable!(self);
+        let Ok(lane) = <<T::Item as IntoLaneIdx>::LaneIdx>::try_from(lane) else {
+            panic!("encountered out of bounds lane index: {lane}");
+        };
+        let (input, value) = self.stack.pop2();
+        if let (Operand::Immediate(x), Operand::Immediate(item)) = (input, value) {
+            let result = T::const_eval(x.val().into(), lane, item.val().raw().into());
+            self.stack.push_immediate(result)?;
+            return Ok(());
+        }
+        let input = self.copy_operand_to_slot(input)?;
+        let value = self
+            .resolve_operand::<RawVal>(value)?
+            .map(|value| T::into_immediate(T::Item::from(value)));
+        self.push_op_with_result_slot(ValType::V128, |result| match value {
+            ResolvedOperand::Reg(_) => T::op_ssr(result, input, lane),
+            ResolvedOperand::Slot(value) => T::op_sss(result, input, lane, value),
+            ResolvedOperand::Immediate(value) => T::op_ssi(result, input, lane, value),
+        })?;
+        Ok(())
+    }
+
+    /// Generically translate a Wasm unary instruction.
+    #[inline(never)]
+    fn translate_simd_unary_sx<T>(
+        &mut self,
+        make_instr: fn(result: Slot, input: Slot) -> Op,
+        const_eval: fn(input: V128) -> T,
+    ) -> Result<(), Error>
+    where
+        T: Into<TypedRawVal> + Typed,
+    {
+        bail_unreachable!(self);
+        let input = self.stack.pop();
+        if let Operand::Immediate(input) = input {
+            // Case: the input is an immediate so we can const-eval the result.
+            let result = const_eval(input.val().into());
+            self.stack.push_immediate(result)?;
+            return Ok(());
+        };
+        let input = self.operand_to_slot(input)?;
+        self.push_op_with_result_slot(<T as Typed>::TY, |result| make_instr(result, input))?;
+        Ok(())
+    }
+
+    /// Generically translate a Wasm unary instruction.
+    #[inline(never)]
+    fn translate_simd_unary_rx<T>(
+        &mut self,
+        make_instr: fn(input: Slot) -> Op,
+        const_eval: fn(input: V128) -> T,
+    ) -> Result<(), Error>
+    where
+        T: Into<TypedRawVal> + Typed,
+    {
+        bail_unreachable!(self);
+        let input = self.stack.pop();
+        if let Operand::Immediate(input) = input {
+            // Case: the input is an immediate so we can const-eval the result.
+            let result = const_eval(input.val().into());
+            self.stack.push_immediate(result)?;
+            return Ok(());
+        };
+        let input = self.operand_to_slot(input)?;
+        self.push_op_with_result_reg(<T as Typed>::TY, make_instr(input))?;
+        Ok(())
+    }
+
+    /// Generically translate a Wasm binary instruction.
+    #[inline(never)]
+    fn translate_simd_binary(
+        &mut self,
+        make_instr: fn(result: Slot, lhs: Slot, rhs: Slot) -> Op,
+        const_eval: fn(lhs: V128, rhs: V128) -> V128,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (lhs, rhs) = self.stack.pop2();
+        if let (Operand::Immediate(lhs), Operand::Immediate(rhs)) = (lhs, rhs) {
+            // Case: both inputs are immediates so we can const-eval the result.
+            let result = const_eval(lhs.val().into(), rhs.val().into());
+            self.stack.push_immediate(result)?;
+            return Ok(());
+        }
+        let lhs = self.copy_operand_to_slot(lhs)?;
+        let rhs = self.copy_operand_to_slot(rhs)?;
+        self.push_op_with_result_slot(ValType::V128, |result| make_instr(result, lhs, rhs))?;
+        Ok(())
+    }
+
+    /// Generically translate a Wasm ternary instruction.
+    #[inline(never)]
+    fn translate_simd_ternary(
+        &mut self,
+        make_instr: fn(result: Slot, a: Slot, b: Slot, c: Slot) -> Op,
+        const_eval: fn(lhas: V128, b: V128, c: V128) -> V128,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (a, b, c) = self.stack.pop3();
+        if let (Operand::Immediate(lhs), Operand::Immediate(rhs), Operand::Immediate(c)) = (a, b, c)
+        {
+            // Case: all inputs are immediates so we can const-eval the result.
+            let result = const_eval(lhs.val().into(), rhs.val().into(), c.val().into());
+            self.stack.push_immediate(result)?;
+            return Ok(());
+        }
+        let lhs = self.copy_operand_to_slot(a)?;
+        let rhs = self.copy_operand_to_slot(b)?;
+        let selector = self.copy_operand_to_slot(c)?;
+        self.push_op_with_result_slot(ValType::V128, |result| {
+            make_instr(result, lhs, rhs, selector)
+        })?;
+        Ok(())
+    }
+
+    /// Generically translate a Wasm SIMD shift instruction.
+    #[inline(never)]
+    fn translate_simd_shift<T>(
+        &mut self,
+        op_ssr: fn(result: Slot, lhs: Slot) -> Op,
+        op_sss: fn(result: Slot, lhs: Slot, rhs: Slot) -> Op,
+        op_ssi: fn(result: Slot, lhs: Slot, rhs: ShiftAmount) -> Op,
+        const_eval: fn(lhs: V128, rhs: u32) -> V128,
+    ) -> Result<(), Error>
+    where
+        T: IntoShiftAmount<ShiftSource: From<TypedRawVal>>,
+    {
+        bail_unreachable!(self);
+        let (lhs, rhs) = self.stack.pop2();
+        if let (Operand::Immediate(lhs), Operand::Immediate(rhs)) = (lhs, rhs) {
+            // Case: both inputs are immediates so we can const-eval the result.
+            let result = const_eval(lhs.val().into(), rhs.val().into());
+            self.stack.push_immediate(result)?;
+            return Ok(());
+        }
+        let Some(rhs) = self
+            .resolve_operand::<T::ShiftSource>(rhs)?
+            .map(T::into_shift_amount)
+            .transpose()
+        else {
+            // Case: the shift operation is a no-op
+            self.stack.push_operand(lhs)?;
+            return Ok(());
+        };
+        let lhs = self.copy_operand_to_slot(lhs)?;
+        self.push_op_with_result_slot(ValType::V128, |result| match rhs {
+            ResolvedOperand::Reg(_) => op_ssr(result, lhs),
+            ResolvedOperand::Slot(rhs) => op_sss(result, lhs, rhs),
+            ResolvedOperand::Immediate(rhs) => op_ssi(result, lhs, rhs),
+        })?;
+        Ok(())
+    }
+
+    fn translate_v128_load(&mut self, memarg: MemArg) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let ptr_opd = self.stack.pop();
+        let Some((memory, offset)) = Self::decode_memarg(memarg)? else {
+            return self.translate_trap(TrapCode::MemoryOutOfBounds);
+        };
+        let ptr = self.resolve_operand_as_index(ptr_opd, memory)?;
+        if let ResolvedOperand::Immediate(ptr) = ptr {
+            if self.effective_address(memory, ptr, offset).is_none() {
+                // Case: `ptr` is statically known to be out-of-bounds.
+                return self.translate_trap(TrapCode::MemoryOutOfBounds);
+            }
+        }
+        let ptr_loc = match ptr {
+            ResolvedOperand::Reg(ty) => Location::Reg(ty),
+            ResolvedOperand::Slot(ptr) => Location::Slot(ptr),
+            ResolvedOperand::Immediate(_ptr) => {
+                // Note: simd load operators have no encoding for an immediate `ptr` operand.
+                self.copy_immediate_to_slot(ptr_opd)?
+            }
+        };
+        'opt: {
+            // Case: optimized load operator if possible, otherwise fallback.
+            if !self.is_default_memory(memory) {
+                break 'opt;
+            }
+            let offset = match Offset16::new(offset) {
+                Some(offset) => offset,
+                None => break 'opt,
+            };
+            self.push_op_with_result_slot(ValType::V128, |result| match ptr_loc {
+                Location::Reg(_) => Op::v128_load_mem0_offset16_sr(result, offset),
+                Location::Slot(ptr) => Op::v128_load_mem0_offset16_ss(result, ptr, offset),
+            })?;
+            return Ok(());
+        }
+        // Case: non-optimized fallback load operator.
+        let memory_addr = self.memory_addr(memarg.memory)?;
+        self.push_op_with_result_slot(ValType::V128, |result| match ptr_loc {
+            Location::Reg(_) => Op::v128_load_sr(result, offset, memory_addr),
+            Location::Slot(ptr) => Op::v128_load_ss(result, ptr, offset, memory_addr),
+        })?;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn translate_v128_load_modify<L: LoadOp>(
+        &mut self,
+        memarg: MemArg,
+        op_sr: fn(result: Slot) -> Op,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let ptr = self.stack.pop();
+        match self.select_load_op::<L>(ptr, memarg)? {
+            Op::Trap { trap_code } => {
+                self.translate_trap(trap_code)?;
+                return Ok(());
+            }
+            op => {
+                self.preserve_reg_of_type(<<L as LoadOp>::Result as Typed>::TY)?;
+                self.instrs.encode_op(op)?;
+            }
+        }
+        self.push_op_with_result_slot(ValType::V128, op_sr)?;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn translate_v128_load_lane<L: LoadOp, T: op::SimdReplaceLane>(
+        &mut self,
+        memarg: MemArg,
+        lane: u8,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let Ok(lane) = <<T::Item as IntoLaneIdx>::LaneIdx>::try_from(lane) else {
+            panic!("encountered out of bounds lane index: {lane}");
+        };
+        let (ptr, v128) = self.stack.pop2();
+        match self.select_load_op::<L>(ptr, memarg)? {
+            Op::Trap { trap_code } => {
+                self.translate_trap(trap_code)?;
+                return Ok(());
+            }
+            op => {
+                self.preserve_reg_of_type(<<L as LoadOp>::Result as Typed>::TY)?;
+                self.instrs.encode_op(op)?;
+            }
+        }
+        let v128 = self.copy_operand_to_slot(v128)?;
+        self.push_op_with_result_slot(ValType::V128, |result| T::op_ssr(result, v128, lane))?;
+        Ok(())
+    }
+
+    #[expect(clippy::type_complexity, clippy::too_many_arguments)]
+    #[inline(never)]
+    fn translate_v128_store_lane<T: IntoLaneIdx>(
+        &mut self,
+        memarg: MemArg,
+        lane: u8,
+        op_rs: fn(offset: Offset, value: Slot, memory: ir::MemoryAddr, lane: T::LaneIdx) -> Op,
+        op_ss: fn(
+            ptr: Slot,
+            offset: Offset,
+            value: Slot,
+            memory: ir::MemoryAddr,
+            lane: T::LaneIdx,
+        ) -> Op,
+        op_rs_mem0_offset16: fn(offset: Offset16, value: Slot, lane: T::LaneIdx) -> Op,
+        op_ss_mem0_offset16: fn(ptr: Slot, offset: Offset16, value: Slot, lane: T::LaneIdx) -> Op,
+        translate_imm: fn(
+            &mut Self,
+            memarg: MemArg,
+            ptr: Operand,
+            lane: T::LaneIdx,
+            value: V128,
+        ) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let Ok(lane) = <T::LaneIdx>::try_from(lane) else {
+            panic!("encountered out of bounds lane index: {lane}");
+        };
+        let (ptr, v128) = self.stack.pop2();
+        let v128 = match v128.resolve(&self.layout)? {
+            ResolvedOperand::Reg(_v128) => {
+                // Note: `v128` typed values may not occupy register operands for now.
+                unreachable!()
+            }
+            ResolvedOperand::Immediate(v128) => {
+                // Case: with `v128` being an immediate value we can extract its
+                //       lane value and translate as a more efficient non-SIMD operation.
+                return translate_imm(self, memarg, ptr, lane, V128::from(v128));
+            }
+            ResolvedOperand::Slot(v128) => v128,
+        };
+        let Some((memory, offset)) = Self::decode_memarg(memarg)? else {
+            return self.translate_trap(TrapCode::MemoryOutOfBounds);
+        };
+        let ptr = self.copy_immediate_to_slot(ptr)?;
+        if self.is_default_memory(memory) {
+            if let Some(offset16) = Offset16::new(offset) {
+                self.push_instr(match ptr {
+                    Location::Reg(_) => op_rs_mem0_offset16(offset16, v128, lane),
+                    Location::Slot(ptr) => op_ss_mem0_offset16(ptr, offset16, v128, lane),
+                })?;
+                return Ok(());
+            }
+        }
+        let memory_addr = self.memory_addr(memarg.memory)?;
+        self.push_instr(match ptr {
+            Location::Reg(_) => op_rs(offset, v128, memory_addr, lane),
+            Location::Slot(ptr) => op_ss(ptr, offset, v128, memory_addr, lane),
+        })?;
+        Ok(())
+    }
+
+    /// Encodes a Wasmi `store128` operator with `(mem 0)` and 16-bit encodable `offset` to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// - Returns `Ok(true)` if encoding was successfull.
+    /// - Returns `Ok(false)` if encoding was unsuccessful.
+    /// - Returns `Err(_)` if an error occurred.
+    fn translate_store128_mem0_offset16(
+        &mut self,
+        ptr: Location,
+        offset: Offset,
+        memory: ir::MemoryAddr,
+        value: Slot,
+    ) -> Result<bool, Error> {
+        if !self.is_default_memory(memory) {
+            return Ok(false);
+        }
+        let Some(offset16) = Offset16::new(offset) else {
+            return Ok(false);
+        };
+        self.push_instr(match ptr {
+            Location::Slot(ptr) => Op::v128_store_mem0_offset16_ss(ptr, offset16, value),
+            Location::Reg(_) => Op::v128_store_mem0_offset16_rs(offset16, value),
+        })?;
+        Ok(true)
+    }
+}

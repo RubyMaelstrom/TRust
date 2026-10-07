@@ -1,0 +1,475 @@
+mod error;
+
+pub use self::error::InstantiationError;
+use super::{ConstExpr, InitDataSegment, Module, element::ElementSegmentKind, export};
+use crate::{
+    AsContext,
+    AsContextMut,
+    ElementSegment,
+    Error,
+    Extern,
+    ExternType,
+    Func,
+    Global,
+    Instance,
+    InstanceEntity,
+    InstanceEntityBuilder,
+    Memory,
+    Nullable,
+    Ref,
+    Table,
+    Val,
+    core::RawRef,
+    engine::Inst,
+    error::ErrorKind,
+    errors::MemoryError,
+    func::WasmFuncEntity,
+    memory::DataSegment,
+    module::{
+        FuncIdx,
+        init_expr::{Eval, EvalContext},
+    },
+    store::StoreInner,
+};
+use alloc::boxed::Box;
+
+impl Module {
+    /// Instantiates a new [`Instance`] from the given compiled [`Module`].
+    ///
+    /// Uses the given `context` to store the instance data to.
+    /// The given `externals` are joined with the imports in the same order in which they occurred.
+    ///
+    /// # Note
+    ///
+    /// This is a very low-level API. For a more high-level API users should use the
+    /// corresponding instantiation methods provided by the [`Linker`].
+    ///
+    /// # Errors
+    ///
+    /// If the given `externals` do not satisfy the required imports, e.g. if an externally
+    /// provided [`Func`] has a different function signature than required by the module import.
+    ///
+    /// [`Linker`]: struct.Linker.html
+    /// [`Func`]: [`crate::Func`]
+    pub(crate) fn instantiate<I>(
+        &self,
+        mut context: impl AsContextMut,
+        externals: I,
+    ) -> Result<Instance, Error>
+    where
+        I: IntoIterator<Item = Extern, IntoIter: ExactSizeIterator>,
+    {
+        let mut context = context.as_context_mut().store;
+        if !context.can_create_more_instances(1) {
+            return Err(Error::from(InstantiationError::TooManyInstances));
+        }
+        let handle = context.as_context_mut().store.inner.alloc_instance();
+        let mut builder = InstanceEntity::build(self);
+
+        self.extract_imports(&context, &mut builder, externals)?;
+        self.extract_functions(&mut context, &mut builder, handle);
+        self.extract_tables(&mut context, &mut builder)?;
+        self.extract_memories(&mut context, &mut builder)?;
+        self.extract_globals(&mut context, &mut builder);
+        self.extract_exports(&mut builder);
+        self.extract_start_fn(&mut builder);
+        self.initialize_table_elements(&mut context, &mut builder)?;
+        self.initialize_memory_data(&mut context, &mut builder)?;
+        Self::start(
+            &mut context,
+            builder,
+            handle,
+            self.get_imports().len_funcs(),
+        )?;
+        Ok(handle)
+    }
+
+    /// Executes the [`Instance`]'s `start` function if any and finalizes instantiation.
+    fn start(
+        mut store: impl AsContextMut,
+        builder: InstanceEntityBuilder,
+        instance: Instance,
+        len_imported_funcs: usize,
+    ) -> Result<(), Error> {
+        let opt_start_index = builder.get_start().map(FuncIdx::into_u32);
+        store.as_context_mut().store.inner.initialize_instance(
+            instance,
+            builder.finish()?,
+            len_imported_funcs,
+        );
+        if let Some(start_index) = opt_start_index {
+            let entity = store.as_context().store.inner.resolve_instance(&instance);
+            let addr = entity.layout().func_addr(start_index).expect(
+                "failed to convert index to instance address for start function: {start_index}",
+            );
+            let start_func = entity
+                .get_func(addr)
+                .expect("missing function at instance address: {addr:?}");
+            start_func.call(store.as_context_mut(), &[], &mut [])?
+        }
+        Ok(())
+    }
+
+    /// Extract the Wasm imports from the module and zips them with the given external values.
+    ///
+    /// This also stores imported references into the [`Instance`] under construction.
+    ///
+    /// # Errors
+    ///
+    /// - If too few or too many external values are given for the required module imports.
+    /// - If the zipped import and given external have mismatching types, e.g. on index `i`
+    ///   the module requires a function import but on index `i` the externals provide a global
+    ///   variable external value.
+    /// - If the externally provided [`Table`], [`Memory`], [`Func`] or [`Global`] has a type
+    ///   mismatch with the expected module import type.
+    ///
+    /// [`Func`]: [`crate::Func`]
+    fn extract_imports<I>(
+        &self,
+        store: impl AsContext,
+        builder: &mut InstanceEntityBuilder,
+        externals: I,
+    ) -> Result<(), InstantiationError>
+    where
+        I: IntoIterator<Item = Extern, IntoIter: ExactSizeIterator>,
+    {
+        let imports = self.imports();
+        let externals = externals.into_iter();
+        {
+            let len_expected = imports.len();
+            let len_actual = externals.len();
+            if len_expected != len_actual {
+                return Err(InstantiationError::mismatched_number_of_imports(
+                    len_expected,
+                    len_actual,
+                ));
+            }
+        }
+        for (import, external) in imports.zip(externals) {
+            let import_name = import.import_name();
+            match (import.ty(), external) {
+                (ExternType::Func(expected_signature), Extern::Func(func)) => {
+                    let actual_signature = &func.ty(&store);
+                    if actual_signature != expected_signature {
+                        return Err(InstantiationError::func_type_mismatch(
+                            import_name,
+                            expected_signature,
+                            actual_signature,
+                        ));
+                    }
+                    builder.push_func(func);
+                }
+                (ExternType::Table(required), Extern::Table(table)) => {
+                    let imported = &table.dynamic_ty(&store);
+                    if !imported.is_subtype_of(required) {
+                        return Err(InstantiationError::table_type_mismatch(
+                            import_name,
+                            required,
+                            imported,
+                        ));
+                    }
+                    builder.push_table(table);
+                }
+                (ExternType::Memory(required), Extern::Memory(memory)) => {
+                    let imported = &memory.dynamic_ty(&store);
+                    if !imported.is_subtype_of(required) {
+                        return Err(InstantiationError::memory_type_mismatch(
+                            import_name,
+                            required,
+                            imported,
+                        ));
+                    }
+                    builder.push_memory(memory);
+                }
+                (ExternType::Global(required), Extern::Global(global)) => {
+                    let imported = &global.ty(&store);
+                    if imported != required {
+                        return Err(InstantiationError::global_type_mismatch(
+                            import_name,
+                            required,
+                            imported,
+                        ));
+                    }
+                    builder.push_global(global);
+                }
+                (expected_import, actual_extern_val) => {
+                    return Err(InstantiationError::import_type_mismatch(
+                        import_name,
+                        expected_import,
+                        &actual_extern_val,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Extracts the Wasm functions from the module and stores them into the [`Store`].
+    ///
+    /// This also stores [`Func`] references into the [`Instance`] under construction.
+    ///
+    /// [`Store`]: struct.Store.html
+    /// [`Func`]: [`crate::Func`]
+    fn extract_functions(
+        &self,
+        mut context: impl AsContextMut,
+        builder: &mut InstanceEntityBuilder,
+        handle: Instance,
+    ) {
+        // Note: this is the uninitialized placeholder entity of `handle`. Successful
+        //       instantiation re-points the created functions to the real entity in
+        //       `StoreInner::warmup_instance_funcs`.
+        let instance = Inst::from(context.as_context().store.inner.resolve_instance(&handle));
+        for (func_type, func_body) in self.internal_funcs() {
+            let Some(func_entry) = self.engine().resolve_func(func_body) else {
+                unreachable!("missing func entry at: {func_body:?}")
+            };
+            let wasm_func = WasmFuncEntity::new(func_type, func_body, func_entry, instance);
+            let func = context
+                .as_context_mut()
+                .store
+                .inner
+                .alloc_func(wasm_func.into());
+            builder.push_func(func);
+        }
+    }
+
+    /// Extracts the Wasm tables from the module and stores them into the [`Store`].
+    ///
+    /// This also stores [`Table`] references into the [`Instance`] under construction.
+    ///
+    /// [`Store`]: struct.Store.html
+    fn extract_tables(
+        &self,
+        mut context: impl AsContextMut,
+        builder: &mut InstanceEntityBuilder,
+    ) -> Result<(), InstantiationError> {
+        let ctx = context.as_context_mut().store;
+        if !ctx.can_create_more_tables(self.len_tables()) {
+            return Err(InstantiationError::TooManyTables);
+        }
+        for table_type in self.internal_tables().copied() {
+            let init = Ref::default_for_ty(table_type.element());
+            let table =
+                Table::new(context.as_context_mut(), table_type, init).map_err(|error| {
+                    let error = match error.kind() {
+                        ErrorKind::Table(error) => *error,
+                        error => panic!("unexpected error: {error}"),
+                    };
+                    InstantiationError::FailedToInstantiateTable(error)
+                })?;
+            builder.push_table(table);
+        }
+        Ok(())
+    }
+
+    /// Extracts the Wasm linear memories from the module and stores them into the [`Store`].
+    ///
+    /// This also stores [`Memory`] references into the [`Instance`] under construction.
+    ///
+    /// [`Store`]: struct.Store.html
+    fn extract_memories(
+        &self,
+        mut context: impl AsContextMut,
+        builder: &mut InstanceEntityBuilder,
+    ) -> Result<(), InstantiationError> {
+        let ctx = context.as_context_mut().store;
+        if !ctx.can_create_more_memories(self.len_memories()) {
+            return Err(InstantiationError::TooManyMemories);
+        }
+        for memory_type in self.internal_memories().copied() {
+            let memory = Memory::new(context.as_context_mut(), memory_type).map_err(|error| {
+                let error = match error.kind() {
+                    ErrorKind::Memory(error) => *error,
+                    error => panic!("unexpected error: {error}"),
+                };
+                InstantiationError::FailedToInstantiateMemory(error)
+            })?;
+            builder.push_memory(memory);
+        }
+        Ok(())
+    }
+
+    /// Extracts the Wasm global variables from the module and stores them into the [`Store`].
+    ///
+    /// This also stores [`Global`] references into the [`Instance`] under construction.
+    ///
+    /// [`Store`]: struct.Store.html
+    fn extract_globals(&self, mut context: impl AsContextMut, builder: &mut InstanceEntityBuilder) {
+        for (global_type, global_init) in self.internal_globals() {
+            let init_value = Self::eval_init_expr(context.as_context_mut(), builder, global_init);
+            let mutability = global_type.mutability();
+            let global = Global::new(context.as_context_mut(), init_value, mutability);
+            builder.push_global(global);
+        }
+    }
+}
+
+struct InstanceBuilderContext<'a, 'b> {
+    store: &'a StoreInner,
+    builder: &'b InstanceEntityBuilder,
+}
+impl<'a, 'b> InstanceBuilderContext<'a, 'b> {
+    /// Creates a new [`InstanceBuilderContext`].
+    pub fn new(store: &'a StoreInner, builder: &'b InstanceEntityBuilder) -> Self {
+        Self { store, builder }
+    }
+}
+impl EvalContext for InstanceBuilderContext<'_, '_> {
+    fn get_global(&self, index: u32) -> Option<Val> {
+        let global = self.builder.get_global(index);
+        let val = self.store.resolve_global(&global).get();
+        let val = Val::from_raw_parts(val.raw(), val.ty(), self.store);
+        Some(val)
+    }
+
+    fn get_func(&self, index: u32) -> Option<Nullable<Func>> {
+        let func = self.builder.get_func(index);
+        Some(<Nullable<Func>>::from(func))
+    }
+}
+
+impl Module {
+    /// Evaluates the given initializer expression using the partially constructed [`Instance`].
+    fn eval_init_expr(
+        context: impl AsContext,
+        builder: &InstanceEntityBuilder,
+        init_expr: &ConstExpr,
+    ) -> Val {
+        let ctx = InstanceBuilderContext::new(&context.as_context().store.inner, builder);
+        init_expr
+            .eval(&ctx)
+            .unwrap_or_else(|| panic!("failed to evaluate init expr: {init_expr:?}"))
+    }
+
+    /// Extracts the Wasm exports from the module and registers them into the [`Instance`].
+    fn extract_exports(&self, builder: &mut InstanceEntityBuilder) {
+        for (field, idx) in &self.module_header().exports {
+            let external = match idx {
+                export::ExternIdx::Func(func_index) => {
+                    let func_index = func_index.into_u32();
+                    let func = builder.get_func(func_index);
+                    Extern::Func(func)
+                }
+                export::ExternIdx::Table(table_index) => {
+                    let table_index = table_index.into_u32();
+                    let table = builder.get_table(table_index);
+                    Extern::Table(table)
+                }
+                export::ExternIdx::Memory(memory_index) => {
+                    let memory_index = memory_index.into_u32();
+                    let memory = builder.get_memory(memory_index);
+                    Extern::Memory(memory)
+                }
+                export::ExternIdx::Global(global_index) => {
+                    let global_index = global_index.into_u32();
+                    let global = builder.get_global(global_index);
+                    Extern::Global(global)
+                }
+            };
+            builder.push_export(field, external);
+        }
+    }
+
+    /// Extracts the optional start function for the build instance.
+    fn extract_start_fn(&self, builder: &mut InstanceEntityBuilder) {
+        if let Some(start_fn) = self.module_header().start {
+            builder.set_start(start_fn)
+        }
+    }
+
+    /// Initializes the [`Instance`] tables with the Wasm element segments of the [`Module`].
+    fn initialize_table_elements(
+        &self,
+        mut context: impl AsContextMut,
+        builder: &mut InstanceEntityBuilder,
+    ) -> Result<(), Error> {
+        for segment in &self.module_header().element_segments[..] {
+            let ctx = InstanceBuilderContext::new(&context.as_context().store.inner, builder);
+            let items: Box<[RawRef]> = match segment.kind() {
+                ElementSegmentKind::Passive | ElementSegmentKind::Active(_) => segment
+                    .items()
+                    .iter()
+                    .map(|const_expr| {
+                        const_expr
+                            .eval(&ctx)
+                            .and_then(|val| val.unwrap_raw_ref(context.as_context()))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "failed initialization of constant expression: {const_expr:?}"
+                                )
+                            })
+                    })
+                    .collect(),
+                ElementSegmentKind::Declared => Box::from([]),
+            };
+            let element = ElementSegment::new(context.as_context_mut(), segment.ty(), items);
+            if let ElementSegmentKind::Active(active) = segment.kind() {
+                let dst_index =
+                    match Self::eval_init_expr(context.as_context(), builder, active.offset()) {
+                        Val::I32(value) => u64::from(value as u32),
+                        Val::I64(value) => value as u64,
+                        invalid => panic!("dst_index is not a valid index value: {invalid:?}"),
+                    };
+                let table = builder.get_table(active.table_index().into_u32());
+                // Note: This checks not only that the elements in the element segments properly
+                //       fit into the table at the given offset but also that the element segment
+                //       consists of at least 1 element member.
+                let len_table = table.size(&context);
+                let len_items = element.size(&context);
+                dst_index
+                    .checked_add(u64::from(len_items))
+                    .filter(|&max_index| max_index <= len_table)
+                    .ok_or(InstantiationError::ElementSegmentDoesNotFit {
+                        table,
+                        table_index: dst_index,
+                        len: len_items,
+                    })?;
+                let (table, elem) = context
+                    .as_context_mut()
+                    .store
+                    .inner
+                    .resolve_table_and_element_mut(&table, &element);
+                table.init(elem.as_ref(), dst_index, 0, len_items, None)?;
+                // Now drop the active element segment as commanded by the Wasm spec.
+                elem.drop_items();
+            }
+            builder.push_element_segment(element);
+        }
+        Ok(())
+    }
+
+    /// Initializes the [`Instance`] linear memories with the Wasm data segments of the [`Module`].
+    fn initialize_memory_data(
+        &self,
+        mut context: impl AsContextMut,
+        builder: &mut InstanceEntityBuilder,
+    ) -> Result<(), Error> {
+        for segment in &self.inner.data_segments {
+            let segment = match segment {
+                InitDataSegment::Active {
+                    memory_index,
+                    offset,
+                    bytes,
+                } => {
+                    let memory = builder.get_memory(memory_index.into_u32());
+                    let offset = match Self::eval_init_expr(context.as_context(), builder, offset) {
+                        Val::I32(value) => u64::from(value as u32),
+                        Val::I64(value) => value as u64,
+                        invalid => panic!("offset is not a valid index value: {invalid:?}"),
+                    };
+                    let Ok(offset) = usize::try_from(offset) else {
+                        return Err(Error::from(MemoryError::OutOfBoundsAccess));
+                    };
+                    memory.write(context.as_context_mut(), offset, bytes)?;
+                    DataSegment::new_active(context.as_context_mut())
+                }
+                InitDataSegment::Passive { bytes } => {
+                    DataSegment::new_passive(context.as_context_mut(), bytes)
+                }
+            };
+            builder.push_data_segment(segment);
+        }
+        Ok(())
+    }
+}

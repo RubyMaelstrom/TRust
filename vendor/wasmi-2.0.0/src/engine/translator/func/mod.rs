@@ -1,0 +1,2964 @@
+#[macro_use]
+mod utils;
+mod encoder;
+mod fuel;
+mod labels;
+mod layout;
+mod locals;
+mod op;
+#[cfg(feature = "simd")]
+mod simd;
+mod stack;
+mod visit;
+
+#[cfg(doc)]
+use self::stack::ImmediateOperand;
+
+pub use self::fuel::FuelMeteringFuncTranslator;
+use self::{
+    encoder::{OpEncoder, OpEncoderAllocations, Pos},
+    labels::{LabelRef, LabelRegistry},
+    layout::{StackLayout, StackSpace},
+    locals::{LocalIdx, LocalsRegistry},
+    op::{
+        BinaryOp,
+        BinaryOpVt,
+        CommutativeBinaryOp,
+        CommutativeBinaryOpVt,
+        LoadOpVt,
+        StoreOpVt,
+        UnaryOp,
+        UnaryOpVt,
+    },
+    stack::{
+        BlockControlFrame,
+        ControlFrame,
+        ControlFrameBase,
+        ControlFrameKind,
+        ElseControlFrame,
+        ElseReachability,
+        IfControlFrame,
+        IfReachability,
+        LocalOperand,
+        Location,
+        LoopControlFrame,
+        Operand,
+        ResolvedOperand,
+        Stack,
+        StackAllocations,
+        TryClause,
+        TryControlFrame,
+    },
+    utils::{Reset, ReusableAllocations},
+};
+#[cfg(feature = "simd")]
+use crate::V128;
+use crate::{
+    Engine,
+    Error,
+    FuncType,
+    TrapCode,
+    ValType,
+    core::{IndexType, RawVal, Typed, TypedRawVal},
+    engine::{
+        BlockType,
+        CompiledFuncEntry,
+        TranslationError,
+        code_map::FuncEntry,
+        costs::{OperatorCostStrategy, WasmOperator},
+        translator::{
+            WasmTranslator,
+            comparator::{
+                LogicalizeCmpInstr,
+                NegateCmpInstr,
+                TryIntoCmpBranchInstr as _,
+                UpdateBranchOffset as _,
+            },
+            func::{
+                op::BinaryOpRhs,
+                stack::{Allocation, BranchParams, PreservedRegs, RegKind},
+            },
+            utils::{WasmInteger, required_cells_for_ty},
+        },
+    },
+    ir::{
+        self,
+        Address,
+        BoundedSlotSpan,
+        BranchOffset,
+        FixedSlotSpan,
+        Offset,
+        Offset16,
+        Op,
+        Slot,
+        SlotAndReg,
+        SlotSpan,
+    },
+    limits::LimitsError,
+    module::{FuncIdx, FuncTypeIdx, MemoryIdx, ModuleHeader, WasmiValueType},
+};
+use alloc::vec::Vec;
+use core::{convert::identity, mem};
+use wasmparser::{MemArg, WasmFeatures};
+
+/// Type concerned with translating from Wasm bytecode to Wasmi bytecode.
+#[derive(Debug)]
+pub struct FuncTranslator {
+    /// The reference to the Wasm module function under construction.
+    func: FuncIdx,
+    /// The engine for which the function is compiled.
+    ///
+    /// # Note
+    ///
+    /// Technically this is not needed since the information is redundant given via
+    /// the `module` field. However, this acts like a faster access since `module`
+    /// only holds a weak reference to the engine.
+    engine: Engine,
+    /// The immutable Wasmi module resources.
+    module: ModuleHeader,
+    /// This represents the reachability of the currently translated code.
+    ///
+    /// - `true`: The currently translated code is reachable.
+    /// - `false`: The currently translated code is unreachable and can be skipped.
+    ///
+    /// # Note
+    ///
+    /// Visiting the Wasm `Else` or `End` control flow operator resets
+    /// reachability to `true` again.
+    reachable: bool,
+    /// Wasm value and control stack.
+    stack: Stack,
+    /// Types of local variables and function parameters.
+    locals: LocalsRegistry,
+    /// Wasm layout to map stack slots to Wasmi registers.
+    layout: StackLayout,
+    /// Constructs and encodes function instructions.
+    instrs: OpEncoder,
+    /// Temporary buffer for immediate values.
+    immediates: Vec<TypedRawVal>,
+    /// The costs of Wasm operators when fuel metering is enabled.
+    operator_cost: OperatorCostStrategy,
+    /// The identity of the next legacy `try` in this function.
+    next_try_id: u32,
+}
+
+/// Heap allocated data structured used by the [`FuncTranslator`].
+#[derive(Debug, Default)]
+pub struct FuncTranslatorAllocations {
+    /// Wasm value and control stack.
+    stack: StackAllocations,
+    /// Types of local variables and function parameters.
+    locals: LocalsRegistry,
+    /// Wasm layout to map stack slots to Wasmi registers.
+    layout: StackLayout,
+    /// Constructs and encodes function instructions.
+    instrs: OpEncoderAllocations,
+    /// Temporary buffer for immediate values.
+    immediates: Vec<TypedRawVal>,
+}
+
+impl Reset for FuncTranslatorAllocations {
+    fn reset(&mut self) {
+        self.stack.reset();
+        self.locals.reset();
+        self.layout.reset();
+        self.instrs.reset();
+        self.immediates.clear();
+    }
+}
+
+impl WasmTranslator<'_> for FuncTranslator {
+    type Allocations = FuncTranslatorAllocations;
+
+    fn setup(&mut self, _bytes: &[u8]) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    fn features(&self) -> WasmFeatures {
+        self.engine.config().wasm_features()
+    }
+
+    fn translate_locals(
+        &mut self,
+        amount: u32,
+        value_type: wasmparser::ValType,
+    ) -> Result<(), Error> {
+        let ty = WasmiValueType::from(value_type).into_inner();
+        self.register_locals(amount, ty)?;
+        Ok(())
+    }
+
+    fn finish_translate_locals(&mut self) -> Result<(), Error> {
+        // Note: must initialize function body `block` after registering all
+        //       function parameters and locals so that the function `block`
+        //       has proper knowledge of its position within the operands stack.
+        self.init_func_body_block()?;
+        Ok(())
+    }
+
+    fn update_pos(&mut self, _pos: usize) {}
+
+    fn finish(
+        mut self,
+        finalize: impl FnOnce(CompiledFuncEntry),
+    ) -> Result<Self::Allocations, Error> {
+        // Note: `update_branch_offsets` might change `frame_size` so we need to compute it prior.
+        //
+        // Context:
+        // This only happens if the function has so many instructions that some conditional branch
+        // operators need to be encoded as their fallbacks which requires to allocate more function
+        // local constant values, thus increasing the size of the function frame.
+        self.instrs.update_branch_offsets()?;
+        let len_local_slots = self.stack.get_local_slots();
+        let Some(len_stack_slots) = self.len_stack_slots() else {
+            return Err(Error::from(TranslationError::AllocatedTooManySlots));
+        };
+        finalize(CompiledFuncEntry::new(
+            len_local_slots,
+            len_stack_slots,
+            self.instrs.encoded_ops(),
+        ));
+        Ok(self.into_allocations())
+    }
+}
+
+impl ReusableAllocations for FuncTranslator {
+    type Allocations = FuncTranslatorAllocations;
+
+    fn into_allocations(self) -> Self::Allocations {
+        Self::Allocations {
+            stack: self.stack.into_allocations(),
+            locals: self.locals,
+            layout: self.layout,
+            instrs: self.instrs.into_allocations(),
+            immediates: self.immediates,
+        }
+    }
+}
+
+impl FuncTranslator {
+    /// Creates a new [`FuncTranslator`].
+    pub fn new(
+        func: FuncIdx,
+        module: ModuleHeader,
+        alloc: FuncTranslatorAllocations,
+    ) -> Result<Self, Error> {
+        let Some(engine) = module.engine().upgrade() else {
+            panic!(
+                "cannot compile function since engine does no longer exist: {:?}",
+                module.engine()
+            )
+        };
+        let FuncTranslatorAllocations {
+            stack,
+            locals,
+            layout,
+            instrs,
+            immediates,
+        } = alloc.into_reset();
+        let stack = Stack::new(&engine, stack);
+        let instrs = OpEncoder::new(&engine, instrs);
+        let operator_cost = engine.config().get_operator_cost().clone();
+        let mut translator = Self {
+            func,
+            engine,
+            module,
+            reachable: true,
+            stack,
+            locals,
+            layout,
+            instrs,
+            immediates,
+            operator_cost,
+            next_try_id: 0,
+        };
+        translator.init_func_params()?;
+        Ok(translator)
+    }
+
+    /// Initializes the function's parameters.
+    fn init_func_params(&mut self) -> Result<(), Error> {
+        for ty in self.func_type().params() {
+            self.register_locals(1, *ty)?;
+        }
+        Ok(())
+    }
+
+    /// Slots an `amount` of local variables of type `ty`.
+    fn register_locals(&mut self, amount: u32, ty: ValType) -> Result<(), Error> {
+        let Ok(amount) = usize::try_from(amount) else {
+            panic!(
+                "failed to register {amount} local variables of type {ty:?}: out of bounds `usize`"
+            )
+        };
+        self.locals.register(amount, ty)?;
+        self.stack.register_locals(amount, ty)?;
+        self.layout.register_locals(amount, ty)?;
+        Ok(())
+    }
+
+    /// Initializes the function body enclosing control block.
+    fn init_func_body_block(&mut self) -> Result<(), Error> {
+        let func_ty = self.module.get_type_of_func(self.func);
+        let block_ty = BlockType::func_type(func_ty);
+        let end_label = self.instrs.new_label();
+        let consume_fuel = self.instrs.encode_consume_fuel_op()?;
+        self.stack
+            .push_func_block(block_ty, end_label, consume_fuel)?;
+        Ok(())
+    }
+
+    /// Returns the total number of stack slots used by the compiled function.
+    ///
+    /// Returns `None` if the this number is out of bounds.
+    fn len_stack_slots(&self) -> Option<u16> {
+        let len_stack_slots = self
+            .stack
+            .max_stack_offset()
+            .checked_add(self.locals.len())?;
+        u16::try_from(len_stack_slots).ok()
+    }
+
+    /// Returns `true` if `memory` addresses the default linear memory (Wasm index 0).
+    ///
+    /// # Note
+    ///
+    /// `memory` is an instance address, not the raw Wasm memory index,
+    /// so the default memory's address is not guaranteed to be zero.
+    #[inline]
+    fn is_default_memory(&self, memory: ir::MemoryAddr) -> bool {
+        matches!(
+            self.module.instance_layout().memory_addr(0),
+            Some(addr) if u32::from(addr) == u32::from(memory)
+        )
+    }
+
+    /// Returns the [`FuncType`] of the function that is currently translated.
+    fn func_type(&self) -> FuncType {
+        self.func_type_with(FuncType::clone)
+    }
+
+    /// Applies `f` to the [`FuncType`] of the function that is currently translated.
+    fn func_type_with<R>(&self, f: impl FnOnce(&FuncType) -> R) -> R {
+        self.resolve_func_type_with(self.func, f)
+    }
+
+    /// Returns the [`FuncType`] of the function at `func_index`.
+    fn resolve_func_type(&self, func_index: FuncIdx) -> FuncType {
+        self.resolve_func_type_with(func_index, FuncType::clone)
+    }
+
+    /// Applies `f` to the [`FuncType`] of the function at `func_index`.
+    fn resolve_func_type_with<R>(&self, func_index: FuncIdx, f: impl FnOnce(&FuncType) -> R) -> R {
+        let dedup_func_type = self.module.get_type_of_func(func_index);
+        self.engine().resolve_func_type(dedup_func_type, f)
+    }
+
+    /// Resolves the [`FuncType`] at the given Wasm module `type_index`.
+    fn resolve_type(&self, type_index: u32) -> FuncType {
+        let func_type_idx = FuncTypeIdx::from(type_index);
+        let dedup_func_type = self.module.get_func_type(func_type_idx);
+        self.engine()
+            .resolve_func_type(dedup_func_type, Clone::clone)
+    }
+
+    /// Resolves the function type carried by the legacy exception tag at `tag_index`.
+    fn resolve_tag_type(&self, tag_index: u32) -> FuncType {
+        let dedup_func_type = self.module.get_type_of_tag(tag_index);
+        self.engine()
+            .resolve_func_type(dedup_func_type, Clone::clone)
+    }
+
+    /// Resolves the deduplicated function type at the given Wasm module `type_index`.
+    ///
+    /// # Note
+    ///
+    /// Resolving this at translation time is what allows the executor to compare function
+    /// types for indirect calls without querying the instance.
+    fn resolve_dedup_type(&self, type_index: u32) -> ir::FuncType {
+        let func_type_idx = FuncTypeIdx::from(type_index);
+        ir::FuncType::from(self.module.get_func_type(func_type_idx).repr_entity())
+    }
+
+    /// Bumps the current [`Op::ConsumeFuel`] operator by the fuel costs of `operator`.
+    ///
+    /// This does nothing if fuel metering is disabled.
+    fn bump_fuel_for_operator(&mut self, operator: WasmOperator) -> Result<(), Error> {
+        let fuel_pos = self.stack.fuel_pos();
+        let fuel_used = self.operator_cost.cost(operator);
+        self.instrs.bump_fuel_consumption_by(fuel_pos, fuel_used)?;
+        Ok(())
+    }
+
+    /// Returns the [`GlobalAddr`] for the global at `index`.
+    ///
+    /// [`GlobalAddr`]: crate::instance::GlobalAddr
+    fn global_addr(&self, index: u32) -> ir::GlobalAddr {
+        let Some(addr) = self.module.instance_layout().global_addr(index) else {
+            panic!("missing address for global at: {}", index)
+        };
+        ir::GlobalAddr::from(u32::from(addr))
+    }
+
+    /// Returns the [`MemoryAddr`] for the linear memory at `index`.
+    ///
+    /// [`MemoryAddr`]: crate::instance::MemoryAddr
+    fn memory_addr(&self, index: u32) -> Result<ir::MemoryAddr, Error> {
+        let Some(addr) = self.module.instance_layout().memory_addr(index) else {
+            panic!("missing address for linear memory at: {index}")
+        };
+        let Ok(addr16) = u16::try_from(u32::from(addr)) else {
+            return Err(Error::from(LimitsError::TooManyMemories));
+        };
+        Ok(ir::MemoryAddr::from(addr16))
+    }
+
+    /// Returns the [`TableAddr`] for the table at `index`.
+    ///
+    /// [`TableAddr`]: crate::instance::TableAddr
+    fn table_addr(&self, index: u32) -> ir::TableAddr {
+        let Some(addr) = self.module.instance_layout().table_addr(index) else {
+            panic!("missing address for table at: {}", index)
+        };
+        ir::TableAddr::from(u32::from(addr))
+    }
+
+    /// Returns the [`FuncAddr`] for the function at `index`.
+    ///
+    /// [`FuncAddr`]: crate::instance::FuncAddr
+    fn func_addr(&self, index: u32) -> ir::FuncAddr {
+        let Some(addr) = self.module.instance_layout().func_addr(index) else {
+            panic!("missing address for function at: {}", index)
+        };
+        ir::FuncAddr::from(u32::from(addr))
+    }
+
+    /// Returns the [`ElemAddr`] for the element segment at `index`.
+    ///
+    /// [`ElemAddr`]: crate::instance::ElemAddr
+    fn elem_addr(&self, index: u32) -> ir::ElemAddr {
+        let Some(addr) = self.module.instance_layout().elem_addr(index) else {
+            panic!("missing address for element segment at: {}", index)
+        };
+        ir::ElemAddr::from(u32::from(addr))
+    }
+
+    /// Returns the [`DataAddr`] for the data segment at `index`.
+    ///
+    /// [`DataAddr`]: crate::instance::DataAddr
+    fn data_addr(&self, index: u32) -> ir::DataAddr {
+        let Some(addr) = self.module.instance_layout().data_addr(index) else {
+            panic!("missing address for data segment at: {}", index)
+        };
+        ir::DataAddr::from(u32::from(addr))
+    }
+
+    /// Returns the [`Engine`] for which the function is compiled.
+    fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// Emits copy operators to copy all operands to satisfy the [`BranchParams`].
+    ///
+    /// # Note
+    ///
+    /// This does _not_ change or mutate the operand stack.
+    fn copy_branch_params(&mut self, params: BranchParams) -> Result<(), Error> {
+        self.copy_branch_params_temps(params)?;
+        self.copy_branch_params_regs(params)?;
+        Ok(())
+    }
+
+    /// Copies the branch params that are expected in temporary stack slots.
+    ///
+    /// Part of [`Self::copy_branch_params`].
+    fn copy_branch_params_temps(&mut self, params: BranchParams) -> Result<(), Error> {
+        let len_temps = params.len_temps();
+        if len_temps == 0 {
+            return Ok(());
+        }
+        let dst = params.temp_slots();
+        self.copy_operands_to_dst(dst.span(), params.len_temps(), params.len_regs())?;
+        Ok(())
+    }
+
+    /// Copies the branch params that are expected in their respective registers.
+    ///
+    /// Part of [`Self::copy_branch_params`].
+    fn copy_branch_params_regs(&mut self, params: BranchParams) -> Result<(), Error> {
+        for (depth, kind) in params.regs().iter().enumerate() {
+            let value = self.stack.peek(depth);
+            debug_assert!(kind.matches_ty(value.ty()));
+            self.encode_copy_rx_op(value)?;
+        }
+        Ok(())
+    }
+
+    /// Encodes a single `copy_rx` operator.
+    ///
+    /// # Note
+    ///
+    /// This won't encode a copy if `value` is already in its register.
+    fn encode_copy_rx_op(&mut self, value: Operand) -> Result<(), Error> {
+        let Some(op) = Self::select_copy_rx_op(value, &self.layout)? else {
+            return Ok(());
+        };
+        self.instrs.encode_op(op)?;
+        Ok(())
+    }
+
+    /// Returns the [`Op`] to copy `value` into its register.
+    ///
+    /// Returns `None` if `value` is already in its register.
+    fn select_copy_rx_op(value: Operand, layout: &StackLayout) -> Result<Option<Op>, Error> {
+        match value.ty() {
+            ValType::I32 | ValType::FuncRef | ValType::ExternRef => {
+                Self::select_u32_copy_rx_op(value, layout)
+            }
+            ValType::I64 => Self::select_u64_copy_rx_op(value, layout),
+            ValType::F32 => Self::select_f32_copy_rx_op(value, layout),
+            ValType::F64 => Self::select_f64_copy_rx_op(value, layout),
+            ValType::V128 => unreachable!(),
+        }
+    }
+
+    /// Returns the [`Op`] to copy `value` of type `u32` into its register.
+    ///
+    /// Returns `None` if `value` is already in its register.
+    fn select_u32_copy_rx_op(value: Operand, layout: &StackLayout) -> Result<Option<Op>, Error> {
+        let op = match value.resolve(layout)? {
+            ResolvedOperand::Reg(ty) => {
+                debug_assert!(matches!(
+                    ty,
+                    ValType::I32 | ValType::ExternRef | ValType::FuncRef
+                ));
+                return Ok(None);
+            }
+            ResolvedOperand::Slot(value) => Op::u64_copy_rs(value),
+            ResolvedOperand::Immediate(value) => Op::u32_copy_ri(u32::from(value.raw())),
+        };
+        Ok(Some(op))
+    }
+
+    /// Returns the [`Op`] to copy `value` of type `u64` into its register.
+    ///
+    /// Returns `None` if `value` is already in its register.
+    fn select_u64_copy_rx_op(value: Operand, layout: &StackLayout) -> Result<Option<Op>, Error> {
+        let op = match value.resolve_as::<u64>(layout)? {
+            ResolvedOperand::Reg(ty) => {
+                debug_assert_eq!(ty, ValType::I64);
+                return Ok(None);
+            }
+            ResolvedOperand::Slot(value) => Op::u64_copy_rs(value),
+            ResolvedOperand::Immediate(value) => Op::u64_copy_ri(value),
+        };
+        Ok(Some(op))
+    }
+
+    /// Returns the [`Op`] to copy `value` of type `f32` into its register.
+    ///
+    /// Returns `None` if `value` is already in its register.
+    fn select_f32_copy_rx_op(value: Operand, layout: &StackLayout) -> Result<Option<Op>, Error> {
+        let op = match value.resolve_as::<f32>(layout)? {
+            ResolvedOperand::Reg(ty) => {
+                debug_assert_eq!(ty, ValType::F32);
+                return Ok(None);
+            }
+            ResolvedOperand::Slot(value) => Op::f32_copy_rs(value),
+            ResolvedOperand::Immediate(value) => Op::f32_copy_ri(value),
+        };
+        Ok(Some(op))
+    }
+
+    /// Returns the [`Op`] to copy `value` of type `f64` into its register.
+    ///
+    /// Returns `None` if `value` is already in its register.
+    fn select_f64_copy_rx_op(value: Operand, layout: &StackLayout) -> Result<Option<Op>, Error> {
+        let op = match value.resolve_as::<f64>(layout)? {
+            ResolvedOperand::Reg(ty) => {
+                debug_assert_eq!(ty, ValType::F64);
+                return Ok(None);
+            }
+            ResolvedOperand::Slot(value) => Op::f64_copy_rs(value),
+            ResolvedOperand::Immediate(value) => Op::f64_copy_ri(value),
+        };
+        Ok(Some(op))
+    }
+
+    /// Convenience wrapper for [`Self::encode_copy_sx_op_impl`].
+    fn encode_copy_sx_op(
+        &mut self,
+        result: Slot,
+        value: Operand,
+    ) -> Result<Option<Pos<Op>>, Error> {
+        Self::encode_copy_sx_op_impl(result, value, &self.layout, &mut self.instrs)
+    }
+
+    /// Encodes a single `copy_sx` operator.
+    ///
+    /// # Note
+    ///
+    /// This won't encode a copy if `result` and `value` yields a no-op copy.
+    fn encode_copy_sx_op_impl(
+        result: Slot,
+        value: Operand,
+        layout: &StackLayout,
+        encoder: &mut OpEncoder,
+    ) -> Result<Option<Pos<Op>>, Error> {
+        let Some(copy_instr) = Self::select_copy_sx_op(result, value, layout)? else {
+            // Case: no-op copy instruction
+            return Ok(None);
+        };
+        let pos = encoder.encode_op(copy_instr)?;
+        Ok(Some(pos))
+    }
+
+    /// Returns the copy instruction to copy the given `operand` to `result`.
+    ///
+    /// Returns `None` if the resulting copy instruction is a no-op.
+    fn select_copy_sx_op(
+        result: Slot,
+        value: Operand,
+        layout: &StackLayout,
+    ) -> Result<Option<Op>, Error> {
+        let ty = value.ty();
+        let op = match value.resolve(layout)? {
+            ResolvedOperand::Reg(ty) => Self::select_copy_sr_op(result, ty),
+            ResolvedOperand::Slot(value) => return Ok(Self::select_copy_ss_op(result, value, ty)),
+            ResolvedOperand::Immediate(value) => Self::select_copy_si_op(result, value),
+        };
+        Ok(Some(op))
+    }
+
+    /// Returns the [`Op`] to copy the register `value` into `result` for `ty`.
+    fn select_copy_sr_op(result: Slot, ty: ValType) -> Op {
+        match ty {
+            | ValType::I32 | ValType::I64 | ValType::FuncRef | ValType::ExternRef => {
+                Self::select_u64_copy_sr_op(result)
+            }
+            | ValType::F32 => Self::select_f32_copy_sr_op(result),
+            | ValType::F64 => Self::select_f64_copy_sr_op(result),
+            | ValType::V128 => unreachable!(),
+        }
+    }
+
+    /// Returns the [`Op`] to copy the register `value` of type `u64` into `result`.
+    fn select_u64_copy_sr_op(result: Slot) -> Op {
+        match u16::from(result) {
+            0 => Op::u64_copy_s0r(),
+            1 => Op::u64_copy_s1r(),
+            2 => Op::u64_copy_s2r(),
+            3 => Op::u64_copy_s3r(),
+            4 => Op::u64_copy_s4r(),
+            5 => Op::u64_copy_s5r(),
+            6 => Op::u64_copy_s6r(),
+            7 => Op::u64_copy_s7r(),
+            8 => Op::u64_copy_s8r(),
+            9 => Op::u64_copy_s9r(),
+            _ => Op::u64_copy_sr(result),
+        }
+    }
+
+    /// Returns the [`Op`] to copy the register `value` of type `f32` into `result`.
+    fn select_f32_copy_sr_op(result: Slot) -> Op {
+        match u16::from(result) {
+            0 => Op::f32_copy_s0r(),
+            1 => Op::f32_copy_s1r(),
+            2 => Op::f32_copy_s2r(),
+            3 => Op::f32_copy_s3r(),
+            4 => Op::f32_copy_s4r(),
+            5 => Op::f32_copy_s5r(),
+            6 => Op::f32_copy_s6r(),
+            7 => Op::f32_copy_s7r(),
+            8 => Op::f32_copy_s8r(),
+            9 => Op::f32_copy_s9r(),
+            _ => Op::f32_copy_sr(result),
+        }
+    }
+
+    /// Returns the [`Op`] to copy the register `value` of type `f64` into `result`.
+    fn select_f64_copy_sr_op(result: Slot) -> Op {
+        match u16::from(result) {
+            0 => Op::f64_copy_s0r(),
+            1 => Op::f64_copy_s1r(),
+            2 => Op::f64_copy_s2r(),
+            3 => Op::f64_copy_s3r(),
+            4 => Op::f64_copy_s4r(),
+            5 => Op::f64_copy_s5r(),
+            6 => Op::f64_copy_s6r(),
+            7 => Op::f64_copy_s7r(),
+            8 => Op::f64_copy_s8r(),
+            9 => Op::f64_copy_s9r(),
+            _ => Op::f64_copy_sr(result),
+        }
+    }
+
+    /// Returns the [`Op`] to copy the [`Slot`] `value` into `result`.
+    ///
+    /// Returns `None` if the `copy` is a no-op.
+    fn select_copy_ss_op(result: Slot, value: Slot, ty: ValType) -> Option<Op> {
+        if result == value {
+            return None;
+        }
+        match ty {
+            #[cfg(feature = "simd")]
+            ValType::V128 => {
+                return Some(Op::v128_copy_ss(result, value));
+            }
+            _ => {}
+        }
+        let r = u16::from(result);
+        let v = u16::from(value);
+        let op = match (r, v) {
+            // s0sN
+            (0, 1) => Op::u64_copy_s0s1(),
+            (0, 2) => Op::u64_copy_s0s2(),
+            (0, 3) => Op::u64_copy_s0s3(),
+            (0, 4) => Op::u64_copy_s0s4(),
+            (0, 5) => Op::u64_copy_s0s5(),
+            // s1sN
+            (1, 0) => Op::u64_copy_s1s0(),
+            (1, 2) => Op::u64_copy_s1s2(),
+            (1, 3) => Op::u64_copy_s1s3(),
+            (1, 4) => Op::u64_copy_s1s4(),
+            (1, 5) => Op::u64_copy_s1s5(),
+            // s2sN
+            (2, 0) => Op::u64_copy_s2s0(),
+            (2, 1) => Op::u64_copy_s2s1(),
+            (2, 3) => Op::u64_copy_s2s3(),
+            (2, 4) => Op::u64_copy_s2s4(),
+            (2, 5) => Op::u64_copy_s2s5(),
+            // s3sN
+            (3, 0) => Op::u64_copy_s3s0(),
+            (3, 1) => Op::u64_copy_s3s1(),
+            (3, 2) => Op::u64_copy_s3s2(),
+            (3, 4) => Op::u64_copy_s3s4(),
+            (3, 5) => Op::u64_copy_s3s5(),
+            // s4sN
+            (4, 0) => Op::u64_copy_s4s0(),
+            (4, 1) => Op::u64_copy_s4s1(),
+            (4, 2) => Op::u64_copy_s4s2(),
+            (4, 3) => Op::u64_copy_s4s3(),
+            (4, 5) => Op::u64_copy_s4s5(),
+            // s5sN
+            (5, 0) => Op::u64_copy_s5s0(),
+            (5, 1) => Op::u64_copy_s5s1(),
+            (5, 2) => Op::u64_copy_s5s2(),
+            (5, 3) => Op::u64_copy_s5s3(),
+            (5, 4) => Op::u64_copy_s5s4(),
+            _ => Op::u64_copy_ss(result, value),
+        };
+        Some(op)
+    }
+
+    /// Returns the [`Op`] to copy the immediate `value` into `result`.
+    fn select_copy_si_op(result: Slot, value: TypedRawVal) -> Op {
+        let raw = value.raw();
+        match value.ty() {
+            | ValType::FuncRef | ValType::ExternRef | ValType::I32 | ValType::F32 => {
+                Op::u32_copy_si(result, u32::from(raw))
+            }
+            | ValType::I64 | ValType::F64 => Op::u64_copy_si(result, u64::from(raw)),
+            #[cfg(feature = "simd")]
+            | ValType::V128 => Op::v128_copy_si(result, V128::from(raw)),
+            #[cfg(not(feature = "simd"))]
+            | ValType::V128 => unreachable!(),
+        }
+    }
+
+    /// Returns `true` if there is a need to copy branch parameters for the frame at `depth` with the current stack.
+    ///
+    /// # Dev. Note
+    ///
+    /// We take `depth` to a frame instead of a reference to the frame directly
+    /// to avoid some borrow-checking issues at users.
+    ///
+    /// # Note
+    ///
+    /// Conditional branches can be encoded in a more efficient way
+    /// if no branch parameter copies are required.
+    fn requires_branch_param_copies(&self, depth: usize) -> bool {
+        let frame = self.stack.peek_control(depth);
+        let branch_params = frame.branch_params();
+        let len_params = usize::from(branch_params.len());
+        if len_params == 0 {
+            // The frame has no branch params and thus no copies need to be performed.
+            return false;
+        }
+        let frame_height = frame.height();
+        let height_matches = frame_height == (self.stack.height() - len_params);
+        let has_temp_params = branch_params.len_temps() > 0;
+        if !height_matches && has_temp_params {
+            // If the height does not match we need to copy
+            return true;
+        }
+        let len_regs = usize::from(branch_params.len_regs());
+        let temp_params_require_copies = (len_regs..len_params)
+            .map(|depth| self.stack.peek(depth))
+            .any(|o| !o.is_temp() || o.in_reg());
+        if temp_params_require_copies {
+            // The branch paramters expected in temporary stack slots require copy operations.
+            return true;
+        }
+        let reg_params_require_copies = (0..len_regs)
+            .map(|depth| self.stack.peek(depth))
+            .any(|o| !o.in_reg());
+        if reg_params_require_copies {
+            // The branch paramters expected in registers require copy operations.
+            return true;
+        }
+        false
+    }
+
+    fn copy_operand_to_reg(&mut self, operand: Operand) -> Result<(), Error> {
+        let ty = operand.ty();
+        let Some(op) = Self::select_copy_rx_op(operand, &self.layout)? else {
+            // Case: No copy needed as operand already resides in register.
+            self.push_result_reg(ty)?;
+            return Ok(());
+        };
+        self.push_op_with_result_reg(ty, op)?;
+        Ok(())
+    }
+
+    /// Copies the top `len` operands on the stack to their respective stack slots.
+    ///
+    /// Returns a [`BoundedSlotSpan`] of the stack slots holding the copy results.
+    fn copy_operands_to_temp(&mut self, len: u16, skip: u16) -> Result<BoundedSlotSpan, Error> {
+        if len == 0 {
+            return Ok(BoundedSlotSpan::new(self.stack.next_temp_slots(), 0));
+        }
+        let dst = self
+            .stack
+            .peek(usize::from(len + skip) - 1)
+            .temp_slots()
+            .span();
+        self.copy_operands_to_dst(dst, len, skip)
+    }
+
+    /// Skips the top `skip` operands and copies the remaining top `len` operands to `dst`.
+    ///
+    /// Returns `dst` extended with information about the number of copied cells.
+    fn copy_operands_to_dst(
+        &mut self,
+        dst: SlotSpan,
+        len: u16,
+        skip: u16,
+    ) -> Result<BoundedSlotSpan, Error> {
+        let mut len_cells: u16 = 0;
+        for depth in (skip..len + skip).rev() {
+            let value = self.stack.peek(depth.into());
+            let result = dst.head().next_n(len_cells);
+            if let Some(copy_op) = Self::select_copy_sx_op(result, value, &self.layout)? {
+                self.instrs.encode_op(copy_op)?;
+            };
+            let copied_cells = required_cells_for_ty(value.ty());
+            len_cells = len_cells
+                .checked_add(copied_cells)
+                .ok_or(TranslationError::AllocatedTooManySlots)?;
+        }
+        Ok(BoundedSlotSpan::new(dst, len_cells))
+    }
+
+    /// Copies the `operand` to its temporary [`Slot`] if it is an immediate.
+    ///
+    /// Returns the temporary [`Slot`] of the `operand`.
+    ///
+    /// # Note
+    ///
+    /// - Returns the associated [`Slot`] if `operand` is an [`Operand::Temp`] or [`Operand::Local`].
+    // TODO: return `BoundedSlotSpan` instead of just `Slot`
+    fn copy_immediate_to_slot(&mut self, operand: Operand) -> Result<Location, Error> {
+        let location = match self.resolve_operand(operand)? {
+            ResolvedOperand::Reg(ty) => Location::Reg(ty),
+            ResolvedOperand::Slot(value) => Location::Slot(value),
+            ResolvedOperand::Immediate(value) => {
+                let result = operand.temp_slots().head();
+                let copy_instr = Self::select_copy_si_op(result, value);
+                self.instrs.encode_op(copy_instr)?;
+                Location::Slot(result)
+            }
+        };
+        Ok(location)
+    }
+
+    /// Copies the `operand` to its associated [`Slot`].
+    ///
+    /// Does nothing if the operand is an [`Operand::Local`] or [`Operand::Temp`].
+    // TODO: return `BoundedSlotSpan` instead of just `Slot`
+    fn copy_operand_to_slot(&mut self, operand: Operand) -> Result<Slot, Error> {
+        let result = operand.temp_slots().head();
+        let ty = operand.ty();
+        let copy_op = match self.resolve_operand::<RawVal>(operand)? {
+            ResolvedOperand::Slot(slot) => return Ok(slot),
+            ResolvedOperand::Reg(ty) => Self::select_copy_sr_op(result, ty),
+            ResolvedOperand::Immediate(value) => {
+                Self::select_copy_si_op(result, TypedRawVal::new(ty, value))
+            }
+        };
+        self.instrs.encode_op(copy_op)?;
+        Ok(result)
+    }
+
+    /// Preserves all local operands on the stack.
+    ///
+    /// # Note
+    ///
+    /// This works by encoding copy instructions to `temp` register space.
+    fn preserve_all_locals(&mut self, skip: usize) -> Result<(), Error> {
+        for local in self.stack.preserve_all_locals(skip) {
+            let result = local.temp_slots().head();
+            let Some(copy_instr) = Self::select_copy_sx_op(result, local.into(), &self.layout)?
+            else {
+                unreachable!("`result` and `local` refer to different stack spaces");
+            };
+            self.instrs.encode_op(copy_instr)?;
+        }
+        Ok(())
+    }
+
+    /// Pushes the `instr` to the function.
+    fn push_instr(&mut self, instr: Op) -> Result<Pos<Op>, Error> {
+        debug_assert!(instr.result_ref().is_none());
+        let instr = self.instrs.encode_op(instr)?;
+        Ok(instr)
+    }
+
+    /// Returns `Some` if the staged [`Op`] can be fused with a `copy_sr` with `result`.
+    ///
+    /// Returns `None` otherwise.
+    fn fuse_copy_sr(&self, result: Slot, input_ty: ValType) -> Option<Op> {
+        match RegKind::new(input_ty)? {
+            RegKind::Ireg => self.fuse_copy_sr_ireg(result),
+            RegKind::Freg32 => self.fuse_copy_sr_freg32(result),
+            RegKind::Freg64 => self.fuse_copy_sr_freg64(result),
+        }
+    }
+
+    fn fuse_copy_sr_ireg(&self, result: Slot) -> Option<Op> {
+        let result = SlotAndReg::from(result);
+        let staged_op = self.instrs.peek_staged()?;
+        #[rustfmt::skip]
+        let op = match staged_op {
+            // i32
+            Op::I32Add_Rrs { rhs, .. } => Op::i32_add_rs_rs(result, rhs),
+            Op::I32Add_Rri { rhs, .. } => Op::i32_add_rs_ri(result, rhs),
+            Op::I32Add_Rss { lhs, rhs, .. } => Op::i32_add_rs_ss(result, lhs, rhs),
+            Op::I32Add_Rsi { lhs, rhs, .. } => Op::i32_add_rs_si(result, lhs, rhs),
+            // i64
+            Op::I64Add_Rrs { rhs, .. } => Op::i64_add_rs_rs(result, rhs),
+            Op::I64Add_Rri { rhs, .. } => Op::i64_add_rs_ri(result, rhs),
+            Op::I64Add_Rss { lhs, rhs, .. } => Op::i64_add_rs_ss(result, lhs, rhs),
+            Op::I64Add_Rsi { lhs, rhs, .. } => Op::i64_add_rs_si(result, lhs, rhs),
+            // load
+            Op::U32LoadMem0Offset16_Rr { offset, .. } => Op::u32_load_mem0_offset16_rs_r(result, offset),
+            Op::U32LoadMem0Offset16_Rs { ptr, offset, .. } => Op::u32_load_mem0_offset16_rs_s(result, ptr, offset),
+            Op::U64LoadMem0Offset16_Rr { offset, .. } => Op::u64_load_mem0_offset16_rs_r(result, offset),
+            Op::U64LoadMem0Offset16_Rs { ptr, offset, .. } => Op::u64_load_mem0_offset16_rs_s(result, ptr, offset),
+            Op::I32LoadExtend8Mem0Offset16_Rr { offset, .. } => Op::i32_load_extend8_mem0_offset16_rs_r(result, offset),
+            Op::I32LoadExtend8Mem0Offset16_Rs { ptr, offset, .. } => Op::i32_load_extend8_mem0_offset16_rs_s(result, ptr, offset),
+            Op::U32LoadExtend8Mem0Offset16_Rr { offset, .. } => Op::u32_load_extend8_mem0_offset16_rs_r(result, offset),
+            Op::U32LoadExtend8Mem0Offset16_Rs { ptr, offset, .. } => Op::u32_load_extend8_mem0_offset16_rs_s(result, ptr, offset),
+            Op::I32LoadExtend16Mem0Offset16_Rr { offset, .. } => Op::i32_load_extend16_mem0_offset16_rs_r(result, offset),
+            Op::I32LoadExtend16Mem0Offset16_Rs { ptr, offset, .. } => Op::i32_load_extend16_mem0_offset16_rs_s(result, ptr, offset),
+            Op::U32LoadExtend16Mem0Offset16_Rr { offset, .. } => Op::u32_load_extend16_mem0_offset16_rs_r(result, offset),
+            Op::U32LoadExtend16Mem0Offset16_Rs { ptr, offset, .. } => Op::u32_load_extend16_mem0_offset16_rs_s(result, ptr, offset),
+            Op::I64LoadExtend8Mem0Offset16_Rr { offset, .. } => Op::i64_load_extend8_mem0_offset16_rs_r(result, offset),
+            Op::I64LoadExtend8Mem0Offset16_Rs { ptr, offset, .. } => Op::i64_load_extend8_mem0_offset16_rs_s(result, ptr, offset),
+            Op::U64LoadExtend8Mem0Offset16_Rr { offset, .. } => Op::u64_load_extend8_mem0_offset16_rs_r(result, offset),
+            Op::U64LoadExtend8Mem0Offset16_Rs { ptr, offset, .. } => Op::u64_load_extend8_mem0_offset16_rs_s(result, ptr, offset),
+            Op::I64LoadExtend16Mem0Offset16_Rr { offset, .. } => Op::i64_load_extend16_mem0_offset16_rs_r(result, offset),
+            Op::I64LoadExtend16Mem0Offset16_Rs { ptr, offset, .. } => Op::i64_load_extend16_mem0_offset16_rs_s(result, ptr, offset),
+            Op::U64LoadExtend16Mem0Offset16_Rr { offset, .. } => Op::u64_load_extend16_mem0_offset16_rs_r(result, offset),
+            Op::U64LoadExtend16Mem0Offset16_Rs { ptr, offset, .. } => Op::u64_load_extend16_mem0_offset16_rs_s(result, ptr, offset),
+            Op::I64LoadExtend32Mem0Offset16_Rr { offset, .. } => Op::i64_load_extend32_mem0_offset16_rs_r(result, offset),
+            Op::I64LoadExtend32Mem0Offset16_Rs { ptr, offset, .. } => Op::i64_load_extend32_mem0_offset16_rs_s(result, ptr, offset),
+            Op::U64LoadExtend32Mem0Offset16_Rr { offset, .. } => Op::u64_load_extend32_mem0_offset16_rs_r(result, offset),
+            Op::U64LoadExtend32Mem0Offset16_Rs { ptr, offset, .. } => Op::u64_load_extend32_mem0_offset16_rs_s(result, ptr, offset),
+            _ => return None,
+        };
+        Some(op)
+    }
+
+    fn fuse_copy_sr_freg32(&self, result: Slot) -> Option<Op> {
+        let result = SlotAndReg::from(result);
+        let staged_op = self.instrs.peek_staged()?;
+        let op = match staged_op {
+            Op::F32LoadMem0Offset16_Rr { offset, .. } => {
+                Op::f32_load_mem0_offset16_rs_r(result, offset)
+            }
+            Op::F32LoadMem0Offset16_Rs { ptr, offset, .. } => {
+                Op::f32_load_mem0_offset16_rs_s(result, ptr, offset)
+            }
+            _ => return None,
+        };
+        Some(op)
+    }
+
+    fn fuse_copy_sr_freg64(&self, result: Slot) -> Option<Op> {
+        let result = SlotAndReg::from(result);
+        let staged_op = self.instrs.peek_staged()?;
+        let op = match staged_op {
+            Op::F64LoadMem0Offset16_Rr { offset, .. } => {
+                Op::f64_load_mem0_offset16_rs_r(result, offset)
+            }
+            Op::F64LoadMem0Offset16_Rs { ptr, offset, .. } => {
+                Op::f64_load_mem0_offset16_rs_s(result, ptr, offset)
+            }
+            _ => return None,
+        };
+        Some(op)
+    }
+
+    /// Pushes a result register operand onto the stack.
+    ///
+    /// If a register operand of an equivalent type is already on the stack
+    /// a copy operator is encoded to turn the existing register operand into
+    /// a temporary operand.
+    fn push_result_reg(&mut self, ty: ValType) -> Result<(), Error> {
+        self.preserve_reg_of_type(ty)?;
+        self.stack.push_temp(ty, Allocation::Reg)?;
+        Ok(())
+    }
+
+    /// Preserves the accumulator register of type `ty` via a `copy` operator if necessary.
+    fn preserve_reg_of_type(&mut self, ty: ValType) -> Result<(), Error> {
+        if let Some(operand) = self.stack.dealloc_reg(ty) {
+            let result = operand.temp_slots().head();
+            let op = match self.fuse_copy_sr(result, ty) {
+                Some(fused_op) => {
+                    self.instrs.drop_staged();
+                    fused_op
+                }
+                None => Self::select_copy_sr_op(result, operand.ty()),
+            };
+            self.instrs.encode_op(op)?;
+        }
+        Ok(())
+    }
+
+    /// Stages the `op` with a register result.
+    fn stage_op_with_result_reg(&mut self, result_ty: ValType, op: Op) -> Result<(), Error> {
+        debug_assert_eq!(op.result_loc().map(|loc| loc.is_reg()), Some(true));
+        self.push_result_reg(result_ty)?;
+        self.instrs.stage_op(op)?;
+        Ok(())
+    }
+
+    /// Pushes the `op` with a register result to the function.
+    fn push_op_with_result_reg(&mut self, result_ty: ValType, op: Op) -> Result<(), Error> {
+        debug_assert_eq!(op.result_loc().map(|loc| loc.is_reg()), Some(true));
+        self.push_result_reg(result_ty)?;
+        self.instrs.encode_op(op)?;
+        Ok(())
+    }
+
+    /// Stages the operator returned by `make_instr` with a stack slot result.
+    #[cfg(feature = "simd")]
+    fn push_op_with_result_slot(
+        &mut self,
+        result_ty: ValType,
+        make_instr: impl FnOnce(Slot) -> Op,
+    ) -> Result<(), Error> {
+        let result = self
+            .stack
+            .push_temp(result_ty, Allocation::None)?
+            .temp_slots()
+            .head();
+        let op = make_instr(result);
+        debug_assert!(op.result_ref().is_some());
+        self.instrs.stage_op(op)?;
+        Ok(())
+    }
+
+    /// Stages the operator returned by `make_op` with a stack slot result if `make_op` yields `Some`.
+    ///
+    /// Only pushes the operand to the stack without encoding an operator if `make_op` yields `None`.
+    #[cfg(feature = "simd")]
+    fn try_push_op_with_result_slot(
+        &mut self,
+        result_ty: ValType,
+        make_op: impl FnOnce(Slot) -> Option<Op>,
+    ) -> Result<(), Error> {
+        let result = self
+            .stack
+            .push_temp(result_ty, Allocation::None)?
+            .temp_slots()
+            .head();
+        if let Some(op) = make_op(result) {
+            self.instrs.stage_op(op)?;
+        }
+        Ok(())
+    }
+
+    /// Populate the `buffer` with the `table` targets including the `table` default target.
+    ///
+    /// Returns a shared slice to the `buffer` after it has been filled.
+    ///
+    /// # Note
+    ///
+    /// The `table` default target is pushed last to the `buffer`.
+    fn copy_targets_from_br_table(
+        table: &wasmparser::BrTable,
+        buffer: &mut Vec<TypedRawVal>,
+    ) -> Result<(), Error> {
+        let default_target = table.default();
+        buffer.clear();
+        for target in table.targets() {
+            buffer.push(TypedRawVal::from(target?));
+        }
+        buffer.push(TypedRawVal::from(default_target));
+        Ok(())
+    }
+
+    /// Encodes a Wasm `br_table` that does not copy branching values.
+    ///
+    /// # Note
+    ///
+    /// Upon call the `immediates` buffer contains all `br_table` target values.
+    fn encode_br_table_0(
+        &mut self,
+        table: wasmparser::BrTable,
+        index: Location,
+    ) -> Result<(), Error> {
+        // We add +1 because we include the default target here.
+        let len_targets = table.len() + 1;
+        debug_assert_eq!(self.immediates.len(), len_targets as usize);
+        let op = match index {
+            Location::Reg(_) => Op::branch_table_r(len_targets),
+            Location::Slot(index) => Op::branch_table_s(len_targets, index),
+        };
+        self.push_instr(op)?;
+        // Encode the `br_table` targets:
+        let targets = &self.immediates[..];
+        for target in targets {
+            let Ok(depth) = usize::try_from(u32::from(*target)) else {
+                panic!("out of bounds `br_table` target does not fit `usize`: {target:?}");
+            };
+            let mut frame = self.stack.peek_control_mut(depth).control_frame();
+            self.instrs.encode_branch(frame.label(), identity)?;
+            frame.branch_to();
+        }
+        Ok(())
+    }
+
+    /// Encodes a Wasm `br_table` that has to copy `len_values` branching values.
+    ///
+    /// # Note
+    ///
+    /// Upon call the `immediates` buffer contains all `br_table` target values.
+    fn encode_br_table_n(
+        &mut self,
+        table: wasmparser::BrTable,
+        index: Location,
+        values: BoundedSlotSpan,
+    ) -> Result<(), Error> {
+        let len_targets = table.len() + 1;
+        debug_assert_eq!(self.immediates.len(), len_targets as usize);
+        let op = match index {
+            Location::Reg(_) => Op::branch_table_span_r(len_targets, values),
+            Location::Slot(index) => Op::branch_table_span_s(len_targets, index, values),
+        };
+        self.push_instr(op)?;
+        // Encode the `br_table` targets:
+        let targets = &self.immediates[..];
+        for target in targets {
+            let Ok(depth) = usize::try_from(u32::from(*target)) else {
+                panic!("out of bounds `br_table` target does not fit `usize`: {target:?}");
+            };
+            let mut frame = self.stack.peek_control_mut(depth).control_frame();
+            let results = frame.branch_params().temp_slots();
+            self.instrs.encode_branch(frame.label(), |offset| {
+                ir::BranchTableTarget::new(results.span(), offset)
+            })?;
+            frame.branch_to();
+        }
+        Ok(())
+    }
+
+    /// Encodes a branching [`Op`].
+    fn encode_branch_op(
+        &mut self,
+        dst: LabelRef,
+        op: impl FnOnce(BranchOffset) -> Op,
+    ) -> Result<Pos<Op>, Error> {
+        self.instrs.pad_to_op_alignment()?;
+        let (pos, _) = self.instrs.encode_branch(dst, op)?;
+        Ok(pos)
+    }
+
+    /// Encodes a generic return operator.
+    fn encode_return(&mut self) -> Result<Pos<Op>, Error> {
+        let len_results = self.func_type_with(FuncType::len_results);
+        match len_results {
+            0 => {}
+            1 => self.prepare_return_1_op()?,
+            n => self.prepare_return_n_op(n)?,
+        };
+        let pos = self.instrs.encode_op(Op::r#return())?;
+        Ok(pos)
+    }
+
+    /// Prepares to encode a return operator returning a single value.
+    fn prepare_return_1_op(&mut self) -> Result<(), Error> {
+        let value = self.stack.peek(0);
+        let result = Slot::from(0);
+        self.encode_copy_sx_op(result, value)?;
+        Ok(())
+    }
+
+    /// Prepares to encode a return operator returning `n` (`n > 1`) values.
+    ///
+    /// This will attempt to copy the `n` values on top of the stack to the
+    /// stack slots required for returning to the caller.
+    fn prepare_return_n_op(&mut self, len: u16) -> Result<(), Error> {
+        debug_assert!(len > 1);
+        self.preserve_pure_locals(len)?;
+        let dst = SlotSpan::new(Slot::from(0));
+        self.copy_operands_to_dst(dst, len, 0)?;
+        Ok(())
+    }
+
+    /// Preserves all pure local operands up to a depth of `n`.
+    ///
+    /// # Note
+    ///
+    /// - A local operand is pure if it isn't hold in an accumulator register.
+    /// - Preserved operands are copied to their temporary stack slots.
+    fn preserve_pure_locals(&mut self, n: u16) -> Result<(), Error> {
+        let mut return_result = Slot::from(0);
+        for depth in (0..n).rev() {
+            let depth = usize::from(depth);
+            let returned = self.stack.peek(depth);
+            let ty = returned.ty();
+            let probe_result = return_result;
+            return_result = return_result.next_n(required_cells_for_ty(ty));
+            let Operand::Local(local) = returned else {
+                // Only locals need to be preserved as only locals may be overwritten.
+                continue;
+            };
+            if local.in_reg() {
+                // Local will be accessed via accumulator register => local overwrite is avoided.
+                continue;
+            }
+            let value = self.layout.local_to_slot(local.local_index())?;
+            let copy_op = Self::select_copy_ss_op(probe_result, value, ty);
+            if copy_op.is_none() {
+                // Local is already at the stack slot expected by the caller => local overwrite is impossible.
+                continue;
+            }
+            let moved = self.stack.operand_to_temp(depth);
+            debug_assert!(!moved.in_reg());
+            debug_assert!(moved.is_same(&returned));
+            let result = local.temp_slots().head();
+            let op = Self::select_copy_ss_op(result, value, ty)
+                .expect("must yield `Some` since `value` is a `local`");
+            self.instrs.encode_op(op)?;
+        }
+        Ok(())
+    }
+
+    /// Translates the end of a Wasm `block` control frame.
+    fn translate_end_block(&mut self, frame: BlockControlFrame) -> Result<(), Error> {
+        if frame.is_branched_to() {
+            if self.reachable {
+                self.copy_branch_params(frame.branch_params())?;
+            }
+            self.stack.push_branch_params(&frame)?;
+        }
+        self.instrs.pin_label(frame.label())?;
+        self.reachable |= frame.is_branched_to();
+        if self.reachable && self.stack.is_control_empty() {
+            self.encode_return()?;
+        }
+        Ok(())
+    }
+
+    /// Translates the end of a Wasm `loop` control frame.
+    fn translate_end_loop(&mut self, _frame: LoopControlFrame) -> Result<(), Error> {
+        debug_assert!(!self.stack.is_control_empty());
+        // Nothing needs to be done since Wasm `loop` control frames always only have a single exit.
+        //
+        // Note: no need to reset `last_instr` since end of `loop` is not a control flow boundary.
+        Ok(())
+    }
+
+    /// Translates the end of a Wasm `if` control frame.
+    fn translate_end_if(&mut self, frame: IfControlFrame) -> Result<(), Error> {
+        debug_assert!(!self.stack.is_control_empty());
+        let is_end_of_then_reachable = self.reachable;
+        let IfReachability::Both { else_label } = frame.reachability() else {
+            let is_end_reachable = match frame.reachability() {
+                IfReachability::OnlyThen => self.reachable,
+                IfReachability::OnlyElse => true,
+                IfReachability::Both { .. } => unreachable!(),
+            };
+            return self.translate_end_if_or_else_only(frame, is_end_reachable);
+        };
+        let len_results = frame.ty().len_results(self.engine());
+        let has_results = len_results >= 1;
+        if is_end_of_then_reachable && has_results {
+            self.copy_branch_params(frame.branch_params())?;
+            self.encode_branch_op(frame.label(), Op::branch)?;
+        }
+        self.instrs.pin_label_if_unpinned(else_label)?;
+        self.stack.push_else_operands(&frame)?;
+        if has_results {
+            // We haven't visited the `else` block and thus the `else`
+            // providers are still on the auxiliary stack and need to
+            // be popped. We use them to restore the stack to the state
+            // when entering the `if` block so that we can properly copy
+            // the `else` results to were they are expected.
+            self.instrs.encode_consume_fuel_op()?;
+            self.copy_branch_params(frame.branch_params())?;
+        }
+        self.stack.push_branch_params(&frame)?;
+        self.instrs.pin_label(frame.label())?;
+        self.reachable = true;
+        Ok(())
+    }
+
+    /// Translates the end of a Wasm `else` control frame.
+    fn translate_end_else(&mut self, frame: ElseControlFrame) -> Result<(), Error> {
+        debug_assert!(!self.stack.is_control_empty());
+        match frame.reachability() {
+            ElseReachability::OnlyThen {
+                is_end_of_then_reachable,
+            } => {
+                return self.translate_end_if_or_else_only(frame, is_end_of_then_reachable);
+            }
+            ElseReachability::OnlyElse => {
+                return self.translate_end_if_or_else_only(frame, self.reachable);
+            }
+            _ => {}
+        };
+        let end_of_then_reachable = frame.is_end_of_then_reachable();
+        let end_of_else_reachable = self.reachable;
+        let reachable = match (end_of_then_reachable, end_of_else_reachable) {
+            (false, false) => frame.is_branched_to(),
+            _ => true,
+        };
+        if end_of_else_reachable {
+            self.copy_branch_params(frame.branch_params())?;
+        }
+        self.stack.push_branch_params(&frame)?;
+        self.instrs.pin_label(frame.label())?;
+        self.reachable = reachable;
+        Ok(())
+    }
+
+    /// Translates the end of a Wasm `else` control frame where only one branch is known to be reachable.
+    fn translate_end_if_or_else_only(
+        &mut self,
+        frame: impl ControlFrameBase,
+        end_is_reachable: bool,
+    ) -> Result<(), Error> {
+        if frame.is_branched_to() {
+            if end_is_reachable {
+                self.copy_branch_params(frame.branch_params())?;
+            }
+            self.stack.push_branch_params(&frame)?;
+        }
+        self.instrs.pin_label(frame.label())?;
+        self.reachable = end_is_reachable || frame.is_branched_to();
+        Ok(())
+    }
+
+    /// Translates a legacy `catch` (if `tag_index` is `Some`) or `catch_all` clause.
+    ///
+    /// # Note
+    ///
+    /// The clauses form a dispatch chain behind the `try` body (legacy exception-handling
+    /// proposal, `exec-throw_ref` step 16): a typed clause tests the pending exception and
+    /// either enters its body with the tag fields or continues at the next clause. The end of
+    /// each reachable body branches to the end of the `try`.
+    fn translate_catch(&mut self, tag_index: Option<u32>) -> Result<(), Error> {
+        let mut frame = match self.stack.pop_control() {
+            ControlFrame::Try(frame) | ControlFrame::Catch(frame) => frame,
+            ControlFrame::Unreachable(
+                ControlFrameKind::Try | ControlFrameKind::Catch | ControlFrameKind::CatchAll,
+            ) => {
+                debug_assert!(!self.reachable);
+                let kind = match tag_index {
+                    Some(_) => ControlFrameKind::Catch,
+                    None => ControlFrameKind::CatchAll,
+                };
+                self.stack.push_unreachable(kind)?;
+                return Ok(());
+            }
+            unexpected => panic!("expected a legacy `try` control frame but found: {unexpected:?}"),
+        };
+        if self.reachable {
+            self.copy_branch_params(frame.branch_params())?;
+            frame.branch_to();
+            self.encode_br(frame.label())?;
+        }
+        match frame.clause() {
+            TryClause::Body => self.instrs.pin_label(frame.handler())?,
+            TryClause::Catch { next } => self.instrs.pin_label(next)?,
+            TryClause::CatchAll => {
+                unreachable!("validation rejects clauses after `catch_all`")
+            }
+        }
+        self.stack.enter_catch(frame.height());
+        let try_id = frame.try_id();
+        let clause = match tag_index {
+            Some(tag_index) => {
+                let tag_type = self.resolve_tag_type(tag_index);
+                let results = self.stack.next_temp_slots();
+                let mut len_cells: u16 = 0;
+                for ty in tag_type.params() {
+                    self.stack.push_temp(*ty, Allocation::None)?;
+                    len_cells = len_cells
+                        .checked_add(required_cells_for_ty(*ty))
+                        .ok_or(TranslationError::AllocatedTooManySlots)?;
+                }
+                let results = BoundedSlotSpan::new(results, len_cells);
+                let next = self.instrs.new_label();
+                self.encode_branch_op(next, |offset| {
+                    Op::exception_catch(results, tag_index, try_id, offset)
+                })?;
+                TryClause::Catch { next }
+            }
+            None => {
+                self.instrs.encode_op(Op::exception_catch_all(try_id))?;
+                TryClause::CatchAll
+            }
+        };
+        let fuel_pos = self.instrs.encode_consume_fuel_op()?;
+        self.stack.push_catch(frame, clause, fuel_pos);
+        self.reachable = true;
+        Ok(())
+    }
+
+    /// Translates the end of a legacy Wasm `try` body without catch clauses.
+    ///
+    /// # Note
+    ///
+    /// Such a `try` installs a handler without clauses, which lets every exception continue
+    /// to an enclosing handler (`exec-throw_ref` step 15). It thus behaves like a `block`.
+    fn translate_end_try(&mut self, mut frame: TryControlFrame) -> Result<(), Error> {
+        if self.reachable {
+            self.copy_branch_params(frame.branch_params())?;
+            frame.branch_to();
+            self.encode_br(frame.label())?;
+        }
+        self.instrs.pin_label(frame.handler())?;
+        self.encode_rethrow_pending(&frame)?;
+        self.translate_end_try_construct(frame)
+    }
+
+    /// Translates the end of the last `catch` or `catch_all` clause of a legacy Wasm `try`.
+    fn translate_end_catch(&mut self, mut frame: TryControlFrame) -> Result<(), Error> {
+        if let TryClause::Catch { next } = frame.clause() {
+            // Exceptions not matched by any clause continue to the enclosing handler.
+            if self.reachable {
+                self.copy_branch_params(frame.branch_params())?;
+                frame.branch_to();
+                self.encode_br(frame.label())?;
+            }
+            self.instrs.pin_label(next)?;
+            self.encode_rethrow_pending(&frame)?;
+        }
+        self.translate_end_try_construct(frame)
+    }
+
+    /// Encodes the re-raise of an exception that no clause of `frame` matched.
+    fn encode_rethrow_pending(&mut self, frame: &TryControlFrame) -> Result<(), Error> {
+        self.instrs
+            .encode_op(Op::exception_rethrow(frame.try_id()))?;
+        self.reachable = false;
+        Ok(())
+    }
+
+    /// Joins the control flow edges at the end of a legacy Wasm `try` like a Wasm `block`.
+    fn translate_end_try_construct(&mut self, frame: TryControlFrame) -> Result<(), Error> {
+        if frame.is_branched_to() {
+            if self.reachable {
+                self.copy_branch_params(frame.branch_params())?;
+            }
+            self.stack.push_branch_params(&frame)?;
+        }
+        self.instrs.pin_label(frame.label())?;
+        self.reachable |= frame.is_branched_to();
+        if self.reachable && self.stack.is_control_empty() {
+            self.encode_return()?;
+        }
+        Ok(())
+    }
+
+    /// Translates the end of an unreachable Wasm control frame.
+    fn translate_end_unreachable(&mut self, _frame: ControlFrameKind) -> Result<(), Error> {
+        debug_assert!(!self.stack.is_control_empty());
+        // We reset `last_instr` out of caution in case there is a control flow boundary.
+        self.instrs.commit_staged_if_any()?;
+        Ok(())
+    }
+}
+
+/// What [`FuncTranslator::translate_local_set`] generated to translate the `local.set`.
+#[derive(Debug, Copy, Clone)]
+pub enum LocalSetCodegen {
+    /// The `local.set` was fused with the staged [`Op`].
+    Fused,
+    /// The `local.set` was found to be a no-op, e.g. `(local.set $n (local.get $n))`.
+    NoOp,
+    /// The `local.set` generated a copy operator.
+    Copy,
+}
+
+impl FuncTranslator {
+    /// Translate the Wasm `local.set` and `local.tee` operations.
+    ///
+    /// # Note
+    ///
+    /// This applies op-code fusion that replaces the result of the previous instruction
+    /// instead of encoding a copy instruction for the `local.set` or `local.tee` if possible.
+    fn translate_local_set(
+        &mut self,
+        local_index: u32,
+        input: Operand,
+    ) -> Result<LocalSetCodegen, Error> {
+        let local_idx = LocalIdx::from(local_index);
+        let result = self.layout.local_to_slot(local_idx)?;
+        if let Operand::Local(input) = input {
+            let input = self.layout.local_to_slot(input)?;
+            if result == input {
+                // Case: `(local.set $n (local.get $n))` is a no-op so we can ignore it.
+                return Ok(LocalSetCodegen::NoOp);
+            }
+        }
+        let unfused_op = Self::select_copy_sx_op(result, input, &self.layout)?
+            .expect("already filtered out no-op copies above");
+        let fused_op = self.fused_local_set(result, input)?;
+        if fused_op.is_some() {
+            self.instrs.drop_staged();
+        }
+        let ty = input.ty();
+        for preserved in self.stack.preserve_locals(local_idx) {
+            let result = preserved.temp_slots().head();
+            let op = Self::select_copy_sx_op(result, preserved.into(), &self.layout)?
+                .expect("local preservation must not yield no-op copies");
+            self.instrs.encode_op(op)?;
+        }
+        if input.in_reg() {
+            self.stack.register_local_for_reg(ty, local_idx)?;
+        } else {
+            self.stack.dealloc_local_for_reg(ty, local_idx)?;
+        }
+        let (outcome, op) = match fused_op {
+            Some(fused_op) => (LocalSetCodegen::Fused, fused_op),
+            None => (LocalSetCodegen::Copy, unfused_op),
+        };
+        self.instrs.encode_op(op)?;
+        Ok(outcome)
+    }
+
+    /// Returns `Some` if the staged [`Op`] can be fused with the `local.set` and `None` otherwise.
+    ///
+    /// # Note
+    ///
+    /// - The `local` argument reflects the local index and `input` is the `input` operand of the `local.set`.
+    /// - This does not unstage or drop the staged [`Op`], nor does it encode the fused [`Op`].
+    /// - This only returns the resulting fused [`Op`] if any for later consideration.
+    fn fused_local_set(&self, result: Slot, input: Operand) -> Result<Option<Op>, Error> {
+        if let ResolvedOperand::Reg(_) = self.resolve_operand::<TypedRawVal>(input)? {
+            if let Some(fused_op) = self.fuse_copy_sr(result, input.ty()) {
+                // The staged operator can be fused with a `copy_sr` operator.
+                return Ok(Some(fused_op));
+            }
+        }
+        let Some(mut staged) = self.instrs.peek_staged() else {
+            // Cannot replace result if no staged operator exists.
+            return Ok(None);
+        };
+        let Some(old_result) = staged.result_mut() else {
+            // Cannot replace result of staged `Op` with non-slot result.
+            return Ok(None);
+        };
+        if matches!(self.layout.stack_space(*old_result), StackSpace::Local) {
+            // Cannot replace result of staged `Op` with a local result as its observable behavior.
+            return Ok(None);
+        }
+        let ResolvedOperand::Slot(input) = self.resolve_operand::<TypedRawVal>(input)? else {
+            // The `local.set` input is not a `Slot` and is not sourced from the staged `Op`.
+            return Ok(None);
+        };
+        if *old_result != input {
+            // The `local.set` input is not equal to staged `Op`'s output, thus the fusion is invalid.
+            return Ok(None);
+        }
+        // All checks passed, now replace result and return new fused `Op`.
+        *old_result = result;
+        Ok(Some(staged))
+    }
+
+    /// Encodes an unconditional Wasm `branch` instruction.
+    fn encode_br(&mut self, label: LabelRef) -> Result<(), Error> {
+        self.encode_branch_op(label, Op::branch)?;
+        Ok(())
+    }
+
+    /// Encodes a `i32.eqz`+`br_if` or `if` conditional branch instruction.
+    fn fused_br_eqz(&self, condition: Operand) -> Result<Option<Op>, Error> {
+        self.fused_cmp_branch(condition, true)
+    }
+
+    /// Try to fuse a cmp+branch [`Op`] with optional negation.
+    fn fused_cmp_branch(&self, condition: Operand, negate: bool) -> Result<Option<Op>, Error> {
+        let Some(staged_op) = self.instrs.peek_staged() else {
+            // Case: cannot fuse without a known last instruction
+            return Ok(None);
+        };
+        let Some(ir::Location::Reg(staged_ty)) = staged_op.result_loc() else {
+            // Case: cannot fuse without register result.
+            return Ok(None);
+        };
+        let ResolvedOperand::Reg(condition_ty) = condition.resolve(&self.layout)? else {
+            // Case: cannot fuse non-register operands
+            //  - locals have observable behavior.
+            //  - immediates cannot be the result of a previous instruction.
+            return Ok(None);
+        };
+        match (RegKind::new(staged_ty), RegKind::new(condition_ty)) {
+            (Some(RegKind::Ireg), Some(RegKind::Ireg)) => {}
+            _ => {
+                // Case: cannot fuse if staged and condition accumulators do not match.
+                return Ok(None);
+            }
+        }
+        let cmp_op = match negate {
+            false => staged_op,
+            true => match staged_op.negate_cmp_instr() {
+                Some(negated) => negated,
+                None => {
+                    // Note: cannot negate staged [`Op`], thus it is not a `cmp` operator and thus not fusable.
+                    return Ok(None);
+                }
+            },
+        };
+        let fused_op_or_none = cmp_op.try_into_cmp_branch_instr(BranchOffset::uninit());
+        Ok(fused_op_or_none)
+    }
+
+    /// Encodes a `i32.eqz`+`br_if` or `if` conditional branch instruction.
+    fn encode_br_eqz(&mut self, condition: Operand, label: LabelRef) -> Result<(), Error> {
+        self.encode_br_if(condition, label, true)
+    }
+
+    /// Encodes a `br_if` conditional branch instruction.
+    fn encode_br_nez(&mut self, condition: Operand, label: LabelRef) -> Result<(), Error> {
+        self.encode_br_if(condition, label, false)
+    }
+
+    /// Encodes a generic `br_if` fused conditional branch instruction.
+    fn encode_br_if(
+        &mut self,
+        condition: Operand,
+        label: LabelRef,
+        branch_eqz: bool,
+    ) -> Result<(), Error> {
+        if let Some(fused_op) = self.fused_cmp_branch(condition, branch_eqz)? {
+            self.instrs.drop_staged();
+            self.encode_branch_op(label, |offset| fused_op.with_branch_offset(offset))?;
+            return Ok(());
+        }
+        let condition = match self.resolve_operand::<i32>(condition)? {
+            ResolvedOperand::Reg(ty) => Location::Reg(ty),
+            ResolvedOperand::Slot(condition) => Location::Slot(condition),
+            ResolvedOperand::Immediate(condition) => {
+                let take_branch = match branch_eqz {
+                    true => condition == 0,
+                    false => condition != 0,
+                };
+                match take_branch {
+                    true => {
+                        self.encode_br(label)?;
+                        self.reachable = false;
+                        return Ok(());
+                    }
+                    false => return Ok(()),
+                }
+            }
+        };
+        self.encode_branch_op(label, |offset| match branch_eqz {
+            true => match condition {
+                Location::Slot(condition) => Op::branch_i32_eq_si(offset, condition, 0),
+                Location::Reg(_) => Op::branch_i32_eq_ri(offset, 0),
+            },
+            false => match condition {
+                Location::Slot(condition) => Op::branch_i32_not_eq_si(offset, condition, 0),
+                Location::Reg(_) => Op::branch_i32_not_eq_ri(offset, 0),
+            },
+        })?;
+        Ok(())
+    }
+
+    /// Generically translates a `call` or `return_call` Wasm operator.
+    fn translate_call(
+        &mut self,
+        function_index: u32,
+        call_internal: fn(params: BoundedSlotSpan, func: ir::InternalFunc) -> Op,
+        call_imported: fn(params: BoundedSlotSpan, func: ir::FuncAddr) -> Op,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let func_idx = FuncIdx::from(function_index);
+        let callee_ty = self.resolve_func_type(func_idx);
+        let params = self.adjust_stack_for_call(&callee_ty)?;
+        let instr = match self.module.get_engine_func(func_idx) {
+            Some(engine_func) => {
+                // Case: We are calling an internal function and can optimize
+                //       this case by using the special instruction for it.
+                let Some(func_entity) = self.engine().resolve_func(engine_func) else {
+                    unreachable!("missing func entry at: {engine_func:?}")
+                };
+                call_internal(
+                    params,
+                    ir::InternalFunc::from(func_entity as *const FuncEntry as usize),
+                )
+            }
+            None => {
+                // Case: We are calling an imported function and must use the
+                //       general calling operator for it.
+                call_imported(params, self.func_addr(function_index))
+            }
+        };
+        self.push_instr(instr)?;
+        Ok(())
+    }
+
+    /// Generically translates a `call_indirect` or `return_call_indirect` Wasm operator.
+    fn translate_call_indirect(
+        &mut self,
+        type_index: u32,
+        table_index: u32,
+        op_s: fn(
+            table: ir::TableAddr,
+            func_type: ir::FuncType,
+            params: BoundedSlotSpan,
+            index: Slot,
+        ) -> Op,
+        op_r: fn(table: ir::TableAddr, func_type: ir::FuncType, params: BoundedSlotSpan) -> Op,
+        op_table0_s: fn(func_type: ir::FuncType, params: BoundedSlotSpan, index: Slot) -> Op,
+        op_table0_r: fn(func_type: ir::FuncType, params: BoundedSlotSpan) -> Op,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let index = self.stack.pop();
+        let table0 = table_index == 0;
+        let table_addr = self.table_addr(table_index);
+        let callee_ty = self.resolve_type(type_index);
+        let index = self.copy_immediate_to_slot(index)?;
+        let params = self.adjust_stack_for_call(&callee_ty)?;
+        let func_type = self.resolve_dedup_type(type_index);
+        let op = match (table0, index) {
+            (true, Location::Slot(index)) => op_table0_s(func_type, params, index),
+            (true, Location::Reg(_)) => op_table0_r(func_type, params),
+            (false, Location::Slot(index)) => op_s(table_addr, func_type, params, index),
+            (false, Location::Reg(_)) => op_r(table_addr, func_type, params),
+        };
+        self.push_instr(op)?;
+        Ok(())
+    }
+
+    /// Adjusts the stack for a call to a function with type `ty`.
+    ///
+    /// Returns a bounded [`SlotSpan`] to the start of the call parameters and results
+    /// with the length equal to the number of cells storing the call parameters.
+    fn adjust_stack_for_call(&mut self, ty: &FuncType) -> Result<BoundedSlotSpan, Error> {
+        self.preserve_regs()?;
+        let params = self.copy_operands_to_temp(ty.len_params(), 0)?;
+        for _ in 0..ty.len_params() {
+            self.stack.pop();
+        }
+        for result in ty.results() {
+            self.stack.push_temp(*result, Allocation::None)?;
+        }
+        Ok(params)
+    }
+
+    fn copy_preserved_regs_to_slots(&mut self, regs: PreservedRegs) -> Result<(), Error> {
+        if !self.reachable {
+            // No need to encode copies if unreachable.
+            return Ok(());
+        }
+        let results_and_tys = [
+            regs.ireg.map(|s| (s, ValType::I64)),
+            regs.freg32.map(|s| (s, ValType::F32)),
+            regs.freg64.map(|s| (s, ValType::F64)),
+        ];
+        for reg in results_and_tys {
+            let Some((result, ty)) = reg else { continue };
+            let op = Self::select_copy_sr_op(result, ty);
+            self.instrs.encode_op(op)?;
+        }
+        Ok(())
+    }
+
+    /// Preserve all register operands on the [`Stack`].
+    fn preserve_regs(&mut self) -> Result<(), Error> {
+        let regs = self.stack.preserve_all_regs();
+        self.copy_preserved_regs_to_slots(regs)
+    }
+
+    /// Preserve all temporary register operands on the [`Stack`] but keep `local` register links.
+    fn preserve_temp_regs(&mut self, skip: usize) -> Result<(), Error> {
+        let regs = self.stack.preserve_all_temp_regs(skip);
+        self.copy_preserved_regs_to_slots(regs)
+    }
+
+    /// Translates a unary Wasm instruction to Wasmi bytecode with a custom optimizer.
+    fn translate_unary_with_opt<Op: UnaryOp>(
+        &mut self,
+        try_opt: fn(&mut FuncTranslator, value: Operand) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        self.translate_unary_vt(&Op::VT, try_opt)
+    }
+
+    /// Translates a unary Wasm instruction to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// All types implementing [`UnaryOp`] share this single monomorphization
+    /// via their [`UnaryOp::VT`] virtual table to avoid codegen bloat.
+    #[cfg_attr(wasmi_opt_size, inline(never))]
+    #[cfg_attr(wasmi_opt_speed, inline(always))]
+    fn translate_unary_vt(
+        &mut self,
+        vt: &UnaryOpVt,
+        try_opt: fn(&mut FuncTranslator, value: Operand) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let input = self.stack.pop();
+        if try_opt(self, input)? {
+            // Case: custom optimization took effect, return early.
+            self.stack.push_temp(vt.result_ty, Allocation::Reg)?;
+            return Ok(());
+        }
+        let op = match self.resolve_operand::<TypedRawVal>(input)? {
+            ResolvedOperand::Reg(_) => (vt.op_rr)(),
+            ResolvedOperand::Slot(input) => (vt.op_rs)(input),
+            ResolvedOperand::Immediate(input) => {
+                match (vt.consteval)(input) {
+                    Ok(result) => {
+                        self.stack.push_immediate(result)?;
+                    }
+                    Err(trap_code) => {
+                        self.translate_trap(trap_code)?;
+                    }
+                }
+                return Ok(());
+            }
+        };
+        self.stage_op_with_result_reg(vt.result_ty, op)?;
+        Ok(())
+    }
+
+    /// Translates a unary Wasm instruction to Wasmi bytecode.
+    fn translate_unary<Op: UnaryOp>(&mut self) -> Result<(), Error> {
+        self.translate_unary_with_opt::<Op>(|_, _| Ok(false))
+    }
+
+    /// Translate a generic Wasm reinterpret-like operation.
+    ///
+    /// # Note
+    ///
+    /// This Wasm operation is a no-op. Ideally we only have to change the types on the stack.
+    fn translate_reinterpret<T, R>(
+        &mut self,
+        op_rr: fn() -> Op,
+        consteval: fn(T) -> R,
+    ) -> Result<(), Error>
+    where
+        T: From<TypedRawVal> + Typed,
+        R: Into<TypedRawVal> + Typed,
+    {
+        bail_unreachable!(self);
+        let input = self.stack.pop();
+        debug_assert_eq!(input.ty(), <T as Typed>::TY);
+        let result_ty = <R as Typed>::TY;
+        match input {
+            input if input.in_reg() => {
+                self.push_op_with_result_reg(result_ty, op_rr())?;
+            }
+            Operand::Local(input) => {
+                self.stack.push_local(input.local_index(), result_ty)?;
+            }
+            Operand::Temp(_input) => {
+                self.stack.push_temp(result_ty, Allocation::None)?;
+            }
+            Operand::Immediate(input) => {
+                let input: T = input.val().into();
+                self.stack.push_immediate(consteval(input))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies `operand` to a temporary stack slot if it is an immediate that cannot be encoded using 32-bits.
+    ///
+    /// - Returns [`ResolvedOperand::Reg`] if `operand` is a register operand.
+    /// - Returns [`ResolvedOperand::Slot`] if `operand` is a local or a temporary operand.
+    /// - Returns [`ResolvedOperand::Immediate`] if `operand` is an immediate that is representable as 32-bit value.
+    /// - Returns [`ResolvedOperand::Slot`] otherwise and encodes a copy storing the immediate into its temporary stack slot.
+    fn resolve_operand_as_index32_or_copy(
+        &mut self,
+        operand: Operand,
+        index_ty: IndexType,
+    ) -> Result<ResolvedOperand<u32>, Error> {
+        let value = self
+            .resolve_operand::<RawVal>(operand)?
+            .filter_map(|value| match index_ty {
+                IndexType::I32 => Some(u32::from(value)),
+                IndexType::I64 => u32::try_from(u64::from(value)).ok(),
+            });
+        let Some(value) = value else {
+            return self
+                .copy_immediate_to_slot(operand)
+                .map(ResolvedOperand::from);
+        };
+        Ok(value)
+    }
+
+    /// Convenience method to tell that there is no custom optimization.
+    fn no_opt_ri(&mut self, _lhs: Operand, _rhs: TypedRawVal) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Convenience method forwarding to [`Operand::resolve`].
+    fn resolve_operand<T>(&self, operand: Operand) -> Result<ResolvedOperand<T>, Error>
+    where
+        T: From<TypedRawVal>,
+    {
+        operand.resolve_as::<T>(&self.layout)
+    }
+
+    /// Resolves the [`Operand`] into a [`ResolvedOperand<u64>`].
+    ///
+    /// See [`Self::resolve_operand`] for rational.
+    fn resolve_operand_as_index(
+        &self,
+        operand: Operand,
+        memory: ir::MemoryAddr,
+    ) -> Result<ResolvedOperand<u64>, Error> {
+        let memidx: MemoryIdx = u32::from(memory).into();
+        let operand = match self.module.get_type_of_memory(memidx).index_ty() {
+            IndexType::I32 => self.resolve_operand::<u32>(operand)?.map(u64::from),
+            IndexType::I64 => self.resolve_operand::<u64>(operand)?,
+        };
+        Ok(operand)
+    }
+
+    /// Issues a panic message for cases where an invalid operand pair was encountered.
+    #[cold]
+    #[inline]
+    #[track_caller]
+    fn unsupported_operand_pair(lhs: impl AsRef<Operand>, rhs: impl AsRef<Operand>) -> ! {
+        #[inline(never)]
+        #[track_caller]
+        fn impl_(lhs: &Operand, rhs: &Operand) -> ! {
+            unreachable!("unsupported operator pair:\n\t- lhs = {lhs:?}\n\t- rhs = {rhs:?}")
+        }
+        let lhs = lhs.as_ref();
+        let rhs = rhs.as_ref();
+        impl_(lhs, rhs)
+    }
+
+    /// Converts the `operand` into a [`Slot`] if possible.
+    ///
+    /// # Note
+    ///
+    /// This method shall be used if `lhs = rhs = register` is encountered to resolve
+    /// `lhs` or `rhs` to `Slot` in order to encode a fallback operator in case the
+    /// base operation does not provide one for this particular variant.
+    fn reg_operand_to_slot(&self, operand: Operand) -> Result<Slot, Error> {
+        let slot = match operand {
+            Operand::Local(operand) => {
+                debug_assert!(operand.in_reg());
+                self.layout.local_to_slot(operand.local_index())?
+            }
+            _ => unreachable!(),
+        };
+        Ok(slot)
+    }
+
+    /// Translates a non-commutative binary Wasm operator to Wasmi bytecode.
+    fn translate_binary_commutative<T: CommutativeBinaryOp>(&mut self) -> Result<(), Error> {
+        self.translate_binary_commutative_with_opt::<T>(Self::no_opt_ri)
+    }
+
+    /// Translates a commutative binary Wasm operator to Wasmi bytecode.
+    fn translate_binary_commutative_with_opt<T: CommutativeBinaryOp>(
+        &mut self,
+        opt_rhs_imm: fn(this: &mut Self, lhs: Operand, rhs: TypedRawVal) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        self.translate_binary_commutative_vt(&T::VT, opt_rhs_imm)
+    }
+
+    /// Translates a commutative binary Wasm operator to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// All types implementing [`CommutativeBinaryOp`] share this single
+    /// monomorphization via their [`CommutativeBinaryOp::VT`] virtual table
+    /// to avoid codegen bloat.
+    #[cfg_attr(wasmi_opt_size, inline(never))]
+    #[cfg_attr(wasmi_opt_speed, inline(always))]
+    fn translate_binary_commutative_vt(
+        &mut self,
+        vt: &CommutativeBinaryOpVt,
+        opt_rhs_imm: fn(this: &mut Self, lhs: Operand, rhs: TypedRawVal) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (lhs, rhs) = self.stack.pop2();
+        let l = self.resolve_operand::<TypedRawVal>(lhs)?;
+        let r = self.resolve_operand::<TypedRawVal>(rhs)?;
+        if let (ResolvedOperand::Immediate(lhs), ResolvedOperand::Immediate(rhs)) = (l, r) {
+            return self.translate_binary_consteval(lhs, rhs, vt.consteval);
+        }
+        let (l, r) = ResolvedOperand::sort(l, r);
+        if let (_, ResolvedOperand::Immediate(rhs)) = (l, r) {
+            if opt_rhs_imm(self, lhs, rhs)? {
+                return Ok(());
+            }
+        }
+        let operator = match (l, r) {
+            (ResolvedOperand::Reg(_), ResolvedOperand::Reg(_)) => match (vt.op_rrr)() {
+                Some(op) => op,
+                None => {
+                    let rhs_slot = self.reg_operand_to_slot(rhs)?;
+                    (vt.op_rrs)(rhs_slot)
+                }
+            },
+            (ResolvedOperand::Reg(_), ResolvedOperand::Slot(rhs)) => (vt.op_rrs)(rhs),
+            (ResolvedOperand::Reg(_), ResolvedOperand::Immediate(rhs)) => (vt.op_rri)(rhs),
+            (ResolvedOperand::Slot(lhs), ResolvedOperand::Slot(rhs)) => (vt.op_rss)(lhs, rhs),
+            (ResolvedOperand::Slot(lhs), ResolvedOperand::Immediate(rhs)) => (vt.op_rsi)(lhs, rhs),
+            _ => Self::unsupported_operand_pair(lhs, rhs),
+        };
+        self.stage_op_with_result_reg(vt.result_ty, operator)?;
+        Ok(())
+    }
+
+    /// Translates a non-commutative binary Wasm operator to Wasmi bytecode.
+    fn translate_binary<T: BinaryOp>(&mut self) -> Result<(), Error> {
+        self.translate_binary_with_opt::<T>(Self::no_opt_ri)
+    }
+
+    /// Translates a non-commutative binary Wasm operator to Wasmi bytecode.
+    fn translate_binary_with_opt<T: BinaryOp>(
+        &mut self,
+        opt_rhs_imm: fn(this: &mut Self, lhs: Operand, rhs: TypedRawVal) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        self.translate_binary_vt(&T::VT, opt_rhs_imm)
+    }
+
+    /// Translates a non-commutative binary Wasm operator to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// All types implementing [`BinaryOp`] share this single monomorphization
+    /// via their [`BinaryOp::VT`] virtual table to avoid codegen bloat.
+    #[cfg_attr(wasmi_opt_size, inline(never))]
+    #[cfg_attr(wasmi_opt_speed, inline(always))]
+    fn translate_binary_vt(
+        &mut self,
+        vt: &BinaryOpVt,
+        opt_rhs_imm: fn(this: &mut Self, lhs: Operand, rhs: TypedRawVal) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (lhs, rhs) = self.stack.pop2();
+        let l = self.resolve_operand::<TypedRawVal>(lhs)?;
+        let r = self.resolve_operand::<TypedRawVal>(rhs)?;
+        let r = match r {
+            ResolvedOperand::Reg(ty) => ResolvedOperand::Reg(ty),
+            ResolvedOperand::Slot(rhs) => ResolvedOperand::Slot(rhs),
+            ResolvedOperand::Immediate(rhs) => match (vt.decode_rhs)(rhs) {
+                BinaryOpRhs::Value(rhs) => ResolvedOperand::Immediate(rhs),
+                BinaryOpRhs::Trap(trap_code) => return self.translate_trap(trap_code),
+                BinaryOpRhs::ReturnLhs => {
+                    self.stack.push_operand(lhs)?;
+                    return Ok(());
+                }
+            },
+        };
+        if let (ResolvedOperand::Immediate(lhs), ResolvedOperand::Immediate(rhs)) = (l, r) {
+            return self.translate_binary_consteval(lhs, rhs, vt.consteval);
+        }
+        if let (_, ResolvedOperand::Immediate(rhs)) = (l, r) {
+            if opt_rhs_imm(self, lhs, rhs)? {
+                return Ok(());
+            }
+        }
+        let operator = match (l, r) {
+            (ResolvedOperand::Reg(_), ResolvedOperand::Reg(_)) => match (vt.op_rrr)() {
+                Some(op) => op,
+                None => {
+                    let rhs_slot = self.reg_operand_to_slot(rhs)?;
+                    (vt.op_rrs)(rhs_slot)
+                }
+            },
+            (ResolvedOperand::Reg(_), ResolvedOperand::Slot(rhs)) => (vt.op_rrs)(rhs),
+            (ResolvedOperand::Reg(_), ResolvedOperand::Immediate(rhs)) => (vt.op_rri)(rhs),
+            (ResolvedOperand::Slot(lhs), ResolvedOperand::Reg(_)) => (vt.op_rsr)(lhs),
+            (ResolvedOperand::Slot(lhs), ResolvedOperand::Slot(rhs)) => (vt.op_rss)(lhs, rhs),
+            (ResolvedOperand::Slot(lhs), ResolvedOperand::Immediate(rhs)) => (vt.op_rsi)(lhs, rhs),
+            (ResolvedOperand::Immediate(lhs), ResolvedOperand::Reg(_)) => (vt.op_rir)(lhs),
+            (ResolvedOperand::Immediate(lhs), ResolvedOperand::Slot(rhs)) => (vt.op_ris)(lhs, rhs),
+            _ => Self::unsupported_operand_pair(lhs, rhs),
+        };
+        self.stage_op_with_result_reg(vt.result_ty, operator)?;
+        Ok(())
+    }
+
+    /// Evaluates `consteval(lhs, rhs)` and pushed either its result or tranlates a `trap`.
+    fn translate_binary_consteval(
+        &mut self,
+        lhs: TypedRawVal,
+        rhs: TypedRawVal,
+        consteval: fn(TypedRawVal, TypedRawVal) -> Result<TypedRawVal, TrapCode>,
+    ) -> Result<(), Error> {
+        match consteval(lhs, rhs) {
+            Ok(value) => {
+                self.stack.push_immediate(value)?;
+            }
+            Err(trap) => {
+                self.translate_trap(trap)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Translates a generic trap instruction.
+    fn translate_trap(&mut self, trap: TrapCode) -> Result<(), Error> {
+        self.push_instr(Op::trap(trap))?;
+        self.reachable = false;
+        Ok(())
+    }
+
+    /// Translates a Wasm `select` or `select <ty>` instruction.
+    ///
+    /// # Note
+    ///
+    /// - This applies constant propagation in case `condition` is a constant value.
+    /// - If both `lhs` and `rhs` are equal registers or constant values `lhs` is forwarded.
+    /// - Fuses compare instructions with the associated select instructions if possible.
+    fn translate_select(&mut self, type_hint: Option<ValType>) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (mut true_val, mut false_val, condition) = self.stack.pop3();
+        debug_assert_eq!(condition.ty(), ValType::I32);
+        if let Some(type_hint) = type_hint {
+            debug_assert_eq!(true_val.ty(), type_hint);
+            debug_assert_eq!(false_val.ty(), type_hint);
+        }
+        if true_val.is_same(&false_val) {
+            // Optimization: both `lhs` and `rhs` either are the same register or constant values and
+            //               thus `select` will always yield this same value irrespective of the condition.
+            self.stack.push_operand(true_val)?;
+            return Ok(());
+        }
+        let ty = true_val.ty();
+        let condition = self.resolve_operand::<i32>(condition)?;
+        let condition = match condition {
+            ResolvedOperand::Reg(ty) => Location::Reg(ty),
+            ResolvedOperand::Slot(condition) => Location::Slot(condition),
+            ResolvedOperand::Immediate(condition) => {
+                let selected = match condition != 0 {
+                    true => true_val,
+                    false => false_val,
+                };
+                match ty {
+                    #[cfg(feature = "simd")]
+                    ValType::V128 => {
+                        // Note: this is a special case where we have to copy the `v128`
+                        //       value that spans across 2 slots into the result slots of
+                        //       the `select` operator.
+                        let selected = self.resolve_operand::<V128>(selected)?;
+                        self.try_push_op_with_result_slot(ty, |result| match selected {
+                            ResolvedOperand::Reg(_) => unreachable!(),
+                            ResolvedOperand::Slot(value) => {
+                                Self::select_copy_ss_op(result, value, ty)
+                            }
+                            ResolvedOperand::Immediate(value) => {
+                                Some(Self::select_copy_si_op(result, value.into()))
+                            }
+                        })?;
+                        return Ok(());
+                    }
+                    _ => self.copy_operand_to_reg(selected)?,
+                }
+                return Ok(());
+            }
+        };
+        let fusion = self.try_fuse_select(condition)?;
+        if fusion.is_fused() {
+            self.instrs.drop_staged();
+            if matches!(fusion, SelectFusion::FusedSwap) {
+                mem::swap(&mut true_val, &mut false_val);
+            }
+        }
+        let operator = match ty {
+            ValType::I32 | ValType::FuncRef | ValType::ExternRef => {
+                self.i32_select_operator(condition, true_val, false_val)?
+            }
+            ValType::I64 => self.i64_select_operator(condition, true_val, false_val)?,
+            ValType::F32 => self.f32_select_operator(condition, true_val, false_val)?,
+            ValType::F64 => self.f64_select_operator(condition, true_val, false_val)?,
+            #[cfg(feature = "simd")]
+            ValType::V128 => return self.encode_v128_select(condition, true_val, false_val),
+            #[cfg(not(feature = "simd"))]
+            ValType::V128 => unreachable!("v128 simd is not enabled"),
+        };
+        self.stage_op_with_result_reg(ty, operator)?;
+        Ok(())
+    }
+
+    fn i32_select_operator(
+        &mut self,
+        condition: Location,
+        true_val: Operand,
+        false_val: Operand,
+    ) -> Result<Op, Error> {
+        use Location as Loc;
+        use ResolvedOperand as Opd;
+        debug_assert!(matches!(
+            true_val.ty(),
+            ValType::I32 | ValType::ExternRef | ValType::FuncRef
+        ));
+        debug_assert!(matches!(
+            false_val.ty(),
+            ValType::I32 | ValType::ExternRef | ValType::FuncRef
+        ));
+        let true_val = self.resolve_operand::<RawVal>(true_val)?.map(u32::from);
+        let false_val = self.resolve_operand::<RawVal>(false_val)?.map(u32::from);
+        let operator = match (condition, true_val, false_val) {
+            (Loc::Reg(_), Opd::Reg(_), Opd::Slot(f)) => Op::u64_select_rrrs(f),
+            (Loc::Reg(_), Opd::Reg(_), Opd::Immediate(f)) => Op::u32_select_rrri(f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Reg(_)) => Op::u64_select_rrsr(t),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Reg(_)) => Op::u32_select_rrir(t),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Slot(f)) => Op::u64_select_rrss(t, f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Immediate(f)) => Op::u32_select_rrsi(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Slot(f)) => Op::u32_select_rris(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Immediate(f)) => Op::u32_select_rrii(t, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Slot(f)) => Op::u64_select_rsrs(c, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Immediate(f)) => Op::u32_select_rsri(c, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Reg(_)) => Op::u64_select_rssr(c, t),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Slot(f)) => Op::u64_select_rsss(c, t, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Immediate(f)) => Op::u32_select_rssi(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Reg(_)) => Op::u32_select_rsir(c, t),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Slot(f)) => Op::u32_select_rsis(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Immediate(f)) => Op::u32_select_rsii(c, t, f),
+            _ => unreachable!(),
+        };
+        Ok(operator)
+    }
+
+    fn i64_select_operator(
+        &mut self,
+        condition: Location,
+        true_val: Operand,
+        false_val: Operand,
+    ) -> Result<Op, Error> {
+        use Location as Loc;
+        use ResolvedOperand as Opd;
+        let true_val = self.resolve_operand::<u64>(true_val)?;
+        let false_val = self.resolve_operand::<u64>(false_val)?;
+        let operator = match (condition, true_val, false_val) {
+            (Loc::Reg(_), Opd::Reg(_), Opd::Slot(f)) => Op::u64_select_rrrs(f),
+            (Loc::Reg(_), Opd::Reg(_), Opd::Immediate(f)) => Op::u64_select_rrri(f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Reg(_)) => Op::u64_select_rrsr(t),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Reg(_)) => Op::u64_select_rrir(t),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Slot(f)) => Op::u64_select_rrss(t, f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Immediate(f)) => Op::u64_select_rrsi(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Slot(f)) => Op::u64_select_rris(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Immediate(f)) => Op::u64_select_rrii(t, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Slot(f)) => Op::u64_select_rsrs(c, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Immediate(f)) => Op::u64_select_rsri(c, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Reg(_)) => Op::u64_select_rssr(c, t),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Slot(f)) => Op::u64_select_rsss(c, t, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Immediate(f)) => Op::u64_select_rssi(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Reg(_)) => Op::u64_select_rsir(c, t),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Slot(f)) => Op::u64_select_rsis(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Immediate(f)) => Op::u64_select_rsii(c, t, f),
+            _ => unreachable!(),
+        };
+        Ok(operator)
+    }
+
+    fn f32_select_operator(
+        &mut self,
+        condition: Location,
+        true_val: Operand,
+        false_val: Operand,
+    ) -> Result<Op, Error> {
+        use Location as Loc;
+        use ResolvedOperand as Opd;
+        let true_val = self.resolve_operand::<f32>(true_val)?;
+        let false_val = self.resolve_operand::<f32>(false_val)?;
+        let operator = match (condition, true_val, false_val) {
+            (Loc::Reg(_), Opd::Reg(_), Opd::Slot(f)) => Op::f32_select_rrrs(f),
+            (Loc::Reg(_), Opd::Reg(_), Opd::Immediate(f)) => Op::f32_select_rrri(f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Reg(_)) => Op::f32_select_rrsr(t),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Reg(_)) => Op::f32_select_rrir(t),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Slot(f)) => Op::f32_select_rrss(t, f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Immediate(f)) => Op::f32_select_rrsi(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Slot(f)) => Op::f32_select_rris(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Immediate(f)) => Op::f32_select_rrii(t, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Slot(f)) => Op::f32_select_rsrs(c, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Immediate(f)) => Op::f32_select_rsri(c, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Reg(_)) => Op::f32_select_rssr(c, t),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Slot(f)) => Op::f32_select_rsss(c, t, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Immediate(f)) => Op::f32_select_rssi(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Reg(_)) => Op::f32_select_rsir(c, t),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Slot(f)) => Op::f32_select_rsis(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Immediate(f)) => Op::f32_select_rsii(c, t, f),
+            _ => unreachable!(),
+        };
+        Ok(operator)
+    }
+
+    fn f64_select_operator(
+        &mut self,
+        condition: Location,
+        true_val: Operand,
+        false_val: Operand,
+    ) -> Result<Op, Error> {
+        use Location as Loc;
+        use ResolvedOperand as Opd;
+        let true_val = self.resolve_operand::<f64>(true_val)?;
+        let false_val = self.resolve_operand::<f64>(false_val)?;
+        let operator = match (condition, true_val, false_val) {
+            (Loc::Reg(_), Opd::Reg(_), Opd::Slot(f)) => Op::f64_select_rrrs(f),
+            (Loc::Reg(_), Opd::Reg(_), Opd::Immediate(f)) => Op::f64_select_rrri(f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Reg(_)) => Op::f64_select_rrsr(t),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Reg(_)) => Op::f64_select_rrir(t),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Slot(f)) => Op::f64_select_rrss(t, f),
+            (Loc::Reg(_), Opd::Slot(t), Opd::Immediate(f)) => Op::f64_select_rrsi(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Slot(f)) => Op::f64_select_rris(t, f),
+            (Loc::Reg(_), Opd::Immediate(t), Opd::Immediate(f)) => Op::f64_select_rrii(t, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Slot(f)) => Op::f64_select_rsrs(c, f),
+            (Loc::Slot(c), Opd::Reg(_), Opd::Immediate(f)) => Op::f64_select_rsri(c, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Reg(_)) => Op::f64_select_rssr(c, t),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Slot(f)) => Op::f64_select_rsss(c, t, f),
+            (Loc::Slot(c), Opd::Slot(t), Opd::Immediate(f)) => Op::f64_select_rssi(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Reg(_)) => Op::f64_select_rsir(c, t),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Slot(f)) => Op::f64_select_rsis(c, t, f),
+            (Loc::Slot(c), Opd::Immediate(t), Opd::Immediate(f)) => Op::f64_select_rsii(c, t, f),
+            _ => unreachable!(),
+        };
+        Ok(operator)
+    }
+
+    #[cfg(feature = "simd")]
+    fn encode_v128_select(
+        &mut self,
+        condition: Location,
+        true_val: Operand,
+        false_val: Operand,
+    ) -> Result<(), Error> {
+        let true_val = self.copy_operand_to_slot(true_val)?;
+        let false_val = self.copy_operand_to_slot(false_val)?;
+        self.push_op_with_result_slot(ValType::V128, |result| match condition {
+            Location::Reg(_) => Op::v128_select_srss(result, true_val, false_val),
+            Location::Slot(condition) => {
+                Op::v128_select_ssss(result, condition, true_val, false_val)
+            }
+        })?;
+        Ok(())
+    }
+}
+
+#[derive(Copy, Clone)]
+enum SelectFusion {
+    None,
+    Fused,
+    FusedSwap,
+}
+
+impl SelectFusion {
+    pub fn is_fused(self) -> bool {
+        matches!(self, Self::Fused | Self::FusedSwap)
+    }
+}
+
+impl FuncTranslator {
+    /// Tries to lower a staged `f32.abs` and a `f32.neg` operator into a `f32.nabs` operator.
+    ///
+    /// Returns `true` if lowering was successful.
+    fn try_lower_f32_abs_neg(&mut self, value: Operand) -> Result<bool, Error> {
+        let Some(staged_op) = self.instrs.peek_staged() else {
+            // Case: no staged `Op` to lower
+            return Ok(false);
+        };
+        let val = self.resolve_operand::<f32>(value)?;
+        if !matches!(val, ResolvedOperand::Reg(ValType::F32)) {
+            // Case: input/output does not match with staged `Op`
+            return Ok(false);
+        }
+        let lowered_op = match staged_op {
+            Op::F32Abs_Rr { .. } => Op::f32_nabs_rr(),
+            Op::F32Abs_Rs { value, .. } => Op::f32_nabs_rs(value),
+            _ => return Ok(false),
+        };
+        self.instrs.replace_staged(lowered_op)?;
+        Ok(true)
+    }
+
+    /// Tries to lower a staged `f64.abs` and a `f64.neg` operator into a `f64.nabs` operator.
+    ///
+    /// Returns `true` if lowering was successful.
+    fn try_lower_f64_abs_neg(&mut self, value: Operand) -> Result<bool, Error> {
+        let Some(staged_op) = self.instrs.peek_staged() else {
+            // Case: no staged `Op` to lower
+            return Ok(false);
+        };
+        let val = self.resolve_operand::<f64>(value)?;
+        if !matches!(val, ResolvedOperand::Reg(ValType::F64)) {
+            // Case: input/output does not match with staged `Op`
+            return Ok(false);
+        }
+        let lowered_op = match staged_op {
+            Op::F64Abs_Rr { .. } => Op::f64_nabs_rr(),
+            Op::F64Abs_Rs { value, .. } => Op::f64_nabs_rs(value),
+            _ => return Ok(false),
+        };
+        self.instrs.replace_staged(lowered_op)?;
+        Ok(true)
+    }
+
+    /// Tries to fuse a compare instruction with a Wasm `select` instruction.
+    ///
+    /// # Returns
+    ///
+    /// - Returns [`SelectFusion::Fused`] or [`SelectFusion::FusedSwap`] if fusion was successful.
+    ///     - If [`SelectFusion::FusedSwap`] was returned, true and false operands need to be swapped.
+    /// - Returns [`SelectFusion::None`] if fusion could not be applied.
+    fn try_fuse_select(&self, condition: Location) -> Result<SelectFusion, Error> {
+        let Some(staged) = self.instrs.peek_staged() else {
+            // If there is no last instruction there is no comparison instruction to negate.
+            return Ok(SelectFusion::None);
+        };
+        let Some(staged_result) = staged.result_loc() else {
+            // All negatable instructions have a single result register.
+            return Ok(SelectFusion::None);
+        };
+        if let ir::Location::Slot(result_slot) = staged_result {
+            if matches!(self.layout.stack_space(result_slot), StackSpace::Local) {
+                // The staged operator stores its result into a local variable which
+                // is an observable side effect that must not be fused.
+                return Ok(SelectFusion::None);
+            }
+        }
+        match (staged_result, condition) {
+            (ir::Location::Reg(ValType::I64), Location::Reg(_)) => {}
+            (ir::Location::Slot(staged), Location::Slot(condition)) if staged == condition => {}
+            _ => return Ok(SelectFusion::None),
+        }
+        #[rustfmt::skip]
+        let fusion = match staged {
+            | Op::I32Eq_Rri { rhs: 0, .. }
+            | Op::I32Eq_Rsi { rhs: 0, .. } => SelectFusion::FusedSwap,
+            | Op::I32NotEq_Rri { rhs: 0, .. }
+            | Op::I32NotEq_Rsi { rhs: 0, .. } => SelectFusion::Fused,
+            | _ => SelectFusion::None,
+        };
+        Ok(fusion)
+    }
+
+    /// Tries to fuse a Wasm `i32.eqz` (or `i32.eq` with 0 `rhs` value) instruction.
+    ///
+    /// Returns
+    ///
+    /// - `Ok(true)` if the intruction fusion was successful.
+    /// - `Ok(false)` if instruction fusion could not be applied.
+    /// - `Err(_)` if an error occurred.
+    pub fn fuse_eqz(&mut self, lhs: Operand, rhs: TypedRawVal) -> Result<bool, Error> {
+        self.fuse_commutative_cmp_with(lhs, rhs, NegateCmpInstr::negate_cmp_instr)
+    }
+
+    /// Tries to fuse a Wasm `i32.ne` instruction with 0 `rhs` value.
+    ///
+    /// Returns
+    ///
+    /// - `Ok(true)` if the intruction fusion was successful.
+    /// - `Ok(false)` if instruction fusion could not be applied.
+    /// - `Err(_)` if an error occurred.
+    pub fn fuse_nez(&mut self, lhs: Operand, rhs: TypedRawVal) -> Result<bool, Error> {
+        self.fuse_commutative_cmp_with(lhs, rhs, LogicalizeCmpInstr::logicalize_cmp_instr)
+    }
+
+    /// Tries to fuse a `i{32,64}`.{eq,ne}` instruction with `rhs` of zero.
+    ///
+    /// Generically applies `f` onto the fused last instruction.
+    ///
+    /// Returns
+    ///
+    /// - `Ok(true)` if the intruction fusion was successful.
+    /// - `Ok(false)` if instruction fusion could not be applied.
+    /// - `Err(_)` if an error occurred.
+    fn fuse_commutative_cmp_with(
+        &mut self,
+        lhs: Operand,
+        rhs: TypedRawVal,
+        try_fuse: fn(cmp: &Op) -> Option<Op>,
+    ) -> Result<bool, Error> {
+        let is_zero = match rhs.ty() {
+            ValType::I32 => i32::from(rhs).is_zero(),
+            ValType::I64 => i64::from(rhs).is_zero(),
+            _ => false,
+        };
+        if !is_zero {
+            // Case: cannot fuse with non-zero `rhs`
+            return Ok(false);
+        }
+        let Some(staged) = self.instrs.peek_staged() else {
+            // Case: cannot fuse without registered last instruction
+            return Ok(false);
+        };
+        let ResolvedOperand::Reg(_ty) = lhs.resolve(&self.layout)? else {
+            // Case: cannot fuse non-register operands
+            //  - locals have observable behavior.
+            //  - immediates cannot be the result of a previous instruction.
+            return Ok(false);
+        };
+        if !matches!(staged.result_loc(), Some(ir::Location::Reg(_))) {
+            // Case: staged operator has no result register.
+            return Ok(false);
+        }
+        let Some(negated) = try_fuse(&staged) else {
+            // Case: the `cmp` instruction cannot be negated
+            return Ok(false);
+        };
+        // Need to push back `lhs` but with its type adjusted to be `i32`
+        // since that's the return type of `i{32,64}.{eqz,eq,ne}`.
+        self.stack.push_temp(ValType::I32, Allocation::Reg)?;
+        self.instrs.replace_staged(negated)?;
+        Ok(true)
+    }
+
+    /// Translates a Wasm `load` instruction to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// This chooses the right encoding for the given `load` instruction.
+    /// If `ptr+offset` is a constant value the address is pre-calculated.
+    ///
+    /// # Usage
+    ///
+    /// Used for translating the following Wasm operators to Wasmi bytecode:
+    ///
+    /// - `{i32, i64, f32, f64}.load`
+    /// - `i32.{load8_s, load8_u, load16_s, load16_u}`
+    /// - `i64.{load8_s, load8_u, load16_s, load16_u load32_s, load32_u}`
+    fn translate_load<T: op::LoadOp>(&mut self, memarg: MemArg) -> Result<(), Error> {
+        self.translate_load_vt(&T::VT, memarg)
+    }
+
+    /// Translates a Wasm `load` instruction to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// All [`LoadOp`]s share the single monomorphization of this method
+    /// via their [`LoadOp::VT`] virtual table to avoid codegen bloat.
+    ///
+    /// [`LoadOp`]: op::LoadOp
+    /// [`LoadOp::VT`]: op::LoadOp::VT
+    #[cfg_attr(wasmi_opt_size, inline(never))]
+    #[cfg_attr(wasmi_opt_speed, inline(always))]
+    fn translate_load_vt(&mut self, vt: &LoadOpVt, memarg: MemArg) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let ptr = self.stack.pop();
+        match self.select_load_op_vt(vt, ptr, memarg)? {
+            Op::Trap { trap_code } => self.translate_trap(trap_code),
+            op => self.stage_op_with_result_reg(vt.result_ty, op),
+        }
+    }
+
+    /// Returns a Wasmi `load` operator for `memarg` and `ptr` if any.
+    ///
+    /// Returns [`Op::Trap`] if `ptr` is known to be out of bounds for the linear memory.
+    ///
+    /// # Note
+    ///
+    /// This chooses the right encoding for the given `load` instruction.
+    /// If `ptr+offset` is a constant value the address is pre-calculated.
+    #[cfg(feature = "simd")]
+    fn select_load_op<T: op::LoadOp>(&mut self, ptr: Operand, memarg: MemArg) -> Result<Op, Error> {
+        self.select_load_op_vt(&T::VT, ptr, memarg)
+    }
+
+    /// Returns a Wasmi `load` operator for `memarg` and `ptr` if any.
+    ///
+    /// Returns [`Op::Trap`] if `ptr` is known to be out of bounds for the linear memory.
+    ///
+    /// # Note
+    ///
+    /// This chooses the right encoding for the given `load` instruction.
+    /// If `ptr+offset` is a constant value the address is pre-calculated.
+    #[cfg_attr(wasmi_opt_speed, inline(always))]
+    fn select_load_op_vt(
+        &mut self,
+        vt: &LoadOpVt,
+        ptr: Operand,
+        memarg: MemArg,
+    ) -> Result<Op, Error> {
+        let Some((memory, offset)) = Self::decode_memarg(memarg)? else {
+            return Ok(Op::trap(TrapCode::MemoryOutOfBounds));
+        };
+        let ptr = self.resolve_operand_as_index(ptr, memory)?;
+        'opt: {
+            // Try to encode an optimized load operator if possible, otherwise fallback.
+            if !self.is_default_memory(memory) {
+                break 'opt;
+            }
+            let offset = match Offset16::new(offset) {
+                Some(offset) => offset,
+                None => break 'opt,
+            };
+            let op = match ptr {
+                ResolvedOperand::Reg(_) => (vt.op_rr_mem0_offset16)(offset),
+                ResolvedOperand::Slot(ptr) => (vt.op_rs_mem0_offset16)(ptr, offset),
+                ResolvedOperand::Immediate(_) => break 'opt,
+            };
+            return Ok(op);
+        }
+        // We need to encode a non-optimized fallback load operator.
+        let Some(ptr) = ptr.filter_map(|ptr| self.effective_address(memory, ptr, offset)) else {
+            return Ok(Op::trap(TrapCode::MemoryOutOfBounds));
+        };
+        let memory_addr = self.memory_addr(memarg.memory)?;
+        let op = match ptr {
+            ResolvedOperand::Reg(_) => (vt.op_rr)(offset, memory_addr),
+            ResolvedOperand::Slot(ptr) => (vt.op_rs)(ptr, offset, memory_addr),
+            ResolvedOperand::Immediate(address) => (vt.op_ri)(address, memory_addr),
+        };
+        Ok(op)
+    }
+
+    /// Translates Wasm integer `store` and `storeN` instructions to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// This chooses the most efficient encoding for the given `store` instruction.
+    /// If `ptr+offset` is a constant value the pointer address is pre-calculated.
+    ///
+    /// # Usage
+    ///
+    /// Used for translating the following Wasm operators to Wasmi bytecode:
+    ///
+    /// - `{i32, i64}.{store, store8, store16, store32}`
+    fn translate_store<T: op::StoreOp>(&mut self, memarg: MemArg) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (ptr, value) = self.stack.pop2();
+        self.encode_store::<T>(memarg, ptr, value)
+    }
+
+    fn encode_store<T: op::StoreOp>(
+        &mut self,
+        memarg: MemArg,
+        ptr: Operand,
+        value: Operand,
+    ) -> Result<(), Error> {
+        self.encode_store_vt(&T::VT, memarg, ptr, value)
+    }
+
+    /// Encodes a Wasm `store` instruction as Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// All types implementing [`StoreOp`] share this single monomorphization
+    /// via their [`StoreOp::VT`] virtual table to avoid codegen bloat.
+    ///
+    /// [`StoreOp`]: op::StoreOp
+    /// [`StoreOp::VT`]: op::StoreOp::VT
+    #[cfg_attr(wasmi_opt_size, inline(never))]
+    #[cfg_attr(wasmi_opt_speed, inline(always))]
+    fn encode_store_vt(
+        &mut self,
+        vt: &StoreOpVt,
+        memarg: MemArg,
+        ptr: Operand,
+        value: Operand,
+    ) -> Result<(), Error> {
+        let op = self.choose_store_op_vt(vt, memarg, ptr, value)?;
+        if let Op::Trap { trap_code } = op {
+            return self.translate_trap(trap_code);
+        }
+        self.push_instr(op)?;
+        Ok(())
+    }
+
+    /// Selects which store operator to encode based on the given `vt`.
+    #[cfg_attr(wasmi_opt_speed, inline(always))]
+    fn choose_store_op_vt(
+        &mut self,
+        vt: &StoreOpVt,
+        memarg: MemArg,
+        ptr: Operand,
+        value: Operand,
+    ) -> Result<Op, Error> {
+        use ResolvedOperand as Opd;
+        let Some((memory, offset)) = Self::decode_memarg(memarg)? else {
+            return Ok(Op::trap(TrapCode::MemoryOutOfBounds));
+        };
+        let Some(ptr) = self
+            .resolve_operand_as_index(ptr, memory)?
+            .map(|ptr| self.effective_address(memory, ptr, offset))
+            .transpose()
+        else {
+            return Ok(Op::trap(TrapCode::MemoryOutOfBounds));
+        };
+        if let Some(op) = self.choose_store_mem0_offset16_op_vt(vt, ptr, offset, memory, value)? {
+            return Ok(op);
+        }
+        let memory_addr = self.memory_addr(memarg.memory)?;
+        let value = self.resolve_operand::<TypedRawVal>(value)?;
+        let op = match (ptr, value) {
+            (Opd::Reg(_), Opd::Reg(_)) => match (vt.store_rr)(offset, memory_addr) {
+                Some(op) => op,
+                None => unreachable!(),
+            },
+            (Opd::Reg(_), Opd::Slot(value)) => (vt.store_rs)(offset, value, memory_addr),
+            (Opd::Reg(_), Opd::Immediate(value)) => (vt.store_ri)(offset, value, memory_addr),
+            (Opd::Slot(ptr), Opd::Reg(_)) => (vt.store_sr)(ptr, offset, memory_addr),
+            (Opd::Slot(ptr), Opd::Slot(value)) => (vt.store_ss)(ptr, offset, value, memory_addr),
+            (Opd::Slot(ptr), Opd::Immediate(value)) => {
+                (vt.store_si)(ptr, offset, value, memory_addr)
+            }
+            (Opd::Immediate(address), Opd::Reg(_)) => (vt.store_ir)(address, memory_addr),
+            (Opd::Immediate(address), Opd::Slot(value)) => {
+                (vt.store_is)(address, value, memory_addr)
+            }
+            (Opd::Immediate(address), Opd::Immediate(value)) => {
+                (vt.store_ii)(address, value, memory_addr)
+            }
+        };
+        Ok(op)
+    }
+
+    /// Selects a Wasm store operator with `(mem 0)` and 16-bit encodable `offset` to Wasmi bytecode.
+    ///
+    /// # Note
+    ///
+    /// - Returns `Ok(true)` if encoding is available.
+    /// - Returns `Ok(false)` if encoding is not available.
+    /// - Returns `Err(_)` if an error occurred.
+    fn choose_store_mem0_offset16_op_vt(
+        &mut self,
+        vt: &StoreOpVt,
+        ptr: ResolvedOperand<Address>,
+        offset: Offset,
+        memory: ir::MemoryAddr,
+        value: Operand,
+    ) -> Result<Option<Op>, Error> {
+        use Location as Loc;
+        use ResolvedOperand as Opd;
+        if !self.is_default_memory(memory) {
+            return Ok(None);
+        }
+        let Some(offset) = Offset16::new(offset) else {
+            return Ok(None);
+        };
+        let ptr = match ptr {
+            Opd::Reg(ty) => Loc::Reg(ty),
+            Opd::Slot(ptr) => Loc::Slot(ptr),
+            Opd::Immediate(_) => return Ok(None),
+        };
+        let resolved_value = self.resolve_operand::<TypedRawVal>(value)?;
+        let op = match (ptr, resolved_value) {
+            (Loc::Reg(_), Opd::Reg(_)) => match (vt.store_mem0_offset16_rr)(offset) {
+                Some(op) => op,
+                None => {
+                    let value = self.reg_operand_to_slot(value)?;
+                    (vt.store_mem0_offset16_rs)(offset, value)
+                }
+            },
+            (Loc::Reg(_), Opd::Slot(value)) => (vt.store_mem0_offset16_rs)(offset, value),
+            (Loc::Reg(_), Opd::Immediate(value)) => (vt.store_mem0_offset16_ri)(offset, value),
+            (Loc::Slot(ptr), Opd::Reg(_)) => (vt.store_mem0_offset16_sr)(ptr, offset),
+            (Loc::Slot(ptr), Opd::Slot(value)) => (vt.store_mem0_offset16_ss)(ptr, offset, value),
+            (Loc::Slot(ptr), Opd::Immediate(value)) => {
+                (vt.store_mem0_offset16_si)(ptr, offset, value)
+            }
+        };
+        Ok(Some(op))
+    }
+
+    /// Returns the [`MemArg`] linear `memory` index and load/store `offset`.
+    ///
+    /// # Panics
+    ///
+    /// If the [`MemArg`] offset is not 32-bit.
+    fn decode_memarg(memarg: MemArg) -> Result<Option<(ir::MemoryAddr, Offset)>, Error> {
+        let memory = ir::MemoryAddr::try_from(memarg.memory)?;
+        let Some(offset) = Offset::new(memarg.offset) else {
+            return Ok(None);
+        };
+        Ok(Some((memory, offset)))
+    }
+
+    /// Returns the effective address `ptr+offset` if it is valid.
+    fn effective_address(&self, mem: ir::MemoryAddr, ptr: u64, offset: Offset) -> Option<Address> {
+        let memory_type = *self
+            .module
+            .get_type_of_memory(MemoryIdx::from(u32::from(u16::from(mem))));
+        let Some(address) = ptr.checked_add(u64::from(offset)) else {
+            // Case: address overflows any legal memory index.
+            return None;
+        };
+        if let Some(max) = memory_type.maximum() {
+            // The memory's maximum size in bytes.
+            //
+            // Computed as `u128` because `max << page_size_log2` can exceed `u64`
+            // for 64-bit memories, matching how `wasmi_core` sizes its memories.
+            let max_size = u128::from(max) << memory_type.page_size_log2();
+            if u128::from(address) > max_size {
+                // Case: address overflows the memory's maximum size.
+                return None;
+            }
+        }
+        if !memory_type.is_64() && address >= 1 << 32 {
+            // Case: address overflows the 32-bit memory index.
+            return None;
+        }
+        Address::new(address)
+    }
+
+    /// Translates a Wasm `i64.binop128` instruction from the `wide-arithmetic` proposal.
+    fn translate_i64_binop128(
+        &mut self,
+        make_instr: fn(
+            results: FixedSlotSpan<2>,
+            lhs_lo: Slot,
+            lhs_hi: Slot,
+            rhs_lo: Slot,
+            rhs_hi: Slot,
+        ) -> Op,
+        const_eval: fn(lhs_lo: i64, lhs_hi: i64, rhs_lo: i64, rhs_hi: i64) -> (i64, i64),
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (rhs_lo, rhs_hi) = self.stack.pop2();
+        let (lhs_lo, lhs_hi) = self.stack.pop2();
+        if let (
+            Operand::Immediate(lhs_lo),
+            Operand::Immediate(lhs_hi),
+            Operand::Immediate(rhs_lo),
+            Operand::Immediate(rhs_hi),
+        ) = (lhs_lo, lhs_hi, rhs_lo, rhs_hi)
+        {
+            let (result_lo, result_hi) = const_eval(
+                lhs_lo.val().into(),
+                lhs_hi.val().into(),
+                rhs_lo.val().into(),
+                rhs_hi.val().into(),
+            );
+            self.stack.push_immediate(result_lo)?;
+            self.stack.push_immediate(result_hi)?;
+            return Ok(());
+        }
+        let rhs_lo = self.copy_operand_to_slot(rhs_lo)?;
+        let rhs_hi = self.copy_operand_to_slot(rhs_hi)?;
+        let lhs_lo = self.copy_operand_to_slot(lhs_lo)?;
+        let lhs_hi = self.copy_operand_to_slot(lhs_hi)?;
+        let result_lo = self
+            .stack
+            .push_temp(ValType::I64, Allocation::None)?
+            .temp_slots()
+            .head();
+        let result_hi = self
+            .stack
+            .push_temp(ValType::I64, Allocation::None)?
+            .temp_slots()
+            .head();
+        let Ok(results) = <FixedSlotSpan<2>>::new(SlotSpan::new(result_lo)) else {
+            return Err(Error::from(TranslationError::AllocatedTooManySlots));
+        };
+        debug_assert_eq!(results.to_array(), [result_lo, result_hi]);
+        self.push_instr(make_instr(results, lhs_lo, lhs_hi, rhs_lo, rhs_hi))?;
+        Ok(())
+    }
+
+    /// Translates a Wasm `i64.mul_wide_sx` instruction from the `wide-arithmetic` proposal.
+    fn translate_i64_mul_wide_sx(
+        &mut self,
+        make_instr: fn(results: FixedSlotSpan<2>, lhs: Slot, rhs: Slot) -> Op,
+        const_eval: fn(lhs: i64, rhs: i64) -> (i64, i64),
+        signed: bool,
+    ) -> Result<(), Error> {
+        bail_unreachable!(self);
+        let (lhs, rhs) = self.stack.pop2();
+        let (lhs, rhs) = match (lhs, rhs) {
+            (Operand::Immediate(lhs), Operand::Immediate(rhs)) => {
+                let (result_lo, result_hi) = const_eval(lhs.val().into(), rhs.val().into());
+                self.stack.push_immediate(result_lo)?;
+                self.stack.push_immediate(result_hi)?;
+                return Ok(());
+            }
+            (lhs, Operand::Immediate(rhs_imm)) => {
+                let rhs_val = rhs_imm.val();
+                if self.try_opt_i64_mul_wide_sx(lhs, rhs_val, signed)? {
+                    return Ok(());
+                }
+                let lhs = self.copy_operand_to_slot(lhs)?;
+                let rhs = self.copy_operand_to_slot(rhs)?;
+                (lhs, rhs)
+            }
+            (Operand::Immediate(lhs_imm), rhs) => {
+                let lhs_val = lhs_imm.val();
+                if self.try_opt_i64_mul_wide_sx(rhs, lhs_val, signed)? {
+                    return Ok(());
+                }
+                let lhs = self.copy_operand_to_slot(lhs)?;
+                let rhs = self.copy_operand_to_slot(rhs)?;
+                (lhs, rhs)
+            }
+            (lhs, rhs) => {
+                let lhs = self.copy_operand_to_slot(lhs)?;
+                let rhs = self.copy_operand_to_slot(rhs)?;
+                (lhs, rhs)
+            }
+        };
+        let result0 = self
+            .stack
+            .push_temp(ValType::I64, Allocation::None)?
+            .temp_slots()
+            .head();
+        self.stack.push_temp(ValType::I64, Allocation::None)?;
+        let Ok(results) = <FixedSlotSpan<2>>::new(SlotSpan::new(result0)) else {
+            return Err(Error::from(TranslationError::AllocatedTooManySlots));
+        };
+        self.push_instr(make_instr(results, lhs, rhs))?;
+        Ok(())
+    }
+
+    /// Try to optimize a `i64.mul_wide_sx` instruction with one [`Slot`] and one immediate input.
+    ///
+    /// - Returns `Ok(true)` if the optimiation was applied successfully.
+    /// - Returns `Ok(false)` if no optimization was applied.
+    fn try_opt_i64_mul_wide_sx(
+        &mut self,
+        lhs: Operand,
+        rhs: TypedRawVal,
+        signed: bool,
+    ) -> Result<bool, Error> {
+        let rhs = i64::from(rhs);
+        if rhs == 0 {
+            // Case: `mul(x, 0)` or `mul(0, x)` always evaluates to 0.
+            self.stack.push_immediate(0_i64)?; // lo-bits
+            self.stack.push_immediate(0_i64)?; // hi-bits
+            return Ok(true);
+        }
+        if rhs == 1 && !signed {
+            // Case: `mul(x, 1)` or `mul(1, x)` always evaluates to just `x`.
+            // This is only valid if `x` is not a singed (negative) value.
+            let result = self.stack.push_operand(lhs)?; // lo-bits
+            if matches!(lhs, Operand::Temp(_)) {
+                // Case: `lhs` is temporary and thus might need a copy to its new result.
+                let result = result.temp_slots().head();
+                self.encode_copy_sx_op(result, lhs)?;
+            }
+            self.stack.push_immediate(0_i64)?; // hi-bits
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}

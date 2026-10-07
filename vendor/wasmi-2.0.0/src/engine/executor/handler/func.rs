@@ -1,0 +1,313 @@
+use crate::{
+    CallHook,
+    Error,
+    Store,
+    engine::{
+        FuncEntryPtr,
+        LiftFromCells,
+        LowerToCells,
+        executor::handler::{
+            dispatch::{ExecutionOutcome, execute_until_done},
+            state::{Freg32, Freg64, Inst, Ip, Ireg, Sp},
+            utils,
+        },
+    },
+    func::HostFuncEntity,
+    ir::{BoundedSlotSpan, Slot, SlotSpan},
+    store::{CallHooks, StoreError},
+};
+use core::marker::PhantomData;
+
+pub struct WasmFuncCall<'a, T, State> {
+    store: &'a mut Store<T>,
+    callee_ip: Ip,
+    callee_sp: Sp,
+    instance: Inst,
+    state: State,
+    ireg: Ireg,
+    freg32: Freg32,
+    freg64: Freg64,
+}
+
+impl<'a, T, State> WasmFuncCall<'a, T, State> {
+    fn new_state<NewState>(self, state: NewState) -> WasmFuncCall<'a, T, NewState> {
+        WasmFuncCall {
+            store: self.store,
+            callee_ip: self.callee_ip,
+            callee_sp: self.callee_sp,
+            instance: self.instance,
+            state,
+            ireg: self.ireg,
+            freg32: self.freg32,
+            freg64: self.freg64,
+        }
+    }
+}
+
+mod state {
+    use super::Sp;
+    use crate::{
+        engine::{InOutParams, executor::handler::state::HostFrame},
+        func::Trampoline,
+    };
+    use core::marker::PhantomData;
+
+    pub type Uninit = PhantomData<marker::Uninit>;
+    pub type Init = PhantomData<marker::Init>;
+    pub type Resumed = PhantomData<marker::Resumed>;
+
+    mod marker {
+        pub enum Uninit {}
+        pub enum Init {}
+        pub enum Resumed {}
+    }
+
+    pub struct UninitHost {
+        pub sp: Sp,
+        pub frame: HostFrame,
+        pub trampoline: Trampoline,
+    }
+
+    pub struct InitHost {
+        pub sp: Sp,
+        pub inout: InOutParams,
+        pub trampoline: Trampoline,
+    }
+
+    pub trait Execute {}
+    impl Execute for Init {}
+    impl Execute for Resumed {}
+    pub struct Done {
+        pub sp: Sp,
+    }
+}
+
+impl<'a, T> WasmFuncCall<'a, T, state::Uninit> {
+    pub fn write_params<Params>(self, params: Params) -> WasmFuncCall<'a, T, state::Init>
+    where
+        Params: LowerToCells,
+    {
+        let mut sp = self.callee_sp;
+        let Ok(_) = params.lower_to_cells(&*self.store, &mut sp) else {
+            panic!("failed to write parameter values to cells")
+        };
+        self.new_state(PhantomData)
+    }
+}
+
+impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
+    pub fn execute(mut self) -> Result<WasmFuncCall<'a, T, state::Done>, ExecutionOutcome> {
+        self.store.invoke_call_hook(CallHook::CallingWasm)?;
+        let outcome = self.execute_until_done();
+        self.store.invoke_call_hook(CallHook::ReturningFromWasm)?;
+        let sp = outcome?;
+        Ok(self.new_state(state::Done { sp }))
+    }
+
+    fn execute_until_done(&mut self) -> Result<Sp, ExecutionOutcome> {
+        let pruned = self.store.prune();
+        let (mem0, mem0_len) = utils::extract_mem0(self.instance);
+        execute_until_done(
+            pruned,
+            self.callee_ip,
+            self.callee_sp,
+            mem0,
+            mem0_len,
+            self.instance,
+            self.ireg,
+            self.freg32,
+            self.freg64,
+        )
+    }
+}
+
+impl<'a, T> WasmFuncCall<'a, T, state::Resumed> {
+    pub fn provide_host_results<Params>(
+        self,
+        params: Params,
+        slots: SlotSpan,
+    ) -> WasmFuncCall<'a, T, state::Init>
+    where
+        Params: LowerToCells,
+    {
+        let mut sp = self.callee_sp.offset(slots.head());
+        let Ok(_) = params.lower_to_cells(&*self.store, &mut sp) else {
+            panic!("failed to store provided host results to cells")
+        };
+        self.new_state(PhantomData)
+    }
+}
+
+impl<'a, T> WasmFuncCall<'a, T, state::Done> {
+    pub fn write_results<Results>(self, results: Results) -> Results::Value
+    where
+        Results: LiftFromCells,
+    {
+        let mut sp = self.state.sp;
+        let Ok(value) = results.lift_from_cells(&*self.store, &mut sp) else {
+            panic!("failed to load result values from cells")
+        };
+        value
+    }
+}
+
+/// Initializes a call to the Wasm function behind `func_entry`.
+///
+/// # Note
+///
+/// Uses the [`Stack`] installed in `store`, see `with_stack`.
+///
+/// [`Stack`]: crate::engine::Stack
+pub fn init_wasm_func_call<T>(
+    store: &mut Store<T>,
+    func_entry: FuncEntryPtr,
+    instance: Inst,
+) -> Result<WasmFuncCall<'_, T, state::Uninit>, Error> {
+    // SAFETY: `func_entry` stems from a `WasmFuncEntity` owned by `store`, thus the engine
+    //         owning the `FuncEntry` outlives this call.
+    let func_entry = unsafe { func_entry.get() };
+    let (fuel, features) = store.inner.fuel_and_features();
+    let compiled_func = func_entry.get_or_compile(Some(fuel), features)?;
+    let callee_ip = Ip::from(compiled_func.ops());
+    let len_local_slots = compiled_func.len_local_slots();
+    let len_stack_slots = compiled_func.len_stack_slots();
+    // Note: using a length of 0 for `callee_params` simply has the effect that all frame
+    //       cells are initialized to zero which is a safe default. There currently is not
+    //       an easy and efficient way to get the number of parameter cells at this point
+    //       so we simply default to 0.
+    let callee_params = BoundedSlotSpan::new(SlotSpan::new(Slot::from(0)), 0);
+    let stack = store.inner.exec_mut().stack_mut();
+    // Note: the call stack is empty here, so the first frame starts at the value stack base.
+    let caller_sp = stack.base_sp();
+    let callee_sp = stack.push_frame(
+        caller_sp,
+        None,
+        callee_ip,
+        callee_params,
+        len_local_slots,
+        len_stack_slots,
+        Some(instance),
+    )?;
+    let (ireg, freg32, freg64) = stack.regs();
+    Ok(WasmFuncCall {
+        store,
+        callee_ip,
+        callee_sp,
+        instance,
+        state: PhantomData,
+        ireg,
+        freg32,
+        freg64,
+    })
+}
+
+pub fn resume_wasm_func_call<T>(
+    store: &mut Store<T>,
+) -> Result<WasmFuncCall<'_, T, state::Resumed>, Error> {
+    let (callee_ip, callee_sp, instance, ireg, freg32, freg64) =
+        store.inner.exec_mut().stack_mut().restore_frame();
+    Ok(WasmFuncCall {
+        store,
+        callee_ip,
+        callee_sp,
+        instance,
+        state: PhantomData,
+        ireg,
+        freg32,
+        freg64,
+    })
+}
+
+pub fn init_host_func_call<'a, T>(
+    store: &'a mut Store<T>,
+    func: HostFuncEntity,
+) -> Result<HostFuncCall<'a, T, state::UninitHost>, Error> {
+    let len_param_cells = func.len_param_cells();
+    let len_result_cells = func.len_result_cells();
+    let trampoline = *func.trampoline();
+    let callee_params = BoundedSlotSpan::new(SlotSpan::new(Slot::from(0)), len_param_cells);
+    let (sp, frame) = store.inner.exec_mut().stack_mut().prepare_host_frame(
+        None,
+        callee_params,
+        len_result_cells,
+    )?;
+    Ok(HostFuncCall {
+        store,
+        state: state::UninitHost {
+            sp,
+            frame,
+            trampoline,
+        },
+    })
+}
+
+#[derive(Debug)]
+pub struct HostFuncCall<'a, T, State> {
+    store: &'a mut Store<T>,
+    state: State,
+}
+
+impl<'a, T> HostFuncCall<'a, T, state::UninitHost> {
+    pub fn write_params<Params>(self, params: Params) -> HostFuncCall<'a, T, state::InitHost>
+    where
+        Params: LowerToCells,
+    {
+        let state::UninitHost {
+            sp,
+            frame,
+            trampoline,
+        } = self.state;
+        let mut sp_writer = sp;
+        let Ok(_) = params.lower_to_cells(&*self.store, &mut sp_writer) else {
+            panic!("failed to store parameter values to cells")
+        };
+        // Note: the `InOutParams` must be derived _after_ the parameters have been written above,
+        //       since writing through `sp` invalidates its pointer. See `Stack::host_inout`.
+        let inout = self.store.inner.exec_mut().stack_mut().host_inout(frame);
+        HostFuncCall {
+            store: self.store,
+            state: state::InitHost {
+                sp,
+                inout,
+                trampoline,
+            },
+        }
+    }
+}
+
+impl<'a, T> HostFuncCall<'a, T, state::InitHost> {
+    pub fn execute(self) -> Result<HostFuncCall<'a, T, state::Done>, Error> {
+        let state::InitHost {
+            sp,
+            inout,
+            trampoline,
+        } = self.state;
+        let outcome = self
+            .store
+            .prune()
+            .call_host_func(trampoline, None, inout, CallHooks::Ignore);
+        if let Err(error) = outcome {
+            match error {
+                StoreError::External(error) => return Err(error),
+                StoreError::Internal(error) => panic!("internal interpreter error: {error}"),
+            }
+        }
+        Ok(HostFuncCall {
+            store: self.store,
+            state: state::Done { sp },
+        })
+    }
+}
+
+impl<'a, T> HostFuncCall<'a, T, state::Done> {
+    pub fn write_results<Results>(self, results: Results) -> Results::Value
+    where
+        Results: LiftFromCells,
+    {
+        let mut sp = self.state.sp;
+        let Ok(value) = results.lift_from_cells(&*self.store, &mut sp) else {
+            panic!("failed to load result value from cells")
+        };
+        value
+    }
+}

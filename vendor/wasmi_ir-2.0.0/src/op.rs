@@ -1,0 +1,105 @@
+#[cfg(feature = "simd")]
+use crate::core::V128;
+#[cfg(feature = "simd")]
+use crate::core::simd::ImmLaneIdx;
+use crate::{
+    Address,
+    BlockFuel,
+    BoundedSlotSpan,
+    BranchOffset,
+    DataAddr,
+    ElemAddr,
+    FixedSlotSpan,
+    FuncAddr,
+    FuncType,
+    GlobalAddr,
+    InternalFunc,
+    Local,
+    MemoryAddr,
+    Offset,
+    Offset16,
+    Reg,
+    Slot,
+    SlotAndReg,
+    Table0,
+    TableAddr,
+    core::{ShiftAmount, TrapCode, ValType},
+};
+use core::num::NonZero;
+
+include!(concat!(env!("OUT_DIR"), "/op.rs"));
+
+impl Copy for Op {}
+impl Clone for Op {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[cfg(not(feature = "debug"))]
+impl ::core::fmt::Debug for Op {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("Op").field("code", &self.code()).finish()
+    }
+}
+
+/// The location of an operand.
+#[derive(Debug, Copy, Clone)]
+pub enum Location {
+    /// The operand resides in a register of a certain type.
+    Reg(ValType),
+    /// The operand resides in a stack slot.
+    Slot(Slot),
+}
+
+impl Location {
+    /// Returns `true` if `self` is a [`Location::Reg`].
+    pub fn is_reg(&self) -> bool {
+        matches!(self, Self::Reg(_))
+    }
+}
+
+impl Slot {
+    #[inline]
+    pub fn location(&self) -> Location {
+        Location::Slot(*self)
+    }
+}
+
+impl<T> SlotAndReg<T> {
+    #[inline]
+    pub fn location(&self) -> Location {
+        Location::Slot(self.slot)
+    }
+}
+
+impl Reg<i64> {
+    #[inline]
+    pub fn location(&self) -> Location {
+        Location::Reg(ValType::I64)
+    }
+}
+
+impl Reg<f32> {
+    #[inline]
+    pub fn location(&self) -> Location {
+        Location::Reg(ValType::F32)
+    }
+}
+
+impl Reg<f64> {
+    #[inline]
+    pub fn location(&self) -> Location {
+        Location::Reg(ValType::F64)
+    }
+}
+
+#[test]
+fn op_size_of_and_alignment() {
+    let expected_size = match cfg!(feature = "simd") && !cfg!(feature = "slot16") {
+        true => 32,
+        false => 24,
+    };
+    assert_eq!(core::mem::size_of::<Op>(), expected_size);
+    assert_eq!(core::mem::align_of::<Op>(), 8);
+}
