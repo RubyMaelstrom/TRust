@@ -216,10 +216,12 @@ enum LumenHostTask {
         name: String,
         kind: LumenResourceKind,
         result: LumenResourceResult,
-        /// A fetched style sheet's text with its imports expanded and its
-        /// URLs resolved against the response URL
-        /// (`http::fetched_stylesheet_text`).
-        stylesheet: Option<String>,
+        /// The decoded text, when decoding needs state from the moment the
+        /// element was prepared: a fetched style sheet with its imports
+        /// expanded and its URLs resolved against the response URL
+        /// (`http::fetched_stylesheet_text`), or a classic script decoded with
+        /// the fallback encoding of HTML #prepare-the-script-element.
+        text: Option<String>,
         timing: Option<LumenResourceTiming>,
         external: bool,
     },
@@ -4620,7 +4622,10 @@ mod desktop {
                 continue;
             };
             if (200..300).contains(&response.status) {
-                let text = crate::http::decode_body(&response.content_type, &response.body);
+                // An SVG sprite sheet is an XML resource.
+                let text =
+                    crate::document_encoding::decode_xml(&response.body, &response.content_type)
+                        .text;
                 crate::dom::prime_sprite_sheet(url.as_str(), &text);
             }
         }
@@ -12105,6 +12110,17 @@ fn send_resource_completion(
     external: bool,
 ) -> bool {
     let context = ctx.host_job_context();
+    let text = match (&kind, &result) {
+        (LumenResourceKind::ClassicScript, Some((_, content_type, body, _))) => {
+            let fallback = dom_fallback_encoding(&host_dom(ctx).borrow(), node_id);
+            Some(crate::document_encoding::decode_classic_script(
+                content_type,
+                body,
+                fallback,
+            ))
+        }
+        _ => None,
+    };
     let Some(events) = ctx.host_mut::<HostState>().and_then(|state| {
         let events = state.task_events.clone()?;
         if kind.delays_load() {
@@ -12124,7 +12140,7 @@ fn send_resource_completion(
             name,
             kind,
             result,
-            stylesheet: None,
+            text,
             timing: None,
             external,
         })
@@ -12325,7 +12341,7 @@ fn spawn_preload_fetch(
             name,
             kind: LumenResourceKind::Preload,
             result,
-            stylesheet: None,
+            text: None,
             timing,
             external: true,
         });
@@ -12365,6 +12381,7 @@ fn spawn_resource_fetch(
     };
     let shared = cache.consume_resource(&request.url, &client, destination, credentials);
     let trace_fetch = std::env::var_os("TRUST_TRACE_FETCH").is_some();
+    let environment = dom_fallback_encoding(&host_dom(ctx).borrow(), node_id);
     cache.spawn(&handle, async move {
         let mut response_url = request.url.clone();
         let (result, timing) = match shared {
@@ -12421,13 +12438,30 @@ fn spawn_resource_fetch(
                 ),
             },
         };
-        let stylesheet = match &result {
+        let text = match &result {
             Some((status, content_type, body, headers))
                 if matches!(kind, LumenResourceKind::Stylesheet)
                     && crate::http::stylesheet_response_allowed(*status, content_type, headers) =>
             {
-                let css = crate::http::decode_body(content_type, body);
-                Some(crate::http::fetched_stylesheet_text(css, response_url, client).await)
+                let (css, encoding) = crate::document_encoding::decode_stylesheet(
+                    content_type,
+                    body,
+                    Some(environment),
+                );
+                Some(
+                    crate::http::fetched_stylesheet_text(css, response_url, client, encoding).await,
+                )
+            }
+            // The script's charset attribute and node document were read
+            // when the element was prepared, as the fallback encoding is.
+            Some((_, content_type, body, _))
+                if matches!(kind, LumenResourceKind::ClassicScript) =>
+            {
+                Some(crate::document_encoding::decode_classic_script(
+                    content_type,
+                    body,
+                    environment,
+                ))
             }
             _ => None,
         };
@@ -12447,7 +12481,7 @@ fn spawn_resource_fetch(
             name,
             kind,
             result,
-            stylesheet,
+            text,
             timing,
             external: true,
         });
@@ -13837,7 +13871,7 @@ fn module_dependency_loader(
         }
         return Some((
             resolved.to_string(),
-            crate::http::decode_body(&content_type, &body),
+            crate::document_encoding::decode_utf8(&body),
         ));
     }
     if !matches!(resolved.scheme(), "http" | "https")
@@ -13879,7 +13913,7 @@ fn module_dependency_loader(
         }
         (
             resolved.to_string(),
-            crate::http::decode_body(&response.content_type, &response.body),
+            crate::document_encoding::decode_utf8(&response.body),
         )
     })
 }
@@ -13907,7 +13941,7 @@ fn data_dynamic_module_result(resolved: &url::Url) -> Option<(String, String)> {
         .map(|body| {
             (
                 resolved.to_string(),
-                crate::http::decode_body(&content_type, &body),
+                crate::document_encoding::decode_utf8(&body),
             )
         })
 }
@@ -14008,7 +14042,7 @@ fn queue_dynamic_module_load(
             .then(|| {
                 (
                     resolved.to_string(),
-                    crate::http::decode_body(&response.content_type, &response.body),
+                    crate::document_encoding::decode_utf8(&response.body),
                 )
             })
         });
@@ -14330,13 +14364,42 @@ fn run_injected_module_task(
     result
 }
 
+/// The fallback encoding of a script or style sheet fetched for `node`: its
+/// `charset` attribute's encoding (HTML #prepare-the-script-element; the CSS
+/// environment encoding of HTML #link-type-stylesheet), or else its node
+/// document's encoding.
+fn element_fallback_encoding(
+    engine: &mut lumen::Engine,
+    node: usize,
+) -> &'static encoding_rs::Encoding {
+    let dom = engine
+        .ctx()
+        .host_mut::<HostState>()
+        .expect("HostState installed before resource dispatch")
+        .dom
+        .clone();
+    let dom = dom.borrow();
+    dom_fallback_encoding(&dom, node)
+}
+
+fn dom_fallback_encoding(dom: &Dom, node: usize) -> &'static encoding_rs::Encoding {
+    dom.attr(node, "charset")
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or_else(|| {
+            dom.owner_document(node)
+                .map_or(encoding_rs::UTF_8, |document| {
+                    dom.document_encoding(document)
+                })
+        })
+}
+
 fn run_resource_task(
     engine: &mut lumen::Engine,
     node_id: usize,
     name: String,
     kind: LumenResourceKind,
     result: LumenResourceResult,
-    stylesheet: Option<String>,
+    text: Option<String>,
     external: bool,
 ) -> Result<(), String> {
     match kind {
@@ -14348,7 +14411,10 @@ fn run_resource_task(
                     &headers,
                 ) =>
             {
-                let source = crate::http::decode_body(&content_type, &body);
+                let source = text.unwrap_or_else(|| {
+                    let fallback = element_fallback_encoding(engine, node_id);
+                    crate::document_encoding::decode_classic_script(&content_type, &body, fallback)
+                });
                 run_injected_classic_task(engine, node_id, &name, &name, &source)?;
                 if external {
                     fire_engine_script_event(engine, node_id, "load");
@@ -14380,7 +14446,7 @@ fn run_resource_task(
                     return Ok(());
                 }
                 speculate_engine_imports(engine, &import_base, &body);
-                let source = crate::http::decode_body(&content_type, &body);
+                let source = crate::document_encoding::decode_utf8(&body);
                 run_injected_module_task(engine, node_id, &name, &source)?;
             }
             _ => {
@@ -14397,8 +14463,15 @@ fn run_resource_task(
                 // CSS Values 4 #relative-urls: a fetched sheet arrives with
                 // its URLs resolved against its own response URL. Only an
                 // undelivered (`data:`) sheet is decoded here.
-                let css =
-                    stylesheet.unwrap_or_else(|| crate::http::decode_body(&content_type, &body));
+                let css = text.unwrap_or_else(|| {
+                    let environment = element_fallback_encoding(engine, node_id);
+                    crate::document_encoding::decode_stylesheet(
+                        &content_type,
+                        &body,
+                        Some(environment),
+                    )
+                    .0
+                });
                 let dom = engine
                     .ctx()
                     .host_mut::<HostState>()
@@ -14653,7 +14726,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             name,
             kind,
             result,
-            stylesheet,
+            text,
             timing,
             external,
         } => {
@@ -14675,7 +14748,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             // against the wrong Realm-local listener registry.
             if context == engine.ctx().host_job_context() {
                 record_resource_timing(engine.ctx(), timing);
-                run_resource_task(engine, node_id, name, kind, result, stylesheet, external)?;
+                run_resource_task(engine, node_id, name, kind, result, text, external)?;
             } else {
                 let realm = engine
                     .ctx()
@@ -14689,7 +14762,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 };
                 match engine.with_embed_realm(&realm, move |engine| {
                     record_resource_timing(engine.ctx(), timing);
-                    run_resource_task(engine, node_id, name, kind, result, stylesheet, external)
+                    run_resource_task(engine, node_id, name, kind, result, text, external)
                 }) {
                     Ok(result) => result?,
                     Err(error) => {

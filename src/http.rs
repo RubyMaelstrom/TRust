@@ -3101,9 +3101,9 @@ mod cookie_policy_tests {
         );
         let frames = HashMap::from([
             (page.join("/redirect").unwrap().to_string(), (url("https://third.example.net/"),
-                "<img src='https://picture.example.com/private.png'><div style=\"background-image:url(https://picture.example.com/background.png)\">x</div><iframe src='https://picture.example.com/inner'></iframe>".into())),
-            (page.join("/inner").unwrap().to_string(), (page.join("/inner").unwrap(), "<img src='https://picture.example.com/nested.png'>".into())),
-            (page.join("/same").unwrap().to_string(), (page.join("/same").unwrap(), "<img src='https://picture.example.com/allowed.png'>".into())),
+                "<img src='https://picture.example.com/private.png'><div style=\"background-image:url(https://picture.example.com/background.png)\">x</div><iframe src='https://picture.example.com/inner'></iframe>".into(), encoding_rs::UTF_8)),
+            (page.join("/inner").unwrap().to_string(), (page.join("/inner").unwrap(), "<img src='https://picture.example.com/nested.png'>".into(), encoding_rs::UTF_8)),
+            (page.join("/same").unwrap().to_string(), (page.join("/same").unwrap(), "<img src='https://picture.example.com/allowed.png'>".into(), encoding_rs::UTF_8)),
         ]);
         install_page_frames(&mut dom, &page, &frames);
         let outer = dom
@@ -5370,7 +5370,7 @@ async fn execute_js_with_presentation(
     let mut prefetched_sheets = None;
     let mut scripted_frames = false;
     if !html.to_ascii_lowercase().contains("<script") {
-        let sheets = fetch_page_sheets(&html, &response.url).await;
+        let sheets = fetch_page_sheets(&html, &response.url, document_encoding).await;
         let needs_live_dom = {
             let mut probe = crate::js::css_prepare(&html, viewport, cell_px);
             probe.attach_external_sheets(&sheets);
@@ -5390,7 +5390,7 @@ async fn execute_js_with_presentation(
         scripted_frames = frames.as_ref().is_some_and(|frames| {
             frames
                 .values()
-                .any(|(_, markup)| markup.to_ascii_lowercase().contains("<script"))
+                .any(|(_, markup, _)| markup.to_ascii_lowercase().contains("<script"))
         });
         if !needs_live_dom && !scripted_frames {
             return css_only_with_sheets(
@@ -5525,11 +5525,24 @@ async fn execute_js_with_presentation(
                         stylesheet_response_allowed(r.status, &r.content_type, &r.headers)
                     }),
                 ) {
+                    // HTML #link-type-stylesheet: the environment encoding
+                    // is the link's charset, else the document's encoding.
+                    let environment = job
+                        .charset
+                        .as_deref()
+                        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+                        .unwrap_or(document_encoding);
+                    let (css, encoding) = crate::document_encoding::decode_stylesheet(
+                        &r.content_type,
+                        &r.body,
+                        Some(environment),
+                    );
                     let css = expand_stylesheet_imports(
-                        decode_body(&r.content_type, &r.body),
+                        css,
                         url,
                         response.url.clone(),
                         Vec::new(),
+                        encoding,
                     )
                     .await;
                     sheets.push((raw, css));
@@ -5539,14 +5552,15 @@ async fn execute_js_with_presentation(
                 if let (Some(url), Some(r)) = (resolved, resp)
                     && (200..300).contains(&r.status)
                 {
-                    let text = decode_body(&r.content_type, &r.body);
+                    // An SVG sprite sheet is an XML resource.
+                    let text = crate::document_encoding::decode_xml(&r.body, &r.content_type).text;
                     crate::dom::prime_sprite_sheet(url.as_str(), &text);
                 }
             }
         }
     }
     if !prefetched {
-        sheets.extend(fetch_inline_style_imports(&html, &response.url).await);
+        sheets.extend(fetch_inline_style_imports(&html, &response.url, document_encoding).await);
     }
     install_stylesheet_fonts(&html, &sheets, &response.url).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
@@ -5692,7 +5706,7 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
             if let Ok(r) = fetch(&Request::subresource(abs.clone(), &page_url, "image", None)).await
                 && (200..300).contains(&r.status)
             {
-                let text = decode_body(&r.content_type, &r.body);
+                let text = crate::document_encoding::decode_xml(&r.body, &r.content_type).text;
                 crate::dom::prime_sprite_sheet(abs.as_str(), &text);
             }
         }
@@ -5743,7 +5757,13 @@ pub(crate) fn splice_inline_imports<'a>(
 /// `<style>` elements `@import` (keyed by `INLINE_IMPORT_KEY` and URL). The
 /// request pool bounds simultaneous I/O; no arbitrary declaration-count
 /// cutoff is applied to the cascade.
-async fn fetch_page_sheets(html: &str, page_url: &Url) -> Vec<(String, String)> {
+/// `encoding` is the document's character encoding, the style sheets'
+/// environment encoding unless a link names its own `charset`.
+async fn fetch_page_sheets(
+    html: &str,
+    page_url: &Url,
+    encoding: &'static encoding_rs::Encoding,
+) -> Vec<(String, String)> {
     let base = base_with_doc_base(html, page_url);
     let jobs = crate::js::external_resources(html)
         .into_iter()
@@ -5768,41 +5788,51 @@ async fn fetch_page_sheets(html: &str, page_url: &Url) -> Vec<(String, String)> 
                 .ok(),
                 None => None,
             };
-            (job.source, resolved, resp)
+            (job.source, job.charset, resolved, resp)
         }
     }))
     .buffered(PREFETCH_CONCURRENCY)
     .collect::<Vec<_>>()
     .await
     .into_iter()
-    .filter_map(|(raw, resolved, resp)| {
+    .filter_map(|(raw, charset, resolved, resp)| {
         let url = resolved?;
         let response = resp?.filter_stylesheet()?;
-        Some((
-            raw,
-            url,
-            decode_body(&response.content_type, &response.body),
-        ))
+        let environment = charset
+            .as_deref()
+            .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+            .unwrap_or(encoding);
+        let (css, encoding) = crate::document_encoding::decode_stylesheet(
+            &response.content_type,
+            &response.body,
+            Some(environment),
+        );
+        // Stream the boxed futures themselves: a closure taking the encoding
+        // reference and returning an async block would be lifetime-generic,
+        // and spawned callers could no longer prove their futures `Send`.
+        let expanded = expand_stylesheet_imports(css, url, page_url.clone(), Vec::new(), encoding);
+        Some((raw, expanded))
     })
     .collect::<Vec<_>>();
-    let mut sheets: Vec<(String, String)> =
-        futures::stream::iter(fetched.into_iter().map(|(raw, url, css)| {
-            let page_url = page_url.clone();
-            async move {
-                let expanded = expand_stylesheet_imports(css, url, page_url, Vec::new()).await;
-                (raw, expanded)
-            }
-        }))
+    let (sources, imports): (Vec<_>, Vec<_>) = fetched.into_iter().unzip();
+    let expanded: Vec<String> = futures::stream::iter(imports)
         .buffered(PREFETCH_CONCURRENCY)
         .collect()
         .await;
-    sheets.extend(fetch_inline_style_imports(html, page_url).await);
+    let mut sheets: Vec<(String, String)> = sources.into_iter().zip(expanded).collect();
+    sheets.extend(fetch_inline_style_imports(html, page_url, encoding).await);
     sheets
 }
 
 /// Fetch the sheets that a document's inline `<style>` elements `@import`,
 /// keyed for the sheets list by `INLINE_IMPORT_KEY` and absolute URL.
-async fn fetch_inline_style_imports(html: &str, page_url: &Url) -> Vec<(String, String)> {
+/// An inline sheet's text is part of the document, so the document's
+/// `encoding` is the imported sheets' environment encoding.
+async fn fetch_inline_style_imports(
+    html: &str,
+    page_url: &Url,
+    encoding: &'static encoding_rs::Encoding,
+) -> Vec<(String, String)> {
     let base = base_with_doc_base(html, page_url);
     let urls = inline_style_import_urls(html, &base, page_url);
     futures::stream::iter(urls.into_iter().map(|url| {
@@ -5812,11 +5842,15 @@ async fn fetch_inline_style_imports(html: &str, page_url: &Url) -> Vec<(String, 
                 .await
                 .ok()
                 .and_then(StylesheetResponseExt::filter_stylesheet)?;
-            let css = decode_body(&response.content_type, &response.body);
+            let (css, encoding) = crate::document_encoding::decode_stylesheet(
+                &response.content_type,
+                &response.body,
+                Some(encoding),
+            );
             let key = format!("{INLINE_IMPORT_KEY}{url}");
             Some((
                 key,
-                expand_stylesheet_imports(css, url, page_url, Vec::new()).await,
+                expand_stylesheet_imports(css, url, page_url, Vec::new(), encoding).await,
             ))
         }
     }))
@@ -5875,20 +5909,29 @@ struct CssImport {
 /// redirects, is the base of its `url()` tokens and `@import` rules, not the
 /// document's. Process a sheet fetched after parsing (a script-inserted
 /// `<link>`, or a sheet of a scripted frame) as the parser-time loader does.
-pub(crate) async fn fetched_stylesheet_text(css: String, sheet_url: Url, client: Url) -> String {
-    expand_stylesheet_imports(css, sheet_url, client, Vec::new()).await
+/// `encoding` is the sheet's own encoding, its imports' environment encoding.
+pub(crate) async fn fetched_stylesheet_text(
+    css: String,
+    sheet_url: Url,
+    client: Url,
+    encoding: &'static encoding_rs::Encoding,
+) -> String {
+    expand_stylesheet_imports(css, sheet_url, client, Vec::new(), encoding).await
 }
 
 /// CSS Cascade 5 §2.2: replace each applicable `@import` in source order by
 /// the imported rules. Imports are cycle-checked; a failed resource contributes
 /// no rules. URL tokens are then made absolute
 /// against the stylesheet that contained them, as CSSOM URL resolution
-/// requires, rather than against the HTML document.
+/// requires, rather than against the HTML document. `encoding` is the
+/// sheet's encoding: the environment encoding of the sheets it imports
+/// (CSS Cascade 5 #at-import).
 fn expand_stylesheet_imports(
     css: String,
     sheet_url: Url,
     page_url: Url,
     mut ancestry: Vec<String>,
+    encoding: &'static encoding_rs::Encoding,
 ) -> futures::future::BoxFuture<'static, String> {
     use futures::FutureExt as _;
     async move {
@@ -5924,11 +5967,17 @@ fn expand_stylesheet_imports(
             else {
                 continue;
             };
+            let (child, child_encoding) = crate::document_encoding::decode_stylesheet(
+                &response.content_type,
+                &response.body,
+                Some(encoding),
+            );
             let child = expand_stylesheet_imports(
-                decode_body(&response.content_type, &response.body),
+                child,
                 url,
                 page_url.clone(),
                 ancestry.clone(),
+                child_encoding,
             )
             .await;
             out.push_str(&wrap_import_condition(child, &import.condition));
@@ -6613,11 +6662,12 @@ async fn css_only_for_device(
     if !(media == "text/html" || media == "application/xhtml+xml") {
         return response;
     }
-    let html = decode_document_body(&response.url, &response.content_type, &response.body).text;
+    let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
+    let html = decoded.text;
     if response.declarative_refresh.is_none() {
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
-    let sheets = fetch_page_sheets(&html, &response.url).await;
+    let sheets = fetch_page_sheets(&html, &response.url, decoded.encoding).await;
     css_only_with_sheets(
         response,
         viewport,
@@ -6640,7 +6690,7 @@ async fn css_only_with_sheets(
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
     sheets: Vec<(String, String)>,
-    frames: Option<HashMap<String, (Url, String)>>,
+    frames: Option<FrameDocuments>,
     terminal_presentation: bool,
 ) -> Response {
     let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
@@ -6659,9 +6709,9 @@ async fn css_only_with_sheets(
     // each frame's `<link rel=stylesheet>` against that frame's own URL. The
     // installed frame tree carries absolutized hrefs, so key them absolutely.
     let mut frame_sheets = Vec::new();
-    for (frame_url, markup) in frames.values() {
+    for (frame_url, markup, encoding) in frames.values() {
         let frame_base = base_with_doc_base(markup, frame_url);
-        for (source, css) in fetch_page_sheets(markup, frame_url).await {
+        for (source, css) in fetch_page_sheets(markup, frame_url, encoding).await {
             if let Ok(url) = frame_base.join(&source) {
                 frame_sheets.push((url.to_string(), css));
             }
@@ -6960,6 +7010,10 @@ fn scan_frame_sources(
     (srcs, srcdocs)
 }
 
+/// Prefetched frame documents by requested URL: the final URL, the decoded
+/// markup and its character encoding.
+type FrameDocuments = HashMap<String, (Url, String, &'static encoding_rs::Encoding)>;
+
 /// Fetch every frame document a script-less page (and its nested frames) needs,
 /// into a `url → content` map, breadth-first so each level's `src` fetches
 /// overlap. `srcdoc` frames hold no URL but their markup is still scanned for
@@ -6971,9 +7025,9 @@ async fn prefetch_frame_documents(
     base: &Url,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
-) -> std::collections::HashMap<String, (Url, String)> {
+) -> FrameDocuments {
     use std::collections::VecDeque;
-    let mut map: HashMap<String, (Url, String)> = HashMap::new();
+    let mut map = FrameDocuments::new();
     // (document markup, its base, fragment-stripped ancestor URLs, the URL
     // that determines its origin, its character encoding)
     type Pending = (
@@ -7050,7 +7104,7 @@ async fn prefetch_frame_documents(
                 url.clone(),
                 child_encoding,
             ));
-            map.insert(requested.to_string(), (url, body));
+            map.insert(requested.to_string(), (url, body, child_encoding));
         }
         // srcdoc bodies hold no URL of their own; recurse to load THEIR frames
         // (base/origin inherit the parent document, per about:srcdoc). Their
@@ -7073,11 +7127,7 @@ async fn prefetch_frame_documents(
 /// frames breadth-first; a `src` frame takes its content from `fetched`, a
 /// `srcdoc` frame from its attribute (base = the parent document). Synchronous
 /// — `Dom` never crosses an `.await`. Bounded identically to the prefetch.
-fn install_page_frames(
-    dom: &mut crate::dom::Dom,
-    page_url: &Url,
-    fetched: &HashMap<String, (Url, String)>,
-) {
+fn install_page_frames(dom: &mut crate::dom::Dom, page_url: &Url, fetched: &FrameDocuments) {
     use crate::dom::{DOCUMENT, NodeId};
     use std::collections::VecDeque;
 
@@ -7117,7 +7167,7 @@ fn install_page_frames(
             }
             if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
                 && let Some(url) = resolve_frame_src(src, &base, page_url, &ancestors)
-                && let Some((final_url, content)) = fetched.get(url.as_str())
+                && let Some((final_url, content, _)) = fetched.get(url.as_str())
             {
                 plans.push((
                     id,
@@ -8925,6 +8975,7 @@ mod tests {
             r#"<base href="css/"><style>@import url("fonts.css"); p{color:blue}</style>
             <style>@IMPORT 'fonts.css';</style>"#,
             &page,
+            encoding_rs::UTF_8,
         )
         .await;
         let url = page.join("css/fonts.css").unwrap();
@@ -8947,6 +8998,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classic_scripts_fall_back_to_their_documents_encoding() {
+        // HTML #prepare-the-script-element and #fetch-a-classic-script: a
+        // script without a charset decodes with its charset attribute's
+        // encoding, else its node document's encoding.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<meta charset=windows-1252><p id=a></p><p id=b></p>\
+             <script src=plain.js></script><script src=koi.js charset=koi8-r></script>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("plain.js"),
+            b"document.getElementById('a').textContent = '\xE9';",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("koi.js"),
+            b"document.getElementById('b').textContent = '\xC1';",
+        )
+        .unwrap();
+        let url = Url::from_file_path(dir.path().join("index.html")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(body.contains("é</p>"), "{body}");
+        assert!(body.contains("а</p>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn stylesheets_decode_with_their_environment_encoding() {
+        // CSS Syntax 3 #determine-the-fallback-encoding: the link's charset
+        // or the document's encoding (HTML #link-type-stylesheet), and an
+        // imported sheet inherits its importer's encoding (CSS Cascade 5).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("plain.css"), b"a::after{content:'\xE9'}").unwrap();
+        std::fs::write(dir.path().join("labelled.css"), b"b::after{content:'\xC1'}").unwrap();
+        std::fs::write(
+            dir.path().join("declared.css"),
+            b"@charset \"koi8-r\";@import 'imported.css';i::after{content:'\xC1'}",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("imported.css"), b"u::after{content:'\xC1'}").unwrap();
+        let page = Url::from_file_path(dir.path().join("index.html")).unwrap();
+        let sheets = fetch_page_sheets(
+            "<link rel=stylesheet href=plain.css>\
+             <link rel=stylesheet href=labelled.css charset=koi8-r>\
+             <link rel=stylesheet href=declared.css>",
+            &page,
+            encoding_rs::WINDOWS_1252,
+        )
+        .await;
+        let text = |name: &str| {
+            sheets
+                .iter()
+                .find(|(source, _)| source == name)
+                .map(|(_, css)| css.clone())
+                .unwrap()
+        };
+        assert!(text("plain.css").contains("content:'é'"));
+        assert!(text("labelled.css").contains("content:'а'"));
+        let declared = text("declared.css");
+        assert!(
+            declared.contains("u::after{content:'а'}")
+                && declared.contains("i::after{content:'а'}"),
+            "{declared}"
+        );
+    }
+
+    #[tokio::test]
     async fn file_stylesheet_base_imports_and_images_keep_the_real_document_client() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("assets")).unwrap();
@@ -8964,6 +9085,7 @@ mod tests {
         let sheets = fetch_page_sheets(
             r#"<base href="assets/"><link rel="stylesheet" href="main.css">"#,
             &page,
+            encoding_rs::UTF_8,
         )
         .await;
         assert_eq!(sheets.len(), 1);
@@ -8980,7 +9102,11 @@ mod tests {
             r#"<base href="{}"><link rel="stylesheet" href="main.css">"#,
             page.join("assets/").unwrap()
         );
-        assert!(fetch_page_sheets(&spoofed_base, &remote).await.is_empty());
+        assert!(
+            fetch_page_sheets(&spoofed_base, &remote, encoding_rs::UTF_8)
+                .await
+                .is_empty()
+        );
         assert!(resolve_frame_src(page.as_str(), &page, &remote, &[]).is_none());
         assert!(
             fetch_graphical_image(&remote, page.as_str(), None)

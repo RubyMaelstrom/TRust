@@ -215,6 +215,43 @@ pub(crate) fn decode_with_label(bytes: &[u8], label: Option<&str>) -> DecodedDoc
     DecodedDocument { text, encoding }
 }
 
+// ---- Subresources ------------------------------------------------------------
+
+/// HTML #fetch-a-classic-script: Fetch's "legacy extract an encoding" picks
+/// the response's supported `charset`, else `fallback` (the element's
+/// `charset` attribute or its node document's encoding, from "prepare the
+/// script element"); Encoding #decode lets a BOM override both.
+pub(crate) fn decode_classic_script(
+    content_type: &str,
+    body: &[u8],
+    fallback: &'static Encoding,
+) -> String {
+    decode(body, transport_encoding(content_type).unwrap_or(fallback)).0
+}
+
+/// HTML #fetch-a-single-module-script: "UTF-8 decode", which removes a UTF-8
+/// BOM and ignores any `charset` parameter.
+pub(crate) fn decode_utf8(body: &[u8]) -> String {
+    UTF_8.decode_with_bom_removal(body).0.into_owned()
+}
+
+/// CSS Syntax 3 §3.2 #input-byte-stream: decode a style sheet with the
+/// fallback encoding from #determine-the-fallback-encoding. `environment` is
+/// the environment encoding: the referring document's (HTML
+/// #link-type-stylesheet) or the importing style sheet's (CSS Cascade 5
+/// #at-import). Returns the text and the encoding it was decoded with.
+pub(crate) fn decode_stylesheet(
+    content_type: &str,
+    body: &[u8],
+    environment: Option<&'static Encoding>,
+) -> (String, &'static Encoding) {
+    let fallback = transport_encoding(content_type)
+        .or_else(|| charset_rule_encoding(body))
+        .or(environment)
+        .unwrap_or(UTF_8);
+    decode(body, fallback)
+}
+
 /// Encoding #decode: BOM sniffing overrides `encoding`; malformed input
 /// decodes to U+FFFD (error mode "replacement").
 fn decode(bytes: &[u8], encoding: &'static Encoding) -> (String, &'static Encoding) {
@@ -1332,6 +1369,103 @@ mod tests {
         assert_eq!(text(b"x", "text/vtt;charset=gbk"), "UTF-8");
         assert_eq!(text(b"x", "text/css"), "UTF-8");
         assert_eq!(text(b"@charset \"gbk\";", "text/css"), "GBK");
+    }
+
+    #[test]
+    fn subresources_use_their_own_fallback_encodings() {
+        // Classic scripts: BOM, then the response charset, then the fallback.
+        let script = decode_classic_script;
+        assert_eq!(script("text/javascript", b"'\xE9'", WINDOWS_1252), "'é'");
+        assert_eq!(
+            script("text/javascript;charset=utf-8", "'é'".as_bytes(), GBK),
+            "'é'"
+        );
+        assert_eq!(
+            script("text/javascript;charset=bogus", b"'\xE9'", WINDOWS_1252),
+            "'é'"
+        );
+        assert_eq!(
+            script(
+                "text/javascript;charset=koi8-r",
+                b"\xEF\xBB\xBF'\xC3\xA9'",
+                GBK
+            ),
+            "'é'"
+        );
+        // Module scripts are always UTF-8.
+        assert_eq!(decode_utf8(b"\xEF\xBB\xBF'\xC3\xA9'"), "'é'");
+        assert_eq!(decode_utf8(b"'\xE9'"), "'\u{FFFD}'");
+        // Style sheets: charset, then @charset, then the environment, then UTF-8.
+        let sheet = |content_type, body: &[u8], environment| {
+            let (text, encoding) = decode_stylesheet(content_type, body, environment);
+            (text, encoding.name())
+        };
+        assert_eq!(
+            sheet("text/css", b"a{content:'\xE9'}", None),
+            ("a{content:'\u{FFFD}'}".into(), "UTF-8")
+        );
+        assert_eq!(
+            sheet("text/css", b"a{content:'\xE9'}", Some(WINDOWS_1252)),
+            ("a{content:'é'}".into(), "windows-1252")
+        );
+        assert_eq!(
+            sheet(
+                "text/css",
+                b"@charset \"koi8-r\";a{content:'\xC1'}",
+                Some(WINDOWS_1252)
+            ),
+            ("@charset \"koi8-r\";a{content:'а'}".into(), "KOI8-R")
+        );
+        assert_eq!(
+            sheet(
+                "text/css;charset=windows-1252",
+                b"@charset \"koi8-r\";\xC1",
+                None
+            )
+            .0,
+            "@charset \"koi8-r\";Á"
+        );
+        assert_eq!(
+            sheet("text/css", b"\xFE\xFF\0a", Some(GBK)),
+            ("a".into(), "UTF-16BE")
+        );
+        // Only the exact `@charset "…";` spelling counts.
+        assert_eq!(
+            sheet("text/css", b"@charset 'koi8-r';\xC1", Some(WINDOWS_1252)).1,
+            "windows-1252"
+        );
+        assert_eq!(
+            sheet("text/css", b"@charset  \"koi8-r\";\xC1", Some(WINDOWS_1252)).1,
+            "windows-1252"
+        );
+        assert_eq!(
+            sheet("text/css", b"@charset \"utf-16\";", Some(WINDOWS_1252)).1,
+            "UTF-8"
+        );
+    }
+
+    #[test]
+    fn xhr_responses_decode_with_their_final_encoding() {
+        // XHR #document-response: the final encoding, else the prescan, else
+        // UTF-8, with no later change of encoding.
+        let name = |bytes: &[u8], label| decode_xhr_html(bytes, label).encoding.name();
+        assert_eq!(name(b"<meta charset=koi8-r>\xC1", None), "KOI8-R");
+        assert_eq!(name(b"<p>\xC3\xA9", None), "UTF-8");
+        assert_eq!(name(b"<meta charset=koi8-r>", Some("gbk")), "GBK");
+        assert_eq!(name(b"<meta charset=koi8-r>", Some("bogus")), "KOI8-R");
+        let starts_inside = format!("{}<meta charset=koi8-r>", " ".repeat(PRESCAN_BYTES - 1));
+        assert_eq!(name(starts_inside.as_bytes(), None), "KOI8-R");
+        let after = format!("{}<meta charset=koi8-r>", " ".repeat(PRESCAN_BYTES));
+        assert_eq!(name(after.as_bytes(), None), "UTF-8");
+        assert_eq!(decode_xhr_html(b"<p>\xC1", Some("koi8-r")).text, "<p>а");
+        // XHR #text-response: Encoding #decode accepts the replacement fallback.
+        assert_eq!(
+            decode_with_label(b"abc", Some("iso-2022-kr")).text,
+            "\u{FFFD}"
+        );
+        assert_eq!(decode_with_label(b"", Some("iso-2022-kr")).text, "");
+        assert_eq!(decode_with_label(b"\xE9", Some("bogus")).text, "\u{FFFD}");
+        assert_eq!(decode_with_label(b"\xFF\xFEa\0", Some("koi8-r")).text, "a");
     }
 
     #[test]

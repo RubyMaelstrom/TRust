@@ -1133,6 +1133,9 @@ pub(crate) struct ExternalResource {
     pub cross_origin: Option<String>,
     pub initiator: &'static str,
     pub render_blocking: bool,
+    /// The element's `charset` attribute: a style sheet's environment
+    /// encoding label (HTML #link-type-stylesheet).
+    pub charset: Option<String>,
 }
 
 impl ExternalResource {
@@ -1227,6 +1230,7 @@ pub(crate) fn external_resources_at(
                 cross_origin: dom.attr(node, "crossorigin").map(str::to_string),
                 initiator: "script",
                 render_blocking: blocks(node, false),
+                charset: dom.attr(node, "charset").map(str::to_string),
             });
         }
     }
@@ -1256,6 +1260,7 @@ pub(crate) fn external_resources_at(
             },
             render_blocking: kind == ExternalResourceKind::Sheet && blocks(node, true)
                 || tag == Some("script") && blocks(node, false),
+            charset: dom.attr(node, "charset").map(str::to_string),
         };
         if tag == Some("link")
             && rel_has("stylesheet")
