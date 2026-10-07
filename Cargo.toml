@@ -101,7 +101,7 @@ glsl-lang = { version = "0.8.1", features = ["lexer-full"] }
 glsl-lang-pp = "0.8.1"
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 half = "2.7.1"
-html5ever = "0.39"
+html5ever = "0.40.1"
 # Small pure-Rust HTTP-date parser for RDAP bootstrap cache freshness.
 httpdate = "1.0.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
@@ -253,7 +253,7 @@ wat = "1"
 # stream IDs remain available during cancellation; see PATCHES.md.
 h3-quinn = { path = "vendor/h3-quinn-0.0.10" }
 # HTML enumerated shadowrootmode values match ASCII case-insensitively.
-html5ever = { path = "vendor/html5ever-0.39.0" }
+html5ever = { path = "vendor/html5ever-0.40.1" }
 # Bound eager GLSL macro expansion before intermediate allocations.
 glsl-lang-pp = { path = "vendor/glsl-lang-pp-0.8.1" }
 # Shared Telnet VT engine: owned conformance/resize fixes, see README.trust.txt.

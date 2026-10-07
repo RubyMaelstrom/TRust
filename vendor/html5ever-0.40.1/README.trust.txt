@@ -1,4 +1,4 @@
-html5ever 0.39.0, copied from the crates.io release without dependency updates.
+html5ever 0.40.1, copied from the crates.io release without dependency updates.
 
 TRust patch: match template shadowrootmode keywords ASCII case-insensitively,
 as required by HTML #keywords-and-enumerated-attributes and #parsing-main-inhead.

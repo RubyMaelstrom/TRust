@@ -105,7 +105,7 @@ fn attribute_name_matches(name: &QualName, qualified: &str) -> bool {
                 .and_then(|rest| rest.strip_prefix(':'))
                 == Some(name.local.as_ref())
         }
-        None => name.local.as_ref() == qualified,
+        None => &*name.local == qualified,
     }
 }
 
@@ -3801,8 +3801,8 @@ impl Dom {
                     return false;
                 };
                 if let Some(namespace) = namespace {
-                    (namespace == "*" || name.ns.as_ref() == namespace)
-                        && (qualified == "*" || name.local.as_ref() == qualified)
+                    (namespace == "*" || &*name.ns == namespace)
+                        && (qualified == "*" || &*name.local == qualified)
                 } else {
                     qualified == "*"
                         || attribute_name_matches(
