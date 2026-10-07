@@ -5335,6 +5335,27 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         } else {
             v
         };
+        // CSS Color 4 #currentcolor-color: `currentcolor` in `color` is the
+        // inherited color, so it computes against the parent's color here,
+        // before inheritance: descendants inherit the mixed color instead of
+        // mixing it again with their own parent's.
+        let v = if name == "color" {
+            v.map(|value| {
+                if !value.to_ascii_lowercase().contains("currentcolor")
+                    || find_var_function(&value).is_some()
+                {
+                    return value;
+                }
+                let parent = parent_computed().unwrap_or_else(|| "canvastext".to_owned());
+                if value.trim().eq_ignore_ascii_case("currentcolor") {
+                    parent
+                } else {
+                    replace_css_current_color(&value, &parent)
+                }
+            })
+        } else {
+            v
+        };
         let v = if unit_guard.as_ref().is_some_and(|guard| guard.cyclic()) {
             parent_computed()
         } else {
@@ -5375,7 +5396,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         // CSS Color 4 #css-system-colors and CSS Color 5 #light-dark compute
         // to colors of the element's color scheme, including `color`'s
         // initial CanvasText.
-        match value {
+        let value = match value {
             Some(value) => {
                 Some(color_scheme::resolve(&value, self.color_scheme(id)).unwrap_or(value))
             }
@@ -5384,7 +5405,40 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     .map(String::from)
             }
             None => None,
+        };
+        if name == "color" {
+            return value.map(|value| {
+                self.with_current_color(value, || self.inherited_color(self.style_parent(id), id))
+            });
         }
+        value
+    }
+
+    /// CSS Color 4 #currentcolor-color: in the `color` property, `currentcolor`
+    /// is the inherited color (alone it acts as `inherit`), so a `color` that
+    /// mentions it, as in Tailwind's `color-mix(in oklab, currentcolor 50%,
+    /// transparent)` placeholder, computes against `current()`. CSS Color 5
+    /// #color-mix then mixes absolute colors.
+    fn with_current_color(&self, value: String, current: impl FnOnce() -> String) -> String {
+        if !value.to_ascii_lowercase().contains("currentcolor") {
+            return value;
+        }
+        let current = current();
+        if value.trim().eq_ignore_ascii_case("currentcolor") {
+            return current;
+        }
+        replace_css_current_color(&value, &current)
+    }
+
+    /// The `color` an element (or pseudo-element) inherits from `parent`, or
+    /// for the root the initial CanvasText of `id`'s color scheme.
+    fn inherited_color(&self, parent: Option<NodeId>, id: NodeId) -> String {
+        parent
+            .and_then(|parent| self.computed_value_resolved(parent, "color"))
+            .or_else(|| {
+                color_scheme::system_color("canvastext", self.color_scheme(id)).map(String::from)
+            })
+            .unwrap_or_else(|| "rgb(0, 0, 0)".to_owned())
     }
 }
 
@@ -5965,6 +6019,17 @@ impl Dom {
     /// `color`: `currentcolor` is the element's (for `color`, its parent's)
     /// color, and system colors use the light palette TRust renders with.
     fn cssom_color(&self, id: NodeId, name: &str, color: &str) -> String {
+        // A color function that mentions `currentcolor` resolves with the
+        // element's color (for `color` itself that was already its parent's).
+        if !color.trim().eq_ignore_ascii_case("currentcolor")
+            && color.to_ascii_lowercase().contains("currentcolor")
+        {
+            let current = self.cssom_color(id, name, "currentcolor");
+            let mixed = replace_css_current_color(color, &current);
+            if let Some(resolved) = properties::resolved_color(&mixed) {
+                return resolved;
+            }
+        }
         if color.trim().eq_ignore_ascii_case("currentcolor") {
             return match name {
                 "color" => self
@@ -7521,11 +7586,19 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 .or_else(ua_value)
                 .or_else(|| inherited.then(inherited_value).flatten()),
         };
-        if guard.cyclic() {
+        let value = if guard.cyclic() {
             inherited.then(inherited_value).flatten()
         } else {
             value
+        };
+        if prop == "color" {
+            // The pseudo-element's `currentcolor` is the color it inherits
+            // from its originating element.
+            return value.map(|value| {
+                self.with_current_color(value, || self.inherited_color(Some(id), id))
+            });
         }
+        value
     }
 }
 
@@ -12766,7 +12839,7 @@ fn escape_attr(s: &str) -> Cow<'_, str> {
 /// identifier that merely contains the same bytes. CSS identifiers are ASCII
 /// case-insensitive here; the surrounding SVG markup remains byte-for-byte
 /// unchanged.
-fn replace_css_current_color(input: &str, replacement: &str) -> String {
+pub(crate) fn replace_css_current_color(input: &str, replacement: &str) -> String {
     const NEEDLE: &str = "currentcolor";
     let lower = input.to_ascii_lowercase();
     let is_ident = |byte: Option<u8>| {
@@ -20388,6 +20461,21 @@ pub(crate) fn supports_color_value(value: &str) -> bool {
         // Custom property substitution occurs at computed-value time.
         || find_var_function(value).is_some()
         || crate::render::PaintColor::parse_css(value).is_some()
+        || nested_current_color_is_valid(value, crate::render::PaintColor::parse_css)
+}
+
+/// Whether a color function that mentions `currentcolor` (CSS Color 5
+/// `color-mix(in oklab, currentcolor 50%, transparent)`, `rgb(from
+/// currentcolor r g b)`) is valid. `currentcolor` is a `<color>` anywhere one
+/// is accepted, so any concrete color in its place answers the syntax
+/// question; its value is resolved later, against the element's color.
+pub(crate) fn nested_current_color_is_valid<T>(
+    value: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> bool {
+    value.to_ascii_lowercase().contains("currentcolor")
+        && !value.trim().eq_ignore_ascii_case("currentcolor")
+        && parse(&replace_css_current_color(value, "#000")).is_some()
 }
 
 /// Does a CSS `@media` query list match the viewport (CSS px; `0` = unknown)?
@@ -24953,6 +25041,61 @@ mod tests {
             "(color: lab(0% 0 0)) or (color: #111110)"
         ));
         assert!(supports_condition("(color: white !important)"));
+    }
+
+    #[test]
+    fn current_color_inside_color_functions_resolves_against_the_right_color() {
+        // CSS Color 4 #currentcolor-color and CSS Color 5 #color-mix: in
+        // `color`, currentcolor is the inherited color, resolved before
+        // descendants inherit; elsewhere it is the element's own color.
+        // Tailwind's preflight placeholder uses exactly this form.
+        let dom = Dom::parse_document(
+            "<style>#p::placeholder{color:color-mix(in srgb,currentcolor 50%,transparent)}\
+             @supports (color:color-mix(in srgb,currentcolor,red)){#s{letter-spacing:3px}}</style>\
+             <body style='color:#fff'>\
+             <div id=m style='color:color-mix(in srgb,currentcolor 50%,transparent)'><span><b id=deep>x</b></span></div>\
+             <div id=b style='color:red;border:2px solid color-mix(in srgb,currentcolor 50%,transparent)'>x</div>\
+             <div id=r style='color:rgb(from currentcolor g r b)'>x</div>\
+             <input id=p placeholder=x style='color:#fff'><p id=s>x</p>",
+        );
+        let paint = |value: Option<String>| {
+            value
+                .as_deref()
+                .and_then(crate::render::PaintColor::parse_css)
+        };
+        let id = |name| dom.get_by_id(name).unwrap();
+        let half_white = Some(crate::render::PaintColor::Rgba(255, 255, 255, 128));
+        assert_eq!(
+            paint(dom.computed_value_resolved(id("m"), "color")),
+            half_white
+        );
+        assert_eq!(
+            paint(dom.computed_value_resolved(id("deep"), "color")),
+            half_white,
+            "inherited, not re-mixed"
+        );
+        assert_eq!(
+            dom.computed_value(id("b"), "border-top-style").as_deref(),
+            Some("solid"),
+            "the border shorthand keeps a color-mix() with currentcolor"
+        );
+        assert_eq!(
+            dom.cssom_resolved_value(id("b"), "border-top-color")
+                .as_deref(),
+            Some("color(srgb 1 0 0 / 0.5)")
+        );
+        assert_eq!(
+            paint(dom.computed_value_resolved(id("r"), "color")),
+            Some(crate::render::PaintColor::Rgba(255, 255, 255, 255))
+        );
+        assert_eq!(
+            paint(dom.pseudo_layout_value(id("p"), PseudoEl::Placeholder, "color")),
+            half_white
+        );
+        assert_eq!(
+            dom.computed_value(id("s"), "letter-spacing").as_deref(),
+            Some("3px")
+        );
     }
 
     #[test]

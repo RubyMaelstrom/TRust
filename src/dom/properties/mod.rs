@@ -101,6 +101,7 @@ impl Kind {
 /// color, or `currentcolor`) as the color properties accept it.
 pub(super) fn is_color(text: &str) -> bool {
     values::computed_color(text).is_some()
+        || crate::dom::nested_current_color_is_valid(text, values::computed_color)
 }
 
 /// CSS Conditional 5 #container-lengths: container query length units in a

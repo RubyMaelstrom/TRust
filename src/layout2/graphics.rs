@@ -6921,7 +6921,18 @@ fn resolve_color_for_style(dom: &Dom, style: PaintStyle, value: &str) -> Option<
             .as_deref()
             .and_then(PaintColor::parse_css);
     }
-    PaintColor::parse_css(value)
+    if let Some(color) = PaintColor::parse_css(value) {
+        return Some(color);
+    }
+    // CSS Color 4 #resolving-other-colors / CSS Color 5 #color-mix: a
+    // `currentcolor` nested in a color function (`color-mix(in srgb,
+    // currentcolor 50%, transparent)`) uses the element's own `color`, which
+    // computes to an absolute color.
+    if value.to_ascii_lowercase().contains("currentcolor") {
+        let current = style.value(dom, "color")?;
+        return PaintColor::parse_css(&crate::dom::replace_css_current_color(value, &current));
+    }
+    None
 }
 
 fn border_color(dom: &Dom, style: PaintStyle, side: &str) -> Option<PaintColor> {
