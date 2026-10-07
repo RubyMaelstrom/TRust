@@ -2,6 +2,7 @@
 //! #calc-serialize. Numeric dimensions survive intermediate products; a
 //! length-percentage retains its percentage basis until used-value time.
 use super::*;
+use crate::layout2::value::{MathFn, Rounding};
 
 // length, angle, time, frequency, resolution, flex, percentage
 type Dim = [i8; 7];
@@ -471,21 +472,15 @@ fn function<'i>(
     if name == "calc" {
         return sum(p, ctx, hint, depth);
     }
-    let mut strategy = "nearest".to_string();
-    if name == "round" {
-        if let Ok(value) = p.try_parse(|p| {
+    let mut strategy = Rounding::Nearest;
+    if name == "round"
+        && let Ok(value) = p.try_parse(|p| {
             let value = p.expect_ident_cloned()?;
             p.expect_comma()?;
             Ok::<_, cssparser::BasicParseError>(value)
-        }) {
-            strategy = value.to_ascii_lowercase();
-        }
-        if !matches!(
-            strategy.as_str(),
-            "nearest" | "up" | "down" | "to-zero" | "line-width"
-        ) {
-            return Err(cssparser::ParseError::custom(()));
-        }
+        })
+    {
+        strategy = Rounding::parse(&value).ok_or_else(|| cssparser::ParseError::custom(()))?;
     }
     let mut args = p.parse_comma_separated(|p| {
         if name == "clamp" && p.try_parse(|p| p.expect_ident_matching("none")).is_ok() {
@@ -517,7 +512,7 @@ fn function<'i>(
     let density = ctx
         .dom
         .map_or(1., |dom| f64::from(dom.device_pixel_ratio()).max(0.001));
-    let line_width = name == "round" && strategy == "line-width";
+    let line_width = name == "round" && strategy == Rounding::LineWidth;
     if line_width && args[0].dim != LENGTH {
         return Err(cssparser::ParseError::custom(()));
     }
@@ -551,11 +546,6 @@ fn function<'i>(
     {
         let a = v[0];
         let b = v.get(1).copied().unwrap_or(0.);
-        let radians = if input_dim == ANGLE {
-            a.to_radians()
-        } else {
-            a
-        };
         let n = if v.iter().any(|v| v.is_nan()) {
             f64::NAN
         } else {
@@ -563,77 +553,32 @@ fn function<'i>(
                 "min" => v.iter().copied().fold(f64::INFINITY, f64::min),
                 "max" => v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
                 "clamp" => a.max(b.min(v[2])),
-                "abs" => a.abs(),
-                "sign" => {
-                    if a == 0. {
-                        a
-                    } else {
-                        a.signum()
-                    }
+                _ => {
+                    let degrees = input_dim == ANGLE;
+                    let function = match name {
+                        "round" => MathFn::Round(strategy),
+                        "mod" => MathFn::Mod,
+                        "rem" => MathFn::Rem,
+                        "abs" => MathFn::Abs,
+                        "sign" => MathFn::Sign,
+                        "hypot" => MathFn::Hypot,
+                        "sin" => MathFn::Sin { degrees },
+                        "cos" => MathFn::Cos { degrees },
+                        "tan" => MathFn::Tan { degrees },
+                        "asin" => MathFn::Asin,
+                        "acos" => MathFn::Acos,
+                        "atan" => MathFn::Atan,
+                        "atan2" => MathFn::Atan2,
+                        "pow" => MathFn::Pow,
+                        "sqrt" => MathFn::Sqrt,
+                        "exp" => MathFn::Exp,
+                        "log" => MathFn::Log,
+                        _ => unreachable!(),
+                    };
+                    // A lone `line-width` argument is snapped, not stepped.
+                    let args = if snap_only { &v[..1] } else { &v[..] };
+                    function.eval(args, density)
                 }
-                "hypot" => v.iter().copied().fold(0., f64::hypot),
-                "mod" => {
-                    if b.is_infinite() && a.is_finite() {
-                        if a.is_sign_negative() == b.is_sign_negative() {
-                            a
-                        } else {
-                            f64::NAN
-                        }
-                    } else {
-                        let rem = a % b;
-                        if rem == 0. {
-                            0_f64.copysign(b)
-                        } else if rem.is_sign_negative() != b.is_sign_negative() {
-                            rem + b
-                        } else {
-                            rem
-                        }
-                    }
-                }
-                "rem" => a % b,
-                "round" => {
-                    let result = if snap_only { a } else { round(a, b, &strategy) };
-                    if line_width {
-                        let pixels = result * density;
-                        if pixels == 0. || !pixels.is_finite() {
-                            result
-                        } else {
-                            pixels.signum() * pixels.abs().floor().max(1.) / density
-                        }
-                    } else {
-                        result
-                    }
-                }
-                "sin" => {
-                    if radians.rem_euclid(std::f64::consts::PI) == 0. {
-                        0.
-                    } else {
-                        radians.sin()
-                    }
-                }
-                "cos" => {
-                    if radians.rem_euclid(std::f64::consts::PI) == std::f64::consts::FRAC_PI_2 {
-                        0.
-                    } else {
-                        radians.cos()
-                    }
-                }
-                "tan" => radians.tan(),
-                "asin" => a.asin().to_degrees(),
-                "acos" => a.acos().to_degrees(),
-                "atan" => a.atan().to_degrees(),
-                "atan2" => a.atan2(b).to_degrees(),
-                "pow" => a.powf(b),
-                "sqrt" => a.sqrt(),
-                "exp" => a.exp(),
-                "log" => {
-                    if count == 1 {
-                        a.ln()
-                    } else {
-                        a.log(b)
-                    }
-                }
-                _ => unreachable!(),
             }
         };
         return Ok(Numeric::literal(n, dim, unit(dim)));
@@ -653,7 +598,7 @@ fn function<'i>(
         nodes.pop();
     }
     let name = if name == "round" {
-        nodes.insert(0, Node::Keyword(strategy));
+        nodes.insert(0, Node::Keyword(strategy.keyword().into()));
         "round"
     } else {
         name
@@ -662,36 +607,4 @@ fn function<'i>(
         dim,
         node: Node::Function(name.to_owned(), nodes),
     })
-}
-
-fn round(a: f64, b: f64, strategy: &str) -> f64 {
-    if b == 0. || a.is_infinite() && b.is_infinite() {
-        return f64::NAN;
-    }
-    if a.is_infinite() {
-        return a;
-    }
-    if b.is_infinite() {
-        return match strategy {
-            "up" if a > 0. => f64::INFINITY,
-            "down" if a < 0. => f64::NEG_INFINITY,
-            "line-width" if a != 0. => f64::INFINITY.copysign(a),
-            _ => 0_f64.copysign(a),
-        };
-    }
-    if a % b == 0. {
-        return a;
-    }
-    let q = a / b.abs();
-    let multiple = match strategy {
-        "up" => q.ceil(),
-        "down" => q.floor(),
-        "to-zero" => q.trunc(),
-        _ => (q + 0.5).floor(),
-    };
-    if strategy == "line-width" && multiple == 0. {
-        b.abs().copysign(a)
-    } else {
-        (b.abs() * multiple).copysign(if multiple == 0. { a } else { multiple })
-    }
 }

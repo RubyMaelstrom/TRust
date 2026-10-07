@@ -14563,9 +14563,7 @@ fn font_size_token(t: &str) -> bool {
             | "xxx-large"
             | "larger"
             | "smaller"
-    ) || ["calc(", "min(", "max(", "clamp("]
-        .iter()
-        .any(|prefix| t.starts_with(prefix))
+    ) || crate::layout2::value::is_math_function(t)
         || t.as_bytes()
             .first()
             .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+'))
@@ -14599,10 +14597,7 @@ pub(crate) fn font_size_px_at(
         return None;
     };
     let size = expression.resolve(Some(parent))?;
-    let lower = value.trim().to_ascii_lowercase();
-    let calculation = ["calc(", "min(", "max(", "clamp("]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix));
+    let calculation = crate::layout2::value::is_math_function(value);
     (size.is_finite() && (size >= 0. || calculation)).then_some(size.max(0.))
 }
 
@@ -16489,9 +16484,7 @@ fn background_size_token(token: &str) -> bool {
 
 fn background_length_percentage(token: &str) -> bool {
     token.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
-        || ["calc(", "min(", "max(", "clamp("]
-            .iter()
-            .any(|function| token.starts_with(function))
+        || crate::layout2::value::is_math_function(token)
 }
 
 /// Recognize standard `<image>` functions and reject legacy proprietary
@@ -16718,9 +16711,7 @@ fn parse_line_shorthand<'v>(
             return (None, None, None);
         } else if matches!(lower.as_str(), "thin" | "medium" | "thick")
             || tok.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
-            || ["calc(", "min(", "max(", "clamp("]
-                .iter()
-                .any(|function| lower.starts_with(function))
+            || crate::layout2::value::is_math_function(tok)
         {
             &mut width
         } else if properties::is_color(tok) || crate::render::PaintColor::parse_css(tok).is_some() {
@@ -19182,9 +19173,7 @@ fn legacy_name_alias(name: &str) -> Option<&'static str> {
 /// thickness). Keywords and colors are matched before this is consulted.
 fn decoration_length(token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
-    ["calc(", "min(", "max(", "clamp("]
-        .iter()
-        .any(|function| lower.starts_with(function))
+    crate::layout2::value::is_math_function(token)
         || lower
             .trim_start_matches(['+', '-'])
             .starts_with(|c: char| c.is_ascii_digit() || c == '.')
@@ -19508,9 +19497,7 @@ pub(crate) fn text_stroke_width_px(
         },
     )?
     .resolve(None)?;
-    let calculation = ["calc(", "min(", "max(", "clamp("]
-        .iter()
-        .any(|prefix| value.starts_with(prefix));
+    let calculation = crate::layout2::value::is_math_function(&value);
     (length.is_finite() && (length >= 0. || calculation)).then_some(length.max(0.))
 }
 

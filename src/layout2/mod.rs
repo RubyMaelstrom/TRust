@@ -289,11 +289,10 @@ fn contains_non_math_css_function(value: &str) -> bool {
             }
             if bytes.get(next) == Some(&b'(') {
                 let name = value[start..index].to_ascii_lowercase();
-                // These are the CSS math functions the shared length engine
-                // currently evaluates. Other CSS functions are invalid in a
-                // source-size value; newer math functions fail closed until
-                // their numeric evaluator is available here.
-                if !matches!(name.as_str(), "calc" | "min" | "max" | "clamp") {
+                // The shared length engine evaluates every CSS Values 4 math
+                // function; other CSS functions are invalid in a source-size
+                // value.
+                if !value::is_math_function_name(&name) {
                     return true;
                 }
             }
