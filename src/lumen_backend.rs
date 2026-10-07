@@ -25069,9 +25069,10 @@ mod tests {
             eprintln!("canvas snapshot handoff exercised on hybrid renderer");
         }
 
-        // HTML canvas serialization is still available to the terminal adapter,
-        // and must serialize this page's snapshot, not the newly painted DOM.
-        let old_url = old_image.data_url().unwrap();
+        // The terminal adapter names this page's snapshot, not the newly
+        // painted DOM, and its key resolves to that snapshot's pixels.
+        let old_url = old_image.terminal_url();
+        let old_rgba = old_image.image.rgba.clone();
         let terminal = crate::http::adapt_rendered_terminal(
             &base,
             "text/html",
@@ -25090,7 +25091,9 @@ mod tests {
                 .any(|item| item.image.as_ref() == Some(&old_url)),
             "terminal rows retain their canvas image"
         );
-        assert_ne!(old_url, new_image.data_url().unwrap());
+        let frame = crate::img::registered_canvas_frame(&old_url).unwrap();
+        assert!(frame.ends_with(&old_rgba));
+        assert_ne!(old_url, new_image.terminal_url());
 
         // Resizing replaces the bitmap with transparent black, even when the
         // dimensions are unchanged; retaining the handle must not retain pixels.

@@ -375,10 +375,111 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
         .or_else(|| looks_like_svg(bytes).then_some(SVG_MIME))
 }
 
+/// The media type reported for a canvas presentation frame.
+pub(crate) const CANVAS_FRAME_MIME: &str = "image/x-trust-canvas-frame";
+
+/// A canvas presentation handed to the terminal image pipeline as raw pixels:
+/// a header (magic, a per-process key, width and height as u32 LE, an alpha
+/// flag) and straight-alpha RGBA8 rows. The key keeps network or page bytes
+/// from ever being taken for a frame: only [`canvas_frame`] can build one.
+const CANVAS_FRAME_MAGIC: &[u8; 8] = b"\0TRUSTRF";
+const CANVAS_FRAME_HEADER: usize = 8 + 8 + 4 + 4 + 1;
+
+fn canvas_frame_key() -> [u8; 8] {
+    static KEY: std::sync::LazyLock<[u8; 8]> = std::sync::LazyLock::new(|| {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_usize(&KEY as *const _ as usize);
+        hasher.finish().to_le_bytes()
+    });
+    *KEY
+}
+
+/// Packs a canvas presentation for the terminal image pipeline.
+pub(crate) fn canvas_frame(width: u32, height: u32, has_alpha: bool, rgba: &[u8]) -> Arc<[u8]> {
+    let mut frame = Vec::with_capacity(CANVAS_FRAME_HEADER + rgba.len());
+    frame.extend_from_slice(CANVAS_FRAME_MAGIC);
+    frame.extend_from_slice(&canvas_frame_key());
+    frame.extend_from_slice(&width.to_le_bytes());
+    frame.extend_from_slice(&height.to_le_bytes());
+    frame.push(u8::from(has_alpha));
+    frame.extend_from_slice(rgba);
+    frame.into()
+}
+
+/// The width, height, alpha flag and pixels of a frame built by [`canvas_frame`].
+fn canvas_frame_parts(bytes: &[u8]) -> Option<(u32, u32, bool, &[u8])> {
+    let header = bytes.get(..CANVAS_FRAME_HEADER)?;
+    if &header[..8] != CANVAS_FRAME_MAGIC || header[8..16] != canvas_frame_key() {
+        return None;
+    }
+    let word = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
+    let (width, height) = (word(16), word(20));
+    let pixels = &bytes[CANVAS_FRAME_HEADER..];
+    (pixels.len() as u64 == u64::from(width) * u64::from(height) * 4).then_some((
+        width,
+        height,
+        header[24] != 0,
+        pixels,
+    ))
+}
+
+/// The newest presentation of each live canvas, for `canvas:` image keys.
+/// Canvases present faster than the terminal loads images, so a key resolves
+/// to its canvas's newest frame, never an older one; bounded by canvas count.
+static CANVAS_FRAMES: std::sync::Mutex<Vec<CanvasFrameEntry>> = std::sync::Mutex::new(Vec::new());
+/// A canvas handle, the generation of its newest frame, and that frame.
+type CanvasFrameEntry = (u64, u64, Arc<[u8]>);
+const MAX_CANVAS_FRAMES: usize = 64;
+
+/// Registers a canvas presentation and returns its terminal image key.
+pub(crate) fn register_canvas_frame(
+    handle: u64,
+    generation: u64,
+    frame: impl FnOnce() -> Arc<[u8]>,
+) -> String {
+    let mut frames = CANVAS_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    match frames.iter().position(|(h, _, _)| *h == handle) {
+        Some(index) => {
+            let (_, newest, _) = frames[index];
+            if generation > newest {
+                frames.remove(index);
+                frames.push((handle, generation, frame()));
+            }
+        }
+        None => {
+            if frames.len() >= MAX_CANVAS_FRAMES {
+                frames.remove(0);
+            }
+            frames.push((handle, generation, frame()));
+        }
+    }
+    format!("canvas:{handle:x}/{generation}")
+}
+
+/// The newest frame of the canvas a `canvas:` key names.
+pub(crate) fn registered_canvas_frame(key: &str) -> Option<Arc<[u8]>> {
+    let (handle, _) = key.strip_prefix("canvas:")?.split_once('/')?;
+    let handle = u64::from_str_radix(handle, 16).ok()?;
+    let frames = CANVAS_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    frames
+        .iter()
+        .find(|(h, _, _)| *h == handle)
+        .map(|(_, _, frame)| frame.clone())
+}
+
 /// Return intrinsic image metadata without exposing an SVG renderer tree to the
 /// rest of the app. Raster images retain the existing decode-first behavior;
 /// SVG is parsed in secure static mode and reports its CSS-pixel viewport.
 pub fn info(bytes: &[u8]) -> Result<ImageInfo, String> {
+    if let Some((width, height, has_alpha, _)) = canvas_frame_parts(bytes) {
+        return Ok(ImageInfo {
+            width,
+            height,
+            mime: CANVAS_FRAME_MIME,
+            has_alpha,
+        });
+    }
     if raster_format(bytes).is_some() {
         let (image, mime) = decode_raster(bytes)?;
         return Ok(ImageInfo {
@@ -1551,6 +1652,17 @@ fn decode_for_box(
     crop: bool,
     tint: Option<SvgTint>,
 ) -> Result<(DynamicImage, ImageInfo, bool), String> {
+    if let Some((width, height, has_alpha, pixels)) = canvas_frame_parts(bytes) {
+        let image = image::RgbaImage::from_raw(width, height, pixels.to_vec())
+            .ok_or_else(|| String::from("malformed canvas frame"))?;
+        let info = ImageInfo {
+            width,
+            height,
+            mime: CANVAS_FRAME_MIME,
+            has_alpha,
+        };
+        return Ok((DynamicImage::ImageRgba8(image), info, false));
+    }
     if raster_format(bytes).is_some() {
         let (image, mime) = decode_raster(bytes)?;
         let info = ImageInfo {
@@ -1602,13 +1714,52 @@ pub fn encode_sliced_bytes(
     let source_size = clip.map_or(size, |clip| {
         Size::new(clip.source_width, clip.source_height)
     });
-    let (image, info, svg_fitted) = decode_for_box(bytes, picker, source_size, crop, tint)?;
-    if let Some(clip) = clip {
-        let filter = if pixelated {
-            FilterType::Nearest
-        } else {
-            FilterType::Lanczos3
+    if !pixelated && let Some((width, height, has_alpha, pixels)) = canvas_frame_parts(bytes) {
+        // A canvas is a replaced element whose initial object-fit is fill
+        // (CSS Images 3 §5.5), or cover where the item crops. Scale only the
+        // visible part of its box, exactly, so the slicer neither rescales
+        // nor pads it.
+        let font = picker.font_size();
+        let (cw, ch) = (u32::from(font.width.max(1)), u32::from(font.height.max(1)));
+        let full = (
+            u32::from(source_size.width.max(1)) * cw,
+            u32::from(source_size.height.max(1)) * ch,
+        );
+        let region = clip.map_or((0, 0, full.0, full.1), |clip| {
+            (
+                u32::from(clip.col) * cw,
+                u32::from(clip.row) * ch,
+                u32::from(clip.width) * cw,
+                u32::from(clip.height) * ch,
+            )
+        });
+        if region.2 == 0
+            || region.3 == 0
+            || region.0 + region.2 > full.0
+            || region.1 + region.3 > full.1
+        {
+            return Err("Invalid visible image rectangle".into());
+        }
+        let fitted = fit_canvas_frame((pixels, width, height), full, crop, region);
+        let info = ImageInfo {
+            width,
+            height,
+            mime: CANVAS_FRAME_MIME,
+            has_alpha,
         };
+        return SlicedProtocol::new_with_resize(
+            picker,
+            DynamicImage::ImageRgba8(fitted),
+            size,
+            Resize::Fit(None),
+        )
+        .map(|protocol| (protocol, info))
+        .map_err(|error| error.to_string());
+    }
+    let (image, info, svg_fitted) = decode_for_box(bytes, picker, source_size, crop, tint)?;
+    let live_canvas = info.mime == CANVAS_FRAME_MIME;
+    let filter = scaling_filter(pixelated, live_canvas);
+    if let Some(clip) = clip {
         let font = picker.font_size();
         let fitted = if crop && !svg_fitted {
             image.resize_to_fill(
@@ -1624,8 +1775,138 @@ pub fn encode_sliced_bytes(
             .map(|protocol| (protocol, info))
             .map_err(|error| error.to_string());
     }
-    encode_sliced(picker, image, size, crop && !svg_fitted, pixelated)
+    encode_sliced_with(picker, image, size, crop && !svg_fitted, filter)
         .map(|protocol| (protocol, info))
+}
+
+/// The `region` (x, y, width, height) of a canvas frame fitted to a `full`
+/// pixel box: stretched over it (`object-fit: fill`), or, with `cover`,
+/// scaled to cover it and cropped about its center.
+fn fit_canvas_frame(
+    (pixels, width, height): (&[u8], u32, u32),
+    full: (u32, u32),
+    cover: bool,
+    (x, y, w, h): (u32, u32, u32, u32),
+) -> image::RgbaImage {
+    if !cover || width == 0 || height == 0 {
+        return resample_rgba((pixels, width, height), full, (x, y, w, h));
+    }
+    let scale = (f64::from(full.0) / f64::from(width)).max(f64::from(full.1) / f64::from(height));
+    let scaled = (
+        ((f64::from(width) * scale).ceil() as u32).max(full.0),
+        ((f64::from(height) * scale).ceil() as u32).max(full.1),
+    );
+    let (dx, dy) = ((scaled.0 - full.0) / 2, (scaled.1 - full.1) / 2);
+    resample_rgba((pixels, width, height), scaled, (x + dx, y + dy, w, h))
+}
+
+/// Scales straight-alpha RGBA8 to `size` with a separable triangle filter in
+/// fixed point (bilinear when enlarging; area-weighted when shrinking, the
+/// filter widening with the reduction), like `image`'s `Triangle` but
+/// specialized for RGBA8, so a canvas presenting at animation rates can be
+/// scaled each frame. Only the output `region` (x, y, width, height) is
+/// computed, exactly as a full scale cropped to it.
+fn resample_rgba(
+    (source, src_width, src_height): (&[u8], u32, u32),
+    size: (u32, u32),
+    (x, y, width, height): (u32, u32, u32, u32),
+) -> image::RgbaImage {
+    const ONE: i32 = 1 << 14;
+    if width == 0 || height == 0 || src_width == 0 || src_height == 0 {
+        return image::RgbaImage::new(width, height);
+    }
+    // Per output coordinate in `range`: the first source index and
+    // fixed-point weights summing to ONE.
+    fn taps(src_len: u32, dst_len: u32, range: std::ops::Range<u32>) -> Vec<(usize, Vec<i32>)> {
+        let ratio = f64::from(src_len) / f64::from(dst_len);
+        let support = ratio.max(1.0);
+        range
+            .map(|i| {
+                let center = (f64::from(i) + 0.5) * ratio;
+                let low = ((center - support).floor().max(0.0) as usize).min(src_len as usize - 1);
+                let high = ((center + support).ceil() as usize).clamp(low + 1, src_len as usize);
+                let weights: Vec<f64> = (low..high)
+                    .map(|j| (1.0 - ((j as f64 + 0.5) - center).abs() / support).max(0.0))
+                    .collect();
+                let sum: f64 = weights.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+                let mut fixed: Vec<i32> = weights
+                    .iter()
+                    .map(|w| (w / sum * f64::from(ONE)).round() as i32)
+                    .collect();
+                // Absorb rounding into the largest weight so flat areas stay flat.
+                if let Some(largest) = (0..fixed.len()).max_by_key(|&k| fixed[k]) {
+                    fixed[largest] += ONE - fixed.iter().sum::<i32>();
+                }
+                (low, fixed)
+            })
+            .collect()
+    }
+    let finish = |acc: i32| ((acc + ONE / 2) >> 14).clamp(0, 255) as u8;
+    let src_row = src_width as usize * 4;
+    let dst_row = width as usize * 4;
+    let columns = taps(src_width, size.0, x..x + width);
+    let rows = taps(src_height, size.1, y..y + height);
+    // The source rows the region's output rows read.
+    let first = rows.first().map_or(0, |(start, _)| *start);
+    let last = rows
+        .iter()
+        .map(|(start, w)| start + w.len())
+        .max()
+        .unwrap_or(first);
+    // Horizontal pass of those rows into the region's columns.
+    let mut wide = vec![0u8; dst_row * (last - first)];
+    for (input, output) in source[first * src_row..last * src_row]
+        .chunks_exact(src_row)
+        .zip(wide.chunks_exact_mut(dst_row))
+    {
+        for ((start, weights), pixel) in columns.iter().zip(output.as_chunks_mut::<4>().0) {
+            let mut acc = [0i32; 4];
+            for (k, weight) in weights.iter().enumerate() {
+                let at = (start + k) * 4;
+                for c in 0..4 {
+                    acc[c] += weight * i32::from(input[at + c]);
+                }
+            }
+            for c in 0..4 {
+                pixel[c] = finish(acc[c]);
+            }
+        }
+    }
+    // Vertical pass, one output row at a time over whole input rows.
+    let mut out = vec![0u8; dst_row * height as usize];
+    let mut acc = vec![0i32; dst_row];
+    for ((start, weights), output) in rows.iter().zip(out.chunks_exact_mut(dst_row)) {
+        acc.fill(0);
+        for (k, weight) in weights.iter().enumerate() {
+            let row = start + k - first;
+            for (sum, value) in acc
+                .iter_mut()
+                .zip(&wide[row * dst_row..(row + 1) * dst_row])
+            {
+                *sum += weight * i32::from(*value);
+            }
+        }
+        for (value, sum) in output.iter_mut().zip(&acc) {
+            *value = finish(*sum);
+        }
+    }
+    image::RgbaImage::from_raw(width, height, out)
+        .unwrap_or_else(|| image::RgbaImage::new(width, height))
+}
+
+/// CSS Images 3 §5.4 `image-rendering`: `pixelated` scales with nearest
+/// neighbor so upscaled blocks stay hard-edged (Steam's 41px QR GIF must stay
+/// machine-scannable). For `auto` the algorithm is the user agent's: smooth
+/// Lanczos for images, and bilinear for a live canvas, which presents a new
+/// frame at animation rates.
+fn scaling_filter(pixelated: bool, live_canvas: bool) -> FilterType {
+    if pixelated {
+        FilterType::Nearest
+    } else if live_canvas {
+        FilterType::Triangle
+    } else {
+        FilterType::Lanczos3
+    }
 }
 
 /// Encode an image to fill a panel of `size` cells. `crop` selects the CSS
@@ -1673,14 +1954,16 @@ pub fn encode_sliced(
     crop: bool,
     pixelated: bool,
 ) -> Result<SlicedProtocol, String> {
-    // CSS Images 3 §5.4 `image-rendering: pixelated`: scale with
-    // nearest-neighbor so upscaled blocks stay hard-edged (Steam's 41px QR
-    // GIF must stay machine-scannable); default stays the smooth Lanczos.
-    let filter = if pixelated {
-        FilterType::Nearest
-    } else {
-        FilterType::Lanczos3
-    };
+    encode_sliced_with(picker, image, size, crop, scaling_filter(pixelated, false))
+}
+
+fn encode_sliced_with(
+    picker: &Picker,
+    image: DynamicImage,
+    size: Size,
+    crop: bool,
+    filter: FilterType,
+) -> Result<SlicedProtocol, String> {
     if crop {
         // object-fit: cover — scale to fill the box preserving aspect and crop
         // the overflow, then slice 1:1 (the image already matches the box, so
@@ -1783,16 +2066,18 @@ fn composite_canvas(
     for layer in layers {
         // SVG rasterizes to the box already (`svg_fitted`); a raster decodes at
         // natural size and is fit to its box below.
-        let (image, _info, svg_fitted) =
+        let (image, info, svg_fitted) =
             decode_for_box(layer.bytes, picker, layer.box_cells, layer.crop, tint)?;
         let lw = u32::from(layer.box_cells.width.max(1)) * cw;
         let lh = u32::from(layer.box_cells.height.max(1)) * ch;
-        let filter = if layer.pixelated {
-            FilterType::Nearest
-        } else {
-            FilterType::Lanczos3
-        };
-        let placed: image::RgbaImage = if svg_fitted {
+        let live_canvas = info.mime == CANVAS_FRAME_MIME;
+        let filter = scaling_filter(layer.pixelated, live_canvas);
+        let placed: image::RgbaImage = if live_canvas && !layer.pixelated {
+            // A canvas fills its box (initial object-fit) or covers it.
+            let frame = image.to_rgba8();
+            let source = (frame.as_raw().as_slice(), frame.width(), frame.height());
+            fit_canvas_frame(source, (lw, lh), layer.crop, (0, 0, lw, lh))
+        } else if svg_fitted {
             image.to_rgba8()
         } else if layer.crop {
             // object-fit: cover — fill the box, cropping the overflow.
@@ -1845,6 +2130,82 @@ pub(crate) fn red_png() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canvas_frames_round_trip_and_reject_foreign_bytes() {
+        let frame = canvas_frame(2, 1, true, &[1, 2, 3, 4, 5, 6, 7, 128]);
+        let parsed = info(&frame).unwrap();
+        assert_eq!(
+            (parsed.width, parsed.height, parsed.mime, parsed.has_alpha),
+            (2, 1, CANVAS_FRAME_MIME, true)
+        );
+        // The same container without this process's key is not a frame.
+        let mut foreign = frame.to_vec();
+        foreign[8] ^= 1;
+        assert!(canvas_frame_parts(&foreign).is_none());
+        assert!(info(&foreign).is_err());
+        // Nor is a frame whose pixels do not match its dimensions.
+        assert!(canvas_frame_parts(&frame[..frame.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn canvas_frame_keys_resolve_to_the_newest_frame() {
+        let handle = u64::MAX - 7;
+        let first = register_canvas_frame(handle, 3, || canvas_frame(1, 1, false, &[1, 1, 1, 255]));
+        let second =
+            register_canvas_frame(handle, 4, || canvas_frame(1, 1, false, &[2, 2, 2, 255]));
+        let stale =
+            register_canvas_frame(handle, 2, || unreachable!("an older frame is not stored"));
+        assert_eq!(first, format!("canvas:{handle:x}/3"));
+        for key in [&first, &second, &stale] {
+            let frame = registered_canvas_frame(key).unwrap();
+            assert_eq!(canvas_frame_parts(&frame).unwrap().3, [2, 2, 2, 255]);
+        }
+        assert!(registered_canvas_frame("canvas:zz/1").is_none());
+    }
+
+    #[test]
+    fn canvas_frames_resample_smoothly_to_the_cell_box() {
+        let flat = image::RgbaImage::from_pixel(64, 48, image::Rgba([10, 200, 30, 255]));
+        let source = (flat.as_raw().as_slice(), 64, 48);
+        for (w, h) in [(16, 12), (100, 37), (64, 48), (1, 1)] {
+            let scaled = resample_rgba(source, (w, h), (0, 0, w, h));
+            assert_eq!(scaled.dimensions(), (w, h));
+            assert!(
+                scaled.pixels().all(|p| p.0 == [10, 200, 30, 255]),
+                "{w}x{h}"
+            );
+        }
+        // Shrinking averages the covered source pixels.
+        let ramp = image::RgbaImage::from_fn(8, 1, |x, _| image::Rgba([(x * 32) as u8, 0, 0, 255]));
+        let halved = resample_rgba((ramp.as_raw(), 8, 1), (4, 1), (0, 0, 4, 1));
+        let reds: Vec<u8> = halved.pixels().map(|p| p.0[0]).collect();
+        assert!(reds.windows(2).all(|w| w[0] < w[1]), "{reds:?}");
+        // A region is exactly the crop of the full scale, for each piece.
+        let noise = image::RgbaImage::from_fn(37, 29, |x, y| {
+            image::Rgba([(x * 7 + y * 3) as u8, (x * y) as u8, (x ^ y) as u8, 255])
+        });
+        let noise = (noise.as_raw().as_slice(), 37, 29);
+        let full = resample_rgba(noise, (90, 50), (0, 0, 90, 50));
+        for (x, y, w, h) in [(0, 0, 90, 1), (13, 7, 40, 20), (89, 49, 1, 1)] {
+            let piece = resample_rgba(noise, (90, 50), (x, y, w, h));
+            assert_eq!(
+                piece,
+                image::imageops::crop_imm(&full, x, y, w, h).to_image()
+            );
+        }
+        // Fill stretches; cover scales up and crops to the same box.
+        let square = image::RgbaImage::from_pixel(10, 10, image::Rgba([1, 2, 3, 255]));
+        let square = (square.as_raw().as_slice(), 10, 10);
+        assert_eq!(
+            fit_canvas_frame(square, (30, 12), false, (0, 0, 30, 12)).dimensions(),
+            (30, 12)
+        );
+        assert_eq!(
+            fit_canvas_frame(square, (30, 12), true, (0, 0, 30, 12)).dimensions(),
+            (30, 12)
+        );
+    }
+
     #[test]
     fn damaged_png_data_decodes_the_rows_before_the_damage() {
         // HTML #img-error: only an image whose dimensions cannot be obtained

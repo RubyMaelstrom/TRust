@@ -665,6 +665,7 @@ pub struct CanvasImage {
     pub(crate) generation: u64,
     pub(crate) image: ImageResource,
     encoded: Arc<std::sync::OnceLock<Option<String>>>,
+    terminal_frame: Arc<std::sync::OnceLock<Arc<[u8]>>>,
 }
 
 impl PartialEq for CanvasImage {
@@ -680,7 +681,26 @@ impl CanvasImage {
             generation,
             image,
             encoded: Arc::default(),
+            terminal_frame: Arc::default(),
         }
+    }
+
+    /// The key under which the terminal image pipeline loads this
+    /// presentation's raw pixels (`crate::img::canvas_frame`), so a canvas
+    /// that changes every frame is neither PNG- nor base64-encoded per frame.
+    pub(crate) fn terminal_url(&self) -> String {
+        crate::img::register_canvas_frame(self.handle.0, self.generation, || {
+            self.terminal_frame
+                .get_or_init(|| {
+                    crate::img::canvas_frame(
+                        self.image.width,
+                        self.image.height,
+                        self.image.has_alpha,
+                        &self.image.rgba,
+                    )
+                })
+                .clone()
+        })
     }
 
     /// Serialization remains lazy: only toDataURL/terminal graphics need PNG.
@@ -712,6 +732,7 @@ impl CanvasImage {
                 .get()
                 .and_then(Option::as_ref)
                 .map_or(0, String::capacity)
+            + self.terminal_frame.get().map_or(0, |frame| frame.len())
     }
 }
 
