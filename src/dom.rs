@@ -9862,7 +9862,7 @@ impl Dom {
                 QuirksMode::Quirks => "",
             });
         }
-        self.serialize_node_inner(root, None, false, &mut out);
+        self.serialize_node_inner(root, None, MarkupMode::Layout, &mut out);
         out
     }
 
@@ -9873,9 +9873,19 @@ impl Dom {
     pub fn serialize_js(&self, root: NodeId) -> String {
         self.cached_string(root, 2, || {
             let mut out = String::new();
-            self.serialize_node_inner(root, None, true, &mut out);
+            self.serialize_node_inner(root, None, MarkupMode::Script, &mut out);
             out
         })
+    }
+
+    /// Script-shaped markup (template contents, raw text, every element) with
+    /// the cascaded box style baked into each `style` attribute, for markup
+    /// that leaves its document's style sheets behind, such as a sprite
+    /// sheet's symbols. XML-safe: no `&nbsp;`.
+    fn serialize_baked_markup(&self, root: NodeId) -> String {
+        let mut out = String::new();
+        self.serialize_node_inner(root, None, MarkupMode::BakedScript, &mut out);
+        out
     }
 
     /// JS-facing `innerHTML`: preserves `<template>` content (single caller is
@@ -9884,7 +9894,7 @@ impl Dom {
         self.cached_string(id, 1, || {
             let mut out = String::new();
             for c in self.child_iter(self.content_target(id)) {
-                self.serialize_node_inner(c, None, true, &mut out);
+                self.serialize_node_inner(c, None, MarkupMode::Script, &mut out);
             }
             out
         })
@@ -10728,13 +10738,16 @@ impl Dom {
         &self,
         id: NodeId,
         host: Option<NodeId>,
-        js_serialization: bool,
+        mode: MarkupMode,
         out: &mut String,
     ) {
+        let js_serialization = mode != MarkupMode::Layout;
+        // HTML #serialising-html-fragments exactly, as script observes it.
+        let spec_markup = mode == MarkupMode::Script;
         match &self.nodes[id].data {
             NodeData::Document | NodeData::Fragment => {
                 for c in self.child_iter(id) {
-                    self.serialize_node_inner(c, host, js_serialization, out);
+                    self.serialize_node_inner(c, host, mode, out);
                 }
             }
             NodeData::Doctype(_) => {}
@@ -10754,7 +10767,12 @@ impl Dom {
             // layout pass ignores them.
             NodeData::Comment(t) => {
                 out.push_str("<!--");
-                out.push_str(&t.replace("--", "- -"));
+                if spec_markup {
+                    // HTML #serialising-html-fragments: the comment's data.
+                    out.push_str(t);
+                } else {
+                    out.push_str(&t.replace("--", "- -"));
+                }
                 out.push_str("-->");
             }
             NodeData::Text(t) => {
@@ -10778,6 +10796,8 @@ impl Dom {
                         });
                 if raw_text_parent {
                     out.push_str(t);
+                } else if spec_markup {
+                    out.push_str(&escape_fragment_string(t, false));
                 } else {
                     out.push_str(&escape_text(t));
                 }
@@ -10793,10 +10813,14 @@ impl Dom {
                     if js_serialization {
                         out.push('<');
                         out.push_str(tag);
-                        self.write_attrs(id, attrs, &mut |_, _| None, out);
+                        if spec_markup {
+                            write_serialized_attrs(attrs, out);
+                        } else {
+                            self.write_attrs(id, attrs, &mut |_, _| None, out);
+                        }
                         out.push('>');
                         for c in self.child_iter(self.content_target(id)) {
-                            self.serialize_node_inner(c, host, true, out);
+                            self.serialize_node_inner(c, host, mode, out);
                         }
                         out.push_str("</");
                         out.push_str(tag);
@@ -10827,11 +10851,11 @@ impl Dom {
                             if self.tag_name(child) == Some("body") {
                                 self.write_serialized_frame_body_open(child, out);
                                 for c in self.child_iter(child) {
-                                    self.serialize_node_inner(c, None, js_serialization, out);
+                                    self.serialize_node_inner(c, None, mode, out);
                                 }
                                 out.push_str("</div>");
                             } else {
-                                self.serialize_node_inner(child, None, js_serialization, out);
+                                self.serialize_node_inner(child, None, mode, out);
                             }
                         }
                         out.push_str("</div>");
@@ -10842,7 +10866,7 @@ impl Dom {
                 if !js_serialization && tag == "frameset" {
                     let element = self.write_serialized_frameset_open(id, out);
                     for c in self.child_iter(id) {
-                        self.serialize_node_inner(c, host, js_serialization, out);
+                        self.serialize_node_inner(c, host, mode, out);
                     }
                     out.push_str("</");
                     out.push_str(element);
@@ -10858,7 +10882,7 @@ impl Dom {
                     let assigned = self.slot_assigned(h, self.attr(id, "name"));
                     if assigned.is_empty() {
                         for c in self.child_iter(id) {
-                            self.serialize_node_inner(c, host, js_serialization, out);
+                            self.serialize_node_inner(c, host, mode, out);
                         }
                     } else {
                         for c in assigned.into_iter().flat_map(|c| {
@@ -10868,16 +10892,23 @@ impl Dom {
                                 vec![c]
                             }
                         }) {
-                            self.serialize_node_inner(c, None, js_serialization, out);
+                            self.serialize_node_inner(c, None, mode, out);
                         }
                     }
                     return;
                 }
                 out.push('<');
                 out.push_str(tag);
-                self.write_attrs(id, attrs, &mut |_, _| None, out);
-                if !js_serialization {
-                    self.write_input_presentation(id, out);
+                if spec_markup {
+                    // The element's own attributes only: the baked layout
+                    // declarations and generated-content markers are for
+                    // the re-parsed layout arena, never for script.
+                    write_serialized_attrs(attrs, out);
+                } else {
+                    self.write_attrs(id, attrs, &mut |_, _| None, out);
+                    if !js_serialization {
+                        self.write_input_presentation(id, out);
+                    }
                 }
                 out.push('>');
                 if VOID_ELEMENTS.contains(&tag) {
@@ -10888,11 +10919,11 @@ impl Dom {
                 // composition fidelity).
                 if !js_serialization && let Some(root) = self.shadow_root(id) {
                     for c in self.child_iter(root) {
-                        self.serialize_node_inner(c, Some(id), js_serialization, out);
+                        self.serialize_node_inner(c, Some(id), mode, out);
                     }
                 } else {
                     for c in self.child_iter(id) {
-                        self.serialize_node_inner(c, host, js_serialization, out);
+                        self.serialize_node_inner(c, host, mode, out);
                     }
                 }
                 out.push_str("</");
@@ -12653,6 +12684,72 @@ const SVG_INHERITED_PRESENTATION_PROPERTIES: &[&str] = &[
     "shape-rendering",
 ];
 
+/// Which markup `serialize_node_inner` writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkupMode {
+    /// For the re-parsed layout arena: visible content, baked styles.
+    Layout,
+    /// HTML fragment serialization, as `innerHTML`/`outerHTML` return it.
+    Script,
+    /// `Script`'s node coverage with `Layout`'s baked attributes.
+    BakedScript,
+}
+
+/// HTML #escapingString for fragment serialization: `&`, U+00A0, `<` and
+/// `>`, plus `"` in attribute mode. (`escape_text`/`escape_attr` serve the
+/// layout and XML-bound SVG serializers, where `&nbsp;` is not an entity.)
+fn escape_fragment_string(s: &str, attribute_mode: bool) -> Cow<'_, str> {
+    let escaped = |c: char| matches!(c, '&' | '\u{a0}' | '<' | '>') || attribute_mode && c == '"';
+    if !s.contains(escaped) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '\u{a0}' => out.push_str("&nbsp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' if attribute_mode => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// HTML #serialising-html-fragments: each attribute as U+0020, its
+/// serialized name, `="`, its value escaped in attribute mode, and `"`.
+fn write_serialized_attrs(attrs: &[Attribute], out: &mut String) {
+    for attribute in attrs {
+        let name = &attribute.name;
+        out.push(' ');
+        if name.ns == ns!() {
+            out.push_str(&name.local);
+        } else if name.ns == ns!(xml) {
+            out.push_str("xml:");
+            out.push_str(&name.local);
+        } else if name.ns == ns!(xmlns) {
+            if &*name.local != "xmlns" {
+                out.push_str("xmlns:");
+            }
+            out.push_str(&name.local);
+        } else if name.ns == ns!(xlink) {
+            out.push_str("xlink:");
+            out.push_str(&name.local);
+        } else {
+            // Some other namespace: the attribute's qualified name.
+            if let Some(prefix) = &name.prefix {
+                out.push_str(prefix);
+                out.push(':');
+            }
+            out.push_str(&name.local);
+        }
+        out.push_str("=\"");
+        out.push_str(&escape_fragment_string(&attribute.value, true));
+        out.push('"');
+    }
+}
+
 fn escape_attr(s: &str) -> Cow<'_, str> {
     if !s.contains(['&', '<', '>', '"']) {
         return Cow::Borrowed(s);
@@ -13690,7 +13787,7 @@ fn build_sprite_symbols(text: &str) -> FxHashMap<String, String> {
         let Some(frag) = dom.attr(sym, "id").filter(|s| !s.is_empty()) else {
             continue;
         };
-        out.insert(frag.to_string(), dom.serialize_js(sym));
+        out.insert(frag.to_string(), dom.serialize_baked_markup(sym));
     }
     out
 }
