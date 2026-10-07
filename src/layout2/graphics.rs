@@ -2193,8 +2193,12 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                     ratio,
                 );
                 let inline_border = piece
-                    .replaced_edges
+                    .replaced_box
                     .filter(|_| !builder.replaced_border_boxes.contains_key(&node))
+                    .and_then(|replaced| match replaced {
+                        super::inline::ReplacedBox::Content { .. } => Some(replaced.outsets().0),
+                        super::inline::ReplacedBox::Border { .. } => None,
+                    })
                     .map(|[top, right, bottom, left]| {
                         snap_to_device_pixels(
                             CssRect::new(

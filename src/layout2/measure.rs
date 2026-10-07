@@ -226,12 +226,42 @@ impl Rect {
             y1: r.y + r.height,
         }
     }
+    /// Grows `self` by edge widths (top, right, bottom, left); negative
+    /// widths shrink it.
+    fn outset(self, [top, right, bottom, left]: [f32; 4]) -> Rect {
+        Rect {
+            x0: self.x0 - left,
+            y0: self.y0 - top,
+            x1: self.x1 + right,
+            y1: self.y1 + bottom,
+        }
+    }
+
     fn union(a: Rect, b: Rect) -> Rect {
         Rect {
             x0: a.x0.min(b.x0),
             y0: a.y0.min(b.y0),
             x1: a.x1.max(b.x1),
             y1: a.y1.max(b.y1),
+        }
+    }
+}
+
+/// A line piece's box in physical coordinates.
+fn piece_rect(f: &Frag, line: &LineFrag, p: &super::inline::Piece) -> Rect {
+    if line.sideways {
+        Rect {
+            x0: f.x + f.w - p.y - p.box_height,
+            y0: f.y + p.x,
+            x1: f.x + f.w - p.y,
+            y1: f.y + p.x + p.box_width,
+        }
+    } else {
+        Rect {
+            x0: f.x + p.x,
+            y0: f.y + p.y,
+            x1: f.x + p.x + p.box_width,
+            y1: f.y + p.y + p.box_height,
         }
     }
 }
@@ -293,21 +323,12 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
             if p.item.node == NO_NODE {
                 continue;
             }
-            let r = if line.sideways {
-                Rect {
-                    x0: f.x + f.w - p.y - p.box_height,
-                    y0: f.y + p.x,
-                    x1: f.x + f.w - p.y,
-                    y1: f.y + p.x + p.box_width,
-                }
-            } else {
-                Rect {
-                    x0: f.x + p.x,
-                    y0: f.y + p.y,
-                    x1: f.x + p.x + p.box_width,
-                    y1: f.y + p.y + p.box_height,
-                }
-            };
+            // A replaced element's piece is its content box: CSSOM View
+            // reports its border box (#dom-element-getboundingclientrect).
+            let r = piece_rect(f, line, p);
+            let r = p
+                .replaced_box
+                .map_or(r, |replaced| r.outset(replaced.outsets().0));
             o.nodes.insert(p.item.node);
             add(&mut o.own, p.item.node, r.transformed(transform));
         }
@@ -550,6 +571,28 @@ pub(super) fn client_metrics(
                     (frag.w - left - right).max(0.),
                     (frag.h - top - bottom).max(0.),
                 ]);
+            }
+            // CSSOM View #dom-element-clientwidth returns zero only for an
+            // inline box, which CSS Display 3 defines as non-replaced. An
+            // atomic inline replaced element or control reports its padding
+            // box and border widths like a block.
+            if let FragKind::Line(line) = &frag.kind {
+                for piece in &line.pieces {
+                    let Some(replaced) = piece.replaced_box else {
+                        continue;
+                    };
+                    if piece.item.node == NO_NODE {
+                        continue;
+                    }
+                    let padding = piece_rect(frag, line, piece).outset(replaced.outsets().1);
+                    let [top, _, _, left] = replaced.border();
+                    result.entry(piece.item.node).or_insert([
+                        left,
+                        top,
+                        (padding.x1 - padding.x0).max(0.),
+                        (padding.y1 - padding.y0).max(0.),
+                    ]);
+                }
             }
             if !frag.children.is_empty() {
                 pending.push(frag.children.iter());

@@ -18644,6 +18644,45 @@ mod tests {
     }
 
     #[test]
+    fn client_geometry_measures_atomic_inline_replaced_elements() {
+        // CSSOM View #dom-element-clientwidth returns zero only for an inline
+        // box, which CSS Display 3 defines as non-replaced. Inline canvases,
+        // images and controls report their padding box, and their offset and
+        // client rectangles are border boxes (#dom-htmlelement-offsetwidth).
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><style>html,body{margin:0}</style>
+            <div style="width:300px;height:200px"><canvas id=fill width=1024 height=1024
+                style="width:100%;height:100%"></canvas></div>
+            <canvas id=canvas width=50 height=40 style="padding:4px;border:3px solid"></canvas>
+            <img id=image style="width:40px;height:30px;padding:2px">
+            <input id=field style="width:100px;padding:3px;border:2px solid">"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                const $ = id => document.getElementById(id);
+                const client = e => [e.clientLeft,e.clientTop,e.clientWidth,e.clientHeight].join();
+                const offset = e => [e.offsetWidth,e.offsetHeight,
+                    e.getBoundingClientRect().width,e.getBoundingClientRect().height].join();
+                if(client($('fill'))!=='0,0,300,200') return 'fill '+client($('fill'));
+                if(client($('canvas'))!=='3,3,58,48') return 'canvas '+client($('canvas'));
+                if(offset($('canvas'))!=='64,54,64,54') return 'canvas offset '+offset($('canvas'));
+                if(client($('image'))!=='0,0,44,34') return 'image '+client($('image'));
+                if(offset($('image'))!=='44,34,44,34') return 'image offset '+offset($('image'));
+                const field = $('field');
+                if(field.clientLeft!==2||field.clientTop!==2||field.clientWidth!==106)
+                    return 'field '+client(field);
+                return 'ok';
+            })()"#
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
     fn offset_geometry_static_body_uses_root_border_edge() {
         // CSSWG resolution 2024-10-30 / csswg-drafts#10549 supplements the
         // local CSSOM View offsetTop/Left prose for child-of-root static BODY.

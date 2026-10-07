@@ -6870,8 +6870,8 @@ b</xmp></body>"#;
             </body>"#;
         let dom = Dom::parse_document(html);
         let layout = lay_graphical(html, 800.0, &images);
-        // Block-level boxes are border boxes; an inline image's piece is its
-        // content box, its edges riding the line beside it.
+        // CSSOM View measures border boxes, of block-level and inline images
+        // alike (an inline image's padding rides the line beside its piece).
         let check = |id: &str, (width, height): (f64, f64), why: &str| {
             let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
             assert!(
@@ -6881,13 +6881,13 @@ b</xmp></body>"#;
                 rect.height
             );
         };
-        check("a", (168.0, 210.0), "a 200px border box");
+        check("a", (200.0, 210.0), "a 200px border box");
         check("b", (216.0, 270.0), "fit-content is the natural width");
-        check("c", (216.0, 270.0), "a 248px border box");
+        check("c", (248.0, 270.0), "a 248px border box");
         check("d", (200.0, 210.0), "");
         check("e", (250.0, 272.5), "");
-        check("f", (134.4, 168.0), "a 200px-high border box");
-        check("g", (184.0, 230.0), "a 200x246 border box");
+        check("f", (134.4, 200.0), "a 200px-high border box");
+        check("g", (200.0, 246.0), "a 200x246 border box");
         check("h", (216.0, 270.0), "");
         check("i", (150.0, 147.5), "");
         check("j", (200.0, 210.0), "");
