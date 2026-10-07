@@ -9123,6 +9123,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_inner_html", 1, guarded_inner_html),
     ("__dom_set_inner_html", 2, guarded_set_inner_html),
     ("__dom_outer_html", 1, guarded_outer_html),
+    ("__dom_xml_serialize", 1, guarded_xml_serialize),
     ("__dom_insert_adjacent", 3, guarded_insert_adjacent),
     ("__dom_query", 3, guarded_query),
     ("__dom_elements_by_tag", 3, guarded_elements_by_tag),
@@ -9836,6 +9837,7 @@ node_access_guards! {
     guarded_inner_html = host_inner_html, [0], Invalidate;
     guarded_set_inner_html = host_set_inner_html, [0], Invalidate;
     guarded_outer_html = host_outer_html, [0], Invalidate;
+    guarded_xml_serialize = host_xml_serialize, [0], Invalidate;
     guarded_insert_adjacent = host_insert_adjacent, [0], Invalidate;
     guarded_query = host_query, [0], Invalidate;
     guarded_elements_by_tag = host_elements_by_tag, [0], Invalidate;
@@ -15638,13 +15640,46 @@ fn host_set_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     Ok(Value::Undefined)
 }
 
+/// HTML #fragment-serializing-algorithm-steps with require well-formed true:
+/// the HTML serializer in an HTML document, else the XML serialization (null
+/// when it would not be well-formed; the prelude throws InvalidStateError).
+fn fragment_serialization(
+    dom: &Dom,
+    id: crate::dom::NodeId,
+    html: impl FnOnce() -> String,
+    xml: impl FnOnce() -> Result<String, crate::dom::NotWellFormed>,
+) -> Value {
+    let document = dom.owner_document(id).unwrap_or(id);
+    if dom.document_content_type(document) == "text/html" {
+        Value::from_engine_text(html())
+    } else {
+        xml().map_or(Value::Null, Value::from_engine_text)
+    }
+}
+
 fn host_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    let html = host_arg_node(&dom, args, 0)
-        .map(|id| dom.inner_html(id))
+    Ok(match host_arg_node(&dom, args, 0) {
+        Some(id) => fragment_serialization(
+            &dom,
+            id,
+            || dom.inner_html(id),
+            || dom.xml_fragment_serialization(id, true),
+        ),
+        None => Value::from_engine_text(String::new()),
+    })
+}
+
+/// HTML #dom-xmlserializer-serializetostring: the XML serialization of the
+/// node given require well-formed false.
+fn host_xml_serialize(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let markup = host_arg_node(&dom, args, 0)
+        .and_then(|id| dom.xml_serialization(id, false).ok())
         .unwrap_or_default();
-    Ok(Value::from_engine_text(html))
+    Ok(Value::from_engine_text(markup))
 }
 
 /// HTML §13.5 fragment parsing with the target element as the context. Template markup is directed
@@ -15663,13 +15698,20 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     Ok(Value::Undefined)
 }
 
+/// HTML #dom-element-outerhtml: fragment serializing a fictional parent
+/// whose only child is the element.
 fn host_outer_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
-    let html = host_arg_node(&dom, args, 0)
-        .map(|id| dom.serialize_js(id))
-        .unwrap_or_default();
-    Ok(Value::from_engine_text(html))
+    Ok(match host_arg_node(&dom, args, 0) {
+        Some(id) => fragment_serialization(
+            &dom,
+            id,
+            || dom.serialize_js(id),
+            || dom.xml_serialization(id, true),
+        ),
+        None => Value::from_engine_text(String::new()),
+    })
 }
 
 fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -20048,6 +20090,44 @@ mod tests {
     }
 
     #[test]
+    fn xml_documents_keep_doctypes_and_serialize_namespaces() {
+        // HTML #dom-domparser-parsefromstring ("a new Document") with a
+        // DocumentType node for the XML DOCTYPE; DOM Parsing
+        // #dfn-xml-serialization for XMLSerializer (require well-formed false)
+        // and an XML document's innerHTML/outerHTML getters (HTML
+        // #fragment-serializing-algorithm-steps, require well-formed true).
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const err = f => { try { f(); return 'none'; } catch (e) { return e.name; } };\n\
+                 const ser = n => new XMLSerializer().serializeToString(n);\n\
+                 const doc = new DOMParser().parseFromString('<!DOCTYPE note PUBLIC \"-//X//EN\" \"note.dtd\" \
+                   [<!ENTITY e \"x\">]><note xmlns:x=\"urn:x\" x:a=\"1\" b=\"&quot;&lt;&#9;\"><x:to>T</x:to>\
+                   <![CDATA[a<b]]><?pi d?><!--c--></note>', 'application/xml');\n\
+                 const root = doc.documentElement;\n\
+                 const created = document.implementation.createDocument('urn:a', 'a:root', null);\n\
+                 const child = created.createElementNS('urn:b', 'child');\n\
+                 child.setAttributeNS('urn:c', 'c:at', 'v');\n\
+                 created.documentElement.appendChild(child);\n\
+                 const bad = created.createElement('x');\n\
+                 bad.appendChild(created.createComment('--'));\n\
+                 const html = document.createElement('div');\n\
+                 html.innerHTML = null;\n\
+                 [doc instanceof XMLDocument, doc.doctype.name, doc.doctype.publicId, doc.doctype.systemId,\n\
+                  doc.firstChild === doc.doctype, ser(doc), root.innerHTML, root.outerHTML === ser(root),\n\
+                  ser(created), ser(document.createElement('br')), ser(bad), err(() => bad.outerHTML),\n\
+                  err(() => ser({})), ser(root.attributes[0]), JSON.stringify(html.innerHTML)].join('|')"
+            ),
+            "false|note|-//X//EN|note.dtd|true|<!DOCTYPE note PUBLIC \"-//X//EN\" \"note.dtd\">\
+             <note xmlns:x=\"urn:x\" x:a=\"1\" b=\"&quot;&lt;&#9;\"><x:to>T</x:to><![CDATA[a<b]]>\
+             <?pi d?><!--c--></note>|<x:to xmlns:x=\"urn:x\">T</x:to><![CDATA[a<b]]><?pi d?><!--c-->|\
+             true|<a:root xmlns:a=\"urn:a\"><child xmlns=\"urn:b\" xmlns:c=\"urn:c\" c:at=\"v\"/></a:root>|\
+             <br xmlns=\"http://www.w3.org/1999/xhtml\" />|<x><!------></x>|InvalidStateError|TypeError||\"\""
+        );
+    }
+
+    #[test]
     fn cdata_sections_and_position_constants_follow_dom() {
         // DOM #dom-document-createcdatasection and the Node interface's
         // DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC constant (0x20).
@@ -22591,7 +22671,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 202, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 203, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -22602,7 +22682,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 202);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 203);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

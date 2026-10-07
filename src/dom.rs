@@ -64,6 +64,8 @@ mod svg_dependencies;
 pub(crate) mod svg_geometry;
 mod transitions;
 mod xml;
+mod xml_serialize;
+pub use xml_serialize::NotWellFormed;
 
 pub type NodeId = usize;
 
