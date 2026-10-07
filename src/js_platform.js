@@ -3562,7 +3562,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (const root of replacedRoots) destroyFrameNavigablesIn(root);
         }
         __dom_load_frame(nodeIds.get(frame), String(markup == null ? "" : markup), base,
-            isTextDocumentType(contentType), encoding);
+            isXmlMime(contentType) ? contentType : isTextDocumentType(contentType), encoding);
         for (let i = 0; i < replacedRoots.length; i++)
             syncWrapperSubtreeRetention(nodeIds.get(replacedRoots[i]));
 
@@ -3606,15 +3606,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             /^(?:application|text)\/(?:x-)?(?:ecmascript|javascript)$/.test(type) ||
             /^text\/(?:javascript1\.[0-5]|jscript|livescript)$/.test(type);
     }
-    // `body` is the response's bytes, or text already decoded as UTF-8.
+    // HTML #loading-a-document: an HTML MIME type loads an HTML document, an
+    // XML MIME type (including application/xhtml+xml and image/svg+xml) an
+    // XML document (#read-xml), and the text types a text document. `body`
+    // is the response's bytes, or text already decoded as UTF-8.
     function loadFrameResource(frame, body, contentType, url, generation, referrer = "", navigationTiming = null) {
         const essence = String(contentType || "text/html").split(";", 1)[0].trim().toLowerCase();
-        if (essence === "text/html" || essence === "application/xhtml+xml" || isTextDocumentType(essence)) {
+        if (essence === "text/html" || isXmlMime(essence) || isTextDocumentType(essence)) {
             let text = body, encoding = "UTF-8";
             if (typeof body !== "string") {
                 // HTML #read-html / #read-text: decode with the encoding
                 // sniffing algorithm, whose step 6 lends a same-origin
-                // container document's encoding (HTML #documentEncoding).
+                // container document's encoding (HTML #documentEncoding);
+                // #read-xml: XML's own encoding determination.
                 const container = frameSameOrigin(url, frame)
                     ? __dom_document_encoding(nodeIds.get(frame.ownerDocument)) : null;
                 const decoded = __document_decode(body, String(contentType || "text/html"), url, container);
@@ -7275,6 +7279,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get innerHTML() { return fragmentMarkup(__dom_inner_html(nodeIds.get(this))); }
         set innerHTML(v) {
             v = v === null ? "" : String(v); // [LegacyNullToEmptyString]
+            checkFragmentMarkup(this, v);
             rangesReplaceChildren(this);
             const removedRoots = __dom_children(nodeIds.get(this));
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
@@ -7368,6 +7373,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!parent) return;
             if (parent.nodeType === 9)
                 throw new DOMException("Failed to set the 'outerHTML' property on 'Element': This element's parent is of type '#document'.", "NoModificationAllowedError");
+            if (__dom_insert_adjacent(nodeIds.get(this), "beforebegin", v, true) === false) throw notWellFormedMarkup();
             const prev = this.previousSibling, next = this.nextSibling;
             const before = MO.length ? new Set(__dom_children(nodeIds.get(parent))) : null;
             const index = rangeIndex(this);
@@ -7405,6 +7411,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (p !== "beforebegin" && p !== "afterbegin" && p !== "beforeend" && p !== "afterend")
                 throw new DOMException("Failed to execute 'insertAdjacentHTML': The value provided ('" + p + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.", "SyntaxError");
             const container = (p === "beforebegin" || p === "afterend") ? this.parentNode : this;
+            // HTML #dom-element-insertadjacenthtml: no sibling position exists
+            // without a parent, or beside a Document's document element.
+            if (!container || container.nodeType === 9)
+                throw new DOMException("Failed to execute 'insertAdjacentHTML': The element has no parent element.", "NoModificationAllowedError");
+            h = String(h);
+            if (__dom_insert_adjacent(nodeIds.get(this), p, h, true) === false) throw notWellFormedMarkup();
             if (!MO.length || !container) {
                 __dom_insert_adjacent(nodeIds.get(this), p, String(h));
                 baseHrefCache = null;
@@ -12305,7 +12317,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get visibilityStates() { return ["visible"]; }
         write(...text) { documentWrite(this, text, false); }
         writeln(...text) { documentWrite(this, text, true); }
-        open() {} close() {}
+        // HTML #dom-document-open / #dom-document-close step 1.
+        open() { rejectXMLDocumentWrite(this); return this; }
+        close() { rejectXMLDocumentWrite(this); }
     }
 
     // HTML child navigables have distinct Documents and Window Realms. Their
@@ -12333,16 +12347,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // The content navigable's document element, found live in the arena.
         // Initial about:blank and navigations both install a populated native Document.
         // Lookup remains live for authored removal/replacement of its document element.
+        // DOM #document-element: the Document's element child, whatever its
+        // name (an XML document's root need not be html).
         get documentElement() {
             // The iframe Element belongs to the parent Realm. Calling its
             // `childNodes` getter would therefore manufacture every nested
             // node wrapper with the parent's interface prototypes. Resolve
             // native ids here and wrap them in this Document's Realm instead.
-            const kids = __dom_children(nodeIds.get(this)).map(wrap);
-            for (let i = 0; i < kids.length; i++) {
-                const c = kids[i];
-                if (c.nodeType === 1 && c.localName === "html") return c;
-            }
+            const kids = __dom_children(nodeIds.get(this));
+            for (let i = 0; i < kids.length; i++)
+                if (__dom_node_type(kids[i]) === 1) return wrap(kids[i]);
             return null;
         }
         get head() { return this.documentElement?.querySelector("head") || null; }
@@ -12367,14 +12381,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return parsed ? parsed[0] : fallback;
         }
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
-        open() { const b = this.body; while (b.firstChild) b.removeChild(b.firstChild); return this; }
+        open() { rejectXMLDocumentWrite(this); const b = this.body; while (b && b.firstChild) b.removeChild(b.firstChild); return this; }
         get currentScript() {
             const script = typeof trust.currentScript === "number" ? wrap(trust.currentScript) : null;
             return script && frameOwnerForNode(script) === internalsOf(this).frame ? script : null;
         }
         write(...text) { documentWrite(this, text, false); }
         writeln(...text) { documentWrite(this, text, true); }
-        close() {}
+        close() { rejectXMLDocumentWrite(this); }
         // DOM #concept-node-document is established before custom-element constructors run.
         // Invoke the ordinary Document algorithm with this native child Document, never the
         // top Document: detached nodes and their shadow roots already belong to this realm.
@@ -12562,7 +12576,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             else maybeRunScript(node);
         }
     }
+    // HTML #document-write-steps, #dom-document-open and #dom-document-close:
+    // an XML document's parser cannot be written to, opened or closed.
+    function rejectXMLDocumentWrite(doc) {
+        if (isXmlMime(doc.contentType))
+            throw new DOMException("The operation is not supported for XML documents.", "InvalidStateError");
+    }
     function documentWrite(doc, values, lineFeed) {
+        rejectXMLDocumentWrite(doc);
         let markup = "";
         for (const value of values) markup += String(value);
         if (lineFeed) markup += "\n";
@@ -12617,9 +12638,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return fallback;
     }
+    // HTML #document-base-url of a Document without a browsing context
+    // (DOMParser, createDocument, createHTMLDocument): its first HTML base
+    // element with an href, parsed against the document's URL (its fallback
+    // base URL), else that URL.
+    function detachedDocumentBaseURL(document) {
+        const url = documentURLs.get(document) || "about:blank";
+        const bases = Document.prototype.querySelectorAll.call(document, "base[href]");
+        for (let i = 0; i < bases.length; i++) {
+            if (bases[i].namespaceURI !== HTML_NS) continue;
+            const parsed = __url_parse(bases[i].getAttribute("href"), url);
+            return parsed ? parsed[0] : url;
+        }
+        return url;
+    }
     function nodeBaseHref(node) {
         const document = node && __dom_owner_document(node);
         if (document && typeof document === "object" && internalsOf(document).frame) return document.baseURI;
+        if (document && typeof document === "object" && nodeIds.get(document) !== 0 && documentURLs.get(document) !== undefined)
+            return detachedDocumentBaseURL(document);
         const owner = frameOwnerForNode(node);
         return (owner || null) === (trust.__activeFrame || null)
             ? baseHref() : documentBaseURL(owner);
@@ -13485,18 +13522,36 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get [Symbol.toStringTag]() { return "XMLDocument"; }
     }
     class DOMParser {
+        constructor() { internalsFor(this).domParserGlobal = g; }
         parseFromString(str, type) {
+            // The relevant global of this DOMParser, not the method's Realm.
+            const global = internalsOf(this).domParserGlobal;
+            if (!global) throw new TypeError("Illegal invocation");
             if (arguments.length < 2) throw new TypeError("parseFromString requires two arguments");
             const s = domString(str), t = domString(type);
             if (!["text/html", "text/xml", "application/xml", "application/xhtml+xml", "image/svg+xml"].includes(t))
                 throw new TypeError("Unsupported DOMParser MIME type");
             // HTML #dom-domparser-parsefromstring: "a new Document", not an
-            // XMLDocument, whichever parser the type selects.
+            // XMLDocument, whichever parser the type selects, whose URL is
+            // that of this's relevant global object's associated Document.
             const id = __dom_parse_document(s, t);
             const doc = rememberWrapper(id, new Document(id), false);
-            documentURLs.set(doc, g.document.URL);
+            documentURLs.set(doc, global.document.URL);
             return doc;
         }
+    }
+    // HTML #xml-fragment-parsing-algorithm: markup that is not well-formed
+    // XML (namespace well-formedness included) is a SyntaxError.
+    function notWellFormedMarkup() {
+        return new DOMException("The provided markup is not well-formed XML.", "SyntaxError");
+    }
+    // HTML #fragment-parsing-algorithm-steps: an XML document's fragment
+    // parser fails before the setter changes anything.
+    function checkFragmentMarkup(target, markup, context) {
+        const document = target.nodeType === 9 ? target : target.ownerDocument;
+        if (!document || !isXmlMime(document.contentType)) return;
+        if (__dom_set_inner_html(nodeIds.get(target), markup, true, context === undefined ? undefined
+            : context === null ? null : nodeIds.get(context)) === false) throw notWellFormedMarkup();
     }
     // HTML #fragment-serializing-algorithm-steps: an XML document's markup is
     // null when its XML serialization would not be well-formed.
@@ -13530,6 +13585,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get innerHTML() { return fragmentMarkup(__dom_inner_html(nodeIds.get(this))); }
         set innerHTML(v) {
             v = v === null ? "" : String(v); // [LegacyNullToEmptyString]
+            checkFragmentMarkup(this, v);
             rangesReplaceChildren(this);
             const removedRoots = __dom_children(nodeIds.get(this));
             const removedWrapperIds = snapshotRemovedWrapperSubtrees(this, removedRoots);
@@ -18139,7 +18195,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (this.collapsed) this.setEnd(parent, newOffset);
         }
         surroundContents(node) { this.insertNode(node); }
-        createContextualFragment(html) { const tpl = g.document.createElement("template"); tpl.innerHTML = String(html); return tpl.content; }
+        // HTML #dom-range-createcontextualfragment: parse in the context of
+        // the start node (or its parent element); without one, or for an
+        // HTML document's html element, in a new body element's context.
+        createContextualFragment(html) {
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'createContextualFragment' on 'Range': 1 argument required.");
+            html = domString(html);
+            const node = this.startContainer;
+            const document = node.nodeType === 9 ? node : node.ownerDocument;
+            const type = node.nodeType;
+            let element = type === 1 ? node : type === 3 || type === 4 || type === 8 ? parentElementOf(node) : null;
+            if (element && !isXmlMime(document.contentType) && element.localName === "html" &&
+                element.namespaceURI === HTML_NS) element = null;
+            const fragment = Document.prototype.createDocumentFragment.call(document);
+            checkFragmentMarkup(fragment, html, element);
+            __dom_set_inner_html(nodeIds.get(fragment), html, false, element ? nodeIds.get(element) : null);
+            return fragment;
+        }
         getBoundingClientRect() { return new DOMRect(0, 0, windowViewportDimension("width"), windowViewportDimension("height")); }
         getClientRects() { return createDOMRectList([this.getBoundingClientRect()]); }
         detach() {}

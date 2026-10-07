@@ -127,8 +127,11 @@ impl Dom {
             self.reset_cssom_sheet(id);
         }
     }
+    /// HTML #update-a-style-block: a style sheet exists for a connected
+    /// style element (or stylesheet link), whose shadow-including root is any
+    /// Document, a DOMParser document included (CSSOM #dom-document-stylesheets).
     pub(crate) fn cssom_sheet_source(&self, id: NodeId) -> Option<String> {
-        if !self.is_connected(id) {
+        if !self.is_dom_connected(id) {
             return None;
         }
         let text = match self.tag_name(id)? {

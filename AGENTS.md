@@ -349,6 +349,13 @@ current behavior and limits; consult the governing standards before changing it.
   and `JSTag` are unimplemented: an uncaught Wasm exception reaches JavaScript
   as a `LinkError` instead of an `Exception`, and JavaScript exceptions thrown
   into Wasm trap instead of being catchable.
+- XML MIME types (text/xml, application/xml and any +xml type, including
+  application/xhtml+xml and image/svg+xml) navigate to XML documents built by
+  the XML parser (`src/dom/xml.rs`), in frames and in the page actor; the
+  static pre-script render still parses XHTML as HTML. Fragment parsing in an
+  XML document uses the XML fragment algorithm. Documents without a browsing
+  context (DOMParser, createDocument, createHTMLDocument) parse and serialize
+  with scripting disabled.
 - Import maps cover static/dynamic imports, scopes, blocked specifiers, and
   integrity metadata. Navigation parses nested declarative Shadow DOM and
   shadow-scoped styles; ordinary `innerHTML` and `DOMParser` keep declarations
