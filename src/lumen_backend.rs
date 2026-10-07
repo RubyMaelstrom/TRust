@@ -7726,6 +7726,109 @@ mod desktop {
             assert_eq!(results["distinct"].as_bool(), Some(true), "{results}");
         }
 
+        #[tokio::test]
+        async fn picture_children_are_relevant_mutations_for_their_images() {
+            // WHATWG HTML #reacting-to-dom-mutations (local snapshot e5071a20)
+            // and the img/source HTML element insertion and removing steps:
+            // an img inserted into a picture, a source added to or removed
+            // from it, and a preceding source's srcset change each rerun
+            // "update the image data", so the selected source follows them.
+            use futures::FutureExt as _;
+            let html = r#"<!doctype html><html><body>
+                <button id="keep">keep actor resident</button>
+                <picture id="host"><source id="first" srcset="/source.png"></picture>
+                <output id="result">pending</output>
+                <script>
+                    document.getElementById("keep").addEventListener("click", () => {});
+                    const results = {};
+                    const tests = [];
+                    const name = url => url.slice(url.lastIndexOf("/") + 1);
+                    const loaded = image => new Promise(done => {
+                        image.addEventListener("load", () => done(name(image.currentSrc)), { once: true });
+                    });
+                    // Inserting an img with its own src into a picture selects the source.
+                    const host = document.getElementById("host");
+                    const inserted = new Image();
+                    inserted.src = "/own.png";
+                    host.appendChild(inserted);
+                    tests.push(inserted.decode().then(() => { results.inserted = name(inserted.currentSrc); }));
+
+                    // The WPT image-decode-picture case: a srcset set after insertion.
+                    const picture = document.createElement("picture");
+                    const source = document.createElement("source");
+                    const img = document.createElement("img");
+                    picture.appendChild(source);
+                    picture.appendChild(img);
+                    source.srcset = "/later.png";
+                    tests.push(img.decode().then(
+                        () => { results.later = name(img.currentSrc); },
+                        error => { results.later = "rejected:" + error.name; }));
+
+                    // Removing the source falls back to the img's own src.
+                    tests.push(new Promise(done => {
+                        const fallback = document.createElement("picture");
+                        const only = document.createElement("source");
+                        only.srcset = "/source.png";
+                        const image = new Image();
+                        image.src = "/own.png";
+                        fallback.appendChild(only);
+                        fallback.appendChild(image);
+                        document.body.appendChild(fallback);
+                        loaded(image).then(first => {
+                            results.before = first;
+                            const next = loaded(image);
+                            only.remove();
+                            return next;
+                        }).then(after => { results.after = after; done(); });
+                    }));
+                    Promise.all(tests).then(() => {
+                        document.getElementById("result").textContent = "done " + JSON.stringify(results);
+                    });
+                </script>
+            </body></html>"#;
+            let cache = Arc::new(crate::http::PageCache::default());
+            for path in ["/source.png", "/own.png", "/later.png"] {
+                let url = format!("https://example.com{path}");
+                let response = Arc::new(crate::http::CachedResp {
+                    status: 200,
+                    content_type: String::from("image/png"),
+                    headers: Vec::new(),
+                    body: crate::img::red_png(),
+                    url_list: vec![url::Url::parse(&url).unwrap()],
+                    timing: None,
+                });
+                cache.seed_pending(url, futures::future::ready(Ok(response)).boxed().shared());
+            }
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.cache = cache;
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+            let html = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("done {") => {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("picture fixture failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the picture images loaded"),
+                    }
+                }
+            })
+            .await
+            .expect("picture images did not settle");
+            for expected in [
+                r#""inserted":"source.png""#,
+                r#""later":"later.png""#,
+                r#""before":"source.png""#,
+                r#""after":"own.png""#,
+            ] {
+                assert!(html.contains(expected), "missing {expected}: {html}");
+            }
+        }
+
         #[test]
         fn terminal_actors_report_geometry_in_the_cell_font_they_paint() {
             // CSSOM View geometry comes from the layout fragments. A terminal

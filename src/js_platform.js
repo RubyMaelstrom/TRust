@@ -10697,6 +10697,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return name === "src" || name === "srcset" || name === "sizes" || name === "width" ||
             name === "crossorigin" || name === "referrerpolicy";
     }
+    // HTML #reacting-to-dom-mutations: setting, changing or removing a source
+    // element's srcset, sizes, media, type, width or height attribute is a
+    // relevant mutation for each img in its picture parent that follows it.
+    function pictureSourceAttributeChanged(source, name) {
+        if (name !== "srcset" && name !== "sizes" && name !== "media" && name !== "type" &&
+            name !== "width" && name !== "height") return;
+        if (htmlElementName(source) !== "source") return;
+        const sourceId = nodeIds.get(source);
+        const parentId = __dom_parent(sourceId);
+        if (typeof parentId !== "number" || htmlElementName(wrap(parentId)) !== "picture") return;
+        const children = __dom_children(parentId);
+        let after = false;
+        for (let i = 0; i < children.length; i++) {
+            if (children[i] === sourceId) { after = true; continue; }
+            if (!after) continue;
+            const image = wrap(children[i]);
+            if (image && htmlElementName(image) === "img") {
+                try { updateImageData(image); }
+                catch (e) { trust.errors.push("update the image data: " + ((e && e.message) || e)); }
+            }
+        }
+    }
     function imageInPicture(image) {
         const parent = image.parentNode;
         return !!parent && htmlElementName(parent) === "picture";
@@ -14732,6 +14754,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Changing src/srcdoc re-runs "process the iframe attributes".
         if (n === "src" || n === "srcdoc") { const ln = element.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(element); }
         if (element.localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
+        if (element.localName === "source") pictureSourceAttributeChanged(element, lower);
         if (lower === "loading" && element.localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(element);
         if (lower === "src" && (element.localName === "video" || element.localName === "audio")) loadMediaElement(element);
         if (linkOld !== undefined) linkAttributeChanged(element, lower, linkOld);
@@ -14750,6 +14773,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Removing src/srcdoc re-runs "process the iframe attributes".
         if (n === "src" || n === "srcdoc") { const ln = element.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(element); }
         if (element.localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
+        if (element.localName === "source") pictureSourceAttributeChanged(element, lower);
         // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
         if (lower === "loading" && element.localName === "img") resumeLazyImage(element);
     }
