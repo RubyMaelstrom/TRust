@@ -26782,9 +26782,8 @@ mod tests {
     fn webassembly_memory_survives_resize_through_forged_getters() {
         // ECMA-262 #sec-arraybuffer.prototype.resize reads [[ArrayBufferMaxByteLength]]
         // (an internal slot) and throws for a fixed-length buffer such as Memory.buffer
-        // (JS API #memories). Even if forged `resizable`/`maxByteLength` getters reached
-        // the shared Data Block, Wasm must keep a memory-safe view: accesses stay bounds
-        // checked against the live bytes.
+        // (JS API #memories), so forged `resizable`/`maxByteLength` getters change
+        // nothing and the memory's bytes stay intact and in bounds.
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
             let mut engine = platform_engine();
             engine.set_tier(tier);
@@ -26825,10 +26824,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{tier:?}: {error:?}"));
             let result = string_value(&mut engine, "forgedResizeResult");
-            assert!(
-                result == "rejected|9,9,9" || result == "safe|true,true,true",
-                "tier {tier:?}: {result}"
-            );
+            assert_eq!(result, "rejected|9,9,9", "tier {tier:?}");
         }
     }
 
