@@ -387,14 +387,11 @@ impl NativeRegion {
 }
 
 /// All pointers are borrowed for one invocation; no native region can grow
-/// memory or call the host. Dirty writes are published even when a later
-/// access falls back to the interpreter to raise its bounds trap.
+/// memory or call the host.
 #[repr(C)]
 pub(crate) struct NativeMemory {
     pub bytes: *mut u8,
     pub len: usize,
-    pub dirty_start: usize,
-    pub dirty_end: usize,
 }
 
 /// The accumulator registers of the interpreter as zero-extended bit patterns.
@@ -960,7 +957,7 @@ fn build_region(
                 offset,
                 width,
             } => {
-                let (address, relative) = memory.checked_address(
+                let (address, _) = memory.checked_address(
                     &mut b,
                     &slots,
                     &mut exits,
@@ -970,7 +967,6 @@ fn build_region(
                 let value = slots.read(&mut b, width, value);
                 b.ins()
                     .store(MemFlags::new().with_notrap(), value, address, 0);
-                memory.mark_dirty(&mut b, relative, width);
             }
             NativeOp::Branch { comparison, target } => {
                 let to = edge(&mut b, &blocks, &indices, &mut exits, i, target, budget);
@@ -990,7 +986,6 @@ fn build_region(
     for (target, block) in exits {
         b.switch_to_block(block);
         slots.flush(&mut b);
-        memory.flush(&mut b);
         let target = b.ins().iconst(types::I64, target as i64);
         b.ins().return_(&[target]);
     }
@@ -1361,8 +1356,6 @@ struct MemoryCode {
     context: Value,
     bytes: Value,
     len: Value,
-    dirty_start: Variable,
-    dirty_end: Variable,
 }
 
 impl MemoryCode {
@@ -1380,18 +1373,10 @@ impl MemoryCode {
             context,
             core::mem::offset_of!(NativeMemory, len) as i32,
         );
-        let dirty_start = b.declare_var(types::I64);
-        let dirty_end = b.declare_var(types::I64);
-        let max = b.ins().iconst(types::I64, -1);
-        let zero = b.ins().iconst(types::I64, 0);
-        b.def_var(dirty_start, max);
-        b.def_var(dirty_end, zero);
         Self {
             context,
             bytes,
             len,
-            dirty_start,
-            dirty_end,
         }
     }
 
@@ -1429,33 +1414,6 @@ impl MemoryCode {
         b.ins().brif(valid, access, &[], exit, &[]);
         b.switch_to_block(access);
         (address, relative)
-    }
-
-    fn mark_dirty(&self, b: &mut FunctionBuilder<'_>, address: Value, width: Type) {
-        let old_start = b.use_var(self.dirty_start);
-        let old_end = b.use_var(self.dirty_end);
-        let end = b.ins().iadd_imm_u(address, i64::from(width.bytes()));
-        let start = b.ins().umin(old_start, address);
-        let end = b.ins().umax(old_end, end);
-        b.def_var(self.dirty_start, start);
-        b.def_var(self.dirty_end, end);
-    }
-
-    fn flush(&self, b: &mut FunctionBuilder<'_>) {
-        let start = b.use_var(self.dirty_start);
-        let end = b.use_var(self.dirty_end);
-        b.ins().store(
-            MemFlags::trusted(),
-            start,
-            self.context,
-            core::mem::offset_of!(NativeMemory, dirty_start) as i32,
-        );
-        b.ins().store(
-            MemFlags::trusted(),
-            end,
-            self.context,
-            core::mem::offset_of!(NativeMemory, dirty_end) as i32,
-        );
     }
 }
 

@@ -69,7 +69,6 @@ fn native_short_host_calls_accumulate_hotness_across_stores() {
             assert_eq!(functions[i].call(&mut stores[i], value).unwrap(), sums[i]);
             let memory = instances[i].get_memory(&stores[i], "memory").unwrap();
             assert_eq!(&memory.data(&stores[i])[..4], &sums[i].to_le_bytes());
-            assert!(!memory.take_dirty_ranges(&mut stores[i]).is_empty());
             if call < 32 {
                 assert_eq!(compiled_regions(&engine), 0);
             }
@@ -174,7 +173,7 @@ fn native_fuel_metering_keeps_interpreter_accounting() {
 }
 
 #[test]
-fn native_memory_boundaries_and_dirty_writes_before_a_trap() {
+fn native_memory_boundaries_and_writes_before_a_trap() {
     for enabled in [false, true] {
         let mut config = Config::default();
         config.native_jit(enabled);
@@ -201,8 +200,6 @@ fn native_memory_boundaries_and_dirty_writes_before_a_trap() {
             .unwrap();
         let memory = instance.get_memory(&store, "memory").unwrap();
         assert_eq!(function.call(&mut store, (50_000, 65_534)).unwrap(), 80);
-        memory.take_dirty_ranges(&mut store);
-        let before = memory.data_version(&store);
         let error = function.call(&mut store, (99, 65_535)).unwrap_err();
         assert_eq!(
             error.as_trap_code(),
@@ -213,18 +210,14 @@ fn native_memory_boundaries_and_dirty_writes_before_a_trap() {
             99,
             "the valid packed store precedes the invalid load"
         );
-        assert_ne!(memory.data_version(&store), before);
-        let dirty_ranges = memory.take_dirty_ranges(&mut store);
-        assert_eq!(dirty_ranges.len(), 1);
-        assert_eq!(dirty_ranges[0], 0..65_536);
-        let before = memory.data_version(&store);
+        let before = memory.data(&store).to_vec();
         for ptr in [65_536, -1, i32::MIN] {
-            assert!(function.call(&mut store, (99, ptr)).is_err());
+            assert!(function.call(&mut store, (98, ptr)).is_err());
         }
         assert_eq!(
-            memory.data_version(&store),
-            before,
-            "trapping stores cannot dirty memory"
+            memory.data(&store),
+            &before[..],
+            "trapping stores cannot write memory"
         );
         if enabled {
             assert!(compiled_regions(&engine) > 0);

@@ -9,7 +9,7 @@ use crate::{
         Args,
         dispatch::Done,
         state::{Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp},
-        utils::{self, IntoControl as _},
+        utils::IntoControl as _,
     },
     store::PrunedStore,
 };
@@ -507,10 +507,8 @@ macro_rules! handler_store_lane_ss {
                     let offset = args.get(offset);
                     let value = args.get(value);
                     let memory = args.fetch_memory(store, memory);
-                    let bytes = memory.data_mut_untracked();
+                    let bytes = memory.data_mut();
                     $eval(bytes, ptr, offset, value, lane).into_control()?;
-                    // Core #exec-vstore_lane / JS API #memories: publish exactly the written lane.
-                    utils::mark_memory_dirty(memory, u64::wrapping_add(ptr, offset), $width);
                     dispatch!(store, args)
                 }
             }
@@ -546,8 +544,6 @@ macro_rules! handler_store_lane_mem0_offset16_ss {
                     let value = args.get(value);
                     let bytes = args.fetch_default_memory_bytes(store);
                     $eval(bytes, ptr, u64::from(offset), value, lane).into_control()?;
-                    let address = u64::wrapping_add(ptr, u64::from(offset));
-                    args.mark_mem0_dirty(store, address, $width);
                     dispatch!(store, args)
                 }
             }

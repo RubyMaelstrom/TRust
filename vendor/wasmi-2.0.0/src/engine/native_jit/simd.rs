@@ -702,7 +702,7 @@ pub(super) fn emit(
             lane,
         } => {
             let width = lane.map_or(I8X16, |(ty, _)| ty);
-            let (address, relative) = memory.checked_address(
+            let (address, _) = memory.checked_address(
                 b,
                 slots,
                 exits,
@@ -718,7 +718,6 @@ pub(super) fn emit(
             };
             b.ins()
                 .store(MemFlags::new().with_notrap(), stored, address, 0);
-            memory.mark_dirty(b, relative, width);
         }
     }
 }

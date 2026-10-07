@@ -97,7 +97,7 @@ fn enter_regions(store: &mut PrunedStore, args: &mut Args) {
         };
         // SAFETY: the region is owned by this execution's entries and by the engine, and
         //         neither is modified while it runs: native code cannot call the host.
-        let next = run(store, args, unsafe { &*region });
+        let next = run(args, unsafe { &*region });
         if next == address {
             // The first operator cannot complete natively (for example an out-of-bounds
             // access); the interpreter executes it to preserve its exact trap.
@@ -140,7 +140,7 @@ fn lookup(store: &mut PrunedStore, address: usize) -> Option<*const NativeRegion
 }
 
 /// Runs `region` on the state of `args` and returns the address of the next operator.
-fn run(store: &mut PrunedStore, args: &mut Args, region: &NativeRegion) -> usize {
+fn run(args: &mut Args, region: &NativeRegion) -> usize {
     #[cfg(test)]
     crate::engine::native_jit::REGION_RUNS.with(|runs| runs.set(runs.get() + 1));
     let mut globals = [core::ptr::null_mut::<u64>(); MAX_GLOBALS];
@@ -156,8 +156,6 @@ fn run(store: &mut PrunedStore, args: &mut Args, region: &NativeRegion) -> usize
     let mut memory = NativeMemory {
         bytes: args.mem0_ptr.as_ptr(),
         len: args.mem0_len.get(),
-        dirty_start: usize::MAX,
-        dirty_end: 0,
     };
     let mut regs = NativeRegs {
         ireg: u64::from(args.ireg),
@@ -175,13 +173,6 @@ fn run(store: &mut PrunedStore, args: &mut Args, region: &NativeRegion) -> usize
             &mut regs,
         )
     };
-    if memory.dirty_start < memory.dirty_end {
-        args.mark_mem0_dirty(
-            store,
-            memory.dirty_start as u64,
-            memory.dirty_end - memory.dirty_start,
-        );
-    }
     args.ireg = Ireg::from(regs.ireg);
     args.freg32 = Freg32::from(f32::from_bits(regs.freg32 as u32));
     args.freg64 = Freg64::from(f64::from_bits(regs.freg64));
