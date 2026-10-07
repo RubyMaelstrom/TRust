@@ -359,6 +359,12 @@ current behavior and limits; consult the governing standards before changing it.
 - The default language is US English regardless of OS locale:
   `Accept-Language: en-US,en;q=0.9`, `navigator.language === "en-US"`, and native
   Intl default `en-US`. Explicit locale requests remain supported.
+- Navigated documents are decoded by `src/document_encoding.rs`: HTML's encoding
+  sniffing (BOM, `Content-Type` charset, `<meta>` prescan, a same-origin
+  container's encoding, then the en-US default windows-1252), re-decoding from
+  memory when the tree builder finds a later declaration. Only local files are
+  autodetected, and only as UTF-8. That encoding is `document.characterSet`.
+  Form submission and URL query strings still encode as UTF-8.
 
 ### Local files and persistent state
 

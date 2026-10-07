@@ -529,6 +529,9 @@ pub struct Dom {
     /// HTML's parser selects the mode; omission means DOM's no-quirks default.
     /// Frame document entries use the arena's embedding-frame document root.
     document_modes: FxHashMap<NodeId, QuirksMode>,
+    /// DOM #concept-document-encoding; omission means the UTF-8 default. Only
+    /// a document created from bytes in another encoding needs an entry.
+    document_encodings: FxHashMap<NodeId, &'static encoding_rs::Encoding>,
     /// CSS Fonts 4 #font-fetching-requirements: `@font-face` network sources
     /// the host fetched for this arena, by absolute URL (`None` = failed).
     downloaded_fonts: FxHashMap<String, Option<std::sync::Arc<[u8]>>>,
@@ -1019,6 +1022,7 @@ impl Dom {
             gc_allocation_leases,
             document_content_types,
             document_modes,
+            document_encodings,
             downloaded_fonts,
             font_requests,
             input_values,
@@ -1176,6 +1180,7 @@ impl Dom {
         }
         fixed_map!(document_content_types, (NodeId, String));
         fixed_map!(document_modes, (NodeId, QuirksMode));
+        fixed_map!(document_encodings, (NodeId, &'static encoding_rs::Encoding));
         fixed_map!(downloaded_fonts, (String, Option<std::sync::Arc<[u8]>>));
         for (url, font) in downloaded_fonts {
             bytes = bytes
@@ -1544,6 +1549,7 @@ impl Dom {
             gc_allocation_leases: false,
             document_content_types: FxHashMap::default(),
             document_modes: FxHashMap::default(),
+            document_encodings: FxHashMap::default(),
             downloaded_fonts: FxHashMap::default(),
             font_requests: RefCell::default(),
             input_values: FxHashMap::default(),
@@ -3439,6 +3445,24 @@ impl Dom {
             .get(&doc)
             .map(String::as_str)
             .unwrap_or("text/html")
+    }
+
+    /// DOM #concept-document-encoding of the document `doc`.
+    pub fn document_encoding(&self, doc: NodeId) -> &'static encoding_rs::Encoding {
+        self.document_encodings
+            .get(&doc)
+            .copied()
+            .unwrap_or(encoding_rs::UTF_8)
+    }
+
+    /// Set the encoding a document's bytes were decoded with (HTML
+    /// #documentEncoding, XHR #document-response).
+    pub fn set_document_encoding(&mut self, doc: NodeId, encoding: &'static encoding_rs::Encoding) {
+        if encoding == encoding_rs::UTF_8 {
+            self.document_encodings.remove(&doc);
+        } else {
+            self.document_encodings.insert(doc, encoding);
+        }
     }
 
     pub fn document_mode(&self, doc: NodeId) -> QuirksMode {
@@ -9231,6 +9255,9 @@ impl Dom {
             self.document_modes.insert(copy, self.document_mode(id));
             self.document_content_types
                 .insert(copy, self.document_content_type(id).to_owned());
+            // DOM #concept-node-clone: a document copy keeps its encoding.
+            let encoding = self.document_encoding(id);
+            self.set_document_encoding(copy, encoding);
         } else {
             self.nodes[copy].owner_document = self.nodes[id].owner_document;
         }
