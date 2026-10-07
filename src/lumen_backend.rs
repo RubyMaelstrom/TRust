@@ -22435,6 +22435,37 @@ mod tests {
         }
     }
 
+    /// The memoized element and attribute name validation still lowercases per
+    /// document type (DOM #dom-document-createelement), rejects invalid names
+    /// every time (#valid-element-local-name, #valid-attribute-local-name) and
+    /// stays correct across cache resets.
+    #[test]
+    fn memoized_element_and_attribute_names_keep_validation() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                const out = [];
+                const fresh = document.createElement('div');
+                out.push(document.createElement('DiV').localName, document.createElement('DiV').tagName);
+                let threw = 0;
+                for (let i = 0; i < 3; i++) { try { document.createElement('a b'); } catch (e) { threw += e.name === 'InvalidCharacterError'; } }
+                const xml = document.implementation.createDocument(null, 'root', null);
+                out.push(threw, xml.contentType, xml.createElement('DiV').localName, xml.createElement('DiV').namespaceURI);
+                for (let i = 0; i < 1100; i++) { document.createElement('x-n' + i); fresh.setAttribute('data-n' + i, ''); }
+                out.push(document.createElement('SPAN').localName, xml.createElement('SPAN').localName, document.contentType);
+                let attrThrew = 0;
+                for (let i = 0; i < 3; i++) { try { fresh.setAttribute('a b', '1'); } catch (e) { attrThrew += e.name === 'InvalidCharacterError'; } }
+                fresh.setAttribute('Data-Y', '2');
+                out.push(attrThrew, fresh.getAttribute('data-y'));
+                out.join('|');
+            "#
+            ),
+            "div|DIV|3|application/xml|DiV||span|SPAN|text/html|3|2"
+        );
+    }
+
     #[test]
     fn node_constructors_create_nodes_and_windows_index_child_navigables() {
         // DOM #dom-text-text, #dom-comment-comment and

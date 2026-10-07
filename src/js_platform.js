@@ -5901,6 +5901,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (effects & REMOVE_SLOTS) slotQueueCheck(parent);
         return c;
     }
+    // An element's local name from its internal slots; any other node's
+    // (absent) localName.
+    function nodeLocalName(node) {
+        const name = internalsOf(node).trustLN;
+        return name !== undefined ? name : node.localName;
+    }
     // Node's superclass is EventTarget (DOM #interface-node). The class is
     // declared without `extends` and linked to EventTarget right after it,
     // which gives the same constructor and prototype chains: EventTarget's
@@ -7237,10 +7243,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         setAttribute(n, v) {
             n = String(n); v = String(v);
             // DOM #dom-element-setattribute step 1.
-            if (!VALID_ATTRIBUTE_LOCAL_NAME.test(n))
+            if (!validAttributeLocalName(n))
                 throw new DOMException("The name is not a valid attribute local name.", "InvalidCharacterError");
-            const id = nodeIds.get(this);
-            setAttributeSteps(this, n, v, () => this.getAttribute(n), () => __dom_set_attr(id, n, v));
+            setAttributeSteps(this, n, v, readAttributeByName, writeAttributeByName);
         }
         // DOM #dom-element-setattributens: validate and extract, then set an
         // attribute value by namespace and local name. A null-namespace
@@ -12115,6 +12120,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // DOM #valid-attribute-local-name.
     const VALID_ATTRIBUTE_LOCAL_NAME = /^[^\t\n\f\r \0\/=>]+$/;
+    // DOM #valid-attribute-local-name is a pure function of the string; valid
+    // names are memoized (bounded) like element names (createdElementLocalName).
+    const validAttributeNames = elementNameCache();
+    let validAttributeNameCount = 0;
+    function validAttributeLocalName(name) {
+        if (validAttributeNames.get(name) !== undefined) return true;
+        if (!VALID_ATTRIBUTE_LOCAL_NAME.test(name)) return false;
+        if (++validAttributeNameCount > ELEMENT_NAME_CACHE_LIMIT) {
+            validAttributeNames.clear();
+            validAttributeNameCount = 1;
+        }
+        validAttributeNames.set(name, true);
+        return true;
+    }
     // XML 1.0 (Fifth Edition) §2.3 [5] Name: NameStartChar (NameChar)*.
     const XML_NAME_START = ":A-Z_a-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF" +
         "\u200C\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD\u{10000}-\u{EFFFF}";
@@ -12150,6 +12169,34 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function asciiLower(value) {
         return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+    }
+    // DOM #dom-document-createelement steps 1–2: the local name is `name`,
+    // ASCII-lowercased in an HTML document, and must be a valid element local
+    // name. Both are a pure function of the string, so validated names are
+    // memoized (bounded) instead of running two regular expressions per call.
+    function elementNameCache() {
+        const map = new Map();
+        Object.defineProperty(map, "get", { value: Map.prototype.get });
+        Object.defineProperty(map, "set", { value: Map.prototype.set });
+        Object.defineProperty(map, "clear", { value: Map.prototype.clear });
+        return map;
+    }
+    const ELEMENT_NAME_CACHE_LIMIT = 512;
+    const exactElementNames = elementNameCache(), loweredElementNames = elementNameCache();
+    let exactElementNameCount = 0, loweredElementNameCount = 0;
+    function createdElementLocalName(name, lower) {
+        const cache = lower ? loweredElementNames : exactElementNames;
+        const known = cache.get(name);
+        if (known !== undefined) return known;
+        const localName = lower ? asciiLower(name) : name;
+        if (!VALID_ELEMENT_LOCAL_NAME.test(localName)) {
+            throw new DOMException("The tag name is not a valid element local name.", "InvalidCharacterError");
+        }
+        if (lower) {
+            if (++loweredElementNameCount > ELEMENT_NAME_CACHE_LIMIT) { cache.clear(); loweredElementNameCount = 1; }
+        } else if (++exactElementNameCount > ELEMENT_NAME_CACHE_LIMIT) { cache.clear(); exactElementNameCount = 1; }
+        cache.set(name, localName);
+        return localName;
     }
     // HTML #the-dir-attribute: the ltr, rtl and auto keywords (ASCII
     // case-insensitive); a missing or invalid value has no state and an
@@ -12312,7 +12359,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Window's document is loaded by a navigation's parser. DOMParser,
         // createDocument and createHTMLDocument documents keep the default.
         get readyState() { return this === g.document ? trust.readyState : "complete"; }
-        get contentType() { return documentContentTypes.get(this) || __dom_document_content_type(nodeIds.get(this)); }
+        // DOM #concept-document-content-type is fixed when the Document is
+        // created; createElement reads it on every call, so cache it in the
+        // slots (cleared when the platform records a Window's content type).
+        get contentType() {
+            const cached = internalsOf(this).trustContentType;
+            if (cached !== undefined) return cached;
+            const id = nodeIds.get(this);
+            const type = documentContentTypes.get(this) || __dom_document_content_type(id);
+            if (id !== undefined) internalsFor(this).trustContentType = type;
+            return type;
+        }
         get compatMode() { return __dom_document_quirks(nodeIds.get(this)) ? "BackCompat" : "CSS1Compat"; }
         // DOM #dom-document-characterset: the name of this document's
         // encoding; charset and inputEncoding are its legacy aliases.
@@ -12435,18 +12492,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         createElement(t) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createElement': 1 argument required");
-            const isHTML = this.contentType === "text/html";
-            const localName = isHTML ? asciiLower(domString(t)) : domString(t);
-            if (!VALID_ELEMENT_LOCAL_NAME.test(localName)) {
-                throw new DOMException("The tag name is not a valid element local name.", "InvalidCharacterError");
-            }
-            const namespace = isHTML || this.contentType === "application/xhtml+xml" ? HTML_NS : null;
+            // The contentType getter caches this Document's fixed content type.
+            const knownContentType = internalsOf(this).trustContentType;
+            const contentType = knownContentType !== undefined ? knownContentType : this.contentType;
+            const isHTML = contentType === "text/html";
+            const localName = createdElementLocalName(domString(t), isHTML);
+            const namespace = isHTML || contentType === "application/xhtml+xml" ? HTML_NS : null;
             const el = newElementWrapper(__dom_create_element_ns(namespace || "", "", localName, nodeIds.get(this)), localName, namespace, null);
             // HTML's script-element creation steps give dynamically created
             // scripts a true force-async flag. Setting async (as an IDL or
             // content attribute) clears it; parser-created wrappers never get
             // this marker and therefore default to false.
-            if (el.localName === "script") internalsFor(el).trustForceAsync = true;
+            if (localName === "script") internalsFor(el).trustForceAsync = true;
             const ctor = namespace === HTML_NS ? CE.defs.get(localName) : null;
             if (ctor) upgradeElement(el, ctor);
             return el;
@@ -14826,49 +14883,57 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // current value and `write` changes it in the arena. setAttribute reports
     // the folded name to attributeChangedCallback; setAttributeNS its exact
     // local name.
+    // setAttribute's old-value read and its write; the steps below pass the
+    // element, name and value, which per-call closures used to capture.
+    function readAttributeByName(element, name) { return element.getAttribute(name); }
+    function writeAttributeByName(element, name, value) { __dom_set_attr(nodeIds.get(element), name, value); }
     function setAttributeSteps(element, n, v, read, write, exactName = false) {
         const lower = n.toLowerCase();
+        // The element's own local name (never changes) selects the
+        // element-specific attribute change steps below.
+        const localName = nodeLocalName(element);
         // HTMLScriptElement's force-async flag is cleared whenever its
         // async content attribute is added. Removing it later must not
         // restore force-async (HTML "prepare the script element").
-        if (lower === "async" && element.localName === "script") internalsFor(element).trustForceAsync = false;
-        const old = (internalsFor(element).ceUpgraded || MO.length) ? read() : null;
+        if (lower === "async" && localName === "script") internalsFor(element).trustForceAsync = false;
+        const old = (internalsFor(element).ceUpgraded || MO.length) ? read(element, n) : null;
         const linkOld = (lower === "rel" || lower === "href" || lower === "as") &&
-            element.localName === "link" ? read() : undefined;
-        write();
+            localName === "link" ? read(element, n) : undefined;
+        write(element, n, v);
         attributesChanged(element);
-        if (n === "href" && element.localName === "base") baseHrefCache = null;
+        if (n === "href" && localName === "base") baseHrefCache = null;
         ceAttrChanged(element, exactName ? n : lower, old, v);
         moAttr(element, n, old);
         // DOM §4.2.2.4: changing a light child's `slot`, or a slot's
         // `name`, can change the assigned-node lists and must signal the
         // affected slots at the next microtask checkpoint.
-        if (lower === "slot" || (lower === "name" && element.localName === "slot")) slotQueueCheck(element.parentNode || element);
+        if (lower === "slot" || (lower === "name" && localName === "slot")) slotQueueCheck(element.parentNode || element);
         // Changing src/srcdoc re-runs "process the iframe attributes".
-        if (n === "src" || n === "srcdoc") { const ln = element.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(element); }
-        if (element.localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
-        if (element.localName === "source") pictureSourceAttributeChanged(element, lower);
-        if (lower === "loading" && element.localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(element);
-        if (lower === "src" && (element.localName === "video" || element.localName === "audio")) loadMediaElement(element);
+        if (n === "src" || n === "srcdoc") { if (localName === "iframe" || localName === "frame") queueFrameNavigation(element); }
+        if (localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
+        if (localName === "source") pictureSourceAttributeChanged(element, lower);
+        if (lower === "loading" && localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(element);
+        if (lower === "src" && (localName === "video" || localName === "audio")) loadMediaElement(element);
         if (linkOld !== undefined) linkAttributeChanged(element, lower, linkOld);
     }
     // The removal counterpart of setAttributeSteps; `remove` detaches the
     // attribute's Attr node and removes the attribute from the arena.
     function removeAttributeSteps(element, n, read, remove, exactName = false) {
         const lower = n.toLowerCase();
+        const localName = nodeLocalName(element);
         const old = (internalsFor(element).ceUpgraded || MO.length) ? read() : null;
         remove();
         attributesChanged(element);
-        if (n === "href" && element.localName === "base") baseHrefCache = null;
+        if (n === "href" && localName === "base") baseHrefCache = null;
         ceAttrChanged(element, exactName ? n : lower, old, null);
         moAttr(element, n, old);
-        if (lower === "slot" || (lower === "name" && element.localName === "slot")) slotQueueCheck(element.parentNode || element);
+        if (lower === "slot" || (lower === "name" && localName === "slot")) slotQueueCheck(element.parentNode || element);
         // Removing src/srcdoc re-runs "process the iframe attributes".
-        if (n === "src" || n === "srcdoc") { const ln = element.localName; if (ln === "iframe" || ln === "frame") queueFrameNavigation(element); }
-        if (element.localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
-        if (element.localName === "source") pictureSourceAttributeChanged(element, lower);
+        if (n === "src" || n === "srcdoc") { if (localName === "iframe" || localName === "frame") queueFrameNavigation(element); }
+        if (localName === "img" && imageRelevantAttribute(lower)) updateImageData(element);
+        if (localName === "source") pictureSourceAttributeChanged(element, lower);
         // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
-        if (lower === "loading" && element.localName === "img") resumeLazyImage(element);
+        if (lower === "loading" && localName === "img") resumeLazyImage(element);
     }
     // Attributes changed: drop the getAttribute read cache, and refresh the
     // [SameObject] NamedNodeMap (DOM §4.9.1, a live collection) so a caller
@@ -16977,6 +17042,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         g.document = internalsOf(realmRootFrame).contentDoc;
         documentReferrers.set(g.document, referrer);
         documentContentTypes.set(g.document, contentType);
+        internalsFor(g.document).trustContentType = undefined;
         cfg.url = String(url);
         cfg.aboutBaseURL = aboutBaseURL;
         updateLoc(url);
