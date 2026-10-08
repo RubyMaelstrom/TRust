@@ -53,6 +53,24 @@ and [worker settings](https://html.spec.whatwg.org/multipage/workers.html),
 [CSSOM View mouse coordinates](https://drafts.csswg.org/cssom-view-1/#extensions-to-the-mouseevent-interface),
 and [Fetch](https://fetch.spec.whatwg.org/#fetch-method).
 
+### XMLHttpRequest and WebSocket in windows and workers
+
+The XHR and WebSocket interfaces are shared by Window and Worker realms. Their
+conformance fixtures run in a Window and in a dedicated worker; the WebSocket
+round trip negotiates a subprotocol with a loopback server and checks ordered
+open/message/drain/close tasks in both realms:
+
+```sh
+cargo test --release --lib xhr_
+cargo test --release --lib websocket
+```
+
+`TRUST_TRACE_FETCH` and `TRUST_WS_DIAG` also trace worker requests and
+connections. They implement the local
+[XMLHttpRequest](https://xhr.spec.whatwg.org/) (whatwg/xhr@c3476b4) and
+[WebSockets](https://websockets.spec.whatwg.org/) (whatwg/websockets@9879e5c)
+snapshots.
+
 ### Worker performance timelines
 
 Workers use the shared User Timing, Resource Timing, and PerformanceObserver

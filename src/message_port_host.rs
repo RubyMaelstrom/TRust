@@ -51,6 +51,10 @@ struct Endpoint {
     peer: Option<u64>,
     enabled: bool,
     messages: VecDeque<(u64, String)>,
+    /// HTML #broadcasting-to-other-browsing-contexts: a BroadcastChannel's
+    /// storage key and channel name. Such an endpoint has no peer, is always
+    /// enabled and receives every other same-key channel's messages.
+    broadcast: Option<String>,
 }
 
 #[derive(Default)]
@@ -172,12 +176,68 @@ impl Registry {
                             peer: Some(peer),
                             enabled: false,
                             messages: VecDeque::new(),
+                            broadcast: None,
                         },
                     );
                 }
                 Ok(json!([a, b]))
             }
             "has" => Ok(json!(self.ready(owner).is_some())),
+            "broadcast-open" => {
+                if self.ports.len() + 1 > MAX_PORTS {
+                    return Err("BroadcastChannel limit exceeded");
+                }
+                let id = self.next_id + 1;
+                self.next_id = id;
+                self.ports.insert(
+                    id,
+                    Endpoint {
+                        owner: Some(owner),
+                        transfer_key: None,
+                        wake,
+                        peer: None,
+                        enabled: true,
+                        messages: VecDeque::new(),
+                        broadcast: Some(payload),
+                    },
+                );
+                Ok(json!(id))
+            }
+            "broadcast-post" => {
+                // Every other open channel with the same storage key and name,
+                // in creation order; each agent drains its queues in sequence.
+                let Some(key) = self
+                    .ports
+                    .get(&id)
+                    .filter(|port| port.owner.is_some_and(|held| held.agent == owner.agent))
+                    .and_then(|port| port.broadcast.clone())
+                else {
+                    return Ok(json!(false));
+                };
+                let mut destinations: Vec<u64> = self
+                    .ports
+                    .iter()
+                    .filter(|(other, port)| **other != id && port.broadcast.as_ref() == Some(&key))
+                    .map(|(&other, _)| other)
+                    .collect();
+                destinations.sort_unstable();
+                let needed = payload.len().saturating_mul(destinations.len());
+                if needed > MAX_QUEUED_BYTES.saturating_sub(self.queued_bytes) {
+                    return Err("BroadcastChannel queue limit exceeded");
+                }
+                for destination in destinations {
+                    self.queued_bytes += payload.len();
+                    self.sequence += 1;
+                    let sequence = self.sequence;
+                    let port = self.ports.get_mut(&destination).unwrap();
+                    let notify = port.messages.is_empty();
+                    port.messages.push_back((sequence, payload.clone()));
+                    if notify {
+                        port.wake.notify();
+                    }
+                }
+                Ok(json!(true))
+            }
             "take" => {
                 let Some(id) = self.ready(owner) else {
                     return Ok(serde_json::Value::Null);
@@ -251,6 +311,18 @@ impl Registry {
                         }
                         Ok(json!(true))
                     }
+                    // A closed BroadcastChannel stops receiving, including
+                    // messages already queued for it.
+                    "broadcast-close" if port.broadcast.is_some() => {
+                        if let Some(port) = self.ports.remove(&id) {
+                            self.queued_bytes -= port
+                                .messages
+                                .iter()
+                                .map(|(_, message)| message.len())
+                                .sum::<usize>();
+                        }
+                        Ok(json!(true))
+                    }
                     "close" => {
                         let peer = port.peer.take();
                         if let Some(peer) = peer.and_then(|peer| self.ports.get_mut(&peer)) {
@@ -271,7 +343,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let id = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     let payload = if op == "receive" {
         host_arg_string(ctx, args, 1)
-    } else if op == "send" {
+    } else if matches!(op.as_str(), "send" | "broadcast-open" | "broadcast-post") {
         host_arg_string(ctx, args, 2)
     } else {
         String::new()

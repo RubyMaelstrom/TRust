@@ -27,9 +27,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     // --- the real-time event-loop core (driven by the Rust worker thread) ---
     var WK = {
-        timers: [], ids: new Set(), nextId: 1, nowMs: 0, activeNesting: 0, errors: [],
+        timers: [], ids: new Set(), nextId: 1, nowMs: 0, clockAt: null, activeNesting: 0, errors: [],
         now: function () { return this.nowMs; },
-        advanceClock: function (now) { this.nowMs = Math.max(this.nowMs, now); },
+        // The loop sets the clock when a task starts; currentTime() adds the
+        // time the task has run since, so a timer started mid-task waits its
+        // whole timeout (HTML #timer-initialisation-steps "startTime").
+        advanceClock: function (now) { this.nowMs = Math.max(this.nowMs, now); this.clockAt = perfClock(); },
         nextDeadline: function () {
             var min = null;
             for (var i = 0; i < this.timers.length; i++) { var a = this.timers[i].at; if (min === null || a < min) min = a; }
@@ -50,7 +53,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             this.timers.splice(this.timers.indexOf(due), 1);
             var previousNesting = this.activeNesting;
             this.activeNesting = due.nesting;
-            try { due.fn.apply(g, due.args); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
+            try { due.fn.apply(g, due.args); } catch (e) { reportException(e); }
             finally { this.activeNesting = previousNesting; }
             if (due.interval && this.ids.has(due.id)) {
                 addTimer(due.fn, due.timeout, due.args, true, due.id, due.nesting);
@@ -92,8 +95,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         runBitmapTask: function () { if (!bitmapTasks.length) return false; bitmapTasks.shift()(); return true; },
         hasPortTask: function () { return portAPI.hasTask(); },
         runPortTask: function () { return portAPI.runTask(); },
-        takeErrors: function () { var e = this.errors; this.errors = []; return e.join("\u001e"); }
+        takeErrors: function () { var e = this.errors; this.errors = []; return e.join("\u001e"); },
+        // Console lines for the owner's developer console, drained after each task.
+        consoleLines: [],
+        takeConsole: function () { var lines = this.consoleLines; this.consoleLines = []; return lines.join("\u001e"); },
+        // HTML #notify-about-rejected-promises (the shared rejection block).
+        notifyRejectedPromises: function (list) { if (rejectionAPI) rejectionAPI.notify(list); }
     };
+    var rejectionAPI = null;
+    var workerClosing = false;
     // The worker loop's control object stays private: the native host and the
     // shared platform blocks reach it through the host-rooted WeakMap keyed by
     // this WorkerGlobalScope, never through a global property.
@@ -108,7 +118,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (typeof handler === "function") return handler;
         if (typeof handler === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
         var source = String(handler);
-        return function () { return (0, eval)(source); };
+        // HTML #timer-initialisation-steps: create and run a classic script
+        // (a Script, not indirect eval code), with the API base URL.
+        return function () { __classic_script_run(source, lp[0]); };
     }
     function timerTimeout(value) {
         var number = Number(value);
@@ -127,9 +139,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         parentNesting = parentNesting === undefined ? WK.activeNesting : parentNesting;
         var id = previousId === undefined ? WK.nextId++ : previousId;
         WK.ids.add(id);
-        WK.timers.push({ id: id, at: WK.nowMs + timerDelay(timeout, parentNesting), timeout: timeout,
+        WK.timers.push({ id: id, at: currentTime() + timerDelay(timeout, parentNesting), timeout: timeout,
                          fn: fn, args: args || [], interval: !!interval, nesting: parentNesting + 1 });
         return id;
+    }
+    // The worker's current time on the loop's clock.
+    function currentTime() {
+        return WK.clockAt === null ? WK.nowMs : WK.nowMs + Math.max(0, perfClock() - WK.clockAt);
     }
     function removeTimer(id) {
         id = Number(id) | 0;
@@ -210,7 +226,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     if (entry.once) removeListener.call(target, state.type, entry.fn, {capture:entry.capture});
                     state.passive = entry.passive;
                     try { (typeof entry.fn === "function") ? entry.fn.call(target, ev) : entry.fn.handleEvent(ev); }
-                    catch (e) { WK.errors.push(errStr(state.type + " handler", e)); }
+                    // DOM #concept-event-listener-inner-invoke reports the exception.
+                    catch (e) { reportException(e, state.type + " handler"); }
                     finally { state.passive = false; }
                     if (state.immediate) break;
                 }
@@ -273,14 +290,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     for (const [name,value] of [['NONE',0],['CAPTURING_PHASE',1],['AT_TARGET',2],['BUBBLING_PHASE',3]]) {
         scopeDefine(Event,name,{value,enumerable:true}); scopeDefine(Event.prototype,name,{value,enumerable:true});
     }
-    function MessageEvent(type, init) { if(!new.target)throw new TypeError('MessageEvent requires construction'); initializeScopeEvent(this,type,init,arguments.length); init = init || {}; this.data = init.data; this.origin = init.origin || ""; this.lastEventId = init.lastEventId || ""; this.source = init.source || null; this.ports = init.ports || []; }
-    MessageEvent.prototype = Object.create(Event.prototype);
-    function ErrorEvent(type, init) { if(!new.target)throw new TypeError('ErrorEvent requires construction'); initializeScopeEvent(this,type,init,arguments.length); init = init || {}; this.message = init.message || ""; this.filename = init.filename || ""; this.lineno = init.lineno || 0; this.colno = init.colno || 0; this.error = init.error || null; }
-    ErrorEvent.prototype = Object.create(Event.prototype);
-    g.Event = Event; g.MessageEvent = MessageEvent; g.ErrorEvent = ErrorEvent;
+    g.Event = Event;
     g.CustomEvent = function CustomEvent(type, init) { if(!new.target)throw new TypeError('CustomEvent requires construction'); initializeScopeEvent(this,type,init,arguments.length); this.detail = (init && init.detail !== undefined) ? init.detail : null; };
     g.CustomEvent.prototype = Object.create(Event.prototype);
-    for (const C of [Event,MessageEvent,ErrorEvent,g.CustomEvent]) {
+    // MessageEvent, ErrorEvent and CloseEvent: the shared HTML_EVENTS block.
+    // A worker has no WindowProxy; its MessageEventSource is a MessagePort.
+    let messagePortBrand = null;
+    g.__html_events_ports = function (brand) { messagePortBrand = brand; };
+    g.__html_events_adapter = {
+        Event,
+        isMessageEventSource(value) { return !!(messagePortBrand && messagePortBrand(value)); },
+        isMessagePort(value) { return !!(messagePortBrand && messagePortBrand(value)); },
+        dispatching(event) { return scopeEventState(event).dispatching; },
+    };
+    /*__HTML_EVENTS_SHARED__*/
+    const htmlEventsAPI = g.__html_events_api;
+    delete g.__html_events_api;
+    const MessageEvent = htmlEventsAPI.MessageEvent, ErrorEvent = htmlEventsAPI.ErrorEvent;
+    const CloseEvent = htmlEventsAPI.CloseEvent;
+    for (const C of [Event,g.CustomEvent]) {
         scopeDefine(C,'length',{value:1,configurable:true});
         scopeDefine(C.prototype,'constructor',{value:C,writable:true,configurable:true});
         scopeDefine(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
@@ -297,23 +325,74 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // event listener registration order relative to addEventListener().
     // SharedWorkerGlobalScope has onconnect instead of DedicatedWorkerGlobalScope's
     // onmessage/onmessageerror (HTML #shared-workers-and-the-sharedworkerglobalscope-interface).
-    (cfg.shared ? ["connect", "error"] : ["message", "messageerror", "error"]).forEach(function (type) {
-        var callback = null, wrapper = null;
+    // WorkerGlobalScope adds onerror, onlanguagechange, onoffline, ononline,
+    // onrejectionhandled and onunhandledrejection (HTML #the-workerglobalscope-common-interface).
+    (cfg.shared ? ["connect"] : ["message", "messageerror"]).concat(["error", "languagechange", "offline", "online",
+        "rejectionhandled", "unhandledrejection"]).forEach(function (type) {
+        // HTML #event-handler-attributes: [LegacyTreatNonObjectAsNull]
+        // EventHandler; activation appends one listener that keeps its place.
+        var callback = null, listener = null;
         Object.defineProperty(g, "on" + type, {
             configurable: true, enumerable: true,
             get: function () { return callback; },
             set: function (value) {
-                if (wrapper) g.removeEventListener(type, wrapper);
-                callback = (typeof value === "function" || (value && typeof value.handleEvent === "function")) ? value : null;
-                wrapper = callback && function (event) {
-                    return typeof callback === "function" ? callback.call(g, event) : callback.handleEvent(event);
-                };
-                if (wrapper) g.addEventListener(type, wrapper);
+                callback = (typeof value === "object" && value !== null) || typeof value === "function" ? value : null;
+                if (callback === null) {
+                    if (listener) g.removeEventListener(type, listener);
+                    listener = null;
+                } else if (!listener) {
+                    listener = function (event) { processEventHandler(callback, event); };
+                    g.addEventListener(type, listener);
+                }
             }
         });
     });
+    // HTML #the-event-handler-processing-algorithm: an ErrorEvent "error" at
+    // the global calls onerror with (message, source, lineno, colno, error),
+    // and true cancels it; any other handler cancels by returning false.
+    function processEventHandler(callback, event) {
+        if (typeof callback !== "function") return;
+        var special = event.type === "error" && htmlEventsAPI.isErrorEvent(event);
+        var returnValue = special
+            ? callback.call(g, event.message, event.filename, event.lineno, event.colno, event.error)
+            : callback.call(g, event);
+        if (special ? returnValue === true : returnValue === false) event.preventDefault();
+    }
+    // HTML #report-an-exception for a worker global. An unhandled report of a
+    // dedicated worker goes on to the Worker object in its owner (the host
+    // forwards the record); a shared worker keeps it (#run-a-worker).
+    var errorReportingMode = false;
+    function reportException(exception, label) {
+        var info = htmlEventsAPI.errorInformation(exception);
+        var notHandled = true;
+        if (!errorReportingMode) {
+            errorReportingMode = true;
+            try {
+                notHandled = dispatchScopeEvent(trustedScopeEvent(ErrorEvent, "error", {cancelable: true,
+                    message: info.message, filename: info.filename, lineno: info.lineno, colno: info.colno,
+                    error: info.error}), true);
+            } finally { errorReportingMode = false; }
+        }
+        if (!notHandled) return;
+        if (cfg.shared) {
+            WK.consoleLines.push(label ? errStr(label, exception)
+                : info.message + (info.filename ? " at " + info.filename + ":" + info.lineno + ":" + info.colno : ""));
+            return;
+        }
+        // The owner's console also receives this worker's diagnostic line.
+        if (label) WK.consoleLines.push(errStr(label, exception));
+        WK.errors.push("\u0001error " + JSON.stringify({message: info.message, filename: info.filename,
+            lineno: info.lineno, colno: info.colno}));
+    }
+    WK.reportException = reportException;
+    // HTML #dom-reporterror.
+    Object.defineProperty(g, "reportError", {writable: true, enumerable: true, configurable: true,
+        value: {reportError(e) {
+            if (arguments.length < 1) throw new TypeError("reportError requires 1 argument");
+            reportException(e);
+        }}.reportError});
 
-    if (!g.DOMException) { g.DOMException = function (message, name) { var e = new Error(message || ""); e.name = name || "Error"; return e; }; }
+    // DOMException is the shared Web IDL interface (worker_prelude() runs its block first).
 
     const addListener = g.addEventListener, removeListener = g.removeEventListener;
     g.EventTarget = class EventTarget {
@@ -339,11 +418,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             dispatchScopeEvent(trustedScopeEvent(Event,'resourcetimingbufferfull',{}),true,target);
         }
     };
+    // The shared AbortSignal block's view of this worker's events.
+    g.__abort_adapter = {
+        EventTarget: g.EventTarget,
+        add(target, type, callback) { addListener.call(target, type, callback); },
+        remove(target, type, callback) { removeListener.call(target, type, callback); },
+        fire(target, type) { dispatchScopeEvent(trustedScopeEvent(Event, type, {}), true, target); },
+        report(error) { WK.errors.push(errStr("abort algorithm", error)); },
+    };
     g.__bitmap_adapter = { queue(fn) { bitmapTasks.push(fn); }, source() { return undefined; } };
     g.__port_adapter = {
         slots: new WeakMap(), EventTarget: g.EventTarget,
         add(target, type, callback) { addListener.call(target, type, callback); },
         remove(target, type, callback) { removeListener.call(target, type, callback); },
+        origin() { return lp[8] || "null"; },
+        // #eligible-for-messaging: a WorkerGlobalScope whose closing flag is false.
+        eligible() { return !workerClosing; },
         deliver(target, type, init) { dispatchScopeEvent(trustedScopeEvent(MessageEvent, type, init), true, target); }
     };
 
@@ -354,7 +444,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (arguments.length === 0) throw new TypeError("postMessage requires a message");
         __worker_self_post(JSON.stringify(portAPI.serialize(message, portAPI.optionsTransfer(options))));
     };
-    g.close = function () { __worker_self_close(); };
+    g.close = function () { workerClosing = true; __worker_self_close(); };
     {
         // HTML #the-workerglobalscope-common-interface, #dedicated-workers-and-the-
         // dedicatedworkerglobalscope-interface and #shared-workers-and-the-
@@ -384,7 +474,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.setInterval = function (fn, delay) { return addTimer(fn, delay, Array.prototype.slice.call(arguments, 2), true); };
     g.clearTimeout = function (id) { removeTimer(id); };
     g.clearInterval = function (id) { removeTimer(id); };
-    g.queueMicrotask = function (fn) { Promise.resolve().then(function () { try { fn(); } catch (e) { WK.errors.push(errStr("queueMicrotask", e)); } }); };
+    g.queueMicrotask = function (fn) { Promise.resolve().then(function () { try { fn(); } catch (e) { reportException(e); } }); };
     // HR-Time #now-method / #dfn-coarsen-time: use the shared native monotonic
     // clock, independently of Date's integral milliseconds or author overrides.
     // HTML #run-a-worker records the origin before the worker prelude runs.
@@ -396,14 +486,95 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         timeOrigin: perfOrigin
     });
 
-    // --- console: a worker's console isn't surfaced; no-op (never throws) ---
-    var noop = function () {};
-    // Console §clear: no visible action when the environment has no clearable console.
-    g.console = { log: noop, info: noop, warn: noop, error: noop, debug: noop, trace: noop, dir: noop, clear() {}, assert: noop, group: noop, groupCollapsed: noop, groupEnd: noop, table: noop, count: noop, time: noop, timeEnd: noop };
+    // --- console: lines reach the owner's developer console after each task ---
+    // WHATWG Console #logger: each line is the level and the stringified data;
+    // groups indent, counters and timers are per console namespace object.
+    var consoleGroupDepth = 0, consoleCounts = new Map(), consoleTimers = new Map();
+    function consoleLog(level) {
+        return function () {
+            var parts = [];
+            for (var i = 0; i < arguments.length; i++) {
+                try { parts.push(String(arguments[i])); } catch (_) { parts.push("?"); }
+            }
+            if (WK.consoleLines.length < 100)
+                WK.consoleLines.push(level + ": " + "  ".repeat(Math.min(consoleGroupDepth, 64)) + parts.join(" "));
+        };
+    }
+    function consoleLabel(label) { return label === undefined ? "default" : `${label}`; }
+    g.console = {
+        log: consoleLog("log"), info: consoleLog("info"), warn: consoleLog("warn"), error: consoleLog("error"),
+        debug: consoleLog("debug"), trace: consoleLog("trace"), dir: consoleLog("dir"), dirxml: consoleLog("dirxml"),
+        table: consoleLog("table"),
+        // Console §clear: no visible action without a clearable console; empty the group stack.
+        clear() { consoleGroupDepth = 0; },
+        assert(condition, ...data) {
+            if (condition) return;
+            if (data.length === 0 || typeof data[0] !== "string") data.unshift("Assertion failed");
+            else data[0] = "Assertion failed: " + data[0];
+            consoleLog("error").apply(null, data);
+        },
+        group(...data) { consoleLog("group").apply(null, data.length ? data : ["console group"]); consoleGroupDepth++; },
+        groupCollapsed(...data) { consoleLog("groupCollapsed").apply(null, data.length ? data : ["console group"]); consoleGroupDepth++; },
+        groupEnd() { consoleGroupDepth = Math.max(0, consoleGroupDepth - 1); },
+        count(label = "default") {
+            label = consoleLabel(label);
+            var count = (consoleCounts.get(label) || 0) + 1;
+            consoleCounts.set(label, count);
+            consoleLog("count")(label + ": " + count);
+        },
+        countReset(label = "default") {
+            label = consoleLabel(label);
+            if (!consoleCounts.has(label)) { consoleLog("warn")("Count for '" + label + "' does not exist"); return; }
+            consoleCounts.set(label, 0);
+        },
+        time(label = "default") {
+            label = consoleLabel(label);
+            if (consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' already exists"); return; }
+            consoleTimers.set(label, g.performance.now());
+        },
+        timeLog(label = "default", ...data) {
+            label = consoleLabel(label);
+            if (!consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' does not exist"); return; }
+            consoleLog("timeLog").apply(null, [label + ": " + (g.performance.now() - consoleTimers.get(label)).toFixed(3) + " ms"].concat(data));
+        },
+        timeEnd(label = "default") {
+            label = consoleLabel(label);
+            if (!consoleTimers.has(label)) { consoleLog("warn")("Timer '" + label + "' does not exist"); return; }
+            consoleLog("timeEnd")(label + ": " + (g.performance.now() - consoleTimers.get(label)).toFixed(3) + " ms");
+            consoleTimers.delete(label);
+        },
+    };
+    Object.defineProperty(g, "console", { value: g.console, writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(g.console, Symbol.toStringTag, { value: "console", configurable: true });
 
     // --- location (WorkerLocation) ---
     var lp = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "/", "", "", "", "", ""];
-    g.location = { href: lp[0], protocol: lp[1], host: lp[2], hostname: lp[3], port: lp[4], pathname: lp[5], search: lp[6], hash: lp[7], origin: lp[8], toString: function () { return lp[0]; } };
+    // HTML #worker-locations: WorkerGlobalScope's [SameObject] location is a
+    // WorkerLocation whose members reflect the worker's URL; none is writable.
+    const workerLocationToken = {};
+    class WorkerLocation {
+        constructor(token) { if (token !== workerLocationToken) throw new TypeError("Illegal constructor"); }
+    }
+    const workerLocation = Reflect.construct(WorkerLocation, [workerLocationToken]);
+    const workerLocationFields = [["href", 0], ["origin", 8], ["protocol", 1], ["host", 2], ["hostname", 3],
+        ["port", 4], ["pathname", 5], ["search", 6], ["hash", 7]];
+    workerLocationFields.forEach(function (field) {
+        var get = {[field[0]]() {
+            if (this !== workerLocation) throw new TypeError("Illegal WorkerLocation invocation");
+            return lp[field[1]];
+        }}[field[0]];
+        Object.defineProperty(get, "name", {value: "get " + field[0], configurable: true});
+        Object.defineProperty(WorkerLocation.prototype, field[0], {get: get, enumerable: true, configurable: true});
+    });
+    // The href stringifier.
+    Object.defineProperty(WorkerLocation.prototype, "toString", {writable: true, enumerable: true, configurable: true,
+        value: {toString() {
+            if (this !== workerLocation) throw new TypeError("Illegal WorkerLocation invocation");
+            return lp[0];
+        }}.toString});
+    Object.defineProperty(WorkerLocation.prototype, Symbol.toStringTag, {value: "WorkerLocation", configurable: true});
+    Object.defineProperty(g, "WorkerLocation", {value: WorkerLocation, writable: true, configurable: true});
+    Object.defineProperty(g, "location", {get: {location() { return workerLocation; }}.location, enumerable: true, configurable: true});
     // Secure Contexts §1.3: a dedicated worker inherits the owner's secure
     // context when its script URL is potentially trustworthy. Rust computes
     // that relationship, including Blob URL inheritance, at construction.
@@ -463,7 +634,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         remove(target, type, fn) { removeListener.call(target, type, fn); },
         fire(target, type) { dispatchScopeEvent(trustedScopeEvent(Event, type, {}), true, target); },
         queue(fn) { platformTasks.push(fn); },
-        report(error) { WK.errors.push(errStr("callback", error)); },
+        report(error) { reportException(error); },
         origin() { return lp[8] || "null"; },
         baseURL() { return lp[0]; },
         secure: !!cfg.secureContext,
@@ -502,39 +673,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // shared text codec block (js_platform.js, __TEXT_CODEC_BEGIN__).
     /*__TEXT_CODEC_SHARED__*/
 
-    // --- crypto ---
-    g.crypto = {
-        getRandomValues: function (a) { for (var i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 4294967296); return a; },
-        randomUUID: function () { var h = ""; for (var i = 0; i < 36; i++) { if (i === 8 || i === 13 || i === 18 || i === 23) h += "-"; else if (i === 14) h += "4"; else if (i === 19) h += (8 + Math.floor(Math.random() * 4)).toString(16); else h += Math.floor(Math.random() * 16).toString(16); } return h; }
-    };
-
-    // --- Blob / File (string-backed, like the page engine's) ---
-    function Blob(parts, opts) {
-        internalsFor(this).parts = Array.isArray(parts) ? parts.slice() : (parts != null ? [parts] : []);
-        opts = opts || {}; this.type = opts.type || "";
-        var size = 0; for (var i = 0; i < internalsFor(this).parts.length; i++) { var p = internalsFor(this).parts[i]; size += (typeof p === "string") ? p.length : ((p && p.byteLength) || 0); }
-        this.size = size;
-    }
-    // Byte-faithful reads via __blobBytes/__blobText (hoisted, defined with the
-    // blob-URL store below) — a structured-clone-delivered Blob arrives with
-    // Uint8Array parts, which the old string-parts-only text()/arrayBuffer()
-    // read as empty.
-    Blob.prototype.text = function () { return Promise.resolve(__blobText(__blobBytes(this))); };
-    Blob.prototype.slice = function (start, end, contentType) {
-        var bytes = __blobBytes(this), size = bytes.length;
-        var s = start === undefined ? 0 : Math.trunc(+start) || 0;
-        var e = end === undefined ? size : Math.trunc(+end) || 0;
-        s = s < 0 ? Math.max(size + s, 0) : Math.min(s, size);
-        e = e < 0 ? Math.max(size + e, 0) : Math.min(e, size);
-        var span = Math.max(e - s, 0), part = bytes.slice(s, s + span);
-        var u = new Uint8Array(part.length);
-        for (var i = 0; i < part.length; i++) u[i] = part.charCodeAt(i) & 0xFF;
-        return new Blob([u], { type: contentType === undefined ? "" : String(contentType).toLowerCase() });
-    };
-    Blob.prototype.arrayBuffer = function () { var t = __blobBytes(this), b = new Uint8Array(t.length); for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i) & 0xFF; return Promise.resolve(b.buffer); };
-    function File(parts, name, opts) { Blob.call(this, parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
-    File.prototype = Object.create(Blob.prototype);
-    g.Blob = Blob; g.File = File;
+    // Crypto, Blob, File, FileReader, FileReaderSync, FormData and the Fetch
+    // interfaces come from the shared platform blocks worker_prelude() appends.
 
     // --- structuredClone (in-realm, via the shared codec) ---
     g.structuredClone = function (v, options) { return portAPI.deserialize(portAPI.serialize(v, options && options.transfer)).data; };
@@ -578,7 +718,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     URL.createObjectURL = function (obj) {
         if (obj === null || typeof obj !== "object") throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
-        var origin = (g.location && g.location.origin) || "null";
+        var origin = lp[8] || "null";
         var u = "blob:" + (origin || "null") + "/" + blobUUID();
         __blobURLStore[u] = obj; return u;
     };
@@ -605,102 +745,127 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return !nosniff || !!__jsMimes[essence];
     }
 
-    // --- importScripts (classic, synchronous fetch + global eval) ---
+    // --- importScripts (HTML #import-scripts-into-worker-global-scope) ---
+    // Parse every URL first, then fetch each classic worker-imported script
+    // synchronously and run it as a classic script with rethrow errors set:
+    // its declarations join the global scope and an exception propagates.
     g.importScripts = function () {
-        // HTML §10.2.1.1 exposes the method in both worker kinds, but the
-        // imported-classic-script algorithm throws in a module worker.
         if (cfg.type === "module") throw new TypeError("importScripts() is unavailable in a module worker");
-        for (var i = 0; i < arguments.length; i++) {
-            var u = String(arguments[i]);
-            if (u.slice(0, 5) === "blob:") {
-                var be = __resolveBlobURL(u);
-                if (!be) throw new Error("importScripts failed: " + u + " (no blob URL entry)");
-                (0, eval)(__blobText(be.bytes));
-                continue;
+        var urls = [], i;
+        for (i = 0; i < arguments.length; i++) urls.push(`${arguments[i]}`.toWellFormed());
+        var records = [];
+        for (i = 0; i < urls.length; i++) {
+            var parsed = __url_parse(urls[i], lp[0]);
+            if (!parsed) throw new g.DOMException("importScripts: invalid URL " + urls[i], "SyntaxError");
+            records.push(parsed[0]);
+        }
+        for (i = 0; i < records.length; i++) {
+            var url = records[i], source;
+            if (url.slice(0, 5) === "blob:") {
+                var entry = __resolveBlobURL(url);
+                if (!entry) throw new g.DOMException("importScripts failed to load " + url, "NetworkError");
+                source = __blobText(entry.bytes);
+            } else {
+                var r = __http_fetch(url, "GET", null, null, "");
+                if (!__classicScriptResponseOK(r)) throw new g.DOMException("importScripts failed to load " + url, "NetworkError");
+                // #fetch-a-classic-worker-imported-script: UTF-8 decode the body.
+                source = r[3] instanceof ArrayBuffer ? new g.TextDecoder().decode(new Uint8Array(r[3])) : String(r[2] || "");
             }
-            var rp = __url_parse(u, g.location.href); if (rp) u = rp[0];
-            var r = __http_fetch(u, "GET", null, null, "");
-            if (!__classicScriptResponseOK(r)) throw new Error("importScripts failed: " + u + " (" + (r ? r[0] : "network error") + ")");
-            (0, eval)(r[2]);
+            __classic_script_run(source, url);
         }
     };
 
-    // Fetch #fetch-method returns before network I/O. The host queues response
-    // processing on this worker's event loop; importScripts remains synchronous.
-    // Fetch #concept-body-consume-body / #dom-body-arraybuffer. The native
-    // response tuple stores bytes independently of its optional decoded text.
-    // Binary responses intentionally have no text field; never reconstruct
-    // binary content from that field or UTF-8-decode it before arrayBuffer().
-    const copyBodyBuffer = __body_buffer;
-    function makeResponse(status, ctype, body, url, headers) {
-        let buffer;
-        if (typeof body === "string") {
-            const bytes = new Uint8Array(body.length);
-            for (let i = 0; i < body.length; i++) bytes[i] = body.charCodeAt(i) & 0xff;
-            buffer = bytes.buffer;
-        } else {
-            buffer = body;
-        }
-        let used = false;
-        function consume(convert) {
-            if (used) return Promise.reject(new TypeError("Body is unusable"));
-            used = true;
-            return Promise.resolve().then(() => convert(copyBodyBuffer(buffer)));
-        }
-        return {
-            ok: status >= 200 && status < 300, status, statusText: "", url, redirected: false, type: "basic",
-            get bodyUsed() { return used; },
-            headers: new g.Headers(headers || (ctype ? {'content-type':ctype} : {})),
-            text() { return consume(bytes => new g.TextDecoder().decode(bytes)); },
-            json() { return consume(bytes => JSON.parse(new g.TextDecoder().decode(bytes))); },
-            arrayBuffer() { return consume(bytes => bytes); },
-            bytes() { return consume(bytes => new Uint8Array(bytes)); },
-            blob() { return consume(bytes => new Blob([bytes], {type:ctype || ""})); },
-            clone() {
-                if (used) throw new TypeError("Body is unusable");
-                return makeResponse(status, ctype, buffer, url, headers);
-            }
-        };
-    }
-    g.fetch = function (input, init) {
-        try {
-            init = init || {};
-            var url = (input && input.url) ? input.url : String(input);
-            if (url.slice(0, 5) === "blob:") {
-                var be = __resolveBlobURL(url);
-                if (!be) return Promise.reject(new TypeError("Failed to fetch: " + url));
-                return Promise.resolve(makeResponse(200, be.type || null, be.bytes, url));
-            }
-            var rp = __url_parse(url, g.location.href);
-            if (!rp) throw new TypeError("Invalid fetch URL: " + url);
-            url = rp[0];
-            var method = String(init.method || (input && input.method) || "GET").toUpperCase();
-            // Use the same header and native BufferSource boundary as Window fetch.
-            const headers = new g.Headers(init.headers !== undefined ? init.headers : input && input.headers);
-            const value = init.body !== undefined ? init.body : input && input.body;
-            let body = null, ctype = null;
-            if (value != null) {
-                if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) body = copyBodyBuffer(value);
-                else if (value instanceof Blob) { body = __blobBytes(value); ctype = value.type || null; }
-                else {
-                    body = new g.TextEncoder().encode(String(value));
-                    ctype = value instanceof URLSearchParams ? 'application/x-www-form-urlencoded;charset=UTF-8' : 'text/plain;charset=UTF-8';
-                }
-            }
-            if (headers.has('content-type')) ctype = headers.get('content-type');
-            let headerWire = '';
-            headers.forEach((value, key) => { headerWire += (headerWire ? '\n' : '') + key + '\n' + value; });
-            const mode = init.mode || (input && input.mode) || 'cors';
-            const credentials = init.credentials || (input && input.credentials) || 'same-origin';
-            if (!['cors','no-cors','same-origin'].includes(mode) || !['omit','same-origin','include'].includes(credentials))
-                throw new TypeError('Invalid fetch mode or credentials');
-            return __http_fetch_async(url, method, body, ctype, headerWire, mode, credentials, 'fetch').then(r => {
-                if (!r) throw new TypeError("Failed to fetch: " + url);
-                const responseHeaders = new g.Headers();
-                const lines = String(r[4] || '').split('\n');
-                for (let i = 0; i + 1 < lines.length; i += 2) responseHeaders.append(lines[i], lines[i + 1]);
-                return makeResponse(r[0], r[1], r[3], url, responseHeaders);
-            });
-        } catch (error) { return Promise.reject(error); }
+    // The shared rejection block's view of this worker: its events, its
+    // platform task queue and its developer console.
+    g.__rejection_adapter = {
+        Event,
+        fire(target, C, type, init) { return dispatchScopeEvent(trustedScopeEvent(C, type, init), true, target); },
+        queue(fn) { platformTasks.push(fn); },
+        report(reason) {
+            var text;
+            try { text = reason instanceof Error ? reason.name + ": " + reason.message : String(reason); }
+            catch (_) { text = "?"; }
+            if (WK.consoleLines.length < 100) WK.consoleLines.push("unhandled rejection: " + text);
+        },
+    };
+    g.__rejection_bind = function (api) { rejectionAPI = api; };
+    // The shared File API and Fetch blocks' view of this worker: its events
+    // and task queue, its API base URL and origin, and its blob URL store. A
+    // worker has no forms, so FormData(form) never matches HTMLFormElement.
+    g.__file_adapter = {
+        Event, EventTarget: g.EventTarget, worker: true,
+        add(target, type, callback) { addListener.call(target, type, callback); },
+        remove(target, type, callback) { removeListener.call(target, type, callback); },
+        fire(target, C, type, init) { dispatchScopeEvent(trustedScopeEvent(C, type, init), true, target); },
+        queue(fn) { platformTasks.push(fn); },
+        now: Date.now,
+        // A worker never holds a selected file's host part: a File reaches
+        // it by structured clone, which copies the bytes.
+        readHostFile() { throw new g.DOMException("The file is not readable in this realm", "NotReadableError"); },
+    };
+    g.__fetch_adapter = {
+        baseURL() { return lp[0]; },
+        origin() { return lp[8] || "null"; },
+        resolveBlobURL(url) {
+            var hash = url.indexOf("#"), entry = __blobURLStore[hash >= 0 ? url.slice(0, hash) : url];
+            return entry || null;
+        },
+        queue(fn) { platformTasks.push(fn); },
+        formEntries() { throw new TypeError("FormData constructor: argument 1 is not an HTMLFormElement"); },
+    };
+    // The shared CRYPTO block settles SubtleCrypto promises in tasks on the
+    // crypto task source, which this worker's event loop runs.
+    g.__crypto_adapter = { queue(fn) { platformTasks.push(fn); } };
+    // The shared XHR block's view of this worker: its events, its platform
+    // task queue and its timer list. A worker has no Document request bodies
+    // and its responseType never becomes "document".
+    // The shared WEBSOCKET block's view of this worker: connection events
+    // arrive as host tasks through the control object's `wsEvent`.
+    g.__websocket_adapter = {
+        EventTarget: g.EventTarget, MessageEvent, CloseEvent,
+        add(target, type, callback) { addListener.call(target, type, callback); },
+        remove(target, type, callback) { removeListener.call(target, type, callback); },
+        fire(target, C, type, init) { dispatchScopeEvent(trustedScopeEvent(C || Event, type, init), true, target); },
+        baseURL() { return lp[0]; },
+        open(url, protocols) { return __ws_open(url, protocols); },
+        send(id, data, binary) { return __ws_send(id, data, binary); },
+        close(id, code, reason) { __ws_close(id, code, reason); },
+        taskQueue() { return function (fn) { platformTasks.push(fn); }; },
+        bind(event) { WK.wsEvent = event; },
+    };
+    const xhrTimerId = {}, XHRURL = g.URL;
+    g.__xhr_adapter = {
+        EventTarget: g.EventTarget, isWindow: false,
+        add(target, type, callback) { addListener.call(target, type, callback); },
+        remove(target, type, callback) { removeListener.call(target, type, callback); },
+        fire(target, C, type, init) { dispatchScopeEvent(trustedScopeEvent(C || Event, type, init), true, target); },
+        hasListeners(target) {
+            const listeners = targetListeners.get(target);
+            if (!listeners) return false;
+            let found = false;
+            listeners.forEach(function (list) { if (list.length) found = true; });
+            return found;
+        },
+        taskQueue() { return function (fn) { platformTasks.push(fn); }; },
+        // A worker's query encoding is UTF-8; the href, or null.
+        parseURL(url) {
+            try { return new XHRURL(url, lp[0]).href; } catch (_) { return null; }
+        },
+        fullyActive() { return true; },
+        now() { return currentTime(); },
+        wallClock() { return perfClock(); },
+        // send()'s timeout wait, on the timer list but outside the
+        // setTimeout() identifier space.
+        delay(ms, fn) {
+            const entry = { id: xhrTimerId, at: currentTime() + ms, timeout: ms, fn: fn, args: [], interval: false, nesting: 0 };
+            WK.timers.push(entry);
+            return entry;
+        },
+        cancelDelay(entry) {
+            const index = WK.timers.indexOf(entry);
+            if (index >= 0) WK.timers.splice(index, 1);
+        },
+        documentBody() { return null; },
+        documentResponse() { return null; },
     };
 })();

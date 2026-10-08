@@ -10,6 +10,8 @@ dependencies = [
  "accesskit_winit",
  "aes-gcm",
  "arboard",
+ "aws-lc-sys",
+ "brotli",
  "brotli-decompressor",
  "bytes",
  "color",

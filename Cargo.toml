@@ -60,6 +60,10 @@ accesskit_winit = { version = "0.34.1", default-features = false, features = ["a
 # Web Crypto AES-GCM, including its standardized 32/64-bit tags. Reuse the
 # re-exported AES primitive for CTR; OS randomness comes from our host API.
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "hazmat", "zeroize"] }
+# Web Crypto's RSA, ECDSA/ECDH, Ed25519/X25519, AES-CBC/KW, HKDF and PBKDF2
+# use AWS-LC, the libcrypto rustls and quinn already link through aws-lc-rs.
+# Default features stay off so the shared build keeps aws-lc-rs's bindings.
+aws-lc-sys = { version = "0.45.0", default-features = false }
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 bytes = "1.12.1"
 # Already used by the raster stack; CSS Color 4 parsing, white-point adaptation
@@ -82,6 +86,9 @@ encoding_rs = "0.8.42"
 # content codings every browser advertises. brotli-decompressor is already in
 # the tree through the WOFF2 decoder.
 brotli-decompressor = "5.0.3"
+# Compression Standard `CompressionStream("brotli")` encodes with the same
+# pure-Rust brotli encoder rustls already links for certificate compression.
+brotli = "8.0.4"
 ruzstd = "0.9.0"
 futures = "0.3.34"
 # HTTP/2 framing, HPACK and stream state; TRust owns connections and all

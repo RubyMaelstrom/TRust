@@ -54,6 +54,19 @@
     check(r.body.includes('Content-Disposition: form-data; name="q"\r\n\r\ncaf\xe9 &#12354;\r\n'), 'multipart value ' + JSON.stringify(r.body));
     check(r.body.includes('name="t\xe9"\r\n\r\na\r\nb\r\n'), 'multipart name ' + JSON.stringify(r.body));
     check(r.body.includes('name="_charset_"\r\n\r\nwindows-1252\r\n'), 'multipart charset');
+    // A selected file's filename is encoded too (with LF, CR and '"'
+    // escaped afterwards); its Content-Type and contents are bytes as they are.
+    const upload = document.createElement('input');
+    upload.type = 'file';
+    upload.name = 'up';
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['x\u00e9'], 'caf\u00e9 \u3042"\n.txt', {type: 'text/plain'}));
+    upload.files = transfer.files;
+    form.append(upload);
+    r = submit(form);
+    check(r.body.includes('name="up"; filename="caf\xe9 &#12354;%22%0A.txt"\r\nContent-Type: text/plain\r\n\r\nx\xc3\xa9\r\n'),
+        'multipart filename ' + JSON.stringify(r.body));
+    upload.remove();
 
     // FormData itself stays UTF-8 (Fetch #concept-bodyinit-extract).
     const data = new FormData(form);

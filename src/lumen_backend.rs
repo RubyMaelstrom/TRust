@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 mod canvas_host;
 #[path = "challenge_message_trace.rs"]
 mod challenge_message_trace;
+#[path = "compression_host.rs"]
+mod compression_host;
 #[path = "geometry_host.rs"]
 mod geometry_host;
 #[path = "image_bitmap_host.rs"]
@@ -140,7 +142,8 @@ fn top_hit_key(ctx: &mut Ctx) -> TopHitKey {
     }
 }
 
-type LumenFetchResult = Option<(u16, String, Vec<u8>, String)>;
+/// (status, Content-Type, body, header blob, final URL after redirects; empty when unknown).
+type LumenFetchResult = Option<(u16, String, Vec<u8>, String, String)>;
 type LumenResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
 
 use crate::performance::ResourceTiming as LumenResourceTiming;
@@ -661,6 +664,12 @@ struct HostState {
     geometry: geometry_host::Registry,
     /// Streaming TextDecoder state for non-UTF-8 encodings.
     text_decoders: text_decoder_host::Registry,
+    /// CompressionStream/DecompressionStream contexts.
+    compression: compression_host::Registry,
+    /// HTML #canvaspattern snapshots by pattern id; contexts painting with a
+    /// pattern hold their own reference. The CanvasPattern's finalizer frees it.
+    canvas_patterns: HashMap<u32, Arc<crate::canvas::Pattern>>,
+    next_canvas_pattern: u32,
     pointer_event_slots: Option<Value>,
     image_element_slots: Option<Value>,
     window_message_slots: Option<Value>,
@@ -769,6 +778,9 @@ impl HostState {
             live_ranges: live_range_host::Registry::default(),
             geometry: geometry_host::Registry::default(),
             text_decoders: Default::default(),
+            compression: Default::default(),
+            canvas_patterns: HashMap::new(),
+            next_canvas_pattern: 0,
             pointer_event_slots: None,
             image_element_slots: None,
             window_message_slots: None,
@@ -791,28 +803,14 @@ impl HostState {
         cache: Arc<crate::http::PageCache>,
         events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     ) {
-        let (ws_events, mut ws_rx) = tokio::sync::mpsc::channel(64);
-        let host_events = events.clone();
-        cache.spawn(&handle, async move {
-            while let Some((id, event)) = ws_rx.recv().await {
-                if host_events
-                    .send(LumenHostTask::WebSocket { id, event })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
         self.base = page;
         self.task_events = Some(LumenTaskSender::Page(events.clone()));
-        self.websockets = Some(LumenWebSockets {
-            handle: handle.clone(),
-            page: self.base.clone(),
-            tasks: cache.task_scope(),
-            events: ws_events,
-            sockets: HashMap::new(),
-            next_id: 1,
-        });
+        self.enable_websockets(
+            self.base.clone(),
+            &handle,
+            &cache,
+            LumenTaskSender::Page(events.clone()),
+        );
         self.workers = Some(LumenPageWorkers {
             handle: handle.clone(),
             page: self.base.clone(),
@@ -828,6 +826,35 @@ impl HostState {
             fetched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_fetch_id: 0,
             pending_fetches: HashMap::new(),
+        });
+    }
+
+    /// WebSockets for a Window or worker global: connection events become
+    /// WebSocket task source tasks of the global's event loop (WebSockets
+    /// #feedback-from-the-protocol). `page` is the document whose subresource
+    /// policy the connections follow.
+    fn enable_websockets(
+        &mut self,
+        page: url::Url,
+        handle: &tokio::runtime::Handle,
+        cache: &Arc<crate::http::PageCache>,
+        tasks: LumenTaskSender,
+    ) {
+        let (ws_events, mut ws_rx) = tokio::sync::mpsc::channel(64);
+        cache.spawn(handle, async move {
+            while let Some((id, event)) = ws_rx.recv().await {
+                if tasks.send(LumenHostTask::WebSocket { id, event }).is_err() {
+                    break;
+                }
+            }
+        });
+        self.websockets = Some(LumenWebSockets {
+            handle: handle.clone(),
+            page,
+            tasks: cache.task_scope(),
+            events: ws_events,
+            sockets: HashMap::new(),
+            next_id: 1,
         });
     }
 
@@ -991,6 +1018,9 @@ impl RetainedMemory for HostState {
             live_ranges,
             geometry,
             text_decoders,
+            compression,
+            canvas_patterns,
+            next_canvas_pattern: _,
             pointer_event_slots,
             image_element_slots,
             window_message_slots,
@@ -1441,6 +1471,14 @@ impl RetainedMemory for HostState {
         live_ranges.scan_retained_memory(visitor);
         geometry.scan_retained_memory(visitor);
         text_decoders.scan_retained_memory(visitor);
+        compression.scan_retained_memory(visitor);
+        for pattern in canvas_patterns.values() {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.canvas-pattern",
+                Arc::as_ptr(pattern) as usize,
+                pattern.retained_bytes(),
+            ));
+        }
         if let Some(value) = element_slots {
             visitor.value(value);
         }
@@ -4220,21 +4258,22 @@ mod desktop {
                     .map(String::from),
             );
         }
-        // HTML #notify-about-rejected-promises: the platform queues the
-        // unhandledrejection events and reports the uncanceled ones.
+        // HTML #notify-about-rejected-promises: the platform queues a task that
+        // fires unhandledrejection and reports each event that is not canceled.
         let rejections = page.engine.take_unhandled_rejections_full();
-        for (promise, reason) in rejections {
-            if engine_call_trust(
-                &mut page.engine,
-                "notifyRejectedPromise",
-                &[promise, reason.clone()],
-            )
-            .is_err()
-            {
-                let message = value_string(&mut page.engine, &reason);
-                page.outcome
-                    .console
-                    .push(format!("unhandled rejection: {message}"));
+        if !rejections.is_empty() {
+            let pairs: Vec<Value> = rejections
+                .iter()
+                .flat_map(|(promise, reason)| [promise.clone(), reason.clone()])
+                .collect();
+            let list = page.engine.ctx().make_array(pairs);
+            if engine_call_trust(&mut page.engine, "notifyRejectedPromises", &[list]).is_err() {
+                for (_, reason) in rejections {
+                    let message = value_string(&mut page.engine, &reason);
+                    page.outcome
+                        .console
+                        .push(format!("unhandled rejection: {message}"));
+                }
             }
         }
         if std::env::var_os("TRUST_LUMEN_TRACE").is_some() {
@@ -10092,6 +10131,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_document_encoding", 1, host_document_encoding),
     ("__document_decode", 4, host_document_decode),
     ("__xhr_decode", 3, host_xhr_decode),
+    ("__html_char_ref", 2, host_html_char_ref),
     ("__dom_pi_target", 1, guarded_pi_target),
     ("__dom_create_comment", 2, guarded_create_comment),
     ("__dom_create_cdata", 2, guarded_create_cdata),
@@ -10252,10 +10292,9 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
     ("__crypto_digest", 2, host_crypto_digest),
     ("__crypto_random_bytes", 1, host_crypto_random_bytes),
-    ("__crypto_hmac", 4, host_crypto_hmac),
-    ("__crypto_aes_ctr", 4, host_crypto_aes_ctr),
-    ("__crypto_aes_gcm", 6, host_crypto_aes_gcm),
-    ("__compression_encode", 2, host_compression_encode),
+    ("__crypto_operation", 2, host_crypto_operation),
+    ("__compression_context", 4, host_compression_context),
+    ("__classic_script_run", 2, host_classic_script_run),
     ("__text_encode", 1, host_text_encode),
     ("__text_decode_utf8", 3, host_text_decode_utf8),
     ("__text_encoding_name", 1, host_text_encoding_name),
@@ -11646,16 +11685,71 @@ fn host_dom_observer_targets(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
 /// header, mode, and credentials transport contract shared with the platform
 /// prelude.
 #[allow(clippy::type_complexity)]
-fn host_fetch_args(
-    ctx: &mut Ctx,
-    args: &[Value],
-) -> (
+/// The fetch arguments, or the message of a request body that could not be read.
+type HostFetchArgs = (
     String,
     String,
     Option<(String, Vec<u8>)>,
     Vec<(String, String)>,
     Option<(crate::http::RequestMode, crate::http::CredentialsMode)>,
-) {
+);
+
+/// A request body from the prelude: bytes (a BufferSource or a byte string),
+/// or a list of byte chunks and `[file id, start, end]` ranges of
+/// user-selected files, which are read now against their snapshot state
+/// (File API #snapshot-state) within the request limit, so an upload is never
+/// copied into script memory.
+fn host_request_body(
+    ctx: &mut Ctx,
+    args: &[Value],
+    index: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(value) = args
+        .get(index)
+        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if let Some(bytes) = ctx.buffer_source_bytes(&value, false) {
+        return Ok(Some(bytes));
+    }
+    if !matches!(value, Value::Obj(_)) {
+        return Ok(Some(host_latin1_bytes(ctx, args, index)));
+    }
+    let number = |ctx: &mut Ctx, object: &Value, key: &str| {
+        ctx.member_get(object, key)
+            .ok()
+            .and_then(|value| value.as_num_opt())
+            .filter(|number| number.is_finite() && *number >= 0.0)
+            .unwrap_or(0.0)
+    };
+    let length = number(ctx, &value, "length") as usize;
+    let mut segments = Vec::with_capacity(length);
+    for index in 0..length {
+        let segment = ctx
+            .member_get(&value, &index.to_string())
+            .map_err(|_| String::from("unreadable request body"))?;
+        segments.push(match ctx.buffer_source_bytes(&segment, false) {
+            Some(bytes) => crate::file_select::BodySegment::Bytes(bytes),
+            None => crate::file_select::BodySegment::File {
+                id: number(ctx, &segment, "0") as u64,
+                start: number(ctx, &segment, "1") as u64,
+                end: number(ctx, &segment, "2") as u64,
+            },
+        });
+    }
+    let state = ctx
+        .host_mut::<HostState>()
+        .ok_or_else(|| String::from("missing browser host state"))?;
+    state
+        .user_files
+        .assemble(&segments, crate::file_select::MAX_READ_BYTES)
+        .map(Some)
+        .map_err(|error| error.message().to_string())
+}
+
+fn host_fetch_args(ctx: &mut Ctx, args: &[Value]) -> Result<HostFetchArgs, String> {
     let target = host_arg_usv(ctx, args, 0);
     let mut method: String = host_arg_usv(ctx, args, 1)
         .chars()
@@ -11670,10 +11764,7 @@ fn host_fetch_args(
     if method.is_empty() {
         method = String::from("GET");
     }
-    let body = args
-        .get(2)
-        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
-        .map(|_| host_latin1_bytes(ctx, args, 2));
+    let body = host_request_body(ctx, args, 2)?;
     let content_type = args
         .get(3)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
@@ -11699,7 +11790,7 @@ fn host_fetch_args(
         };
         (mode, credentials)
     });
-    (target, method, body, headers, policy)
+    Ok((target, method, body, headers, policy))
 }
 
 #[cfg(test)]
@@ -11870,6 +11961,7 @@ fn lumen_fetch_result(response: crate::http::Response) -> LumenFetchResult {
         response.content_type,
         response.body,
         crate::js::headers_to_blob(&response.headers),
+        response.url.to_string(),
     ))
 }
 
@@ -11887,11 +11979,15 @@ fn lumen_cached_result(response: &crate::http::CachedResp) -> LumenFetchResult {
         response.content_type.clone(),
         response.body.clone(),
         crate::js::headers_to_blob(&response.headers),
+        response
+            .url_list
+            .last()
+            .map_or_else(String::new, |url| url.to_string()),
     ))
 }
 
 fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
-    let Some((status, content_type, body, headers)) = result else {
+    let Some((status, content_type, body, headers, url)) = result else {
         return Value::Null;
     };
     let text = if crate::js::response_body_is_binary(&content_type) {
@@ -11906,12 +12002,15 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
     let bytes = ctx
         .make_array_buffer(&body)
         .unwrap_or_else(|_| Value::from_string(body.iter().copied().map(char::from).collect()));
+    // [status, Content-Type, text, bytes, headers, final URL]: Fetch's response
+    // URL list ends with the URL that answered after redirects.
     ctx.make_array(vec![
         Value::Num(f64::from(status)),
         Value::from_string(content_type),
         text,
         bytes,
         Value::from_string(headers),
+        Value::from_string(url),
     ])
 }
 
@@ -11951,6 +12050,7 @@ fn resource_initiator(ctx: &mut Ctx, args: &[Value]) -> &'static str {
     match host_arg_string(ctx, args, 7).as_str() {
         "fetch" => "fetch",
         "xmlhttprequest" => "xmlhttprequest",
+        "beacon" => "beacon",
         _ => "",
     }
 }
@@ -12002,7 +12102,10 @@ fn record_resource_timing_ref(ctx: &mut Ctx, report: &LumenResourceTiming) {
 /// application runtime while only this page thread waits, avoiding a nested Tokio `block_on`.
 fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let started = crate::performance::now_ms();
-    let (target, method, body, headers, policy) = host_fetch_args(ctx, args);
+    // A body whose selected file can no longer be read is a network error.
+    let Ok((target, method, body, headers, policy)) = host_fetch_args(ctx, args) else {
+        return Ok(Value::Null);
+    };
     let initiator = resource_initiator(ctx, args);
     let client = request_client_url(ctx);
     let cookie_context = request_cookie_context(ctx);
@@ -12303,7 +12406,12 @@ enum AsyncFetchSource {
 /// data crosses the runtime channel; the resolving function remains rooted in the page realm and
 /// is invoked later when the browser selects the networking task.
 fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let (target, method, body, headers, policy) = host_fetch_args(ctx, args);
+    // A body whose selected file can no longer be read is a network error.
+    let Ok((target, method, body, headers, policy)) = host_fetch_args(ctx, args) else {
+        let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+        let _ = ctx.invoke(resolve, Value::Undefined, &[Value::Null]);
+        return Ok(promise);
+    };
     let initiator = resource_initiator(ctx, args);
     let started = crate::performance::now_ms();
     let client = request_client_url(ctx);
@@ -13076,7 +13184,18 @@ fn host_fetch_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
 /// HTML §8.1.4.6 #report-the-exception for a script's uncaught exception:
 /// the platform fires the cancelable `error` ErrorEvent at the Window. Returns
 /// whether the exception remains "not handled" (to be logged by the caller).
-fn host_report_exception(ctx: &mut Ctx, exception: Value, label: &str, muted: bool) -> bool {
+/// HTML #report-an-exception for a script the host ran: `location` is the
+/// script's URL and, for a parse error, its line, which locate the
+/// ErrorEvent when the exception carries no stack frame. Returns whether the
+/// exception was not handled (the caller then logs it).
+fn host_report_exception(
+    ctx: &mut Ctx,
+    exception: Value,
+    label: &str,
+    muted: bool,
+    location: Option<(&str, u32)>,
+) -> bool {
+    let (filename, lineno) = location.unwrap_or(("", 0));
     match host_call_trust(
         ctx,
         "reportException",
@@ -13084,25 +13203,13 @@ fn host_report_exception(ctx: &mut Ctx, exception: Value, label: &str, muted: bo
             exception,
             Value::from_string(label.to_string()),
             Value::Bool(muted),
+            Value::from_string(filename.to_string()),
+            Value::Num(f64::from(lineno)),
         ],
     ) {
         Ok(Value::Bool(not_handled)) => not_handled,
         _ => true,
     }
-}
-
-/// HTML #muted-errors: a classic script fetched from another origin without
-/// CORS (no `crossorigin` attribute) reports its errors as "Script error.".
-fn classic_script_errors_muted(ctx: &mut Ctx, node_id: usize, url: &str) -> bool {
-    let cors = host_dom(ctx)
-        .borrow()
-        .attr(node_id, "crossorigin")
-        .is_some();
-    if cors {
-        return false;
-    }
-    let document = element_request_client_url(ctx, node_id);
-    url::Url::parse(url).is_ok_and(|script| script.origin() != document.origin())
 }
 
 fn host_push_injected_error(ctx: &mut Ctx, message: impl Into<String>) {
@@ -13599,7 +13706,7 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: S
                 .coerce_string(&error)
                 .map(|message| message.to_string())
                 .unwrap_or_else(|_| String::from("classic script threw"));
-            if host_report_exception(ctx, error, name, false) {
+            if host_report_exception(ctx, error, name, false, Some((&document_url, 0))) {
                 host_push_injected_error(ctx, format!("{name}: {message}"));
             }
         }
@@ -13610,7 +13717,13 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: S
             // HTML #run-a-classic-script: a script's parse error is reported
             // as a SyntaxError of its realm.
             let syntax_error = ctx.make_error("SyntaxError", error.message.clone());
-            if host_report_exception(ctx, syntax_error, name, false) {
+            if host_report_exception(
+                ctx,
+                syntax_error,
+                name,
+                false,
+                Some((&document_url, error.line)),
+            ) {
                 host_push_injected_error(
                     ctx,
                     format!(
@@ -13923,21 +14036,18 @@ fn host_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
         .first()
         .and_then(Value::as_num_opt)
         .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
-    let data = host_arg_usv(ctx, args, 1);
-    let binary = matches!(args.get(2), Some(Value::Bool(true)));
+    // A binary message is a BufferSource copy of the Blob or buffer bytes.
+    let message = match args.get(1) {
+        Some(value) if matches!(args.get(2), Some(Value::Bool(true))) => {
+            crate::ws::WsOut::Binary(ctx.buffer_source_bytes(value, true).unwrap_or_default())
+        }
+        _ => crate::ws::WsOut::Text(host_arg_usv(ctx, args, 1)),
+    };
     let sent = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.websockets.as_mut())
         .and_then(|sockets| id.and_then(|id| sockets.sockets.get(&id)))
-        .is_some_and(|sender| {
-            sender
-                .try_send(if binary {
-                    crate::ws::WsOut::Binary(data.chars().map(|ch| ch as u32 as u8).collect())
-                } else {
-                    crate::ws::WsOut::Text(data)
-                })
-                .is_ok()
-        });
+        .is_some_and(|sender| sender.try_send(message).is_ok());
     Ok(Value::Bool(sent))
 }
 
@@ -14189,6 +14299,26 @@ fn host_worker_self_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     Ok(Value::Undefined)
 }
 
+/// HTML #run-a-classic-script with "rethrow errors" set, for the platform's own script sources:
+/// `importScripts()` in workers and string TimerHandlers in both realms. The source is a
+/// ScriptEvaluation in the current Realm (global declarations and the global lexical scope
+/// persist), not indirect eval code. A parse failure is the SyntaxError to rethrow; an
+/// uncaught exception propagates to the caller, which reports or rethrows it.
+fn host_classic_script_run(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let source = host_arg_usv(ctx, args, 0);
+    let url = host_arg_string(ctx, args, 1);
+    let origin = lumen::SourceOrigin::new(&url);
+    match ctx.eval_classic_script_interruptible_with_origin(&source, Some(&origin)) {
+        Ok(Ok(_)) => Ok(Value::Undefined),
+        Ok(Err(EvalError::Throw(error))) => Err(error),
+        Ok(Err(EvalError::Interrupted(reason))) => Err(ctx.make_error("Error", reason.message())),
+        Err(error) => Err(ctx.make_error(
+            "SyntaxError",
+            format!("{} (line {})", error.message, error.line),
+        )),
+    }
+}
+
 fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     if let Some(worker) = ctx
         .host_mut::<HostState>()
@@ -14220,6 +14350,9 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__url_set", 3, host_url_set as NativeFn),
         ("__http_fetch", 5, host_http_fetch as NativeFn),
         ("__http_fetch_async", 5, host_http_fetch_async as NativeFn),
+        ("__ws_open", 2, host_ws_open as NativeFn),
+        ("__ws_send", 3, host_ws_send as NativeFn),
+        ("__ws_close", 3, host_ws_close as NativeFn),
         ("__worker_self_post", 1, host_worker_self_post as NativeFn),
         ("__worker_self_close", 0, host_worker_self_close as NativeFn),
         ("__storage_manager", 2, host_storage_manager as NativeFn),
@@ -14229,19 +14362,22 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             1,
             host_crypto_sha256_digest as NativeFn,
         ),
-        ("__crypto_aes_ctr", 4, host_crypto_aes_ctr as NativeFn),
-        ("__crypto_aes_gcm", 6, host_crypto_aes_gcm as NativeFn),
+        ("__crypto_operation", 2, host_crypto_operation as NativeFn),
         ("__crypto_digest", 2, host_crypto_digest as NativeFn),
         (
             "__crypto_random_bytes",
             1,
             host_crypto_random_bytes as NativeFn,
         ),
-        ("__crypto_hmac", 4, host_crypto_hmac as NativeFn),
         (
-            "__compression_encode",
+            "__compression_context",
+            4,
+            host_compression_context as NativeFn,
+        ),
+        (
+            "__classic_script_run",
             2,
-            host_compression_encode as NativeFn,
+            host_classic_script_run as NativeFn,
         ),
         ("__text_encode", 1, host_text_encode as NativeFn),
         ("__text_decode_utf8", 3, host_text_decode_utf8 as NativeFn),
@@ -14499,18 +14635,31 @@ fn eval_lumen_worker_classic(
 ) -> bool {
     let origin = lumen::SourceOrigin::new(label);
     match engine.eval_value_interruptible_with_origin(source, Some(&origin)) {
+        // HTML #run-a-worker: a script whose error to rethrow is a parse error
+        // fires a plain "error" event at the Worker object.
         Err(error) => {
             send_lumen_worker_error(
                 events,
                 id,
                 format!(
-                    "{label} parse error at line {}: {}",
+                    "\u{1}fail {label} parse error at line {}: {}",
                     error.line, error.message
                 ),
             );
         }
+        // An uncaught exception is reported in the worker global first.
         Ok(Err(EvalError::Throw(error))) => {
-            send_lumen_worker_error(events, id, describe_throw(engine, error, label));
+            match lumen_worker_internal_call(
+                engine,
+                "reportException",
+                std::slice::from_ref(&error),
+            ) {
+                Ok(_) => {}
+                Err(EvalError::Interrupted(_)) => return false,
+                Err(EvalError::Throw(_)) => {
+                    send_lumen_worker_error(events, id, describe_throw(engine, error, label));
+                }
+            }
         }
         Ok(Err(EvalError::Interrupted(_))) => return false,
         Ok(Ok(_)) => {}
@@ -14533,11 +14682,15 @@ fn eval_lumen_worker_module(
     let loader_handle = fetch.handle;
     let loader_cache = fetch.cache;
     let loader_fetched = fetch.fetched;
+    // A dependency that cannot be fetched leaves the module graph without a
+    // result: #run-a-worker then fires a plain error event, not a report.
+    let missing_dependency = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loader_missing = missing_dependency.clone();
     match engine.eval_module_attrs_interruptible(
         &script.source,
         script.url.as_str(),
         move |specifier, referrer, _attributes| {
-            module_dependency_loader(
+            let loaded = module_dependency_loader(
                 &loader_page,
                 &cookie_context,
                 &loader_handle,
@@ -14546,22 +14699,41 @@ fn eval_lumen_worker_module(
                 None,
                 specifier,
                 referrer,
-            )
+            );
+            if loaded.is_none() {
+                loader_missing.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            loaded
         },
     ) {
         Err(error) => send_lumen_worker_error(
             events,
             id,
             format!(
-                "{} parse error at line {}: {}",
+                "\u{1}fail {} parse error at line {}: {}",
                 script.url, error.line, error.message
             ),
         ),
-        Ok(lumen::ExecutionOutcome::Throw { name, message }) => send_lumen_worker_error(
-            events,
-            id,
-            format!("{} threw {name}: {message}", script.url),
-        ),
+        // HTML #run-a-worker runs the module script, which reports its exception.
+        Ok(lumen::ExecutionOutcome::Throw { name, message })
+            if missing_dependency.load(std::sync::atomic::Ordering::Relaxed) =>
+        {
+            send_lumen_worker_error(
+                events,
+                id,
+                format!("\u{1}fail {} threw {name}: {message}", script.url),
+            );
+        }
+        Ok(lumen::ExecutionOutcome::Throw { name, message }) => {
+            let error = engine.ctx().make_error(&name, message.clone());
+            if lumen_worker_internal_call(engine, "reportException", &[error]).is_err() {
+                send_lumen_worker_error(
+                    events,
+                    id,
+                    format!("{} threw {name}: {message}", script.url),
+                );
+            }
+        }
         Ok(lumen::ExecutionOutcome::Interrupted { .. }) => return false,
         Ok(lumen::ExecutionOutcome::Value(_)) => {}
     }
@@ -14586,6 +14758,33 @@ fn lumen_worker_report_buffered_errors(
     events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     id: usize,
 ) -> bool {
+    // HTML #notify-about-rejected-promises after the task's microtask checkpoint.
+    let rejections = engine.take_unhandled_rejections_full();
+    if !rejections.is_empty() {
+        let pairs: Vec<Value> = rejections
+            .into_iter()
+            .flat_map(|(promise, reason)| [promise, reason])
+            .collect();
+        let list = engine.ctx().make_array(pairs);
+        if let Err(EvalError::Interrupted(_)) =
+            lumen_worker_internal_call(engine, "notifyRejectedPromises", &[list])
+        {
+            return false;
+        }
+    }
+    match lumen_worker_internal_call(engine, "takeConsole", &[]) {
+        Ok(value) => {
+            let lines = value_string(engine, &value);
+            if !lines.is_empty() {
+                let _ = events.send(LumenHostTask::Worker {
+                    id,
+                    event: crate::js::WorkerOut::Console(lines),
+                });
+            }
+        }
+        Err(EvalError::Interrupted(_)) => return false,
+        Err(EvalError::Throw(_)) => {}
+    }
     match lumen_worker_internal_call(engine, "takeErrors", &[]) {
         Ok(value) => {
             let errors = value_string(engine, &value);
@@ -14665,6 +14864,14 @@ fn run_lumen_worker(
         next_fetch_id: 0,
         pending_fetches: HashMap::new(),
     });
+    // WebSocket is [Exposed=(Window,Worker)]: the worker's connections follow
+    // its owner document's subresource policy and wake this worker's loop.
+    state.enable_websockets(
+        launch.owner_page.clone(),
+        &handle,
+        &cache,
+        launch.task_sender.clone(),
+    );
     state.worker_self = Some(LumenWorkerSelf {
         id: launch.id,
         events: events.clone(),
@@ -14733,7 +14940,10 @@ fn run_lumen_worker(
         send_lumen_worker_error(
             &events,
             launch.id,
-            format!("worker script failed to load: {}", launch.script_url),
+            format!(
+                "\u{1}fail worker script failed to load: {}",
+                launch.script_url
+            ),
         );
         return;
     };
@@ -15246,6 +15456,25 @@ fn push_engine_error(engine: &mut lumen::Engine, message: String) {
     host_push_injected_error(engine.ctx(), message);
 }
 
+/// HTML #muted-errors: a classic script's errors are muted when its response
+/// was CORS-cross-origin, i.e. an HTTP(S) or file script of another origin
+/// fetched without a `crossorigin` attribute (a CORS-mode fetch that failed
+/// its check never runs). data: and blob: responses are basic, not opaque.
+fn classic_script_errors_muted(ctx: &mut Ctx, node_id: usize, url: &str) -> bool {
+    let Ok(script) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(script.scheme(), "http" | "https" | "file") {
+        return false;
+    }
+    let document = element_request_client_url(ctx, node_id);
+    let cors = host_dom(ctx)
+        .borrow()
+        .attr(node_id, "crossorigin")
+        .is_some();
+    !cors && !crate::http::same_origin_for_host(&document, &script)
+}
+
 fn fire_engine_script_event(engine: &mut lumen::Engine, node_id: usize, event_type: &str) {
     host_fire_script_event(engine.ctx(), node_id, event_type);
 }
@@ -15295,17 +15524,21 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
                 state.pending_module_evaluations =
                     state.pending_module_evaluations.saturating_sub(1);
             }
-            let reason = args
-                .first()
-                .and_then(|value| ctx.coerce_string(value).ok())
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| String::from("module evaluation failed"));
-            // HTML #run-a-module-script: report the evaluation's exception.
+            // HTML #run-a-module-script reports the rejected evaluation;
+            // #execute-the-script-element then fires load at an external
+            // script, whose fetch and parse succeeded.
             let exception = args.first().cloned().unwrap_or(Value::Undefined);
-            if host_report_exception(ctx, exception, &failed_name, false) {
+            if host_report_exception(ctx, exception.clone(), &failed_name, false, None) {
+                let reason = ctx
+                    .coerce_string(&exception)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| String::from("module evaluation failed"));
                 host_push_injected_error(ctx, format!("module {failed_name}: {reason}"));
             }
-            host_fire_script_event(ctx, node_id, "error");
+            let external = host_dom(ctx).borrow().attr(node_id, "src").is_some();
+            if external {
+                host_fire_script_event(ctx, node_id, "load");
+            }
             Ok(Value::Undefined)
         }),
     );
@@ -15353,7 +15586,7 @@ fn run_injected_classic_task(
     match evaluated {
         Ok(Ok(Ok(_))) => {}
         Ok(Ok(Err(EvalError::Throw(error)))) => {
-            if host_report_exception(engine.ctx(), error.clone(), name, muted) {
+            if host_report_exception(engine.ctx(), error.clone(), name, muted, Some((url, 0))) {
                 let message = describe_throw(engine, error, name);
                 push_engine_error(engine, message);
             }
@@ -15366,7 +15599,13 @@ fn run_injected_classic_task(
             let syntax_error = engine
                 .ctx()
                 .make_error("SyntaxError", error.message.clone());
-            if host_report_exception(engine.ctx(), syntax_error, name, muted) {
+            if host_report_exception(
+                engine.ctx(),
+                syntax_error,
+                name,
+                muted,
+                Some((url, error.line)),
+            ) {
                 push_engine_error(
                     engine,
                     format!(
@@ -15685,7 +15924,10 @@ fn dispatch_websocket_task(
         }
         crate::ws::WsIn::Binary(bytes) => {
             args[1] = Value::from_string(String::from("message"));
-            args[2] = Value::from_string(bytes.into_iter().map(char::from).collect());
+            args[2] = engine
+                .ctx()
+                .make_array_buffer(&bytes)
+                .map_err(|_| String::from("WebSocket task: message too large"))?;
             args[3] = Value::Bool(true);
         }
         crate::ws::WsIn::Sent(bytes) => {
@@ -16007,6 +16249,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             let (name, payload) = match event {
                 crate::js::WorkerOut::Message(message) => ("workerMessage", message),
                 crate::js::WorkerOut::Error(message) => ("workerError", message),
+                crate::js::WorkerOut::Console(lines) => ("workerConsole", lines),
             };
             dispatch_lumen_worker_task(engine, id, name, Value::from_engine_text(payload))?;
         }
@@ -16224,6 +16467,91 @@ fn host_xhr_decode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         crate::document_encoding::decode_with_label(&bytes, label.as_deref())
     };
     Ok(host_decoded_document(ctx, decoded))
+}
+
+/// HTML's "consume a character reference" outside an attribute, as WebVTT's
+/// cue text tokenizer uses it (WebVTT #webvtt-cue-text-tokenizer, "HTML
+/// character reference in data/annotation state"): (text after the U+0026,
+/// additional allowed character or null) → [code units consumed, characters],
+/// or null when nothing is consumed and the ampersand stays literal.
+fn host_html_char_ref(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let input = host_arg_string(ctx, args, 0);
+    let additional = match args.get(1) {
+        Some(Value::Str(_)) => host_arg_string(ctx, args, 1).chars().next(),
+        _ => None,
+    };
+    Ok(match consume_character_reference(&input, additional) {
+        Some((consumed, text)) => {
+            ctx.make_array(vec![Value::Num(consumed as f64), Value::from_string(text)])
+        }
+        None => Value::Null,
+    })
+}
+
+/// HTML #character-reference-state, #numeric-character-reference-end-state
+/// and #named-character-reference-state, not as part of an attribute: the
+/// number of (ASCII, so UTF-16 and UTF-8 alike) units consumed after the
+/// U+0026 and the characters they stand for.
+fn consume_character_reference(input: &str, additional: Option<char>) -> Option<(usize, String)> {
+    let bytes = input.as_bytes();
+    let first = input.chars().next()?;
+    if matches!(first, '\t' | '\n' | '\x0C' | ' ' | '<' | '&') || Some(first) == additional {
+        return None;
+    }
+    if first == '#' {
+        let hex = matches!(bytes.get(1), Some(b'x' | b'X'));
+        let digits_start = if hex { 2 } else { 1 };
+        let radix = if hex { 16 } else { 10 };
+        let mut end = digits_start;
+        let mut value: u32 = 0;
+        while let Some(digit) = bytes
+            .get(end)
+            .and_then(|&byte| char::from(byte).to_digit(radix))
+        {
+            // Any value past U+10FFFF is replaced; saturate rather than wrap.
+            value = value
+                .saturating_mul(radix)
+                .saturating_add(digit)
+                .min(0x11_0000);
+            end += 1;
+        }
+        if end == digits_start {
+            return None;
+        }
+        if bytes.get(end) == Some(&b';') {
+            end += 1;
+        }
+        let character = match value {
+            0 | 0xD800..=0xDFFF => '\u{FFFD}',
+            0x80..=0x9F => html5ever::data::C1_REPLACEMENTS[(value - 0x80) as usize]
+                .unwrap_or_else(|| char::from_u32(value).unwrap_or('\u{FFFD}')),
+            value => char::from_u32(value).unwrap_or('\u{FFFD}'),
+        };
+        return Some((end, character.to_string()));
+    }
+    // The longest name in the named character reference table that the
+    // input starts with; a missing semicolon is only a parse error here.
+    let mut matched = None;
+    for (index, character) in input.char_indices() {
+        if !character.is_ascii() {
+            break;
+        }
+        match html5ever::data::NAMED_ENTITIES.get(&input[..=index]) {
+            Some(&(first, second)) => {
+                if first != 0 {
+                    matched = Some((index + 1, first, second));
+                }
+            }
+            None => break,
+        }
+    }
+    let (consumed, first, second) = matched?;
+    let mut text = String::new();
+    text.extend(char::from_u32(first));
+    if second != 0 {
+        text.extend(char::from_u32(second));
+    }
+    Some((consumed, text))
 }
 
 fn host_create_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -20008,144 +20336,396 @@ fn host_crypto_random_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     ctx.make_uint8array(&bytes)
 }
 
-/// Web Crypto #hmac-operations-sign / #hmac-operations-verify. RustCrypto
-/// verifies the complete MAC in constant time; JS never compares secret tags.
-fn host_crypto_hmac(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    use hmac::{Hmac, KeyInit, Mac};
-    let name = host_arg_string(ctx, args, 0);
-    let key = args
-        .get(1)
-        .and_then(|v| ctx.buffer_source_bytes(v, false))
-        .ok_or_else(|| ctx.make_error("TypeError", "HMAC key is not a BufferSource"))?;
-    let data = args
-        .get(2)
-        .and_then(|v| ctx.buffer_source_bytes(v, false))
-        .ok_or_else(|| ctx.make_error("TypeError", "HMAC data is not a BufferSource"))?;
-    let signature =
-        match args.get(3).filter(|v| !matches!(v, Value::Undefined)) {
-            Some(value) => Some(ctx.buffer_source_bytes(value, false).ok_or_else(|| {
-                ctx.make_error("TypeError", "HMAC signature is not a BufferSource")
-            })?),
-            None => None,
-        };
-    macro_rules! mac {
-        ($hash:ty) => {{
-            let mut mac = Hmac::<$hash>::new_from_slice(&key).expect("HMAC accepts any key size");
-            mac.update(&data);
-            if let Some(signature) = &signature {
-                return host_resolved_promise(
-                    ctx,
-                    Value::Bool(mac.verify_slice(signature).is_ok()),
-                );
+fn crypto_member(ctx: &mut Ctx, list: &Value, index: usize) -> Value {
+    ctx.member_get(list, &index.to_string())
+        .unwrap_or(Value::Undefined)
+}
+
+/// A copied byte argument; `undefined` means an absent optional member.
+fn crypto_bytes(ctx: &mut Ctx, list: &Value, index: usize) -> Result<Option<Vec<u8>>, Value> {
+    match crypto_member(ctx, list, index) {
+        Value::Undefined => Ok(None),
+        value => ctx
+            .buffer_source_bytes(&value, false)
+            .map(Some)
+            .ok_or_else(|| ctx.make_error("TypeError", "Web Crypto operand is not a byte buffer")),
+    }
+}
+
+fn crypto_required(ctx: &mut Ctx, list: &Value, index: usize) -> Result<Vec<u8>, Value> {
+    crypto_bytes(ctx, list, index)?
+        .ok_or_else(|| ctx.make_error("TypeError", "missing Web Crypto operand"))
+}
+
+fn crypto_text(ctx: &mut Ctx, list: &Value, index: usize) -> String {
+    let value = crypto_member(ctx, list, index);
+    ctx.coerce_usv_string(&value).unwrap_or_default()
+}
+
+fn crypto_number(ctx: &mut Ctx, list: &Value, index: usize) -> f64 {
+    crypto_member(ctx, list, index)
+        .as_num_opt()
+        .unwrap_or(f64::NAN)
+}
+
+fn crypto_flag(ctx: &mut Ctx, list: &Value, index: usize) -> bool {
+    matches!(crypto_member(ctx, list, index), Value::Bool(true))
+}
+
+fn crypto_buffer(ctx: &mut Ctx, bytes: &[u8]) -> Result<Value, Value> {
+    ctx.make_array_buffer(bytes)
+}
+
+/// [handle, private, modulusLength, publicExponent, namedCurve] for the
+/// prelude's CryptoKey construction.
+fn crypto_material(
+    ctx: &mut Ctx,
+    material: &crate::crypto::keys::KeyMaterial,
+) -> Result<Value, Value> {
+    let der = ctx.make_uint8array(&material.der)?;
+    let exponent = ctx.make_uint8array(&material.public_exponent)?;
+    let curve = material.curve.map_or(Value::Null, |curve| {
+        Value::from_string(curve.name().to_string())
+    });
+    Ok(ctx.make_array(vec![
+        der,
+        Value::Bool(material.private),
+        Value::Num(f64::from(material.modulus_bits)),
+        exponent,
+        curve,
+    ]))
+}
+
+/// Web Cryptography API operations (w3c/webcrypto@811c24c). The prelude has
+/// normalized the algorithm, checked key types and usages and copied every
+/// BufferSource; this performs the operation's cryptographic step on those
+/// copies. `args` is (operation, [operands…]). A step that throws returns the
+/// DOMException name as a string, which the prelude throws in its own Realm
+/// (Lumen owns only ECMAScript errors); no successful result is a string.
+fn host_crypto_operation(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use crate::crypto::keys::{self, Curve, Failure, Family, Hash, RsaPrivateJwk, Scheme};
+    let operation = host_arg_string(ctx, args, 0);
+    let list = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let fail = |failure: Failure| Ok(Value::from_string(failure.name().to_string()));
+    let hash_at = |ctx: &mut Ctx, index: usize| {
+        let name = crypto_text(ctx, &list, index);
+        Hash::from_name(&name).ok_or_else(|| ctx.make_error("TypeError", "unregistered digest"))
+    };
+    let family_at = |ctx: &mut Ctx, index: usize| {
+        let name = crypto_text(ctx, &list, index);
+        Family::from_name(&name).ok_or_else(|| ctx.make_error("TypeError", "unknown key family"))
+    };
+    let length_at = |ctx: &mut Ctx, index: usize| {
+        let value = crypto_number(ctx, &list, index);
+        if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX)
+        {
+            Ok(value as usize)
+        } else {
+            Err(ctx.make_error("TypeError", "invalid Web Crypto length"))
+        }
+    };
+    match operation.as_str() {
+        // #sha-operations-digest
+        "digest" => {
+            let hash = hash_at(ctx, 0)?;
+            let data = crypto_required(ctx, &list, 1)?;
+            match hash.digest(&data) {
+                Ok(digest) => crypto_buffer(ctx, &digest),
+                Err(failure) => fail(failure),
             }
-            mac.finalize().into_bytes().to_vec()
-        }};
+        }
+        // #hmac-operations-sign / #hmac-operations-verify. RustCrypto
+        // compares the complete MAC in constant time.
+        "hmac" | "hmac-verify" => {
+            use hmac::{Hmac, KeyInit, Mac};
+            let hash = hash_at(ctx, 0)?;
+            let key = crypto_required(ctx, &list, 1)?;
+            let data = crypto_required(ctx, &list, 2)?;
+            let signature = crypto_bytes(ctx, &list, 3)?;
+            macro_rules! mac {
+                ($digest:ty) => {{
+                    let mut mac =
+                        Hmac::<$digest>::new_from_slice(&key).expect("HMAC accepts any key size");
+                    mac.update(&data);
+                    match &signature {
+                        Some(signature) => {
+                            return Ok(Value::Bool(mac.verify_slice(signature).is_ok()));
+                        }
+                        None => mac.finalize().into_bytes().to_vec(),
+                    }
+                }};
+            }
+            let bytes = match hash {
+                Hash::Sha1 => mac!(sha1::Sha1),
+                Hash::Sha256 => mac!(sha2::Sha256),
+                Hash::Sha384 => mac!(sha2::Sha384),
+                Hash::Sha512 => mac!(sha2::Sha512),
+            };
+            crypto_buffer(ctx, &bytes)
+        }
+        // #aes-ctr-operations: encryption and decryption are the same XOR.
+        "aes-ctr" => {
+            let key = crypto_required(ctx, &list, 0)?;
+            let counter = crypto_required(ctx, &list, 1)?;
+            let bits = crypto_number(ctx, &list, 2);
+            let data = crypto_required(ctx, &list, 3)?;
+            let bits = if (1.0..=128.0).contains(&bits) && bits.fract() == 0.0 {
+                bits as u8
+            } else {
+                0
+            };
+            match crate::crypto::aes_ctr_crypt(&key, &counter, bits, &data) {
+                Some(output) => crypto_buffer(ctx, &output),
+                None => fail(Failure::Operation),
+            }
+        }
+        // #aes-gcm-operations: ciphertext is C ‖ T; decryption releases
+        // plaintext only after authentication.
+        "aes-gcm" => {
+            let key = crypto_required(ctx, &list, 0)?;
+            let iv = crypto_required(ctx, &list, 1)?;
+            let additional = crypto_bytes(ctx, &list, 2)?.unwrap_or_default();
+            let tag = crypto_number(ctx, &list, 3);
+            let data = crypto_required(ctx, &list, 4)?;
+            let decrypt = crypto_flag(ctx, &list, 5);
+            let tag = if (0.0..=255.0).contains(&tag) && tag.fract() == 0.0 {
+                tag as u8
+            } else {
+                0
+            };
+            match crate::crypto::aes_gcm_crypt(&key, &iv, &additional, tag, &data, decrypt) {
+                Some(output) => crypto_buffer(ctx, &output),
+                None => fail(Failure::Operation),
+            }
+        }
+        "aes-cbc" => {
+            let key = crypto_required(ctx, &list, 0)?;
+            let iv = crypto_required(ctx, &list, 1)?;
+            let data = crypto_required(ctx, &list, 2)?;
+            let decrypt = crypto_flag(ctx, &list, 3);
+            match keys::aes_cbc(&key, &iv, &data, decrypt) {
+                Ok(output) => crypto_buffer(ctx, &output),
+                Err(failure) => fail(failure),
+            }
+        }
+        "aes-kw" => {
+            let key = crypto_required(ctx, &list, 0)?;
+            let data = crypto_required(ctx, &list, 1)?;
+            let unwrap = crypto_flag(ctx, &list, 2);
+            match keys::aes_kw(&key, &data, unwrap) {
+                Ok(output) => crypto_buffer(ctx, &output),
+                Err(failure) => fail(failure),
+            }
+        }
+        "hkdf" => {
+            let hash = hash_at(ctx, 0)?;
+            let key = crypto_required(ctx, &list, 1)?;
+            let salt = crypto_required(ctx, &list, 2)?;
+            let info = crypto_required(ctx, &list, 3)?;
+            let length = length_at(ctx, 4)?;
+            match keys::hkdf(hash, &key, &salt, &info, length) {
+                Ok(output) => crypto_buffer(ctx, &output),
+                Err(failure) => fail(failure),
+            }
+        }
+        "pbkdf2" => {
+            let hash = hash_at(ctx, 0)?;
+            let password = crypto_required(ctx, &list, 1)?;
+            let salt = crypto_required(ctx, &list, 2)?;
+            let iterations = length_at(ctx, 3)? as u32;
+            let length = length_at(ctx, 4)?;
+            match keys::pbkdf2(hash, &password, &salt, iterations, length) {
+                Ok(output) => crypto_buffer(ctx, &output),
+                Err(failure) => fail(failure),
+            }
+        }
+        "generate" => {
+            let family = family_at(ctx, 0)?;
+            let curve = Curve::from_name(&crypto_text(ctx, &list, 1));
+            let bits = length_at(ctx, 2).unwrap_or(0) as u32;
+            let exponent = crypto_bytes(ctx, &list, 3)?.unwrap_or_default();
+            match keys::generate(family, curve, bits, &exponent) {
+                Ok((private, public)) => {
+                    let private = crypto_material(ctx, &private)?;
+                    let public = crypto_material(ctx, &public)?;
+                    Ok(ctx.make_array(vec![private, public]))
+                }
+                Err(failure) => fail(failure),
+            }
+        }
+        "import" => {
+            let family = family_at(ctx, 0)?;
+            let format = crypto_text(ctx, &list, 1);
+            let data = crypto_required(ctx, &list, 2)?;
+            let curve = Curve::from_name(&crypto_text(ctx, &list, 3));
+            let imported = match format.as_str() {
+                "spki" => keys::import_spki(family, &data),
+                "pkcs8" => keys::import_pkcs8(family, &data),
+                "raw" => keys::import_raw_public(family, curve, &data),
+                _ => Err(Failure::NotSupported),
+            };
+            match imported {
+                Ok(material) => crypto_material(ctx, &material),
+                Err(failure) => fail(failure),
+            }
+        }
+        "import-jwk" => {
+            let family = family_at(ctx, 0)?;
+            let curve = Curve::from_name(&crypto_text(ctx, &list, 1));
+            let mut members = Vec::new();
+            for index in 2..10 {
+                members.push(crypto_bytes(ctx, &list, index)?);
+            }
+            let member = |index: usize| members[index].as_deref();
+            let imported = match family {
+                Family::Rsa => match (member(0), member(1)) {
+                    (Some(n), Some(e)) => {
+                        let private = member(2).map(|d| RsaPrivateJwk {
+                            d,
+                            crt: match (member(3), member(4), member(5), member(6), member(7)) {
+                                (Some(p), Some(q), Some(dp), Some(dq), Some(qi)) => {
+                                    Some([p, q, dp, dq, qi])
+                                }
+                                _ => None,
+                            },
+                        });
+                        keys::import_rsa_jwk(n, e, private)
+                    }
+                    _ => Err(Failure::Data),
+                },
+                Family::Ec => match (curve, member(0), member(1)) {
+                    (Some(curve), Some(x), Some(y)) => keys::import_ec_jwk(curve, x, y, member(2)),
+                    _ => Err(Failure::Data),
+                },
+                Family::Ed25519 | Family::X25519 => match member(0) {
+                    Some(x) => keys::import_okp_jwk(family, x, member(1)),
+                    None => Err(Failure::Data),
+                },
+            };
+            match imported {
+                Ok(material) => crypto_material(ctx, &material),
+                Err(failure) => fail(failure),
+            }
+        }
+        "export-jwk" => {
+            let family = family_at(ctx, 0)?;
+            let der = crypto_required(ctx, &list, 1)?;
+            let private = crypto_flag(ctx, &list, 2);
+            match keys::jwk_components(family, &der, private) {
+                Ok(members) => {
+                    let mut values = Vec::with_capacity(members.len());
+                    for member in &members {
+                        values.push(ctx.make_uint8array(member)?);
+                    }
+                    Ok(ctx.make_array(values))
+                }
+                Err(failure) => fail(failure),
+            }
+        }
+        "export-raw" => {
+            let family = family_at(ctx, 0)?;
+            let der = crypto_required(ctx, &list, 1)?;
+            match keys::raw_public(family, &der) {
+                Ok(raw) => crypto_buffer(ctx, &raw),
+                Err(failure) => fail(failure),
+            }
+        }
+        "sign" | "verify" => {
+            let scheme_name = crypto_text(ctx, &list, 0);
+            let hash = Hash::from_name(&crypto_text(ctx, &list, 1));
+            let salt = crypto_number(ctx, &list, 2);
+            let scheme = match (scheme_name.as_str(), hash) {
+                ("RSASSA-PKCS1-v1_5", Some(hash)) => Scheme::RsaPkcs1(hash),
+                ("RSA-PSS", Some(hash)) if salt >= 0.0 && salt <= f64::from(u32::MAX) => {
+                    Scheme::RsaPss(hash, salt as u32)
+                }
+                ("ECDSA", Some(hash)) => Scheme::Ecdsa(hash),
+                ("Ed25519", _) => Scheme::Ed25519,
+                _ => return Err(ctx.make_error("TypeError", "unknown signature scheme")),
+            };
+            let der = crypto_required(ctx, &list, 3)?;
+            let data = crypto_required(ctx, &list, 4)?;
+            if operation == "sign" {
+                match keys::sign(scheme, &der, &data) {
+                    Ok(signature) => crypto_buffer(ctx, &signature),
+                    Err(failure) => fail(failure),
+                }
+            } else {
+                let signature = crypto_required(ctx, &list, 5)?;
+                Ok(Value::Bool(keys::verify(scheme, &der, &signature, &data)))
+            }
+        }
+        "rsa-oaep" => {
+            let hash = hash_at(ctx, 0)?;
+            let der = crypto_required(ctx, &list, 1)?;
+            let label = crypto_bytes(ctx, &list, 2)?.unwrap_or_default();
+            let data = crypto_required(ctx, &list, 3)?;
+            let decrypt = crypto_flag(ctx, &list, 4);
+            match keys::rsa_oaep(&der, hash, &label, &data, decrypt) {
+                Ok(output) => crypto_buffer(ctx, &output),
+                Err(failure) => fail(failure),
+            }
+        }
+        "derive" => {
+            let family = family_at(ctx, 0)?;
+            let private = crypto_required(ctx, &list, 1)?;
+            let public = crypto_required(ctx, &list, 2)?;
+            match keys::derive(family, &private, &public) {
+                Ok(secret) => crypto_buffer(ctx, &secret),
+                Err(failure) => fail(failure),
+            }
+        }
+        _ => Err(ctx.make_error("TypeError", "unknown Web Crypto operation")),
     }
-    let bytes = match name.as_str() {
-        "SHA-1" => mac!(sha1::Sha1),
-        "SHA-256" => mac!(sha2::Sha256),
-        "SHA-384" => mac!(sha2::Sha384),
-        "SHA-512" => mac!(sha2::Sha512),
-        _ => return Err(ctx.make_error("NotSupportedError", "Unsupported HMAC hash")),
+}
+
+/// Compression Standard #compression-stream and #decompression-stream contexts:
+/// ("compress" | "decompress", format) → handle; ("write", handle, bytes, finish) →
+/// [Uint8Array output, failed]; ("free", handle). The constructor validated the format.
+fn host_compression_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let operation = host_arg_string(ctx, args, 0);
+    let handle = |value: Option<&Value>| match value {
+        Some(Value::Num(number)) if *number >= 1.0 && *number <= u32::MAX as f64 => *number as u32,
+        _ => 0,
     };
-    let view = ctx.make_uint8array(&bytes)?;
-    let buffer = ctx.member_get(&view, "buffer")?;
-    host_resolved_promise(ctx, buffer)
-}
-
-/// Web Cryptography Level 2 §27.7: AES-CTR's decrypt operation is the same
-/// counter-mode XOR as encrypt. The prelude performs algorithm normalization;
-/// this host keeps the raw key and copied BufferSource bytes out of the JS
-/// interpreter while returning a realm-local ArrayBuffer Promise result.
-fn host_crypto_aes_ctr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let key = args
-        .first()
-        .and_then(|value| ctx.buffer_source_bytes(value, false))
-        .ok_or_else(|| ctx.make_error("DataError", "AES key is not a BufferSource"))?;
-    let counter = args
-        .get(1)
-        .and_then(|value| ctx.buffer_source_bytes(value, false))
-        .ok_or_else(|| ctx.make_error("OperationError", "AES-CTR counter is not a BufferSource"))?;
-    let counter_bits = args
-        .get(2)
-        .and_then(Value::as_num_opt)
-        .filter(|value| value.is_finite() && value.fract() == 0.0)
-        .and_then(|value| u8::try_from(value as i64).ok())
-        .ok_or_else(|| ctx.make_error("OperationError", "Invalid AES-CTR counter length"))?;
-    let input = args
-        .get(3)
-        .and_then(|value| ctx.buffer_source_bytes(value, false))
-        .ok_or_else(|| ctx.make_error("TypeError", "AES-CTR data is not a BufferSource"))?;
-    let output = crate::crypto::aes_ctr_crypt(&key, &counter, counter_bits, &input)
-        .ok_or_else(|| ctx.make_error("OperationError", "Invalid AES-CTR parameters"))?;
-    let view = ctx.make_uint8array(&output)?;
-    let buffer = ctx.member_get(&view, "buffer")?;
-    host_resolved_promise(ctx, buffer)
-}
-
-/// Web Crypto #aes-gcm-operations. RustCrypto authenticates before releasing
-/// plaintext. Null signals an operation failure so the prelude can construct
-/// the invoking realm's DOMException (Lumen itself owns ECMAScript errors).
-fn host_crypto_aes_gcm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let mut bytes = Vec::with_capacity(4);
-    for index in [0, 1, 2, 4] {
-        bytes.push(
-            args.get(index)
+    match operation.as_str() {
+        "compress" | "decompress" => {
+            let format = host_arg_string(ctx, args, 1);
+            let created = ctx
+                .host_mut::<HostState>()
+                .and_then(|state| state.compression.create(&format, operation == "decompress"));
+            match created {
+                Some(handle) => Ok(Value::Num(f64::from(handle))),
+                None => Err(ctx.make_error("TypeError", "Unsupported compression format")),
+            }
+        }
+        "write" => {
+            let id = handle(args.get(1));
+            let input = args
+                .get(2)
                 .and_then(|value| ctx.buffer_source_bytes(value, false))
-                .ok_or_else(|| ctx.make_error("TypeError", "Expected AES-GCM BufferSource"))?,
-        );
+                .ok_or_else(|| ctx.make_error("TypeError", "The chunk must be a BufferSource"))?;
+            let finish = matches!(args.get(3), Some(Value::Bool(true)));
+            let output = ctx
+                .host_mut::<HostState>()
+                .and_then(|state| state.compression.write(id, &input, finish));
+            let (bytes, failed) = match output {
+                Some(output) => (output.bytes, output.failed),
+                // An evicted context: its stream errors instead of producing output.
+                None => (Vec::new(), true),
+            };
+            let view = ctx.make_uint8array(&bytes)?;
+            Ok(ctx.make_array(vec![view, Value::Bool(failed)]))
+        }
+        "free" => {
+            let id = handle(args.get(1));
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                state.compression.free(id);
+            }
+            Ok(Value::Undefined)
+        }
+        _ => Err(ctx.make_error("TypeError", "Unknown compression operation")),
     }
-    let tag_bits = args
-        .get(3)
-        .and_then(Value::as_num_opt)
-        .filter(|n| n.is_finite() && n.fract() == 0.0 && (0.0..=255.0).contains(n))
-        .ok_or_else(|| ctx.make_error("TypeError", "Invalid native AES-GCM tag length"))?
-        as u8;
-    let decrypt = matches!(args.get(5), Some(Value::Bool(true)));
-    let Some(output) = crate::crypto::aes_gcm_crypt(
-        &bytes[0], &bytes[1], &bytes[2], tag_bits, &bytes[3], decrypt,
-    ) else {
-        return Ok(Value::Null);
-    };
-    let view = ctx.make_uint8array(&output)?;
-    ctx.member_get(&view, "buffer")
-}
-
-/// Compression Streams §4's compression operation. The JavaScript TransformStream owns chunking
-/// and invokes this once with the copied, bounded aggregate at flush time.
-fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    use std::io::Write as _;
-
-    let format = host_arg_string(ctx, args, 0);
-    let input = args
-        .get(1)
-        .and_then(|value| ctx.buffer_source_bytes(value, false))
-        .ok_or_else(|| {
-            ctx.make_error(
-                "TypeError",
-                "CompressionStream input must be a BufferSource",
-            )
-        })?;
-    let output = match format.as_str() {
-        "deflate" => {
-            let mut encoder =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&input).and_then(|()| encoder.finish())
-        }
-        "deflate-raw" => {
-            let mut encoder =
-                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&input).and_then(|()| encoder.finish())
-        }
-        "gzip" => {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&input).and_then(|()| encoder.finish())
-        }
-        _ => return Err(ctx.make_error("TypeError", "Unsupported compression format")),
-    }
-    .map_err(|error| ctx.make_error("TypeError", format!("CompressionStream failed: {error}")))?;
-    ctx.make_uint8array(&output)
 }
 
 /// Encoding §7.4 UTF-8 encode: the Web IDL `USVString` conversion has already replaced lone
@@ -23598,9 +24178,8 @@ mod tests {
             "Body formData and extraction",
         )
         .unwrap();
-        for _ in 0..20 {
-            run_microtask_checkpoint(&mut engine);
-        }
+        // File API #blob-get-stream reads a Blob's bytes from file reading tasks.
+        settle_fixture(&mut engine, false);
         assert_eq!(
             string_value(&mut engine, "String(globalThis.result)"),
             "true|[\"user@example.com\",\"second\"]|true|true|a %22b%22.pdf|application/pdf|%PDF\r\n--x|false|true|true|\
@@ -24147,8 +24726,88 @@ mod tests {
             ),
             "true|||true|XMLHttpRequestUpload||true|TypeError|TypeError|4|2|0|8 \
              rs1 xhr:loadstart:0/0:true up:loadstart:0/5:true sent up:progress:5/5:true \
-             up:load:5/5:true up:loadend:5/5:true rs2 rs3 xhr:progress:5/5:true rs4 \
-             xhr:load:5/5:true xhr:loadend:5/5:true"
+             up:load:5/5:true up:loadend:5/5:true rs2 rs3 xhr:progress:5/0:true \
+             xhr:progress:5/0:true rs4 xhr:load:5/0:true xhr:loadend:5/0:true"
+        );
+    }
+
+    #[test]
+    fn media_elements_and_text_tracks_follow_html_and_webvtt() {
+        // HTML #media-elements without a decoder (readonly paused, volume and
+        // muted state, playback rates with ratechange, the load algorithm's
+        // reset, reflected attributes, srcObject), #timed-text-tracks
+        // (TextTrackList, TextTrack modes, cue lists in text track cue
+        // order, time marches on, TrackEvent) and WebVTT's VTTCue, VTTRegion
+        // and getCueAsHTML() cue text parsing.
+        platform_fixture_in_window(
+            "media elements",
+            include_str!("fixtures/media_elements.mjs"),
+        );
+    }
+
+    #[test]
+    fn character_references_follow_the_html_tokenizer_outside_attributes() {
+        // HTML #named-character-reference-state and
+        // #numeric-character-reference-end-state, as WebVTT cue text uses them.
+        assert_eq!(
+            consume_character_reference("amp; x", None),
+            Some((4, "&".into()))
+        );
+        assert_eq!(
+            consume_character_reference("notin;", None),
+            Some((6, "\u{2209}".into()))
+        );
+        assert_eq!(
+            consume_character_reference("notit", None),
+            Some((3, "\u{AC}".into()))
+        );
+        assert_eq!(
+            consume_character_reference("acE;", None),
+            Some((4, "\u{223E}\u{333}".into()))
+        );
+        assert_eq!(consume_character_reference("bogus;", None), None);
+        assert_eq!(
+            consume_character_reference("#x41;", None),
+            Some((5, "A".into()))
+        );
+        assert_eq!(
+            consume_character_reference("#65x", None),
+            Some((3, "A".into()))
+        );
+        assert_eq!(
+            consume_character_reference("#0;", None),
+            Some((3, "\u{FFFD}".into()))
+        );
+        assert_eq!(
+            consume_character_reference("#x80;", None),
+            Some((5, "\u{20AC}".into()))
+        );
+        assert_eq!(
+            consume_character_reference("#xD800;", None),
+            Some((7, "\u{FFFD}".into()))
+        );
+        assert_eq!(
+            consume_character_reference("#99999999999;", None),
+            Some((13, "\u{FFFD}".into()))
+        );
+        assert_eq!(consume_character_reference("#;", None), None);
+        assert_eq!(consume_character_reference(" amp;", None), None);
+        assert_eq!(consume_character_reference(">", Some('>')), None);
+        assert_eq!(consume_character_reference("", None), None);
+    }
+
+    #[test]
+    fn xhr_follows_the_xmlhttprequest_standard_in_windows_and_workers() {
+        // XHR #interface-xmlhttprequest over Fetch #main-fetch: open() and
+        // setRequestHeader() validation, the attribute setters, event order
+        // (processBodyChunk and #handle-response-end-of-body both fire
+        // progress, with the Content-Length as total), response types, text
+        // decoding (#final-charset, BOM, XML declaration, replacement),
+        // blob: ranges, network errors, abort(), upload events and
+        // synchronous requests, in a Window and a DedicatedWorkerGlobalScope.
+        platform_fixture_in_window_and_secure_worker(
+            "XMLHttpRequest",
+            include_str!("fixtures/xhr_requests.mjs"),
         );
     }
 
@@ -29493,6 +30152,56 @@ mod tests {
     }
 
     #[test]
+    fn canvas_patterns_hit_testing_focus_rings_and_serialization() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_patterns.mjs"),
+                "canvas pattern conformance",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "canvas-patterns-ok",
+                "{tier:?}"
+            );
+            assert_eq!(
+                string_value(&mut engine, "String(focusedForRing)"),
+                "true",
+                "{tier:?}"
+            );
+        }
+        // HTML #dom-canvas-toblob: the callback runs in a later task.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const canvas = document.createElement('canvas'); canvas.width = 3; canvas.height = 2;
+            canvas.getContext('2d').fillRect(0, 0, 3, 2);
+            globalThis.blobResult = 'pending';
+            canvas.toBlob(blob => { blobResult = [blob instanceof Blob, blob.type, blob.size > 0].join('|'); }, 'image/jpeg', 0.8);
+            const empty = document.createElement('canvas'); empty.width = 0;
+            globalThis.emptyBlob = 'pending';
+            empty.toBlob(blob => { emptyBlob = String(blob); });
+            globalThis.synchronous = blobResult;
+            "#,
+            "canvas toBlob",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "__trust");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[synchronous, blobResult, emptyBlob].join(',')"
+            ),
+            "pending,true|image/jpeg|true,null"
+        );
+    }
+
+    #[test]
     fn canvas_gradients_are_branded_across_same_agent_window_realms() {
         let mut engine = platform_engine();
         eval(
@@ -33490,6 +34199,613 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// An async platform fixture body with the `check`, `rejects` and
+    /// `throws` helpers; it stores `globalThis.result` ("ok" or the failures).
+    fn wrap_platform_fixture(source: &str) -> String {
+        format!(
+            "(async () => {{\n\
+             const fails = [];\n\
+             const check = (condition, message) => {{ if (!condition) fails.push(message); }};\n\
+             const rejects = async (promise, name, message) => {{\n\
+                 try {{ await promise; fails.push(message + ': resolved'); }}\n\
+                 catch (error) {{ if (name && error.name !== name) fails.push(message + ': ' + error.name + ' ' + error.message); }}\n\
+             }};\n\
+             const throws = (fn, name, message) => {{\n\
+                 try {{ fn(); fails.push(message + ': no exception'); }}\n\
+                 catch (error) {{ if (name && error.name !== name) fails.push(message + ': ' + error.name + ' ' + error.message); }}\n\
+             }};\n\
+             {source}\n\
+             globalThis.result = fails.length ? fails.join(' | ') : 'ok';\n\
+             }})().catch(error => {{ globalThis.result = 'threw ' + error.name + ': ' + error.message + ' ' + error.stack; }});"
+        )
+    }
+
+    /// Runs an async platform fixture in a Window only ([Exposed=Window]).
+    fn platform_fixture_in_window(label: &str, source: &str) {
+        let mut window = platform_engine();
+        eval(&mut window, &wrap_platform_fixture(source), label).unwrap();
+        assert_eq!(settle_fixture(&mut window, false), "ok", "{label} (Window)");
+    }
+
+    /// Runs an async platform fixture in a Window and in a dedicated worker,
+    /// settling tasks and microtasks until it stores `globalThis.result`.
+    fn platform_fixture_in_window_and_worker(label: &str, source: &str) {
+        let wrapped = wrap_platform_fixture(source);
+        let mut window = platform_engine();
+        eval(&mut window, &wrapped, label).unwrap();
+        assert_eq!(settle_fixture(&mut window, false), "ok", "{label} (Window)");
+        let mut worker = worker_platform_engine();
+        eval(&mut worker, &wrapped, label).unwrap();
+        assert_eq!(
+            settle_fixture(&mut worker, true),
+            "ok",
+            "{label} (DedicatedWorkerGlobalScope)"
+        );
+    }
+
+    /// The fixture of [`platform_fixture_in_window_and_worker`] in a Window and a
+    /// dedicated worker that is a secure context ([SecureContext] interfaces).
+    fn platform_fixture_in_window_and_secure_worker(label: &str, source: &str) {
+        let wrapped = wrap_platform_fixture(source);
+        let mut window = platform_engine();
+        eval(&mut window, &wrapped, label).unwrap();
+        assert_eq!(settle_fixture(&mut window, false), "ok", "{label} (Window)");
+        let mut worker = worker_engine_with_secure_context(true);
+        eval(&mut worker, &wrapped, label).unwrap();
+        assert_eq!(
+            settle_fixture(&mut worker, true),
+            "ok",
+            "{label} (DedicatedWorkerGlobalScope)"
+        );
+    }
+
+    /// Run microtasks, queued platform tasks and due timers until the fixture
+    /// stores `globalThis.result` or no work remains.
+    fn settle_fixture(engine: &mut lumen::Engine, worker: bool) -> String {
+        let control = if worker { "__wkr" } else { "__trust" };
+        let tick = if worker {
+            "__wkr.tick(1e12)"
+        } else {
+            "__trust.tick()"
+        };
+        for _ in 0..5000 {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, "typeof globalThis.result") != "undefined" {
+                break;
+            }
+            if string_value(engine, &format!("String({control}.hasPlatformTask())")) == "true" {
+                eval(
+                    engine,
+                    &format!("{control}.runPlatformTask()"),
+                    "platform task",
+                )
+                .unwrap();
+                continue;
+            }
+            if string_value(engine, &format!("String({tick})")) != "true" {
+                break;
+            }
+        }
+        run_microtask_checkpoint(engine);
+        string_value(engine, "String(globalThis.result)")
+    }
+
+    #[test]
+    fn streams_follow_the_streams_standard_in_windows_and_workers() {
+        // Streams Standard (local whatwg/streams@b9ba9f4): #rs-class, #rbs-controller-class,
+        // #byob-reader-class, #readable-stream-tee, #readable-stream-pipe-to,
+        // #rs-asynciterator, #readable-stream-from-iterable, #ws-class, #ts-class and #qs.
+        platform_fixture_in_window_and_worker(
+            "streams",
+            r#"
+            // Interface objects: internal state is never an own or inherited property.
+            for (const name of ["ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamBYOBReader",
+                    "ReadableStreamDefaultController", "ReadableByteStreamController", "ReadableStreamBYOBRequest",
+                    "WritableStream", "WritableStreamDefaultWriter", "WritableStreamDefaultController",
+                    "TransformStream", "TransformStreamDefaultController", "ByteLengthQueuingStrategy",
+                    "CountQueuingStrategy", "TextEncoderStream", "TextDecoderStream", "CompressionStream",
+                    "DecompressionStream"]) {
+                const C = globalThis[name];
+                check(typeof C === "function", name + " exposed");
+                check(Object.prototype.toString.call(C.prototype) === "[object " + name + "]", name + " tag");
+            }
+            const rs = new ReadableStream();
+            check(Reflect.ownKeys(rs).length === 0, "no own stream properties");
+            check(!Object.getOwnPropertyNames(ReadableStream.prototype).some(n => n[0] === "_"), "no private names");
+            check(ReadableStream.prototype[Symbol.asyncIterator] === ReadableStream.prototype.values, "@@asyncIterator");
+            check(Object.getOwnPropertyDescriptor(ReadableStream.prototype, "getReader").enumerable, "enumerable ops");
+            check(ReadableStream.prototype.pipeTo.length === 1 && ReadableStream.from.length === 1, "lengths");
+            throws(() => new ReadableStreamDefaultController(), "TypeError", "illegal controller constructor");
+            throws(() => new ReadableStream(null), "TypeError", "null underlying source");
+            throws(() => new ReadableStream({type: "other"}), "TypeError", "invalid type");
+            throws(() => new ReadableStream({}, {highWaterMark: -1}), "RangeError", "negative HWM");
+            await rejects(ReadableStream.prototype.cancel.call({}), "TypeError", "cancel brand check rejects");
+
+            // Default stream: queue, desiredSize and backpressure-driven pull.
+            let pulls = 0, controller;
+            const counted = new ReadableStream({
+                start(c) { controller = c; c.enqueue("a"); },
+                pull() { pulls++; },
+            }, new CountQueuingStrategy({highWaterMark: 2}));
+            check(controller.desiredSize === 1, "desiredSize after one chunk");
+            const reader = counted.getReader();
+            check(counted.locked, "locked by reader");
+            throws(() => counted.getReader(), "TypeError", "second reader");
+            check((await reader.read()).value === "a", "first chunk");
+            check(pulls > 0, "pull after start");
+            controller.close();
+            check((await reader.read()).done, "closed");
+            reader.releaseLock();
+            await rejects(reader.closed, "TypeError", "released reader closed promise");
+
+            // Byte stream with a BYOB reader and min.
+            const bytes = new ReadableStream({
+                type: "bytes",
+                pull(c) {
+                    const view = c.byobRequest.view;
+                    view[0] = 1; view[1] = 2;
+                    c.byobRequest.respond(2);
+                    if (++bytesPulls === 2) c.close();
+                },
+            });
+            let bytesPulls = 0;
+            const byob = bytes.getReader({mode: "byob"});
+            const first = await byob.read(new Uint8Array(4), {min: 4});
+            check(first.value.length === 4 && first.value.join() === "1,2,1,2", "BYOB min fill " + first.value.join());
+            const last = await byob.read(new Uint8Array(4));
+            check(last.done && last.value.byteLength === 0, "BYOB close gives an empty view");
+            await rejects(byob.read(new Uint8Array(0)), "TypeError", "empty view");
+
+            // tee() of a default stream with a composite cancel reason.
+            let cancelReason;
+            const source = new ReadableStream({start(c) { c.enqueue(1); }, cancel(r) { cancelReason = r; }});
+            const [b1, b2] = source.tee();
+            const b1reader = b1.getReader();
+            check((await b1reader.read()).value === 1, "tee branch 1");
+            const b2reader = b2.getReader();
+            check((await b2reader.read()).value === 1, "tee branch 2");
+            b2reader.releaseLock();
+            await Promise.all([b1reader.cancel("x"), b2.cancel("y")]);
+            check(Array.isArray(cancelReason) && cancelReason.join() === "x,y", "composite cancel reason");
+
+            // pipeTo with an AbortSignal, then pipeThrough a TransformStream.
+            const written = [];
+            const ac = new AbortController();
+            let sourceController;
+            const pipeSource = new ReadableStream({start(c) { sourceController = c; }});
+            const sink = new WritableStream({write(chunk) { written.push(chunk); }});
+            const piped = pipeSource.pipeTo(sink, {signal: ac.signal});
+            sourceController.enqueue("p");
+            await new Promise(resolve => setTimeout(resolve, 0));
+            ac.abort();
+            await rejects(piped, "AbortError", "aborted pipe");
+            check(written.join() === "p", "chunk written before abort");
+            const upper = new TransformStream({transform(chunk, c) { c.enqueue(chunk.toUpperCase()); }});
+            const out = ReadableStream.from(["a", "b"]).pipeThrough(upper);
+            const collected = [];
+            for await (const chunk of out) collected.push(chunk);
+            check(collected.join("") === "AB", "pipeThrough + async iteration");
+            const iterated = ReadableStream.from((async function* () { yield 1; yield 2; })());
+            const iterator = iterated.values({preventCancel: true});
+            check((await iterator.next()).value === 1, "async generator source");
+            await iterator.return();
+            check(!iterated.locked, "return() releases the lock");
+
+            // WritableStream backpressure and errors.
+            const slow = new WritableStream({write() { return new Promise(r => setTimeout(r, 0)); }},
+                new CountQueuingStrategy({highWaterMark: 1}));
+            const writer = slow.getWriter();
+            check(writer.desiredSize === 1, "initial desiredSize");
+            const w1 = writer.write("1");
+            check(writer.desiredSize === 0, "backpressure after write");
+            await w1;
+            await writer.close();
+            await rejects(writer.write("x"), "TypeError", "write after close");
+            const ts = new TransformStream();
+            check(ts.readable instanceof ReadableStream && ts.writable instanceof WritableStream, "transform sides");
+            const bl = new ByteLengthQueuingStrategy({highWaterMark: 16});
+            check(bl.highWaterMark === 16 && bl.size(new Uint8Array(3)) === 3, "byte length strategy");
+            "#,
+        );
+    }
+
+    #[test]
+    fn encoding_and_compression_streams_transform_incrementally() {
+        // Encoding #interface-textencoderstream / #interface-textdecoderstream and Compression
+        // (local whatwg/compression@770f314) #compression-stream / #decompression-stream.
+        platform_fixture_in_window_and_worker(
+            "encoding and compression streams",
+            r#"
+            const readAll = async stream => {
+                const chunks = [];
+                for await (const chunk of stream) chunks.push(chunk);
+                return chunks;
+            };
+            // A surrogate pair split between chunks is reassembled; a lone
+            // trailing surrogate is U+FFFD at the end of input.
+            const encoder = new TextEncoderStream();
+            const ew = encoder.writable.getWriter();
+            ew.write("a\uD83D"); ew.write("\uDE42"); ew.write("\uD800"); ew.close();
+            const encoded = (await readAll(encoder.readable)).map(c => Array.from(c).join(".")).join("/");
+            check(encoded === "97/240.159.153.130/239.191.189", "TextEncoderStream " + encoded);
+            const decoder = new TextDecoderStream("utf-8", {fatal: true});
+            check(decoder.encoding === "utf-8" && decoder.fatal && !decoder.ignoreBOM, "TextDecoderStream attributes");
+            const dw = decoder.writable.getWriter();
+            dw.write(new Uint8Array([0xC3])).catch(() => {});
+            dw.write(new Uint8Array([0xA9, 0xFF])).catch(() => {});
+            await rejects(readAll(decoder.readable), "TypeError", "fatal decoder errors the stream");
+            const loose = new TextDecoderStream("windows-1252");
+            const lw = loose.writable.getWriter();
+            lw.write(new Uint8Array([0x80])); lw.close();
+            check((await readAll(loose.readable)).join("") === "€", "windows-1252 stream");
+            const badChunk = new TextDecoderStream();
+            const bw = badChunk.writable.getWriter();
+            const badRead = badChunk.readable.getReader().read();
+            await rejects(bw.write(undefined), "TypeError", "undefined is not a BufferSource");
+            await rejects(badRead, "TypeError", "the readable side errors too");
+
+            const input = new Uint8Array(70000);
+            for (let i = 0; i < input.length; i++) input[i] = (i * 31) % 251;
+            for (const format of ["gzip", "deflate", "deflate-raw", "brotli"]) {
+                const compressed = new Blob([input]).stream().pipeThrough(new CompressionStream(format));
+                const roundTrip = new Uint8Array(await new Response(
+                    compressed.pipeThrough(new DecompressionStream(format))).arrayBuffer());
+                check(roundTrip.length === input.length && roundTrip.every((b, i) => b === input[i]), format + " round trip");
+            }
+            throws(() => new CompressionStream("zstd"), "TypeError", "unsupported format");
+            // Trailing data after the end of a gzip member, and truncated input.
+            const gz = new Uint8Array(await new Response(new Blob(["x"]).stream()
+                .pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+            const doubled = new Uint8Array(gz.length * 2); doubled.set(gz); doubled.set(gz, gz.length);
+            await rejects(new Response(new Blob([doubled]).stream().pipeThrough(new DecompressionStream("gzip"))).text(),
+                "TypeError", "trailing gzip member");
+            await rejects(new Response(new Blob([gz.subarray(0, gz.length - 2)]).stream()
+                .pipeThrough(new DecompressionStream("gzip"))).text(), "TypeError", "truncated gzip");
+            const inflater = new DecompressionStream("deflate");
+            const inflated = inflater.readable.getReader().read();
+            await rejects(inflater.writable.getWriter().write(new Uint8Array([1, 2, 3, 4])), "TypeError", "corrupt zlib header");
+            await rejects(inflated, "TypeError", "corrupt input errors the readable side");
+            "#,
+        );
+    }
+
+    #[test]
+    fn abort_controller_and_signal_follow_dom_abort_steps() {
+        // DOM Standard #interface-abortcontroller and #interface-AbortSignal: abort algorithms
+        // run before the abort event, dependent signals (#create-a-dependent-abort-signal)
+        // abort with their source, and timeout() rejects with a TimeoutError.
+        platform_fixture_in_window_and_worker(
+            "abort signals",
+            r#"
+            throws(() => new AbortSignal(), "TypeError", "AbortSignal is not constructible");
+            const controller = new AbortController();
+            const signal = controller.signal;
+            check(controller.signal === signal && !signal.aborted && signal.reason === undefined, "initial state");
+            check(Reflect.ownKeys(signal).length === 0 && Reflect.ownKeys(controller).length === 0, "no own state");
+            const order = [];
+            signal.addEventListener("abort", e => order.push("listener:" + e.isTrusted));
+            signal.onabort = () => order.push("handler");
+            const dependent = AbortSignal.any([signal]);
+            const nested = AbortSignal.any([dependent, AbortSignal.any([])]);
+            dependent.addEventListener("abort", () => order.push("dependent"));
+            controller.abort();
+            check(signal.aborted && signal.reason instanceof DOMException && signal.reason.name === "AbortError", "default reason");
+            check(order.join() === "listener:true,handler,dependent", "abort event order " + order.join());
+            check(dependent.reason === signal.reason && nested.aborted, "dependents share the reason");
+            throws(() => signal.throwIfAborted(), "AbortError", "throwIfAborted");
+            controller.abort("again");
+            check(signal.reason.name === "AbortError", "abort is idempotent");
+            const preAborted = AbortSignal.abort("why");
+            check(preAborted.aborted && preAborted.reason === "why", "AbortSignal.abort(reason)");
+            check(AbortSignal.any([preAborted]).reason === "why", "any() of an aborted signal");
+            throws(() => AbortSignal.any([{}]), "TypeError", "any() requires signals");
+            const timeout = AbortSignal.timeout(0);
+            await new Promise(resolve => timeout.addEventListener("abort", resolve));
+            check(timeout.reason instanceof DOMException && timeout.reason.name === "TimeoutError", "timeout reason");
+            "#,
+        );
+    }
+
+    #[test]
+    fn fetch_headers_request_and_response_follow_the_fetch_standard() {
+        // Fetch (local whatwg/fetch@394d20d) #headers-class, #request-class, #response-class,
+        // #body-mixin and #fetch-method in both realms; the worker's fetch is the same API.
+        platform_fixture_in_window_and_worker(
+            "fetch classes",
+            r#"
+            for (const name of ["Headers", "Request", "Response", "FormData"])
+                check(Object.prototype.toString.call(globalThis[name].prototype) === "[object " + name + "]", name);
+            // Headers: validation, sort-and-combine iteration, guards and Set-Cookie.
+            const headers = new Headers([["B", "2"], ["a", " 1 "], ["b", "3"], ["Set-Cookie", "x=1"], ["set-cookie", "y=2"]]);
+            check([...headers].map(p => p.join(":")).join(",") === "a:1,b:2, 3,set-cookie:x=1,set-cookie:y=2", "sort and combine");
+            check(headers.getSetCookie().join() === "x=1,y=2", "getSetCookie");
+            throws(() => headers.append("bad name", "v"), "TypeError", "invalid header name");
+            throws(() => headers.set("x", "a\nb"), "TypeError", "invalid header value");
+            throws(() => new Headers({"x": "Ā"}), "TypeError", "ByteString");
+            throws(() => new Headers([["only-one"]]), "TypeError", "header pairs");
+            const request = new Request("https://example.org/a#frag", {method: "post", headers: {"Cookie": "no", "X-Ok": "yes"}, body: "text"});
+            check(request.method === "POST" && request.url === "https://example.org/a#frag", "method normalization");
+            check(!request.headers.has("cookie") && request.headers.get("x-ok") === "yes", "request guard drops forbidden headers");
+            check(request.headers.get("content-type") === "text/plain;charset=UTF-8", "extracted Content-Type");
+            check(request.duplex === "half" && request.signal instanceof AbortSignal && request.mode === "cors", "defaults");
+            throws(() => new Request("https://example.org/", {method: "GET", body: "x"}), "TypeError", "GET with body");
+            throws(() => new Request("https://example.org/", {method: "HEAD", body: ""}), "TypeError", "HEAD with body");
+            throws(() => new Request("https://example.org/", {method: "CONNECT"}), "TypeError", "forbidden method");
+            throws(() => new Request("https://example.org/", {mode: "navigate"}), "TypeError", "navigate mode");
+            throws(() => new Request("https://example.org/", {cache: "only-if-cached"}), "TypeError", "only-if-cached");
+            throws(() => new Request("https://example.org/", {mode: "no-cors", method: "PUT"}), "TypeError", "no-cors method");
+            throws(() => new Request("https://u:p@example.org/"), "TypeError", "credentials in URL");
+            throws(() => new Request("https://example.org/", {body: new ReadableStream(), method: "POST"}), "TypeError", "duplex required");
+            const noCors = new Request("https://example.org/", {mode: "no-cors"});
+            noCors.headers.set("X-Custom", "1");
+            noCors.headers.set("Accept", "text/html");
+            check(!noCors.headers.has("x-custom") && noCors.headers.get("accept") === "text/html", "no-cors guard");
+            const copy = new Request(request);
+            check(request.bodyUsed && !copy.bodyUsed, "Request(Request) proxies the body");
+            check(await copy.text() === "text" && copy.bodyUsed, "proxied body");
+            throws(() => new Request(request), "TypeError", "unusable input body");
+            const cloneSource = new Request("https://example.org/", {method: "POST", body: "clone"});
+            const cloned = cloneSource.clone();
+            check(await cloneSource.text() === "clone" && await cloned.text() === "clone", "clone tees the body");
+            throws(() => cloneSource.clone(), "TypeError", "clone of a used body");
+
+            // Response
+            throws(() => new Response("x", {status: 199}), "RangeError", "status range");
+            throws(() => new Response("x", {status: 204}), "TypeError", "null body status");
+            throws(() => new Response("x", {statusText: "\n"}), "TypeError", "reason phrase");
+            const response = new Response("hello", {status: 201, statusText: "Created", headers: {"X-A": "1"}});
+            check(response.ok && response.status === 201 && response.statusText === "Created" && response.type === "default", "init");
+            check(Reflect.ownKeys(response).length === 0, "no own Response state");
+            check(!response.bodyUsed && await response.text() === "hello" && response.bodyUsed, "consume once");
+            await rejects(response.text(), "TypeError", "second read rejects");
+            const json = Response.json({a: 1}, {status: 202});
+            check(json.headers.get("content-type") === "application/json" && (await json.json()).a === 1, "Response.json");
+            const redirect = Response.redirect("https://example.org/next", 307);
+            check(redirect.status === 307 && redirect.headers.get("location") === "https://example.org/next", "redirect");
+            throws(() => Response.redirect("https://example.org/", 200), "RangeError", "redirect status");
+            throws(() => redirect.headers.set("x", "y"), "TypeError", "immutable headers");
+            const error = Response.error();
+            check(error.type === "error" && error.status === 0, "Response.error");
+            const streamed = new Response(new ReadableStream({start(c) { c.enqueue(new Uint8Array([104, 105])); c.close(); }}));
+            check(await streamed.text() === "hi", "ReadableStream body");
+            const bad = new Response(new ReadableStream({start(c) { c.enqueue("not bytes"); c.close(); }}));
+            await rejects(bad.arrayBuffer(), "TypeError", "non-Uint8Array chunk");
+            const textStream = new Response("ab").textStream();
+            const parts = [];
+            for await (const part of textStream) parts.push(part);
+            check(parts.join("") === "ab", "textStream");
+            const fd = new FormData();
+            fd.append("name", "va\nlue");
+            fd.append("file", new Blob(["data"], {type: "text/x-test"}), "f.txt");
+            const multipart = new Response(fd);
+            check(/^multipart\/form-data; boundary=/.test(multipart.headers.get("content-type")), "multipart type");
+            const parsed = await multipart.formData();
+            check(parsed.get("name") === "va\r\nlue" && parsed.get("file").name === "f.txt" && parsed.get("file").type === "text/x-test", "multipart round trip");
+            const urlencoded = await new Response("a=1&b=%20", {headers: {"content-type": "application/x-www-form-urlencoded"}}).formData();
+            check(urlencoded.get("b") === " ", "urlencoded formData");
+            await rejects(new Response("x").formData(), "TypeError", "formData needs a form MIME type");
+
+            // fetch(): local schemes and abort.
+            const data = await fetch("data:text/plain;base64,aGk=");
+            check(data.type === "basic" && data.statusText === "OK" && await data.text() === "hi", "data: URL");
+            const head = await fetch("data:,body", {method: "HEAD"});
+            check(head.body === null, "HEAD has a null body");
+            const blobURL = URL.createObjectURL(new Blob(["0123456789"], {type: "text/plain"}));
+            const ranged = await fetch(blobURL, {headers: {Range: "bytes=2-4"}});
+            check(ranged.status === 206 && await ranged.text() === "234" &&
+                ranged.headers.get("content-range") === "bytes 2-4/10", "blob: range");
+            await rejects(fetch(blobURL, {method: "POST", body: "x"}), "TypeError", "blob: POST");
+            await rejects(fetch("about:blank"), "TypeError", "about:blank in cors mode");
+            await rejects(fetch("data:,x", {signal: AbortSignal.abort()}), "AbortError", "pre-aborted fetch");
+            const later = new AbortController();
+            const pending = fetch("data:,x", {signal: later.signal});
+            later.abort();
+            await rejects(pending, "AbortError", "abort before the response");
+            "#,
+        );
+    }
+
+    #[test]
+    fn file_api_blob_file_and_readers_follow_the_file_api() {
+        // File API (local w3c/FileAPI@1341d26) #blob-section, #file-section, #APIASynch and
+        // #FileReaderSync; XHR #interface-progressevent for the reader's events.
+        platform_fixture_in_window_and_worker(
+            "file api",
+            r#"
+            const blob = new Blob(["a\r\nb", new Uint8Array([0xC3, 0xA9]), new Blob(["!"])], {type: "Text/Plain", endings: "native"});
+            check(blob.size === 6 && blob.type === "text/plain", "parts and type " + blob.size + " " + blob.type);
+            check(await blob.text() === "a\nbé!", "native endings and UTF-8");
+            check(new Blob([], {type: "é"}).type === "", "non-printable type");
+            check(Reflect.ownKeys(blob).length === 0, "no own Blob state");
+            const slice = blob.slice(-3, -1, "X/Y");
+            check(slice.size === 2 && slice.type === "x/y", "slice");
+            check((await slice.bytes()).join() === "195,169", "slice bytes");
+            check((await blob.arrayBuffer()).byteLength === 6, "arrayBuffer");
+            const chunks = [];
+            for await (const chunk of blob.stream()) chunks.push(chunk);
+            check(chunks.every(c => c instanceof Uint8Array) && chunks.reduce((n, c) => n + c.length, 0) === 6, "stream");
+            throws(() => new Blob("not a sequence"), "TypeError", "blob parts sequence");
+            throws(() => new Blob([], {endings: "crlf"}), "TypeError", "endings enum");
+            const file = new File(["xyz"], "näme.txt", {type: "text/plain", lastModified: 42});
+            check(file instanceof Blob && file.name === "näme.txt" && file.lastModified === 42, "File");
+            throws(() => new File(["x"]), "TypeError", "File requires a name");
+            // #file-section: name and lastModified are prototype accessors over internal slots.
+            check(Reflect.ownKeys(file).length === 0 && typeof Object.getOwnPropertyDescriptor(File.prototype, "name").get === "function"
+                && typeof Object.getOwnPropertyDescriptor(File.prototype, "lastModified").get === "function", "File accessors");
+            throws(() => Object.getOwnPropertyDescriptor(File.prototype, "name").get.call(new Blob([])), "TypeError", "File brand");
+            // XHR #interface-formdata: Web IDL arguments, USVString names and the Blob overload.
+            const form = new FormData();
+            throws(() => form.append("only"), "TypeError", "append arity");
+            throws(() => form.get(), "TypeError", "get arity");
+            throws(() => form.append("n", "v", "f.txt"), "TypeError", "filename needs a Blob");
+            form.append("\uD800", new Blob(["1"]));
+            const entry = form.get("\uFFFD");
+            check(entry instanceof File && entry.name === "blob", "Blob entry becomes File blob");
+            form.set("n", {toString() { return "\uDC00x"; }});
+            check(form.get("n") === "\uFFFDx" && form.getAll("n").length === 1, "USVString values");
+            // FileReader: loadstart, progress?, load, loadend, all ProgressEvents.
+            const reader = new FileReader();
+            const events = [];
+            for (const type of ["loadstart", "load", "loadend"])
+                reader.addEventListener(type, e => events.push(e.type + ":" + (e instanceof ProgressEvent) + ":" + e.isTrusted));
+            const done = new Promise(resolve => reader.onloadend = resolve);
+            reader.readAsText(new Blob([new Uint8Array([0xFF, 0xFE, 0x41, 0x00])]));
+            check(reader.readyState === FileReader.LOADING, "loading");
+            throws(() => reader.readAsText(blob), "InvalidStateError", "concurrent read");
+            await done;
+            check(reader.result === "A" && reader.readyState === 2, "BOM-sniffed UTF-16LE " + JSON.stringify(reader.result));
+            check(events.join() === "loadstart:true:true,load:true:true,loadend:true:true", "events " + events.join());
+            const urlReader = new FileReader();
+            await new Promise(resolve => { urlReader.onload = resolve; urlReader.readAsDataURL(new Blob(["hi"], {type: "text/plain"})); });
+            check(urlReader.result === "data:text/plain;base64,aGk=", "data URL");
+            const aborted = new FileReader();
+            const abortEvents = [];
+            aborted.onabort = () => abortEvents.push("abort");
+            aborted.onloadend = () => abortEvents.push("loadend");
+            aborted.onload = () => abortEvents.push("load");
+            aborted.readAsArrayBuffer(blob);
+            aborted.abort();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            check(abortEvents.join() === "abort,loadend" && aborted.result === null, "abort " + abortEvents.join());
+            const progress = new ProgressEvent("progress", {lengthComputable: true, loaded: 1, total: 2});
+            check(progress.lengthComputable && progress.loaded === 1 && progress.total === 2, "ProgressEvent init");
+            if (typeof FileReaderSync === "function") {
+                const sync = new FileReaderSync();
+                check(sync.readAsText(new Blob(["sync"])) === "sync", "FileReaderSync");
+                check(new Uint8Array(sync.readAsArrayBuffer(new Blob([new Uint8Array([7])])))[0] === 7, "sync buffer");
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_exception_is_one_web_idl_interface_in_both_realms() {
+        // Web IDL (local whatwg/webidl@8f18262) #idl-DOMException and
+        // #js-DOMException-specialness: accessors on the interface prototype, legacy codes,
+        // and an %Error.prototype% prototype chain, in Window and worker realms.
+        platform_fixture_in_window_and_worker(
+            "DOMException",
+            r#"
+            const e = new DOMException("msg", "NotFoundError");
+            check(e instanceof Error && e instanceof DOMException, "inheritance");
+            check(Object.getPrototypeOf(DOMException.prototype) === Error.prototype, "prototype chain");
+            check(e.name === "NotFoundError" && e.message === "msg" && e.code === 8, "attributes");
+            check(!Object.prototype.hasOwnProperty.call(e, "name") && !Object.prototype.hasOwnProperty.call(e, "code"), "no own name/code");
+            const getter = Object.getOwnPropertyDescriptor(DOMException.prototype, "name").get;
+            throws(() => getter.call({}), "TypeError", "brand check");
+            check(new DOMException().name === "Error" && new DOMException().message === "", "defaults");
+            check(new DOMException("x", "Custom").code === 0, "unknown name code");
+            check(DOMException.NOT_FOUND_ERR === 8 && e.DATA_CLONE_ERR === 25, "legacy constants");
+            check(Object.prototype.toString.call(e) === "[object DOMException]", "class string");
+            throws(() => new DOMException(Symbol()), "TypeError", "DOMString conversion");
+            "#,
+        );
+    }
+
+    #[test]
+    fn unhandled_rejections_fire_promise_rejection_events_in_windows_and_workers() {
+        // HTML #unhandled-promise-rejections (local whatwg/html@e5071a2): after a microtask
+        // checkpoint, promises rejected without a handler fire a cancelable, trusted
+        // PromiseRejectionEvent named unhandledrejection at the global from a queued task;
+        // only events that were not canceled reach the developer console.
+        let html = r#"<!doctype html><body><pre id="o">pending</pre><script>
+            const events = [];
+            addEventListener('unhandledrejection', e => {
+                events.push([e.type, e.reason, e.promise instanceof Promise, e.cancelable, e.isTrusted,
+                    e instanceof PromiseRejectionEvent].join(':'));
+                if (e.reason === 'quiet') e.preventDefault();
+            });
+            onunhandledrejection = e => events.push('handler:' + e.reason);
+            Promise.reject('loud');
+            Promise.reject('quiet');
+            Promise.reject('handled').catch(() => {});
+            setTimeout(() => { document.getElementById('o').textContent = events.join(','); }, 20);
+            </script>"#;
+        let (output, outcome) = crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        let result = output
+            .split("<pre id=\"o\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</pre>").next())
+            .unwrap_or_default();
+        assert_eq!(
+            result,
+            "unhandledrejection:loud:true:true:true:true,handler:loud,\
+             unhandledrejection:quiet:true:true:true:true,handler:quiet",
+            "{output}"
+        );
+        assert!(
+            outcome
+                .console
+                .iter()
+                .any(|line| line == "unhandled rejection: loud"),
+            "{:?}",
+            outcome.console
+        );
+        assert!(
+            !outcome
+                .console
+                .iter()
+                .any(|line| line.ends_with(": quiet") || line.ends_with(": handled")),
+            "{:?}",
+            outcome.console
+        );
+
+        let mut worker = worker_platform_engine();
+        eval(
+            &mut worker,
+            r#"
+            globalThis.events = [];
+            self.onunhandledrejection = e => {
+                events.push(e.reason + ':' + e.isTrusted + ':' + (e instanceof PromiseRejectionEvent));
+                if (e.reason === 'quiet') e.preventDefault();
+            };
+            Promise.reject('loud');
+            Promise.reject('quiet');
+            console.log('from', 'worker');
+            "#,
+            "worker rejections",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut worker);
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        assert_eq!(
+            settle_fixture_events(&mut worker),
+            "loud:true:true,quiet:true:true"
+        );
+        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        let mut console = Vec::new();
+        while let Ok(task) = received.try_recv() {
+            if let LumenHostTask::Worker {
+                id: 7,
+                event: crate::js::WorkerOut::Console(lines),
+            } = task
+            {
+                console.extend(lines.split('\u{1e}').map(String::from));
+            }
+        }
+        assert_eq!(console, ["log: from worker", "unhandled rejection: loud"]);
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "(() => { try { new PromiseRejectionEvent('x', {}); return 'no'; } catch (e) { return e.name; } })()"
+            ),
+            "TypeError"
+        );
+    }
+
+    /// Run a worker's queued platform tasks, then read `events`.
+    fn settle_fixture_events(worker: &mut lumen::Engine) -> String {
+        for _ in 0..100 {
+            run_microtask_checkpoint(worker);
+            if string_value(worker, "String(__wkr.hasPlatformTask())") != "true" {
+                break;
+            }
+            eval(worker, "__wkr.runPlatformTask()", "platform task").unwrap();
+        }
+        string_value(worker, "events.join(',')")
+    }
+
     #[test]
     fn worker_message_ports_transfer_queues_buffers_and_return_endpoints() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -34204,6 +35520,63 @@ mod tests {
 
     #[test]
     fn websocket_boundary_negotiates_and_delivers_ordered_protocol_tasks() {
+        websocket_round_trip(false);
+    }
+
+    #[test]
+    fn websocket_interface_follows_the_websockets_standard() {
+        // WebSockets #interface-definition in a Window and a worker: Web IDL
+        // conversions ([Clamp] close code, (DOMString or sequence<DOMString>)
+        // protocols, the BinaryType enumeration), prototype attributes and
+        // constants, and a connection that cannot be established failing
+        // with error and a 1006 close event from a task.
+        platform_fixture_in_window_and_worker(
+            "WebSocket interface",
+            r#"
+            const tasks = async () => { for (let i = 0; i < 3; i++) await new Promise(r => setTimeout(r, 0)); };
+            const events = [];
+            const socket = new WebSocket('ws://example.invalid/chat?x');
+            check(socket.readyState === 0 && socket.url === 'ws://example.invalid/chat?x' && socket.protocol === '' &&
+                socket.extensions === '' && socket.binaryType === 'blob' && socket.bufferedAmount === 0, 'initial state');
+            check(Object.getOwnPropertyNames(socket).length === 0 && WebSocket.CLOSING === 2 && socket.OPEN === 1 &&
+                !Object.getOwnPropertyDescriptor(WebSocket.prototype, 'CLOSED').writable, 'attributes and constants');
+            socket.onerror = event => events.push('error:' + socket.readyState + ':' + event.isTrusted);
+            socket.onclose = event => events.push('close:' + event.code + ':' + event.wasClean + ':' + (event instanceof CloseEvent));
+            socket.binaryType = 'text';
+            check(socket.binaryType === 'blob', 'BinaryType ignores other values');
+            throws(() => new WebSocket(), 'TypeError', 'url is required');
+            throws(() => new WebSocket('ws://example.invalid/#'), 'SyntaxError', 'an empty fragment');
+            throws(() => new WebSocket('ftp://example.invalid/'), 'SyntaxError', 'scheme');
+            throws(() => new WebSocket('ws://example.invalid/', ['a', 'a']), 'SyntaxError', 'duplicate protocol');
+            throws(() => new WebSocket('ws://example.invalid/', 'a b'), 'SyntaxError', 'protocol token');
+            throws(() => new WebSocket('ws://example.invalid/', {}), 'SyntaxError', 'a non-iterable object is a DOMString');
+            const relative = new WebSocket('/path', new Set(['chat']));
+            check(relative.url === 'wss://' + location.host + '/path', 'http(s) schemes map to ws(s): ' + relative.url);
+            throws(() => socket.close(2999), 'InvalidAccessError', 'close code range');
+            throws(() => socket.close(1000, 'x'.repeat(124)), 'SyntaxError', 'close reason length');
+            throws(() => socket.send(), 'TypeError', 'send requires data');
+            throws(() => socket.send('x'), 'InvalidStateError', 'send while connecting');
+            const closing = new WebSocket('ws://example.invalid/');
+            closing.close(999.5);
+            check(closing.readyState === 2, 'close() rounds a [Clamp] code half to even and fails a connecting socket');
+            await tasks();
+            check(events.join() === 'error:3:true,close:1006:false:true', 'failure events: ' + events.join());
+            check(closing.readyState === 3 && relative.readyState === 3, 'closed');
+            closing.send(new Uint8Array(5));
+            closing.send('é');
+            check(closing.bufferedAmount === 7, 'bufferedAmount counts sends after close');
+            "#,
+        );
+    }
+
+    #[test]
+    fn worker_websockets_use_the_same_boundary_and_task_source() {
+        // WebSocket is [Exposed=(Window,Worker)]: a worker's connection events
+        // are host tasks of the worker's own event loop.
+        websocket_round_trip(true);
+    }
+
+    fn websocket_round_trip(worker: bool) {
         // WebSockets §2.2/§4 and RFC 6455 §4.1: the opening response proves receipt of
         // the nonce, selects one offered subprotocol, and every open/message/send-complete/close
         // notification returns to the page as an ordered WebSocket-task-source task.
@@ -34269,9 +35642,43 @@ mod tests {
         let cache = Arc::new(crate::http::PageCache::default());
         let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
         let clock = Rc::new(RealmClock::new());
-        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
-        state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
-        let mut engine = configured_engine(state, page.as_str());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+        let mut engine = if worker {
+            let script = page.join("worker.js").unwrap();
+            state.base = script.clone();
+            let (events, _) = tokio::sync::mpsc::unbounded_channel();
+            state.worker_self = Some(LumenWorkerSelf {
+                id: 1,
+                events,
+                closed: false,
+                origin: script.clone(),
+            });
+            state.enable_websockets(
+                page.clone(),
+                runtime.handle(),
+                &cache,
+                LumenTaskSender::Page(task_tx),
+            );
+            let mut engine = lumen::Engine::new();
+            let origin = clock.origin_ms;
+            engine.set_wall_clock(move || clock.now_ms());
+            engine
+                .ctx()
+                .op_state()
+                .put_retained_memory_with_external_memory(state);
+            install_lumen_worker_boundary(&mut engine);
+            eval(
+                &mut engine,
+                &format!("globalThis.__worker_cfg={{url:'{script}',timeOrigin:{origin}}}"),
+                "worker config",
+            )
+            .unwrap();
+            assert!(eval_lumen_worker_platform_setup(&mut engine).unwrap());
+            engine
+        } else {
+            state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
+            configured_engine(state, page.as_str())
+        };
         eval(
             &mut engine,
             &format!(
@@ -34283,7 +35690,10 @@ mod tests {
                 try {{ new WebSocket('/duplicate', ['chat', 'chat']); }} catch (error) {{ wsLog.push('bad-protocol:' + error.name); }}
                 globalThis.socket = new WebSocket('http://127.0.0.1:{port}/echo', ['chat', 'superchat']);
                 socket.binaryType = 'arraybuffer';
-                try {{ socket.binaryType = 'invalid'; }} catch (error) {{ wsLog.push('bad-binary:' + error.name); }}
+                socket.binaryType = 'invalid';
+                wsLog.push('binary-type:' + socket.binaryType);
+                wsLog.push('shape:' + [Object.getOwnPropertyNames(socket).length, WebSocket.OPEN, socket.CLOSED,
+                    Object.getOwnPropertyDescriptor(WebSocket, 'OPEN').writable].join(','));
                 try {{ socket.send('too-soon'); }} catch (error) {{ wsLog.push('connecting-send:' + error.name); }}
                 try {{ socket.close(2000); }} catch (error) {{ wsLog.push('bad-close:' + error.name); }}
                 try {{ socket.close(1000, 'é'.repeat(62)); }} catch (error) {{ wsLog.push('long-reason:' + error.name); }}
@@ -34336,7 +35746,8 @@ mod tests {
         let log = string_value(&mut engine, "wsLog.join('|')");
         assert!(log.contains("bad-url:SyntaxError"), "{log}");
         assert!(log.contains("bad-protocol:SyntaxError"), "{log}");
-        assert!(log.contains("bad-binary:TypeError"), "{log}");
+        assert!(log.contains("binary-type:arraybuffer"), "{log}");
+        assert!(log.contains("shape:0,1,3,false"), "{log}");
         assert!(log.contains("connecting-send:InvalidStateError"), "{log}");
         assert!(log.contains("bad-close:InvalidAccessError"), "{log}");
         assert!(log.contains("long-reason:SyntaxError"), "{log}");
@@ -37581,6 +38992,24 @@ mod tests {
         string_value(engine, &format!("String(globalThis.{result})"))
     }
 
+    /// Run microtasks and queued platform tasks (the crypto task source among
+    /// them) until neither remains.
+    fn drain_platform_tasks(engine: &mut lumen::Engine, control: &str) {
+        for _ in 0..10_000 {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, &format!("String({control}.hasPlatformTask())")) != "true" {
+                break;
+            }
+            eval(
+                engine,
+                &format!("{control}.runPlatformTask()"),
+                "platform task",
+            )
+            .unwrap();
+        }
+        run_microtask_checkpoint(engine);
+    }
+
     /// A dedicated-worker global with an explicit secure-context configuration.
     fn worker_engine_with_secure_context(secure: bool) -> lumen::Engine {
         let clock = Rc::new(RealmClock::new());
@@ -38124,8 +39553,9 @@ mod tests {
             const reader = compression.readable.getReader();
             writer.write(new TextEncoder().encode("hello"));
             writer.close();
+            // The streaming gzip context emits the RFC 1952 header as its first chunk.
             reader.read().then(result => binaryResult.push(
-                result.value[0] + "," + result.value[1] + "," + (result.value.byteLength > 10)
+                result.value[0] + "," + result.value[1] + "," + (result.value.byteLength >= 10)
             ));
 
             localStorage.clear();
@@ -38157,11 +39587,13 @@ mod tests {
             "binary and stateful host boundary",
         )
         .unwrap();
-        run_microtask_checkpoint(&mut engine);
+        drain_platform_tasks(&mut engine, "__trust");
 
         assert_eq!(
             string_value(&mut engine, "binaryResult.join('|')"),
-            "65,195,169,240,159,153,130|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|31,139,true"
+            // SubtleCrypto settles its promises in crypto task source tasks, after the
+            // compression stream's read resolves in a microtask.
+            "65,195,169,240,159,153,130|31,139,true|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
             string_value(&mut engine, "hostStateResult"),
@@ -38178,6 +39610,317 @@ mod tests {
         assert_eq!(
             blobs.lock().unwrap().get(&blob_url).cloned(),
             Some((vec![0, 128, 255], "application/x-lumen-port".to_owned()))
+        );
+    }
+
+    #[test]
+    fn web_crypto_registered_algorithms_follow_the_web_cryptography_api() {
+        // Web Cryptography API (local w3c/webcrypto@811c24c): #cryptokey-interface,
+        // #SubtleCrypto-methods and every registered algorithm's operations, with
+        // RFC 8032 / RFC 7748 / RFC 3394 / RFC 5869 / RFC 6070 / SP 800-38A vectors;
+        // Web IDL #quotaexceedederror.
+        platform_fixture_in_window_and_secure_worker(
+            "web crypto",
+            r#"
+            const subtle = crypto.subtle;
+            const hex = b => Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, "0")).join("");
+            const bytes = h => Uint8Array.from(h.match(/../g) || [], p => parseInt(p, 16));
+            const b64 = h => bytes(h).toBase64({alphabet: "base64url", omitPadding: true});
+            const text = s => new TextEncoder().encode(s);
+            const message = text("Web Crypto");
+
+            // Promises settle in tasks on the crypto task source.
+            let settled = false;
+            const pending = subtle.digest("SHA-256", new Uint8Array(0)).then(() => settled = true);
+            await Promise.resolve();
+            check(!settled, "settled before a task ran");
+            await pending;
+            await rejects(subtle.digest("MD5", message), "NotSupportedError", "unregistered digest");
+
+            // CryptoKey: internal slots only, cached attribute objects, HMAC bit lengths.
+            const hmac = await subtle.generateKey({name: "hmac", hash: "sha-256", length: 77}, true, ["sign"]);
+            check(Reflect.ownKeys(hmac).length === 0 && hmac.algorithm === hmac.algorithm && hmac.usages === hmac.usages, "CryptoKey slots");
+            const hmacRaw = new Uint8Array(await subtle.exportKey("raw", hmac));
+            check(hmac.algorithm.name === "HMAC" && hmac.algorithm.length === 77 && hmacRaw.length === 10 && (hmacRaw[9] & 7) === 0, "HMAC length bits");
+            throws(() => new CryptoKey(), "TypeError", "CryptoKey constructor");
+
+            // RSA: generation, PKCS1 and PSS signatures, OAEP, SPKI/PKCS #8/JWK.
+            const rsaAlgorithm = {name: "RSASSA-PKCS1-v1_5", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256"};
+            const rsa = await subtle.generateKey(rsaAlgorithm, true, ["sign", "verify"]);
+            check(Object.keys(rsa).join() === "privateKey,publicKey", "CryptoKeyPair");
+            check(rsa.publicKey.algorithm.modulusLength === 1024 && hex(rsa.publicKey.algorithm.publicExponent) === "010001"
+                && rsa.publicKey.algorithm.hash.name === "SHA-256", "RSA algorithm");
+            check(rsa.publicKey.usages.join() === "verify" && rsa.privateKey.usages.join() === "sign" && rsa.publicKey.extractable, "RSA usages");
+            const pkcs1 = await subtle.sign("RSASSA-PKCS1-v1_5", rsa.privateKey, message);
+            check(pkcs1.byteLength === 128 && await subtle.verify("RSASSA-PKCS1-v1_5", rsa.publicKey, pkcs1, message), "PKCS1");
+            check(!(await subtle.verify("RSASSA-PKCS1-v1_5", rsa.publicKey, pkcs1, text("other"))), "PKCS1 other data");
+            await rejects(subtle.sign("RSASSA-PKCS1-v1_5", rsa.publicKey, message), "InvalidAccessError", "sign with a public key");
+            const spki = await subtle.exportKey("spki", rsa.publicKey);
+            const pkcs8 = await subtle.exportKey("pkcs8", rsa.privateKey);
+            const jwk = await subtle.exportKey("jwk", rsa.privateKey);
+            check(Object.keys(jwk).join() === "alg,d,dp,dq,e,ext,key_ops,kty,n,p,q,qi" && jwk.alg === "RS256" && jwk.e === "AQAB", "RSA JWK");
+            const pss = await subtle.importKey("pkcs8", pkcs8, {name: "RSA-PSS", hash: "SHA-256"}, false, ["sign"]);
+            const pssPublic = await subtle.importKey("jwk", {kty: "RSA", n: jwk.n, e: jwk.e}, {name: "RSA-PSS", hash: "SHA-256"}, true, ["verify"]);
+            for (const saltLength of [0, 32, 94]) {
+                const signature = await subtle.sign({name: "RSA-PSS", saltLength}, pss, message);
+                check(await subtle.verify({name: "RSA-PSS", saltLength}, pssPublic, signature, message), "PSS salt " + saltLength);
+            }
+            await rejects(subtle.sign({name: "RSA-PSS", saltLength: 95}, pss, message), "OperationError", "PSS salt too long");
+            check(hex(await subtle.exportKey("spki", pssPublic)) === hex(spki), "canonical SPKI");
+            const dOnly = await subtle.importKey("jwk", {kty: "RSA", n: jwk.n, e: jwk.e, d: jwk.d}, {name: "RSASSA-PKCS1-v1_5", hash: "SHA-256"}, true, ["sign"]);
+            check(hex(await subtle.sign("RSASSA-PKCS1-v1_5", dOnly, message)) === hex(pkcs1), "JWA 6.3.2 private key without CRT members");
+            await rejects(subtle.importKey("jwk", {kty: "RSA", n: jwk.n, e: jwk.e, d: jwk.d, p: jwk.p}, {name: "RSASSA-PKCS1-v1_5", hash: "SHA-256"}, true, ["sign"]), "DataError", "partial CRT members");
+            await rejects(subtle.importKey("jwk", {...jwk, alg: "RS384"}, {name: "RSASSA-PKCS1-v1_5", hash: "SHA-256"}, true, ["sign"]), "DataError", "JWK alg and hash");
+            await rejects(subtle.importKey("jwk", {kty: "RSA", n: jwk.n, e: "AAEAAQ"}, {name: "RSASSA-PKCS1-v1_5", hash: "SHA-256"}, true, ["verify"]), "DataError", "non-minimal Base64urlUInt");
+            await rejects(subtle.generateKey({...rsaAlgorithm, publicExponent: new Uint8Array([2])}, true, ["sign"]), "OperationError", "even exponent");
+            await rejects(subtle.generateKey({...rsaAlgorithm, publicExponent: [1, 0, 1]}, true, ["sign"]), "TypeError", "BigInteger");
+            await rejects(subtle.generateKey(rsaAlgorithm, true, ["encrypt"]), "SyntaxError", "RSA usages");
+            const oaep = await subtle.generateKey({name: "RSA-OAEP", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-1"},
+                true, ["encrypt", "decrypt"]);
+            const label = text("label");
+            const ciphertext = await subtle.encrypt({name: "RSA-OAEP", label}, oaep.publicKey, message);
+            check(hex(await subtle.decrypt({name: "RSA-OAEP", label}, oaep.privateKey, ciphertext)) === hex(message), "OAEP");
+            await rejects(subtle.decrypt({name: "RSA-OAEP"}, oaep.privateKey, ciphertext), "OperationError", "OAEP label");
+
+            // ECDSA and ECDH over P-256, P-384 and P-521.
+            for (const [namedCurve, size] of [["P-256", 64], ["P-384", 96], ["P-521", 132]]) {
+                const ec = await subtle.generateKey({name: "ECDSA", namedCurve}, true, ["sign", "verify"]);
+                const signature = await subtle.sign({name: "ECDSA", hash: "SHA-384"}, ec.privateKey, message);
+                check(signature.byteLength === size && await subtle.verify({name: "ECDSA", hash: "SHA-384"}, ec.publicKey, signature, message), "ECDSA " + namedCurve);
+                const raw = new Uint8Array(await subtle.exportKey("raw", ec.publicKey));
+                const compressed = new Uint8Array([2 + (raw[raw.length - 1] & 1), ...raw.subarray(1, 1 + (raw.length - 1) / 2)]);
+                const decompressed = await subtle.importKey("raw", compressed, {name: "ECDSA", namedCurve}, true, ["verify"]);
+                check(hex(await subtle.exportKey("raw", decompressed)) === hex(raw), "compressed point " + namedCurve);
+                const ecJwk = await subtle.exportKey("jwk", ec.privateKey);
+                check(Object.keys(ecJwk).join() === "crv,d,ext,key_ops,kty,x,y" && ecJwk.crv === namedCurve, "EC JWK " + namedCurve);
+                await rejects(subtle.importKey("jwk", ecJwk, {name: "ECDSA", namedCurve: namedCurve === "P-256" ? "P-384" : "P-256"}, true, ["sign"]), "DataError", "crv mismatch");
+            }
+            await rejects(subtle.importKey("raw", new Uint8Array(65), {name: "ECDSA", namedCurve: "P-256"}, true, ["verify"]), "DataError", "invalid point");
+            await rejects(subtle.generateKey({name: "ECDSA", namedCurve: "P-192"}, true, ["sign"]), "NotSupportedError", "unregistered curve");
+            const alice = await subtle.generateKey({name: "ECDH", namedCurve: "P-256"}, false, ["deriveBits", "deriveKey"]);
+            const bob = await subtle.generateKey({name: "ECDH", namedCurve: "P-256"}, false, ["deriveBits"]);
+            check(alice.publicKey.usages.length === 0, "ECDH public usages");
+            const ab = await subtle.deriveBits({name: "ECDH", public: bob.publicKey}, alice.privateKey, 256);
+            const ba = await subtle.deriveBits({name: "ECDH", public: alice.publicKey}, bob.privateKey, null);
+            check(ab.byteLength === 32 && hex(ab) === hex(ba), "ECDH agreement");
+            const partial = new Uint8Array(await subtle.deriveBits({name: "ECDH", public: bob.publicKey}, alice.privateKey, 12));
+            check(partial.length === 2 && partial[0] === new Uint8Array(ab)[0] && (partial[1] & 15) === 0, "first length bits");
+            await rejects(subtle.deriveBits({name: "ECDH", public: bob.publicKey}, alice.privateKey, 264), "OperationError", "ECDH length");
+            await rejects(subtle.deriveBits({name: "ECDH", public: bob.privateKey}, alice.privateKey, 256), "InvalidAccessError", "ECDH public member");
+            const derived = await subtle.deriveKey({name: "ECDH", public: bob.publicKey}, alice.privateKey, {name: "AES-GCM", length: 128}, true, ["encrypt"]);
+            check(hex(await subtle.exportKey("raw", derived)) === hex(ab).slice(0, 32), "deriveKey");
+
+            // Ed25519 (RFC 8032 §7.1 TEST 1) and X25519 (RFC 7748 §6.1).
+            const edSecret = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+            const edPublic = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+            const edSignature = "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b";
+            const edPrivate = await subtle.importKey("jwk", {kty: "OKP", crv: "Ed25519", d: b64(edSecret), x: b64(edPublic)}, "Ed25519", true, ["sign"]);
+            check(hex(await subtle.sign("Ed25519", edPrivate, new Uint8Array(0))) === edSignature, "Ed25519 sign");
+            const edKey = await subtle.importKey("raw", bytes(edPublic), {name: "Ed25519"}, true, ["verify"]);
+            check(await subtle.verify("Ed25519", edKey, bytes(edSignature), new Uint8Array(0)), "Ed25519 verify");
+            const smallOrder = await subtle.importKey("raw", new Uint8Array(32), "Ed25519", true, ["verify"]);
+            check(!(await subtle.verify("Ed25519", smallOrder, new Uint8Array(64), new Uint8Array(0))), "small-order key");
+            check(hex(await subtle.exportKey("pkcs8", edPrivate)) === "302e020100300506032b657004220420" + edSecret, "RFC 8410 PKCS #8");
+            const edJwk = await subtle.exportKey("jwk", edPrivate);
+            check(Object.keys(edJwk).join() === "alg,crv,d,ext,key_ops,kty,x" && edJwk.alg === "Ed25519", "OKP JWK");
+            await rejects(subtle.importKey("jwk", {kty: "OKP", crv: "Ed25519", d: b64(edSecret), x: b64(edSecret)}, "Ed25519", true, ["sign"]), "DataError", "x does not match d");
+            const xAlice = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+            const xAlicePublic = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+            const xBobPublic = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f";
+            const xShared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+            const xPrivate = await subtle.importKey("jwk", {kty: "OKP", crv: "X25519", d: b64(xAlice), x: b64(xAlicePublic)}, "X25519", false, ["deriveBits"]);
+            const xPublic = await subtle.importKey("raw", bytes(xBobPublic), "X25519", true, []);
+            check(hex(await subtle.deriveBits({name: "X25519", public: xPublic}, xPrivate, 256)) === xShared, "X25519");
+            const zero = await subtle.importKey("raw", new Uint8Array(32), "X25519", true, []);
+            await rejects(subtle.deriveBits({name: "X25519", public: zero}, xPrivate, 256), "OperationError", "all-zero secret");
+            await rejects(subtle.importKey("raw", bytes(xBobPublic), "X25519", true, ["deriveBits"]), "SyntaxError", "X25519 public usages");
+
+            // AES-CBC (SP 800-38A F.2.1), AES-KW (RFC 3394 §4.1), wrapKey and unwrapKey.
+            const cbcKey = await subtle.importKey("raw", bytes("2b7e151628aed2a6abf7158809cf4f3c"), "AES-CBC", true, ["encrypt", "decrypt"]);
+            const iv = bytes("000102030405060708090a0b0c0d0e0f");
+            const cbc = await subtle.encrypt({name: "AES-CBC", iv}, cbcKey, bytes("6bc1bee22e409f96e93d7e117393172a"));
+            check(cbc.byteLength === 32 && hex(cbc).startsWith("7649abac8119b246cee98e9b12e9197d"), "AES-CBC");
+            check(hex(await subtle.decrypt({name: "AES-CBC", iv}, cbcKey, cbc)) === "6bc1bee22e409f96e93d7e117393172a", "AES-CBC decrypt");
+            await rejects(subtle.decrypt({name: "AES-CBC", iv}, cbcKey, cbc.slice(0, 16)), "OperationError", "PKCS #7 padding");
+            const kek = await subtle.importKey("raw", bytes("000102030405060708090a0b0c0d0e0f"), "AES-KW", false, ["wrapKey", "unwrapKey"]);
+            const dataKey = await subtle.importKey("raw", bytes("00112233445566778899aabbccddeeff"), "AES-GCM", true, ["encrypt"]);
+            const wrapped = await subtle.wrapKey("raw", dataKey, kek, "AES-KW");
+            check(hex(wrapped) === "1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5", "RFC 3394 wrap");
+            const unwrapped = await subtle.unwrapKey("raw", wrapped, kek, "AES-KW", "AES-GCM", false, ["encrypt"]);
+            check(unwrapped.algorithm.name === "AES-GCM" && !unwrapped.extractable && unwrapped.usages.join() === "encrypt", "unwrapKey");
+            await rejects(subtle.wrapKey("raw", unwrapped, kek, "AES-KW"), "InvalidAccessError", "wrap a non-extractable key");
+            const wrapper = await subtle.generateKey({name: "AES-GCM", length: 256}, false, ["wrapKey", "unwrapKey"]);
+            const gcmIv = new Uint8Array(12);
+            const wrappedJwk = await subtle.wrapKey("jwk", dataKey, wrapper, {name: "AES-GCM", iv: gcmIv});
+            // #concept-parse-a-jwk runs JSON.parse "in the context of a new global object".
+            Object.defineProperty(Object.prototype, "kty", {get() { throw Error("author prototype read"); }, configurable: true});
+            let unwrappedJwk;
+            try {
+                unwrappedJwk = await subtle.unwrapKey("jwk", wrappedJwk, wrapper, {name: "AES-GCM", iv: gcmIv}, "AES-GCM", true, ["encrypt"]);
+            } finally { delete Object.prototype.kty; }
+            check(hex(await subtle.exportKey("raw", unwrappedJwk)) === "00112233445566778899aabbccddeeff", "JWK wrapping through encrypt");
+
+            // HKDF (RFC 5869 A.1) and PBKDF2 (RFC 6070 test 2).
+            const ikm = await subtle.importKey("raw", new Uint8Array(22).fill(11), "HKDF", false, ["deriveBits"]);
+            check(hex(await subtle.deriveBits({name: "HKDF", hash: "SHA-256", salt: bytes("000102030405060708090a0b0c"),
+                info: bytes("f0f1f2f3f4f5f6f7f8f9")}, ikm, 336)) === "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", "HKDF");
+            await rejects(subtle.importKey("raw", new Uint8Array(1), "HKDF", true, ["deriveBits"]), "SyntaxError", "extractable HKDF key");
+            const password = await subtle.importKey("raw", text("password"), "PBKDF2", false, ["deriveBits", "deriveKey"]);
+            check(hex(await subtle.deriveBits({name: "PBKDF2", hash: "SHA-1", salt: text("salt"), iterations: 2}, password, 160))
+                === "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957", "PBKDF2");
+            await rejects(subtle.deriveBits({name: "PBKDF2", hash: "SHA-1", salt: text("salt"), iterations: 0}, password, 160), "OperationError", "zero iterations");
+            await rejects(subtle.exportKey("raw", password), "NotSupportedError", "PBKDF2 keys do not export");
+
+            // #cryptokey-interface serialization keeps non-extractable keys usable.
+            const clone = structuredClone({key: xPrivate}).key;
+            check(clone instanceof CryptoKey && clone !== xPrivate && !clone.extractable && clone.usages.join() === "deriveBits", "CryptoKey clone");
+            check(hex(await subtle.deriveBits({name: "X25519", public: xPublic}, clone, 256)) === xShared, "cloned key");
+
+            // Web IDL #quotaexceedederror.
+            try { crypto.getRandomValues(new Uint8Array(65537)); fails.push("no QuotaExceededError"); }
+            catch (error) {
+                check(error instanceof QuotaExceededError && error instanceof DOMException && error.code === 22
+                    && error.quota === null && error.requested === null, "getRandomValues quota");
+            }
+            const quota = new QuotaExceededError("over", {quota: 1, requested: 2});
+            check(quota.name === "QuotaExceededError" && quota.message === "over" && quota.quota === 1 && quota.requested === 2, "QuotaExceededError options");
+            throws(() => new QuotaExceededError("m", {quota: 2, requested: 1}), "RangeError", "requested below quota");
+            throws(() => new QuotaExceededError("m", {quota: NaN}), "TypeError", "restricted double");
+            const quotaClone = structuredClone(quota);
+            check(quotaClone instanceof QuotaExceededError && quotaClone.quota === 1 && quotaClone.requested === 2, "QuotaExceededError serialization");
+            "#,
+        );
+    }
+
+    #[test]
+    fn broadcast_channel_serializes_at_post_and_delivers_to_same_key_channels() {
+        // HTML #broadcasting-to-other-browsing-contexts (local whatwg/html@e5071a2):
+        // StructuredSerialize at postMessage, every other open same-name channel
+        // of the storage key in creation order, closed channels skipped, and
+        // MessageEvents (#the-messageevent-interface) carrying the source origin.
+        let source = r#"
+            globalThis.result = undefined;
+            const a = new BroadcastChannel("chan"), b = new BroadcastChannel("chan");
+            const c = new BroadcastChannel("other"), d = new BroadcastChannel("chan");
+            const log = [];
+            const fails = [];
+            const check = (condition, message) => { if (!condition) fails.push(message); };
+            check(Reflect.ownKeys(a).length === 0 && a.name === "chan" && String(a) === "[object BroadcastChannel]", "slots");
+            try { new BroadcastChannel(); fails.push("no name"); } catch (e) { check(e instanceof TypeError, "name required"); }
+            a.onmessage = () => log.push("self");
+            b.onmessage = e => log.push(["b", e.data.value, e.data.map.get(1), e.isTrusted, e instanceof MessageEvent,
+                e.origin, e.source === null, e.ports.length, Object.isFrozen(e.ports)].join(":"));
+            c.onmessage = () => log.push("other");
+            d.addEventListener("message", e => log.push("d:" + e.data.value));
+            const payload = {value: 1, map: new Map([[1, "one"]])};
+            a.postMessage(payload);
+            payload.value = 2;
+            d.close();
+            try { a.postMessage(() => {}); fails.push("function cloned"); } catch (e) { check(e.name === "DataCloneError", "DataCloneError " + e.name); }
+            a.close();
+            try { a.postMessage(1); fails.push("closed post"); } catch (e) { check(e.name === "InvalidStateError", "closed " + e.name); }
+            const event = new MessageEvent("message", {data: 5, origin: "x", lastEventId: "7"});
+            check(event.data === 5 && event.origin === "x" && event.lastEventId === "7" && event.source === null
+                && event.ports.length === 0 && Reflect.ownKeys(event).every(key => !["data", "origin", "ports"].includes(key)), "MessageEvent init");
+            try { new MessageEvent("message", {source: {}}); fails.push("bad source"); } catch (e) { check(e instanceof TypeError, "source brand"); }
+            globalThis.finish = () => {
+                check(log.join("|") === "b:1:one:true:true:" + (self.origin || location.origin) + ":true:0:true", "delivery " + log.join("|"));
+                globalThis.result = fails.length ? fails.join(" | ") : "ok";
+            };
+        "#;
+        for worker in [false, true] {
+            let mut engine = if worker {
+                worker_platform_engine()
+            } else {
+                platform_engine()
+            };
+            eval(&mut engine, source, "broadcast channel").unwrap();
+            let control = if worker { "__wkr" } else { "__trust" };
+            for _ in 0..100 {
+                run_microtask_checkpoint(&mut engine);
+                let port = if worker {
+                    "__wkr.hasPortTask()"
+                } else {
+                    "__trust.hasMessageTask()"
+                };
+                if string_value(&mut engine, &format!("String({port})")) == "true" {
+                    let run = if worker {
+                        "__wkr.runPortTask()"
+                    } else {
+                        "__trust.runMessageTask()"
+                    };
+                    eval(&mut engine, run, "port task").unwrap();
+                    continue;
+                }
+                if string_value(&mut engine, &format!("String({control}.hasPlatformTask())"))
+                    == "true"
+                {
+                    eval(
+                        &mut engine,
+                        &format!("{control}.runPlatformTask()"),
+                        "platform task",
+                    )
+                    .unwrap();
+                    continue;
+                }
+                break;
+            }
+            eval(&mut engine, "finish()", "finish").unwrap();
+            assert_eq!(
+                string_value(&mut engine, "String(result)"),
+                "ok",
+                "worker={worker}"
+            );
+        }
+    }
+
+    #[test]
+    fn exceptions_are_reported_as_error_events_at_the_global() {
+        // HTML #report-an-exception, #dom-reporterror and the event handler
+        // processing algorithm's OnErrorEventHandler branch; #the-errorevent-interface
+        // and WebSockets #the-closeevent-interface (local whatwg/html@e5071a2).
+        platform_fixture_in_window_and_worker(
+            "report an exception",
+            r#"
+            const seen = [], handlerArguments = [];
+            self.onerror = function (message, source, lineno, colno, error) {
+                handlerArguments.push([typeof message, typeof source, typeof lineno, typeof colno, String(error && error.message)].join(","));
+                return !!error && error.message === "handled";
+            };
+            const listener = e => seen.push([e instanceof ErrorEvent, e.message, e.error && e.error.message,
+                e.cancelable, e.isTrusted, e.defaultPrevented].join(":"));
+            addEventListener("error", listener);
+            reportError(new Error("handled"));
+            reportError("plain");
+            throws(() => reportError(), "TypeError", "reportError arity");
+            const target = new EventTarget();
+            let later = false;
+            target.addEventListener("x", () => { throw new TypeError("listener"); });
+            target.addEventListener("x", () => { later = true; });
+            target.dispatchEvent(new Event("x"));
+            check(later, "later listeners still run");
+            queueMicrotask(() => { throw new RangeError("microtask"); });
+            await Promise.resolve();
+            setTimeout(() => { throw new SyntaxError("timer"); }, 0);
+            await new Promise(resolve => setTimeout(resolve, 1));
+            removeEventListener("error", listener);
+            self.onerror = null;
+            check(seen.join("|") === [
+                "true:Uncaught Error: handled:handled:true:true:true",
+                "true:Uncaught plain::true:true:false",
+                "true:Uncaught TypeError: listener:listener:true:true:false",
+                "true:Uncaught RangeError: microtask:microtask:true:true:false",
+                "true:Uncaught SyntaxError: timer:timer:true:true:false"].join("|"), "reports " + seen.join("|"));
+            check(handlerArguments.length === 5 && handlerArguments[0] === "string,string,number,number,handled", "onerror arguments " + handlerArguments.join("|"));
+
+            const error = new ErrorEvent("error", {message: "m", filename: "\uD800f", lineno: 2 ** 32 + 3, colno: -1, error: 0});
+            check(error.message === "m" && error.filename === "\uFFFDf" && error.lineno === 3 && error.colno === 4294967295
+                && error.error === 0 && new ErrorEvent("e").error === undefined && Reflect.ownKeys(error).every(key => key !== "message"), "ErrorEvent");
+            throws(() => ErrorEvent("e"), "TypeError", "ErrorEvent needs new");
+            const close = new CloseEvent("close", {code: 65537, reason: "\uD800", wasClean: 1});
+            check(close.code === 1 && close.reason === "\uFFFD" && close.wasClean === true && new CloseEvent("c").code === 0, "CloseEvent");
+            check(Object.getOwnPropertyDescriptor(MessageEvent.prototype, "data").get && MessageEvent.length === 1, "MessageEvent attributes");
+            "#,
         );
     }
 
@@ -38228,7 +39971,7 @@ mod tests {
             cryptoResult=JSON.stringify(results);
         })().catch(e=>cryptoResult='ERROR:'+e.stack);
         "#,"HMAC and native digests").unwrap();
-        run_microtask_checkpoint(&mut engine);
+        drain_platform_tasks(&mut engine, "__trust");
         let actual = string_value(&mut engine, "cryptoResult");
         let got: Vec<serde_json::Value> =
             serde_json::from_str(&actual).unwrap_or_else(|e| panic!("{e}: {actual}"));
@@ -38279,7 +40022,8 @@ mod tests {
         "#,"secure random views").unwrap();
         assert_eq!(
             string_value(&mut engine, "randomResult"),
-            "true|true|true|true|true|TypeMismatchError|TypeMismatchError|TypeMismatchError|QuotaExceededError"
+            // An Array is not an ArrayBufferView: Web IDL conversion throws a TypeError.
+            "true|true|true|true|true|TypeMismatchError|TypeMismatchError|TypeError|QuotaExceededError"
         );
     }
 
@@ -38306,7 +40050,7 @@ mod tests {
                 const key = await pendingKey;
                 assert(key instanceof CryptoKey && key.type === 'secret', 'CryptoKey');
                 assert(key.algorithm.name === 'AES-GCM' && key.algorithm.length === vector.key.length * 4, 'algorithm');
-                assert(key.usages.join(',') === 'encrypt,decrypt' && Object.isFrozen(key.usages), 'usages');
+                assert(key.usages.join(',') === 'encrypt,decrypt' && key.usages === key.usages, 'usages');
                 assert(hex(await crypto.subtle.exportKey('raw', key)) === vector.key, 'key copy');
                 const jwk = await crypto.subtle.exportKey('jwk', key);
                 assert(jwk.alg === 'A' + vector.key.length * 4 + 'GCM' && jwk.ext && jwk.kty === 'oct', 'JWK');
@@ -38338,7 +40082,7 @@ mod tests {
         })().catch(e => gcmResult = e.name + ':' + e.message);
         "#;
         eval(&mut engine, &source, "Web Crypto AES-GCM vectors and keys").unwrap();
-        run_microtask_checkpoint(&mut engine);
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(string_value(&mut engine, "gcmResult"), "ok");
     }
 
@@ -38416,20 +40160,22 @@ mod tests {
             gcmErrors = 'ok';
         })().catch(e => gcmErrors = e.name + ':' + e.message);
         "#, "Web Crypto AES-GCM rejection semantics").unwrap();
-        run_microtask_checkpoint(&mut engine);
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(string_value(&mut engine, "gcmErrors"), "ok");
     }
 
     #[test]
     fn web_crypto_aes_gcm_worker_boundary_and_buffer_brands() {
         let mut engine = lumen::Engine::new();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.test_hooks.internals = true;
         engine
             .ctx()
             .op_state()
-            .put_retained_memory_with_external_memory(HostState::new(
-                Rc::new(RefCell::new(Dom::new())),
-                Rc::new(RealmClock::new()),
-            ));
+            .put_retained_memory_with_external_memory(state);
         install_lumen_worker_boundary(&mut engine);
         eval(
             &mut engine,
@@ -38469,10 +40215,10 @@ mod tests {
             workerGcm = hex + '|' + decrypted.byteLength + '|' + errors.join(',');
         })().catch(e => workerGcm = e.name + ':' + e.message);
         "#, "AES-GCM worker and BufferSource conversions").unwrap();
-        run_microtask_checkpoint(&mut engine);
+        drain_platform_tasks(&mut engine, "__wkr");
         assert_eq!(
             string_value(&mut engine, "workerGcm"),
-            "58e2fccefa7e3061367f1d57a4e7455a|0|TypeError,TypeError,TypeError"
+            "58e2fccefa7e3061367f1d57a4e7455a|0|TypeError,TypeError,DataError"
         );
     }
 
@@ -38499,7 +40245,7 @@ mod tests {
             gcmOrder = events.join(',') + '|' + same + '|' + error;
         })().catch(e => gcmOrder = e.name + ':' + e.message);
         "#, "AES-GCM normalization ordering").unwrap();
-        run_microtask_checkpoint(&mut engine);
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(&mut engine, "gcmOrder"),
             "name,name,aad,iv,tag|true|TypeError"
@@ -38535,7 +40281,7 @@ mod tests {
             "Web Crypto AES-CTR",
         )
         .unwrap();
-        run_microtask_checkpoint(&mut engine);
+        drain_platform_tasks(&mut engine, "__trust");
 
         assert_eq!(
             string_value(&mut engine, "aesCtrResult"),
@@ -44159,16 +45905,6 @@ mod tests {
     }
 
     /// Run queued platform tasks and microtasks until both queues are empty.
-    fn drain_platform_tasks(engine: &mut lumen::Engine, label: &str) {
-        for _ in 0..50 {
-            run_microtask_checkpoint(engine);
-            if string_value(engine, "__trust.hasPlatformTask()") != "true" {
-                return;
-            }
-            eval(engine, "__trust.runPlatformTask()", label).unwrap();
-        }
-    }
-
     fn settle_picker(
         engine: &mut lumen::Engine,
         request: u64,
@@ -44189,6 +45925,286 @@ mod tests {
                 .unwrap()
                 .file_picker_requests,
         )
+    }
+
+    #[test]
+    fn file_api_interfaces_are_shared_by_windows_and_workers() {
+        // File API #blob-section, #file-section and #filelist-section are
+        // [Exposed=(Window,Worker)]: one implementation whose byte sequence is
+        // a list of leaves, sliced without copying the rest.
+        platform_fixture_in_window_and_worker(
+            "File API",
+            r#"
+            check(typeof FileList === 'function' && FileList.prototype[Symbol.iterator] === Array.prototype.values,
+                'FileList interface');
+            throws(() => new FileList(), 'TypeError', 'FileList is not constructible');
+            const file = new File(['ab', new Uint8Array([99]), new Blob(['de'])], 'n.txt', {type: 'Text/Plain'});
+            check(file.size === 5 && file.type === 'text/plain' && file.webkitRelativePath === '', 'File members');
+            const sliced = file.slice(1, -1, 'A/B');
+            check(sliced.size === 3 && sliced.type === 'a/b' && !(sliced instanceof File), 'slice');
+            check(await sliced.text() === 'bcd' && (await file.bytes())[2] === 99, 'byte sequence');
+            const reader = new FileReader();
+            const loaded = new Promise(resolve => { reader.onloadend = resolve; });
+            reader.readAsText(new Blob([file, file]));
+            await loaded;
+            check(reader.result === 'abcdeabcde', 'nested blob parts');
+            "#,
+        );
+    }
+
+    #[test]
+    fn fetch_and_xhr_uploads_send_selected_files_from_the_host() {
+        // Fetch #concept-bodyinit-extract and XHR #the-send()-method with a
+        // user-selected file (File API #snapshot-state): a Blob or FormData
+        // body keeps the file's byte range, which the host reads when it sends
+        // the request, so the upload is never copied into script memory. A
+        // file that changed after it was selected is a network error.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("up.bin");
+        std::fs::write(&path, b"hello\x00world\xff").unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = runtime.spawn(async move {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "client closed before the request ended");
+                    data.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |value| value.trim().parse().unwrap());
+                while data.len() < header_end + length {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "client closed before the body ended");
+                    data.extend_from_slice(&chunk[..read]);
+                }
+                // Header names are case-insensitive; the boundary is not.
+                let raw = String::from_utf8_lossy(&data[..header_end]).to_string();
+                let content_type = raw
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+                    .map_or("", |line| &line["content-type:".len()..])
+                    .trim()
+                    .to_string();
+                bodies.push((content_type, data[header_end..header_end + length].to_vec()));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+            bodies
+        });
+        let page = url::Url::parse(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'); document.append(html);
+            html.append(document.createElement('head'), document.createElement('body'));
+            globalThis.up = document.createElement('input');
+            up.type = 'file';
+            document.body.append(up);
+            __trust.pointerButton(up.__id, true, 1, 1);
+            __trust.pointerButton(up.__id, false, 1, 1);
+            up.click();
+            "#,
+            "file input",
+        )
+        .unwrap();
+        let requests = take_file_pickers(&mut engine);
+        settle_picker(&mut engine, requests[0].request, Some(vec![path.clone()]));
+        drain_platform_tasks(&mut engine, "__trust");
+        eval(
+            &mut engine,
+            r#"
+            globalThis.out = [];
+            const file = up.files[0];
+            const form = new FormData();
+            form.append('note', 'n');
+            form.append('up', file);
+            fetch('/form', {method: 'POST', body: form}).then(r => r.text()).then(t => out.push('fetch:' + t),
+                e => out.push('fetch:' + e.name));
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/blob');
+            xhr.onloadend = () => out.push('xhr:' + xhr.status + ':' + xhr.responseText);
+            xhr.send(file.slice(5));
+            "#,
+            "uploads",
+        )
+        .unwrap();
+        for _ in 0..40 {
+            if string_value(&mut engine, "String(out.length)") == "2" {
+                break;
+            }
+            let Ok(Some(task)) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), task_rx.recv()).await
+            }) else {
+                break;
+            };
+            dispatch_host_task(&mut engine, task).unwrap();
+            drain_platform_tasks(&mut engine, "__trust");
+        }
+        let bodies = runtime.block_on(server).unwrap();
+        let mut out = string_value(&mut engine, "out.sort().join('|')");
+        assert_eq!(out, "fetch:ok|xhr:200:ok");
+        let (form_type, form_body) = bodies
+            .iter()
+            .find(|(kind, _)| kind.starts_with("multipart/"))
+            .unwrap();
+        let boundary = form_type.split("boundary=").nth(1).unwrap();
+        let mut expected = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nn\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"up\"; filename=\"up.bin\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        expected.extend_from_slice(b"hello\x00world\xff\r\n");
+        expected.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        assert_eq!(form_body, &expected);
+        let (_, blob_body) = bodies
+            .iter()
+            .find(|(kind, _)| !kind.starts_with("multipart/"))
+            .unwrap();
+        assert_eq!(blob_body, b"\x00world\xff");
+        // The file changed after it was selected: sending it fails.
+        std::fs::write(&path, b"replaced").unwrap();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.out = [];
+            fetch('/again', {method: 'POST', body: up.files[0]}).then(() => out.push('sent'), e => out.push(e.name));
+            "#,
+            "changed upload",
+        )
+        .unwrap();
+        for _ in 0..40 {
+            out = string_value(&mut engine, "out.join()");
+            if !out.is_empty() {
+                break;
+            }
+            drain_platform_tasks(&mut engine, "__trust");
+            if let Ok(Some(task)) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(200), task_rx.recv()).await
+            }) {
+                dispatch_host_task(&mut engine, task).unwrap();
+            }
+        }
+        assert_eq!(out, "TypeError");
+    }
+
+    #[test]
+    fn xhr_encoding_parses_its_url_and_fetch_parses_utf8() {
+        // XHR #the-open()-method encoding-parses its URL relative to the
+        // relevant settings object (HTML #encoding-parsing-a-url), so a
+        // windows-1252 Document's query is windows-1252; Fetch #dom-request
+        // and Beacon use the plain URL parser, which is always UTF-8.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = runtime.spawn(async move {
+            let mut targets = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !data.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "client closed before the request ended");
+                    data.extend_from_slice(&chunk[..read]);
+                }
+                let line = String::from_utf8_lossy(&data)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string();
+                targets.push(line.split(' ').nth(1).unwrap().to_string());
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+            targets.sort();
+            targets
+        });
+        let page = url::Url::parse(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dom = Rc::new(RefCell::new(Dom::new()));
+        dom.borrow_mut()
+            .set_document_encoding(DOCUMENT, encoding_rs::WINDOWS_1252);
+        let mut state = HostState::new(dom, Rc::new(RealmClock::new()));
+        state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            r#"
+            globalThis.out = [];
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', '/xhr?\u00e9');
+            xhr.onloadend = () => out.push('xhr:' + xhr.status + ':' + new URL(xhr.responseURL).search);
+            xhr.send();
+            fetch('/fetch?\u00e9').then(r => out.push('fetch:' + r.status + ':' + new URL(r.url).search),
+                e => out.push('fetch:' + e.name));
+            "#,
+            "requests",
+        )
+        .unwrap();
+        for _ in 0..40 {
+            if string_value(&mut engine, "String(out.length)") == "2" {
+                break;
+            }
+            let Ok(Some(task)) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), task_rx.recv()).await
+            }) else {
+                break;
+            };
+            dispatch_host_task(&mut engine, task).unwrap();
+            drain_platform_tasks(&mut engine, "__trust");
+        }
+        assert_eq!(
+            runtime.block_on(server).unwrap(),
+            ["/fetch?%C3%A9", "/xhr?%E9"]
+        );
+        assert_eq!(
+            string_value(&mut engine, "out.sort().join('|')"),
+            "fetch:200:?%C3%A9|xhr:200:?%E9"
+        );
     }
 
     #[test]
@@ -44249,7 +46265,7 @@ mod tests {
             requests[0].request,
             Some(vec![alpha.clone(), image.clone()]),
         );
-        drain_platform_tasks(&mut engine, "file selection");
+        drain_platform_tasks(&mut engine, "__trust");
         eval(
             &mut engine,
             r#"
@@ -44265,7 +46281,7 @@ mod tests {
             "selected file",
         )
         .unwrap();
-        drain_platform_tasks(&mut engine, "file reads");
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(&mut engine, "out.join('|')"),
             "input:true:true:true change:true:false:true|1|true|true|alpha.txt|text/plain|5|\
@@ -44282,11 +46298,11 @@ mod tests {
         let requests = take_file_pickers(&mut engine);
         assert_eq!(requests.len(), 1, "a label activates the control");
         settle_picker(&mut engine, requests[0].request, None);
-        drain_platform_tasks(&mut engine, "dismissed prompt");
+        drain_platform_tasks(&mut engine, "__trust");
         eval(&mut engine, "activate(); up.click();", "same file").unwrap();
         let requests = take_file_pickers(&mut engine);
         settle_picker(&mut engine, requests[0].request, Some(vec![alpha.clone()]));
-        drain_platform_tasks(&mut engine, "same file");
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(&mut engine, "log.join(' ')"),
             "cancel:true:false:true cancel:true:false:true"
@@ -44307,14 +46323,14 @@ mod tests {
             "changed file",
         )
         .unwrap();
-        drain_platform_tasks(&mut engine, "changed file reads");
+        drain_platform_tasks(&mut engine, "__trust");
         eval(
             &mut engine,
             "__trust.tickTo(__trust.now() + 10)",
             "reader timer",
         )
         .unwrap();
-        drain_platform_tasks(&mut engine, "reader result");
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(&mut engine, "out.join()"),
             "NotReadableError,reader:NotReadableError"
@@ -44384,7 +46400,7 @@ mod tests {
         let requests = take_file_pickers(&mut engine);
         assert!(requests[0].directory && requests[0].multiple);
         settle_picker(&mut engine, requests[0].request, Some(vec![root]));
-        drain_platform_tasks(&mut engine, "directory selection");
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(
                 &mut engine,
@@ -44450,7 +46466,7 @@ mod tests {
             "data transfer",
         )
         .unwrap();
-        drain_platform_tasks(&mut engine, "getAsString");
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(&mut engine, "out.join('|')"),
             "none|none|0|0|0|true|true|[object DataTransfer]|[object DataTransferItemList]|\
@@ -44527,7 +46543,7 @@ mod tests {
             "drop on a drop zone",
         )
         .unwrap();
-        drain_platform_tasks(&mut engine, "drop reads");
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(&mut engine, "log.join(' ')"),
             "dragenter@zone:true:true:Files:0:1:file:false:copy \
@@ -44551,7 +46567,7 @@ mod tests {
             "body fallback and file input drop",
         )
         .unwrap();
-        drain_platform_tasks(&mut engine, "file input drop");
+        drain_platform_tasks(&mut engine, "__trust");
         assert_eq!(
             string_value(&mut engine, "log.join(' ') + '|' + fi.value"),
             "dragenter@body dragover@body \

@@ -52,18 +52,26 @@
     const sequence = parser.parseFromString('<r>a<![CDATA[b]]>c<![CDATA[d]]></r>', 'text/xml').documentElement.childNodes;
     assert(sequence.length === 4 && sequence[0].nodeType === 3 && sequence[1].nodeType === 4 && sequence[2].nodeType === 3 && sequence[3].nodeType === 4, 'CDATA boundaries retained');
 
-    // Exercise the real response assembly, without network variability.
+    // Exercise the real response assembly over data: URLs, without network
+    // variability.
     function response(type, body, responseType) {
         const xhr = new XMLHttpRequest();
-        xhr.open('GET', 'https://example.com/game.xml');
+        xhr.open('GET', 'data:' + type + ',' + encodeURIComponent(body));
         xhr.responseType = responseType;
-        __trust.finishXhrResponse(xhr, [200, type, body, null]);
+        xhr.send();
+        while (__trust.hasPlatformTask()) __trust.runPlatformTask();
         return xhr;
     }
-    const xhr = response('text/xml; charset=utf-8', '<metadata><emulator>dosbox</emulator></metadata>', 'document');
+    const xhr = response('text/xml;charset=utf-8', '<metadata><emulator>dosbox</emulator></metadata>', 'document');
     assert(xhr.response instanceof XMLDocument && xhr.response === xhr.responseXML && xhr.response === xhr.response, 'shared cached XHR document');
     assert(xhr.response.documentElement.firstElementChild.nodeName === 'emulator', 'archive metadata keeps XML names');
-    assert(xhr.response.URL === 'https://example.com/game.xml' && xhr.response.documentURI === xhr.response.URL, 'XHR document URL');
+    assert(xhr.response.URL === xhr.responseURL && xhr.responseURL.startsWith('data:text/xml;charset=utf-8,') &&
+        xhr.response.documentURI === xhr.response.URL, 'XHR document URL');
+    assert(xhr.response.characterSet === 'UTF-8' && xhr.response.contentType === 'text/xml', 'XHR XML document encoding and type');
+    const htmlDocument = response('text/html;charset=windows-1252', '<p>caf\u00e9', 'document');
+    assert(htmlDocument.response instanceof Document && !(htmlDocument.response instanceof XMLDocument) &&
+        htmlDocument.response.characterSet === 'windows-1252' && htmlDocument.response.body.textContent === 'caf\u00c3\u00a9',
+        'XHR HTML document decodes with the final encoding');
     const brokenXHR = response('application/xml', '<broken>', 'document');
     assert(brokenXHR.response === null && brokenXHR.responseXML === null, 'XHR parser failure yields null');
     assert(response('application/json', '{}', 'document').response === null, 'non-document MIME returns null');

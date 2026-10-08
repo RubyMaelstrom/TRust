@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use resvg::tiny_skia as sk;
 use vello_cpu::color::{ColorSpaceTag, DynamicColor};
-use vello_cpu::kurbo::{Affine, Arc as EllipseArc, BezPath, PathEl, Point, Shape};
+use vello_cpu::kurbo::{
+    Affine, Arc as EllipseArc, BezPath, ParamCurveNearest, PathEl, Point, Rect, Shape,
+};
 
 const MAX_BITMAP_BYTES: usize = 256 * 1024 * 1024;
 
@@ -186,6 +188,226 @@ impl Gradient {
     }
 }
 
+/// HTML #canvaspattern: a snapshot of the image (so later changes to the
+/// source do not affect it), its repetition behavior and its transformation
+/// matrix. Contexts painting with the pattern share it; `setTransform()`
+/// therefore affects every later paint, as it does through the JS object.
+pub(crate) struct Pattern {
+    image: sk::Pixmap,
+    repeat_x: bool,
+    repeat_y: bool,
+    pub origin_clean: bool,
+    matrix: std::sync::Mutex<Affine>,
+    vello: std::sync::OnceLock<Option<Arc<vello_common::pixmap::Pixmap>>>,
+}
+
+impl Pattern {
+    pub fn new(image: sk::Pixmap, repetition: &str, origin_clean: bool) -> Option<Self> {
+        let (repeat_x, repeat_y) = match repetition {
+            "repeat" => (true, true),
+            "repeat-x" => (true, false),
+            "repeat-y" => (false, true),
+            "no-repeat" => (false, false),
+            _ => return None,
+        };
+        Some(Self {
+            image,
+            repeat_x,
+            repeat_y,
+            origin_clean,
+            matrix: std::sync::Mutex::new(Affine::IDENTITY),
+            vello: std::sync::OnceLock::new(),
+        })
+    }
+
+    pub fn set_matrix(&self, matrix: Affine) {
+        *self.matrix.lock().unwrap_or_else(|e| e.into_inner()) = matrix;
+    }
+
+    fn matrix(&self) -> Affine {
+        *self.matrix.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.image.data().len()
+    }
+
+    /// The pattern's mapping to device space under `ctm`, or None when it is
+    /// singular: such a pattern renders transparent black.
+    fn device(&self, ctm: Affine) -> Option<Affine> {
+        let device = ctm * self.matrix();
+        (device.determinant() != 0. && device.as_coeffs().iter().all(|n| n.is_finite()))
+            .then_some(device)
+    }
+
+    /// Filtering wraps to the image's dimensions whatever the repetition.
+    fn shader(&self, to_device: Affine, alpha: f32, quality: sk::FilterQuality) -> sk::Shader<'_> {
+        sk::Pattern::new(
+            self.image.as_ref(),
+            sk::SpreadMode::Repeat,
+            quality,
+            alpha,
+            sk_transform(to_device * self.matrix()),
+        )
+    }
+
+    /// "Replace any part of the image outside the area in which the pattern
+    /// is to be rendered with transparent black": the device coverage of the
+    /// image's copies along the axes it does not repeat, or None when it
+    /// repeats in both directions.
+    fn domain(&self, device: Affine, width: u32, height: u32) -> Option<sk::Mask> {
+        if self.repeat_x && self.repeat_y {
+            return None;
+        }
+        let mut mask = sk::Mask::new(width.max(1), height.max(1))?;
+        let bounds = device
+            .inverse()
+            .transform_rect_bbox(Rect::new(0., 0., f64::from(width), f64::from(height)))
+            .inflate(1., 1.);
+        let (w, h) = (
+            f64::from(self.image.width()),
+            f64::from(self.image.height()),
+        );
+        let x = if self.repeat_x {
+            (bounds.x0, bounds.x1)
+        } else {
+            (0., w)
+        };
+        let y = if self.repeat_y {
+            (bounds.y0, bounds.y1)
+        } else {
+            (0., h)
+        };
+        if x.0 < x.1 && y.0 < y.1 {
+            let area = device * Rect::new(x.0, y.0, x.1, y.1).to_path(0.1);
+            if let Some(path) = sk_path(&area) {
+                mask.fill_path(
+                    &path,
+                    sk::FillRule::Winding,
+                    true,
+                    sk::Transform::identity(),
+                );
+            }
+        }
+        Some(mask)
+    }
+
+    fn vello_paint(
+        &self,
+        quality: vello_cpu::peniko::ImageQuality,
+    ) -> Option<vello_common::paint::PaintType> {
+        use vello_common::paint::{Image, ImageSource};
+        use vello_cpu::peniko::{Extend, ImageSampler};
+        let pixmap = self
+            .vello
+            .get_or_init(|| {
+                let width = u16::try_from(self.image.width()).ok()?;
+                let height = u16::try_from(self.image.height()).ok()?;
+                Some(Arc::new(vello_common::pixmap::Pixmap::from_parts(
+                    self.image.data().to_vec(),
+                    width,
+                    height,
+                    vello_common::pixmap::PixelMetadata::new(
+                        vello_cpu::peniko::ImageAlphaType::AlphaPremultiplied,
+                        true,
+                    ),
+                )))
+            })
+            .clone()?;
+        Some(
+            Image {
+                image: ImageSource::Pixmap(pixmap),
+                sampler: ImageSampler {
+                    x_extend: Extend::Repeat,
+                    y_extend: Extend::Repeat,
+                    quality,
+                    alpha: 1.,
+                },
+            }
+            .into(),
+        )
+    }
+}
+
+/// Multiply `mask` into `into` (coverage intersection).
+fn intersect_mask(into: &mut sk::Mask, mask: &sk::Mask) {
+    for (out, other) in into.data_mut().iter_mut().zip(mask.data()) {
+        *out = ((u32::from(*out) * u32::from(*other) + 127) / 255) as u8;
+    }
+}
+
+/// Multiply `mask` into a premultiplied pixmap of the same size.
+fn apply_mask(pixmap: &mut sk::Pixmap, mask: &sk::Mask) {
+    for (pixel, coverage) in pixmap
+        .data_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(mask.data())
+    {
+        for channel in pixel {
+            *channel = ((u32::from(*channel) * u32::from(*coverage) + 127) / 255) as u8;
+        }
+    }
+}
+
+/// A copy of `path` with every subpath closed, as the fill rules require.
+fn closed_path(path: &BezPath) -> BezPath {
+    let mut closed = BezPath::new();
+    let mut open = false;
+    for element in path.elements() {
+        match element {
+            PathEl::MoveTo(_) if open => {
+                closed.close_path();
+                closed.push(*element);
+            }
+            PathEl::MoveTo(_) => {
+                open = true;
+                closed.push(*element);
+            }
+            PathEl::ClosePath => {
+                open = false;
+                closed.close_path();
+            }
+            _ => closed.push(*element),
+        }
+    }
+    if open {
+        closed.close_path();
+    }
+    closed
+}
+
+/// HTML #is-point-in-path: inside under the fill rule, or on the path itself.
+fn path_contains(path: &BezPath, point: Point, evenodd: bool) -> bool {
+    let closed = closed_path(path);
+    let winding = closed.winding(point);
+    let inside = if evenodd {
+        winding % 2 != 0
+    } else {
+        winding != 0
+    };
+    inside
+        || closed
+            .segments()
+            .any(|segment| segment.nearest(point, 1e-9).distance_sq <= 1e-12)
+}
+
+fn bez_from_sk(path: &sk::Path) -> BezPath {
+    let mut out = BezPath::new();
+    let p = |point: sk::Point| Point::new(f64::from(point.x), f64::from(point.y));
+    for segment in path.segments() {
+        match segment {
+            sk::PathSegment::MoveTo(a) => out.move_to(p(a)),
+            sk::PathSegment::LineTo(a) => out.line_to(p(a)),
+            sk::PathSegment::QuadTo(a, b) => out.quad_to(p(a), p(b)),
+            sk::PathSegment::CubicTo(a, b, c) => out.curve_to(p(a), p(b), p(c)),
+            sk::PathSegment::Close => out.close_path(),
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub(crate) struct State {
     pub transform: Affine,
@@ -194,6 +416,7 @@ pub(crate) struct State {
     pub fill_text: String,
     pub stroke_text: String,
     pub gradients: [Option<Arc<Gradient>>; 2],
+    pub patterns: [Option<Arc<Pattern>>; 2],
     pub text: crate::canvas_text::TextState,
     pub shadow: crate::canvas_shadow::Shadow,
     pub alpha: f32,
@@ -202,7 +425,30 @@ pub(crate) struct State {
     pub dash: Vec<f64>,
     pub dash_offset: f64,
     pub smoothing: bool,
+    /// ImageSmoothingQuality: 0 low, 1 medium, 2 high.
+    pub smoothing_quality: u8,
     pub clip: Option<Arc<sk::Mask>>,
+}
+
+impl State {
+    /// HTML #image-smoothing: nearest-neighbor when smoothing is disabled;
+    /// otherwise imageSmoothingQuality guides the filter.
+    pub fn filter_quality(&self) -> sk::FilterQuality {
+        match (self.smoothing, self.smoothing_quality) {
+            (false, _) => sk::FilterQuality::Nearest,
+            (true, 0) => sk::FilterQuality::Bilinear,
+            (true, _) => sk::FilterQuality::Bicubic,
+        }
+    }
+
+    fn vello_quality(&self) -> vello_cpu::peniko::ImageQuality {
+        use vello_cpu::peniko::ImageQuality;
+        match (self.smoothing, self.smoothing_quality) {
+            (false, _) => ImageQuality::Low,
+            (true, 0) => ImageQuality::Medium,
+            (true, _) => ImageQuality::High,
+        }
+    }
 }
 
 impl Default for State {
@@ -214,6 +460,7 @@ impl Default for State {
             fill_text: "#000000".into(),
             stroke_text: "#000000".into(),
             gradients: [None, None],
+            patterns: [None, None],
             text: crate::canvas_text::TextState::default(),
             shadow: crate::canvas_shadow::Shadow::default(),
             alpha: 1.,
@@ -222,6 +469,7 @@ impl Default for State {
             dash: Vec::new(),
             dash_offset: 0.,
             smoothing: true,
+            smoothing_quality: 0,
             clip: None,
         }
     }
@@ -757,17 +1005,28 @@ impl Canvas {
         } else {
             state.fill
         };
+        let transparent =
+            || vello_cpu::color::AlphaColor::<vello_cpu::color::Srgb>::new([0.; 4]).into();
+        let pattern = state.patterns[usize::from(stroke)].as_ref();
         let paint: vello_common::paint::PaintType =
             if let Some(gradient) = &state.gradients[usize::from(stroke)] {
                 gradient.vello_paint()
+            } else if let Some(pattern) = pattern {
+                // HTML #canvaspattern; a singular matrix is transparent black.
+                pattern
+                    .device(ctm)
+                    .and_then(|_| pattern.vello_paint(state.vello_quality()))
+                    .unwrap_or_else(transparent)
             } else {
                 vello_cpu::color::AlphaColor::<vello_cpu::color::Srgb>::new(color).into()
             };
         let paint_transform = transform.inverse()
             * ctm
-            * state.gradients[usize::from(stroke)]
-                .as_ref()
-                .map_or(Affine::IDENTITY, |gradient| gradient.vello_transform());
+            * match (&state.gradients[usize::from(stroke)], pattern) {
+                (Some(gradient), _) => gradient.vello_transform(),
+                (None, Some(pattern)) => pattern.matrix(),
+                (None, None) => Affine::IDENTITY,
+            };
         let cap = match state.stroke.line_cap {
             sk::LineCap::Butt => Cap::Butt,
             sk::LineCap::Round => Cap::Round,
@@ -842,6 +1101,12 @@ impl Canvas {
                 }
             }
         }
+        if let Some(pattern) = pattern
+            && let Some(device) = pattern.device(ctm)
+            && let Some(domain) = pattern.domain(device, width, height)
+        {
+            apply_mask(layer, &domain);
+        }
         if state.alpha != 1. {
             for byte in layer.data_mut() {
                 *byte = (f32::from(*byte) * state.alpha).round() as u8;
@@ -850,6 +1115,14 @@ impl Canvas {
     }
 
     fn paint(&mut self, path: BezPath, stroke: bool, evenodd: bool, clear: bool) {
+        let pattern = if clear {
+            None
+        } else {
+            self.state.patterns[usize::from(stroke)].clone()
+        };
+        let pattern_device = pattern
+            .as_ref()
+            .map(|pattern| pattern.device(self.state.transform));
         let Some(bitmap) = self.bitmap.as_mut() else {
             return;
         };
@@ -874,6 +1147,23 @@ impl Canvas {
             };
             paint.shader = gradient.shader(transform, self.state.alpha);
         }
+        // HTML #canvaspattern rendering; a singular matrix is transparent black.
+        let mut domain = None;
+        if let (Some(pattern), Some(device)) = (&pattern, pattern_device) {
+            match device {
+                Some(device) => {
+                    let to_device = if stroke {
+                        Affine::IDENTITY
+                    } else {
+                        self.state.transform
+                    };
+                    paint.shader =
+                        pattern.shader(to_device, self.state.alpha, self.state.filter_quality());
+                    domain = pattern.domain(device, self.width, self.height);
+                }
+                None => paint.set_color(sk::Color::TRANSPARENT),
+            }
+        }
         // tiny-skia masks modulate source alpha; Clear ignores source alpha,
         // so express rectangle erasure as DestinationOut with an opaque source.
         // This also keeps clearRect independent of the drawing color/alpha.
@@ -890,7 +1180,19 @@ impl Canvas {
         } else {
             sk::FillRule::Winding
         };
-        let clip = self.state.clip.as_deref();
+        let pattern_mask = domain.as_ref();
+        let clipped_domain = match (pattern_mask, self.state.clip.as_deref()) {
+            (Some(domain), Some(clip)) => {
+                let mut combined = domain.clone();
+                intersect_mask(&mut combined, clip);
+                Some(combined)
+            }
+            _ => None,
+        };
+        let clip = clipped_domain
+            .as_ref()
+            .or(pattern_mask)
+            .or(self.state.clip.as_deref());
         // Canvas default paths already contain transformed coordinates. Stroke
         // thickness is transformed at paint time, even for an old default path.
         let (path, transform) = if stroke {
@@ -916,16 +1218,29 @@ impl Canvas {
                 } else {
                     shift
                 };
+                // The shadow is cast by the pattern's rendered area.
+                let shifted = match (&pattern, pattern_device) {
+                    (Some(pattern), Some(Some(device))) => {
+                        pattern.domain(shift * device, layer.width(), layer.height())
+                    }
+                    _ => None,
+                };
                 if stroke {
                     layer.stroke_path(
                         &path,
                         &source_paint,
                         &self.state.stroke,
                         sk_transform(matrix),
-                        None,
+                        shifted.as_ref(),
                     );
                 } else {
-                    layer.fill_path(&path, &source_paint, rule, sk_transform(matrix), None);
+                    layer.fill_path(
+                        &path,
+                        &source_paint,
+                        rule,
+                        sk_transform(matrix),
+                        shifted.as_ref(),
+                    );
                 }
             });
         }
@@ -939,16 +1254,88 @@ impl Canvas {
             let mode = paint.blend_mode;
             paint.blend_mode = sk::BlendMode::SourceOver;
             if stroke {
-                layer.stroke_path(&path, &paint, &self.state.stroke, transform, None);
+                layer.stroke_path(&path, &paint, &self.state.stroke, transform, pattern_mask);
             } else {
-                layer.fill_path(&path, &paint, rule, transform, None);
+                layer.fill_path(&path, &paint, rule, transform, pattern_mask);
             }
-            composite_full(bitmap, &layer, mode, clip);
+            composite_full(bitmap, &layer, mode, self.state.clip.as_deref());
         } else if stroke {
             bitmap.stroke_path(&path, &paint, &self.state.stroke, transform, clip);
         } else {
             bitmap.fill_path(&path, &paint, rule, transform, clip);
         }
+        self.changed();
+    }
+
+    /// The intended path: a Path2D's commands transformed by the current
+    /// transformation matrix, or the current default path (already in
+    /// canvas coordinates).
+    pub fn intended_path(&self, commands: Option<&str>) -> Option<BezPath> {
+        let Some(commands) = commands else {
+            return Some(self.path.clone());
+        };
+        let commands = serde_json::from_str::<serde_json::Value>(commands).ok()?;
+        let mut builder = Canvas::new(0, 0, true)?;
+        builder.read_path_commands(&commands, 0);
+        Some(self.state.transform * builder.path)
+    }
+
+    /// HTML #is-point-in-path: the point is in canvas coordinates, unaffected
+    /// by the current transformation.
+    pub fn point_in_path(&self, path: &BezPath, x: f64, y: f64, evenodd: bool) -> bool {
+        x.is_finite() && y.is_finite() && path_contains(path, Point::new(x, y), evenodd)
+    }
+
+    /// HTML #is-point-in-stroke: trace the path with the line styles (under
+    /// the current transformation, as stroke() paints it) and test the
+    /// nonzero outline, its own edges included.
+    pub fn point_in_stroke(&self, path: &BezPath, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() || self.state.transform.determinant() == 0. {
+            return false;
+        }
+        let local = self.state.transform.inverse() * path.clone();
+        let Some(mut traced) = sk_path(&local) else {
+            return false;
+        };
+        let [a, b, c, d, _, _] = self.state.transform.as_coeffs();
+        let scale = (a.hypot(b).max(c.hypot(d)) as f32).max(1.);
+        if let Some(dash) = &self.state.stroke.dash {
+            let Some(dashed) = traced.dash(dash, scale) else {
+                return false;
+            };
+            traced = dashed;
+        }
+        let Some(outline) = traced.stroke(&self.state.stroke, scale) else {
+            return false;
+        };
+        let outline = self.state.transform * bez_from_sk(&outline);
+        path_contains(&outline, Point::new(x, y), false)
+    }
+
+    /// HTML #draw-focus-if-needed: a focus ring along the path, subject only
+    /// to the clipping region: no shadow, global alpha, compositing operator,
+    /// fill or stroke style, or line styles.
+    pub fn focus_ring(&mut self, path: &BezPath) {
+        let Some(bitmap) = self.bitmap.as_mut() else {
+            return;
+        };
+        let Some(path) = sk_path(path) else {
+            return;
+        };
+        let mut paint = sk::Paint::default();
+        paint.set_color(sk::Color::from_rgba8(0, 95, 204, 255));
+        paint.anti_alias = true;
+        let ring = sk::Stroke {
+            width: 2.,
+            ..sk::Stroke::default()
+        };
+        bitmap.stroke_path(
+            &path,
+            &paint,
+            &ring,
+            sk::Transform::identity(),
+            self.state.clip.as_deref(),
+        );
         self.changed();
     }
 
@@ -1214,11 +1601,7 @@ impl Canvas {
         let Some(rect) = sk::Rect::from_ltrb(x0 as f32, y0 as f32, x1 as f32, y1 as f32) else {
             return;
         };
-        let quality = if self.state.smoothing {
-            sk::FilterQuality::Bilinear
-        } else {
-            sk::FilterQuality::Nearest
-        };
+        let quality = self.state.filter_quality();
         let mut paint = sk::Paint {
             shader: sk::Pattern::new(
                 source.as_ref(),
@@ -1281,6 +1664,65 @@ impl Canvas {
         );
         self.presentation = Some(image.clone());
         Some(image)
+    }
+
+    /// HTML #a-serialisation-of-the-bitmap-as-a-file: PNG unless JPEG or WebP
+    /// is requested. JPEG has no alpha channel, so the bitmap is composited
+    /// onto opaque black; `quality` in [0, 1] guides it (0.92 otherwise).
+    /// WebP is encoded losslessly. None when the bitmap has no pixels.
+    pub fn serialize(
+        &mut self,
+        mime: &str,
+        quality: Option<f64>,
+    ) -> Option<(&'static str, Vec<u8>)> {
+        use image::ImageEncoder as _;
+        let image = self.backing_image()?;
+        let resource = &image.image;
+        let (width, height) = (resource.width, resource.height);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut out = Vec::new();
+        match mime.to_ascii_lowercase().as_str() {
+            "image/jpeg" => {
+                let mut rgb = Vec::with_capacity(resource.rgba.len() / 4 * 3);
+                for pixel in resource.rgba.as_chunks::<4>().0 {
+                    let alpha = u32::from(pixel[3]);
+                    for channel in &pixel[..3] {
+                        rgb.push(((u32::from(*channel) * alpha + 127) / 255) as u8);
+                    }
+                }
+                let quality = quality
+                    .filter(|quality| (0.0..=1.0).contains(quality))
+                    .map_or(92, |quality| (quality * 100.).round().clamp(1., 100.) as u8);
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+                    .write_image(&rgb, width, height, image::ExtendedColorType::Rgb8)
+                    .ok()?;
+                Some(("image/jpeg", out))
+            }
+            "image/webp" => {
+                image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+                    .write_image(
+                        &resource.rgba,
+                        width,
+                        height,
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .ok()?;
+                Some(("image/webp", out))
+            }
+            _ => {
+                image::codecs::png::PngEncoder::new(&mut out)
+                    .write_image(
+                        &resource.rgba,
+                        width,
+                        height,
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .ok()?;
+                Some(("image/png", out))
+            }
+        }
     }
 
     pub fn data_url(&mut self) -> String {

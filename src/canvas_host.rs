@@ -33,6 +33,20 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     }
     let payload = args.get(3).cloned().unwrap_or(Value::Undefined);
     let text = payload.as_text().unwrap_or_default().into_owned();
+    // HTML #dom-canvaspattern-settransform and pattern release: patterns are
+    // not tied to one canvas element.
+    if op == "patternTransform" || op == "freePattern" {
+        let state = ctx.host_mut::<HostState>().unwrap();
+        let id = n.first().copied().unwrap_or(0.) as u32;
+        if op == "freePattern" {
+            state.canvas_patterns.remove(&id);
+        } else if n.len() >= 7
+            && let Some(pattern) = state.canvas_patterns.get(&id)
+        {
+            pattern.set_matrix(Affine::new([n[1], n[2], n[3], n[4], n[5], n[6]]));
+        }
+        return Ok(Value::Undefined);
+    }
     if op == "color" {
         return Ok(Canvas::color(&text).map_or(Value::Null, |(color, _)| {
             ctx.make_array(color.into_iter().map(|n| Value::Num(n as f64)).collect())
@@ -43,7 +57,8 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     } else {
         None
     };
-    let loaded_image = if op == "draw" && !matches!(payload, Value::Undefined) {
+    let image_op = op == "draw" || op == "createPattern";
+    let loaded_image = if image_op && !matches!(payload, Value::Undefined) {
         let width = ctx.member_get(&payload, "0")?.as_num_opt().unwrap_or(0.) as u32;
         let height = ctx.member_get(&payload, "1")?.as_num_opt().unwrap_or(0.) as u32;
         let pixels = ctx.member_get(&payload, "2")?;
@@ -66,7 +81,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         .ok_or_else(|| ctx.make_error("TypeError", "Invalid canvas"))?;
     let readback = if matches!(op.as_str(), "url" | "snapshot") {
         Some(id)
-    } else if op == "draw" && loaded_image.is_none() {
+    } else if image_op && loaded_image.is_none() {
         n.first().map(|n| *n as usize)
     } else {
         None
@@ -137,6 +152,25 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         }
         return Ok(Value::Bool(true));
     }
+    // HTML #dom-canvas-todataurl / #dom-canvas-toblob: serialize the bitmap
+    // as `text` (PNG, JPEG or WebP; anything else is PNG) with quality n[0].
+    if op == "encode" {
+        let quality = n.first().copied().filter(|q| q.is_finite());
+        let mut canvases = dom.canvases.borrow_mut();
+        let encoded = if let Some(canvas) = canvases.get_mut(&id) {
+            canvas.serialize(&text, quality)
+        } else {
+            Canvas::new(width, height, true).and_then(|mut canvas| canvas.serialize(&text, quality))
+        };
+        drop(canvases);
+        return match encoded {
+            Some((mime, bytes)) => {
+                let bytes = ctx.make_uint8array(&bytes)?;
+                Ok(ctx.make_array(vec![Value::from_string(mime.to_string()), bytes]))
+            }
+            None => Ok(Value::Null),
+        };
+    }
     if op == "url" {
         let mut canvases = dom.canvases.borrow_mut();
         let url = if let Some(canvas) = canvases.get_mut(&id) {
@@ -147,7 +181,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         };
         return Ok(Value::from_string(url));
     }
-    let source = if op == "draw" {
+    let source = if image_op {
         let origin = dom
             .canvases
             .borrow()
@@ -424,6 +458,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         "setStyle" => {
             if let Some((color, serialized)) = Canvas::color(&text) {
                 canvas.state.gradients[usize::from(n.first() == Some(&1.))] = None;
+                canvas.state.patterns[usize::from(n.first() == Some(&1.))] = None;
                 if n.first() == Some(&1.) {
                     canvas.state.stroke_color = color;
                     canvas.state.stroke_text = serialized;
@@ -442,9 +477,83 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             {
                 canvas.state.gradients[usize::from(index == 1.)] =
                     Some(std::sync::Arc::new(gradient));
+                canvas.state.patterns[usize::from(index == 1.)] = None;
             }
             Value::Undefined
         }
+        // HTML #dom-context-2d-createpattern: snapshot the usable image.
+        "createPattern" => match source {
+            Some((image, clean)) => {
+                let repetition = ["repeat", "repeat-x", "repeat-y", "no-repeat"]
+                    .get(n.get(1).copied().unwrap_or(0.) as usize)
+                    .copied()
+                    .unwrap_or("repeat");
+                let Some(pattern) = crate::canvas::Pattern::new(image, repetition, clean) else {
+                    return Ok(Value::Null);
+                };
+                drop(canvases);
+                let state = ctx.host_mut::<HostState>().unwrap();
+                state.next_canvas_pattern = state.next_canvas_pattern.wrapping_add(1).max(1);
+                let pattern_id = state.next_canvas_pattern;
+                state
+                    .canvas_patterns
+                    .insert(pattern_id, std::sync::Arc::new(pattern));
+                return Ok(
+                    ctx.make_array(vec![Value::Num(f64::from(pattern_id)), Value::Bool(clean)])
+                );
+            }
+            None => Value::Null,
+        },
+        // #dom-context-2d-fillstyle setter steps for a CanvasPattern.
+        "setPattern" => {
+            let index = usize::from(n.first() == Some(&1.));
+            let pattern_id = n.get(1).copied().unwrap_or(0.) as u32;
+            drop(canvases);
+            let pattern = ctx
+                .host_mut::<HostState>()
+                .and_then(|state| state.canvas_patterns.get(&pattern_id).cloned());
+            let mut canvases = dom.canvases.borrow_mut();
+            if let (Some(pattern), Some(canvas)) = (pattern, canvases.get_mut(&id)) {
+                if !pattern.origin_clean {
+                    canvas.origin_clean = false;
+                }
+                canvas.state.gradients[index] = None;
+                canvas.state.patterns[index] = Some(pattern);
+            }
+            return Ok(Value::Undefined);
+        }
+        "isPointInPath" | "isPointInStroke" => {
+            let path = canvas.intended_path((!text.is_empty()).then_some(text.as_str()));
+            let x = n.first().copied().unwrap_or(f64::NAN);
+            let y = n.get(1).copied().unwrap_or(f64::NAN);
+            Value::Bool(path.is_some_and(|path| {
+                if op == "isPointInPath" {
+                    canvas.point_in_path(&path, x, y, n.get(2) == Some(&1.))
+                } else {
+                    canvas.point_in_stroke(&path, x, y)
+                }
+            }))
+        }
+        "focusRing" => {
+            if let Some(path) = canvas.intended_path((!text.is_empty()).then_some(text.as_str())) {
+                canvas.focus_ring(&path);
+                changed = true;
+            }
+            Value::Undefined
+        }
+        "setSmoothingQuality" => {
+            if let Some(quality) = ["low", "medium", "high"]
+                .iter()
+                .position(|value| *value == text)
+            {
+                canvas.state.smoothing_quality = quality as u8;
+            }
+            Value::Undefined
+        }
+        "getSmoothingQuality" => Value::from_string(
+            ["low", "medium", "high"][usize::from(canvas.state.smoothing_quality.min(2))]
+                .to_string(),
+        ),
         "getStyle" => Value::from_string(if n.first() == Some(&1.) {
             canvas.state.stroke_text.clone()
         } else {

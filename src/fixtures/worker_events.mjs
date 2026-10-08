@@ -51,7 +51,10 @@
     target.addEventListener('error-report',()=>{throw {get message(){throw Error('formatting');}};},{once:true});
     target.addEventListener('error-report',()=>{afterError=true;},{once:true});
     target.dispatchEvent(new Event('error-report'));
-    check(afterError && __wkr.takeErrors().includes('exception could not be formatted'),'listener exceptions remain contained');
+    // HTML #report-an-exception: the exception is reported without running
+    // author getters, and later listeners still run.
+    check(afterError && __wkr.takeErrors().includes('Uncaught [object]') &&
+        __wkr.takeConsole().includes('exception could not be formatted'),'listener exceptions remain contained');
     const dateNow=Date.now;
     Date.now=()=>-1000000;
     let timed;try{timed=new Event('timed');}finally{Date.now=dateNow;}

@@ -56,6 +56,9 @@ pub type WebStorage = std::sync::Arc<
 pub enum WorkerOut {
     Message(String),
     Error(String),
+    /// Developer-console lines the worker's console and unhandled-rejection
+    /// reporting produced during one task, separated by U+001E.
+    Console(String),
 }
 
 /// Page-lifetime mirror of JavaScript-created `blob:` URL bytes.
@@ -951,12 +954,18 @@ pub(crate) fn worker_prelude() -> &'static str {
     PRELUDE
         .get_or_init(|| {
             let ports = platform_block("/*__PORTS_BEGIN__*/", "/*__PORTS_END__*/");
-            let headers = wrapped_platform_block("/*__HEADERS_BEGIN__*/", "/*__HEADERS_END__*/");
             let codec = platform_block("/*__SC_CODEC_BEGIN__*/", "/*__SC_CODEC_END__*/");
             let features = platform_block("/*__FEATURES_BEGIN__*/", "/*__FEATURES_END__*/");
             let bitmap = platform_block("/*__IMAGE_BITMAP_BEGIN__*/", "/*__IMAGE_BITMAP_END__*/");
-            let crypto = wrapped_platform_block("/*__CRYPTO_BEGIN__*/", "/*__CRYPTO_END__*/");
-            let streams = wrapped_platform_block("/*__STREAMS_BEGIN__*/", "/*__STREAMS_END__*/");
+            let crypto = platform_block("/*__CRYPTO_BEGIN__*/", "/*__CRYPTO_END__*/");
+            let domexception = platform_block("/*__DOMEXCEPTION_BEGIN__*/", "/*__DOMEXCEPTION_END__*/");
+            let abort = platform_block("/*__ABORT_BEGIN__*/", "/*__ABORT_END__*/");
+            let streams = platform_block("/*__STREAMS_BEGIN__*/", "/*__STREAMS_END__*/");
+            let file = platform_block("/*__FILE_BEGIN__*/", "/*__FILE_END__*/");
+            let fetch = platform_block("/*__FETCH_BEGIN__*/", "/*__FETCH_END__*/");
+            let xhr = platform_block("/*__XHR_BEGIN__*/", "/*__XHR_END__*/");
+            let websocket = platform_block("/*__WEBSOCKET_BEGIN__*/", "/*__WEBSOCKET_END__*/");
+            let rejection = platform_block("/*__REJECTION_BEGIN__*/", "/*__REJECTION_END__*/");
             let wasm = platform_block("/*__WASM_BEGIN__*/", "/*__WASM_END__*/");
             let urlpattern = platform_block("/*__URLPATTERN_BEGIN__*/", "/*__URLPATTERN_END__*/");
             let permissions =
@@ -980,12 +989,20 @@ pub(crate) fn worker_prelude() -> &'static str {
                     "/*__TEXT_CODEC_SHARED__*/",
                     platform_block("/*__TEXT_CODEC_BEGIN__*/", "/*__TEXT_CODEC_END__*/"),
                     1,
+                )
+                .replacen(
+                    "/*__HTML_EVENTS_SHARED__*/",
+                    platform_block("/*__HTML_EVENTS_BEGIN__*/", "/*__HTML_EVENTS_END__*/"),
+                    1,
                 );
             format!(
-                "{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{bitmap}\n{headers}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{fetch}\n{xhr}\n{websocket}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\
                  delete globalThis.__bitmap_api; delete globalThis.__sc_bitmap_codec;\n\
+                 __sc_crypto_codec(__crypto_key_api);\n\
+                 __html_events_ports(__port_api.state); delete globalThis.__html_events_ports;\n\
+                 delete globalThis.__crypto_key_api; delete globalThis.__sc_crypto_codec;\n\
                  (function (control) {{\n\
                  \x20   control.installPorts(__port_api);\n\
                  \x20   control.messageCodec = {{ serialize: __sc_serialize, deserialize: __sc_deserialize }};\n\

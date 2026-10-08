@@ -310,6 +310,17 @@ current behavior and limits; consult the governing standards before changing it.
   only its stream. Never blindly replay a possibly processed POST after
   network failure. The owned h3-quinn adapter fixes pending-read cancellation
   without copying receive buffers; keep its focused regression coverage.
+- XMLHttpRequest and WebSocket are shared Window/Worker platform blocks
+  (`/*__XHR_BEGIN__*/` and `/*__WEBSOCKET_BEGIN__*/` in `src/js_platform.js`,
+  assembled for workers by `js::worker_prelude()`); each realm supplies only
+  an adapter. Workers may send synchronous XHR, which blocks only the worker
+  thread; `responseXML` and the "document" response type are Window-only. A
+  worker's WebSockets follow its owner document's subresource policy, arrive
+  as host tasks of the worker loop and close when the worker ends. Response
+  bodies arrive complete, so XHR fires one LOADING `readystatechange` and a
+  synchronous timeout is detected only after the response. `statusText` stays
+  empty (the host response keeps no reason phrase), and XHR's use-CORS-preflight
+  flag for upload listeners is not forwarded to the host.
 - `--renderer=auto` selects Hybrid only after surface, adapter, device, and
   capability initialization succeed; recoverable later failures fall back to
   Vello CPU. `--renderer=cpu` forces the reference renderer, while

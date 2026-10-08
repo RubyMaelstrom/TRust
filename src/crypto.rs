@@ -4,6 +4,8 @@
 //! layer owns Web IDL normalization and Promise behavior; RustCrypto owns
 //! AES and GCM's authentication, including constant-time tag verification.
 
+pub(crate) mod keys;
+
 use aes_gcm::AesGcm;
 use aes_gcm::aes::cipher::{BlockCipherEncrypt, KeyInit, array::Array, consts};
 use aes_gcm::aes::{Aes128, Aes192, Aes256};
