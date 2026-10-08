@@ -22469,6 +22469,36 @@ mod tests {
         );
     }
 
+    /// DOM #find-a-slot gives a slottable to the first slot in tree order
+    /// with its name, and #find-slotables only to that slot; slottables are
+    /// elements and text, and names compare exactly ("" for an absent
+    /// attribute).
+    #[test]
+    fn slottables_go_to_the_first_slot_with_their_name() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const host = document.createElement('div'); body.appendChild(host);
+            const root = host.attachShadow({ mode: 'open' });
+            root.innerHTML = '<slot name=a id=a1></slot><slot name=a id=a2></slot><slot id=d1></slot>';
+            host.innerHTML = '<b slot=a>1</b>text<!--c--><i slot="">2</i><u slot=" a">3</u>';
+            const ids = nodes => nodes.map(n => n.nodeType === 1 ? n.localName : n.nodeType === 3 ? '#t' : '#c').join(',');
+            const [a1, a2, d1] = ['a1', 'a2', 'd1'].map(id => root.getElementById(id));
+            const out = [ids(a1.assignedNodes()), ids(a2.assignedNodes()), ids(d1.assignedNodes())];
+            out.push(host.firstChild.assignedSlot === a1, host.querySelector('u').assignedSlot);
+            const d0 = document.createElement('slot'); root.insertBefore(d0, a1);
+            out.push(ids(d0.assignedNodes()), ids(d1.assignedNodes()), host.childNodes[1].assignedSlot === d0);
+            return out.join('|');
+        })()"#
+            ),
+            "b||#t,i|true||#t,i||true"
+        );
+    }
+
     /// HTML's iframe insertion and removing steps run whenever a navigable
     /// container is in the inserted or removed subtree, at any depth and on
     /// every path; the frame-free fast path never skips them.

@@ -8895,19 +8895,19 @@ impl Dom {
         stack[start..].reverse();
     }
 
-    /// The light-DOM nodes assigned to a `<slot>` (HTML §4.8.2 slot
-    /// assignment): the slot's shadow HOST's children whose `slot=` attribute
-    /// matches this slot's `name` (the default slot is `name=""`/absent, where
-    /// text nodes and slot-less children land). Returns empty when the slot is
-    /// not inside a shadow tree, or nothing is assigned — the caller then falls
-    /// back to the slot's own children (its fallback content). This is what
-    /// projects a web component's light children into its shadow `<slot>`s so
-    /// the flat (rendered) tree is complete — archive.org's `<router-slot>`
-    /// shadow is just `<slot>`, with the routed `<home-page>` (and the
-    /// `<infinite-scroller>` beneath it) assigned as a light child.
+    /// The light-DOM nodes assigned to a `<slot>`, DOM #find-slotables: in a
+    /// shadow root with named slot assignment, each slottable child of the
+    /// host (an element or text node) whose slot name (its `slot` attribute,
+    /// else "") equals the slot's name (its `name` attribute, else "") — but
+    /// only for the first slot in tree order with that name (#find-a-slot),
+    /// so a later slot with the same name receives nothing. Empty when the
+    /// slot is not inside a shadow tree or nothing is assigned; the caller
+    /// then falls back to the slot's own children (its fallback content).
+    /// This projects a web component's light children into its shadow
+    /// `<slot>`s so the flat (rendered) tree is complete.
     pub fn slot_assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
         let mut cur = self.nodes[slot].parent;
-        let host = loop {
+        let (shadow, host) = loop {
             match cur {
                 Some(p) => {
                     if let Some(&h) = self.shadow_hosts.get(&p) {
@@ -8918,16 +8918,28 @@ impl Dom {
                         {
                             return Vec::new();
                         }
-                        break h;
+                        break (p, h);
                     }
                     cur = self.nodes[p].parent;
                 }
                 None => return Vec::new(),
             }
         };
-        let want = self.attr(slot, "name").unwrap_or("").trim().to_owned();
+        let name = self.attr(slot, "name").unwrap_or("");
+        let first = self.descendants(shadow).find(|&candidate| {
+            self.tag_name(candidate) == Some("slot")
+                && self.attr(candidate, "name").unwrap_or("") == name
+        });
+        if first != Some(slot) {
+            return Vec::new();
+        }
         self.child_iter(host)
-            .filter(|&c| self.attr(c, "slot").unwrap_or("").trim() == want)
+            .filter(|&child| {
+                matches!(
+                    self.nodes[child].data,
+                    NodeData::Element { .. } | NodeData::Text(_) | NodeData::CData(_)
+                ) && self.attr(child, "slot").unwrap_or("") == name
+            })
             .collect()
     }
 
@@ -9412,18 +9424,6 @@ impl Dom {
         for (id, attr, val) in edits {
             self.set_attr(id, attr, &val);
         }
-    }
-
-    /// The host's light children assigned to a slot (by name, or the
-    /// default slot). Text nodes always belong to the default slot.
-    fn slot_assigned(&self, host: NodeId, slot_name: Option<&str>) -> Vec<NodeId> {
-        self.child_iter(host)
-            .filter(|&c| match (self.attr(c, "slot"), slot_name) {
-                (Some(a), Some(n)) => a == n,
-                (None, None) => true,
-                _ => false,
-            })
-            .collect()
     }
 
     /// Concatenated descendant text (DOM textContent).
@@ -10474,10 +10474,8 @@ impl Dom {
                 {
                     return;
                 }
-                if tag == "slot"
-                    && let Some(h) = host
-                {
-                    let assigned = self.slot_assigned(h, self.attr(id, "name"));
+                if tag == "slot" && host.is_some() {
+                    let assigned = self.slot_assigned_nodes(id);
                     if assigned.is_empty() {
                         for child in self.child_iter(id) {
                             self.serialize_svg_node_for_image(child, host, out, images);
@@ -11015,11 +11013,8 @@ impl Dom {
                 }
                 // <slot> inside a shadow tree: project the host's light
                 // children (or the slot's own fallback content).
-                if !js_serialization
-                    && tag == "slot"
-                    && let Some(h) = host
-                {
-                    let assigned = self.slot_assigned(h, self.attr(id, "name"));
+                if !js_serialization && tag == "slot" && host.is_some() {
+                    let assigned = self.slot_assigned_nodes(id);
                     if assigned.is_empty() {
                         for c in self.child_iter(id) {
                             self.serialize_node_inner(c, host, mode, out);
@@ -11148,10 +11143,8 @@ impl Dom {
             out.push('>');
             return;
         }
-        if tag == "slot"
-            && let Some(h) = host
-        {
-            let assigned = self.slot_assigned(h, self.attr(id, "name"));
+        if tag == "slot" && host.is_some() {
+            let assigned = self.slot_assigned_nodes(id);
             if assigned.is_empty() {
                 for c in self.child_iter(id) {
                     self.serialize_live_node(c, host, clickable, in_anchor, out);
@@ -11921,10 +11914,14 @@ impl<'a> StyleView<'a> {
         {
             return None;
         }
-        let wanted = self.attr(id, "slot").unwrap_or("").trim();
+        // Only elements and text nodes are slottables; names compare exactly.
+        if !self.nodes.is_element(id) && self.nodes.text(id).is_none() {
+            return None;
+        }
+        let wanted = self.attr(id, "slot").unwrap_or("");
         self.descendants(shadow).find(|&candidate| {
             self.tag_name(candidate) == Some("slot")
-                && self.attr(candidate, "name").unwrap_or("").trim() == wanted
+                && self.attr(candidate, "name").unwrap_or("") == wanted
         })
     }
 
