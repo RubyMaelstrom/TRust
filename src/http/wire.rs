@@ -5,8 +5,13 @@
 use super::{Headers, Request};
 use http_wire::{HeaderMap, HeaderName, HeaderValue, Version};
 
+/// Bound on a decoded field section, counted as RFC 9113 §6.5.2 sizes
+/// SETTINGS_MAX_HEADER_LIST_SIZE: name plus value octets plus 32 octets per
+/// field line. The per-line overhead also bounds the number of lines (at most
+/// 8,192), so no separate field count applies: HTTP sets no limit on how many
+/// field lines a section holds (RFC 9110 §5.4), and real responses exceed a
+/// few hundred, e.g. CDNs that append one timing field per hop.
 pub(super) const HEADER_BYTES: u32 = 256 * 1024;
-pub(super) const HEADER_FIELDS: usize = 256;
 
 pub(super) struct Error {
     pub(super) message: String,
@@ -70,9 +75,6 @@ pub(super) fn request(
 }
 
 pub(super) fn response_headers(fields: &HeaderMap) -> Result<(Headers, Vec<String>), Error> {
-    if fields.len() > HEADER_FIELDS {
-        return Err(Error::limit("too many HTTP response headers"));
-    }
     let mut headers = Headers::new();
     let mut cookies = Vec::new();
     let mut bytes = 0usize;

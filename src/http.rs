@@ -4584,9 +4584,12 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
     navigation_get: bool,
     mut timing: Option<&mut crate::performance::FetchTiming>,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+    // RFC 9110 §5.4 sets no limit on field lines or on the section as a
+    // whole. These byte bounds keep parsing bounded; the line count is bounded
+    // by them, so a response with many short fields (CDNs append one timing
+    // field per hop) is not refused for its count alone.
     const MAX_HEADER_LINE: usize = 64 * 1024;
     const MAX_HEADER_BYTES: usize = 256 * 1024;
-    const MAX_HEADER_FIELDS: usize = 256;
     let mut interim_framing_violation = false;
     let (status, headers, set_cookies, http11) = loop {
         // Wait for the first available response bytes before sampling. A
@@ -4618,7 +4621,6 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
         let mut headers = HashMap::new();
         let mut set_cookies = Vec::new();
         let mut header_bytes = status_line.len();
-        let mut header_fields = 0usize;
         loop {
             let line = read_line(io).await?;
             header_bytes = header_bytes.saturating_add(line.len().saturating_add(2));
@@ -4646,10 +4648,6 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
             let name = raw_name.to_ascii_lowercase();
             if name.is_empty() {
                 return Err(String::from("response header has an empty name"));
-            }
-            header_fields += 1;
-            if header_fields > MAX_HEADER_FIELDS {
-                return Err(String::from("too many response headers"));
             }
             if name == "set-cookie" {
                 set_cookies.push(value.trim().to_string());
@@ -18474,6 +18472,41 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[tokio::test]
+    async fn many_response_field_lines_within_the_byte_bound_are_accepted() {
+        // RFC 9110 §5.4 sets no limit on the number of field lines. A CDN that
+        // appends two timing fields per hop sends hundreds of them; only the
+        // section's byte bound may refuse a response.
+        let mut raw = String::from("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n");
+        for hop in 0..240 {
+            raw.push_str(&format!("X-Hop-Latency: {hop}\r\nX-Hop-RTT: {hop}\r\n"));
+        }
+        raw.push_str("Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nok");
+        let (status, headers, body, reusable, cookies) =
+            read_response(&mut BufReader::new(raw.as_bytes()), false)
+                .await
+                .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"ok");
+        assert!(reusable);
+        assert_eq!(cookies, ["a=1", "b=2"]);
+        let latency = &headers["x-hop-latency"];
+        assert!(latency.starts_with("0, 1, 2, ") && latency.ends_with(", 238, 239"));
+
+        // The byte bound still applies to a section of many small lines.
+        let mut raw = String::from("HTTP/1.1 200 OK\r\n");
+        while raw.len() <= 256 * 1024 {
+            raw.push_str("X-Filler: 0123456789abcdef\r\n");
+        }
+        raw.push_str("\r\n");
+        assert_eq!(
+            read_response(&mut BufReader::new(raw.as_bytes()), false)
+                .await
+                .unwrap_err(),
+            "response headers exceed size limit"
+        );
+    }
+
+    #[tokio::test]
     async fn reads_delimited_responses() {
         // Content-Length delimits even with pipelined junk behind it.
         let raw: &[u8] =
@@ -18699,7 +18732,10 @@ customElements.define('lit-counter', LitCounter);
         assert_eq!(status, 304);
         assert!(body.is_empty());
 
-        let mut raw = b"HTTP/1.1 200 OK\r\n".to_vec();
+        // RFC 9110 §5.4: the number of field lines is not a framing error;
+        // only the section's byte bound applies (see
+        // many_response_field_lines_within_the_byte_bound_are_accepted).
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
         for _ in 0..257 {
             raw.extend_from_slice(b"X-Repeat: value\r\n");
         }
@@ -18707,7 +18743,7 @@ customElements.define('lit-counter', LitCounter);
         assert!(
             read_response(&mut BufReader::new(raw.as_slice()), false)
                 .await
-                .is_err()
+                .is_ok()
         );
 
         let mut raw = b"HTTP/1.1 200 OK\r\nX-Long: ".to_vec();

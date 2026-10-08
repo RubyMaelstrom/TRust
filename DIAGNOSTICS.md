@@ -203,9 +203,11 @@ The ordinary `cargo test --lib http2` suite uses local TLS servers for ALPN
 fallback, multiplexing, flow control, uploads, disk streaming, cancellation,
 GOAWAY/reset retry safety, response validation, and timing. HTTP/2 receive
 credits are 1 MiB per stream / 8 MiB per connection, not eager allocations;
-uploads stage at most 64 KiB at a time. Header blocks are bounded to 256 KiB
-and 256 fields, with at most 128 interim responses per request. Page-body and
-download limits remain separate. At most 32 recently used origin entries are
+uploads stage at most 64 KiB at a time. Header blocks are bounded to 256 KiB,
+counting 32 octets per field line as RFC 9113 §6.5.2 does (HTTP/1.1 counts raw
+bytes); the number of lines is not otherwise limited (RFC 9110 §5.4). At most
+128 interim responses are accepted per request. Page-body and download limits
+remain separate. At most 32 recently used origin entries are
 retained for reuse; active streams keep their own session alive when evicted.
 
 Check HTTP/3 discovery and actual QUIC responses:
@@ -233,8 +235,8 @@ authentication at a different advertised host/port, multiplexing, uploads,
 early responses, stream-local cancellation, downloads, cookies, compression,
 malformed messages, encoded-header bounds, 421, and fallback. Receive credits
 are 1 MiB per stream / 8 MiB per connection; uploads stage 64 KiB. Metadata
-is limited to 256 KiB decoded / 512 KiB encoded and 256 fields. QPACK uses
-static entries/literals and advertises zero dynamic-table capacity. No 0-RTT,
+is limited to 256 KiB decoded / 512 KiB encoded, with no separate field count.
+QPACK uses static entries/literals and advertises zero dynamic-table capacity. No 0-RTT,
 server push, extended CONNECT, or QUIC datagrams are enabled. Unused sessions
 close after 30 seconds; 128 origin/partition advertisements are retained only
 in memory, for at most seven days or their shorter advertised freshness.

@@ -1251,6 +1251,25 @@ mod tests {
         assert_eq!(response_headers(&headers).unwrap().1, ["a=1", "b=2"]);
     }
 
+    #[test]
+    fn http2_field_sections_are_bounded_by_size_not_line_count() {
+        // RFC 9110 §5.4: no line-count limit. RFC 9113 §6.5.2 sizes a list as
+        // name + value + 32 octets per line, which alone bounds the section.
+        let mut headers = HeaderMap::new();
+        for hop in 0..485 {
+            headers.append("x-hop-rtt", HeaderValue::from(hop));
+        }
+        let (fields, _) = response_headers(&headers).unwrap();
+        assert!(fields["x-hop-rtt"].starts_with("0, 1, 2, "));
+        assert!(fields["x-hop-rtt"].ends_with(", 483, 484"));
+
+        let mut headers = HeaderMap::new();
+        for _ in 0..=(HEADER_BYTES as usize / (32 + "x-hop-rtt".len() + 1)) {
+            headers.append("x-hop-rtt", HeaderValue::from_static("0"));
+        }
+        assert!(response_headers(&headers).is_err());
+    }
+
     async fn frame<T: tokio::io::AsyncWrite + Unpin>(
         io: &mut T,
         kind: u8,
