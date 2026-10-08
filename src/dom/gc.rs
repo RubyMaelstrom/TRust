@@ -94,6 +94,7 @@ impl Dom {
         }
         // DOM #signal-slot-list holds its slots until their slotchange event.
         self.visit_slot_signal_roots(&mut visit);
+        self.visit_track_change_roots(&mut visit);
     }
 
     pub(crate) fn visit_gc_pending_allocations(&self, mut visit: impl FnMut(NodeId)) {

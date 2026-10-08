@@ -598,8 +598,180 @@ fn expanded_in(property: &str, value: &str, quirks: bool) -> Vec<(String, String
     }
     expanded
         .into_iter()
-        .map(|(name, value)| (name, value, false))
+        .map(|(name, value)| {
+            let value = declared_colors(&name, &value).unwrap_or(value);
+            (name, value, false)
+        })
         .collect()
+}
+
+/// The longhands whose whole value is one `<color>`.
+fn color_longhand(name: &str) -> bool {
+    matches!(
+        name,
+        "color"
+            | "background-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "border-block-start-color"
+            | "border-block-end-color"
+            | "border-inline-start-color"
+            | "border-inline-end-color"
+            | "outline-color"
+            | "column-rule-color"
+            | "text-decoration-color"
+            | "text-emphasis-color"
+            | "caret-color"
+            | "accent-color"
+            | "stop-color"
+            | "flood-color"
+            | "lighting-color"
+            | "-webkit-text-fill-color"
+            | "-webkit-text-stroke-color"
+            | "-webkit-tap-highlight-color"
+    )
+}
+
+/// CSSOM #serialize-a-css-component-value for a `<color>` of a declared
+/// value (CSS Color 4 #resolving-sRGB-values and #serializing-sRGB-values):
+/// a named color, system color, `transparent` or `currentcolor` keeps its
+/// ASCII-lowercase keyword; a hex color or an `rgb()`, `rgba()`, `hsl()`,
+/// `hsla()` or `hwb()` value is the corresponding sRGB color, serialized as
+/// `rgb()`/`rgba()` (or as its own modern form when a component is
+/// missing); other color spaces use their own serialization. Relative
+/// colors and `color-mix()` keep their declared form.
+fn declared_color(text: &str) -> Option<String> {
+    let text = text.trim();
+    let mut parser = cssparser::Parser::new(text);
+    if let Ok(ident) = parser.expect_ident_cloned()
+        && parser.is_exhausted()
+    {
+        return properties::is_color(text).then(|| ident.to_ascii_lowercase());
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("from") || lower.contains("color-mix") || lower.contains("var(") {
+        return None;
+    }
+    properties::resolved_color(text)
+}
+
+/// The declared value `value` of longhand `name` with its `<color>`
+/// components serialized as CSSOM requires (see `declared_color`), or None
+/// when nothing changes. A color longhand's whole value is one color; in
+/// any other property's value only hex colors and the sRGB color functions
+/// are colors unambiguously (an identifier there may be a font family or a
+/// custom ident), so only they are rewritten. Custom properties keep their
+/// token streams.
+fn declared_colors(name: &str, value: &str) -> Option<String> {
+    if name.starts_with("--")
+        || wide_keyword(value).is_some()
+        || pending_shorthand(value).is_some()
+        || value.starts_with(PENDING_BOX_SHORTHAND)
+        || find_var_function(value).is_some()
+    {
+        return None;
+    }
+    if color_longhand(name) {
+        return declared_color(value).filter(|color| color != value);
+    }
+    if !value.contains(['#', '(']) {
+        return None;
+    }
+    // Rewrite each hash token that is a hex color and each sRGB color
+    // function, skipping strings and url() tokens.
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len() + 16);
+    let mut changed = false;
+    let mut i = 0;
+    let mut copied = 0;
+    let name_char = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b >= 0x80;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\'' {
+            // A string token, with its escapes.
+            i += 1;
+            while i < bytes.len() && bytes[i] != b {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+            continue;
+        }
+        let starts_word = i == 0 || !name_char(bytes[i - 1]);
+        if starts_word && value[i..].len() >= 4 && value[i..i + 4].eq_ignore_ascii_case("url(") {
+            // A url() token or function: its contents are not colors.
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let end = if b == b'#' {
+            let mut end = i + 1;
+            while end < bytes.len() && name_char(bytes[end]) {
+                end += 1;
+            }
+            let digits = &value[i + 1..end];
+            (matches!(digits.len(), 3 | 4 | 6 | 8) && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then_some(end)
+        } else if starts_word && b.is_ascii_alphabetic() {
+            let mut open = i;
+            while open < bytes.len() && name_char(bytes[open]) {
+                open += 1;
+            }
+            let function = value[i..open].to_ascii_lowercase();
+            if open < bytes.len()
+                && bytes[open] == b'('
+                && matches!(function.as_str(), "rgb" | "rgba" | "hsl" | "hsla" | "hwb")
+            {
+                let mut depth = 0usize;
+                let mut end = open;
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                (end < bytes.len()).then_some(end + 1)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(end) = end
+            && let Some(color) = declared_color(&value[i..end])
+        {
+            out.push_str(&value[copied..i]);
+            out.push_str(&color);
+            changed |= color != value[i..end];
+            copied = end;
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&value[copied..]);
+    changed.then_some(out)
 }
 
 pub(super) fn supports(property: &str, value: &str) -> bool {
@@ -2063,7 +2235,9 @@ mod tests {
             );
         }
         let declarations = parse("background-image:url(old.png);background:#222!important");
-        assert_eq!(get("background-color", &declarations), "#222");
+        // CSSOM #serialize-a-css-component-value: a declared hex color is
+        // its sRGB color (CSS Color 4 #serializing-sRGB-values).
+        assert_eq!(get("background-color", &declarations), "rgb(34, 34, 34)");
         assert_eq!(get("background-image", &declarations), "none");
         assert!(declarations.iter().all(|d| d.2));
         assert_eq!(

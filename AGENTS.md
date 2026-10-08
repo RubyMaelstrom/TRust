@@ -378,7 +378,17 @@ current behavior and limits; consult the governing standards before changing it.
   `fullscreen` policy (iframe `allow`/`allowfullscreen`, default 'self').
   trust-desktop enters borderless window fullscreen and hides its overlays; the
   terminal hides its address and status rows so the page fills it;
-  trust-headless refuses. A keyboard lock is recorded but never applied.
+  trust-headless refuses. Each frontend states whether it can present
+  fullscreen (`WindowEnvironment::fullscreen_supported`, `PageEnv`), which is
+  the page's "fullscreen is supported": `document.fullscreenEnabled` is false
+  and requests fail at once in trust-headless. A keyboard lock is recorded but
+  never applied.
+- `<track>` elements load WebVTT (`src/js_platform.js`'s WebVTT file parser)
+  into their text tracks through HTML's track processing model; automatic
+  text track selection honors only the `default` attribute (there are no
+  caption preferences). The arena journals track element parent changes
+  (`src/dom/media_tracks.rs`) so parser-created tracks get their addtrack
+  events and selection. Cues are never rendered: no media plays inline.
 - WebGL 1 uses lazy-loaded EGL/OpenGL ES with Rust shader preparation and
   validation, without bundled ANGLE. A missing robust context makes
   `getContext("webgl")` return `null`. WebGL 2 and multisample antialiasing are

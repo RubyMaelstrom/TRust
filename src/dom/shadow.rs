@@ -163,11 +163,9 @@ impl Dom {
         if let NodeData::Element {
             template_contents, ..
         } = &mut self.nodes[template].data
-            && let Some(old) = template_contents.replace(root)
         {
-            // The template's own (now unreachable) contents fragment is no
-            // longer a template contents root.
-            self.ce_registries.inert_roots_remove(old);
+            // The template's own contents fragment becomes unreachable.
+            template_contents.replace(root);
         }
         true
     }

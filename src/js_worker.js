@@ -209,6 +209,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         l[i].removed = true;
         l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
     };
+    // The platform's listener operations, captured before author code runs.
+    const scopeAddListener = g.addEventListener, scopeRemoveListener = g.removeEventListener;
     function dispatchScopeEvent(ev, preserveTrusted, target) {
         target = target || g;
         var state = scopeEventState(ev), l = lsFor(state.type, target);
@@ -331,6 +333,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         "rejectionhandled", "unhandledrejection"]).forEach(function (type) {
         // HTML #event-handler-attributes: [LegacyTreatNonObjectAsNull]
         // EventHandler; activation appends one listener that keeps its place.
+        // The handler's listener is added and removed with the platform's
+        // own operations: author code that replaces addEventListener never
+        // observes or intercepts an event handler's activation.
         var callback = null, listener = null;
         Object.defineProperty(g, "on" + type, {
             configurable: true, enumerable: true,
@@ -338,11 +343,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             set: function (value) {
                 callback = (typeof value === "object" && value !== null) || typeof value === "function" ? value : null;
                 if (callback === null) {
-                    if (listener) g.removeEventListener(type, listener);
+                    if (listener) scopeRemoveListener.call(g, type, listener);
                     listener = null;
                 } else if (!listener) {
                     listener = function (event) { processEventHandler(callback, event); };
-                    g.addEventListener(type, listener);
+                    scopeAddListener.call(g, type, listener);
                 }
             }
         });

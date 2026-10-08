@@ -30,6 +30,7 @@ mod container_queries;
 mod counter_styles;
 pub(crate) mod cssom;
 pub(crate) mod custom_registry;
+mod editing;
 mod focus;
 mod gc;
 mod generated;
@@ -37,6 +38,7 @@ mod html_hints;
 mod input;
 mod invalidation;
 mod media;
+mod media_tracks;
 mod parallel_match;
 mod parallel_style;
 mod properties;
@@ -622,6 +624,9 @@ pub struct Dom {
     slot_signals: slotting::SlotSignals,
     /// Custom element registry associations (see `custom_registry`).
     ce_registries: custom_registry::State,
+    /// HTML #sourcing-out-of-band-text-tracks: track element parent changes
+    /// awaiting the platform (see `media_tracks`).
+    media_tracks: media_tracks::State,
     /// Set by every tree/attribute mutation; the living page takes it
     /// to decide whether a dispatch warrants re-extraction at all.
     dirty: bool,
@@ -1142,6 +1147,7 @@ impl Dom {
             manual_slots: _,
             slot_signals: _,
             ce_registries,
+            media_tracks,
             dirty,
             epoch,
             window_names_epoch,
@@ -1366,6 +1372,7 @@ impl Dom {
         fixed_map!(shadow_data, (NodeId, shadow::ShadowRootData));
         bytes = bytes.saturating_add(self.slotting_retained_bytes());
         bytes = bytes.saturating_add(ce_registries.retained_bytes());
+        bytes = bytes.saturating_add(media_tracks.retained_bytes());
         fixed_map!(geometry_dirty_nodes, (NodeId, DirtyKind));
         fixed_map!(adopted_styles, (NodeId, String));
         for text in adopted_styles.values() {
@@ -1701,6 +1708,7 @@ impl Dom {
             manual_slots: slotting::ManualSlots::default(),
             slot_signals: slotting::SlotSignals::default(),
             ce_registries: custom_registry::State::default(),
+            media_tracks: media_tracks::State::default(),
             dirty: false,
             epoch: 0,
             window_names_epoch: 0,
@@ -3643,8 +3651,9 @@ impl Dom {
         if !self.is_valid(root) {
             return;
         }
-        let mut stack = vec![(root, false)];
-        while let Some((id, inert)) = stack.pop() {
+        let inert = self.is_template_contents_owner(document);
+        let mut stack = vec![(root, document, inert)];
+        while let Some((id, document, inert)) = stack.pop() {
             // HTML child navigables share the presentation arena, not their node document.
             // A Document is always its own node document and adoption cannot cross it.
             if matches!(self.nodes[id].data, NodeData::Document) {
@@ -3654,7 +3663,7 @@ impl Dom {
             if previous != document && !inert {
                 self.note_adopted_image(id);
             }
-            stack.extend(self.child_iter(id).map(|child| (child, inert)));
+            stack.extend(self.child_iter(id).map(|child| (child, document, inert)));
             let template_contents = match &self.nodes[id].data {
                 NodeData::Element {
                     template_contents: Some(contents),
@@ -3662,11 +3671,17 @@ impl Dom {
                 } => Some(*contents),
                 _ => None,
             };
-            if let Some(contents) = template_contents {
-                stack.push((contents, true));
+            // HTML #template-contents: a template's contents belong to its
+            // node document's appropriate template contents owner document,
+            // and the template's adopting steps adopt them into it.
+            if let Some(contents) = template_contents
+                && !self.shadow_hosts.contains_key(&contents)
+            {
+                let owner = self.appropriate_template_contents_owner(document);
+                stack.push((contents, owner, true));
             }
             if let Some(&shadow) = self.shadow_roots.get(&id) {
-                stack.push((shadow, inert));
+                stack.push((shadow, document, inert));
             }
         }
     }
@@ -3789,11 +3804,11 @@ impl Dom {
     }
 
     /// A template element's contents (HTML #template-contents): a
-    /// DocumentFragment of the inert template contents owner document.
+    /// DocumentFragment of the appropriate template contents owner document
+    /// of the template's node document, which the caller establishes (see
+    /// `set_owner_document_subtree`).
     fn new_template_contents(&mut self) -> NodeId {
-        let contents = self.new_node(NodeData::Fragment);
-        self.note_template_contents(contents);
-        contents
+        self.new_node(NodeData::Fragment)
     }
 
     pub fn create_fragment(&mut self) -> NodeId {
@@ -3988,6 +4003,7 @@ impl Dom {
         if let Some(parent) = parent {
             self.child_collection_changed(parent, id, false);
             self.note_picture_child_change(parent, id);
+            self.note_track_parent_change(parent, id, false);
             self.clear_top_layer_disconnected();
         }
         if let Some(select) = affected_select {
@@ -4015,6 +4031,7 @@ impl Dom {
         self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
         self.note_picture_child_change(parent, child);
+        self.note_track_parent_change(parent, child, true);
     }
 
     /// Link a newly-created, detached node while constructing another detached
@@ -4037,6 +4054,7 @@ impl Dom {
         }
         self.nodes[parent].last_child = Some(child);
         self.child_collection_changed(parent, child, true);
+        self.note_track_parent_change(parent, child, true);
     }
 
     /// Unlink a node while html5ever is constructing its private parse arena.
@@ -4067,6 +4085,7 @@ impl Dom {
         node.next_sibling = None;
         if let Some(parent) = parent {
             self.child_collection_changed(parent, id, false);
+            self.note_track_parent_change(parent, id, false);
         }
     }
 
@@ -4076,6 +4095,10 @@ impl Dom {
     fn parser_append(&mut self, parent: NodeId, child: NodeId) {
         self.parser_detach(child);
         let previous = self.nodes[parent].last_child;
+        // Parser insertions never cross a Document: a node takes its
+        // parent's node document, which differs from the parse's Document
+        // only in template contents (HTML #template-contents).
+        self.nodes[child].owner_document = self.nodes[parent].owner_document;
         self.nodes[child].parent = Some(parent);
         self.nodes[child].prev_sibling = previous;
         if let Some(previous) = previous {
@@ -4085,6 +4108,7 @@ impl Dom {
         }
         self.nodes[parent].last_child = Some(child);
         self.child_collection_changed(parent, child, true);
+        self.note_track_parent_change(parent, child, true);
     }
 
     /// Insert within html5ever's private arena, preserving DOM pre-insert's
@@ -4103,6 +4127,7 @@ impl Dom {
         };
         self.parser_detach(child);
         let previous = self.nodes[reference].prev_sibling;
+        self.nodes[child].owner_document = self.nodes[parent].owner_document;
         self.nodes[child].parent = Some(parent);
         self.nodes[child].prev_sibling = previous;
         self.nodes[child].next_sibling = Some(reference);
@@ -4113,6 +4138,7 @@ impl Dom {
             self.nodes[parent].first_child = Some(child);
         }
         self.child_collection_changed(parent, child, true);
+        self.note_track_parent_change(parent, child, true);
     }
 
     fn parser_append_text(&mut self, parent: NodeId, text: &str) {
@@ -4199,6 +4225,7 @@ impl Dom {
         let mut old = self.nodes[parent].first_child;
         while let Some(child) = old {
             old = self.nodes[child].next_sibling;
+            self.note_track_parent_change(parent, child, false);
             self.clear_focus_in_subtree(child);
             let node = &mut self.nodes[child];
             node.parent = None;
@@ -4226,6 +4253,7 @@ impl Dom {
             self.set_owner_document_subtree(child, owner_document);
             self.registries_after_insertion(child, registry_context);
             self.invalidate_style_subtree(child, true);
+            self.note_track_parent_change(parent, child, true);
             previous = Some(child);
         }
         self.nodes[parent].last_child = previous;
@@ -4294,6 +4322,7 @@ impl Dom {
         self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
         self.note_picture_child_change(parent, child);
+        self.note_track_parent_change(parent, child, true);
     }
 
     /// Implement the DOM Standard's adopt algorithm (DOM §4.5): remove the
@@ -4316,8 +4345,6 @@ impl Dom {
         let registry_context = self.registry_context_before_insertion(id);
         self.detach(id);
         self.set_owner_document_subtree(id, document);
-        // An adopted copy of template contents leaves their inert document.
-        self.leave_inert_document(id);
         self.registries_after_insertion(id, registry_context);
         if old_document != document {
             // DOM #concept-node-adopt changes the node document even for an
@@ -10370,10 +10397,10 @@ impl Dom {
             matches!(self.nodes[document].data, NodeData::Document)
                 && !matches!(self.nodes[id].data, NodeData::Document)
         });
+        // A copy in an inert template contents owner document is never fully
+        // active, so its images never load.
         let (registries, inert_copy) = self.clone_registries(id, document, fallback);
-        let copy = self.clone_subtree_with(id, deep, false, document, registries);
-        self.note_clone_root(copy, inert_copy);
-        copy
+        self.clone_subtree_with(id, deep, inert_copy, document, registries)
     }
 
     /// `inert`: the copy lands in template contents, whose node document is
@@ -10456,7 +10483,15 @@ impl Dom {
             {
                 *template_contents = Some(frag);
             }
-            self.nodes[frag].owner_document = self.nodes[copy].owner_document;
+            // HTML #template-contents: the copy's own contents belong to its
+            // node document's appropriate template contents owner document.
+            let owner = self.nodes[copy].owner_document;
+            let owner = if matches!(self.nodes[owner].data, NodeData::Document) {
+                self.appropriate_template_contents_owner(owner)
+            } else {
+                owner
+            };
+            self.nodes[frag].owner_document = owner;
             if deep {
                 // HTML template cloning steps clone the contents into the
                 // copy's (inert) template contents, without a fallback.
@@ -10991,7 +11026,7 @@ impl Dom {
             });
         });
         let mut out = String::new();
-        if !matches!(self.tag_name(id), Some(tag) if is_serialized_void(tag)) {
+        if !self.serializes_as_void(id) {
             self.write_serialized_shadow_root(id, MarkupMode::Script, &mut out);
             for c in self.child_iter(self.content_target(id)) {
                 self.serialize_node_inner(c, None, MarkupMode::Script, &mut out);
@@ -11047,6 +11082,10 @@ impl Dom {
     pub fn inner_html(&self, id: NodeId) -> String {
         self.cached_string(id, 1, || {
             let mut out = String::new();
+            // HTML #html-fragment-serialisation-algorithm step 1.
+            if self.serializes_as_void(id) {
+                return out;
+            }
             for c in self.child_iter(self.content_target(id)) {
                 self.serialize_node_inner(c, None, MarkupMode::Script, &mut out);
             }
@@ -11902,12 +11941,33 @@ impl Dom {
                     self.serialize_node_inner(c, host, mode, out);
                 }
             }
+            // HTML #serialising-html-fragments: "<!DOCTYPE ", the name and
+            // ">" (a Document's child; the public and system identifiers
+            // are not serialized).
+            NodeData::Doctype(info) if spec_markup => {
+                out.push_str("<!DOCTYPE ");
+                out.push_str(&info.name);
+                out.push('>');
+            }
             NodeData::Doctype(_) => {}
+            // A CDATASection is a Text node (DOM #interface-cdatasection), and
+            // the HTML fragment serialization algorithm has no case of its
+            // own for it: its data is appended as any Text node's is. Only
+            // the XML serializer writes `<![CDATA[`.
+            NodeData::CData(text) if spec_markup => {
+                if self.raw_text_parent(id) {
+                    out.push_str(text);
+                } else {
+                    out.push_str(&escape_fragment_string(text, false));
+                }
+            }
             NodeData::CData(text) => {
                 out.push_str("<![CDATA[");
                 out.push_str(text);
                 out.push_str("]]>");
             }
+            // HTML #serialising-html-fragments (local whatwg/html e5071a20,
+            // 2026-09-04): "<?", the target, U+0020, the data and "?>".
             NodeData::ProcessingInstruction { target, data } => {
                 out.push_str("<?");
                 out.push_str(target);
@@ -11935,17 +11995,7 @@ impl Dom {
                 // and expect the getter to return markup, not `&lt;...&gt;`.
                 // A noscript parent counts only while scripting is enabled for
                 // the node (HTML #serialising-html-fragments).
-                let raw_text_parent = js_serialization
-                    && self.nodes[id]
-                        .parent
-                        .is_some_and(|parent| match self.tag_name(parent) {
-                            Some(
-                                "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes"
-                                | "plaintext",
-                            ) => true,
-                            Some("noscript") => self.scripting_enabled_for(id),
-                            _ => false,
-                        });
+                let raw_text_parent = js_serialization && self.raw_text_parent(id);
                 if raw_text_parent {
                     out.push_str(t);
                 } else if spec_markup {
@@ -12046,8 +12096,23 @@ impl Dom {
                     }
                     return;
                 }
+                // HTML #serialising-html-fragments: the tagname is the local
+                // name of an HTML, MathML or SVG element and the qualified
+                // name of any other.
+                let qualified;
+                let tagname: &str = if spec_markup
+                    && name.ns != ns!(html)
+                    && name.ns != ns!(svg)
+                    && name.ns != ns!(mathml)
+                    && let Some(prefix) = &name.prefix
+                {
+                    qualified = format!("{prefix}:{tag}");
+                    &qualified
+                } else {
+                    tag
+                };
                 out.push('<');
-                out.push_str(tag);
+                out.push_str(tagname);
                 if spec_markup {
                     // HTML #serialising-html-fragments: an is value the
                     // element was created with, when it has no is attribute,
@@ -12071,7 +12136,12 @@ impl Dom {
                     }
                 }
                 out.push('>');
-                if VOID_ELEMENTS.contains(&tag) || (spec_markup && is_serialized_void(tag)) {
+                // HTML #serializes-as-void names HTML element types.
+                if if spec_markup {
+                    name.ns == ns!(html) && is_serialized_void(tag)
+                } else {
+                    VOID_ELEMENTS.contains(&tag)
+                } {
                     return;
                 }
                 // A shadow root renders IN PLACE of the light children
@@ -12090,10 +12160,28 @@ impl Dom {
                     }
                 }
                 out.push_str("</");
-                out.push_str(tag);
+                out.push_str(tagname);
                 out.push('>');
             }
         }
+    }
+
+    /// HTML #serialising-html-fragments: whether a Text node's data is
+    /// appended literally, because its parent is an HTML style, script, xmp,
+    /// iframe, noembed, noframes or plaintext element, or a noscript element
+    /// while scripting is enabled for the node.
+    fn raw_text_parent(&self, id: NodeId) -> bool {
+        self.nodes[id]
+            .parent
+            .is_some_and(|parent| match &self.nodes[parent].data {
+                NodeData::Element { name, .. } if name.ns == ns!(html) => match &*name.local {
+                    "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes"
+                    | "plaintext" => true,
+                    "noscript" => self.scripting_enabled_for(id),
+                    _ => false,
+                },
+                _ => false,
+            })
     }
 
     /// Serialize for a LIVING page: like `serialize`, but elements in
@@ -14319,7 +14407,16 @@ thread_local! {
     static SHADOW_SERIALIZATION: RefCell<Option<ShadowSerialization>> = const { RefCell::new(None) };
 }
 
-/// HTML #serializes-as-void.
+impl Dom {
+    /// HTML #serializes-as-void: an HTML element whose type is a void
+    /// element, basefont, bgsound, frame, keygen or param.
+    fn serializes_as_void(&self, id: NodeId) -> bool {
+        matches!(&self.nodes[id].data, NodeData::Element { name, .. }
+            if name.ns == ns!(html) && is_serialized_void(&name.local))
+    }
+}
+
+/// HTML #serializes-as-void, by local name.
 fn is_serialized_void(tag: &str) -> bool {
     VOID_ELEMENTS.contains(&tag)
         || matches!(tag, "basefont" | "bgsound" | "frame" | "keygen" | "param")
@@ -23355,7 +23452,14 @@ impl TreeSink for Sink {
 
     fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> NodeId {
         let mut dom = self.dom.borrow_mut();
-        let contents = flags.template.then(|| dom.new_template_contents());
+        // HTML #template-contents: the parse's Document's appropriate
+        // template contents owner document owns the contents.
+        let contents = flags.template.then(|| {
+            let contents = dom.new_template_contents();
+            let owner = dom.appropriate_template_contents_owner(DOCUMENT);
+            dom.nodes[contents].owner_document = owner;
+            contents
+        });
         dom.new_node(NodeData::Element {
             name,
             attrs,
@@ -24268,6 +24372,26 @@ mod tests {
         assert!(!html.contains("inert"), "{html}");
         assert!(!html.contains("color:red"), "{html}");
         assert!(html.contains("keep"), "{html}");
+    }
+
+    #[test]
+    fn script_serialization_follows_the_html_fragment_algorithm() {
+        // HTML #serialising-html-fragments (local whatwg/html e5071a20): a
+        // Document's DocumentType child is "<!DOCTYPE " and its name, a
+        // comment keeps its data verbatim, and a processing instruction is
+        // "<?target data?>".
+        let mut dom = Dom::parse_document(
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\"><p id=p>x<!--a--b--></p>",
+        );
+        let p = dom.get_by_id("p").unwrap();
+        let pi = dom.create_processing_instruction("t", "d");
+        dom.append(p, pi);
+        assert_eq!(
+            dom.serialize_js(DOCUMENT),
+            "<!DOCTYPE html><html><head></head><body><p id=\"p\">x<!--a--b--><?t d?></p></body></html>"
+        );
+        // The presentation serializer keeps its own rules.
+        assert!(!dom.serialize(DOCUMENT).contains("<!--a--b-->"));
     }
 
     #[test]

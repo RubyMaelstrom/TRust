@@ -1434,6 +1434,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 : t === 8 ? newNodeWrapper(Comment, id)
                 : t === 10 ? new DocumentType(id, DOCUMENT_TYPE_TOKEN)
                 : new Node(id);
+            // HTML #appropriate-template-contents-owner-document creates the
+            // inert Document with DOM's default URL, about:blank.
+            if (t === 9 && __dom_template_document(id)) documentURLs.set(w, "about:blank");
         }
         return rememberWrapper(id, w, knownConnected);
     }
@@ -6890,26 +6893,63 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (plan) trust.queueFormSubmit(nodeIds.get(form), submitter && submitter !== form ? nodeIds.get(submitter) : null);
             return {handled: true, planned: true};
         }
-        // Other schemes (HTML's table): data: GET mutates the action URL;
-        // mailto: GET mails with the pairs as headers, POST with them as the
-        // body; the rest get the action URL.
+        // Other schemes (HTML #form-submission-algorithm's table): data: GET
+        // mutates the action URL; mailto: GET mails with the pairs as
+        // headers, POST with them as the body; the rest get the action URL.
+        // Each sets only the parsed action URL's query; its fragment stays.
         let url = parsed[0];
         if ((scheme === "data" && method === "get") || scheme === "mailto") {
-            const base = url.replace(/[?#].*$/s, "");
-            let query = urlencodedSerialize(nameValuePairs(entries), encoding);
-            if (scheme === "mailto") {
-                if (method === "get") query = query.replace(/\+/g, "%20");
-                else {
-                    let body = enctype === "text/plain" ? textPlainSerialize(nameValuePairs(entries)) : query;
-                    body = encodeURIComponent(body);
-                    const existing = (parsed[0].match(/\?([^#]*)/) || [, ""])[1];
-                    query = (existing ? existing + "&" : "") + "body=" + body;
-                }
+            const hash = url.indexOf("#");
+            const fragment = hash < 0 ? "" : url.slice(hash);
+            const withoutFragment = hash < 0 ? url : url.slice(0, hash);
+            const question = withoutFragment.indexOf("?");
+            const base = question < 0 ? withoutFragment : withoutFragment.slice(0, question);
+            // The parsed action's query: null without a "?".
+            const existing = question < 0 ? null : withoutFragment.slice(question + 1);
+            const pairs = nameValuePairs(entries);
+            let query;
+            if (scheme === "data") {
+                // #submit-mutate-action.
+                query = urlencodedSerialize(pairs, encoding);
+            } else if (method === "get") {
+                // #submit-mailto-headers: the urlencoded pairs, with each "+"
+                // replaced by "%20", replace the query.
+                query = urlencodedSerialize(pairs, encoding).replace(/\+/g, "%20");
+            } else {
+                // #submit-mailto-body: a text/plain body is UTF-8
+                // percent-encoded with the default (path) encode set; any
+                // other enctype is the urlencoded serialization in the
+                // form's encoding, appended as is.
+                const body = enctype === "text/plain"
+                    ? utf8PercentEncodePath(textPlainSerialize(pairs))
+                    : urlencodedSerialize(pairs, encoding);
+                query = existing === null ? "" : existing;
+                if (query !== "") query += "&";
+                query += "body=" + body;
             }
-            url = base + (query ? "?" + query : "");
+            url = base + "?" + query + fragment;
         }
         navigateLoc(url, false, false);
         return {handled: true};
+    }
+    // URL #string-utf-8-percent-encode with the path percent-encode set (the
+    // former default encode set): C0 controls, code points above U+007E,
+    // space, ", #, <, >, ?, ^, `, { and }.
+    function utf8PercentEncodePath(input) {
+        let output = "";
+        for (const character of String(input).toWellFormed()) {
+            const code = character.codePointAt(0);
+            if (code < 0x21 || code > 0x7E || code === 0x22 || code === 0x23 || code === 0x3C ||
+                code === 0x3E || code === 0x3F || code === 0x5E || code === 0x60 || code === 0x7B ||
+                code === 0x7D) {
+                const bytes = code < 0x80 ? [code]
+                    : code < 0x800 ? [0xC0 | code >> 6, 0x80 | code & 63]
+                    : code < 0x10000 ? [0xE0 | code >> 12, 0x80 | code >> 6 & 63, 0x80 | code & 63]
+                    : [0xF0 | code >> 18, 0x80 | code >> 12 & 63, 0x80 | code >> 6 & 63, 0x80 | code & 63];
+                for (const byte of bytes) output += "%" + "0123456789ABCDEF"[byte >> 4] + "0123456789ABCDEF"[byte & 15];
+            } else output += character;
+        }
+        return output;
     }
     // HTML #dom-form-checkvalidity / #dom-form-reportvalidity.
     function formCheckValidity(form) { return staticallyValidateConstraints(form)[0]; }
@@ -7004,68 +7044,56 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // A projection for the native caret only. The DOM and its live Range are
     // authoritative. UTF-16 positions include authored line/paragraph breaks
-    // and retain protected text, without making that text editable.
+    // and retain protected text, without making that text editable. The
+    // arena builds it in one walk (`__dom_editable_model`, see
+    // src/dom/editing.rs), together with the offsets of the live selection's
+    // anchor and focus and of each trailing placeholder br: segments are
+    // rows of [start, end, kind, node, before node, before offset, after
+    // node, after offset] in a flat array.
+    const EDIT_TEXT = 0, EDIT_PROTECTED = 1, EDIT_BREAK = 2;
     function editableModel(host) {
-        const segments = [], placeholders = [];
-        let text = "", pending = null;
-        function append(value, before, after, node, kind) {
-            if (!value) return;
-            segments.push({start:text.length, end:text.length + value.length,
-                text:value, before, after, node, kind});
-            text += value;
-        }
-        function flush(point) {
-            if (pending) {
-                append("\n", pending, point, null, "paragraph");
-                pending = null;
+        const selection = g.getSelection();
+        let anchor = null, focus = null, anchorOffset = 0, focusOffset = 0;
+        if (selection.rangeCount) {
+            const anchorNode = selection.anchorNode, focusNode = selection.focusNode;
+            if (anchorNode && focusNode && host.contains(anchorNode) && host.contains(focusNode)) {
+                anchor = nodeIds.get(anchorNode); focus = nodeIds.get(focusNode);
+                anchorOffset = selection.anchorOffset; focusOffset = selection.focusOffset;
             }
         }
-        function visit(node) {
-            const parent = node.parentNode, index = parent ? rangeIndex(node) : 0;
-            if (node.nodeType === 3) {
-                if (node.length) { flush([node,0]); append(node.data,[node,0],[node,node.length],node,"text"); }
-                return;
-            }
-            if (node.nodeType !== 1) return;
-            if (node !== host && ceDisabled(node)) {
-                flush([parent,index]);
-                append(node.textContent || "\uFFFC",[parent,index],[parent,index+1],node,"protected");
-                return;
-            }
-            if (node.localName === "br") {
-                // A sole or trailing repeated BR keeps an empty editing line
-                // paintable; it does not add another character to that line.
-                if (!node.nextSibling && (!text || text.endsWith("\n"))) { placeholders.push(node); return; }
-                flush([parent,index]);
-                append("\n",[parent,index],[parent,index+1],node,"break");
-                return;
-            }
-            const block = node !== host && editableBlock(node);
-            if (block) {
-                if (!pending && text && !text.endsWith("\n")) pending = segments[segments.length-1].after;
-                flush([node,0]);
-            }
-            for (const child of node.childNodes) visit(child);
-            if (block) pending = [node,node.childNodes.length];
+        const result = __dom_editable_model(nodeIds.get(host), anchor, anchorOffset, focus, focusOffset);
+        const placeholders = [], placeholderOffsets = [];
+        for (let i = 0; i + 1 < result[2].length; i += 2) {
+            placeholders.push(wrap(result[2][i]));
+            placeholderOffsets.push(result[2][i + 1]);
         }
-        visit(host);
-        return {host, text, segments, placeholders};
+        return {host, text: result[0], rows: result[1], count: result[1].length / 8, placeholders,
+            placeholderOffsets, selection: anchor === null ? null : [result[3][0], result[3][1]]};
     }
-    function editableOffset(model, node, offset) {
-        for (const segment of model.segments) {
-            if (segment.kind === "text" && segment.node === node)
-                return segment.start + Math.min(offset, segment.text.length);
-            if (rangeOrder(node,offset,...segment.before) !== 1) return segment.start;
-            if (rangeOrder(node,offset,...segment.after) === -1) return segment.start;
+    function segmentStart(model, i) { return model.rows[i * 8]; }
+    function segmentEnd(model, i) { return model.rows[i * 8 + 1]; }
+    function segmentKind(model, i) { return model.rows[i * 8 + 2]; }
+    function segmentNode(model, i) { return wrap(model.rows[i * 8 + 3]); }
+    function segmentBefore(model, i) { return [wrap(model.rows[i * 8 + 4]), model.rows[i * 8 + 5]]; }
+    function segmentAfter(model, i) { return [wrap(model.rows[i * 8 + 6]), model.rows[i * 8 + 7]]; }
+    // The first segment whose end is at least `offset` (segments are
+    // contiguous and ordered), or `model.count`.
+    function segmentAtOrAfter(model, offset) {
+        let low = 0, high = model.count;
+        while (low < high) {
+            const middle = (low + high) >> 1;
+            if (segmentEnd(model, middle) < offset) low = middle + 1;
+            else high = middle;
         }
-        return model.text.length;
+        return low;
     }
     function editablePoint(model, offset) {
         offset = Math.max(0, Math.min(offset, model.text.length));
-        for (const segment of model.segments) {
-            if (offset > segment.end) continue;
-            if (segment.kind === "text") return [segment.node,offset-segment.start];
-            return offset <= segment.start ? segment.before : segment.after;
+        const i = segmentAtOrAfter(model, offset);
+        if (i < model.count) {
+            const start = segmentStart(model, i);
+            if (segmentKind(model, i) === EDIT_TEXT) return [segmentNode(model, i), offset - start];
+            return offset <= start ? segmentBefore(model, i) : segmentAfter(model, i);
         }
         let empty = model.host;
         while (empty.firstChild && empty.firstChild.nodeType === 1 &&
@@ -7073,11 +7101,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return [empty,0];
     }
     function editableSelection(model) {
-        const selection = g.getSelection();
-        if (!selection.rangeCount || !model.host.contains(selection.anchorNode) || !model.host.contains(selection.focusNode))
-            return {start:model.text.length,end:model.text.length,direction:0};
-        const anchor = editableOffset(model,selection.anchorNode,selection.anchorOffset);
-        const focus = editableOffset(model,selection.focusNode,selection.focusOffset);
+        const length = model.text.length;
+        if (model.selection === null) return {start:length,end:length,direction:0};
+        const anchor = model.selection[0], focus = model.selection[1];
         return {start:Math.min(anchor,focus),end:Math.max(anchor,focus),direction:anchor > focus ? -1 : anchor < focus ? 1 : 0};
     }
     function setEditableSelection(model, start, end, direction = 0) {
@@ -7097,11 +7123,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return JSON.stringify({node:elementIdentity(host),text:model.text,selection:editableSelection(model)});
     };
     function editableStep(model, position, direction) {
-        for (const segment of model.segments) {
-            if (segment.kind === "protected" && (direction < 0
-                ? position > segment.start && position <= segment.end
-                : position >= segment.start && position < segment.end))
-                return direction < 0 ? segment.start : segment.end;
+        // The protected island the step would enter, if any: the segment
+        // holding position (from its start when moving forward).
+        const i = segmentAtOrAfter(model, direction < 0 ? position : position + 1);
+        if (i < model.count && segmentKind(model, i) === EDIT_PROTECTED) {
+            const start = segmentStart(model, i), end = segmentEnd(model, i);
+            if (direction < 0 ? position > start && position <= end : position >= start && position < end)
+                return direction < 0 ? start : end;
         }
         const text = model.text;
         if (direction < 0) {
@@ -7130,15 +7158,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         let changed = false;
         // Remove only editable parts. A selection may cross a protected island
         // but must never rewrite its data or remove an ancestor containing it.
-        for (let i = model.segments.length - 1; i >= 0; i--) {
-            const segment = model.segments[i];
-            const a = Math.max(start,segment.start), b = Math.min(end,segment.end);
-            if (a >= b || segment.kind === "protected") continue;
-            if (segment.kind === "text") segment.node.deleteData(a-segment.start,b-a);
-            else if (segment.kind === "break") segment.node.remove();
+        // Only the segments overlapping [start, end) can change.
+        const first = segmentAtOrAfter(model, start + 1);
+        for (let i = Math.min(segmentAtOrAfter(model, end), model.count - 1); i >= first; i--) {
+            const segmentStartOffset = segmentStart(model, i), kind = segmentKind(model, i);
+            const a = Math.max(start,segmentStartOffset), b = Math.min(end,segmentEnd(model, i));
+            if (a >= b || kind === EDIT_PROTECTED) continue;
+            if (kind === EDIT_TEXT) segmentNode(model, i).deleteData(a-segmentStartOffset,b-a);
+            else if (kind === EDIT_BREAK) segmentNode(model, i).remove();
             else {
-                const left = editableAncestorBlock(model.host,segment.before[0]);
-                const right = editableAncestorBlock(model.host,segment.after[0]);
+                const left = editableAncestorBlock(model.host,segmentBefore(model, i)[0]);
+                const right = editableAncestorBlock(model.host,segmentAfter(model, i)[0]);
                 if (left === right || left === model.host || right === model.host ||
                     left.contains(right) || right.contains(left)) continue;
                 for (const placeholder of model.placeholders)
@@ -7226,9 +7256,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         } else if (data != null && !inputType.startsWith("delete")) {
             const selection = g.getSelection();
             const currentModel = editableModel(host), position = editableSelection(currentModel).start;
-            for (const placeholder of currentModel.placeholders)
-                if (editableOffset(currentModel,placeholder.parentNode,rangeIndex(placeholder)) === position)
-                    placeholder.remove();
+            for (let i = 0; i < currentModel.placeholders.length; i++)
+                if (currentModel.placeholderOffsets[i] === position) currentModel.placeholders[i].remove();
             const range = selection.getRangeAt(0);
             const node = range.startContainer, offset = range.startOffset;
             if (node.nodeType === 3) {
@@ -7531,7 +7560,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // local name never changes). Each answer reflects the tree when its step
     // runs: only internal bookkeeping precedes the last of them.
     const INSERT_RANGES = 1, INSERT_LISTENERS = 2, INSERT_SLOTS = 4,
-        INSERT_SCRIPT = 8, INSERT_LINK = 16, INSERT_BASE = 32, INSERT_FORM_STATE = 64;
+        INSERT_SCRIPT = 8, INSERT_LINK = 16, INSERT_BASE = 32, INSERT_FORM_STATE = 64, INSERT_TRACK = 128;
     function insertedNodeSteps(parent, node, oldParent, oldIndex, silent = false) {
         const id = nodeIds.get(node);
         const effects = __dom_insertion_effects(id, nodeIds.get(parent));
@@ -7543,6 +7572,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (effects & INSERT_FORM_STATE) formStateSubtreeChanged(node, true);
         if (effects & INSERT_SLOTS) slotQueueCheck(parent, true);
         if (!silent) moChildInsert(parent, node);
+        // HTML #sourcing-out-of-band-text-tracks: a track element's parent
+        // changed (its old parent's removal included).
+        if (effects & INSERT_TRACK) processTrackChanges();
         if (ceDefined) {
             if (deferredCeReactions !== null) deferredCeReactions.push(() => ceScan(node));
             else ceScan(node);
@@ -7580,10 +7612,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // DOM #concept-node-adopt removes the node from its old parent first.
         if (oldParent && liveNodeIterators.size) nodeIteratorsPreRemove(node);
         if (oldParent && MO.length) moAdoptRemove(parent, node, ref, oldParent, silent);
+        const frames = oldParent !== null && removalDestroysNavigables(node);
         preInsertResult(ref === null
             ? __dom_append(nodeIds.get(parent), nodeIds.get(node))
             : __dom_insert_before(nodeIds.get(parent), nodeIds.get(node), nodeIds.get(ref), 0), false);
+        if (frames) destroyFrameNavigablesIn(node);
         insertedNodeSteps(parent, node, oldParent, oldIndex, silent);
+    }
+    // DOM #concept-node-remove runs the HTML removing steps for each removed
+    // node, also when an insertion adopts the node from its old parent: an
+    // iframe's removing steps destroy its child navigable (HTML
+    // #the-iframe-element), and the insertion's post-connection steps then
+    // create a new one and process the iframe attributes again, so the
+    // content reloads. Only moveBefore() (#concept-node-move) keeps it.
+    function removalDestroysNavigables(node) {
+        const id = nodeIds.get(node);
+        return __dom_has_frames(id) && __dom_is_connected(id);
     }
     // The index a node had before being adopted into a new parent, needed
     // only to adjust live Ranges (DOM #concept-node-remove steps 4–7). Without
@@ -7596,7 +7640,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // arena removal one query tells which remaining steps have work; with a
     // navigable container in the subtree, whose destruction can run author
     // code, each later step asks again as before.
-    const REMOVE_FRAMES = 1, REMOVE_LISTENERS = 2, REMOVE_SLOTS = 4, REMOVE_FORM_STATE = 8;
+    const REMOVE_FRAMES = 1, REMOVE_LISTENERS = 2, REMOVE_SLOTS = 4, REMOVE_FORM_STATE = 8, REMOVE_TRACK = 16;
     function removeChildSteps(parent, c, silent = false) {
         rangesRemove(c, parent, c);
         if (internalsOf(c).trustLN === "base") baseHrefCache = null;
@@ -7617,6 +7661,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (effects & REMOVE_SLOTS) { slotQueueCheck(parent, true); slotCheckId(id); }
         }
         if (effects & REMOVE_FORM_STATE) formStateSubtreeChanged(c, false);
+        if (effects & REMOVE_TRACK) processTrackChanges();
         // HTML #cereactions: disconnectedCallback runs once the removal is
         // complete (after an enclosing operation's, when one is deferring).
         if (ceDefined) {
@@ -7688,6 +7733,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             moNotify({ type: "childList", target: parent, addedNodes: [node],
                 previousSibling: wrap(__dom_prev(nodeId)), nextSibling: reference });
         } else moEnqueue();
+        processTrackChanges();
         // Step 21.3's connectedMoveCallback reactions, and form-associated
         // custom elements' moving steps.
         if (ceDefined) ceMoved(node, !!__dom_is_connected(parentId));
@@ -7775,6 +7821,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // attributes and starts each newly inserted nested navigable.
         // Script elements remain inert under the fragment parser.
         queueFrameNavigationsIn(target);
+        processTrackChanges();
     }
     // An element's local name from its internal slots; any other node's
     // (absent) localName.
@@ -7879,6 +7926,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 // DOM #string-replace-all removes each child (#concept-node-remove).
                 if (ceDefined) for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]);
+                if (removedRoots.length) processTrackChanges();
                 return;
             }
             if (t === 3 || t === 4 || t === 7 || t === 8) { const old = __dom_text(nodeIds.get(this)); __dom_set_text(nodeIds.get(this), v); moCharData(this, old); return; }
@@ -7896,6 +7944,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 for (let i = 0; i < removed.length; i++) slotQueueCheck(removed[i]);
             }
             if (ceDefined) for (let i = 0; i < removed.length; i++) ceDisconnect(removed[i]);
+            if (removed.length) processTrackChanges();
         }
         get nodeValue() {
             const t = this.nodeType;
@@ -8028,7 +8077,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             // Validity (DOM #concept-node-replace step 1) before any side
             // effect: the insert syscall refuses an invalid replacement.
+            const adoptedFrames = oldParent !== null && removalDestroysNavigables(n);
             preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(n), nodeIds.get(old), 1), true);
+            // The adopted node's removing steps (see insertOneNode).
+            if (adoptedFrames) destroyFrameNavigablesIn(n);
             rangesRemove(n, oldParent, oldIndex);
             const replacementIndex = rangeIndex(n);
             if (n === old) {
@@ -8036,6 +8088,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n], removedNodes: [],
                     previousSibling: prev, nextSibling: next });
                 else moEnqueue();
+                // Its removal destroyed its navigables; the insertion's
+                // post-connection steps create new ones.
+                if (adoptedFrames) maybeProcessInsertedFrames(n, this);
                 return old;
             }
             // DOM #concept-node-replace removes the old child before the
@@ -8058,6 +8113,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             insertionResourceSteps(n);
             if (internalsFor(old).trustLN === "base") baseHrefCache = null;
             maybeProcessInsertedFrames(n, this);
+            processTrackChanges();
             return old;
         }
         // DOM #dom-childnode-remove: remove this from its parent, if any. The
@@ -9833,7 +9889,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 volume: 1, mutedState: "default", playbackRate: 1, defaultPlaybackRate: 1,
                 preservesPitch: true, defaultStart: 0, showPoster: true, canAutoplay: true,
                 textTrackChangePending: false, textTracks: null, audioTracks: null, videoTracks: null,
-                tracks: []};
+                tracks: [], element, blockedOnParser: false, didPerformTrackSelection: false,
+                pendingTextTracks: []};
             mediaStates.set(element, state);
         }
         return state;
@@ -9928,7 +9985,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         selectMediaResource(element, state);
     }
     function textTrackListOf(state) {
-        return state.textTracks || (state.textTracks = createTrackList(TextTrackList, () => state.tracks));
+        return state.textTracks || (state.textTracks = createTrackList(TextTrackList,
+            () => mediaTextTracks(state.element, state)));
     }
     // #internal-pause-steps: paused is always true here, so only the can
     // autoplay flag changes.
@@ -10207,7 +10265,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (arguments.length < 1) throw new TypeError("getTrackById requires an id");
             id = `${id}`;
             const tracks = record.items();
-            for (let i = 0; i < tracks.length; i++) if (trackSlots.get(tracks[i]).id === id) return tracks[i];
+            for (let i = 0; i < tracks.length; i++) if (textTrackField(trackSlots.get(tracks[i]), "id") === id) return tracks[i];
             return null;
         }
     }
@@ -10255,10 +10313,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
 
     // A text track (#text-track): kind, label, language, identifier, in-band
     // metadata track dispatch type, readiness state, mode and list of cues.
-    function createTextTrack(kind, label, language, id, mode) {
+    function createTextTrack(kind, label, language, id, mode, element = null) {
         const track = Reflect.construct(EventTarget, [], TextTrack);
+        // A track element's text track starts not loaded; addTextTrack()'s
+        // starts loaded (#dom-media-addtexttrack).
         trackSlots.set(track, {kind: "TextTrack", trackKind: kind, label, language, id, dispatchType: "",
-            readiness: "loaded", mode, cues: [], media: null, cueList: null, activeCueList: null});
+            readiness: element === null ? "loaded" : "not loaded", mode, cues: [], media: null,
+            cueList: null, activeCueList: null, element});
         return track;
     }
     function addTextTrackToMedia(element, state, track) {
@@ -10284,7 +10345,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // The text track mode change steps (#pending-text-track-change-notification-flag).
     function textTrackModeChanged(track, record) {
-        const element = record.media;
+        const element = trackMedia(record);
         if (element === null) return;
         const state = mediaState(element);
         if (!state.textTrackChangePending) {
@@ -10321,7 +10382,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const position = 0;
         const current = [], other = [];
         const cueOrder = new Map();
-        state.tracks.forEach(function (track) {
+        const tracks = mediaTextTracks(element, state);
+        tracks.forEach(function (track) {
             const record = trackSlots.get(track);
             if (record.mode === "disabled") return;
             for (const cue of sortedCues(record)) {
@@ -10347,7 +10409,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         events.sort((a, b) => a.time - b.time || a.order - b.order || (a.type === "enter" ? 0 : 1) - (b.type === "enter" ? 0 : 1));
         for (const event of events) queueMediaTask(element, state, () => fireMediaEvent(event.cue, event.type));
-        affected.sort((a, b) => state.tracks.indexOf(a) - state.tracks.indexOf(b));
+        affected.sort((a, b) => tracks.indexOf(a) - tracks.indexOf(b));
         for (const track of affected) queueMediaTask(element, state, () => fireMediaEvent(track, "cuechange"));
         for (const cue of current) setCueActive(cue, true);
         for (const cue of other) setCueActive(cue, false);
@@ -10360,28 +10422,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         record.cues.splice(record.cues.indexOf(cue), 1);
         cueRecord.track = null;
         setCueActive(cue, false);
-        if (record.media !== null) {
-            const state = mediaState(record.media);
-            if (!state.showPoster) timeMarchesOn(record.media, state);
+        const media = trackMedia(record);
+        if (media !== null) {
+            const state = mediaState(media);
+            if (!state.showPoster) timeMarchesOn(media, state);
         }
     }
     let cueAdditions = 0;
     class TextTrack extends EventTarget {
         constructor() { throw new TypeError("Illegal constructor"); }
-        get kind() { return trackRecord(this, "TextTrack").trackKind; }
-        get label() { return trackRecord(this, "TextTrack").label; }
-        get language() { return trackRecord(this, "TextTrack").language; }
-        get id() { return trackRecord(this, "TextTrack").id; }
+        get kind() { return textTrackField(trackRecord(this, "TextTrack"), "trackKind"); }
+        get label() { return textTrackField(trackRecord(this, "TextTrack"), "label"); }
+        get language() { return textTrackField(trackRecord(this, "TextTrack"), "language"); }
+        get id() { return textTrackField(trackRecord(this, "TextTrack"), "id"); }
         get inBandMetadataTrackDispatchType() { return trackRecord(this, "TextTrack").dispatchType; }
         get mode() { return trackRecord(this, "TextTrack").mode; }
         // An enumeration attribute ignores values outside TextTrackMode.
         set mode(value) {
             const record = trackRecord(this, "TextTrack");
             value = `${value}`;
-            if (!TEXT_TRACK_MODES.includes(value) || record.mode === value) return;
-            record.mode = value;
-            if (value === "disabled") for (const cue of record.cues) setCueActive(cue, false);
-            textTrackModeChanged(this, record);
+            if (!TEXT_TRACK_MODES.includes(value)) return;
+            setTextTrackMode(this, record, value);
         }
         get cues() {
             const record = trackRecord(this, "TextTrack");
@@ -10407,9 +10468,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             cueRecord.track = this;
             cueRecord.added = ++cueAdditions;
             record.cues.push(cue);
-            if (record.media !== null) {
-                const state = mediaState(record.media);
-                if (!state.showPoster) timeMarchesOn(record.media, state);
+            const media = trackMedia(record);
+            if (media !== null) {
+                const state = mediaState(media);
+                if (!state.showPoster) timeMarchesOn(media, state);
             }
         }
         removeCue(cue) {
@@ -10443,7 +10505,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // A cue's times changed: its media element's text tracks are re-evaluated.
     function cueTimesChanged(cueRecord) {
         if (cueRecord.track === null) return;
-        const media = trackSlots.get(cueRecord.track).media;
+        const media = trackMedia(trackSlots.get(cueRecord.track));
         if (media === null) return;
         const state = mediaState(media);
         if (!state.showPoster) timeMarchesOn(media, state);
@@ -10786,6 +10848,591 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return trackEventSlots.get(this);
         }
     }
+
+    // ---- HTML #the-track-element and #sourcing-out-of-band-text-tracks ------
+    // (local whatwg/html e5071a20, 2026-09-04), with the W3C WebVTT parser
+    // (#file-parsing, local w3c/webvtt@0648025). A track element's text track
+    // is created with the element (here, with its wrapper's internal slot):
+    // its kind, label, language and identifier follow the element's
+    // attributes; its readiness state starts "not loaded" and its mode
+    // "disabled". A media element's list of text tracks is its track element
+    // children in tree order, then its addTextTrack() tracks (#list-of-text-
+    // tracks); the arena journals each track element parent change so the
+    // addtrack/removetrack events, automatic text track selection and the
+    // track processing model run for parser-created tracks too.
+    const TRACK_READINESS = {"not loaded": 0, loading: 1, loaded: 2, "failed to load": 3};
+    function trackElementState(element) {
+        const slots = internalsFor(element);
+        return slots.trackState || (slots.trackState = {track: null, url: null, running: false,
+            waiting: false, fetchURL: null, generation: 0});
+    }
+    function isTrackElement(node) {
+        return !!node && node.nodeType === 1 && htmlElementName(node) === "track";
+    }
+    function isMediaElement(node) {
+        const name = !!node && node.nodeType === 1 ? htmlElementName(node) : "";
+        return name === "audio" || name === "video";
+    }
+    // The track element's text track.
+    function trackTextTrack(element) {
+        const state = trackElementState(element);
+        return state.track || (state.track = createTextTrack("", "", "", "", "disabled", element));
+    }
+    // The media element whose list of text tracks holds this track: a track
+    // element's parent media element, or addTextTrack()'s media element.
+    function trackMedia(record) {
+        if (record.element === null || record.element === undefined) return record.media;
+        const parent = record.element.parentNode;
+        return isMediaElement(parent) ? parent : null;
+    }
+    // #sourcing-out-of-band-text-tracks: a track element's text track kind,
+    // label, language and identifier follow its attributes.
+    function textTrackField(record, field) {
+        const element = record.element;
+        if (element === null || element === undefined) return record[field];
+        const id = nodeIds.get(element);
+        if (field === "trackKind") {
+            // #attr-track-kind: missing → subtitles, invalid → metadata.
+            const kind = __dom_get_attr(id, "kind");
+            if (kind === null) return "subtitles";
+            const lower = asciiLower(kind);
+            return TEXT_TRACK_KINDS.includes(lower) ? lower : "metadata";
+        }
+        if (field === "label") return __dom_get_attr(id, "label") || "";
+        if (field === "language") return __dom_get_attr(id, "srclang") || "";
+        return __dom_get_attr(id, "id") || "";
+    }
+    // #list-of-text-tracks.
+    function mediaTextTracks(element, state) {
+        const tracks = [];
+        if (element) {
+            const children = __dom_children(nodeIds.get(element));
+            for (let i = 0; i < children.length; i++) {
+                if (__dom_node_type(children[i]) !== 1) continue;
+                const child = wrap(children[i]);
+                if (isTrackElement(child)) tracks.push(trackTextTrack(child));
+            }
+        }
+        return tracks.concat(state.tracks);
+    }
+    // Setting a text track's mode, through the IDL attribute or automatic
+    // text track selection: the mode change steps, and for a track element's
+    // text track, the track processing model (#start-the-track-processing-model).
+    function setTextTrackMode(track, record, value) {
+        if (record.mode === value) return;
+        record.mode = value;
+        if (value === "disabled") for (const cue of record.cues) setCueActive(cue, false);
+        textTrackModeChanged(track, record);
+        if (record.element) {
+            startTrackProcessing(record.element);
+            restartTrackProcessing(record.element);
+            abortTrackFetchOnChange(record.element);
+        }
+    }
+    // #honor-user-preferences-for-automatic-text-track-selection. TRust has
+    // no caption preferences, so only the default attribute selects a track.
+    function honorUserPreferences(media, state) {
+        performAutomaticTextTrackSelection(media, state, ["subtitles", "captions"]);
+        performAutomaticTextTrackSelection(media, state, ["descriptions"]);
+        for (const track of mediaTextTracks(media, state)) {
+            const record = trackSlots.get(track);
+            const kind = textTrackField(record, "trackKind");
+            if ((kind === "chapters" || kind === "metadata") && record.element &&
+                __dom_get_attr(nodeIds.get(record.element), "default") !== null && record.mode === "disabled")
+                setTextTrackMode(track, record, "hidden");
+        }
+        state.didPerformTrackSelection = true;
+    }
+    // #perform-automatic-text-track-selection.
+    function performAutomaticTextTrackSelection(media, state, kinds) {
+        const candidates = mediaTextTracks(media, state)
+            .filter(track => kinds.includes(textTrackField(trackSlots.get(track), "trackKind")));
+        if (!candidates.length) return;
+        if (candidates.some(track => trackSlots.get(track).mode === "showing")) return;
+        for (const track of candidates) {
+            const record = trackSlots.get(track);
+            if (record.element && __dom_get_attr(nodeIds.get(record.element), "default") !== null &&
+                record.mode === "disabled") {
+                setTextTrackMode(track, record, "showing");
+                return;
+            }
+        }
+    }
+    // #populate-the-list-of-pending-text-tracks.
+    function populatePendingTextTracks(media, state) {
+        for (const track of mediaTextTracks(media, state)) {
+            const record = trackSlots.get(track);
+            if (record.mode !== "disabled" && record.readiness === "loading" && !state.pendingTextTracks.includes(track))
+                state.pendingTextTracks.push(track);
+        }
+    }
+    function removePendingTextTrack(track) {
+        const record = trackSlots.get(track), media = trackMedia(record);
+        for (const element of media ? [media] : []) {
+            const pending = mediaState(element).pendingTextTracks, index = pending.indexOf(track);
+            if (index >= 0) pending.splice(index, 1);
+        }
+    }
+    // The text track readiness state changes (#text-track-readiness-state);
+    // loaded and failed to load leave every list of pending text tracks.
+    function setTrackReadiness(track, record, readiness) {
+        record.readiness = readiness;
+        if (readiness === "loaded" || readiness === "failed to load") removePendingTextTrack(track);
+    }
+    // The track URL (#track-url), set when the src attribute is: the
+    // encoding-parsed and serialized src relative to the node document, or
+    // the empty string.
+    function trackURL(element) {
+        const state = trackElementState(element);
+        if (state.url === null) {
+            const value = __dom_get_attr(nodeIds.get(element), "src");
+            const parsed = value === null || value === "" ? null : encodingParseForNode(value, element);
+            state.url = parsed ? parsed[0] : "";
+        }
+        return state.url;
+    }
+    // #the-track-element: the src attribute is set, changed or removed. The
+    // track URL is recomputed, and the text track's list of cues emptied at
+    // once, so a fetch for the previous URL can no longer add cues.
+    function trackSourceChanged(element) {
+        const state = trackElementState(element);
+        state.url = null;
+        trackURL(element);
+        const track = trackTextTrack(element), record = trackSlots.get(track);
+        for (const cue of record.cues.slice()) detachCue(cue, trackSlots.get(cue));
+        abortTrackFetchOnChange(element);
+        restartTrackProcessing(element);
+    }
+    // #start-the-track-processing-model.
+    function startTrackProcessing(element) {
+        const state = trackElementState(element);
+        const track = trackTextTrack(element), record = trackSlots.get(track);
+        if (state.running) return;
+        if (record.mode !== "hidden" && record.mode !== "showing") return;
+        if (!isMediaElement(element.parentNode)) return;
+        state.running = true;
+        trackProcessingTop(element);
+    }
+    // Top: await a stable state, then the synchronous section, then fetch.
+    function trackProcessingTop(element) {
+        const state = trackElementState(element);
+        const track = trackTextTrack(element), record = trackSlots.get(track);
+        state.waiting = false;
+        imageMicrotask(function () {
+            setTrackReadiness(track, record, "loading");
+            const url = trackURL(element);
+            const parent = element.parentNode;
+            let cors = "No CORS";
+            if (isMediaElement(parent)) {
+                const value = __dom_get_attr(nodeIds.get(parent), "crossorigin");
+                if (value !== null) cors = asciiLower(value) === "use-credentials" ? "Use Credentials" : "Anonymous";
+            }
+            state.fetchURL = url;
+            const generation = ++state.generation;
+            const fail = function () {
+                setTrackReadiness(track, record, "failed to load");
+                dispatch(element, createTrustedEvent(Event, "error"), false);
+                trackProcessingWait(element);
+            };
+            if (url === "") {
+                __queue_dom_task(function () { if (state.generation === generation) fail(); });
+                return;
+            }
+            fetchTextTrack(element, url, cors, function (bytes) {
+                __queue_dom_task(function () {
+                    // An aborted fetch discards its pending tasks.
+                    if (state.generation !== generation) return;
+                    if (bytes === null) { fail(); return; }
+                    let text = __text_decode_utf8(bytes, false, false);
+                    if (typeof text !== "string") text = text[0];
+                    if (text.length && text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+                    const parsed = parseWebVTTFile(text);
+                    if (parsed === null) { fail(); return; }
+                    for (const cue of parsed.cues) addParsedCue(track, record, cue);
+                    setTrackReadiness(track, record, "loaded");
+                    dispatch(element, createTrustedEvent(Event, "load"), false);
+                    trackProcessingWait(element);
+                });
+            });
+        });
+    }
+    // "Wait until the track URL is no longer equal to URL, at the same time
+    // as the text track mode is set to hidden or showing. Jump to Top."
+    function trackProcessingWait(element) {
+        const state = trackElementState(element);
+        state.waiting = true;
+        restartTrackProcessing(element);
+    }
+    function restartTrackProcessing(element) {
+        const state = trackElementState(element);
+        if (!state.running || !state.waiting) return;
+        const record = trackSlots.get(trackTextTrack(element));
+        if ((record.mode === "hidden" || record.mode === "showing") && trackURL(element) !== state.fetchURL)
+            trackProcessingTop(element);
+    }
+    // While fetching: a track URL that changes while the mode is hidden or
+    // showing, or a mode that becomes hidden or showing while the track URL
+    // differs, aborts the fetch and fails the load in a task.
+    function abortTrackFetchOnChange(element) {
+        const state = trackElementState(element);
+        if (!state.running || state.waiting || state.fetchURL === null) return;
+        const track = trackTextTrack(element), record = trackSlots.get(track);
+        if (record.readiness !== "loading") return;
+        if ((record.mode === "hidden" || record.mode === "showing") && trackURL(element) !== state.fetchURL) {
+            const generation = ++state.generation;
+            __queue_dom_task(function () {
+                if (state.generation !== generation) return;
+                setTrackReadiness(track, record, "failed to load");
+                dispatch(element, createTrustedEvent(Event, "error"), false);
+                trackProcessingWait(element);
+            });
+        }
+    }
+    // HTML #sourcing-out-of-band-text-tracks: a potential-CORS request with
+    // the "track" destination and the same-origin fallback flag set, whose
+    // client is the track element's node document's settings object. A
+    // network error or an error status fails the load; `deliver` receives
+    // the response body's bytes, or null.
+    function fetchTextTrack(element, url, cors, deliver) {
+        const fields = {url, method: "GET", headerList: [], body: null, sync: false,
+            mode: cors === "No CORS" ? "same-origin" : "cors",
+            credentials: cors === "Anonymous" ? "same-origin" : "include",
+            destination: "track", initiatorType: "track"};
+        try {
+            runInFrame(frameOwnerForNode(element.ownerDocument) || realmRootFrame, function () {
+                fetchAPI.fetchForXHR(fields, function (response) {
+                    if (response.type === "error" || response.status < 200 || response.status > 299) {
+                        deliver(null);
+                        return;
+                    }
+                    fetchAPI.readBody(response).then(deliver, function () { deliver(null); });
+                });
+            });
+        } catch (error) {
+            deliver(null);
+        }
+    }
+    // A parsed WebVTT cue becomes a VTTCue in the text track's list of cues.
+    function addParsedCue(track, record, parsed) {
+        const cue = new VTTCue(parsed.startTime, parsed.endTime, parsed.text);
+        const cueRecord = trackSlots.get(cue);
+        cueRecord.id = parsed.id;
+        cueRecord.pauseOnExit = false;
+        cueRecord.region = parsed.region;
+        cueRecord.vertical = parsed.vertical;
+        cueRecord.snapToLines = parsed.snapToLines;
+        cueRecord.line = parsed.line;
+        cueRecord.lineAlign = parsed.lineAlign;
+        cueRecord.position = parsed.position;
+        cueRecord.positionAlign = parsed.positionAlign;
+        cueRecord.size = parsed.size;
+        cueRecord.align = parsed.align;
+        cueRecord.track = track;
+        cueRecord.added = ++cueAdditions;
+        record.cues.push(cue);
+        const media = trackMedia(record);
+        if (media !== null) {
+            const state = mediaState(media);
+            if (!state.showPoster) timeMarchesOn(media, state);
+        }
+    }
+
+    // ---- WebVTT #file-parsing ------------------------------------------------
+    const VTT_WHITESPACE = "\t\n\f\r ";
+    function vttSplitOnSpaces(input) {
+        return input.split(/[\t\n\f\r ]+/).filter(token => token !== "");
+    }
+    // #parse-a-percentage-string: 0–100, or null.
+    function vttPercentage(input) {
+        if (!/^[0-9]+(\.[0-9]+)?%$/.test(input)) return null;
+        const percentage = Number(input.slice(0, -1));
+        return percentage >= 0 && percentage <= 100 ? percentage : null;
+    }
+    // #collect-a-webvtt-block and the parser algorithm. Returns null when
+    // the file does not start with the WebVTT file signature, otherwise its
+    // cues, regions and style sheet texts.
+    function parseWebVTTFile(source) {
+        const input = source.replace(/\0/g, "�").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        let position = 0, seenCue = false;
+        const cues = [], regions = [], stylesheets = [];
+        const result = {cues, regions, stylesheets};
+        if (input.length < 6) return null;
+        if (input.length === 6 && input !== "WEBVTT") return null;
+        if (input.length > 6 && (input.slice(0, 6) !== "WEBVTT" || " \t\n".indexOf(input[6]) < 0)) return null;
+        const collectLine = function () {
+            let end = input.indexOf("\n", position);
+            if (end < 0) end = input.length;
+            const line = input.slice(position, end);
+            position = end;
+            return line;
+        };
+        const skipNewlines = function () { while (position < input.length && input[position] === "\n") position++; };
+        collectLine();
+        if (position >= input.length) return result;
+        position++;
+        if (position >= input.length) return result;
+        // Header.
+        if (input[position] !== "\n") collectBlock(true);
+        else position++;
+        skipNewlines();
+        // Block loop.
+        while (position < input.length) {
+            const block = collectBlock(false);
+            if (block !== null) {
+                if (block.cue) cues.push(block.cue);
+                else if (block.stylesheet !== undefined) stylesheets.push(block.stylesheet);
+                else if (block.region) regions.push(block.region);
+            }
+            skipNewlines();
+        }
+        return result;
+
+        function collectBlock(inHeader) {
+            let lineCount = 0, previousPosition = position, buffer = "", seenEOF = false, seenArrow = false;
+            let cue = null, stylesheet = null, region = null;
+            for (;;) {
+                const line = collectLine();
+                lineCount++;
+                if (position >= input.length) seenEOF = true;
+                else position++;
+                if (line.indexOf("-->") >= 0) {
+                    if (!inHeader && (lineCount === 1 || (lineCount === 2 && !seenArrow))) {
+                        seenArrow = true;
+                        previousPosition = position;
+                        // Cue creation.
+                        cue = {id: buffer, startTime: 0, endTime: 0, region: null, vertical: "",
+                            snapToLines: true, line: "auto", lineAlign: "start", position: "auto",
+                            positionAlign: "auto", size: 100, align: "center", text: ""};
+                        if (!collectCueTimingsAndSettings(line, regions, cue)) cue = null;
+                        else { buffer = ""; seenCue = true; }
+                    } else {
+                        position = previousPosition;
+                        break;
+                    }
+                } else if (line === "") {
+                    break;
+                } else {
+                    if (!inHeader && lineCount === 2) {
+                        if (!seenCue && /^STYLE[\t\n\f\r ]*$/.test(buffer)) {
+                            stylesheet = true;
+                            buffer = "";
+                        } else if (!seenCue && /^REGION[\t\n\f\r ]*$/.test(buffer)) {
+                            // Region creation.
+                            region = {id: "", width: 100, lines: 3, regionAnchorX: 0, regionAnchorY: 100,
+                                viewportAnchorX: 0, viewportAnchorY: 100, scroll: ""};
+                            buffer = "";
+                        }
+                    }
+                    if (buffer !== "") buffer += "\n";
+                    buffer += line;
+                    previousPosition = position;
+                }
+                if (seenEOF) break;
+            }
+            if (cue !== null) { cue.text = buffer; return {cue}; }
+            // A CSS style sheet: its rules are parsed from the buffer; this
+            // user agent renders no cues, so only the block boundary matters.
+            if (stylesheet !== null) return {stylesheet: buffer};
+            if (region !== null) {
+                collectRegionSettings(buffer, region);
+                return {region: createVTTRegion(region)};
+            }
+            return null;
+        }
+    }
+    function createVTTRegion(settings) {
+        const region = new VTTRegion();
+        const record = trackSlots.get(region);
+        for (const key of ["id", "width", "lines", "regionAnchorX", "regionAnchorY", "viewportAnchorX",
+            "viewportAnchorY", "scroll"]) record[key] = settings[key];
+        return region;
+    }
+    // #collect-webvtt-region-settings.
+    function collectRegionSettings(input, region) {
+        for (const setting of vttSplitOnSpaces(input)) {
+            const colon = setting.indexOf(":");
+            if (colon <= 0 || colon === setting.length - 1) continue;
+            const name = setting.slice(0, colon), value = setting.slice(colon + 1);
+            if (name === "id") region.id = value;
+            else if (name === "width") {
+                const percentage = vttPercentage(value);
+                if (percentage !== null) region.width = percentage;
+            } else if (name === "lines") {
+                if (!/^[0-9]+$/.test(value)) continue;
+                region.lines = Number(value);
+            } else if (name === "regionanchor" || name === "viewportanchor") {
+                const comma = value.indexOf(",");
+                if (comma < 0) continue;
+                const x = vttPercentage(value.slice(0, comma)), y = vttPercentage(value.slice(comma + 1));
+                if (x === null || y === null) continue;
+                if (name === "regionanchor") { region.regionAnchorX = x; region.regionAnchorY = y; }
+                else { region.viewportAnchorX = x; region.viewportAnchorY = y; }
+            } else if (name === "scroll") {
+                if (value === "up") region.scroll = "up";
+            }
+        }
+    }
+    // #collect-webvtt-cue-timings-and-settings.
+    function collectCueTimingsAndSettings(input, regions, cue) {
+        let position = 0;
+        const skipWhitespace = function () {
+            while (position < input.length && VTT_WHITESPACE.indexOf(input[position]) >= 0) position++;
+        };
+        skipWhitespace();
+        const start = collectVTTTimestamp(input, position);
+        if (start === null) return false;
+        cue.startTime = start.value;
+        position = start.position;
+        skipWhitespace();
+        for (const expected of "-->") {
+            if (input[position] !== expected) return false;
+            position++;
+        }
+        skipWhitespace();
+        const end = collectVTTTimestamp(input, position);
+        if (end === null) return false;
+        cue.endTime = end.value;
+        position = end.position;
+        parseCueSettings(input.slice(position), regions, cue);
+        return true;
+    }
+    // #parse-the-webvtt-cue-settings.
+    function parseCueSettings(input, regions, cue) {
+        for (const setting of vttSplitOnSpaces(input)) {
+            const colon = setting.indexOf(":");
+            if (colon <= 0 || colon === setting.length - 1) continue;
+            const name = setting.slice(0, colon), value = setting.slice(colon + 1);
+            if (name === "region") {
+                let found = null;
+                for (const region of regions) if (trackSlots.get(region).id === value) found = region;
+                cue.region = found;
+            } else if (name === "vertical") {
+                if (value === "rl") cue.vertical = "rl";
+                else if (value === "lr") cue.vertical = "lr";
+                if (cue.vertical !== "") cue.region = null;
+            } else if (name === "line") {
+                const comma = value.indexOf(",");
+                const linepos = comma < 0 ? value : value.slice(0, comma);
+                const linealign = comma < 0 ? null : value.slice(comma + 1);
+                if (!/[0-9]/.test(linepos)) continue;
+                let number;
+                const percent = linepos[linepos.length - 1] === "%";
+                if (percent) {
+                    number = vttPercentage(linepos);
+                    if (number === null) continue;
+                } else {
+                    if (/[^0-9.\-]/.test(linepos)) continue;
+                    if (linepos.indexOf("-", 1) >= 0) continue;
+                    const dots = linepos.split(".").length - 1;
+                    if (dots > 1) continue;
+                    if (dots === 1) {
+                        const dot = linepos.indexOf(".");
+                        if (dot === 0 || dot === linepos.length - 1 ||
+                            !/[0-9]/.test(linepos[dot - 1]) || !/[0-9]/.test(linepos[dot + 1])) continue;
+                    }
+                    // HTML #rules-for-parsing-floating-point-number-values over
+                    // the validated form [-]digits[.digits].
+                    number = Number(linepos);
+                    if (!Number.isFinite(number)) continue;
+                }
+                if (linealign === "start") cue.lineAlign = "start";
+                else if (linealign === "center") cue.lineAlign = "center";
+                else if (linealign === "end") cue.lineAlign = "end";
+                else if (linealign !== null) continue;
+                cue.line = number;
+                cue.snapToLines = !percent;
+                if (cue.line !== "auto") cue.region = null;
+            } else if (name === "position") {
+                const comma = value.indexOf(",");
+                const colpos = comma < 0 ? value : value.slice(0, comma);
+                const colalign = comma < 0 ? null : value.slice(comma + 1);
+                const number = vttPercentage(colpos);
+                if (number === null) continue;
+                if (colalign === "line-left") cue.positionAlign = "line-left";
+                else if (colalign === "center") cue.positionAlign = "center";
+                else if (colalign === "line-right") cue.positionAlign = "line-right";
+                else if (colalign !== null) continue;
+                cue.position = number;
+            } else if (name === "size") {
+                const number = vttPercentage(value);
+                if (number === null) continue;
+                cue.size = number;
+                if (cue.size !== 100) cue.region = null;
+            } else if (name === "align") {
+                if (["start", "center", "end", "left", "right"].includes(value)) cue.align = value;
+            }
+        }
+    }
+
+    // The track element's parent changed (journaled by the arena): join or
+    // leave the media element's list of text tracks with an addtrack or
+    // removetrack event, queue automatic text track selection, and start the
+    // track processing model.
+    function processTrackChanges() {
+        const changes = __dom_track_changes();
+        if (changes === null) return;
+        for (let i = 0; i + 2 < changes.length; i += 3) {
+            const element = wrap(changes[i]), media = wrap(changes[i + 1]);
+            if (!element || !media) continue;
+            const track = trackTextTrack(element);
+            const state = mediaState(media), list = textTrackListOf(state);
+            if (changes[i + 2] === 1) {
+                queueMediaTask(media, state, function () {
+                    dispatch(list, createTrustedEvent(TrackEvent, "addtrack", {track}), false);
+                });
+                queueMediaTask(media, state, function () {
+                    if (state.blockedOnParser || state.didPerformTrackSelection) return;
+                    honorUserPreferences(media, state);
+                });
+                startTrackProcessing(element);
+            } else {
+                const pending = state.pendingTextTracks, index = pending.indexOf(track);
+                if (index >= 0) pending.splice(index, 1);
+                queueMediaTask(media, state, function () {
+                    dispatch(list, createTrustedEvent(TrackEvent, "removetrack", {track}), false);
+                });
+            }
+        }
+    }
+    // A media element the HTML parser created: blocked on the parser until
+    // it is popped off the stack of open elements, which honors user
+    // preferences for automatic text track selection, populates its list of
+    // pending text tracks and clears the flag (#blocked-on-parser).
+    trust.parserMediaCreated = function (ids) {
+        for (const id of ids) {
+            const media = wrap(id);
+            if (media) mediaState(media).blockedOnParser = true;
+        }
+        processTrackChanges();
+    };
+    trust.parserMediaPopped = function (ids) {
+        processTrackChanges();
+        for (const id of ids) {
+            const media = wrap(id);
+            if (!media) continue;
+            const state = mediaState(media);
+            honorUserPreferences(media, state);
+            populatePendingTextTracks(media, state);
+            state.blockedOnParser = false;
+        }
+    };
+    class HTMLTrackElement extends HTMLElement {
+        // #dom-track-readystate.
+        get readyState() {
+            if (!isTrackElement(this)) throw new TypeError("Illegal HTMLTrackElement invocation");
+            return TRACK_READINESS[trackSlots.get(trackTextTrack(this)).readiness];
+        }
+        // #dom-track-track.
+        get track() {
+            if (!isTrackElement(this)) throw new TypeError("Illegal HTMLTrackElement invocation");
+            return trackTextTrack(this);
+        }
+    }
+    for (const [name, value] of [["NONE", 0], ["LOADING", 1], ["LOADED", 2], ["ERROR", 3]]) {
+        Object.defineProperty(HTMLTrackElement, name, {value, enumerable: true});
+        Object.defineProperty(HTMLTrackElement.prototype, name, {value, enumerable: true});
+    }
+    Object.defineProperty(g, "HTMLTrackElement", {value: HTMLTrackElement, writable: true, configurable: true});
 
     installHandlerProps(TextTrackList.prototype, ["change", "addtrack", "removetrack"]);
     installHandlerProps(AudioTrackList.prototype, ["change", "addtrack", "removetrack"]);
@@ -19285,6 +19932,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (localName === "source") pictureSourceAttributeChanged(element, lower);
         if (lower === "loading" && localName === "img" && v.toLowerCase() !== "lazy") resumeLazyImage(element);
         if (lower === "src" && (localName === "video" || localName === "audio")) loadMediaElement(element);
+        if (lower === "src" && localName === "track" && isTrackElement(element)) trackSourceChanged(element);
         if (linkOld !== undefined) linkAttributeChanged(element, lower, linkOld);
     }
     // The removal counterpart of setAttributeSteps; `remove` detaches the
@@ -19319,6 +19967,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (localName === "source") pictureSourceAttributeChanged(element, lower);
         // HTML #lazy-loading-attributes: the Eager state resumes a lazy load.
         if (lower === "loading" && localName === "img") resumeLazyImage(element);
+        if (lower === "src" && localName === "track" && isTrackElement(element)) trackSourceChanged(element);
     }
     // Attributes changed: drop the getAttribute read cache, and refresh the
     // [SameObject] NamedNodeMap (DOM §4.9.1, a live collection) so a caller
@@ -24972,16 +25621,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             define(VisualViewport.prototype, name, {configurable: true, enumerable: true,
                 get: named({get() { viewportState(this); return value(); }}.get, "get " + name)});
         }
-        for (const type of ["resize", "scroll", "scrollend"]) {
-            define(VisualViewport.prototype, "on" + type, {configurable: true, enumerable: true,
-                get: named({get() { return viewportState(this).handlers[type] || null; }}.get, "get on" + type),
-                set: named({set(handler) {
-                    const handlers = viewportState(this).handlers;
-                    if (handlers[type]) this.removeEventListener(type, handlers[type]);
-                    handlers[type] = typeof handler === "function" ? handler : null;
-                    if (handlers[type]) this.addEventListener(type, handlers[type]);
-                }}.set, "set on" + type)});
-        }
+        for (const type of ["resize", "scroll", "scrollend"])
+            defineHandlerAttribute(VisualViewport.prototype, type, (target) => viewportState(target).handlers);
         define(VisualViewport.prototype, Symbol.toStringTag, {value: "VisualViewport", configurable: true});
         define(g, "VisualViewport", {value: VisualViewport, writable: true, configurable: true});
         const visualViewport = Reflect.construct(EventTarget, [], VisualViewport);
@@ -25036,14 +25677,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             define(ScreenOrientation.prototype, name, {configurable: true, enumerable: true,
                 get: named({get() { return orientationState(this)[name]; }}.get, "get " + name)});
         }
-        define(ScreenOrientation.prototype, "onchange", {configurable: true, enumerable: true,
-            get: named({get() { return orientationState(this).handlers.change || null; }}.get, "get onchange"),
-            set: named({set(handler) {
-                const handlers = orientationState(this).handlers;
-                if (handlers.change) this.removeEventListener("change", handlers.change);
-                handlers.change = typeof handler === "function" ? handler : null;
-                if (handlers.change) this.addEventListener("change", handlers.change);
-            }}.set, "set onchange")});
+        defineHandlerAttribute(ScreenOrientation.prototype, "change", (target) => orientationState(target).handlers);
         define(ScreenOrientation.prototype, Symbol.toStringTag, {value: "ScreenOrientation", configurable: true});
         define(g, "ScreenOrientation", {value: ScreenOrientation, writable: true, configurable: true});
         const parentTrust = cfg.parentWindow && trustOf(cfg.parentWindow);
@@ -26623,6 +27257,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function moDeliver() {
         moQueued = false;
+        // HTML #sourcing-out-of-band-text-tracks: the track element parent
+        // changes of the mutations this microtask follows.
+        processTrackChanges();
         if (moDisabled) return;
         // DOM #notify-mutation-observers steps 4–5, before any callback.
         const signalSet = takeSlotSignals();
@@ -29237,6 +29874,42 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HTML #event-handler-idl-attributes: getters and setters over the event
     // handler map (see setEventHandlerAttribute). Web IDL attributes are
     // enumerable accessors.
+    // HTML #event-handler-attributes for an interface whose handlers live in
+    // a per-object map from `handlersOf` (an internal slot): an
+    // [LegacyTreatNonObjectAsNull] EventHandler whose first non-null value
+    // adds one listener, through the platform's own listener operations,
+    // which keeps its position while the value is replaced and runs the
+    // event handler processing algorithm (a false return value cancels).
+    function defineHandlerAttribute(proto, type, handlersOf) {
+        const name = "on" + type;
+        const accessors = {
+            get [name]() {
+                const handler = handlersOf(this)[type];
+                return handler ? handler.value : null;
+            },
+            set [name](value) {
+                const handlers = handlersOf(this);
+                value = typeof value === "function" || (value !== null && typeof value === "object") ? value : null;
+                let handler = handlers[type];
+                if (value === null) {
+                    if (handler) removeL(this, type, handler.listener, false);
+                    handlers[type] = undefined;
+                } else if (handler) handler.value = value;
+                else {
+                    const target = this;
+                    handler = handlers[type] = {value, listener(event) {
+                        const callback = handler.value;
+                        if (typeof callback === "function" && invokeCallback(callback, target, [event], g) === false)
+                            setCanceledFlag(eventRecord(event));
+                    }};
+                    addL(this, type, handler.listener, false);
+                }
+            },
+        };
+        const descriptor = Object.getOwnPropertyDescriptor(accessors, name);
+        Object.defineProperty(proto, name, {get: descriptor.get, set: descriptor.set,
+            enumerable: true, configurable: true});
+    }
     function installHandlerProps(proto, types) {
         for (const type of types) {
             const name = "on" + type;
@@ -29250,9 +29923,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
     installHandlerProps(g, Array.from(new Set(ELEMENT_DOCUMENT_HANDLER_TYPES.concat(WINDOW_EVENT_HANDLER_TYPES))));
-    // HTML: body and frameset elements also expose the WindowEventHandlers,
-    // which act on their Window.
-    installHandlerProps(Element.prototype, ELEMENT_DOCUMENT_HANDLER_TYPES);
+    // HTML #globaleventhandlers is included by HTMLElement, Document and
+    // Window; SVG 2 #InterfaceSVGElement and MathML Core #dom-mathmlelement
+    // include it in SVGElement and MathMLElement. An Element of another
+    // namespace has none of these handlers.
+    for (const C of [HTMLElement, SVGElement, MathMLElement])
+        installHandlerProps(C.prototype, ELEMENT_DOCUMENT_HANDLER_TYPES);
     installHandlerProps(Document.prototype,
         ELEMENT_DOCUMENT_HANDLER_TYPES.concat(["readystatechange", "visibilitychange", "pointerlockchange", "pointerlockerror"]));
     installHandlerProps(FrameDocument.prototype,
@@ -30523,6 +31199,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             throw new TypeError("Invalid FullscreenNavigationUI value");
         return {keyboardLock, navigationUI};
     }
+    // #fullscreen-is-supported: no platform limitation, as the frontend
+    // declares it (trust-headless, for one, cannot present fullscreen).
+    const fullscreenSupported = cfg.fullscreenSupported !== false;
     // #dom-element-requestfullscreen.
     function requestFullscreen(options = undefined) {
         if (elementIdentity(this) === undefined) return Promise.reject(new TypeError("Illegal invocation"));
@@ -30539,6 +31218,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 || (namespace === MATHML_NS && localName === "math"))) error = true;
             if (htmlElementName(element) === "dialog") error = true;
             if (!fullscreenElementReadyCheck(element)) error = true;
+            if (!fullscreenSupported) error = true;
             const state = windowStateForNode(element);
             if (!hasTransientActivation(state)) error = true;
             if (!error) consumeUserActivationEverywhere();
@@ -30576,8 +31256,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // [LegacyLenientSetter]: assignment is ignored.
             set: Object.getOwnPropertyDescriptor({set [name](_) {}}, name).set,
         });
-        // #dom-document-fullscreenenabled.
-        lenient("fullscreenEnabled", (document) => fullscreenAllowedForDocument(document));
+        // #dom-document-fullscreenenabled: allowed to use the "fullscreen"
+        // feature and fullscreen is supported.
+        lenient("fullscreenEnabled", (document) => fullscreenAllowedForDocument(document) && fullscreenSupported);
         // #dom-document-fullscreen (historical).
         lenient("fullscreen", (document) => fullscreenElementOf(document) !== null);
         // #dom-document-exitfullscreen.
@@ -38903,15 +39584,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // response record; an asynchronous one passes it to `deliver` once it is
     // available (for a local scheme, before fetchForXHR returns), and the
     // caller queues its processing. The record's body bytes are fully read.
+    // Other platform fetches of a whole resource (a track element's text
+    // track) pass their own mode, destination and initiator type.
     function fetchForXHR(fields, deliver) {
         const request = newRequestRecord({url: fields.url, urlList: [fields.url], method: fields.method,
-            headerList: fields.headerList, mode: "cors", credentials: fields.credentials});
-        request.initiatorType = "xmlhttprequest";
+            headerList: fields.headerList, mode: fields.mode || "cors", credentials: fields.credentials});
+        request.initiatorType = fields.initiatorType || "xmlhttprequest";
+        if (fields.destination) request.destination = fields.destination;
         const parsed = parseURL(request.url, null);
         const scheme = parsed === null ? "" : parsed.protocol;
         const httpScheme = scheme === "http:" || scheme === "https:" || scheme === "file:";
         const finish = function (response) {
-            // A "cors" request never yields an opaque response.
+            // A "cors" or "same-origin" request never yields an opaque response.
             if (response.type === "opaque") { terminateBody(response.body); return networkError(); }
             if (response.type !== "error" && (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(response.status) >= 0)) {
                 terminateBody(response.body);
@@ -40849,6 +41533,26 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!slot) throw new TypeError("Illegal MessagePort invocation");
             return slot;
         }
+        function handlerValue(slot, type) {
+            const handler = slot["on" + type];
+            return handler ? handler.value : null;
+        }
+        function setHandler(target, slot, type, value) {
+            value = typeof value === "function" || (value !== null && typeof value === "object") ? value : null;
+            const handler = slot["on" + type];
+            if (value === null) {
+                if (handler) adapter.remove(target, type, handler.listener);
+                slot["on" + type] = null;
+            } else if (handler) handler.value = value;
+            else {
+                const entry = slot["on" + type] = {value, listener(event) {
+                    const callback = entry.value;
+                    if (typeof callback === "function" && apply(callback, target, [event]) === false)
+                        event.preventDefault();
+                }};
+                adapter.add(target, type, entry.listener);
+            }
+        }
         function cloneError(message) { return new g.DOMException(message, "DataCloneError"); }
         function sequence(value, method) {
             if ((typeof value !== "object" && typeof value !== "function") || value === null)
@@ -40944,21 +41648,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 } }]);
                 portsById.set(id, this);
             }
-            get onmessage() { return requirePort(this).onmessage; }
+            // HTML #event-handler-attributes: [LegacyTreatNonObjectAsNull]
+            // EventHandlers whose activated listener keeps its position while
+            // the value is replaced. The first time onmessage is set, the
+            // port message queue is enabled as if start() had been called
+            // (HTML #message-ports).
+            get onmessage() { return handlerValue(requirePort(this), "message"); }
             set onmessage(handler) {
                 const slot = requirePort(this);
-                if (slot.onmessage) adapter.remove(this, "message", slot.onmessage);
-                slot.onmessage = typeof handler === "function" ? handler : null;
-                if (slot.onmessage) adapter.add(this, "message", slot.onmessage);
+                setHandler(this, slot, "message", handler);
                 native("start", slot.id);
             }
-            get onmessageerror() { return requirePort(this).onmessageerror; }
-            set onmessageerror(handler) {
-                const slot = requirePort(this);
-                if (slot.onmessageerror) adapter.remove(this, "messageerror", slot.onmessageerror);
-                slot.onmessageerror = typeof handler === "function" ? handler : null;
-                if (slot.onmessageerror) adapter.add(this, "messageerror", slot.onmessageerror);
-            }
+            get onmessageerror() { return handlerValue(requirePort(this), "messageerror"); }
+            set onmessageerror(handler) { setHandler(this, requirePort(this), "messageerror", handler); }
             postMessage(data, options) {
                 const slot = requirePort(this);
                 if (arguments.length === 0) throw new TypeError("MessagePort.postMessage requires a message");
@@ -43552,10 +44254,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new TypeError("Invalid Worker credentials mode");
             }
             const name = options.name != null ? String(options.name) : "";
-            // HTML #dom-worker: encoding-parse the script URL relative to the
-            // outside settings object (its API base URL and the Window's
-            // Document's encoding).
-            const parsed = __url_parse(domString(url), messageWindowState.apiBaseURL(), messageWindowState.documentEncoding());
+            // HTML #dom-worker: encoding-parse the script URL relative to
+            // this's relevant settings object, the Window the constructor
+            // runs for (a same-Realm child navigable's Window included): its
+            // API base URL (its Document's base URL) and its Document's
+            // character encoding.
+            const parsed = __url_parse(domString(url), baseHref(), documentQueryEncoding(g.document));
             if (!parsed) throw new DOMException("Invalid worker script URL", "SyntaxError");
             const href = parsed[0];
             // HTML's Worker constructor fetches Blob URLs from the File API
@@ -43668,7 +44372,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     if (!sharedWorkerTypes.includes(type)) throw new TypeError("Invalid SharedWorker type");
                 }
             } else name = `${options}`;
-            const parsed = __url_parse(scriptURL, messageWindowState.apiBaseURL(), messageWindowState.documentEncoding());
+            // HTML #dom-sharedworker: encoding-parse relative to this's
+            // relevant settings object (see the Worker constructor).
+            const parsed = __url_parse(scriptURL, baseHref(), documentQueryEncoding(g.document));
             if (!parsed) throw new DOMException("Invalid shared worker script URL", "SyntaxError");
             const href = parsed[0];
             super();
@@ -49037,6 +49743,94 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (namespace && typeof namespace === "object" && !own(namespace, toStringTag))
                 define(namespace, toStringTag, {value: name, configurable: true});
         }
+        // Web IDL #es-attributes, #es-operations, #es-constants,
+        // #es-stringifier and #es-iterable: every attribute, regular and
+        // static operation, constant and iteration method is an enumerable
+        // property of its interface prototype object or interface object,
+        // and of a namespace object (#namespace-object). Only "constructor"
+        // (#interface-prototype-object), the interface object's own "length",
+        // "name" and "prototype", and symbol-keyed members are not. The
+        // prelude defines many members as class methods and accessors, which
+        // ECMAScript makes non-enumerable, so one pass over every exposed
+        // interface makes them enumerable in place, keeping each object's
+        // property order.
+        const ownNames = Object.getOwnPropertyNames;
+        function enumerateMembers(object, skip) {
+            for (const key of ownNames(object)) {
+                if (skip.has(key)) continue;
+                const descriptor = own(object, key);
+                if (descriptor.enumerable || !descriptor.configurable) {
+                    // A constant is {writable: false, enumerable: true,
+                    // configurable: false}; one defined non-enumerable
+                    // cannot be redefined, and none is.
+                    continue;
+                }
+                descriptor.enumerable = true;
+                define(object, key, descriptor);
+            }
+        }
+        const PROTOTYPE_SKIP = new Set(["constructor"]);
+        const INTERFACE_SKIP = new Set(["length", "name", "prototype", "arguments", "caller"]);
+        const enumerated = new Set();
+        function enumerateInterface(C) {
+            const prototype = own(C, "prototype");
+            const proto = prototype && prototype.value;
+            if (!proto || typeof proto !== "object" || enumerated.has(proto)) return;
+            const constructor = own(proto, "constructor");
+            if (!constructor || constructor.value !== C) return;
+            enumerated.add(proto);
+            enumerateMembers(proto, PROTOTYPE_SKIP);
+            enumerateMembers(C, INTERFACE_SKIP);
+        }
+        // Web IDL #interface-object, #legacy-factory-functions and
+        // #namespace-object: the global's interface objects, legacy factory
+        // functions (Image, Audio, Option) and namespace objects are
+        // {writable: true, enumerable: false, configurable: true} properties.
+        const hide = function (name) {
+            const binding = own(globalThis, name);
+            if (binding && "value" in binding && binding.enumerable && binding.configurable) {
+                binding.enumerable = false;
+                define(globalThis, name, binding);
+            }
+        };
+        for (const name of ownNames(globalThis)) {
+            const first = name.charCodeAt(0);
+            if (!(first >= 65 && first <= 90) || engineNames.has(name)) continue;
+            const binding = own(globalThis, name);
+            const value = binding && binding.value;
+            if (typeof value !== "function") continue;
+            enumerateInterface(value);
+            const prototype = own(value, "prototype");
+            if (prototype && prototype.value && typeof prototype.value === "object") hide(name);
+        }
+        for (const name of ["console", "CSS", "WebAssembly"]) if (!engineNames.has(name)) hide(name);
+        // Namespaces: console, CSS and WebAssembly. WebAssembly's interface
+        // objects are non-enumerable members of the namespace object
+        // ([LegacyNamespace], #interface-object), as are its three error
+        // constructors, which are ECMAScript NativeError-like objects
+        // (WebAssembly JS API #error-objects) rather than interfaces.
+        for (const name of ["console", "CSS", "WebAssembly"]) {
+            const binding = own(globalThis, name);
+            const namespace = binding && binding.value;
+            if (!namespace || typeof namespace !== "object" || engineNames.has(name)) continue;
+            const interfaces = new Set();
+            for (const member of ownNames(namespace)) {
+                const first = member.charCodeAt(0), binding = own(namespace, member), value = binding.value;
+                if (first >= 65 && first <= 90 && typeof value === "function") {
+                    interfaces.add(member);
+                    if (member !== "CompileError" && member !== "LinkError" && member !== "RuntimeError")
+                        enumerateInterface(value);
+                    if (binding.enumerable && binding.configurable) {
+                        binding.enumerable = false;
+                        define(namespace, member, binding);
+                    }
+                }
+            }
+            enumerateMembers(namespace, interfaces);
+        }
+        // A same-Realm child navigable's Document wrapper inherits from this
+        // Document subclass, which is not itself exposed.
+        if (typeof FrameDocument === "function") enumerateMembers(FrameDocument.prototype, PROTOTYPE_SKIP);
     })(new Set(globalThis.__engine_global_names));
     delete globalThis.__engine_global_names;
     /*__CLASS_STRINGS_END__*/

@@ -359,7 +359,7 @@ clock when the engine declines to answer:
 
 | Verdict | Meaning | Reached when |
 |---|---|---|
-| engine final | No further render can arrive for this document | The fetch committed with no resident actor (a script-free page, Gopher, Gemini, internal gemtext), **or** the actor classified the document inert and sent `PageEvt::Static`, **or** the fetch failed and no document committed |
+| engine final | No further render can arrive for this document | The fetch committed with no resident actor (a script-free page, Gopher, Gemini, internal gemtext), **or** the actor classified the document inert and sent `PageEvt::Static` (at load, or once the timers, tasks, fetches and rendering work pending then have finished), **or** the fetch failed and no document committed |
 | quiet | The page stopped changing; not the same as finished | A live actor never went final and `--settle` elapsed since the last revision |
 | timeout | The dump is incomplete | `--timeout` expired before either of the above |
 
@@ -409,7 +409,11 @@ The engine verdict is worth roughly an order of magnitude on documents that can
 reach it — a script-free page used to pay the whole settle window for no reason,
 and measured about 0.05 s instead of about 1.3 s. A failed or unparsable
 address likewise now returns in tens of milliseconds instead of idling out the
-timeout.
+timeout. The actor asks again whenever its event loop would park with nothing
+scheduled, so a page whose zero-delay timer or selectionchange task was still
+pending at load retires as soon as that work has run. A page with anything to
+interact with (a form control, a click target, a `contenteditable` editing
+host, whose native editing runs in the actor) stays resident.
 
 One caveat deserves prominence because it decides most real-world behavior:
 `Static` requires *no* hover or scroll work, and its hover clause asks whether

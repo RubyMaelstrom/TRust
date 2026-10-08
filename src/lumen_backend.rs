@@ -2259,6 +2259,7 @@ mod desktop {
             last_modified: env.last_modified,
             document_encoding: env.document_encoding,
             content_type: env.content_type.clone(),
+            fullscreen_supported: env.fullscreen_supported,
         };
         let mut page = match load_page(
             html,
@@ -2658,6 +2659,9 @@ mod desktop {
         let mut background_service: Option<(Instant, usize)> = None;
         let mut task_gc_defer_until: Option<Instant> = None;
         let mut animation_schedule = AnimationSchedule::default();
+        // Whether anything happened since the actor last asked whether the
+        // document has become inert (see `retire_if_inert`).
+        let mut retirement_check_due = true;
 
         'event_loop: loop {
             if matches!(
@@ -2832,6 +2836,26 @@ mod desktop {
                     timeout_wake = Wake::Maintenance;
                 }
             }
+            // A document that became inert after its load (its timers,
+            // tasks, fetches and rendering work all finished, and nothing on
+            // it can be interacted with) retires its actor exactly as one
+            // that was inert at load does, so that a frontend learns no
+            // further render can arrive. Classifying only once, at load,
+            // kept every page with any work then (a zero-delay timer, a
+            // selectionchange task) resident forever.
+            if immediate.is_none()
+                && wait.is_none()
+                && retirement_check_due
+                && lifecycle_complete
+                && !page.render_pending
+                && deferred_host_task.is_none()
+            {
+                retirement_check_due = false;
+                if let Some(event) = retire_if_inert(&mut page) {
+                    let _ = events.blocking_send(event);
+                    return;
+                }
+            }
             let wake = immediate.unwrap_or_else(|| {
                 // Lumen's forced host collection is an idle hook, not a task-
                 // boundary hook. A future timer/animation-frame deadline means
@@ -2856,6 +2880,9 @@ mod desktop {
                 })
             });
 
+            if !matches!(wake, Wake::Maintenance) {
+                retirement_check_due = true;
+            }
             // Remember whether this turn started inside the bounded background-service
             // window. A completed rendering opportunity may start that window, but it must
             // not renew an already-expired window indefinitely. Otherwise a continuous
@@ -3482,6 +3509,7 @@ mod desktop {
                     data
                 }),
             env.last_modified,
+            env.fullscreen_supported,
             MainWindowTraces::from_environment(),
         );
         if let Err(error) = eval(&mut engine, &config, "TRust configuration") {
@@ -3576,6 +3604,31 @@ mod desktop {
             images.sort_unstable();
             (links.into(), images.into())
         };
+        // HTML #blocked-on-parser: the parser creates each media element
+        // blocked on the parser; it honors user preferences for automatic
+        // text track selection when the element is popped off the stack of
+        // open elements, before any later parser script runs.
+        let mut parser_media: std::collections::VecDeque<usize> = {
+            let dom = page.dom.borrow();
+            let mut media: Vec<_> = dom
+                .shadow_including_subtree(DOCUMENT)
+                .into_iter()
+                .filter(|&node| {
+                    dom.is_media_element(node) && dom.owner_document(node) == Some(DOCUMENT)
+                })
+                .collect();
+            media.sort_unstable();
+            media.into()
+        };
+        if !parser_media.is_empty() {
+            let ids = page.engine.ctx().make_array(
+                parser_media
+                    .iter()
+                    .map(|&id| Value::Num(id as f64))
+                    .collect(),
+            );
+            let _ = call_trust(&mut page, "parserMediaCreated", &[ids], "parser media");
+        }
         // The parser owns its pending script list independently of the live DOM.
         // An earlier script may detach a later entry while this native list still
         // needs its identity for the preparation/connectedness checks.
@@ -3603,6 +3656,7 @@ mod desktop {
             if !written {
                 process_parser_links(&mut page, &mut parser_links, Some(node));
                 process_parser_images(&mut page, &mut parser_images, Some(node));
+                process_parser_media(&mut page, &mut parser_media, Some(node));
             }
             // Earlier scripts may change a later element before the parser
             // prepares it. The speculative scanner is never authoritative.
@@ -3713,6 +3767,7 @@ mod desktop {
         }
         process_parser_links(&mut page, &mut parser_links, None);
         process_parser_images(&mut page, &mut parser_images, None);
+        process_parser_media(&mut page, &mut parser_media, None);
         let _ = call_trust(&mut page, "parserFinished", &[], "parser EOF");
         checkpoint(&mut page, "parser EOF");
         for node in deferred {
@@ -3776,6 +3831,37 @@ mod desktop {
         let ids = page.engine.ctx().make_array(ids);
         let _ = call_trust(page, "startCreatedImages", &[ids], "parser images");
         checkpoint(page, "parser images");
+    }
+
+    /// Pop the parser-created media elements that the parser closed before
+    /// the script `before` (all of them at the end of parsing): those whose
+    /// start tag precedes it and that do not contain it.
+    fn process_parser_media(
+        page: &mut LumenPage,
+        media: &mut std::collections::VecDeque<usize>,
+        before: Option<usize>,
+    ) {
+        let mut ids = Vec::new();
+        {
+            let dom = page.dom.borrow();
+            while let Some(&element) = media.front() {
+                if let Some(script) = before
+                    && (element > script
+                        || (dom.is_valid(script)
+                            && dom.is_host_including_inclusive_ancestor(element, script)))
+                {
+                    break;
+                }
+                media.pop_front();
+                ids.push(Value::Num(element as f64));
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let ids = page.engine.ctx().make_array(ids);
+        let _ = call_trust(page, "parserMediaPopped", &[ids], "parser media");
+        checkpoint(page, "parser media");
     }
 
     /// Process the parser-inserted links that precede `before` (all of them
@@ -3996,6 +4082,33 @@ mod desktop {
                                 .any(LumenBodyStream::transferring)
                     })
             })
+    }
+
+    /// The `Static` event of a resident document that has become inert: no
+    /// resident work (see `has_resident_work`) and nothing to interact with,
+    /// with its final rendering. Interaction is examined only after the
+    /// cheaper conditions, and the rendering only after both.
+    fn retire_if_inert(page: &mut LumenPage) -> Option<PageEvt> {
+        if has_resident_work(page, false) {
+            return None;
+        }
+        let listeners = listener_ids(page, "clickables");
+        if crate::js::clickable_set_for_dom(&page.dom.borrow(), &listeners).1 {
+            return None;
+        }
+        let (shell, mut rendered, has_interaction) = render_with_observers(page);
+        if has_resident_work(page, has_interaction) {
+            page.render_pending = true;
+            return None;
+        }
+        rendered.direct_actor_nodes = false;
+        let mut outcome = std::mem::take(&mut page.outcome);
+        outcome.elapsed = page.started.elapsed();
+        outcome.rendered = Some(Box::new(rendered));
+        Some(PageEvt::Static {
+            html: static_document_source(page, shell),
+            outcome,
+        })
     }
 
     fn has_resident_work(page: &mut LumenPage, has_interaction: bool) -> bool {
@@ -6844,6 +6957,76 @@ mod desktop {
             })
             .await
             .expect("continuous rendering starved a native page key");
+        }
+
+        #[tokio::test]
+        async fn a_document_whose_work_finishes_after_load_retires_its_actor() {
+            // A zero-delay timer and the selectionchange task of a selection
+            // made during parsing are pending at load. Once they ran, nothing
+            // can render this document again (no interaction, timers, fetches
+            // or rendering work), so the actor sends Static and exits, as it
+            // does for a document inert at load.
+            let html = r#"<p id=p>hi</p><script>
+                setTimeout(() => { document.getElementById('p').textContent = 'timer ran'; }, 0);
+                getSelection().collapse(document.getElementById('p').firstChild, 1);
+            </script>"#;
+            let (_handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let mut updated = false;
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { .. }) => updated = true,
+                        Some(PageEvt::Static { html, outcome }) => {
+                            assert!(updated, "the document was not inert at load");
+                            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                            assert!(html.contains("timer ran"), "{html}");
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("page closed without retiring"),
+                    }
+                }
+                assert!(
+                    events.recv().await.is_none(),
+                    "the retired actor kept sending"
+                );
+            })
+            .await
+            .expect("an idle page kept its actor");
+        }
+
+        #[tokio::test]
+        async fn an_editing_host_keeps_its_actor_resident() {
+            // HTML #editing-host: native editing runs in the page actor, so an
+            // idle document with a contenteditable host (and a selection in
+            // it) is not retired, while the same page without the host is.
+            for (html, resident) in [
+                (
+                    "<div id=e contenteditable>hello</div><script>\
+                     getSelection().collapse(document.getElementById('e').firstChild, 2);</script>",
+                    true,
+                ),
+                (
+                    "<div id=e>hello</div><script>\
+                     getSelection().collapse(document.getElementById('e').firstChild, 2);</script>",
+                    false,
+                ),
+            ] {
+                let (_handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+                let retired = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        match events.recv().await {
+                            Some(PageEvt::Static { .. }) => return true,
+                            Some(_) => {}
+                            None => return false,
+                        }
+                    }
+                })
+                .await
+                .unwrap_or(false);
+                assert_eq!(retired, !resident, "{html}");
+            }
         }
 
         #[tokio::test]
@@ -10206,6 +10389,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_parse_document", 2, host_parse_document),
     ("__dom_create_document", 1, host_create_document),
     ("__dom_document_content_type", 1, host_document_content_type),
+    ("__dom_template_document", 1, host_template_document),
     ("__dom_document_quirks", 1, host_document_quirks),
     ("__dom_document_encoding", 1, host_document_encoding),
     ("__document_decode", 4, host_document_decode),
@@ -10251,6 +10435,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_slot_assign", 2, guarded_slot_assign),
     ("__dom_slot_check", 2, guarded_slot_check),
     ("__dom_slot_signals", 1, host_slot_signals),
+    ("__dom_track_changes", 0, host_track_changes),
+    ("__dom_editable_model", 5, guarded_editable_model),
     ("__dom_move_before", 5, guarded_move_before),
     ("__dom_custom_registry", 3, guarded_custom_registry),
     ("__dom_next", 1, host_next),
@@ -11015,6 +11201,7 @@ node_access_guards! {
     guarded_ce_candidates = host_ce_candidates, [0], Invalidate;
     guarded_input = host_input, [0], Invalidate;
     guarded_computed_style = host_computed_style, [0], Invalidate;
+    guarded_editable_model = host_editable_model, [0, 1, 3], Invalidate;
     guarded_offset_style = host_offset_style, [0], Invalidate;
     guarded_rect = host_rect, [0], Invalidate;
     guarded_svg_geometry = svg_geometry_host::call, [0], Invalidate;
@@ -12946,10 +13133,11 @@ fn main_window_config(
     device_pixel_ratio: f32,
     navigation_timing: serde_json::Value,
     last_modified: Option<f64>,
+    fullscreen_supported: bool,
     traces: MainWindowTraces,
 ) -> String {
     format!(
-        "globalThis.__trust_cfg = {{ url: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {} }};",
+        "globalThis.__trust_cfg = {{ url: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {} }};",
         json_string(response_url.as_str()),
         json_string(crate::http::user_agent()),
         json_string(crate::http::navigator_compatibility_mode().as_str()),
@@ -12969,6 +13157,7 @@ fn main_window_config(
         traces.challenge_messages,
         navigation_timing,
         last_modified.map_or_else(|| String::from("null"), |time| time.to_string()),
+        fullscreen_supported,
     )
 }
 
@@ -13292,6 +13481,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             "secureContext",
             "frameTrace",
             "challengeMessageTrace",
+            "fullscreenSupported",
         ] {
             if let Ok(value) = realm_ctx.member_get(&source_config, name) {
                 realm_ctx.member_set(&config, name, value)?;
@@ -17013,6 +17203,16 @@ fn host_document_content_type(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     Ok(Value::from_engine_text(content_type))
 }
 
+/// Whether the Document is an inert template contents owner document (HTML
+/// #appropriate-template-contents-owner-document): its URL is about:blank.
+fn host_template_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::Bool(
+        host_arg_node(&dom, args, 0).is_some_and(|id| dom.is_template_contents_owner(id)),
+    ))
+}
+
 fn host_document_quirks(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -17513,6 +17713,119 @@ fn host_slot_check(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// With several Window Realms, a Realm takes the slots of its own Documents
 /// (and of Documents no navigable owns): its mutation observer microtask
 /// fires their slotchange events with its own wrappers and listeners.
+/// Native editing's projection of an editing host (see
+/// `dom::editing`): `__dom_editable_model(host, anchorNode, anchorOffset,
+/// focusNode, focusOffset)` returns `[text, segment rows, [placeholder,
+/// offset, …], [anchor offset, focus offset]]`. A null anchor or focus maps
+/// no point. Elements' `display` values are the resolved ones script reads.
+fn host_editable_model(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    sync_css_transitions(ctx);
+    let (host, points) = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let Some(host) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Null);
+        };
+        let point = |node: usize, offset: usize| {
+            let id = host_arg_node(&dom, args, node)?;
+            let offset = args.get(offset).and_then(Value::as_num_opt).unwrap_or(0.0);
+            Some((id, offset.max(0.0) as usize))
+        };
+        (
+            host,
+            [point(1, 2), point(3, 4)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        )
+    };
+    let model = read_layout_dependent_style(ctx, |dom| {
+        dom.editable_model(host, &points, &|id| {
+            dom.is_connected(id)
+                .then(|| dom.cssom_resolved_value(id, "display"))
+                .flatten()
+        })
+    });
+    let mut ids: Vec<usize> = model
+        .segments
+        .chunks(8)
+        .flat_map(|row| [row[3], row[4], row[6]])
+        .filter(|&id| id >= 0.0)
+        .map(|id| id as usize)
+        .collect();
+    let segments = ctx.make_array(model.segments.into_iter().map(Value::Num).collect());
+    let mut placeholders = Vec::with_capacity(model.placeholders.len() * 2);
+    for (node, offset) in model.placeholders {
+        ids.push(node);
+        placeholders.extend([Value::Num(node as f64), Value::Num(offset as f64)]);
+    }
+    let placeholders = ctx.make_array(placeholders);
+    let points = ctx.make_array(
+        model
+            .points
+            .into_iter()
+            .map(|offset| Value::Num(offset as f64))
+            .collect(),
+    );
+    let result = ctx.make_array(vec![
+        Value::from_engine_text(model.text),
+        segments,
+        placeholders,
+        points,
+    ]);
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state
+            .dom_gc
+            .retain(result.clone(), ids, DomGcOwnerKind::IdArray);
+    }
+    Ok(result)
+}
+
+/// HTML #sourcing-out-of-band-text-tracks: take the calling Realm's
+/// recorded track element parent changes as a flat
+/// `[track, media, entered (1 or 0), …]` array, or null when there are none.
+fn host_track_changes(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let caller = ctx.host_job_context();
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let handle = state.dom.clone();
+    let taken = {
+        let mut dom = handle.borrow_mut();
+        if !dom.has_track_changes() {
+            return Ok(Value::Null);
+        }
+        let all = dom.take_track_changes();
+        if state.window_realms.is_empty() {
+            all
+        } else {
+            let (mine, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|&(track, _, _)| {
+                node_window_context(state, &dom, track).is_none_or(|owner| owner == caller)
+            });
+            dom.restore_track_changes(others);
+            mine
+        }
+    };
+    if taken.is_empty() {
+        return Ok(Value::Null);
+    }
+    let mut values = Vec::with_capacity(taken.len() * 3);
+    let mut ids = Vec::with_capacity(taken.len() * 2);
+    for (track, media, entered) in taken {
+        values.extend([
+            Value::Num(track as f64),
+            Value::Num(media as f64),
+            Value::Num(if entered { 1.0 } else { 0.0 }),
+        ]);
+        ids.extend([track, media]);
+    }
+    let array = ctx.make_array(values);
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state
+            .dom_gc
+            .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
+    }
+    Ok(array)
+}
+
 fn host_slot_signals(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let take = matches!(args.first(), Some(Value::Bool(true)));
     let caller = ctx.host_job_context();
@@ -18602,18 +18915,24 @@ fn host_has_frames(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// `node` (argument 0) into `parent` (argument 1), as bits the platform shares with this function:
 /// 1 a live Range may exist, 2 the node's subtree holds a listener-bearing node (see
 /// `host_listener_subtree`), 4 the parent can change slot assignment (see `host_slot_scope`), and
-/// 8/16/32 the node is a `script`, `link` or `base` element. One crossing replaces a query per
-/// step for the common insertion. An unknown node or parent answers every bit.
+/// 8/16/32 the node is a `script`, `link` or `base` element, 64 form-state controls, and 128 a
+/// track element parent change is journaled. One crossing replaces a query per step for the
+/// common insertion. An unknown node or parent answers every bit.
 fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let dom = state.dom.borrow();
     let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
     else {
-        return Ok(Value::Num(127.0));
+        return Ok(Value::Num(255.0));
     };
     let mut effects = 0u32;
     if state.live_ranges.may_have_ranges() {
         effects |= 1;
+    }
+    // HTML #sourcing-out-of-band-text-tracks: a track element parent change
+    // awaits the platform (see `host_track_changes`).
+    if dom.has_track_changes() {
+        effects |= 128;
     }
     if subtree_has_listener_node(&dom, &state.dom_gc.listener_nodes, node) {
         effects |= 2;
@@ -18643,18 +18962,23 @@ fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 
 /// Which of DOM #concept-node-remove's remaining steps can have an effect once the arena removed
 /// `node` (argument 0) from `parent` (argument 1): 1 the node's subtree holds a navigable container
-/// (see `host_has_frames`), 2 a listener-bearing node, and 4 the parent can change slot assignment.
-/// An unknown node or parent answers every bit.
+/// (see `host_has_frames`), 2 a listener-bearing node, 4 the parent can change slot assignment,
+/// 8 form-state controls, and 16 a track element parent change is journaled. An unknown node or
+/// parent answers every bit.
 fn host_removal_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let state = ctx.host_mut::<HostState>().expect("DOM host");
     let dom = state.dom.borrow();
     let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
     else {
-        return Ok(Value::Num(15.0));
+        return Ok(Value::Num(31.0));
     };
     let mut effects = 0u32;
     if dom.shadow_including_subtree_has_frames(node) {
         effects |= 1;
+    }
+    // A track element left a media element (see `host_track_changes`).
+    if dom.has_track_changes() {
+        effects |= 16;
     }
     if subtree_has_listener_node(&dom, &state.dom_gc.listener_nodes, node) {
         effects |= 2;
@@ -26520,6 +26844,776 @@ mod tests {
         }
     }
 
+    /// HTML #serialising-html-fragments (local whatwg/html e5071a20,
+    /// 2026-09-04): comments and processing instructions keep their data
+    /// ("<?target data?>"), a CDATASection is a Text node, elements outside
+    /// the HTML, SVG and MathML namespaces use their qualified name, only an
+    /// HTML element serializes as void, and a void element's own fragment is
+    /// empty. XMLSerializer keeps CDATA sections (DOM Parsing
+    /// #dfn-xml-serializing-a-cdatasection-node).
+    #[test]
+    fn html_fragment_serialization_follows_the_algorithm() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    const d = document.createElement('div');
+                    d.appendChild(document.createComment('a--b->'));
+                    d.appendChild(document.createProcessingInstruction('t', 'd?'));
+                    const xml = new DOMParser().parseFromString('<r><![CDATA[x<y&]]></r>', 'text/xml');
+                    d.appendChild(document.adoptNode(xml.documentElement.firstChild));
+                    const style = document.createElement('style');
+                    style.appendChild(document.adoptNode(xml.createCDATASection('a>b')));
+                    d.appendChild(style);
+                    d.appendChild(document.createElementNS('urn:x', 'p:foo'));
+                    d.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'svg:g'));
+                    d.appendChild(document.createElementNS('urn:y', 'br'));
+                    const br = document.createElement('br');
+                    br.appendChild(document.createTextNode('x'));
+                    const svgStyle = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+                    svgStyle.textContent = 'a>b';
+                    const r = new DOMParser().parseFromString('<r><![CDATA[c]]><?pi d?><!--e--></r>', 'text/xml');
+                    return [d.innerHTML, br.innerHTML, br.outerHTML, svgStyle.outerHTML,
+                        new XMLSerializer().serializeToString(r)].join('|');
+                })()"#
+                ),
+                "<!--a--b->--><?t d??>x&lt;y&amp;<style>a>b</style><p:foo></p:foo><g></g><br></br>\
+                 ||<br>|<style>a&gt;b</style>|<r><![CDATA[c]]><?pi d?><!--e--></r>",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// Web IDL #es-attributes, #es-operations, #es-constants and
+    /// #interface-object: every member of an interface prototype object,
+    /// interface object and namespace object is enumerable except
+    /// "constructor" and symbols, in source order; the interface objects,
+    /// legacy factory functions and namespaces on the global are not.
+    #[test]
+    fn web_idl_members_are_enumerable_and_interface_objects_are_not() {
+        const SCAN: &str = r#"(() => {
+            const ecmascript = new Set(['Object','Function','Array','Number','Boolean','String','Symbol',
+                'Date','Promise','RegExp','Error','AggregateError','EvalError','RangeError','ReferenceError',
+                'SyntaxError','TypeError','URIError','ArrayBuffer','SharedArrayBuffer','DataView','Map','Set',
+                'WeakMap','WeakSet','WeakRef','FinalizationRegistry','Proxy','BigInt','Iterator',
+                'AsyncIterator','SuppressedError','DisposableStack','AsyncDisposableStack','Uint8Array',
+                'Int8Array','Uint16Array','Int16Array','Uint32Array','Int32Array','Float16Array',
+                'Float32Array','Float64Array','BigInt64Array','BigUint64Array','Uint8ClampedArray']);
+            const hidden = [];
+            for (const name of Object.getOwnPropertyNames(globalThis)) {
+                const binding = Object.getOwnPropertyDescriptor(globalThis, name);
+                const C = binding.value;
+                if (typeof C !== 'function' || !/^[A-Z]/.test(name) || ecmascript.has(name)) continue;
+                const prototype = C.prototype;
+                if (!prototype || prototype.constructor !== C) continue;
+                if (binding.enumerable) hidden.push('global ' + name);
+                for (const key of Object.getOwnPropertyNames(prototype))
+                    if (key !== 'constructor' && !key.startsWith('__') &&
+                        !Object.getOwnPropertyDescriptor(prototype, key).enumerable) hidden.push(name + '.' + key);
+                for (const key of Object.getOwnPropertyNames(C))
+                    if (!['length', 'name', 'prototype'].includes(key) &&
+                        !Object.getOwnPropertyDescriptor(C, key).enumerable) hidden.push(name + '.' + key);
+            }
+            return hidden.join(',') || 'none';
+        })()"#;
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(string_value(&mut engine, SCAN), "none", "{tier:?}");
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    const d = (object, key) => Object.getOwnPropertyDescriptor(object, key);
+                    const keys = [];
+                    for (const key in document.createElement('input')) keys.push(key);
+                    return [d(HTMLMediaElement.prototype, 'load').enumerable,
+                        d(HTMLInputElement.prototype, 'value').enumerable,
+                        d(HTMLInputElement.prototype, 'constructor').enumerable,
+                        d(HTMLElement.prototype, Symbol.toStringTag).enumerable,
+                        keys.includes('select') && keys.includes('focus') && keys.includes('appendChild'),
+                        d(globalThis, 'HTMLDivElement').enumerable, d(globalThis, 'Image').enumerable,
+                        d(globalThis, 'console').enumerable, d(globalThis, 'WebAssembly').enumerable,
+                        d(console, 'log').enumerable, d(WebAssembly, 'validate').enumerable,
+                        d(WebAssembly, 'Module').enumerable, d(WebAssembly.Module, 'exports').enumerable,
+                        d(WebAssembly.CompileError.prototype, 'name').enumerable,
+                        d(URL, 'createObjectURL').enumerable, d(Node, 'ELEMENT_NODE').enumerable,
+                        Object.keys(DOMTokenList.prototype).slice(0, 3).join('/')].join();
+                })()"#
+                ),
+                "true,true,false,false,true,false,false,false,false,true,true,false,true,false,true,true,\
+                 add/remove/toggle",
+                "{tier:?}"
+            );
+        }
+        let mut worker = worker_platform_engine();
+        assert_eq!(string_value(&mut worker, SCAN), "none");
+    }
+
+    /// HTML #event-handler-attributes: GlobalEventHandlers belong to
+    /// HTMLElement, SVGElement, MathMLElement, Document and Window (not to
+    /// every Element), and every EventHandler is an enumerable
+    /// [LegacyTreatNonObjectAsNull] accessor whose listener the platform
+    /// adds itself, so author code replacing addEventListener or
+    /// removeEventListener never intercepts it.
+    #[test]
+    fn event_handler_attributes_use_internal_listener_operations() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    const where = name => ['Element', 'HTMLElement', 'SVGElement', 'MathMLElement', 'Document']
+                        .filter(i => Object.prototype.hasOwnProperty.call(globalThis[i].prototype, name)).join('+');
+                    const add = EventTarget.prototype.addEventListener, remove = EventTarget.prototype.removeEventListener;
+                    let intercepted = 0;
+                    EventTarget.prototype.addEventListener = function () { intercepted++; return add.apply(this, arguments); };
+                    EventTarget.prototype.removeEventListener = function () { intercepted++; return remove.apply(this, arguments); };
+                    const div = document.createElement('div');
+                    let fired = 0;
+                    div.onclick = () => { fired++; return false; };
+                    const click = new MouseEvent('click', {cancelable: true});
+                    div.dispatchEvent(click);
+                    div.onclick = null;
+                    div.click();
+                    const object = {handleEvent() {}};
+                    visualViewport.onresize = () => {};
+                    visualViewport.onresize = object;
+                    const objectKept = visualViewport.onresize === object;
+                    visualViewport.onresize = null;
+                    screen.orientation.onchange = object;
+                    const channel = new MessageChannel();
+                    channel.port1.onmessage = object;
+                    channel.port1.onmessage = 5;
+                    new AbortController().signal.onabort = () => {};
+                    EventTarget.prototype.addEventListener = add;
+                    EventTarget.prototype.removeEventListener = remove;
+                    const d = (o, k) => Object.getOwnPropertyDescriptor(o, k);
+                    return [where('onclick'), where('onfullscreenchange'),
+                        'onclick' in document.createElementNS('urn:x', 'x'),
+                        'onclick' in document.createElementNS('http://www.w3.org/1998/Math/MathML', 'mi'),
+                        intercepted, fired, click.defaultPrevented, objectKept,
+                        screen.orientation.onchange === object, channel.port1.onmessage,
+                        d(MessagePort.prototype, 'onmessage').enumerable,
+                        d(AbortSignal.prototype, 'onabort').enumerable,
+                        d(VisualViewport.prototype, 'onresize').enumerable].join();
+                })()"#
+                ),
+                "HTMLElement+SVGElement+MathMLElement+Document,Element+Document,false,true,0,1,true,true,\
+                 true,,true,true,true",
+                "{tier:?}"
+            );
+        }
+        // WorkerGlobalScope's handlers add their listeners through the
+        // platform's own operation too.
+        let mut worker = worker_platform_engine();
+        assert_eq!(
+            string_value(
+                &mut worker,
+                r#"(() => {
+                let intercepted = 0;
+                const add = self.addEventListener;
+                self.addEventListener = function () { intercepted++; return add.apply(this, arguments); };
+                self.onmessage = () => {};
+                self.onerror = {handleEvent() {}};
+                self.addEventListener = add;
+                return [intercepted, typeof self.onerror,
+                    Object.getOwnPropertyDescriptor(self, 'onmessage').enumerable].join();
+            })()"#
+            ),
+            "0,object,true"
+        );
+    }
+
+    /// Run the platform's queued tasks and their microtask checkpoints.
+    fn settle_platform_tasks(engine: &mut lumen::Engine) {
+        run_microtask_checkpoint(engine);
+        eval(
+            engine,
+            "for (let i = 0; i < 1000 && __trust.hasPlatformTask(); i++) __trust.runPlatformTask()",
+            "platform tasks",
+        )
+        .unwrap();
+        run_microtask_checkpoint(engine);
+    }
+
+    /// HTML #the-track-element and #sourcing-out-of-band-text-tracks (local
+    /// whatwg/html e5071a20): the reflected attributes, readyState and
+    /// track; the list of text tracks (track children in tree order, then
+    /// addTextTrack()'s); addtrack/removetrack events; automatic text track
+    /// selection of a default track; and the track processing model, which
+    /// fetches the track URL and parses it with the WebVTT parser (W3C
+    /// WebVTT #file-parsing, local w3c/webvtt@0648025) into VTTCues and
+    /// VTTRegions, then fires load (or error).
+    #[test]
+    fn track_elements_load_webvtt_into_their_text_tracks() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    globalThis.trackLog = [];
+                    const video = document.createElement('video');
+                    document.body.appendChild(video);
+                    video.textTracks.onaddtrack = event => trackLog.push('addtrack:' + (event.track === track.track));
+                    video.textTracks.onchange = () => trackLog.push('change');
+                    const track = document.createElement('track');
+                    track.default = true; track.kind = 'Captions'; track.srclang = 'en';
+                    track.label = 'English'; track.id = 'tid';
+                    const vtt = 'WEBVTT - title\n\nREGION\nid:r1 width:40% lines:2 regionanchor:0%,100% ' +
+                        'viewportanchor:10%,90% scroll:up\n\nSTYLE\n::cue { color: red }\n\nNOTE x\n\n' +
+                        'c1\n00:00.500 --> 00:02.000 region:r1 align:start\nHello <b>world</b>\n\n' +
+                        '00:01:03.250 --> 00:01:04.000 line:-1 position:30%,line-left size:50% vertical:rl\n' +
+                        'Second\nline\n\n00:05.000 --> 00:04.000 line:50%,end bogus:1\nlate\n\n' +
+                        '00:06.000 --> nonsense\ndropped\n';
+                    track.src = 'data:text/vtt,' + encodeURIComponent(vtt);
+                    track.onload = () => trackLog.push('load');
+                    track.onerror = () => trackLog.push('error');
+                    const t = track.track;
+                    trackLog.push([track.readyState, t.mode, t.kind, t.language, t.label, t.id, t.cues === null].join('/'));
+                    video.appendChild(track);
+                    video.addTextTrack('metadata', 'script');
+                    trackLog.push(video.textTracks.length + '/' + (video.textTracks[0] === t) + '/' +
+                        video.textTracks.getTrackById('tid').label + '/' + track.readyState);
+                    return trackLog.join(' ');
+                })()"#
+                ),
+                "0/disabled/captions/en/English/tid/true 2/true/English/0",
+                "{tier:?}"
+            );
+            settle_platform_tasks(&mut engine);
+            settle_platform_tasks(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    const track = document.querySelector('track'), cues = track.track.cues;
+                    const region = cues[0].region;
+                    return [trackLog.join(' '), track.readyState, track.track.mode, cues.length,
+                        Array.from(cues, c => [c.id, c.startTime, c.endTime, JSON.stringify(c.text), c.align,
+                            c.line, c.lineAlign, c.snapToLines, c.position, c.positionAlign, c.size, c.vertical,
+                            c.region === region].join(',')).join(' ; '),
+                        [region.id, region.width, region.lines, region.regionAnchorX, region.regionAnchorY,
+                            region.viewportAnchorX, region.viewportAnchorY, region.scroll].join(','),
+                        cues[0].getCueAsHTML().childNodes.length].join(' | ');
+                })()"#
+                ),
+                "0/disabled/captions/en/English/tid/true 2/true/English/0 addtrack:true addtrack:false change load | \
+                 2 | showing | 3 | \
+                 c1,0.5,2,\"Hello <b>world</b>\",start,auto,start,true,auto,auto,100,,true ; \
+                 ,5,4,\"late\",center,50,end,false,auto,auto,100,,false ; \
+                 ,63.25,64,\"Second\\nline\",center,-1,start,true,30,line-left,50,rl,false | \
+                 r1,40,2,0,100,10,90,up | 2",
+                "{tier:?}"
+            );
+            // Removal fires removetrack; a later default track is not selected
+            // again (the did-perform-automatic-track-selection flag); a script
+            // mode change starts the processing model, and a resource without
+            // the WebVTT signature fails to load.
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    globalThis.trackLog2 = [];
+                    const video = document.querySelector('video'), first = document.querySelector('track');
+                    video.textTracks.onremovetrack = event => trackLog2.push('removetrack:' + (event.track === first.track));
+                    first.remove();
+                    trackLog2.push('length:' + video.textTracks.length);
+                    const second = document.createElement('track');
+                    second.default = true; second.src = 'data:text/plain,nope';
+                    second.onerror = () => trackLog2.push('error:' + second.readyState);
+                    video.appendChild(second);
+                    const odd = document.createElement('track');
+                    odd.setAttribute('kind', 'bogus');
+                    return [odd.kind, odd.track.kind, HTMLTrackElement.LOADED, odd.ERROR, odd.NONE,
+                        odd.LOADING].join();
+                })()"#
+                ),
+                "metadata,metadata,2,3,0,1",
+                "{tier:?}"
+            );
+            settle_platform_tasks(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "(() => { const second = document.querySelector('track');
+                       const mode = second.track.mode; second.track.mode = 'hidden';
+                       return mode + ' ' + trackLog2.join(' '); })()"
+                ),
+                "disabled length:1 removetrack:true",
+                "{tier:?}"
+            );
+            settle_platform_tasks(&mut engine);
+            settle_platform_tasks(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "trackLog2.join(' ') + ' ' + document.querySelector('track').readyState"
+                ),
+                "length:1 removetrack:true error:3 3",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// HTML #blocked-on-parser: a parser-created media element honors user
+    /// preferences when the parser pops it, before a later script runs; the
+    /// parser's insertion of its track queues addtrack.
+    #[test]
+    fn parser_created_tracks_are_selected_before_later_scripts() {
+        let html = "<!doctype html><video><track id=t default kind=captions \
+            src=\"data:text/vtt,WEBVTT%0A%0A00:00.000 --> 00:01.000%0AHi\"></video><pre id=o></pre>\
+            <script>\
+              const t = document.getElementById('t'), o = document.getElementById('o');\
+              const log = ['mode:' + t.track.mode, 'ready:' + t.readyState];\
+              document.querySelector('video').textTracks.addEventListener('addtrack', () => log.push('addtrack'));\
+              t.addEventListener('load', () => { log.push('load:' + t.track.cues[0].text); o.textContent = log.join(','); });\
+            </script>";
+        let (output, outcome) = crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            output.contains("mode:showing,ready:1,addtrack,load:Hi"),
+            "{output}"
+        );
+    }
+
+    /// HTML #the-iframe-element: inserting a connected iframe with
+    /// appendChild/insertBefore/replaceChild first removes it, which
+    /// destroys its child navigable, and the insertion creates a new one
+    /// and processes its attributes again, so it reloads. moveBefore()
+    /// keeps it (see `move_before_keeps_child_navigables_and_scripts`).
+    #[test]
+    fn reinserting_a_connected_iframe_replaces_its_navigable() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut engine = platform_engine_with_body();
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(() => {
+                        globalThis.frameLog = [];
+                        const left = document.createElement('section'), right = document.createElement('section');
+                        document.body.append(left, right);
+                        const frame = document.createElement('iframe');
+                        frame.srcdoc = '<body><script>parent.frameLog.push("run");<\/script>';
+                        frame.onload = () => frameLog.push('load');
+                        left.appendChild(frame);
+                        return 'pending';
+                    })()"#
+                    ),
+                    "pending"
+                );
+                settle_platform_tasks(&mut engine);
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(() => {
+                        const frame = document.querySelector('iframe');
+                        globalThis.firstWindow = frame.contentWindow;
+                        document.querySelectorAll('section')[1].appendChild(frame);
+                        return frameLog.join() + '|' + firstWindow.closed;
+                    })()"#
+                    ),
+                    "run,load|true"
+                );
+                settle_platform_tasks(&mut engine);
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(() => {
+                        const frame = document.querySelector('iframe');
+                        globalThis.secondWindow = frame.contentWindow;
+                        const fresh = secondWindow !== firstWindow;
+                        frame.parentNode.replaceChild(frame, frame);
+                        return [frameLog.join(), fresh, secondWindow.closed].join('|');
+                    })()"#
+                    ),
+                    "run,load,run,load|true|true"
+                );
+                settle_platform_tasks(&mut engine);
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(() => {
+                        const frame = document.querySelector('iframe');
+                        const replaced = frame.contentWindow !== secondWindow;
+                        globalThis.thirdWindow = frame.contentWindow;
+                        document.querySelector('section').moveBefore(frame, null);
+                        return [frameLog.join(), replaced, frame.contentDocument.body.childNodes.length].join('|');
+                    })()"#
+                    ),
+                    "run,load,run,load,run,load|true|1"
+                );
+                settle_platform_tasks(&mut engine);
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        "[frameLog.join(), document.querySelector('iframe').contentWindow === thirdWindow,                           thirdWindow.closed].join('|')"
+                    ),
+                    "run,load,run,load,run,load|true|false"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// HTML #template-contents and #appropriate-template-contents-owner-
+    /// document: a template's contents belong to its node document's inert
+    /// template document (no browsing context, URL about:blank, null custom
+    /// element registry), which owns its own templates' contents too;
+    /// inserting the contents adopts them, and only then do custom elements
+    /// upgrade. An XML document's inert template document is an XML document.
+    #[test]
+    fn template_contents_belong_to_an_inert_owner_document() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    customElements.define('x-a', class extends HTMLElement {});
+                    const XA = customElements.get('x-a');
+                    const t = document.createElement('template');
+                    t.innerHTML = '<span>x</span><template id=n><b></b></template><x-a></x-a>';
+                    const inert = t.content.ownerDocument;
+                    const nested = t.content.querySelector('template');
+                    const imported = document.importNode(t.content, true);
+                    const clone = t.cloneNode(true);
+                    const results = [inert === document, inert.defaultView, inert.URL, inert.contentType,
+                        inert.nodeName, inert === document.createElement('template').content.ownerDocument,
+                        t.content.firstChild.ownerDocument === inert, nested.ownerDocument === inert,
+                        nested.content.ownerDocument === inert, t.content.lastChild instanceof XA,
+                        imported.firstChild.ownerDocument === document, imported.lastChild instanceof XA,
+                        clone.content.ownerDocument === inert, clone.content.lastChild instanceof XA,
+                        inert.createElement('x-a') instanceof XA, inert.customElementRegistry,
+                        inert.createElement('template').content.ownerDocument === inert];
+                    document.body.appendChild(t.content);
+                    results.push(document.body.lastChild instanceof XA,
+                        document.body.lastChild.ownerDocument === document, t.content.childNodes.length);
+                    const adopted = document.adoptNode(document.createElement('template'));
+                    const xml = new DOMParser().parseFromString(
+                        '<root xmlns="http://www.w3.org/1999/xhtml"><template><i/></template></root>',
+                        'application/xhtml+xml');
+                    const xmlTemplate = xml.querySelector('template');
+                    results.push(adopted.content.ownerDocument === inert,
+                        xmlTemplate.content.ownerDocument.contentType,
+                        xmlTemplate.content.ownerDocument === xml, xmlTemplate.content.firstChild.localName,
+                        xml.adoptNode(t).content.ownerDocument === xmlTemplate.content.ownerDocument);
+                    return results.join();
+                })()"#
+                ),
+                "false,,about:blank,text/html,#document,true,true,true,true,false,true,true,true,false,\
+                 false,,true,true,true,0,true,application/xml,false,i,true",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// CSSOM #serialize-a-css-component-value with CSS Color 4
+    /// #resolving-sRGB-values and #serializing-sRGB-values: a declared hex,
+    /// rgb(), hsl() or hwb() color serializes as rgb()/rgba() (alpha to two
+    /// decimals when that round-trips its byte), a named color as its
+    /// lowercase keyword; other properties' hex and sRGB functions too, but
+    /// not identifiers, strings, url() contents or custom properties.
+    #[test]
+    fn declared_colors_serialize_as_srgb_functions() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r##"(() => {
+                    const s = document.createElement('div').style;
+                    const out = [];
+                    for (const value of ['#ff0000', '#00ff0080', '#ABC', 'RED', 'Transparent', 'currentColor',
+                        'rgb(255 0 0 / 50%)', 'rgba(0, 0, 255, .25)', 'hsl(120deg 100% 50%)', 'hwb(0 0% 0%)',
+                        'lab(50% 0 0)']) {
+                        s.color = value; out.push(s.color);
+                    }
+                    s.cssText = 'background: #123456 url("a#b.png"); box-shadow: 1px 1px #0f0; ' +
+                        '--x: #fff; border: 1px solid hsl(0, 100%, 50%)';
+                    out.push(s.backgroundColor, s.backgroundImage, s.boxShadow,
+                        s.getPropertyValue('--x'), s.borderTopColor);
+                    const sheet = new CSSStyleSheet();
+                    sheet.replaceSync('p { color: #0000ff }');
+                    out.push(sheet.cssRules[0].cssText);
+                    return out.join(' | ');
+                })()"##
+                ),
+                "rgb(255, 0, 0) | rgba(0, 255, 0, 0.5) | rgb(170, 187, 204) | red | transparent | \
+                 currentcolor | rgba(255, 0, 0, 0.5) | rgba(0, 0, 255, 0.25) | rgb(0, 255, 0) | \
+                 rgb(255, 0, 0) | lab(50 0 0) | rgb(18, 52, 86) | url(\"a#b.png\") | \
+                 1px 1px rgb(0, 255, 0) | #fff | rgb(255, 0, 0) | p { color: rgb(0, 0, 255); }",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// Fullscreen API #dom-document-fullscreenenabled and
+    /// #dom-element-requestfullscreen: without "fullscreen is supported" (a
+    /// frontend that cannot present fullscreen, such as trust-headless)
+    /// fullscreenEnabled is false and a request fails at once, without
+    /// consuming user activation.
+    #[test]
+    fn fullscreen_is_enabled_only_when_the_frontend_supports_it() {
+        let clock = Rc::new(RealmClock::new());
+        let mut engine = configured_engine_before_prelude(
+            HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
+            DEFAULT_URL,
+        );
+        eval(
+            &mut engine,
+            "globalThis.__trust_cfg.fullscreenSupported = false;",
+            "unsupported fullscreen",
+        )
+        .unwrap();
+        eval_platform_prelude(&mut engine).unwrap();
+        eval(
+            &mut engine,
+            "document.appendChild(document.createElement('html'));
+             globalThis.fullscreenLog = [document.fullscreenEnabled];
+             document.documentElement.requestFullscreen().then(
+                 () => fullscreenLog.push('resolved'), error => fullscreenLog.push(error.name));",
+            "request",
+        )
+        .unwrap();
+        settle_platform_tasks(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "fullscreenLog.join()"),
+            "false,TypeError"
+        );
+        let mut supported = platform_engine();
+        assert_eq!(
+            string_value(&mut supported, "document.fullscreenEnabled"),
+            "true"
+        );
+        // The page configuration carries the frontend's answer.
+        assert!(
+            main_window_config(
+                &url::Url::parse(DEFAULT_URL).unwrap(),
+                crate::layout2::Viewport::new(10.0, 10.0),
+                1.0,
+                serde_json::Value::Null,
+                None,
+                false,
+                MainWindowTraces::default(),
+            )
+            .contains("fullscreenSupported: false")
+        );
+    }
+
+    /// HTML #submit-mailto-headers and #submit-mailto-body: GET mails the
+    /// urlencoded pairs (in the form's encoding, "+" as "%20") as the query;
+    /// POST appends body= with the urlencoded pairs, or for text/plain the
+    /// text/plain body UTF-8 percent-encoded with the path (default) encode
+    /// set; the action's fragment is kept.
+    #[test]
+    fn mailto_form_submission_builds_headers_and_bodies() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"(() => {
+                    const urls = [];
+                    const submit = (method, enctype, action) => {
+                        const form = document.createElement('form');
+                        form.method = method; form.action = action;
+                        if (enctype) form.enctype = enctype;
+                        form.innerHTML = '<input name="a b" value="x+y&z=é"><input name=c value="1 2#">';
+                        document.body.appendChild(form);
+                        form.submit();
+                        urls.push(__trust.takeNavigationRequest()[0]);
+                        form.remove();
+                    };
+                    submit('get', '', 'mailto:a@b?x=1#f');
+                    submit('post', '', 'mailto:a@b?subject=s#f');
+                    submit('post', 'text/plain', 'mailto:a@b');
+                    submit('get', '', 'data:text/plain,abc');
+                    return urls.join('\n');
+                })()"#
+                ),
+                "mailto:a@b?a%20b=x%2By%26z%3D%C3%A9&c=1%202%23#f\n\
+                 mailto:a@b?subject=s&body=a+b=x%2By%26z%3D%C3%A9&c=1+2%23#f\n\
+                 mailto:a@b?body=a%20b=x+y&z=%C3%A9%0D%0Ac=1%202%23%0D%0A\n\
+                 data:text/plain,abc?a+b=x%2By%26z%3D%C3%A9&c=1+2%23",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// HTML #dom-worker and #dom-sharedworker: the script URL is
+    /// encoding-parsed relative to this's relevant settings object, whose
+    /// API base URL is its Document's base URL (here set by a base element),
+    /// not the document's URL.
+    #[test]
+    fn worker_script_urls_resolve_against_the_document_base_url() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let page =
+            url::Url::parse(&format!("http://{}/page/", listener.local_addr().unwrap())).unwrap();
+        let server = runtime.spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(15), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count =
+                        tokio::time::timeout(Duration::from_secs(15), stream.read(&mut bytes))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let head = String::from_utf8_lossy(&request);
+                let body = if head.starts_with("GET /dir/w.js ") {
+                    "postMessage(location.href)"
+                } else {
+                    assert!(head.starts_with("GET /dir/s.js "), "{head}");
+                    "onconnect = event => event.ports[0].postMessage(location.href)"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\
+                     Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            r#"
+            document.appendChild(document.createElement('html'));
+            const head = document.createElement('head');
+            document.documentElement.appendChild(head);
+            const base = document.createElement('base');
+            base.href = '/dir/';
+            head.appendChild(base);
+            globalThis.workerURLs = [];
+            globalThis.dedicated = new Worker('w.js');
+            dedicated.onmessage = event => workerURLs.push('dedicated ' + event.data);
+            dedicated.onerror = event => workerURLs.push('ERROR ' + event.message);
+            globalThis.shared = new SharedWorker('s.js');
+            shared.port.onmessage = event => workerURLs.push('shared ' + event.data);
+            shared.onerror = () => workerURLs.push('ERROR shared');
+            "#,
+            "workers relative to the base URL",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while string_value(&mut engine, "workerURLs.length") != "2" {
+            assert!(
+                Instant::now() < deadline,
+                "workers stalled: {}",
+                string_value(&mut engine, "workerURLs.join('|')")
+            );
+            // Worker replies arrive as host tasks; port messages as platform
+            // tasks.
+            if matches!(
+                engine_call_trust_method(&mut engine, "hasPlatformTask", &[]),
+                Ok(Value::Bool(true))
+            ) {
+                engine_call_trust_method(&mut engine, "runPlatformTask", &[]).unwrap_or_else(
+                    |error| panic!("{}", describe_eval_error(&mut engine, error, "worker task")),
+                );
+            } else if let Ok(Some(task)) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(200), task_rx.recv()).await
+            }) {
+                dispatch_host_task(&mut engine, task).unwrap();
+            }
+            run_microtask_checkpoint(&mut engine);
+        }
+        let origin = page.origin().ascii_serialization();
+        assert_eq!(
+            string_value(&mut engine, "workerURLs.sort().join('|')"),
+            format!("dedicated {origin}/dir/w.js|shared {origin}/dir/s.js")
+        );
+        eval(&mut engine, "dedicated.terminate()", "cleanup").unwrap();
+        runtime.block_on(server).unwrap();
+    }
+
+    /// Native editing (src/dom/editing.rs) projects an editing host in one
+    /// arena walk with tree-order keys: a keystroke in a 15,000-node host
+    /// costs linear time, where the script projection's per-node sibling
+    /// index lookups had made it quadratic (seconds). The edit itself is
+    /// unchanged.
+    #[test]
+    fn native_editing_in_a_large_host_is_linear() {
+        let mut engine = platform_engine_with_body();
+        eval(
+            &mut engine,
+            r#"
+            const host = document.createElement('div');
+            host.contentEditable = 'true';
+            let markup = '';
+            for (let i = 0; i < 3000; i++) markup += '<p>para <b>bold ' + i + '</b> tail</p>';
+            host.innerHTML = markup;
+            document.body.appendChild(host);
+            globalThis.editor = host;
+            __trust.focusPage(host.__id);
+            getSelection().collapse(host.children[1500].firstChild, 2);
+            "#,
+            "large editing host",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = string_value(
+            &mut engine,
+            "__trust.editableKeyDefault(null, 'X', false, false, false, false);
+             __trust.editableKeyDefault(null, 'Backspace', false, false, false, false);
+             __trust.editableKeyDefault(null, 'Y', false, false, false, false);
+             const state = JSON.parse(__trust.editableState());
+             [editor.children[1500].textContent, state.selection.start, state.text.length].join('|')",
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(result, "paYra bold 1500 tail|28893|58890");
+        let bound = Duration::from_secs(if cfg!(debug_assertions) { 30 } else { 3 });
+        assert!(elapsed < bound, "three keystrokes took {elapsed:?}");
+    }
+
     /// A move runs no insertion or removing steps: a child navigable keeps
     /// its Document and Window and an already started script does not run
     /// again.
@@ -28714,7 +29808,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 232, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 235, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -28725,7 +29819,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 232);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 235);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -37564,7 +38658,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             string_value(&mut engine, "colorSupportResult"),
-            "true|true|false|false|white|lab(50% 0 0)"
+            "true|true|false|false|white|lab(50 0 0)"
         );
     }
 
@@ -44197,7 +45291,9 @@ mod tests {
                 const a=document.createElement('iframe'), b=document.createElement('iframe');
                 body.appendChild(a); body.appendChild(b);
                 const aw=a.contentWindow, bw=b.contentWindow, order=[], times=[];
-                body.insertBefore(b,a);
+                // A move keeps b's navigable (insertBefore() would replace
+                // it, HTML #the-iframe-element) while reordering the frames.
+                body.moveBefore(b,a);
                 aw.requestAnimationFrame(()=>order.push('retired'));
                 bw.requestAnimationFrame(t=>{
                     order.push('b'); times.push(bw.performance.timeOrigin+t);

@@ -21,11 +21,12 @@
 //!
 //! Almost every node has its node document's registry, so only differences
 //! are stored. The default of a node in template contents is null: HTML
-//! gives template contents an inert "template contents owner document"
-//! without a registry, which this arena does not materialize (template
-//! contents share the template's node document). Trees that conceptually
-//! belong to such a document are tracked by their roots, and moving a node
-//! into or out of one runs the registry steps of DOM's adopt algorithm.
+//! gives template contents an inert "appropriate template contents owner
+//! document" (#appropriate-template-contents-owner-document), a Document
+//! without a browsing context and so without a registry. The arena keeps
+//! each Document's associated inert template document here, and moving a
+//! node into or out of one (an adoption) runs the registry steps of DOM's
+//! adopt algorithm.
 
 use super::*;
 
@@ -50,12 +51,10 @@ impl CeRegistry {
     }
 }
 
-/// A node's conceptual node document: its arena node document, or an inert
-/// template contents owner document.
+/// A node's node document, whose registry is its nodes' default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RegistryContext {
     document: NodeId,
-    inert: bool,
 }
 
 #[derive(Default)]
@@ -65,9 +64,12 @@ pub(crate) struct State {
     /// Documents whose registry differs from the default: null, or the
     /// Window's global registry for a Document with a browsing context.
     documents: FxHashMap<NodeId, CeRegistry>,
-    /// Roots of trees that belong to an inert template contents owner
-    /// document: template contents, and copies cloned from them.
-    inert_roots: FxHashSet<NodeId>,
+    /// HTML #appropriate-template-contents-owner-document: each Document's
+    /// associated inert template document.
+    template_documents: FxHashMap<NodeId, NodeId>,
+    /// The Documents that algorithm created ("a Document created by this
+    /// algorithm"), which own the contents of their own templates.
+    inert_documents: FxHashSet<NodeId>,
     /// Whether any shadow root has an explicit registry.
     explicit_shadows: bool,
     /// Whether any Document has a scoped registry.
@@ -78,18 +80,20 @@ impl State {
     pub(super) fn retained_bytes(&self) -> usize {
         self.elements.capacity() * std::mem::size_of::<(NodeId, CeRegistry)>()
             + self.documents.capacity() * std::mem::size_of::<(NodeId, CeRegistry)>()
-            + self.inert_roots.capacity() * std::mem::size_of::<NodeId>()
+            + self.template_documents.capacity() * std::mem::size_of::<(NodeId, NodeId)>()
+            + self.inert_documents.capacity() * std::mem::size_of::<NodeId>()
     }
 
-    pub(super) fn inert_roots_remove(&mut self, root: NodeId) {
-        self.inert_roots.remove(&root);
-    }
-
-    /// Drop the associations of retired identities.
+    /// Drop the associations of retired identities. An inert template
+    /// document lives while a node it owns (or its wrapper) does; once it is
+    /// gone, its Document gets a new one when another template needs it,
+    /// which no script can distinguish.
     pub(super) fn retain(&mut self, valid: &dyn Fn(NodeId) -> bool) {
         self.elements.retain(|&id, _| valid(id));
         self.documents.retain(|&id, _| valid(id));
-        self.inert_roots.retain(|&id| valid(id));
+        self.template_documents
+            .retain(|&document, inert| valid(document) && valid(*inert));
+        self.inert_documents.retain(|&id| valid(id));
         macro_rules! shrink {
             ($($map:expr),+) => {$(
                 if $map.capacity() > $map.len().saturating_mul(4).max(64) {
@@ -97,7 +101,12 @@ impl State {
                 }
             )+};
         }
-        shrink!(self.elements, self.documents, self.inert_roots);
+        shrink!(
+            self.elements,
+            self.documents,
+            self.template_documents,
+            self.inert_documents
+        );
     }
 }
 
@@ -131,49 +140,49 @@ impl Dom {
             .insert(document, CeRegistry::Global);
     }
 
-    /// Whether `id` is in a tree that belongs to an inert template contents
-    /// owner document (following shadow roots to their hosts).
-    fn in_inert_tree(&self, id: NodeId) -> bool {
-        let roots = &self.ce_registries.inert_roots;
-        if roots.is_empty() {
-            return false;
+    /// HTML #appropriate-template-contents-owner-document of `document`:
+    /// itself when that algorithm created it; otherwise its associated inert
+    /// template document, created on first use as a Document without a
+    /// browsing context (so without a custom element registry, scripting or
+    /// fully active state) of the same type, HTML or XML.
+    pub(crate) fn appropriate_template_contents_owner(&mut self, document: NodeId) -> NodeId {
+        if self.ce_registries.inert_documents.contains(&document) {
+            return document;
         }
-        let mut current = id;
-        loop {
-            if roots.contains(&current) {
-                return true;
-            }
-            let Some(node) = self.nodes.get(current) else {
-                return false;
-            };
-            if matches!(node.data, NodeData::Document) {
-                return false;
-            }
-            match node
-                .parent
-                .or_else(|| self.shadow_hosts.get(&current).copied())
-            {
-                Some(next) => current = next,
-                None => return false,
-            }
+        if let Some(&inert) = self.ce_registries.template_documents.get(&document)
+            && self.is_valid(inert)
+        {
+            return inert;
         }
+        let content_type = if self.is_xml_document(document) {
+            "application/xml"
+        } else {
+            "text/html"
+        };
+        let inert = self.create_document(content_type);
+        self.ce_registries.inert_documents.insert(inert);
+        self.ce_registries
+            .template_documents
+            .insert(document, inert);
+        inert
+    }
+
+    /// Whether `document` is an inert template contents owner document.
+    pub(crate) fn is_template_contents_owner(&self, document: NodeId) -> bool {
+        self.ce_registries.inert_documents.contains(&document)
     }
 
     pub(super) fn registry_context(&self, id: NodeId) -> RegistryContext {
         RegistryContext {
             document: self.nodes[id].owner_document,
-            inert: self.in_inert_tree(id),
         }
     }
 
     /// The registry a node in `context` has unless it records another one:
-    /// its (conceptual) node document's registry.
+    /// its node document's registry (null for an inert template document,
+    /// which has no browsing context).
     fn default_registry(&self, context: RegistryContext) -> CeRegistry {
-        if context.inert {
-            CeRegistry::Null
-        } else {
-            self.document_registry(context.document)
-        }
+        self.document_registry(context.document)
     }
 
     /// DOM #element-custom-element-registry.
@@ -282,23 +291,6 @@ impl Dom {
         self.ce_registries.explicit_shadows |= data.registry.is_some() || data.keep_registry_null;
     }
 
-    /// Template contents (HTML #template-contents) belong to an inert
-    /// document without a custom element registry.
-    pub(super) fn note_template_contents(&mut self, contents: NodeId) {
-        self.ce_registries.inert_roots.insert(contents);
-    }
-
-    /// A copy of a node from an inert tree is a detached root in that inert
-    /// document (DOM #concept-node-clone with the node's node document).
-    fn note_inert_copy(&mut self, root: NodeId) {
-        self.ce_registries.inert_roots.insert(root);
-    }
-
-    /// `root` was adopted into a Document (DOM #concept-node-adopt).
-    pub(super) fn leave_inert_document(&mut self, root: NodeId) {
-        self.ce_registries.inert_roots.remove(&root);
-    }
-
     /// Before `child` is inserted: the conceptual document whose registry
     /// steps may have to run, when any node records a registry.
     pub(super) fn registry_context_before_insertion(
@@ -317,9 +309,6 @@ impl Dom {
         child: NodeId,
         before: Option<RegistryContext>,
     ) {
-        if !self.ce_registries.inert_roots.is_empty() && self.nodes[child].parent.is_some() {
-            self.ce_registries.inert_roots.remove(&child);
-        }
         if let Some(old) = before {
             let new = self.registry_context(child);
             if new != old {
@@ -470,7 +459,6 @@ impl Dom {
                 id != document
                     && self.nodes[id].owner_document == document
                     && self.tree_scope(id) != document
-                    && !self.in_inert_tree(id)
             })
             .collect();
         for id in outside {
@@ -676,20 +664,14 @@ impl Dom {
         fallback: CeRegistry,
     ) -> (CloneRegistries, bool) {
         let source_context = self.registry_context(source);
-        let copy_inert = document.is_none() && source_context.inert;
         let copy_document = document.unwrap_or(source_context.document);
-        let document_registry = if copy_inert {
-            CeRegistry::Null
-        } else {
-            self.document_registry(copy_document)
-        };
         (
             CloneRegistries {
                 source_default: self.default_registry(source_context),
-                document: document_registry,
+                document: self.document_registry(copy_document),
                 fallback,
             },
-            copy_inert,
+            self.is_template_contents_owner(copy_document),
         )
     }
 
@@ -739,13 +721,6 @@ impl Dom {
             copy.keep_registry_null = data.keep_registry_null;
         }
         self.ce_registries.explicit_shadows |= data.keep_registry_null;
-    }
-
-    /// A copy of an inert tree's node stays in the inert document.
-    pub(super) fn note_clone_root(&mut self, copy: NodeId, inert: bool) {
-        if inert {
-            self.note_inert_copy(copy);
-        }
     }
 
     /// A cloned Document keeps a scoped registry (DOM #clone-a-single-node,

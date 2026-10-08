@@ -5752,6 +5752,8 @@ pub async fn execute_js_for_device(
         (0, 0),
         storage,
         true,
+        // The terminal presents a fullscreen page by hiding its chrome rows.
+        true,
     )
     .await
 }
@@ -5823,6 +5825,7 @@ pub(crate) fn prefetch_page_scripts(
     }
 }
 
+/// `fullscreen_supported` is the frontend's Fullscreen API #fullscreen-is-supported.
 pub(crate) async fn execute_js_for_window(
     response: Response,
     viewport: (u16, u16),
@@ -5830,6 +5833,7 @@ pub(crate) async fn execute_js_for_window(
     device_pixel_ratio: f32,
     screen_position: (i32, i32),
     storage: crate::js::WebStorage,
+    fullscreen_supported: bool,
 ) -> Response {
     execute_js_with_presentation(
         response,
@@ -5839,10 +5843,12 @@ pub(crate) async fn execute_js_for_window(
         screen_position,
         storage,
         false,
+        fullscreen_supported,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_js_with_presentation(
     mut response: Response,
     viewport: (u16, u16),
@@ -5851,6 +5857,7 @@ async fn execute_js_with_presentation(
     screen_position: (i32, i32),
     storage: crate::js::WebStorage,
     terminal_presentation: bool,
+    fullscreen_supported: bool,
 ) -> Response {
     let device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
         device_pixel_ratio
@@ -6111,6 +6118,7 @@ async fn execute_js_with_presentation(
         last_modified: document_last_modified(&response.url, &response.headers),
         document_encoding,
         content_type: media.clone(),
+        fullscreen_supported,
     };
     // The page actor owns the engine on its own dedicated stack. Its first
     // event is `Static`
@@ -12732,6 +12740,7 @@ mod tests {
                 (0, 0),
                 Default::default(),
                 false,
+                true,
             )
             .await;
             assert_eq!(response.live.is_some(), live, "{inner}");
@@ -12806,6 +12815,7 @@ mod tests {
                 (0, 0),
                 Default::default(),
                 terminal,
+                true,
             )
             .await;
             assert!(
@@ -15627,8 +15637,16 @@ mod tests {
             response.content_type = String::from("text/html");
         }
         let mut response = if std::env::var_os("TRUST_BROWSER_GATE_DESKTOP").is_some() {
-            execute_js_for_window(response, viewport, (8, 16), 1.0, (0, 0), Default::default())
-                .await
+            execute_js_for_window(
+                response,
+                viewport,
+                (8, 16),
+                1.0,
+                (0, 0),
+                Default::default(),
+                true,
+            )
+            .await
         } else {
             execute_js(response, viewport, (8, 16), Default::default()).await
         };

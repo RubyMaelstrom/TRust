@@ -618,6 +618,9 @@ struct WindowEnvironment {
     viewport: CssSize,
     device_pixel_ratio: f32,
     screen_position: (i32, i32),
+    /// Fullscreen API #fullscreen-is-supported: whether this frontend can
+    /// present a page fullscreen (`set_fullscreen_available`).
+    fullscreen_supported: bool,
 }
 
 /// Durable browser/protocol controller shared by native frontends.
@@ -780,6 +783,7 @@ impl BrowserController {
                 viewport,
                 device_pixel_ratio: 1.0,
                 screen_position: (0, 0),
+                fullscreen_supported: false,
             })
             .0,
             device_pixel_ratio: 1.0,
@@ -1101,6 +1105,9 @@ impl BrowserController {
     /// API's viewport resize). Without it, page requests fail.
     pub fn set_fullscreen_available(&mut self, available: bool) {
         self.fullscreen_available = available;
+        // Later documents learn it as their "fullscreen is supported".
+        self.window_environment
+            .send_modify(|env| env.fullscreen_supported = available);
     }
 
     /// The next fullscreen change the frontend must present. Answer
@@ -1854,6 +1861,7 @@ impl BrowserController {
                                     viewport,
                                     device_pixel_ratio,
                                     screen_position,
+                                    fullscreen_supported,
                                 } = *window_environment.borrow();
                                 let size = (
                                     viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
@@ -1866,6 +1874,7 @@ impl BrowserController {
                                     device_pixel_ratio,
                                     screen_position,
                                     storage,
+                                    fullscreen_supported,
                                 )
                                 .await;
                                 CoreEvent::GeminiImage {
@@ -3481,6 +3490,7 @@ async fn fetch_protocol_interactive(
             viewport,
             device_pixel_ratio,
             screen_position,
+            fullscreen_supported,
         } = *window_environment.borrow();
         let size = (
             viewport.width.round().clamp(1.0, u16::MAX as f32) as u16,
@@ -3493,6 +3503,7 @@ async fn fetch_protocol_interactive(
             device_pixel_ratio,
             screen_position,
             storage,
+            fullscreen_supported,
         )
         .await;
         return Ok(InteractiveFetch::Document(FetchedDocument::Http(Box::new(
@@ -3560,6 +3571,7 @@ async fn fetch_protocol_interactive(
             viewport,
             device_pixel_ratio,
             screen_position,
+            fullscreen_supported,
         } = *window_environment.borrow();
         let css_viewport = (
             viewport.width.round().clamp(1.0, f32::from(u16::MAX)) as u16,
@@ -3572,6 +3584,7 @@ async fn fetch_protocol_interactive(
             device_pixel_ratio,
             screen_position,
             storage,
+            fullscreen_supported,
         )
         .await;
         Ok(InteractiveFetch::Document(FetchedDocument::Http(Box::new(
@@ -3947,6 +3960,7 @@ mod tests {
             viewport: CssSize::new(960., 640.),
             device_pixel_ratio: 1.,
             screen_position: (0, 0),
+            fullscreen_supported: false,
         });
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -3959,6 +3973,7 @@ mod tests {
                 viewport: CssSize::new(1440., 900.),
                 device_pixel_ratio: 2.,
                 screen_position: (25, 30),
+                fullscreen_supported: false,
             });
             let body = "<!doctype html><script>console.log('GEOMETRY '+innerWidth+' '+innerHeight+' '+devicePixelRatio+' '+screenX+' '+screenY)</script>";
             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
@@ -6147,6 +6162,7 @@ mod whois_tests {
                 viewport: CssSize::new(800.0, 600.0),
                 device_pixel_ratio: 1.0,
                 screen_position: (0, 0),
+                fullscreen_supported: false,
             })
             .1,
             Default::default(),

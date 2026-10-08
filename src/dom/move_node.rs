@@ -143,6 +143,10 @@ impl Dom {
         // HTML img and source moving steps: leaving a picture is a relevant
         // mutation.
         self.note_picture_child_change(old_parent, node);
+        // A track element's parent changes in a move too (HTML
+        // #sourcing-out-of-band-text-tracks is not limited to insertion and
+        // removal).
+        self.note_track_parent_change(old_parent, node, false);
         // Steps 18–19: append, or insert before the reference child.
         let previous = match child {
             Some(child) => self.nodes[child].prev_sibling,
@@ -164,6 +168,7 @@ impl Dom {
         self.touch_content(Some(new_parent), &[node]);
         self.child_collection_changed(new_parent, node, true);
         self.note_picture_child_change(new_parent, node);
+        self.note_track_parent_change(new_parent, node, true);
         if let Some(select) = old_select {
             self.run_selectedness_setting_algorithm(select);
         }

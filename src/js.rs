@@ -181,6 +181,10 @@ pub struct PageEnv {
     /// The response's MIME type essence: an XML MIME type makes the page an
     /// XML document built by the XML parser (HTML #read-xml).
     pub(crate) content_type: String,
+    /// Fullscreen API #fullscreen-is-supported: whether the frontend can
+    /// present this page fullscreen (`document.fullscreenEnabled` and
+    /// `requestFullscreen()` consult it).
+    pub(crate) fullscreen_supported: bool,
 }
 
 impl PageEnv {
@@ -205,6 +209,7 @@ impl PageEnv {
             last_modified: None,
             document_encoding: encoding_rs::UTF_8,
             content_type: String::from("text/html"),
+            fullscreen_supported: true,
         }
     }
 }
