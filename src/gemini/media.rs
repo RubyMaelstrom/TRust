@@ -20,32 +20,168 @@ impl MediaType {
         self.essence.starts_with("image/")
     }
 
+    /// Decodes a text body in its `charset` (UTF-8 by default). While the
+    /// body is `loading`, an incomplete trailing sequence waits for more
+    /// bytes instead of decoding as U+FFFD. A leading byte order mark is
+    /// ignored, as Gemini 0.24.1 "Response bodies" asks of clients.
     pub fn decode(&self, bytes: &[u8], loading: bool) -> Result<String, String> {
-        match self.charset.as_deref().unwrap_or("utf-8") {
-            "utf-8" | "utf8" => {
-                let bytes = if loading {
-                    match std::str::from_utf8(bytes) {
-                        Err(e) if e.error_len().is_none() => &bytes[..e.valid_up_to()],
-                        _ => bytes,
-                    }
-                } else {
-                    bytes
-                };
-                let text = String::from_utf8_lossy(bytes);
-                Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
-            }
-            "us-ascii" | "ascii" => Ok(bytes
-                .iter()
-                .map(|&b| if b < 128 { char::from(b) } else { '\u{fffd}' })
-                .collect()),
-            "iso-8859-1" | "latin1" | "latin-1" => {
-                Ok(bytes.iter().map(|&b| char::from(b)).collect())
-            }
-            charset => Err(format!(
+        let charset = self.charset.as_deref().unwrap_or("utf-8");
+        let text = decode_charset(charset, bytes, loading).ok_or_else(|| {
+            format!(
                 "Unsupported charset: {charset}. Save the original source to decode it elsewhere."
-            )),
+            )
+        })?;
+        Ok(match text.strip_prefix('\u{feff}') {
+            Some(rest) => rest.to_string(),
+            None => text,
+        })
+    }
+}
+
+/// IANA character set names for US-ASCII and ISO-8859-1 (RFC 2046 §4.1.2
+/// defers to the IANA registry). The WHATWG Encoding Standard folds both into
+/// windows-1252, which assigns printable characters to 0x80–0x9F; MIME text
+/// must decode them exactly.
+const US_ASCII: &[&str] = &[
+    "us-ascii",
+    "ascii",
+    "ansi_x3.4-1968",
+    "ansi_x3.4-1986",
+    "iso-ir-6",
+    "iso_646.irv:1991",
+    "iso646-us",
+    "us",
+    "ibm367",
+    "cp367",
+    "csascii",
+];
+const LATIN_1: &[&str] = &[
+    "iso-8859-1",
+    "iso_8859-1",
+    "iso_8859-1:1987",
+    "iso-ir-100",
+    "latin1",
+    "latin-1",
+    "l1",
+    "ibm819",
+    "cp819",
+    "csisolatin1",
+    "iso8859-1",
+    "iso88591",
+];
+
+/// Decodes `bytes` in the IANA-named `charset` (already lowercased), or
+/// `None` when TRust has no decoder for it.
+///
+/// The WHATWG Encoding Standard's label table (encoding_rs) supplies every
+/// other encoding, with three corrections for MIME semantics:
+/// - "UTF-16" and "UTF-32" without an explicit byte order follow the byte
+///   order mark and are otherwise big-endian (RFC 2781 §4.3; Unicode
+///   D99/D101), where WHATWG maps "utf-16" to little-endian.
+/// - ISO-8859 labels that WHATWG resolves to a Windows superset keep
+///   0x80–0x9F as the C1 controls those standards assign.
+/// - Labels that WHATWG maps to its "replacement" encoding are unsupported
+///   rather than one U+FFFD.
+fn decode_charset(charset: &str, bytes: &[u8], loading: bool) -> Option<String> {
+    if US_ASCII.contains(&charset) {
+        return Some(
+            bytes
+                .iter()
+                .map(|&b| if b < 0x80 { char::from(b) } else { '\u{fffd}' })
+                .collect(),
+        );
+    }
+    if LATIN_1.contains(&charset) {
+        return Some(bytes.iter().map(|&b| char::from(b)).collect());
+    }
+    match charset {
+        "utf-16" | "csutf16" => {
+            let (encoding, bom) = match bytes {
+                [0xff, 0xfe, ..] => (encoding_rs::UTF_16LE, 2),
+                [0xfe, 0xff, ..] => (encoding_rs::UTF_16BE, 2),
+                [_] if loading => return Some(String::new()),
+                _ => (encoding_rs::UTF_16BE, 0),
+            };
+            return Some(decode_with(encoding, &bytes[bom..], loading));
+        }
+        "utf-32" | "csutf32" => return Some(decode_utf32(bytes, None, loading)),
+        "utf-32be" | "csutf32be" => return Some(decode_utf32(bytes, Some(true), loading)),
+        "utf-32le" | "csutf32le" => return Some(decode_utf32(bytes, Some(false), loading)),
+        _ => {}
+    }
+    let encoding = encoding_rs::Encoding::for_label_no_replacement(charset.as_bytes())?;
+    let text = decode_with(encoding, bytes, loading);
+    let windows_superset = [
+        (
+            encoding_rs::WINDOWS_1252,
+            &["windows-1252", "cp1252", "x-cp1252"][..],
+        ),
+        (
+            encoding_rs::WINDOWS_1254,
+            &["windows-1254", "cp1254", "x-cp1254"],
+        ),
+        (encoding_rs::WINDOWS_874, &["windows-874", "dos-874"]),
+    ]
+    .iter()
+    .any(|(windows, own_labels)| encoding == *windows && !own_labels.contains(&charset));
+    if !windows_superset {
+        return Some(text);
+    }
+    // Single-byte decoders emit exactly one scalar value per byte.
+    Some(
+        text.chars()
+            .zip(bytes)
+            .map(|(c, &b)| {
+                if (0x80..=0x9f).contains(&b) {
+                    char::from(b)
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
+}
+
+fn decode_with(encoding: &'static encoding_rs::Encoding, bytes: &[u8], loading: bool) -> String {
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut text = String::with_capacity(bytes.len());
+    let mut read = 0;
+    loop {
+        let (result, consumed, _) = decoder.decode_to_string(&bytes[read..], &mut text, !loading);
+        read += consumed;
+        match result {
+            encoding_rs::CoderResult::InputEmpty => return text,
+            encoding_rs::CoderResult::OutputFull => text.reserve(bytes.len() - read + 16),
         }
     }
+}
+
+/// UTF-32 (Unicode D99–D101): `big_endian` is the explicit byte order, or
+/// `None` to follow a byte order mark and default to big-endian.
+fn decode_utf32(bytes: &[u8], big_endian: Option<bool>, loading: bool) -> String {
+    let (big_endian, bytes) = match (big_endian, bytes) {
+        (Some(order), _) => (order, bytes),
+        (None, [0xff, 0xfe, 0, 0, rest @ ..]) => (false, rest),
+        (None, [0, 0, 0xfe, 0xff, rest @ ..]) => (true, rest),
+        (None, _) => (true, bytes),
+    };
+    let whole = bytes.len() - bytes.len() % 4;
+    let mut text: String = bytes[..whole]
+        .chunks_exact(4)
+        .map(|unit| {
+            let unit = [unit[0], unit[1], unit[2], unit[3]];
+            let scalar = if big_endian {
+                u32::from_be_bytes(unit)
+            } else {
+                u32::from_le_bytes(unit)
+            };
+            char::from_u32(scalar).unwrap_or('\u{fffd}')
+        })
+        .collect();
+    if whole < bytes.len() && !loading {
+        text.push('\u{fffd}');
+    }
+    text
 }
 
 fn token(b: u8) -> bool {
@@ -191,6 +327,13 @@ mod tests {
                 .decode(b"data", false)
                 .is_err()
         );
+        assert!(
+            MediaType::parse("text/plain; charset=iso-2022-kr")
+                .unwrap()
+                .decode(b"data", false)
+                .is_err(),
+            "WHATWG's replacement encoding is not a decoder"
+        );
         for invalid in [
             "",
             "text",
@@ -202,5 +345,88 @@ mod tests {
         ] {
             assert!(MediaType::parse(invalid).is_err(), "{invalid}");
         }
+    }
+
+    fn decode(charset: &str, bytes: &[u8], loading: bool) -> Result<String, String> {
+        MediaType::parse(&format!("text/gemini; charset={charset}"))
+            .unwrap()
+            .decode(bytes, loading)
+    }
+
+    #[test]
+    fn mime_charsets_decode_with_their_registered_semantics() {
+        // Legacy multi-byte and single-byte encodings come from the WHATWG
+        // label table.
+        assert_eq!(
+            decode("Shift_JIS", b"\x93\xfa\x96\x7b", false).unwrap(),
+            "日本"
+        );
+        assert_eq!(
+            decode("EUC-KR", b"\xc7\xd1\xb1\xdb", false).unwrap(),
+            "한글"
+        );
+        assert_eq!(
+            decode("GB18030", b"\xd6\xd0\xce\xc4", false).unwrap(),
+            "中文"
+        );
+        assert_eq!(decode("koi8-r", b"\xf0\xd2\xc9", false).unwrap(), "При");
+        assert_eq!(
+            decode("windows-1251", b"\xcf\xf0\xe8", false).unwrap(),
+            "При"
+        );
+        // windows-1252 keeps its printable 0x80–0x9F; ISO-8859-1, ISO-8859-9
+        // and ISO-8859-11 keep the C1 controls their standards assign.
+        assert_eq!(decode("windows-1252", b"\x80", false).unwrap(), "€");
+        assert_eq!(decode("latin1", b"\x80\xe9", false).unwrap(), "\u{80}é");
+        assert_eq!(decode("iso-8859-9", b"\x80\xfe", false).unwrap(), "\u{80}ş");
+        assert_eq!(decode("windows-1254", b"\x80\xfe", false).unwrap(), "€ş");
+        assert_eq!(decode("tis-620", b"\x85\xa1", false).unwrap(), "\u{85}ก");
+        assert_eq!(decode("us-ascii", b"a\xe9", false).unwrap(), "a\u{fffd}");
+        assert_eq!(decode("csASCII", b"ok", false).unwrap(), "ok");
+    }
+
+    #[test]
+    fn unicode_charsets_follow_their_byte_order_rules() {
+        // RFC 2781 §4.3: unmarked "UTF-16" is big-endian; a mark selects the
+        // order and is not content.
+        assert_eq!(decode("UTF-16", b"\x00h\x00i", false).unwrap(), "hi");
+        assert_eq!(
+            decode("UTF-16", b"\xff\xfeh\x00i\x00", false).unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            decode("UTF-16", b"\xfe\xff\x00h\x00i", false).unwrap(),
+            "hi"
+        );
+        assert_eq!(decode("UTF-16LE", b"h\x00i\x00", false).unwrap(), "hi");
+        assert_eq!(decode("UTF-16BE", b"\xfe\xff\x00h", false).unwrap(), "h");
+        assert_eq!(decode("UTF-32", b"\x00\x00\x00h", false).unwrap(), "h");
+        assert_eq!(
+            decode("UTF-32", b"\xff\xfe\x00\x00h\x00\x00\x00", false).unwrap(),
+            "h"
+        );
+        assert_eq!(
+            decode("UTF-32LE", b"\x00\xf6\x01\x00", false).unwrap(),
+            "😀"
+        );
+        assert_eq!(
+            decode("UTF-32BE", b"\x00\x11\x00\x00", false).unwrap(),
+            "\u{fffd}"
+        );
+    }
+
+    #[test]
+    fn incomplete_trailing_sequences_wait_while_loading() {
+        for (charset, bytes, partial, done) in [
+            ("utf-8", &b"ok\xe6\x97"[..], "ok", "ok\u{fffd}"),
+            ("shift_jis", b"ok\x93", "ok", "ok\u{fffd}"),
+            ("utf-16be", b"\x00o\x00k\x00", "ok", "ok\u{fffd}"),
+            ("utf-32le", b"o\x00\x00\x00k\x00", "o", "o\u{fffd}"),
+        ] {
+            assert_eq!(decode(charset, bytes, true).unwrap(), partial, "{charset}");
+            assert_eq!(decode(charset, bytes, false).unwrap(), done, "{charset}");
+        }
+        // A lone first byte cannot pick a UTF-16 byte order yet.
+        assert_eq!(decode("utf-16", b"\xff", true).unwrap(), "");
     }
 }

@@ -610,8 +610,11 @@ current behavior and limits; consult the governing standards before changing it.
   masked and excluded from history/stored addresses. Client-certificate consent
   covers host, port, and path subtree, including existing PEM identities. Binary
   saving consumes the original response connection without resubmitting input.
-  Cross-protocol redirects show a link. Support UTF-8, ASCII, and ISO-8859-1;
-  unsupported charsets produce an explicit notice.
+  Cross-protocol redirects show a link. Text decodes in its MIME `charset`
+  (`src/gemini/media.rs`): IANA names through the WHATWG label table, except
+  that US-ASCII/ISO-8859 keep C1 controls and unmarked UTF-16/UTF-32 follow
+  the BOM, else big-endian. Unknown or WHATWG "replacement" charsets produce
+  an explicit notice.
 - Gophers/Gemini currently encrypt without CA, hostname, expiry, or server-pin
   validation, including replacement certificates; Gemini server pins are
   ignored. Client identities require explicit scope consent. HTTPS uses WebPKI;
