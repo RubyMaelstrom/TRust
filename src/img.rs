@@ -133,6 +133,8 @@ pub struct GraphicalAnimationFrame {
 pub struct GraphicalAnimationDecoder {
     frames: image::Frames<'static>,
     loop_count: AnimationLoopCount,
+    /// The resource's metadata orientation, applied to every frame.
+    orientation: image::metadata::Orientation,
 }
 
 impl GraphicalAnimationDecoder {
@@ -146,7 +148,7 @@ impl GraphicalAnimationDecoder {
         };
         let frame = frame.map_err(|error| format!("animation decode: {error}"))?;
         let delay = frame.delay().into();
-        let rgba = frame.into_buffer();
+        let rgba = oriented_rgba(frame.into_buffer(), self.orientation);
         let has_alpha = rgba.pixels().any(|pixel| pixel[3] < 255);
         Ok(Some(GraphicalAnimationFrame {
             image: crate::render::ImageResource {
@@ -508,11 +510,20 @@ pub fn natural_size(bytes: &[u8]) -> Result<(u32, u32), String> {
     }
     match raster_format(bytes) {
         Some(RasterFormat::Codec(format)) => {
+            use image::ImageDecoder as _;
             let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
             reader.limits(raster_limits());
-            let (width, height) = reader
-                .into_dimensions()
+            let mut decoder = reader
+                .into_decoder()
                 .map_err(|error| format!("decode: {error}"))?;
+            let (width, height) = decoder.dimensions();
+            // CSS Images 3: natural dimensions follow the metadata rotation.
+            let transposed = decoder.orientation().is_ok_and(orientation_transposes);
+            let (width, height) = if transposed {
+                (height, width)
+            } else {
+                (width, height)
+            };
             let max_alloc = image::Limits::default().max_alloc.unwrap_or(u64::MAX);
             if width == 0
                 || height == 0
@@ -850,6 +861,14 @@ fn animation_decoder(
     bytes: Arc<[u8]>,
     loop_count_override: Option<AnimationLoopCount>,
 ) -> Result<GraphicalAnimationDecoder, String> {
+    let orientation = metadata_orientation(
+        &bytes,
+        match format {
+            AnimatedRasterFormat::Gif => image::ImageFormat::Gif,
+            AnimatedRasterFormat::Png => image::ImageFormat::Png,
+            AnimatedRasterFormat::WebP => image::ImageFormat::WebP,
+        },
+    );
     match format {
         AnimatedRasterFormat::Gif => {
             let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
@@ -862,6 +881,7 @@ fn animation_decoder(
             Ok(GraphicalAnimationDecoder {
                 frames: decoder.into_frames(),
                 loop_count,
+                orientation,
             })
         }
         AnimatedRasterFormat::Png => {
@@ -877,6 +897,7 @@ fn animation_decoder(
             Ok(GraphicalAnimationDecoder {
                 frames: decoder.into_frames(),
                 loop_count,
+                orientation,
             })
         }
         AnimatedRasterFormat::WebP => {
@@ -902,6 +923,7 @@ fn animation_decoder(
             Ok(GraphicalAnimationDecoder {
                 frames: decoder.into_frames(),
                 loop_count,
+                orientation,
             })
         }
     }
@@ -948,16 +970,63 @@ fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
     reader.limits(raster_limits());
-    match reader.decode() {
-        Ok(image) => Ok((image, mime)),
+    let mut orientation = image::metadata::Orientation::NoTransforms;
+    let decoded = reader
+        .into_decoder()
+        .and_then(|mut decoder| {
+            use image::ImageDecoder as _;
+            orientation = decoder.orientation().unwrap_or(orientation);
+            DynamicImage::from_decoder(decoder)
+        })
+        .map_err(|error| format!("decode: {error}"));
+    let mut image = match decoded {
+        Ok(image) => image,
         // HTML #img-error: an image is broken only when it is corrupted so
         // fatally that its dimensions cannot be obtained. Otherwise it is
         // completely available (the load event fires) and presents the pixel
         // data that decoded, with the rest transparent.
-        Err(error) => decode_damaged_raster(bytes, format)
-            .map(|image| (image, mime))
-            .ok_or_else(|| format!("decode: {error}")),
+        Err(error) => decode_damaged_raster(bytes, format).ok_or(error)?,
+    };
+    image.apply_orientation(orientation);
+    Ok((image, mime))
+}
+
+/// CSS Images 3 #the-image-orientation: `from-image`, the initial value,
+/// rotates and flips an image as its metadata (EXIF in JPEG APP1, PNG eXIf
+/// or the WebP EXIF chunk) specifies, and "all CSS layout and rendering
+/// processes use the image after rotation", natural dimensions included.
+/// TRust does not offer the optional `none` and `<angle>` values (the
+/// property is not a supported declaration), so every image is oriented.
+fn metadata_orientation(bytes: &[u8], format: image::ImageFormat) -> image::metadata::Orientation {
+    use image::ImageDecoder as _;
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(raster_limits());
+    reader
+        .into_decoder()
+        .ok()
+        .and_then(|mut decoder| decoder.orientation().ok())
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// Whether `orientation` exchanges an image's width and height.
+fn orientation_transposes(orientation: image::metadata::Orientation) -> bool {
+    use image::metadata::Orientation::*;
+    matches!(
+        orientation,
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH
+    )
+}
+
+fn oriented_rgba(
+    rgba: image::RgbaImage,
+    orientation: image::metadata::Orientation,
+) -> image::RgbaImage {
+    if orientation == image::metadata::Orientation::NoTransforms {
+        return rgba;
     }
+    let mut image = DynamicImage::ImageRgba8(rgba);
+    image.apply_orientation(orientation);
+    image.into_rgba8()
 }
 
 /// The presentable image of a raster whose header decodes but whose pixel
@@ -2030,6 +2099,9 @@ pub struct CompositeInput<'a> {
     pub off_cells: (u16, u16),
     pub crop: bool,
     pub pixelated: bool,
+    /// The layer's visible part of a larger object box (css-images-3
+    /// #the-object-fit): fit to the clip's source box, then crop.
+    pub clip: Option<crate::layout2::ImageClip>,
 }
 
 /// Alpha-composite an overlap group into ONE `SlicedProtocol` (P8): allocate a
@@ -2098,11 +2170,15 @@ fn composite_canvas(
     let mut canvas = image::RgbaImage::from_pixel(uw, uh, image::Rgba([0, 0, 0, 0]));
     for layer in layers {
         // SVG rasterizes to the box already (`svg_fitted`); a raster decodes at
-        // natural size and is fit to its box below.
+        // natural size and is fit to its box below. A layer showing part of a
+        // larger object is fit to that object's box, then cropped.
+        let fit_box = layer.clip.map_or(layer.box_cells, |clip| {
+            Size::new(clip.source_width, clip.source_height)
+        });
         let (image, info, svg_fitted) =
-            decode_for_box(layer.bytes, picker, layer.box_cells, layer.crop, tint)?;
-        let lw = u32::from(layer.box_cells.width.max(1)) * cw;
-        let lh = u32::from(layer.box_cells.height.max(1)) * ch;
+            decode_for_box(layer.bytes, picker, fit_box, layer.crop, tint)?;
+        let lw = u32::from(fit_box.width.max(1)) * cw;
+        let lh = u32::from(fit_box.height.max(1)) * ch;
         let live_canvas = info.mime == CANVAS_FRAME_MIME;
         let filter = scaling_filter(layer.pixelated, live_canvas);
         let placed: image::RgbaImage = if live_canvas && !layer.pixelated {
@@ -2124,6 +2200,12 @@ fn composite_canvas(
             let dy = i64::from(lh.saturating_sub(scaled.height()) / 2);
             image::imageops::overlay(&mut tile, &scaled, dx, dy);
             tile
+        };
+        let placed = match layer.clip {
+            Some(clip) => {
+                clip_cell_image(picker, DynamicImage::ImageRgba8(placed), clip)?.to_rgba8()
+            }
+            None => placed,
         };
         let ox = i64::from(u32::from(layer.off_cells.0) * cw);
         let oy = i64::from(u32::from(layer.off_cells.1) * ch);
@@ -2323,6 +2405,67 @@ mod tests {
 
     use super::*;
     use image::GenericImageView as _;
+
+    /// A 4×2 PNG, red on the left and blue on the right, carrying an eXIf
+    /// chunk (PNG 3 §11.3.5) with EXIF orientation `exif` before its IDAT.
+    fn oriented_png(exif: u8) -> Vec<u8> {
+        let mut pixels = image::RgbaImage::from_pixel(4, 2, image::Rgba([255, 0, 0, 255]));
+        for y in 0..2 {
+            for x in 2..4 {
+                pixels.put_pixel(x, y, image::Rgba([0, 0, 255, 255]));
+            }
+        }
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        // Big-endian TIFF: one IFD entry, Orientation (0x0112) SHORT.
+        let data = [
+            b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, exif, 0, 0, 0, 0,
+            0, 0,
+        ];
+        let mut chunk = Vec::new();
+        chunk.extend((data.len() as u32).to_be_bytes());
+        let mut crc = flate2::Crc::new();
+        crc.update(b"eXIf");
+        crc.update(&data);
+        chunk.extend(b"eXIf");
+        chunk.extend(data);
+        chunk.extend(crc.sum().to_be_bytes());
+        // After the signature (8) and IHDR (25).
+        png.splice(33..33, chunk);
+        png
+    }
+
+    /// CSS Images 3 #the-image-orientation: `from-image` (the initial value)
+    /// rotates by the image's EXIF orientation, and the natural dimensions
+    /// are the rotated image's.
+    #[test]
+    fn exif_orientation_rotates_images_and_their_natural_size() {
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        // 6: rotate 90° clockwise, so the left (red) columns become the top.
+        let png = oriented_png(6);
+        assert_eq!(natural_size(&png).unwrap(), (2, 4));
+        let (image, _) = decode(&png).unwrap();
+        let image = image.into_rgba8();
+        assert_eq!(image.dimensions(), (2, 4));
+        assert_eq!(image.get_pixel(0, 0).0, red);
+        assert_eq!(image.get_pixel(1, 3).0, blue);
+        let graphical = decode_graphical(&png).unwrap();
+        assert_eq!((graphical.width, graphical.height), (2, 4));
+        // 3: rotate 180°, keeping the dimensions.
+        let png = oriented_png(3);
+        assert_eq!(natural_size(&png).unwrap(), (4, 2));
+        let image = decode(&png).unwrap().0.into_rgba8();
+        assert_eq!(image.get_pixel(0, 0).0, blue);
+        // 1 and invalid values leave the image as encoded.
+        for exif in [1, 0, 9] {
+            let png = oriented_png(exif);
+            assert_eq!(natural_size(&png).unwrap(), (4, 2), "{exif}");
+            assert_eq!(decode(&png).unwrap().0.into_rgba8().get_pixel(0, 0).0, red);
+        }
+    }
 
     fn gif_frames(repeat: Option<image::codecs::gif::Repeat>, frame_count: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -3011,6 +3154,7 @@ mod tests {
                 off_cells: (0, 0),
                 crop: false,
                 pixelated: false,
+                clip: None,
             }
         }
         let base = rgba_png(cw, ch, [255, 0, 0, 255]); // opaque red base
@@ -3042,6 +3186,53 @@ mod tests {
             [0, 0, 255, 255],
             "an opaque overlay covers the base"
         );
+    }
+
+    /// css-images-3 #the-object-fit: a composite layer showing part of an
+    /// object larger than its box is fit to the object box, then cropped.
+    #[test]
+    fn composite_layers_crop_their_part_of_an_oversized_object() {
+        let picker = Picker::halfblocks();
+        let font = picker.font_size();
+        let (cw, ch) = (u32::from(font.width.max(1)), u32::from(font.height.max(1)));
+        // A 2×1-cell object: red on the left, blue on the right.
+        let mut object = image::RgbaImage::from_pixel(2 * cw, ch, image::Rgba([255, 0, 0, 255]));
+        for y in 0..ch {
+            for x in cw..2 * cw {
+                object.put_pixel(x, y, image::Rgba([0, 0, 255, 255]));
+            }
+        }
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgba8(object)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let cell = Size::new(1, 1);
+        let canvas = composite_canvas(
+            &picker,
+            cell,
+            &[CompositeInput {
+                bytes: &bytes,
+                box_cells: cell,
+                off_cells: (0, 0),
+                crop: true,
+                pixelated: true,
+                clip: Some(crate::layout2::ImageClip {
+                    source_width: 2,
+                    source_height: 1,
+                    col: 1,
+                    row: 0,
+                    width: 1,
+                    height: 1,
+                }),
+            }],
+            None,
+        )
+        .unwrap();
+        assert_eq!(canvas.dimensions(), (cw, ch));
+        assert_eq!(canvas.get_pixel(0, 0).0, [0, 0, 255, 255]);
     }
 
     #[test]

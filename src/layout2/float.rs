@@ -99,7 +99,7 @@ struct FloatRect {
 /// BFC root (the ICB, a flex/grid/table item, a `flow-root`/`overflow≠visible`
 /// box, a float's own content); every other block threads the ancestor BFC's
 /// context down.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FloatCtx {
     lefts: Vec<FloatRect>,
     rights: Vec<FloatRect>,

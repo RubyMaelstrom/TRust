@@ -135,6 +135,9 @@ pub(super) struct SelectorDependencies {
     empty: bool,
     text_direction: bool,
     text_placeholder: bool,
+    /// The validity pseudo-classes and `:default` read control values, option
+    /// lists and the controls a form or fieldset owns (HTML #constraints).
+    form_state: bool,
     /// `:indeterminate` radios read their whole group's checkedness (HTML
     /// #selector-indeterminate), so only a child-list change that moves a radio
     /// or a form can restyle an element outside the changed subtree.
@@ -422,12 +425,20 @@ fn relational_compound(compound: &Compound) -> bool {
             .structural
             .iter()
             .any(|structural| matches!(structural, Structural::Nth { of: Some(_), .. }))
-        // Radio groups associate controls across the tree; every other state
-        // reads the element, its ancestry or its own children.
-        && !compound
-            .states
-            .iter()
-            .any(|state| matches!(state, StatePseudo::Indeterminate))
+        // Radio groups and form owners associate controls across the tree;
+        // every other state reads the element, its ancestry or its own
+        // children.
+        && !compound.states.iter().any(|state| {
+            matches!(
+                state,
+                StatePseudo::Indeterminate
+                    | StatePseudo::Valid
+                    | StatePseudo::Invalid
+                    | StatePseudo::UserValid
+                    | StatePseudo::UserInvalid
+                    | StatePseudo::Default
+            )
+        })
         && !compound.target
         && !compound.popover_open
         && !compound.scope
@@ -975,11 +986,17 @@ impl SelectorDependencies {
             // of them changes outside it. :placeholder-shown reads a textarea's
             // own children, handled at that parent below. :defined and
             // :state() read the element's own custom element state.
+            // Validity, :default and :open: a child-list change that can
+            // alter them (option lists, textarea defaults, the controls a
+            // form or fieldset owns) is detected by
+            // `structure_may_change_validity`. A heading's level reads its
+            // ancestors' attributes only, like :lang().
             self.structure_global |= !matches!(
                 state,
                 StatePseudo::AnyLink
                     | StatePseudo::Focus
                     | StatePseudo::FocusWithin
+                    | StatePseudo::FocusVisible
                     | StatePseudo::Checked
                     | StatePseudo::Disabled
                     | StatePseudo::Enabled
@@ -995,6 +1012,27 @@ impl SelectorDependencies {
                     | StatePseudo::PlaceholderShown
                     | StatePseudo::Defined
                     | StatePseudo::Custom(_)
+                    | StatePseudo::Valid
+                    | StatePseudo::Invalid
+                    | StatePseudo::UserValid
+                    | StatePseudo::UserInvalid
+                    | StatePseudo::InRange
+                    | StatePseudo::OutOfRange
+                    | StatePseudo::Default
+                    | StatePseudo::Open
+                    | StatePseudo::Heading(_)
+                    | StatePseudo::Active
+                    | StatePseudo::Media(_)
+            );
+            self.form_state |= matches!(
+                state,
+                StatePseudo::Valid
+                    | StatePseudo::Invalid
+                    | StatePseudo::UserValid
+                    | StatePseudo::UserInvalid
+                    | StatePseudo::InRange
+                    | StatePseudo::OutOfRange
+                    | StatePseudo::Default
             );
             self.indeterminate |= matches!(state, StatePseudo::Indeterminate);
             self.text_direction |= matches!(state, StatePseudo::Dir(_));
@@ -1492,7 +1530,9 @@ impl Dom {
                             && (changed.is_empty()
                                 || changed.iter().any(|&node| self.subtree_has_radio_group_member(node))))
                         && !(dependencies.text_placeholder
-                            && self.tag_name(parent) == Some("textarea")))
+                            && self.tag_name(parent) == Some("textarea"))
+                        && !(dependencies.form_state
+                            && self.structure_may_change_validity(parent, changed)))
                     .then(|| {
                         let (empty_siblings, restyle_children) =
                             dependencies.structure_impact(self, parent);
@@ -1578,11 +1618,12 @@ impl Dom {
                 .borrow()
                 .as_ref()
                 .is_some_and(|(epoch, index)| {
+                    let dependencies = index.selector_dependencies.for_node(self, node);
                     *epoch == self.style_epoch
-                        && !index
-                            .selector_dependencies
-                            .for_node(self, node)
-                            .text_placeholder
+                        && !dependencies.text_placeholder
+                        // HTML #constraints: the value feeds the validity
+                        // states of the control and of its form owner.
+                        && !dependencies.form_state
                 });
         if !independent {
             // Placeholder state must invalidate its selector subjects, even
@@ -1608,6 +1649,11 @@ impl Dom {
         direction_changed: bool,
         character_data: Option<NodeId>,
     ) {
+        // HTML Rendering #bidi-rendering: the `direction` of a `dir=auto`
+        // or `bdi` ancestor follows its contained text's directionality.
+        if direction_changed && let Some(root) = self.auto_direction_root(parent) {
+            self.invalidate_style_subtree(root, false);
+        }
         let stable_shadow_text = character_data.is_some() && !empty_changed && !direction_changed;
         // A shadow host's Text children are slottables (DOM #find-slotables).
         let independent = (self.shadow_root(parent).is_none() || stable_shadow_text) && {
@@ -1619,6 +1665,7 @@ impl Dom {
                         && dependencies.text_direction
                         && self.text_may_change_direction(parent))
                     && !(dependencies.text_placeholder && self.tag_name(parent) == Some("textarea"))
+                    && !(dependencies.form_state && self.text_may_change_validity(parent))
                     && !(empty_changed && dependencies.empty)
             })
         };
@@ -1647,25 +1694,31 @@ impl Dom {
     /// The walk follows the flat tree (`style_parent`), as directionality does
     /// through slots and shadow roots.
     fn text_may_change_direction(&self, parent: NodeId) -> bool {
+        self.auto_direction_root(parent).is_some()
+    }
+
+    /// The nearest `dir=auto` or `bdi` element whose automatic
+    /// directionality text under `parent` can decide.
+    fn auto_direction_root(&self, parent: NodeId) -> Option<NodeId> {
         let mut current = Some(parent);
         while let Some(node) = current {
             match self.attr(node, "dir") {
-                Some(value) if value.eq_ignore_ascii_case("auto") => return true,
+                Some(value) if value.eq_ignore_ascii_case("auto") => return Some(node),
                 Some(value)
                     if value.eq_ignore_ascii_case("ltr") || value.eq_ignore_ascii_case("rtl") =>
                 {
-                    return false;
+                    return None;
                 }
                 _ => {}
             }
             match self.tag_name(node) {
-                Some("bdi") => return true,
-                Some("script" | "style" | "textarea") => return false,
+                Some("bdi") => return Some(node),
+                Some("script" | "style" | "textarea") => return None,
                 _ => {}
             }
             current = self.style_parent(node);
         }
-        false
+        None
     }
 }
 
@@ -4001,5 +4054,132 @@ mod tests {
             std::rc::Rc::ptr_eq(&before, &cached(&dom, "item")),
             "without structural rules an unrelated new sibling preserves matches"
         );
+    }
+
+    #[test]
+    fn validity_pseudo_classes_restyle_controls_and_their_owners() {
+        // HTML #selector-valid, #selector-invalid, #selector-user-invalid,
+        // #selector-out-of-range, #selector-open and #selector-default:
+        // control state that is not an attribute restyles the control, its
+        // fieldset ancestors and its form owner (including one named by a
+        // form attribute), and unrelated child-list changes stay local.
+        let mut dom = Dom::parse_document(
+            "<style>input:invalid{color:red} form:invalid{width:7px} fieldset:valid{height:3px}\
+             select:invalid + b{color:red} input:user-invalid{font-size:20px}\
+             input:out-of-range{line-height:9px} select:open{width:4px} button:default{height:6px}\
+             textarea:invalid{color:red}</style>\
+             <form id=f><fieldset id=fs><input id=a required></fieldset>\
+             <select id=s required><option value=''>pick</option><option>x</option></select>\
+             <b id=after>b</b><input id=n type=number max=5 value=3>\
+             <textarea id=t required></textarea></form>\
+             <input id=outside form=f><button id=late form=f>go</button>\
+             <section id=list></section><aside id=stable><span id=stable_child>s</span></aside>",
+        );
+        let red = |dom: &Dom, id: &str| value_of(dom, id, "color").as_deref() == Some("red");
+        assert!(red(&dom, "a") && red(&dom, "after") && red(&dom, "t"));
+        assert_eq!(value_of(&dom, "f", "width").as_deref(), Some("7px"));
+        assert_ne!(value_of(&dom, "fs", "height").as_deref(), Some("3px"));
+        let a = dom.get_by_id("a").unwrap();
+        dom.set_input_value(a, "x", true);
+        assert!(!red(&dom, "a"));
+        assert_eq!(value_of(&dom, "fs", "height").as_deref(), Some("3px"));
+        assert_matches_full_scan(&dom);
+        // Option selectedness restyles the select's following sibling.
+        let options = dom.select_options(dom.get_by_id("s").unwrap());
+        dom.set_option_selectedness(options[1], Some(true), Some(true));
+        dom.set_option_selectedness(options[0], Some(false), Some(true));
+        assert!(!red(&dom, "after"));
+        // Character data in a textarea is its default value.
+        let t = dom.get_by_id("t").unwrap();
+        let text = dom.create_text("");
+        dom.append(t, text);
+        dom.set_text(text, "words");
+        assert!(!red(&dom, "t"));
+        assert_ne!(value_of(&dom, "f", "width").as_deref(), Some("7px"));
+        assert_matches_full_scan(&dom);
+        // A custom error on a control the form attribute associates.
+        let outside = dom.get_by_id("outside").unwrap();
+        dom.set_custom_validity_error(outside, true);
+        assert_eq!(value_of(&dom, "f", "width").as_deref(), Some("7px"));
+        dom.set_custom_validity_error(outside, false);
+        assert_ne!(value_of(&dom, "f", "width").as_deref(), Some("7px"));
+        // User validity and range state.
+        dom.set_user_validity(a, true);
+        dom.set_input_value(a, "", true);
+        assert_eq!(value_of(&dom, "a", "font-size").as_deref(), Some("20px"));
+        let n = dom.get_by_id("n").unwrap();
+        dom.set_input_value(n, "9", true);
+        assert_eq!(value_of(&dom, "n", "line-height").as_deref(), Some("9px"));
+        // A shown drop-down box.
+        dom.set_picker_open(dom.get_by_id("s").unwrap(), true);
+        assert_eq!(value_of(&dom, "s", "width").as_deref(), Some("4px"));
+        // The form's first submit button, by tree order.
+        assert_eq!(value_of(&dom, "late", "height").as_deref(), Some("6px"));
+        let early = dom.create_element("button");
+        dom.append(dom.get_by_id("f").unwrap(), early);
+        assert_ne!(value_of(&dom, "late", "height").as_deref(), Some("6px"));
+        assert_matches_full_scan(&dom);
+        // A child-list change without controls keeps unrelated matches.
+        let before = cached(&dom, "stable_child");
+        let epoch = dom.style_value_epoch;
+        let list = dom.get_by_id("list").unwrap();
+        let row = dom.create_element("div");
+        dom.set_text(row, "row");
+        dom.append(list, row);
+        dom.detach(row);
+        assert_eq!(
+            dom.style_value_epoch, epoch,
+            "a control-free change expired the document"
+        );
+        assert!(std::rc::Rc::ptr_eq(&before, &cached(&dom, "stable_child")));
+        // Inserting a control the form owns changes the form.
+        let required = dom.create_element("input");
+        dom.set_attr(required, "required", "");
+        dom.append(dom.get_by_id("f").unwrap(), required);
+        assert_eq!(value_of(&dom, "f", "width").as_deref(), Some("7px"));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn radio_group_validity_restyles_every_member() {
+        let mut dom = Dom::parse_document(
+            "<style>input:invalid{color:red} :heading(2){width:5px}</style>\
+             <form><input id=a type=radio name=g required><input id=b type=radio name=g></form>\
+             <section id=sec><h1 id=h>h</h1></section>",
+        );
+        let red = |dom: &Dom, id: &str| value_of(dom, id, "color").as_deref() == Some("red");
+        assert!(red(&dom, "a") && red(&dom, "b"));
+        dom.set_checkedness(dom.get_by_id("b").unwrap(), true, Some(true));
+        assert!(!red(&dom, "a") && !red(&dom, "b"));
+        assert_matches_full_scan(&dom);
+        // HTML #heading-levels-&-offsets: an ancestor's headingoffset.
+        assert_ne!(value_of(&dom, "h", "width").as_deref(), Some("5px"));
+        dom.set_attr(dom.get_by_id("sec").unwrap(), "headingoffset", "1");
+        assert_eq!(value_of(&dom, "h", "width").as_deref(), Some("5px"));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
+    }
+
+    #[test]
+    fn file_selection_restyles_required_file_inputs() {
+        // HTML #file-upload-state-(type=file): a required File Upload input
+        // with no selected files suffers from being missing, which its form
+        // owner's :invalid observes too.
+        let mut dom = Dom::parse_document(
+            "<style>input:invalid{color:red} form:invalid{width:7px}</style>\
+             <form id=f><input id=file type=file required></form>",
+        );
+        let red = |dom: &Dom| value_of(dom, "file", "color").as_deref() == Some("red");
+        let form_invalid = |dom: &Dom| value_of(dom, "f", "width").as_deref() == Some("7px");
+        assert!(red(&dom) && form_invalid(&dom));
+        let file = dom.get_by_id("file").unwrap();
+        assert!(dom.set_input_files(file, vec![String::from("notes.txt")]));
+        assert!(!red(&dom) && !form_invalid(&dom));
+        assert_matches_full_scan(&dom);
+        assert!(dom.set_input_files(file, Vec::new()));
+        assert!(red(&dom) && form_invalid(&dom));
+        assert_matches_full_scan(&dom);
+        assert_style_values_match_cold(&mut dom);
     }
 }

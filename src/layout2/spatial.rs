@@ -167,7 +167,7 @@ impl ScrollTree {
             // Inline wrappers do not create scrollports of their own. Record
             // their placement at their generated pieces, crossing slots and
             // shadow roots through flat-tree ancestry, once per layout.
-            for piece in &line.pieces {
+            for piece in line.laid_pieces() {
                 let mut node = (piece.item.node != NO_NODE).then_some(piece.item.node);
                 while let Some(id) = node {
                     if self.nodes.contains_key(&id) {

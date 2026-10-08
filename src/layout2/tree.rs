@@ -168,6 +168,10 @@ pub(crate) struct TableBox {
     /// The resolved grid edges of the collapsing border model (CSS 2.2
     /// §17.6.2); `None` for separated borders and for an empty grid.
     pub collapsed: Option<Arc<super::table::CollapsedBorders>>,
+    /// Each row's (row, row group) and each column's (column, column group)
+    /// elements, for CSS Tables 3 #visible-track.
+    pub row_boxes: Vec<(Option<NodeId>, Option<NodeId>)>,
+    pub col_boxes: Vec<(Option<NodeId>, Option<NodeId>)>,
 }
 
 /// One cell placed in the grid: its box plus the top-left coordinates and
@@ -1708,6 +1712,8 @@ impl Builder<'_> {
                 nrows,
                 fixed_layout,
                 collapsed,
+                row_boxes,
+                col_boxes,
             })),
             marker: None,
             marker_image: None,

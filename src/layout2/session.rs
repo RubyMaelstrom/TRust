@@ -212,9 +212,18 @@ impl LayoutFragments {
                 flow::FragKind::Line(line) => {
                     bytes +=
                         std::mem::size_of::<flow::LineFrag>() + 2 * std::mem::size_of::<usize>();
+                    let laid = line
+                        .laid
+                        .iter()
+                        .flat_map(|laid| laid.pieces.iter().chain(&laid.atom_boxes));
                     bytes += (line.pieces.capacity() + line.atom_boxes.capacity())
                         * std::mem::size_of::<inline::Piece>();
-                    for piece in line.pieces.iter().chain(&line.atom_boxes) {
+                    bytes += line.laid.as_ref().map_or(0, |laid| {
+                        std::mem::size_of::<flow::LaidLine>()
+                            + (laid.pieces.capacity() + laid.atom_boxes.capacity())
+                                * std::mem::size_of::<inline::Piece>()
+                    });
+                    for piece in line.pieces.iter().chain(&line.atom_boxes).chain(laid) {
                         bytes += piece.item.text.capacity();
                         for value in [
                             &piece.item.terminal_text,

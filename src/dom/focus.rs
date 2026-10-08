@@ -55,11 +55,87 @@ impl Dom {
             self.focused_areas.remove(&document);
         }
         let changed = self.focus_state_changes(old, target);
+        // Selectors 4 #the-focus-visible-pseudo: a focus moved by keyboard
+        // (or into a control that takes keyboard input) indicates focus;
+        // one moved by a pointing device does not. The flag outlives a
+        // focus move to the viewport, for `focus()` to consult.
+        if let Some(target) = target {
+            let indicated = !self.pointer_modality() || self.supports_keyboard_input(target);
+            self.update_control_state(document, |state| state.focus_indicated = indicated);
+        }
         // Like the rendering check, consult a current rule index: without
         // focus rules a change needs no invalidation at all.
         let index = self.style_index();
         if !self.invalidate_live_state(&index, &changed) {
             self.touch();
+        }
+    }
+
+    fn pointer_modality(&self) -> bool {
+        self.element_states
+            .get(&DOCUMENT)
+            .is_some_and(|state| state.pointer_modality)
+    }
+
+    /// Selectors 4 #the-focus-visible-pseudo: an element that supports
+    /// keyboard input (one that would show a virtual keyboard) indicates
+    /// focus however it was focused.
+    fn supports_keyboard_input(&self, id: NodeId) -> bool {
+        match self.tag_name(id) {
+            Some("textarea") => true,
+            Some("input") => !matches!(
+                self.input_type(id).as_str(),
+                "checkbox"
+                    | "radio"
+                    | "button"
+                    | "submit"
+                    | "reset"
+                    | "image"
+                    | "range"
+                    | "color"
+                    | "file"
+                    | "hidden"
+            ),
+            _ => self
+                .style_view()
+                .read_write(id, self.tag_name(id).unwrap_or("")),
+        }
+    }
+
+    /// Whether `document`'s focused area indicates focus.
+    pub(crate) fn focus_indicated(&self, document: NodeId) -> bool {
+        self.element_states
+            .get(&document)
+            .is_some_and(|state| state.focus_indicated)
+    }
+
+    /// Set whether `document`'s focused area indicates focus (HTML
+    /// #dom-focus step 3's `focusVisible`), restyling `:focus-visible`.
+    pub(crate) fn set_focus_indicated(&mut self, document: NodeId, indicated: bool) {
+        if !self.is_valid(document) || self.focus_indicated(document) == indicated {
+            return;
+        }
+        self.update_control_state(document, |state| state.focus_indicated = indicated);
+        if let Some(focused) = self.focused_area(document) {
+            let index = self.style_index();
+            if !self.invalidate_live_state(&index, &[(focused, invalidation::LiveState::Focus)]) {
+                self.touch();
+            }
+        }
+    }
+
+    /// The user's latest interaction modality for the `:focus-visible`
+    /// heuristics: keyboard use makes the current focus indicated; pointer
+    /// use affects the focus moves that follow.
+    pub(crate) fn set_input_modality(&mut self, keyboard: bool) {
+        if self.pointer_modality() == keyboard {
+            self.update_control_state(DOCUMENT, |state| state.pointer_modality = !keyboard);
+        }
+        if keyboard {
+            let documents: Vec<NodeId> = self.focused_areas.keys().copied().collect();
+            for document in documents {
+                self.set_focus_indicated(document, true);
+            }
         }
     }
 
@@ -253,10 +329,12 @@ pub(super) fn complex_uses_focus(complex: &Complex) -> bool {
 }
 
 fn compound_uses_focus(c: &Compound) -> bool {
-    c.states
-        .iter()
-        .any(|s| matches!(s, StatePseudo::Focus | StatePseudo::FocusWithin))
-        || c.nots.iter().flatten().any(complex_uses_focus)
+    c.states.iter().any(|s| {
+        matches!(
+            s,
+            StatePseudo::Focus | StatePseudo::FocusWithin | StatePseudo::FocusVisible
+        )
+    }) || c.nots.iter().flatten().any(complex_uses_focus)
         || c.selects
             .iter()
             .any(|(group, _)| group.iter().any(complex_uses_focus))
@@ -292,6 +370,19 @@ impl StyleView<'_> {
             current = self.state.shadow_hosts.get(&self.tree_scope(node)).copied();
         }
         false
+    }
+
+    /// Selectors 4 #the-focus-visible-pseudo: the focused element itself,
+    /// while its Document indicates focus.
+    pub(super) fn matches_focus_visible(&self, id: NodeId) -> bool {
+        let document = self.nodes.owner_document(id);
+        self.state.focused_areas.get(&document) == Some(&id)
+            && !matches!(self.tag_name(id), Some("iframe" | "frame"))
+            && self
+                .state
+                .element_states
+                .get(&document)
+                .is_some_and(|state| state.focus_indicated)
     }
 
     pub(super) fn matches_focus_within(&self, id: NodeId) -> bool {
@@ -409,5 +500,43 @@ mod tests {
         );
         dom.set_attr(host, "tabindex", "-1");
         assert_eq!(order(&dom), ["after", "before"]);
+    }
+
+    #[test]
+    fn focus_visible_follows_the_input_modality() {
+        // Selectors 4 #the-focus-visible-pseudo heuristics: keyboard focus
+        // and keyboard-input controls indicate focus, pointer focus on other
+        // elements does not, and keyboard use indicates the current focus.
+        let mut dom = Dom::parse_document(
+            "<style>:focus-visible{color:red}</style><button id=b>b</button>\
+             <input id=t><input id=c type=checkbox><a id=l href=#>l</a>",
+        );
+        let red = |dom: &Dom, id: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "color")
+                .as_deref()
+                == Some("red")
+        };
+        let focus = |dom: &mut Dom, id: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            dom.set_focused_area(DOCUMENT, Some(node));
+        };
+        // No pointer interaction yet: focus is indicated.
+        focus(&mut dom, "b");
+        assert!(red(&dom, "b") && dom.matches_focus(dom.get_by_id("b").unwrap()));
+        dom.set_input_modality(false);
+        focus(&mut dom, "c");
+        assert!(!red(&dom, "c") && !red(&dom, "b"));
+        focus(&mut dom, "t");
+        assert!(red(&dom, "t"), "a text input supports keyboard input");
+        focus(&mut dom, "l");
+        assert!(!red(&dom, "l"));
+        dom.set_input_modality(true);
+        assert!(red(&dom, "l"), "keyboard use indicates the current focus");
+        dom.set_focus_indicated(DOCUMENT, false);
+        assert!(!red(&dom, "l"));
+        dom.set_focused_area(DOCUMENT, None);
+        assert!(!red(&dom, "l"));
+        let parsed = SelectorList::parse(":focus-visible").unwrap();
+        assert_eq!(parsed.0[0].specificity(), (0, 1, 0));
     }
 }

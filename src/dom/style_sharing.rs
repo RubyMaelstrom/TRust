@@ -124,6 +124,9 @@ struct ComputationInput {
     parent: Option<Identity<RefCell<computed_cache::Row>>>,
     tag: String,
     ua: UaContext,
+    /// The UA `direction` rule an element's `dir` attribute (or `bdi`,
+    /// `input[type=tel]`) selects (`ComputeView::ua_direction`).
+    direction: Option<bool>,
 }
 
 /// HTML Rendering, Phrasing content / Lists / Tables / Form controls / Details
@@ -494,6 +497,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             parent: parent.as_ref().map(|row| Identity(Rc::downgrade(row))),
             tag: tag.to_owned(),
             ua: UaContext::of(self, id, tag),
+            direction: self.ua_direction(id, tag),
         };
         // Cascading/parent preparation may settle a lazy dependency or observe
         // a newly installed font set. It can retire the provisional row. Only

@@ -389,6 +389,9 @@ pub enum PageCmd {
     /// Native focus navigation. None focuses the document viewport; a hit on
     /// an element resolves to its nearest click-focusable ancestor.
     Focus(Option<usize>),
+    /// `Focus` by sequential (keyboard) focus navigation, which indicates
+    /// focus (Selectors 4 #the-focus-visible-pseudo).
+    KeyboardFocus(Option<usize>),
     Key {
         /// None resolves the currently focused area in the resident page.
         node: Option<usize>,
@@ -418,6 +421,12 @@ pub enum PageCmd {
         node: usize,
         direction: i8,
         click: bool,
+    },
+    /// HTML #selector-open: the frontend showed (`open`) or closed a
+    /// select's drop-down box or an input's picker.
+    PickerOpen {
+        node: usize,
+        open: bool,
     },
     Submit {
         form: usize,

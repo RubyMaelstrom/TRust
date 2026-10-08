@@ -17,6 +17,7 @@ mod command_panel;
 pub mod documents;
 pub mod headless;
 mod hit_index;
+pub(crate) mod matrix3d;
 mod media_controls;
 pub use command_panel::{CommandPanelGeometry, CommandResponse};
 pub(crate) use hit_index::PageHitIndex;
@@ -290,6 +291,10 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+    /// CSS Compositing 2 #mix-blend-mode `plus-lighter`: no blending, and the
+    /// plus-lighter Porter-Duff operator (#porterduffcompositingoperators_plus_lighter)
+    /// in place of source-over: `co = min(1, αs·Cs + αb·Cb)`.
+    PlusLighter,
 }
 
 /// CSS Compositing 1 #porterduffcompositingoperators: how a group's pixels
@@ -1286,7 +1291,8 @@ pub struct CssTransformFrame {
 }
 
 /// One transform function resolved to CSS px and radians, interpolable per
-/// CSS Transforms 1 #interpolation-of-transforms.
+/// CSS Transforms 1 #interpolation-of-transforms and Transforms 2
+/// #interpolation-of-transform-functions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TransformStep {
     Translate(f32, f32),
@@ -1294,6 +1300,27 @@ pub enum TransformStep {
     Scale(f32, f32),
     Skew(f32, f32),
     Matrix(Affine2d),
+    /// `translate3d()` and its derivatives with a z component.
+    Translate3d(f32, f32, f32),
+    /// `scale3d()` and its derivatives with a z factor.
+    Scale3d(f32, f32, f32),
+    /// `rotate3d()` about an axis other than ±z (`rotateX()`, `rotateY()`).
+    Rotate3d([f32; 3], f32),
+    /// `perspective()`: its depth in px (infinite for `none`).
+    Perspective(f32),
+    Matrix3d(matrix3d::Matrix3d),
+}
+
+/// The transform primitives (Transforms 2 #transform-primitives) that
+/// decide which functions interpolate pairwise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransformPrimitive {
+    Translate,
+    Scale,
+    Rotate,
+    Skew,
+    Matrix,
+    Perspective,
 }
 
 impl TransformStep {
@@ -1307,6 +1334,41 @@ impl TransformStep {
             Self::Scale(x, y) => Affine2d::scale(x, y),
             Self::Skew(x, y) => Affine2d([1., y.tan(), x.tan(), 1., 0., 0.]),
             Self::Matrix(matrix) => matrix,
+            three_d => matrix3d::flatten(&three_d.matrix3d(), crate::core::CssPoint::default()),
+        }
+    }
+
+    /// Transforms 2 #mathematical-description.
+    fn matrix3d(self) -> matrix3d::Matrix3d {
+        match self {
+            Self::Translate3d(x, y, z) => matrix3d::translate(x, y, z),
+            Self::Scale3d(x, y, z) => matrix3d::scale(x, y, z),
+            Self::Rotate3d([x, y, z], angle) => matrix3d::rotate(x, y, z, angle),
+            Self::Perspective(depth) => matrix3d::perspective(depth),
+            Self::Matrix3d(matrix) => matrix,
+            two_d => matrix3d::from_affine(two_d.matrix()),
+        }
+    }
+
+    fn three_dimensional(self) -> bool {
+        matches!(
+            self,
+            Self::Translate3d(..)
+                | Self::Scale3d(..)
+                | Self::Rotate3d(..)
+                | Self::Perspective(_)
+                | Self::Matrix3d(_)
+        )
+    }
+
+    fn primitive(self) -> TransformPrimitive {
+        match self {
+            Self::Translate(..) | Self::Translate3d(..) => TransformPrimitive::Translate,
+            Self::Scale(..) | Self::Scale3d(..) => TransformPrimitive::Scale,
+            Self::Rotate(_) | Self::Rotate3d(..) => TransformPrimitive::Rotate,
+            Self::Skew(..) => TransformPrimitive::Skew,
+            Self::Matrix(_) | Self::Matrix3d(_) => TransformPrimitive::Matrix,
+            Self::Perspective(_) => TransformPrimitive::Perspective,
         }
     }
 
@@ -1318,56 +1380,162 @@ impl TransformStep {
             Self::Scale(..) => Self::Scale(1., 1.),
             Self::Skew(..) => Self::Skew(0., 0.),
             Self::Matrix(_) => Self::Matrix(Affine2d::IDENTITY),
+            Self::Translate3d(..) => Self::Translate3d(0., 0., 0.),
+            Self::Scale3d(..) => Self::Scale3d(1., 1., 1.),
+            Self::Rotate3d(axis, _) => Self::Rotate3d(axis, 0.),
+            Self::Perspective(_) => Self::Perspective(f32::INFINITY),
+            Self::Matrix3d(_) => Self::Matrix3d(matrix3d::IDENTITY),
         }
     }
 
-    /// Numeric interpolation of two functions of one type.
-    fn interpolate(self, other: Self, t: f32) -> Option<Affine2d> {
+    /// Transforms 2 #interpolation-of-transform-functions for two functions
+    /// of one primitive: numerically in their common primitive, matrices by
+    /// decomposition. `None` for different primitives.
+    fn interpolate(self, other: Self, t: f32) -> Option<matrix3d::Matrix3d> {
         let mix = |a: f32, b: f32| a + (b - a) * t;
+        if self.primitive() != other.primitive() {
+            return None;
+        }
+        let three_d = self.three_dimensional() || other.three_dimensional();
         Some(match (self, other) {
             (Self::Translate(x0, y0), Self::Translate(x1, y1)) => {
-                Self::Translate(mix(x0, x1), mix(y0, y1)).matrix()
+                matrix3d::translate(mix(x0, x1), mix(y0, y1), 0.)
             }
-            (Self::Rotate(a0), Self::Rotate(a1)) => Self::Rotate(mix(a0, a1)).matrix(),
             (Self::Scale(x0, y0), Self::Scale(x1, y1)) => {
-                Self::Scale(mix(x0, x1), mix(y0, y1)).matrix()
+                matrix3d::scale(mix(x0, x1), mix(y0, y1), 1.)
             }
+            (Self::Rotate(a0), Self::Rotate(a1)) => Self::Rotate(mix(a0, a1)).matrix3d(),
             (Self::Skew(x0, y0), Self::Skew(x1, y1)) => {
-                Self::Skew(mix(x0, x1), mix(y0, y1)).matrix()
+                Self::Skew(mix(x0, x1), mix(y0, y1)).matrix3d()
             }
-            (Self::Matrix(a), Self::Matrix(b)) => interpolate_matrices(a, b, t),
-            _ => return None,
+            (Self::Matrix(a), Self::Matrix(b)) => {
+                matrix3d::from_affine(interpolate_matrices(a, b, t))
+            }
+            _ if self.primitive() == TransformPrimitive::Translate && three_d => {
+                let [x0, y0, z0] = self.translation3d();
+                let [x1, y1, z1] = other.translation3d();
+                matrix3d::translate(mix(x0, x1), mix(y0, y1), mix(z0, z1))
+            }
+            _ if self.primitive() == TransformPrimitive::Scale && three_d => {
+                let [x0, y0, z0] = self.scale3d();
+                let [x1, y1, z1] = other.scale3d();
+                matrix3d::scale(mix(x0, x1), mix(y0, y1), mix(z0, z1))
+            }
+            _ if self.primitive() == TransformPrimitive::Rotate => {
+                // Normalized axes that differ, with both angles non-zero,
+                // interpolate as matrices; otherwise the angle does, about
+                // the non-zero angle's axis ([0, 0, 1] if both are zero).
+                let (axis0, a0) = self.rotation3d();
+                let (axis1, a1) = other.rotation3d();
+                let normalize = |[x, y, z]: [f32; 3]| {
+                    let length = (x * x + y * y + z * z).sqrt();
+                    if length == 0. {
+                        [0., 0., 1.]
+                    } else {
+                        [x / length, y / length, z / length]
+                    }
+                };
+                let (n0, n1) = (normalize(axis0), normalize(axis1));
+                let same = n0.iter().zip(n1).all(|(a, b)| (a - b).abs() < 1e-6);
+                if !same && a0 != 0. && a1 != 0. {
+                    return matrix3d::interpolate(&self.matrix3d(), &other.matrix3d(), t);
+                }
+                let axis = if a0 != 0. {
+                    n0
+                } else if a1 != 0. {
+                    n1
+                } else {
+                    [0., 0., 1.]
+                };
+                let [x, y, z] = axis;
+                matrix3d::rotate(x, y, z, mix(a0, a1))
+            }
+            // `matrix()`, `matrix3d()` and `perspective()` interpolate as
+            // 4x4 matrices (Transforms 2 #matrix-interpolation).
+            _ => return matrix3d::interpolate(&self.matrix3d(), &other.matrix3d(), t),
         })
+    }
+
+    fn translation3d(self) -> [f32; 3] {
+        match self {
+            Self::Translate(x, y) => [x, y, 0.],
+            Self::Translate3d(x, y, z) => [x, y, z],
+            _ => [0.; 3],
+        }
+    }
+
+    fn scale3d(self) -> [f32; 3] {
+        match self {
+            Self::Scale(x, y) => [x, y, 1.],
+            Self::Scale3d(x, y, z) => [x, y, z],
+            _ => [1.; 3],
+        }
+    }
+
+    fn rotation3d(self) -> ([f32; 3], f32) {
+        match self {
+            Self::Rotate(angle) => ([0., 0., 1.], angle),
+            Self::Rotate3d(axis, angle) => (axis, angle),
+            _ => ([0., 0., 1.], 0.),
+        }
     }
 }
 
-/// CSS Transforms 1 #interpolation-of-transforms: a `none` list takes the
-/// other's identity functions; lists of the same function types interpolate
-/// function by function, and other pairs as decomposed matrices.
+#[cfg(test)]
+pub(crate) fn interpolate_transform_steps_for_test(
+    from: &[TransformStep],
+    to: &[TransformStep],
+    t: f32,
+) -> Affine2d {
+    interpolate_transform_steps(from, to, t)
+}
+
+/// CSS Transforms 1 #interpolation-of-transforms: the shorter list (`none`
+/// is empty) is extended with the identity functions matching the longer
+/// list; pairs of one primitive interpolate function by function until the
+/// first pair that does not, after which the remaining functions of each
+/// list are composed into matrices and interpolated by decomposition. The
+/// box is then flattened into its parent's plane (Transforms 2).
 fn interpolate_transform_steps(from: &[TransformStep], to: &[TransformStep], t: f32) -> Affine2d {
-    let identity = |steps: &[TransformStep]| steps.iter().map(|step| step.identity()).collect();
-    let (from, to): (Vec<_>, Vec<_>) = match (from.is_empty(), to.is_empty()) {
-        (true, false) => (identity(to), to.to_vec()),
-        (false, true) => (from.to_vec(), identity(from)),
-        _ => (from.to_vec(), to.to_vec()),
+    let length = from.len().max(to.len());
+    let pad = |steps: &[TransformStep], other: &[TransformStep]| -> Vec<TransformStep> {
+        (0..length)
+            .map(|i| steps.get(i).copied().unwrap_or_else(|| other[i].identity()))
+            .collect()
     };
-    if from.len() == to.len()
-        && let Some(steps) = from
-            .iter()
-            .zip(&to)
-            .map(|(a, b)| a.interpolate(*b, t))
-            .collect::<Option<Vec<_>>>()
-    {
-        return steps
-            .into_iter()
-            .fold(Affine2d::IDENTITY, |matrix, step| matrix.then(step));
+    let (from, to) = (pad(from, to), pad(to, from));
+    let mut matrix = matrix3d::IDENTITY;
+    for index in 0..length {
+        match from[index].interpolate(to[index], t) {
+            Some(step) => matrix = matrix3d::multiply(&matrix, &step),
+            None => {
+                let compose = |steps: &[TransformStep]| {
+                    steps.iter().fold(matrix3d::IDENTITY, |matrix, step| {
+                        matrix3d::multiply(&matrix, &step.matrix3d())
+                    })
+                };
+                let (a, b) = (compose(&from[index..]), compose(&to[index..]));
+                let rest = if matrix3d::is_2d(&a) && matrix3d::is_2d(&b) {
+                    // Two 2D matrices decompose in two dimensions
+                    // (Transforms 1 #decomposing-a-2d-matrix).
+                    let flat =
+                        |m: &matrix3d::Matrix3d| Affine2d([m[0], m[1], m[4], m[5], m[12], m[13]]);
+                    Some(matrix3d::from_affine(interpolate_matrices(
+                        flat(&a),
+                        flat(&b),
+                        t,
+                    )))
+                } else {
+                    matrix3d::interpolate(&a, &b, t)
+                };
+                // A matrix that cannot be decomposed animates discretely.
+                let rest = rest.unwrap_or(if t < 0.5 { a } else { b });
+                matrix = matrix3d::multiply(&matrix, &rest);
+                break;
+            }
+        }
     }
-    let compose = |steps: &[TransformStep]| {
-        steps.iter().fold(Affine2d::IDENTITY, |matrix, step| {
-            matrix.then(step.matrix())
-        })
-    };
-    interpolate_matrices(compose(&from), compose(&to), t)
+    matrix3d::flatten(&matrix, crate::core::CssPoint::default())
 }
 
 /// A 2D matrix decomposed by CSS Transforms 1 #decomposing-a-2d-matrix.
@@ -1422,7 +1590,7 @@ fn decompose_2d(matrix: Affine2d) -> Option<Decomposed2d> {
 
 /// #interpolation-of-decomposed-2d-matrix-values and
 /// #recomposing-to-a-2d-matrix; a singular endpoint animates discretely.
-fn interpolate_matrices(from: Affine2d, to: Affine2d, t: f32) -> Affine2d {
+pub(crate) fn interpolate_matrices(from: Affine2d, to: Affine2d, t: f32) -> Affine2d {
     let (Some(a), Some(b)) = (decompose_2d(from), decompose_2d(to)) else {
         return if t < 0.5 { from } else { to };
     };

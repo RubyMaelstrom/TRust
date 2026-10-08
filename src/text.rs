@@ -189,6 +189,158 @@ pub struct ShapedText {
 }
 
 impl ShapedText {
+    /// CSS Overflow 3 #text-overflow: the visual position, from this text's
+    /// origin, where content hidden to make room for an ellipsis begins.
+    /// Characters (grapheme clusters, the property's unit) that end after
+    /// `limit` are hidden; because clusters tile the run in visual order,
+    /// they form a visual suffix starting at the returned position. With
+    /// `keep_first`, the visually first character survives regardless: the
+    /// first character on a line "must be clipped rather than ellipsed".
+    /// `None` when no character remains before the cut.
+    pub(crate) fn visual_elision_cut(&self, limit: f32, keep_first: bool) -> Option<f32> {
+        const EPSILON: f32 = 0.01;
+        let mut order: Vec<&Cluster> = self.clusters.iter().collect();
+        order.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let first = order.first()?;
+        let cut = order
+            .iter()
+            .find(|cluster| cluster.x + cluster.advance > limit + EPSILON)
+            .map_or(self.advance.max(limit), |cluster| cluster.x);
+        let cut = if keep_first {
+            cut.max(first.x + first.advance)
+        } else {
+            cut
+        };
+        order
+            .iter()
+            .any(|cluster| cluster.x < cut - EPSILON)
+            .then_some(cut)
+    }
+
+    /// The mirror of [`ShapedText::visual_elision_cut`] for an end edge at
+    /// the left (CSS Overflow 3 #text-overflow in a right-to-left line): the
+    /// visual position from which every cluster to its right ends no
+    /// further left than `limit`, or `None` when no cluster would remain.
+    /// `keep_last` keeps the rightmost cluster (the line's first character
+    /// is clipped rather than ellipsed).
+    pub(crate) fn visual_elision_cut_start(&self, limit: f32, keep_last: bool) -> Option<f32> {
+        const EPSILON: f32 = 0.01;
+        let mut order: Vec<&Cluster> = self.clusters.iter().collect();
+        order.sort_by(|a, b| (b.x + b.advance).total_cmp(&(a.x + a.advance)));
+        let last = order.first()?;
+        let cut = order
+            .iter()
+            .find(|cluster| cluster.x < limit - EPSILON)
+            .map_or(limit.min(0.0), |cluster| cluster.x + cluster.advance);
+        let cut = if keep_last { cut.min(last.x) } else { cut };
+        order
+            .iter()
+            .any(|cluster| cluster.x + cluster.advance > cut + EPSILON)
+            .then_some(cut)
+    }
+
+    /// The part of this text painted before `cut` (from
+    /// [`ShapedText::visual_elision_cut`]): its clusters and glyphs at their
+    /// original visual positions, so bidi reordering and shaping are
+    /// unchanged. The text and cluster ranges keep only the surviving
+    /// characters, in logical order.
+    pub(crate) fn visual_prefix(&self, cut: f32) -> ShapedText {
+        const EPSILON: f32 = 0.01;
+        self.visual_part(|x| x < cut - EPSILON, |center| center < cut - EPSILON, 0.0)
+    }
+
+    /// The part of this text painted from `cut` on (from
+    /// [`ShapedText::visual_elision_cut_start`]), moved so that `cut` is its
+    /// origin; otherwise as [`ShapedText::visual_prefix`].
+    pub(crate) fn visual_suffix(&self, cut: f32) -> ShapedText {
+        const EPSILON: f32 = 0.01;
+        self.visual_part(
+            |x| x >= cut - EPSILON,
+            |center| center >= cut - EPSILON,
+            cut,
+        )
+    }
+
+    fn visual_part(
+        &self,
+        keep_cluster: impl Fn(f32) -> bool,
+        keep_glyph: impl Fn(f32) -> bool,
+        origin: f32,
+    ) -> ShapedText {
+        let mut kept: Vec<&Cluster> = self
+            .clusters
+            .iter()
+            .filter(|cluster| keep_cluster(cluster.x))
+            .collect();
+        kept.sort_by_key(|cluster| cluster.text_range.start);
+        let mut text = String::new();
+        // (old start, old end, new start) for each surviving cluster.
+        let mut spans = Vec::with_capacity(kept.len());
+        let mut clusters = Vec::with_capacity(kept.len());
+        for cluster in &kept {
+            let start = text.len();
+            text.push_str(&self.text[cluster.text_range.clone()]);
+            spans.push((cluster.text_range.start, cluster.text_range.end, start));
+            clusters.push(Cluster {
+                text_range: start..text.len(),
+                x: cluster.x - origin,
+                ..(*cluster).clone()
+            });
+        }
+        // A logical offset maps to the surviving text that precedes it.
+        let map = |offset: usize| {
+            spans
+                .iter()
+                .filter(|(start, _, _)| *start < offset)
+                .map(|(start, end, new)| new + (offset.min(*end) - start))
+                .max()
+                .unwrap_or(0)
+        };
+        let runs = self
+            .runs
+            .iter()
+            .filter_map(|run| {
+                let glyphs: Vec<ShapedGlyph> = run
+                    .glyphs
+                    .iter()
+                    .filter(|glyph| keep_glyph(glyph.x + glyph.advance.max(0.0) * 0.5))
+                    .map(|glyph| ShapedGlyph {
+                        x: glyph.x - origin,
+                        ..*glyph
+                    })
+                    .collect();
+                (!glyphs.is_empty()).then(|| ShapedRun {
+                    font: run.font.clone(),
+                    font_size: run.font_size,
+                    color: run.color,
+                    normalized_coords: run.normalized_coords.clone(),
+                    glyphs,
+                    text_range: map(run.text_range.start)..map(run.text_range.end),
+                    rtl: run.rtl,
+                    synth_bold: run.synth_bold,
+                    synth_skew_degrees: run.synth_skew_degrees,
+                })
+            })
+            .collect();
+        let advance = clusters
+            .iter()
+            .map(|cluster| cluster.x + cluster.advance)
+            .fold(0.0f32, f32::max);
+        ShapedText {
+            text,
+            advance,
+            ascent: self.ascent,
+            descent: self.descent,
+            leading: self.leading,
+            line_height: self.line_height,
+            baseline: self.baseline,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
+            runs,
+            clusters,
+        }
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         let ShapedText {
             text,
@@ -1643,6 +1795,53 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CSS Overflow 3 #bidi-ellipsis: the characters hidden for an ellipsis
+    /// are those visually at the end edge, which in a right-to-left run are
+    /// its logically first characters.
+    #[test]
+    fn visual_elision_hides_the_visual_end_of_bidi_text() {
+        // "ab" then the right-to-left run "\u{5d0}\u{5d1}", painted as
+        // a b bet alef.
+        let text = "ab\u{5d0}\u{5d1}".to_string();
+        let cluster = |range: Range<usize>, x: f32, rtl| Cluster {
+            text_range: range,
+            x,
+            advance: 1.0,
+            rtl,
+        };
+        let shaped = ShapedText {
+            text,
+            advance: 4.0,
+            ascent: 1.0,
+            descent: 0.0,
+            leading: 0.0,
+            line_height: 1.0,
+            baseline: 1.0,
+            underline: false,
+            strikethrough: false,
+            runs: Vec::new(),
+            clusters: vec![
+                cluster(0..1, 0.0, false),
+                cluster(1..2, 1.0, false),
+                cluster(2..4, 3.0, true),
+                cluster(4..6, 2.0, true),
+            ],
+        };
+        let cut = shaped.visual_elision_cut(3.0, false).unwrap();
+        assert_eq!(cut, 3.0);
+        let prefix = shaped.visual_prefix(cut);
+        // Alef (logically first in its run, visually last) is hidden.
+        assert_eq!(prefix.text, "ab\u{5d1}");
+        assert_eq!(prefix.advance, 3.0);
+        assert_eq!(prefix.clusters[2].text_range, 2..4);
+        assert_eq!(prefix.clusters[2].x, 2.0);
+        // Nothing fits before the limit, yet the first character stays.
+        assert_eq!(shaped.visual_elision_cut(0.5, false), None);
+        assert_eq!(shaped.visual_elision_cut(0.5, true), Some(1.0));
+        // Everything fits: no character is hidden.
+        assert_eq!(shaped.visual_elision_cut(10.0, false), Some(10.0));
+    }
 
     #[test]
     fn downloaded_regular_face_synthesizes_italic_and_bold() {

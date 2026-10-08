@@ -19,7 +19,7 @@
 use super::*;
 use crate::layout2::value::Vp;
 
-mod values;
+pub(super) mod values;
 use transitions::Easing;
 use values::{Color, Kind, Value};
 

@@ -127,6 +127,7 @@ pub fn connect(
     port: u16,
     size: (u16, u16),
     use_tls: bool,
+    encoding: crate::terminal::Encoding,
 ) -> (Handle, mpsc::Receiver<Event>) {
     let (tx, commands) = mpsc::channel(1024);
     let (events, receiver) = mpsc::channel(32);
@@ -157,13 +158,31 @@ pub fn connect(
                     .send(Event::Connected { peer, tls: true })
                     .await
                     .map_err(|_| String::new())?;
-                run_session(stream, size, commands, sizes, &events, task_queued).await
+                run_session(
+                    stream,
+                    size,
+                    encoding,
+                    commands,
+                    sizes,
+                    &events,
+                    task_queued,
+                )
+                .await
             } else {
                 events
                     .send(Event::Connected { peer, tls: false })
                     .await
                     .map_err(|_| String::new())?;
-                run_session(stream, size, commands, sizes, &events, task_queued).await
+                run_session(
+                    stream,
+                    size,
+                    encoding,
+                    commands,
+                    sizes,
+                    &events,
+                    task_queued,
+                )
+                .await
             }
         };
         // Covers DNS, TCP, TLS, and every pending I/O operation. Dropping the
@@ -201,6 +220,37 @@ pub const LOCAL_SLC: &[(u8, u8)] = &[
     (12, 23),  // EW, ^W
 ];
 
+/// RFC 2066 §2 CHARSET subnegotiation commands.
+mod charset_command {
+    pub const REQUEST: u8 = 1;
+    pub const ACCEPTED: u8 = 2;
+    pub const REJECTED: u8 = 3;
+    pub const TTABLE_IS: u8 = 4;
+    pub const TTABLE_REJECTED: u8 = 5;
+}
+
+/// The IANA character set names this client can encode and decode: the
+/// registered name first, then its registered aliases (case-insensitive).
+fn charset_encoding(name: &[u8]) -> Option<crate::terminal::Encoding> {
+    use crate::terminal::Encoding;
+    let name = std::str::from_utf8(name).ok()?.trim();
+    let is = |names: &[&str]| names.iter().any(|n| n.eq_ignore_ascii_case(name));
+    if is(&["UTF-8", "csUTF8"]) {
+        Some(Encoding::Utf8)
+    } else if is(&["IBM437", "cp437", "437", "csPC8CodePage437"]) {
+        Some(Encoding::Cp437)
+    } else {
+        None
+    }
+}
+
+fn charset_name(encoding: crate::terminal::Encoding) -> &'static [u8] {
+    match encoding {
+        crate::terminal::Encoding::Utf8 => b"UTF-8",
+        crate::terminal::Encoding::Cp437 => b"IBM437",
+    }
+}
+
 struct Protocol {
     parser: Parser,
     options: Options,
@@ -209,10 +259,14 @@ struct Protocol {
     mode: u8,
     ttype: usize,
     disabled_slc: u32,
+    /// The character set both sides encode text in (RFC 2066).
+    encoding: crate::terminal::Encoding,
+    /// This client's CHARSET REQUEST awaiting ACCEPTED or REJECTED.
+    charset_requested: bool,
 }
 
 impl Protocol {
-    fn new(size: (u16, u16)) -> Self {
+    fn new(size: (u16, u16), encoding: crate::terminal::Encoding) -> Self {
         Self {
             parser: Parser::default(),
             options: Options::default(),
@@ -221,6 +275,8 @@ impl Protocol {
             mode: 0,
             ttype: 0,
             disabled_slc: 0,
+            encoding,
+            charset_requested: false,
         }
     }
 
@@ -247,6 +303,13 @@ impl Protocol {
                 }
                 Frame::Negotiation(command, option) => {
                     self.negotiate(command, option, wire, events)
+                }
+                // RFC 2066 §5: either side that sent WILL CHARSET and
+                // received DO may start a subnegotiation.
+                Frame::Subnegotiation(CHARSET, payload)
+                    if self.local(CHARSET) || self.remote(CHARSET) =>
+                {
+                    self.charset(&payload, wire, events)
                 }
                 Frame::Subnegotiation(option, payload) if self.local(option) => {
                     self.suboption(option, &payload, wire, events)
@@ -275,10 +338,10 @@ impl Protocol {
         let supported = if local {
             matches!(
                 option,
-                BINARY | SGA | NAWS | TTYPE | STATUS | TSPEED | NEWENVIRON | LINEMODE
+                BINARY | SGA | NAWS | TTYPE | STATUS | TSPEED | NEWENVIRON | LINEMODE | CHARSET
             )
         } else {
-            matches!(option, BINARY | ECHO | SGA)
+            matches!(option, BINARY | ECHO | SGA | CHARSET)
         };
         let state = if local {
             &mut self.options.local[usize::from(option)]
@@ -317,6 +380,14 @@ impl Protocol {
         if local && option == TTYPE {
             self.ttype = 0;
         }
+        if local && option == CHARSET {
+            self.charset_requested = false;
+            // RFC 2066 §5: a client that knows the user's character set
+            // specifies it once it has sent WILL CHARSET and received DO.
+            if enabled {
+                self.request_charset(wire);
+            }
+        }
         if local && option == LINEMODE {
             self.mode = 0; // RFC 1184 §3: EDIT starts OFF.
             self.disabled_slc = 0;
@@ -331,6 +402,95 @@ impl Protocol {
                 }
                 wire.extend(protocol::subnegotiation(LINEMODE, &slc));
             }
+        }
+    }
+
+    /// RFC 2066 CHARSET REQUEST: the user's character set, then the other
+    /// one this client supports, in order of preference.
+    fn request_charset(&mut self, wire: &mut Vec<u8>) {
+        use crate::terminal::Encoding;
+        let other = match self.encoding {
+            Encoding::Utf8 => Encoding::Cp437,
+            Encoding::Cp437 => Encoding::Utf8,
+        };
+        let mut request = vec![charset_command::REQUEST];
+        for encoding in [self.encoding, other] {
+            request.push(b';');
+            request.extend(charset_name(encoding));
+        }
+        wire.extend(protocol::subnegotiation(CHARSET, &request));
+        self.charset_requested = true;
+    }
+
+    /// RFC 2066 §2 CHARSET subnegotiation messages.
+    fn charset(&mut self, payload: &[u8], wire: &mut Vec<u8>, events: &mut VecDeque<Event>) {
+        let Some((&command, rest)) = payload.split_first() else {
+            return;
+        };
+        match command {
+            charset_command::REQUEST => {
+                // A client answers the server's REQUEST even while its own is
+                // outstanding; the server rejects the client's (§5).
+                // The optional `"[TTABLE ]" <Version>` prefix; a translation
+                // table is never sent in reply, so the version is unused.
+                let list = match rest
+                    .strip_prefix(b"[TTABLE ]")
+                    .or_else(|| rest.strip_prefix(b"[TTABLE]"))
+                {
+                    Some(after) => after.get(1..).unwrap_or_default(),
+                    None => rest,
+                };
+                let names: Vec<&[u8]> = match list.split_first() {
+                    Some((&separator, names)) if separator != IAC => {
+                        names.split(|&byte| byte == separator).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                // A side already using a listed set MUST accept it; otherwise
+                // accept the first set this client supports.
+                let choice = names
+                    .iter()
+                    .find(|name| charset_encoding(name) == Some(self.encoding))
+                    .or_else(|| names.iter().find(|name| charset_encoding(name).is_some()));
+                match choice {
+                    Some(name) => {
+                        let mut reply = vec![charset_command::ACCEPTED];
+                        reply.extend(*name);
+                        wire.extend(protocol::subnegotiation(CHARSET, &reply));
+                        self.set_charset(charset_encoding(name), events);
+                    }
+                    None => wire.extend(protocol::subnegotiation(
+                        CHARSET,
+                        &[charset_command::REJECTED],
+                    )),
+                }
+            }
+            charset_command::ACCEPTED if self.charset_requested => {
+                self.charset_requested = false;
+                self.set_charset(charset_encoding(rest), events);
+            }
+            charset_command::REJECTED => self.charset_requested = false,
+            // This client never offers [TTABLE]; a table it did not ask for
+            // is refused, which every CHARSET implementation must support.
+            charset_command::TTABLE_IS => {
+                self.charset_requested = false;
+                wire.extend(protocol::subnegotiation(
+                    CHARSET,
+                    &[charset_command::TTABLE_REJECTED],
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    fn set_charset(
+        &mut self,
+        encoding: Option<crate::terminal::Encoding>,
+        events: &mut VecDeque<Event>,
+    ) {
+        if let Some(encoding) = encoding.filter(|&encoding| encoding != self.encoding) {
+            self.encoding = encoding;
+            events.push_back(Event::Charset(encoding));
         }
     }
 
@@ -443,6 +603,14 @@ impl Protocol {
         match command {
             Command::Send(data) => wire.extend(protocol::encode(&data, self.local(BINARY))),
             Command::SendIac(command) => wire.extend([IAC, command]),
+            Command::Charset(encoding) => {
+                let changed = encoding != self.encoding;
+                self.encoding = encoding;
+                // One subnegotiation at a time (RFC 2066 §5).
+                if changed && self.local(CHARSET) && !self.charset_requested {
+                    self.request_charset(wire);
+                }
+            }
             Command::LineModeRequest { edit } if self.local(LINEMODE) => {
                 let mode = (self.mode & !1) | u8::from(edit);
                 if mode != self.mode {
@@ -461,13 +629,14 @@ impl Protocol {
 async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     size: (u16, u16),
+    encoding: crate::terminal::Encoding,
     mut commands: mpsc::Receiver<Command>,
     mut sizes: watch::Receiver<(u16, u16)>,
     events: &mpsc::Sender<Event>,
     queued: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut protocol = Protocol::new(size);
+    let mut protocol = Protocol::new(size, encoding);
     let mut buffer = [0; 8192];
     let mut wire = Vec::new();
     let mut written = 0;
@@ -538,7 +707,7 @@ mod tests {
         let greeting =
             b"\xff\xfd\x22\xff\xfa\x22\x01\x0b\xff\xf0\xff\xfb\x01\xff\xfd\x00\xff\xfc\x01login: ";
         for split in 0..=greeting.len() {
-            let mut protocol = Protocol::new((80, 24));
+            let mut protocol = Protocol::new((80, 24), crate::terminal::Encoding::Utf8);
             let mut terminal = crate::terminal::Terminal::new(24, 80);
             let (mut wire, mut events) = (Vec::new(), VecDeque::new());
             for chunk in [&greeting[..split], &greeting[split..]] {
@@ -585,7 +754,7 @@ mod tests {
     #[test]
     fn binary_and_sga_negotiate_independently_in_both_directions() {
         for option in [BINARY, SGA] {
-            let mut protocol = Protocol::new((255, 511));
+            let mut protocol = Protocol::new((255, 511), crate::terminal::Encoding::Utf8);
             let (mut wire, mut events) = (Vec::new(), VecDeque::new());
             protocol
                 .receive(
@@ -610,7 +779,7 @@ mod tests {
 
     #[test]
     fn ttype_repeats_final_name_once_then_restarts() {
-        let mut protocol = Protocol::new((80, 24));
+        let mut protocol = Protocol::new((80, 24), crate::terminal::Encoding::Utf8);
         let (mut wire, mut events) = (Vec::new(), VecDeque::new());
         protocol
             .receive(&[IAC, DO, TTYPE], &mut wire, &mut events)
@@ -633,7 +802,7 @@ mod tests {
 
     #[test]
     fn linemode_defaults_ack_rules_and_fixed_slc() {
-        let mut protocol = Protocol::new((80, 24));
+        let mut protocol = Protocol::new((80, 24), crate::terminal::Encoding::Utf8);
         let (mut wire, mut events) = (Vec::new(), VecDeque::new());
         protocol
             .receive(&[IAC, DO, LINEMODE], &mut wire, &mut events)
@@ -667,6 +836,7 @@ mod tests {
             listener.local_addr().unwrap().port(),
             (80, 24),
             false,
+            crate::terminal::Encoding::Utf8,
         );
         let (socket, _) = listener.accept().await.unwrap();
         let (mut reader, mut writer) = socket.into_split();
@@ -708,6 +878,7 @@ mod tests {
             listener.local_addr().unwrap().port(),
             (80, 24),
             true,
+            crate::terminal::Encoding::Utf8,
         );
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buffer = [0; 4096];
@@ -759,6 +930,7 @@ mod tests {
             listener.local_addr().unwrap().port(),
             (80, 24),
             false,
+            crate::terminal::Encoding::Utf8,
         );
         let (socket, _) = listener.accept().await.unwrap();
         socket.set_nodelay(true).unwrap();
@@ -811,5 +983,154 @@ mod tests {
             start.elapsed().as_micros()
         );
         flood.abort();
+    }
+
+    /// RFC 2066 CHARSET: the client specifies the user's character set once
+    /// the server asks, follows the server's choice, and answers the
+    /// server's own requests.
+    #[test]
+    fn charset_option_negotiates_the_terminal_character_set() {
+        use crate::terminal::Encoding;
+        let request = |list: &[u8]| {
+            let mut payload = vec![charset_command::REQUEST];
+            payload.extend(list);
+            protocol::subnegotiation(CHARSET, &payload)
+        };
+        let mut protocol = Protocol::new((80, 24), Encoding::Utf8);
+        let (mut wire, mut events) = (Vec::new(), VecDeque::new());
+        // Server DO CHARSET: WILL, then this client's REQUEST.
+        protocol
+            .receive(&[IAC, DO, CHARSET], &mut wire, &mut events)
+            .unwrap();
+        let mut expected = vec![IAC, WILL, CHARSET];
+        expected.extend(request(b";UTF-8;IBM437"));
+        assert_eq!(wire, expected);
+        wire.clear();
+        // The server picks IBM437: the terminal follows.
+        let mut accepted = vec![charset_command::ACCEPTED];
+        accepted.extend(b"IBM437");
+        protocol
+            .receive(
+                &protocol::subnegotiation(CHARSET, &accepted),
+                &mut wire,
+                &mut events,
+            )
+            .unwrap();
+        assert!(wire.is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Charset(Encoding::Cp437)))
+        );
+        events.clear();
+        // An unsolicited ACCEPTED is ignored.
+        let mut stray = vec![charset_command::ACCEPTED];
+        stray.extend(b"UTF-8");
+        protocol
+            .receive(
+                &protocol::subnegotiation(CHARSET, &stray),
+                &mut wire,
+                &mut events,
+            )
+            .unwrap();
+        assert!(events.is_empty());
+        // The server's REQUEST: the set already in use is accepted, else the
+        // first supported one, with the name as the server spelled it.
+        for (list, reply, switched) in [
+            (&b" ISO-8859-1 cp437 UTF-8"[..], &b"cp437"[..], None),
+            (b";iso-8859-1;utf-8", b"utf-8", Some(Encoding::Utf8)),
+            (b"[TTABLE]\x01 IBM437", b"IBM437", Some(Encoding::Cp437)),
+        ] {
+            protocol
+                .receive(&request(list), &mut wire, &mut events)
+                .unwrap();
+            let mut accepted = vec![charset_command::ACCEPTED];
+            accepted.extend(reply);
+            assert_eq!(wire, protocol::subnegotiation(CHARSET, &accepted));
+            assert_eq!(
+                events.iter().find_map(|e| match e {
+                    Event::Charset(encoding) => Some(*encoding),
+                    _ => None,
+                }),
+                switched
+            );
+            wire.clear();
+            events.clear();
+        }
+        // Nothing usable: REJECTED, unchanged.
+        protocol
+            .receive(&request(b" KOI8-R EBCDIC-INT"), &mut wire, &mut events)
+            .unwrap();
+        assert_eq!(
+            wire,
+            protocol::subnegotiation(CHARSET, &[charset_command::REJECTED])
+        );
+        assert!(events.is_empty());
+        wire.clear();
+        // A translation table this client never offered is refused.
+        protocol
+            .receive(
+                &protocol::subnegotiation(CHARSET, &[charset_command::TTABLE_IS, 1, b' ']),
+                &mut wire,
+                &mut events,
+            )
+            .unwrap();
+        assert_eq!(
+            wire,
+            protocol::subnegotiation(CHARSET, &[charset_command::TTABLE_REJECTED])
+        );
+        wire.clear();
+        // A user switch requests the new set; while it is outstanding the
+        // client still answers the server's simultaneous request.
+        protocol.command(Command::Charset(Encoding::Utf8), &mut wire);
+        assert_eq!(wire, request(b";UTF-8;IBM437"));
+        wire.clear();
+        protocol
+            .receive(&request(b" IBM437"), &mut wire, &mut events)
+            .unwrap();
+        let mut accepted = vec![charset_command::ACCEPTED];
+        accepted.extend(b"IBM437");
+        assert_eq!(wire, protocol::subnegotiation(CHARSET, &accepted));
+        wire.clear();
+        // The server rejects the client's request; nothing further changes.
+        events.clear();
+        protocol
+            .receive(
+                &protocol::subnegotiation(CHARSET, &[charset_command::REJECTED]),
+                &mut wire,
+                &mut events,
+            )
+            .unwrap();
+        assert!(wire.is_empty() && events.is_empty());
+        // A server-only CHARSET (WILL/DO) may also send requests.
+        let mut protocol = Protocol::new((80, 24), Encoding::Cp437);
+        protocol
+            .receive(&[IAC, WILL, CHARSET], &mut wire, &mut events)
+            .unwrap();
+        assert_eq!(wire, [IAC, DO, CHARSET]);
+        wire.clear();
+        protocol
+            .receive(&request(b";UTF-8"), &mut wire, &mut events)
+            .unwrap();
+        let mut accepted = vec![charset_command::ACCEPTED];
+        accepted.extend(b"UTF-8");
+        assert_eq!(wire, protocol::subnegotiation(CHARSET, &accepted));
+    }
+
+    #[test]
+    fn terminal_follows_and_reports_charset_changes() {
+        use crate::terminal::{Control, Encoding, Terminal};
+        let mut terminal = Terminal::new(24, 80);
+        terminal.observe(&Event::Charset(Encoding::Cp437));
+        assert_eq!(terminal.encoding, Encoding::Cp437);
+        assert!(matches!(
+            terminal.control("set encoding utf8", true),
+            Some(Ok(Control::Send(Command::Charset(Encoding::Utf8), _)))
+        ));
+        assert!(matches!(
+            terminal.control("set encoding cp437", false),
+            Some(Ok(Control::Message(_)))
+        ));
+        assert_eq!(terminal.encoding, Encoding::Cp437);
     }
 }

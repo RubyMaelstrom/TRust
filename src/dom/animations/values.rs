@@ -13,7 +13,7 @@ use color::{ColorSpaceTag as Space, DynamicColor, HueDirection};
 
 /// The animation type of a supported property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(in crate::dom) enum Kind {
     /// `<color>`.
     Color,
     /// SVG 2 `<paint>`: interpolable when both endpoints are colors.
@@ -40,7 +40,7 @@ pub(super) enum Kind {
 }
 
 impl Kind {
-    pub(super) fn of(property: &str) -> Self {
+    pub(in crate::dom) fn of(property: &str) -> Self {
         match property {
             "color"
             | "background-color"
@@ -117,7 +117,7 @@ impl Kind {
 /// (CSS Color 4 #interpolation), which only paint knows when both endpoints
 /// keep the keyword.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Color {
+pub(in crate::dom) enum Color {
     Current,
     Value {
         color: DynamicColor,
@@ -137,7 +137,7 @@ impl Color {
         legacy: true,
     };
 
-    pub(super) fn parse(dom: &Dom, id: NodeId, text: &str) -> Option<Self> {
+    pub(in crate::dom) fn parse(dom: &Dom, id: NodeId, text: &str) -> Option<Self> {
         let text = text.trim();
         if text.eq_ignore_ascii_case("currentcolor") {
             return Some(Self::Current);
@@ -253,7 +253,7 @@ fn serialize_color(color: DynamicColor, legacy: bool) -> String {
 
 /// One `<shadow>` with its lengths computed to CSS px.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Shadow {
+pub(in crate::dom) struct Shadow {
     color: Color,
     x: f32,
     y: f32,
@@ -339,7 +339,7 @@ fn parse_shadows(dom: &Dom, id: NodeId, text: &str, spread: bool, vp: Vp) -> Opt
 
 /// A `<length-percentage>` as `px + pct·basis`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Linear {
+pub(in crate::dom) struct Linear {
     px: f32,
     pct: f32,
 }
@@ -427,7 +427,7 @@ fn parse_position(dom: &Dom, id: NodeId, text: &str, vertical: bool, vp: Vp) -> 
 /// One `<filter-function>` (Filter Effects 1 #filter-functions), with
 /// amounts as numbers, angles in degrees and lengths in CSS px.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Filter {
+pub(in crate::dom) enum Filter {
     Blur(f32),
     Amount(&'static str, f32),
     HueRotate(f32),
@@ -585,19 +585,16 @@ fn angle(text: &str) -> Option<f32> {
 /// Filter Effects 1 #interpolation-of-filters: matching function lists
 /// interpolate pairwise, padding the shorter (or `none`) list with the
 /// longer list's functions at their initial values for interpolation.
-fn mix_filters(
+fn mix_filter_list(
     start: &[Filter],
     end: &[Filter],
     t: f32,
     current: &dyn Fn() -> Option<Color>,
-) -> Option<String> {
+) -> Option<Vec<Filter>> {
     if start.iter().zip(end).any(|(a, b)| a.name() != b.name()) {
         return None;
     }
     let length = start.len().max(end.len());
-    if length == 0 {
-        return Some("none".into());
-    }
     let mut out = Vec::with_capacity(length);
     for index in 0..length {
         let (a, b) = match (start.get(index), end.get(index)) {
@@ -606,14 +603,14 @@ fn mix_filters(
             (None, Some(b)) => (b.neutral(), *b),
             (None, None) => unreachable!("index below the longer list"),
         };
-        out.push(a.mix(b, t, current)?.css());
+        out.push(a.mix(b, t, current)?);
     }
-    Some(out.join(" "))
+    Some(out)
 }
 
 /// A computed keyframe or underlying value, parsed for interpolation.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum Value {
+pub(in crate::dom) enum Value {
     Color(Color),
     Shadows(Vec<Shadow>),
     Filters(Vec<Filter>),
@@ -627,7 +624,7 @@ pub(super) enum Value {
 impl Value {
     /// Parse a computed value of `kind`. Anything that is not interpolable
     /// keeps its text and animates discretely.
-    pub(super) fn parse(dom: &Dom, id: NodeId, kind: Kind, text: &str, vp: Vp) -> Self {
+    pub(in crate::dom) fn parse(dom: &Dom, id: NodeId, kind: Kind, text: &str, vp: Vp) -> Self {
         let trimmed = text.trim();
         let parsed = match kind {
             Kind::Color | Kind::Paint => Color::parse(dom, id, trimmed).map(Self::Color),
@@ -664,7 +661,7 @@ impl Value {
         parsed.unwrap_or_else(|| Self::Other(trimmed.to_string()))
     }
 
-    pub(super) fn css(&self, kind: Kind) -> String {
+    pub(in crate::dom) fn css(&self, kind: Kind) -> String {
         match self {
             Self::Color(color) => color.css(),
             Self::Shadows(shadows) if shadows.is_empty() => "none".into(),
@@ -738,20 +735,49 @@ fn interpolated(
     t: f32,
     current: &dyn Fn() -> Option<Color>,
 ) -> Option<String> {
+    mix_value(kind, start, end, t, current).map(|value| value.css(kind))
+}
+
+/// CSS Values 4 #interpolation as a value: `None` when the pair is not
+/// interpolable (its animation type is discrete), which CSS Transitions 1
+/// #transitionable makes not transitionable. Web Animations 1
+/// #animating-visibility interpolates `visible` with another value as a
+/// step: `visible` strictly inside the interval, else the closer endpoint.
+pub(in crate::dom) fn mix_value(
+    kind: Kind,
+    start: &Value,
+    end: &Value,
+    t: f32,
+    current: &dyn Fn() -> Option<Color>,
+) -> Option<Value> {
     Some(match (start, end) {
-        (Value::Color(a), Value::Color(b)) => a.mix(*b, t, current)?.css(),
-        (Value::Shadows(a), Value::Shadows(b)) => {
-            let spread = matches!(kind, Kind::Shadow { spread: true });
-            mix_shadows(a, b, t, spread, current)?
+        (Value::Other(a), Value::Other(b)) if kind == Kind::Visibility => {
+            let visible = |value: &str| value.eq_ignore_ascii_case("visible");
+            if !(visible(a) || visible(b)) {
+                return None;
+            }
+            Value::Other(if t > 0.0 && t < 1.0 {
+                "visible".into()
+            } else if t <= 0.0 {
+                a.clone()
+            } else {
+                b.clone()
+            })
         }
-        (Value::Filters(a), Value::Filters(b)) => mix_filters(a, b, t, current)?,
+        (Value::Color(a), Value::Color(b)) => Value::Color(a.mix(*b, t, current)?),
+        (Value::Shadows(a), Value::Shadows(b)) => {
+            Value::Shadows(mix_shadow_list(a, b, t, current)?)
+        }
+        (Value::Filters(a), Value::Filters(b)) => {
+            Value::Filters(mix_filter_list(a, b, t, current)?)
+        }
         (Value::Length(a), Value::Length(b)) => {
             let mut value = a.mix(*b, t);
             // CSS Values 4 #combining-range: clamp to the property's range.
             if matches!(kind, Kind::Length { negative: false }) && value.pct == 0.0 {
                 value.px = value.px.max(0.0);
             }
-            value.css()
+            Value::Length(value)
         }
         (Value::Positions(a), Value::Positions(b)) => {
             // Web Animations #repeatable-list: lists repeat to their least
@@ -760,10 +786,11 @@ fn interpolated(
             if length == 0 || length > 64 {
                 return None;
             }
-            (0..length)
-                .map(|index| a[index % a.len()].mix(b[index % b.len()], t).css())
-                .collect::<Vec<_>>()
-                .join(", ")
+            Value::Positions(
+                (0..length)
+                    .map(|index| a[index % a.len()].mix(b[index % b.len()], t))
+                    .collect(),
+            )
         }
         (Value::Number(a), Value::Number(b)) => {
             let mut value = a + (b - a) * t;
@@ -775,7 +802,7 @@ fn interpolated(
                 Kind::FontWeight => value = value.clamp(1.0, 1000.0),
                 _ => value = value.max(0.0),
             }
-            number(value)
+            Value::Number(value)
         }
         _ => return None,
     })
@@ -784,17 +811,13 @@ fn interpolated(
 /// CSS Backgrounds 3 #box-shadow, Web Animations #animating-shadow-lists:
 /// pairwise interpolation, the shorter list padded with transparent zero
 /// shadows whose `inset` matches; mismatched `inset` keywords are discrete.
-fn mix_shadows(
+fn mix_shadow_list(
     start: &[Shadow],
     end: &[Shadow],
     t: f32,
-    spread: bool,
     current: &dyn Fn() -> Option<Color>,
-) -> Option<String> {
+) -> Option<Vec<Shadow>> {
     let length = start.len().max(end.len());
-    if length == 0 {
-        return Some("none".into());
-    }
     let mut out = Vec::with_capacity(length);
     for index in 0..length {
         let (a, b) = match (start.get(index), end.get(index)) {
@@ -817,12 +840,7 @@ fn mix_shadows(
             inset: a.inset,
         });
     }
-    Some(
-        out.into_iter()
-            .map(|shadow| shadow.css(spread))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
+    Some(out)
 }
 
 fn lcm(a: usize, b: usize) -> usize {

@@ -36,7 +36,7 @@ use super::vello_cpu::{
     ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, conic_transform,
     decoration_strokes, erase_blend, gradient_extend, inset_shadow_hole, inset_shadow_ring,
     offset_shape, outside_shape_path, point_bounds, premultiplied_pixmap, premultiply_rgba,
-    radial_aspect_transform, radial_gradient, rect_is_visible, rect_path, shape_fill,
+    radial_aspect_transform, radial_gradient, rect_is_visible, rect_path, shadow_blur, shape_fill,
     shape_is_visible, shape_path, simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend,
     vello_color, vello_css_filter, vello_rect, vello_stops, vello_stroke,
 };
@@ -936,6 +936,20 @@ impl VelloHybridRenderer {
                         target.fill_blurred_rounded_rect(&rect, radius, std_dev, false);
                         target.pop_layer();
                         target.pop_layer();
+                    } else if let Some(filter) = shadow_blur(*blur_radius) {
+                        // Mirrors the CPU reference's blurred shadow plane.
+                        target.push_layer(None, None, None, None, None);
+                        target.push_layer(None, None, None, None, Some(filter));
+                        target.set_paint(vello_color(*color));
+                        target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
+                        target.fill_path(&outside_shape_path(&hole, shape, *blur_radius));
+                        target.pop_layer();
+                        target.push_layer(None, Some(erase_blend()), None, None, None);
+                        target.set_paint(vello_common::color::palette::css::BLACK);
+                        target.fill_path(&outside_shape_path(shape, shape, *blur_radius * 2.0));
+                        target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+                        target.pop_layer();
+                        target.pop_layer();
                     } else {
                         target.push_clip_path(&padding);
                         target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
@@ -964,6 +978,24 @@ impl VelloHybridRenderer {
                     }
                     apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
                     target.set_paint(vello_color(*color));
+                    if simple_rounded_rect(&shifted).is_none()
+                        && let Some(filter) = shadow_blur(*blur_radius)
+                    {
+                        // Mirrors the CPU reference: any other shape is
+                        // blurred as a Gaussian filter layer, then erased
+                        // under the border box.
+                        target.push_layer(None, None, None, None, None);
+                        target.push_layer(None, None, None, None, Some(filter));
+                        target.set_paint(vello_color(*color));
+                        target.fill_path(&shape_path(&shifted));
+                        target.pop_layer();
+                        target.push_layer(None, Some(erase_blend()), None, None, None);
+                        target.set_paint(vello_common::color::palette::css::BLACK);
+                        target.fill_path(&shape_path(shape));
+                        target.pop_layer();
+                        target.pop_layer();
+                        continue;
+                    }
                     target.set_fill_rule(vello_common::peniko::Fill::EvenOdd);
                     target.push_clip_path(&outside_shape_path(shape, &shifted, expansion));
                     target.set_fill_rule(vello_common::peniko::Fill::NonZero);
@@ -975,9 +1007,6 @@ impl VelloHybridRenderer {
                             false,
                         );
                     } else {
-                        // Both current Vello backends expose direct blur only
-                        // for rounded rectangles; arbitrary shadows retain the
-                        // same unblurred fallback as the CPU reference.
                         target.fill_path(&shape_path(&shifted));
                     }
                     target.pop_clip();

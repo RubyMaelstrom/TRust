@@ -1452,6 +1452,15 @@ impl TerminalSession {
                         |error| format!("Telnet: {error}"),
                     ));
                 }
+                trust::telnet::Event::Charset(encoding) => {
+                    status = Some(format!(
+                        "Server negotiated the {} character set",
+                        match encoding {
+                            trust::terminal::Encoding::Utf8 => "UTF-8",
+                            trust::terminal::Encoding::Cp437 => "CP437",
+                        }
+                    ));
+                }
                 _ => {}
             }
         }
@@ -2915,7 +2924,8 @@ impl DesktopApp {
         let (cols, rows) = view.size_for_viewport(self.browser_viewport());
         view.resize(cols, rows);
         let _runtime = self.runtime.enter();
-        let (handle, mut events) = trust::telnet::connect(host, port, (cols, rows), tls);
+        let (handle, mut events) =
+            trust::telnet::connect(host, port, (cols, rows), tls, view.terminal.encoding);
         drop(_runtime);
         let proxy = self.event_proxy.clone();
         let forwarder = self
@@ -6012,6 +6022,17 @@ impl DesktopApp {
         let target = controls[current % controls.len()].clone();
         if let Some((form, field)) = self.form_target_for_hit(&target) {
             self.keyboard_target = None;
+            // Sequential navigation indicates the control's focus.
+            let actor = self
+                .page_layout
+                .as_ref()
+                .and_then(|page| page.document.forms.get(form))
+                .and_then(|form| form.fields.get(field))
+                .and_then(|control| control.live_node);
+            if actor.is_some() && self.focus != (FocusTarget::Form { form, field }) {
+                self.browser
+                    .handle_action(UserAction::KeyboardFocus { actor });
+            }
             self.focus_form(form, field);
             return;
         }
@@ -6023,7 +6044,7 @@ impl DesktopApp {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        self.browser.handle_action(UserAction::PageFocus {
+        self.browser.handle_action(UserAction::KeyboardFocus {
             actor: target.actor,
         });
         self.keyboard_target = Some(target);
@@ -6485,6 +6506,12 @@ impl DesktopApp {
                     }
                     .to_string(),
                 );
+                // RFC 1436 §3.8: the selector names the account to log in as.
+                let hint = String::from_utf8_lossy(&url.selector).into_owned();
+                if !hint.is_empty() {
+                    self.browser
+                        .set_status(format!("Telnet login hint: {hint}"));
+                }
                 return;
             }
             if url.is_download() {
@@ -9785,8 +9812,13 @@ mod tests {
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (handle, mut events) =
-            trust::telnet::connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = trust::telnet::connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            trust::terminal::Encoding::Utf8,
+        );
         let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
             .unwrap()
@@ -10180,7 +10212,13 @@ mod tests {
     #[tokio::test]
     async fn terminal_retired_session_events_cannot_change_the_current_session() {
         use trust::telnet::{Event, op_command, op_option};
-        let (handle, _events) = trust::telnet::connect("127.0.0.1".into(), 0, (80, 24), false);
+        let (handle, _events) = trust::telnet::connect(
+            "127.0.0.1".into(),
+            0,
+            (80, 24),
+            false,
+            trust::terminal::Encoding::Utf8,
+        );
         let mut terminal = TerminalSession {
             id: 2,
             forwarder: tokio::spawn(std::future::pending::<()>()).abort_handle(),

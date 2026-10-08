@@ -326,6 +326,10 @@ impl InlineBoxEntry {
                 VerticalAlign::Middle(half_x) => {
                     line_baseline - half_x - self.line_height / 2.0 + self.baseline
                 }
+                VerticalAlign::TextTop(ascent) => line_baseline - ascent + self.baseline,
+                VerticalAlign::TextBottom(descent) => {
+                    line_baseline + descent - (self.line_height - self.baseline)
+                }
             };
         (baseline - self.ascent, baseline + self.descent)
     }
@@ -709,6 +713,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// CSS Text 3 #text-align-last-property: the alignment of the last line
     /// and of lines ending in a forced break.
     align_last: Align2,
+    /// The block's `direction` is `rtl`: the start edge of its line boxes
+    /// is their right edge.
+    rtl: bool,
     /// Set while `finish` flushes the final line.
     finishing: bool,
     /// A list item's outside marker ascent, which the first line box grows
@@ -791,9 +798,18 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     atom_next: usize,
     /// Resolved atom-box placements, returned by `finish`.
     atom_places: Vec<AtomBoxPlace>,
-    /// The current line box's CSS-pixel float band.
+    /// The current line box's CSS-pixel float band: `line_end` is its end
+    /// edge, which alignment uses; `line_right` is the edge content breaks
+    /// against, `line_end` less any `break_inset`.
     line_left: f32,
     line_right: f32,
+    line_end: f32,
+    /// CSS Text 4 #text-wrap-style: an inline-size reduction that only
+    /// line breaking sees, applied to the lines from `break_inset_from` on.
+    /// Balancing narrows break decisions; line boxes keep their full width
+    /// for alignment and justification.
+    break_inset: f32,
+    break_inset_from: usize,
     /// `text-indent`, applied to the first formatted line (CSS px).
     indent: f32,
     /// Whether the line about to be composed is the IFC's first (indent gate).
@@ -870,6 +886,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             } else {
                 align
             },
+            rtl: false,
             finishing: false,
             first_line_ascent: None,
             lines: Vec::new(),
@@ -905,6 +922,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             atom_places: Vec::new(),
             line_left: 0.0,
             line_right: cap,
+            line_end: cap,
+            break_inset: 0.0,
+            break_inset_from: 0,
             indent,
             on_first_line: true,
             measuring: false,
@@ -974,7 +994,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             _ => (0.0, self.cap),
         };
         self.line_left = left;
-        self.line_right = right.max(left);
+        self.line_end = right.max(left);
+        self.line_right = self.breaking_edge();
         let indent = if self.on_first_line { self.indent } else { 0.0 };
         let moved = self.line_left + indent - self.line_start;
         self.line_start = self.line_left + indent;
@@ -995,7 +1016,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     fn move_line_below_floats(&mut self) -> bool {
         if !self.cur.is_empty()
             || self.pen > self.line_start
-            || (self.line_left <= 0.0 && self.line_right >= self.cap)
+            || (self.line_left <= 0.0 && self.line_end >= self.cap)
         {
             return false;
         }
@@ -1058,6 +1079,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
                 VerticalAlign::Shift(rise) => p.ascent + rise,
                 VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 + half_x,
+                VerticalAlign::TextTop(ascent) => ascent,
+                VerticalAlign::TextBottom(descent) => p.layout_height() - descent,
                 _ => p.ascent,
             })
             .fold(strut.baseline, f32::max);
@@ -1067,6 +1090,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 VerticalAlign::Top | VerticalAlign::Bottom => 0.0,
                 VerticalAlign::Shift(rise) => p.descent - rise,
                 VerticalAlign::Middle(half_x) => p.layout_height() / 2.0 - half_x,
+                VerticalAlign::TextTop(ascent) => p.layout_height() - ascent,
+                VerticalAlign::TextBottom(descent) => descent,
                 _ => p.descent,
             })
             // CSS 2.2 §10.8.1: a line-height below the content area gives a
@@ -1096,7 +1121,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         else {
             return;
         };
-        let fits_current = leading || super::css_px_fits(fb.mw, self.line_right - self.pen);
+        let fits_current = leading || super::css_px_fits(fb.mw, self.line_end - self.pen);
         let top_min = if fits_current {
             line_y
         } else {
@@ -1124,8 +1149,27 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.pen += shift;
             self.line_start += shift;
             self.line_left = next_left;
-            self.line_right = next_right;
+            self.line_end = next_right;
+            self.line_right = self.breaking_edge();
         }
+    }
+
+    /// The edge the current line's content breaks against.
+    fn breaking_edge(&self) -> f32 {
+        if self.lines.len() >= self.break_inset_from {
+            (self.line_end - self.break_inset).max(self.line_left)
+        } else {
+            self.line_end
+        }
+    }
+
+    /// CSS Text 4 #text-wrap-style: narrow line breaking by `inset` CSS px
+    /// from line `from` on, without narrowing the line boxes. Must precede
+    /// `run`.
+    pub fn set_break_inset(&mut self, inset: f32, from: usize) {
+        self.break_inset = inset.max(0.0);
+        self.break_inset_from = from;
+        self.line_right = self.breaking_edge();
     }
 
     /// Lay the IFC's content. `root` is the block container's own inline
@@ -1673,10 +1717,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // from one shape instead of shaping/breaking every remaining tail.
         // Floats retain per-line band queries and the general composition path.
         let available = self.line_right - self.pen - self.pending_gap_px;
+        // A break inset that starts on a later line makes the following
+        // lines' widths unequal; such runs take the per-line path.
+        let following = (self.cap - self.break_inset).max(0.0);
         if t.len() >= 256
             && self.fc.as_ref().is_none_or(|fc| fc.is_empty())
             && available > 0.0
-            && self.cap > 0.0
+            && following > 0.0
+            && (self.break_inset == 0.0 || self.lines.len() >= self.break_inset_from)
             && !self.pending_space
         {
             let style = ctx.text_style();
@@ -1689,7 +1737,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     t,
                     &style,
                     available,
-                    self.cap,
+                    following,
                     self.break_style(ctx),
                     budget.saturating_sub(self.lines.len()).max(1),
                 )
@@ -1717,7 +1765,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 return;
             }
             let lines =
-                crate::text::wrapped_lines(t, &style, available, self.cap, self.break_style(ctx));
+                crate::text::wrapped_lines(t, &style, available, following, self.break_style(ctx));
             for (index, shaped) in lines.into_iter().enumerate() {
                 if index > 0 {
                     self.soft_break();
@@ -3018,6 +3066,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.align_last = align_last;
     }
 
+    /// The block's inline base direction is right-to-left (CSS Writing
+    /// Modes 4 #direction).
+    pub fn set_rtl(&mut self, rtl: bool) {
+        self.rtl = rtl;
+    }
+
     /// An outside list marker's line, for the first line box to hold.
     pub fn set_first_line_ascent(&mut self, ascent: Option<f32>) {
         self.first_line_ascent = ascent;
@@ -3035,14 +3089,24 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// CSS 2.2 §10.3.7: a static position is that of the hypothetical box
     /// on its line, so it moves with the line's center/right alignment —
     /// including a line with no in-flow content.
-    fn align_oof_marks(&mut self, width: f32, align: Align2) {
-        let line = self.lines.len();
-        let free = (self.line_right - self.line_left - width).max(0.0);
-        let off = match align {
+    /// CSS Text 3 #text-align-property: the line's shift for `free` space
+    /// (negative when the contents overflow). Contents too long for the
+    /// line are start-aligned, overflowing its end edge: the right edge
+    /// starts a right-to-left line.
+    fn alignment_offset(&self, free: f32, align: Align2) -> f32 {
+        if free < 0.0 {
+            return if self.rtl { free } else { 0.0 };
+        }
+        match align {
             Align2::Center => free / 2.0,
             Align2::Right => free,
             Align2::Left | Align2::Justify => 0.0,
-        };
+        }
+    }
+
+    fn align_oof_marks(&mut self, width: f32, align: Align2) {
+        let line = self.lines.len();
+        let off = self.alignment_offset(self.line_end - self.line_left - width, align);
         for mark in self
             .oofs
             .iter_mut()
@@ -3063,7 +3127,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // does not exist otherwise. Keep them, aligned like the static
             // positions above, beside the line boxes.
             if !self.cur_empty.is_empty() {
-                let free = (self.line_right - self.line_left).max(0.0);
+                let free = (self.line_end - self.line_left).max(0.0);
                 let off = match align {
                     Align2::Center => free / 2.0,
                     Align2::Right => free,
@@ -3127,6 +3191,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // CSS 2.2 #valdef-vertical-align-middle: x-height is above
                 // the alphabetic baseline; CSS-pixel y grows downwards.
                 VerticalAlign::Middle(half_x) => baseline - half_x - p.layout_height() / 2.0,
+                // CSS 2.2 §10.8.1: the box top (bottom) at the parent's
+                // content-area top (bottom).
+                VerticalAlign::TextTop(ascent) => baseline - ascent,
+                VerticalAlign::TextBottom(descent) => baseline + descent - p.layout_height(),
             } + p.vertical_edges[0];
         }
         // The pen is the line's used extent. A contain-fitted replaced box
@@ -3146,21 +3214,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             forced,
             width,
             left: self.line_left,
-            right: self.line_right,
+            right: self.line_end,
             gap_before: std::mem::take(&mut self.line_gap),
             empty_boxes: std::mem::take(&mut self.cur_empty),
         };
         // Center/right shift now, within this line's (float-shortened) band;
         // justification waits for `finish`, where "last line" is known.
         self.align_oof_marks(self.pen - self.line_left, align);
-        let free = (self.line_right - self.pen).max(0.0);
-        if free > 0.0 {
-            let off = match align {
-                Align2::Center => free / 2.0,
-                Align2::Right => free,
-                Align2::Left | Align2::Justify => 0.0,
-            };
-            if off > 0.0 {
+        let free = self.line_end - self.pen;
+        if free > 0.0 || (self.rtl && free < 0.0) {
+            let off = self.alignment_offset(free, align);
+            if off != 0.0 {
                 line.alignment_offset = off;
                 for p in &mut line.pieces {
                     p.x += off;
@@ -3549,6 +3613,255 @@ fn composed_contains(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
         current = dom.parent_composed(id);
     }
     false
+}
+
+/// CSS Overflow 3 #text-overflow (`ellipsis`, local CSSWG snapshot
+/// 81c27f686901): when the line's inline content overflows its end line box
+/// edge `end`, hide the characters and atomic inline-level boxes at the end
+/// edge as needed to fit an ellipsis, and place the ellipsis immediately
+/// after the remaining content. The first character or atomic inline on
+/// the line is clipped rather than ellipsed. #ellipsing-details: ellipsing
+/// only affects rendering, so the laid pieces are retained in `line.laid`
+/// for CSSOM geometry and scrollable overflow; the ellipsis is styled and
+/// baseline-aligned per the block (`root`), and pointer events on it reach
+/// the elided element. Returns the atomic inline boxes to hide.
+///
+/// Recomputing from `line.laid` keeps the operation idempotent when a
+/// retained line is laid again.
+pub(super) fn text_overflow_ellipsis(
+    line: &mut super::flow::LineFrag,
+    root: &InlineStyle,
+    rtl: bool,
+) -> Vec<NodeId> {
+    const EPSILON: f32 = 0.01;
+    if let Some(laid) = line.laid.take() {
+        line.pieces = laid.pieces;
+        line.atom_boxes = laid.atom_boxes;
+    }
+    if rtl {
+        return text_overflow_ellipsis_rtl(line, root);
+    }
+    let end = line.band[1];
+    let content_end = line
+        .pieces
+        .iter()
+        .chain(&line.atom_boxes)
+        .map(|piece| piece.x + piece.box_width)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if content_end <= end + EPSILON {
+        return Vec::new();
+    }
+    let shaped = crate::text::shape("…", &root.text_style());
+    // `text-overflow: ellipsis` names U+2026 HORIZONTAL ELLIPSIS; a font
+    // without it falls back like any other character.
+    let limit = end - shaped.advance;
+    line.laid = Some(Box::new(super::flow::LaidLine {
+        pieces: line.pieces.clone(),
+        atom_boxes: line.atom_boxes.clone(),
+    }));
+    let mut units: Vec<Piece> = std::mem::take(&mut line.pieces);
+    units.append(&mut line.atom_boxes);
+    // Visual order: ellipsing occurs after relative positioning, which
+    // `x` already includes (#ellipsing-details).
+    units.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let mut kept: Vec<Piece> = Vec::with_capacity(units.len());
+    let mut hidden_atoms = Vec::new();
+    // The element whose content the ellipsis represents.
+    let mut elided: Option<(NodeId, Option<Link>)> = None;
+    let mut cutting = false;
+    for mut piece in units {
+        if cutting {
+            if piece.atom_box {
+                hidden_atoms.push(piece.item.node);
+            }
+            elided.get_or_insert_with(|| (piece.item.node, piece.item.link.clone()));
+            continue;
+        }
+        if piece.x + piece.box_width <= limit + EPSILON {
+            kept.push(piece);
+            continue;
+        }
+        cutting = true;
+        let first = kept.is_empty();
+        let text = !piece.atom_box
+            && piece.replaced_box.is_none()
+            && piece.control_text.is_none()
+            && piece.item.image.is_none()
+            && piece.text_style.is_some();
+        if text && let Some(shaped) = piece.shaped.as_ref() {
+            let local = limit - piece.x - piece.paint_x;
+            if let Some(cut) = shaped.visual_elision_cut(local, first) {
+                let mut prefix = shaped.visual_prefix(cut);
+                // Left-to-right text keeps a logical prefix; reshaping it
+                // keeps ligatures and kerning exact up to the cut. Bidi text
+                // retains its visual glyph positions instead.
+                if !shaped.clusters.iter().any(|cluster| cluster.rtl)
+                    && let Some(style) = piece.text_style.as_ref()
+                {
+                    prefix = crate::text::shape(&prefix.text, style);
+                }
+                piece.item.text = prefix.text.clone();
+                piece.box_width = prefix.advance;
+                piece.paint_width = prefix.advance;
+                piece.shaped = Some(prefix);
+                elided = Some((piece.item.node, piece.item.link.clone()));
+                kept.push(piece);
+                continue;
+            }
+        } else if first {
+            // An atomic inline (or replaced) first unit is clipped rather
+            // than ellipsed; the ellipsis follows it.
+            kept.push(piece);
+            continue;
+        }
+        if piece.atom_box {
+            hidden_atoms.push(piece.item.node);
+        }
+        elided = Some((piece.item.node, piece.item.link.clone()));
+    }
+    let after = kept
+        .iter()
+        .map(|piece| piece.x + piece.box_width)
+        .fold(line.band[0], f32::max);
+    let (node, link) = elided.unwrap_or((NO_NODE, None));
+    let mut ellipsis = Piece::shaped(
+        InlineItem {
+            text: "…".into(),
+            terminal_text: None,
+            kind: ItemKind::Text,
+            graphical_image: None,
+            image: None,
+            emph: root.emph,
+            style_node: root.node,
+            pseudo: root.pseudo,
+            node,
+            link,
+            crop: false,
+            pixelated: false,
+            invisible: root.invisible,
+        },
+        shaped,
+    );
+    ellipsis.x = after;
+    ellipsis.y = line.baseline - ellipsis.ascent;
+    kept.push(ellipsis);
+    for piece in kept {
+        if piece.atom_box {
+            line.atom_boxes.push(piece);
+        } else {
+            line.pieces.push(piece);
+        }
+    }
+    hidden_atoms
+}
+
+/// [`text_overflow_ellipsis`] for a right-to-left block, whose end edge is
+/// the line box's left edge: content overflows to the left (CSS Text 3
+/// #text-align-property starts it at the right), and the ellipsis replaces
+/// what is visually at the left.
+fn text_overflow_ellipsis_rtl(line: &mut super::flow::LineFrag, root: &InlineStyle) -> Vec<NodeId> {
+    const EPSILON: f32 = 0.01;
+    let start = line.band[0];
+    let content_start = line
+        .pieces
+        .iter()
+        .chain(&line.atom_boxes)
+        .map(|piece| piece.x)
+        .fold(f32::INFINITY, f32::min);
+    if content_start >= start - EPSILON {
+        return Vec::new();
+    }
+    let shaped = crate::text::shape("…", &root.text_style());
+    let limit = start + shaped.advance;
+    line.laid = Some(Box::new(super::flow::LaidLine {
+        pieces: line.pieces.clone(),
+        atom_boxes: line.atom_boxes.clone(),
+    }));
+    let mut units: Vec<Piece> = std::mem::take(&mut line.pieces);
+    units.append(&mut line.atom_boxes);
+    // Visual order from the start (right) edge.
+    units.sort_by(|a, b| (b.x + b.box_width).total_cmp(&(a.x + a.box_width)));
+    let mut kept: Vec<Piece> = Vec::with_capacity(units.len());
+    let mut hidden_atoms = Vec::new();
+    let mut elided: Option<(NodeId, Option<Link>)> = None;
+    let mut cutting = false;
+    for mut piece in units {
+        if cutting {
+            if piece.atom_box {
+                hidden_atoms.push(piece.item.node);
+            }
+            elided.get_or_insert_with(|| (piece.item.node, piece.item.link.clone()));
+            continue;
+        }
+        if piece.x >= limit - EPSILON {
+            kept.push(piece);
+            continue;
+        }
+        cutting = true;
+        let first = kept.is_empty();
+        let text = !piece.atom_box
+            && piece.replaced_box.is_none()
+            && piece.control_text.is_none()
+            && piece.item.image.is_none()
+            && piece.text_style.is_some();
+        if text && let Some(shaped) = piece.shaped.as_ref() {
+            let local = limit - piece.x - piece.paint_x;
+            if let Some(cut) = shaped.visual_elision_cut_start(local, first) {
+                let suffix = shaped.visual_suffix(cut);
+                piece.x += piece.paint_x + cut;
+                piece.paint_x = 0.0;
+                piece.item.text = suffix.text.clone();
+                piece.box_width = suffix.advance;
+                piece.paint_width = suffix.advance;
+                piece.shaped = Some(suffix);
+                elided = Some((piece.item.node, piece.item.link.clone()));
+                kept.push(piece);
+                continue;
+            }
+        } else if first {
+            kept.push(piece);
+            continue;
+        }
+        if piece.atom_box {
+            hidden_atoms.push(piece.item.node);
+        }
+        elided = Some((piece.item.node, piece.item.link.clone()));
+    }
+    let before = kept
+        .iter()
+        .map(|piece| piece.x)
+        .fold(line.band[1], f32::min);
+    let (node, link) = elided.unwrap_or((NO_NODE, None));
+    let mut ellipsis = Piece::shaped(
+        InlineItem {
+            text: "…".into(),
+            terminal_text: None,
+            kind: ItemKind::Text,
+            graphical_image: None,
+            image: None,
+            emph: root.emph,
+            style_node: root.node,
+            pseudo: root.pseudo,
+            node,
+            link,
+            crop: false,
+            pixelated: false,
+            invisible: root.invisible,
+        },
+        shaped,
+    );
+    ellipsis.x = before - ellipsis.box_width;
+    ellipsis.y = line.baseline - ellipsis.ascent;
+    kept.push(ellipsis);
+    kept.sort_by(|a, b| a.x.total_cmp(&b.x));
+    for piece in kept {
+        if piece.atom_box {
+            line.atom_boxes.push(piece);
+        } else {
+            line.pieces.push(piece);
+        }
+    }
+    hidden_atoms
 }
 
 /// Insert the block ellipsis into the last visible line of clamped content.

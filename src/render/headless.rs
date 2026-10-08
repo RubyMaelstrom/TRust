@@ -502,6 +502,111 @@ mod tests {
         }
     }
 
+    /// CSS Compositing 2 #porterduffcompositingoperators_plus_lighter: the
+    /// element's colors are added to the backdrop, clamped.
+    #[test]
+    fn plus_lighter_adds_to_the_backdrop_on_both_backends() {
+        let html = r#"<!doctype html><style>
+            body{margin:0;background:black}
+            div{position:absolute;top:0;width:40px;height:20px}
+            #a{left:0;background:rgb(100,0,0)} #b{left:20px;background:rgb(0,100,200);mix-blend-mode:plus-lighter}
+            #c{left:100px;background:rgb(200,0,0)} #d{left:120px;background:rgb(100,0,0);mix-blend-mode:plus-lighter}
+        </style><div id=a></div><div id=b></div><div id=c></div><div id=d></div>"#;
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(html);
+        let scene = scene_for_dom(
+            &dom,
+            &base,
+            CssSize::new(180., 20.),
+            &[],
+            &Default::default(),
+            &ImageSizes::new(),
+            ImageStore::default(),
+        );
+        let check = |frame: &OwnedRgbaFrame| {
+            let at = |x: usize| frame.pixels[(10 * 180 + x) * 4..][..3].to_vec();
+            let near = |actual: Vec<u8>, expected: [u8; 3]| {
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2)
+            };
+            assert!(near(at(30), [100, 100, 200]), "sum: {:?}", at(30));
+            assert!(near(at(50), [0, 100, 200]), "over black: {:?}", at(50));
+            assert!(near(at(130), [255, 0, 0]), "clamped: {:?}", at(130));
+        };
+        check(&VelloCpuRenderer::new().render_rgba(&scene).unwrap());
+        if let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) {
+            check(&hybrid.render_rgba(&scene).unwrap());
+        }
+    }
+
+    #[test]
+    fn box_shadows_with_unequal_radii_are_blurred_on_both_backends() {
+        // CSS Backgrounds 3 #shadow-blur: every shadow shape takes the
+        // Gaussian blur, including top-only and elliptical corner radii.
+        let html = r#"<!doctype html><style>
+            body{margin:0;background:white}
+            .card{position:absolute;top:20px;width:40px;height:40px;background:white}
+            #outer{left:20px;border-radius:12px 12px 0 0;box-shadow:0 0 16px black}
+            #inset{left:100px;border-radius:50% / 30%;box-shadow:inset 0 0 16px black}
+            #sharp{left:180px;border-radius:12px 12px 0 0;box-shadow:0 0 0 4px black}
+        </style><div class=card id=outer></div><div class=card id=inset></div>
+        <div class=card id=sharp></div>"#;
+        let base = Url::parse("https://example.test/").unwrap();
+        let dom = crate::dom::Dom::parse_document(html);
+        let scene = scene_for_dom(
+            &dom,
+            &base,
+            CssSize::new(240., 80.),
+            &[],
+            &Default::default(),
+            &ImageSizes::new(),
+            ImageStore::default(),
+        );
+        let check = |frame: &OwnedRgbaFrame| {
+            let at = |x: usize, y: usize| frame.pixels[(y * 240 + x) * 4..][..3].to_vec();
+            // Outside the box the shadow fades with distance, rather than
+            // ending in a hard edge at its unblurred extent.
+            let (near, far) = (at(18, 40)[0], at(10, 40)[0]);
+            assert!(near < far && near < 200 && far > 60, "outer: {near} {far}");
+            // Beside the box's straight left side the blur is a Gaussian
+            // with σ = 8px: coverage ½·erfc(d / (σ√2)) at distance d, times
+            // erf(20 / (σ√2)) for the 40px side's finite height.
+            let erf = |x: f32| {
+                // Abramowitz & Stegun 7.1.26.
+                let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+                let poly = t
+                    * (0.254_829_6
+                        + t * (-0.284_496_7
+                            + t * (1.421_413_7 + t * (-1.453_152 + t * 1.061_405_4))));
+                (1.0 - poly * (-x * x).exp()).copysign(x)
+            };
+            let side = erf(20.0 / (8.0 * 2f32.sqrt()));
+            for x in [4usize, 10, 14, 19] {
+                let d = 20.0 - x as f32 - 0.5;
+                let coverage = 0.5 * (1.0 - erf(d / (8.0 * 2f32.sqrt()))) * side;
+                let expected = 255.0 * (1.0 - coverage);
+                let actual = f32::from(at(x, 40)[0]);
+                assert!(
+                    (actual - expected).abs() <= 6.0,
+                    "{x}: {actual} vs {expected}"
+                );
+            }
+            // An inset shadow darkens toward the padding edge.
+            let (edge, middle) = (at(101, 40)[0], at(120, 40)[0]);
+            assert!(edge < middle && middle > 200, "inset: {edge} {middle}");
+            // An unblurred spread stays a hard edge.
+            assert_eq!(at(177, 40), [0, 0, 0]);
+            assert_eq!(at(175, 40), [255, 255, 255]);
+        };
+        check(&VelloCpuRenderer::new().render_rgba(&scene).unwrap());
+        if let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) {
+            check(&hybrid.render_rgba(&scene).unwrap());
+        }
+    }
+
     #[test]
     fn blurred_content_stays_inside_rounded_overflow_clips_on_both_backends() {
         // CSS Filter Effects 1 §4 and CSS Overflow 3: an element's filter

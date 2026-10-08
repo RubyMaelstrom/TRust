@@ -299,6 +299,8 @@ impl Terminal {
                 self.linemode_edit = mode & 1 != 0;
             }
             Event::Slc { disabled } => self.disabled_slc = disabled,
+            // RFC 2066: subsequent text is encoded in the negotiated set.
+            Event::Charset(encoding) => self.encoding = encoding,
             Event::Closed(_) => self.reset_negotiation(),
             _ => {}
         }
@@ -861,17 +863,23 @@ impl Terminal {
                     "Enter sends CR (CR NUL in NVT mode)"
                 })
             }
-            "set" if parts.next() == Some("encoding") => match parts.next() {
-                Some("utf8" | "utf-8") => {
-                    self.encoding = Encoding::Utf8;
-                    message("Terminal encoding: UTF-8")
+            "set" if parts.next() == Some("encoding") => {
+                let (encoding, text) = match parts.next() {
+                    Some("utf8" | "utf-8") => (Encoding::Utf8, "Terminal encoding: UTF-8"),
+                    Some("cp437") => (Encoding::Cp437, "Terminal encoding: CP437"),
+                    _ => return Some(Err("usage: set encoding utf8|cp437".into())),
+                };
+                self.encoding = encoding;
+                // RFC 2066: the transport tells a CHARSET-capable server.
+                if connected {
+                    Ok(Control::Send(
+                        crate::telnet::Command::Charset(encoding),
+                        text.into(),
+                    ))
+                } else {
+                    message(text)
                 }
-                Some("cp437") => {
-                    self.encoding = Encoding::Cp437;
-                    message("Terminal encoding: CP437")
-                }
-                _ => Err("usage: set encoding utf8|cp437".into()),
-            },
+            }
             "status" | "st" | "help" | "?" => {
                 let (rows, cols) = self.screen().size();
                 self.report = Some(format!(

@@ -1513,7 +1513,8 @@ fn find_fr_size(tracks: &[Track], space: f32) -> f32 {
 
 /// Map a content-distribution keyword onto the shared distribution model.
 fn dist_of(v: Option<&str>) -> Justify {
-    match v.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+    let (safe, v) = super::flex::overflow_position(v.unwrap_or(""));
+    match v.as_str() {
         "end" | "flex-end" | "right" => Justify::End,
         "center" => Justify::Center,
         "space-between" => Justify::Between,
@@ -1521,6 +1522,7 @@ fn dist_of(v: Option<&str>) -> Justify {
         "space-evenly" => Justify::Evenly,
         _ => Justify::Start,
     }
+    .safe(safe)
 }
 
 /// Whether a content-distribution keyword stretches auto tracks (§11.8:
@@ -1538,14 +1540,16 @@ fn dist_stretches(v: Option<&str>) -> bool {
 /// non-replaced grid items (css-align §6.1.2).
 fn self_align(own: Option<&str>, items_default: super::flex::AlignItem) -> super::flex::AlignItem {
     use super::flex::AlignItem;
-    match own.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+    let (safe, own) = super::flex::overflow_position(own.unwrap_or(""));
+    match own.as_str() {
         "start" | "flex-start" | "self-start" | "left" => AlignItem::Start,
         "end" | "flex-end" | "self-end" | "right" => AlignItem::End,
         "center" => AlignItem::Center,
         "stretch" | "normal" => AlignItem::Stretch,
         "baseline" | "first baseline" | "last baseline" => AlignItem::Baseline,
-        _ => items_default,
+        _ => return items_default,
     }
+    .safe(safe)
 }
 
 impl Flow<'_> {

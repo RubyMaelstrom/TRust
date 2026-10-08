@@ -5111,6 +5111,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const control = controls[i];
             userEditedText.delete(control);
             valueLastChangedByUser.delete(control);
+            // HTML #concept-form-reset-control: input, select and textarea
+            // reset their user validity.
+            setUserValidity(control, false);
             resetControl(control);
             if (isTextControl(control)) textEditBaselines.set(control,control.value);
         }
@@ -6180,109 +6183,38 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (const name of formAssociatedNames) selector += "," + cssIdentifier(name);
         return selector;
     }
-    // HTML #constraints (local whatwg/html e5071a2). The "last changed by a
-    // user edit" state of a text control's value (#concept-fe-value).
-    const valueLastChangedByUser = new WeakSet();
+    // HTML #constraints (local whatwg/html e5071a2). Constraint validation
+    // state lives in the DOM (`dom::validity`), which the `:valid`,
+    // `:invalid`, `:user-valid`, `:user-invalid`, `:in-range` and
+    // `:out-of-range` selectors share. The "last changed by a user edit"
+    // state of a text control's value (#concept-fe-value):
+    const valueLastChangedByUser = {
+        add(el) { __dom_input(elementIdentity(el), "user-edited", true); },
+        delete(el) { __dom_input(elementIdentity(el), "user-edited", false); },
+    };
     const TEXT_LIKE_INPUT_TYPES = ["text", "search", "url", "tel", "email", "password"];
-    const READONLY_INPUT_TYPES = TEXT_LIKE_INPUT_TYPES.concat(["date", "month", "week", "time",
-        "datetime-local", "number"]);
     function inputTypeOf(el) { return String(el.type || "text").toLowerCase(); }
     // HTML #barred-from-constraint-validation / #candidate-for-constraint-validation.
     function controlWillValidate(el) {
-        const name = htmlElementName(el);
-        if (name !== "input" && name !== "button" && name !== "select" && name !== "textarea" &&
-            !isFormAssociatedCustomElement(el)) return false;
-        if (isActuallyDisabled(el)) return false;
-        for (let ancestor = parentElementOf(el); ancestor; ancestor = parentElementOf(ancestor))
-            if (htmlElementName(ancestor) === "datalist") return false;
-        if (name === "input") {
-            const type = inputTypeOf(el);
-            if (type === "hidden" || type === "reset" || type === "button") return false;
-            if (el.hasAttribute("readonly") && READONLY_INPUT_TYPES.includes(type)) return false;
-        } else if (name === "button") {
-            if (!isSubmitButton(el)) return false;
-        } else if (name === "textarea") {
-            if (el.hasAttribute("readonly")) return false;
-        } else if (name !== "select" && el.hasAttribute("readonly")) return false;
-        return true;
+        return __dom_input(elementIdentity(el), "will-validate", null) === true;
     }
-    // HTML #valid-e-mail-address.
-    const VALID_EMAIL = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
-    function inputValues(el) {
-        const value = String(el.value);
-        if (inputTypeOf(el) === "email" && el.hasAttribute("multiple"))
-            return value === "" ? [] : value.split(",").map((part) => part.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ""));
-        return [value];
-    }
-    // HTML #compiled-pattern-regular-expression.
-    function compiledPattern(el) {
-        const pattern = el.getAttribute("pattern");
-        if (pattern === null) return null;
-        try { return new RegExp("^(?:" + pattern + ")$", "v"); } catch (_) { return null; }
-    }
-    // HTML #placeholder-label-option.
-    function placeholderLabelOption(select) {
-        if (!select.hasAttribute("required") || selectDisplaySize(select) !== 1) return null;
-        const first = selectOptionList(select)[0];
-        if (!first || first.value !== "" || rangeParent(first) !== select) return null;
-        return first;
-    }
-    function controlValueMissing(el, name) {
-        if (name === "select") {
-            if (!el.hasAttribute("required")) return false;
-            const selected = selectOptionList(el).filter(optionSelectedness);
-            return selected.length === 0 || (selected.length === 1 && selected[0] === placeholderLabelOption(el));
-        }
-        if (name === "textarea")
-            return el.hasAttribute("required") && !isActuallyDisabled(el) && !el.hasAttribute("readonly") && el.value === "";
-        if (name !== "input") return false;
-        const type = inputTypeOf(el);
-        if (type === "checkbox") return el.hasAttribute("required") && !el.checked;
-        if (type === "radio") {
-            const group = radioGroupFor(el);
-            return group.some((radio) => radio.hasAttribute("required")) && !group.some((radio) => radio.checked);
-        }
-        // HTML #file-upload-state-(type=file) constraint validation.
-        if (type === "file") return el.hasAttribute("required") && inputSelectedFiles(el).length === 0;
-        if (!READONLY_INPUT_TYPES.includes(type)) return false;
-        return el.hasAttribute("required") && !isActuallyDisabled(el) && !el.hasAttribute("readonly") && el.value === "";
-    }
-    // The validity states of a form control (HTML #the-constraint-validation-api).
-    function controlValidity(el) {
-        const name = htmlElementName(el);
-        const custom = internalsFor(el).customValidityMessage || "";
-        if (isFormAssociatedCustomElement(el)) return faceValidity(el);
-        const flags = {valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false,
-            tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false,
-            customError: custom !== ""};
-        if (name === "input" || name === "select" || name === "textarea") flags.valueMissing = controlValueMissing(el, name);
-        if (name === "input") {
-            const type = inputTypeOf(el);
-            const values = inputValues(el).filter((value) => value !== "");
-            if (type === "email") flags.typeMismatch = values.some((value) => !VALID_EMAIL.test(value));
-            else if (type === "url") flags.typeMismatch = values.some((value) => !__url_parse(value, ""));
-            if (TEXT_LIKE_INPUT_TYPES.includes(type)) {
-                const pattern = compiledPattern(el);
-                if (pattern) flags.patternMismatch = values.some((value) => !pattern.test(value));
-            }
-            const numeric = __dom_input(elementIdentity(el), "validity", null) || [false, false, false, false];
-            flags.rangeUnderflow = !!numeric[0]; flags.rangeOverflow = !!numeric[1];
-            flags.stepMismatch = !!numeric[2]; flags.badInput = !!numeric[3];
-        }
-        // HTML #attr-fe-maxlength / #attr-fe-minlength: a value last changed
-        // by a user edit and longer or (when non-empty) shorter than allowed.
-        if ((name === "textarea" || (name === "input" && TEXT_LIKE_INPUT_TYPES.includes(inputTypeOf(el)))) &&
-            valueLastChangedByUser.has(el)) {
-            const length = String(el.value).length;
-            const max = el.maxLength, min = el.minLength;
-            if (max >= 0 && length > max) flags.tooLong = true;
-            if (min >= 0 && length > 0 && length < min) flags.tooShort = true;
-        }
-        flags.valid = !Object.keys(flags).some((key) => flags[key]);
-        return flags;
+    // HTML #user-validity: set when the user commits a change, by select
+    // update notifications and by form submission; reset clears it.
+    function setUserValidity(el, value) {
+        __dom_input(elementIdentity(el), "user-validity", !!value);
     }
     const VALIDITY_FLAGS = ["valueMissing", "typeMismatch", "patternMismatch", "tooLong", "tooShort",
         "rangeUnderflow", "rangeOverflow", "stepMismatch", "badInput", "customError", "valid"];
+    // The validity states of a form control (HTML #the-constraint-validation-api),
+    // as the DOM computes them (bits in VALIDITY_FLAGS order).
+    function controlValidity(el) {
+        if (isFormAssociatedCustomElement(el)) return faceValidity(el);
+        const bits = __dom_input(elementIdentity(el), "constraint-validity", null) | 0;
+        const flags = {};
+        for (let i = 0; i < 10; i++) flags[VALIDITY_FLAGS[i]] = (bits & (1 << i)) !== 0;
+        flags.valid = bits === 0;
+        return flags;
+    }
     // HTML #validitystate: a live view of its element's validity states.
     class ValidityState {
         constructor() { throw new TypeError("Illegal constructor"); }
@@ -6390,7 +6322,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 value: { setCustomValidity(error) {
                     requireHTMLInterface(this, [tag]);
                     if (arguments.length < 1) throw new TypeError("setCustomValidity requires an argument");
-                    internalsFor(this).customValidityMessage = idlDOMString(error).replace(/\r\n?/g, "\n");
+                    const message = idlDOMString(error).replace(/\r\n?/g, "\n");
+                    internalsFor(this).customValidityMessage = message;
+                    __dom_input(elementIdentity(this), "custom-validity", message !== "");
                 } }.setCustomValidity },
         });
     }
@@ -6645,6 +6579,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!fromSubmitMethod) {
             if (slots.firingSubmissionEvents) return {handled: true};
             slots.firingSubmissionEvents = true;
+            // Every submittable element the form owns gets user validity.
+            __dom_input(elementIdentity(form), "form-user-validity", null);
             let shouldContinue;
             try {
                 if (!submissionNoValidate(form, submitter) && !interactivelyValidateConstraints(form))
@@ -6740,7 +6676,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML #common-input-element-events and #unfocus-causes-change-event:
         // text input changes are committed on Enter or before blur, not once
         // for every character. Script-only changes never set the user flag.
-        if (previous !== value) dispatch(el, createTrustedEvent(Event,"change",{bubbles:true}), false);
+        // Committing an input's change sets its user validity first.
+        if (previous !== value) {
+            if (el.localName === "input") setUserValidity(el, true);
+            dispatch(el, createTrustedEvent(Event,"change",{bubbles:true}), false);
+        }
     }
     // Set a control property as a USER edit would, NOT a script write.
     // Frameworks (React, Vue, Preact) install an instance-level "value
@@ -7169,6 +7109,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         } else {
             if (el.value !== value) { nativeSet(el, "value", value); changed = true; }
         }
+        // HTML #common-input-element-events: a committed number edit, and
+        // #send-select-update-notifications for a select, set the control's
+        // user validity before its change event.
+        if (changed && (tag === "select" || (tag === "input" && type === "number"))) setUserValidity(el, true);
         if (changed && tag === "input" && type === "number") {
             dispatch(el, createTrustedEvent(Event, "input", {bubbles:true, composed:true}), false);
             dispatch(el, createTrustedEvent(Event, "change", {bubbles:true}), false);
@@ -7190,6 +7134,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const changed = __dom_input(id, direction < 0 ? "down" : "up", 1);
         if (changed) {
             __dom_input(id, "user", __dom_input(id, "get", null));
+            setUserValidity(el, true);
             dispatch(el, createTrustedEvent(Event, "input", {bubbles:true, composed:true}), false);
             dispatch(el, createTrustedEvent(Event, "change", {bubbles:true}), false);
         }
@@ -9371,7 +9316,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             try { activateClick(this, false, false); } catch (e) {}
             finally { internalsFor(this).trustClickInProgress = false; }
         }
-        focus(options) { focusElement(this, options || {}); }
+        focus(options) {
+            // HTML #dom-focus: focusVisible decides whether to indicate focus;
+            // without it, Selectors 4's heuristic carries the previous
+            // focus's indication over to a focus move made by script.
+            const previous = focusedArea && focusedArea.nodeType === 1
+                ? __dom_input(elementIdentity(focusedArea), "focus-visible-get", null) : null;
+            const requested = options ? options.focusVisible : undefined;
+            focusElement(this, options || {});
+            if (focusedArea !== this) return;
+            const indicate = requested !== undefined ? !!requested : previous;
+            if (typeof indicate === "boolean") __dom_input(elementIdentity(this), "focus-visible", indicate);
+        }
         blur() { blurElement(this); }
         get tabIndex() {
             const parsed = parsedTabIndex(this);
@@ -9705,8 +9661,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         set currentTime(v) { internalsFor(this).ct = +v || 0; }
         get volume() { return internalsFor(this).vol === undefined ? 1 : internalsFor(this).vol; }
         set volume(v) { internalsFor(this).vol = +v; }
-        get muted() { return !!internalsFor(this).muted; }
-        set muted(v) { internalsFor(this).muted = !!v; }
+        // HTML #dom-media-muted: a created element's muted state starts from
+        // its muted content attribute (the DOM keeps it until script sets it).
+        get muted() {
+            const muted = internalsFor(this).muted;
+            return muted === undefined ? this.hasAttribute("muted") : !!muted;
+        }
+        set muted(v) {
+            internalsFor(this).muted = !!v;
+            // HTML #selector-muted reads the DOM's copy.
+            __dom_input(elementIdentity(this), "media-muted", !!v);
+        }
         get playbackRate() { return internalsFor(this).pbr === undefined ? 1 : internalsFor(this).pbr; }
         set playbackRate(v) { internalsFor(this).pbr = +v; }
         get defaultPlaybackRate() { return 1; }
@@ -16975,6 +16940,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             slots.faceValidationMessage = any ? message : "";
             slots.customValidityMessage = converted.customError ? slots.faceValidationMessage : "";
             slots.faceValidationAnchor = anchor;
+            // The DOM's copy, for the validity pseudo-classes.
+            let bits = 0;
+            for (let i = 0; i < 10; i++) if (converted[VALIDITY_FLAGS[i]]) bits |= 1 << i;
+            __dom_input(elementIdentity(target), "face-validity", bits);
         }
         get willValidate() { return controlWillValidate(requireFaceTarget(this)); }
         get validity() { return validityStateFor(requireFaceTarget(this)); }
@@ -32398,12 +32367,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
     g.WebSocket = WebSocket;
     // The actor calls this for every inbound WebSocket event (open/message/close).
-    trust.wsEvent = function (id, kind, data, isBinary, code, reason, wasClean, failed, protocol) {
+    trust.wsEvent = function (id, kind, data, isBinary, code, reason, wasClean, failed, protocol, extensions) {
         const ws = WS_REGISTRY[id];
         if (!ws) return;
         if (kind === "open") {
             ws.readyState = 1; // OPEN
             ws.protocol = protocol || "";
+            // WebSockets #dom-websocket-extensions: the extensions in use.
+            ws.extensions = extensions || "";
             socketFire.call(ws, "open", {});
         } else if (kind === "message") {
             let payload = data;

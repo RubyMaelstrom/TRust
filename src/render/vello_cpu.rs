@@ -393,9 +393,34 @@ impl VelloCpuRenderer {
                             .fill_blurred_rounded_rect(&rect, radius, std_dev, false);
                         self.context.pop_layer();
                         self.context.pop_layer();
+                    } else if let Some(filter) = shadow_blur(*blur_radius) {
+                        // CSS Backgrounds 3 #shadow-blur for any other shape
+                        // (elliptical or unequal radii): the shadow plane
+                        // around the hole under a Gaussian blur, then kept
+                        // only inside the padding box. A clip active while
+                        // drawing would cut the plane before the blur.
+                        self.context.push_layer(None, None, None, None, None);
+                        self.context
+                            .push_layer(None, None, None, None, Some(filter));
+                        self.context.set_paint(vello_color(*color));
+                        self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
+                        self.context
+                            .fill_path(&outside_shape_path(&hole, shape, *blur_radius));
+                        self.context.pop_layer();
+                        self.context
+                            .push_layer(None, Some(erase_blend()), None, None, None);
+                        self.context.set_paint(BLACK);
+                        // Beyond the plane and its blur halo (three
+                        // deviations), everything outside the padding box.
+                        self.context.fill_path(&outside_shape_path(
+                            shape,
+                            shape,
+                            *blur_radius * 2.0,
+                        ));
+                        self.context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+                        self.context.pop_layer();
+                        self.context.pop_layer();
                     } else {
-                        // Vello CPU's direct blur primitive currently accepts
-                        // rounded rectangles, not arbitrary paths.
                         self.context.push_clip_path(&padding);
                         self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
                         self.context.fill_path(&inset_shadow_ring(shape, &hole));
@@ -423,6 +448,29 @@ impl VelloCpuRenderer {
                     }
                     apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
                     self.context.set_paint(vello_color(*color));
+                    if simple_rounded_rect(&shifted).is_none()
+                        && let Some(filter) = shadow_blur(*blur_radius)
+                    {
+                        // CSS Backgrounds 3 #shadow-blur for any other shape
+                        // (elliptical or unequal radii): the shadow shape
+                        // under a Gaussian blur whose standard deviation is
+                        // half the blur radius, then erased under the border
+                        // box (#shadow-shape). A clip active while drawing
+                        // would cut the shape before the blur.
+                        self.context.push_layer(None, None, None, None, None);
+                        self.context
+                            .push_layer(None, None, None, None, Some(filter));
+                        self.context.set_paint(vello_color(*color));
+                        self.context.fill_path(&shape_path(&shifted));
+                        self.context.pop_layer();
+                        self.context
+                            .push_layer(None, Some(erase_blend()), None, None, None);
+                        self.context.set_paint(BLACK);
+                        self.context.fill_path(&shape_path(shape));
+                        self.context.pop_layer();
+                        self.context.pop_layer();
+                        continue;
+                    }
                     self.context.set_fill_rule(vello_cpu::peniko::Fill::EvenOdd);
                     self.context
                         .push_clip_path(&outside_shape_path(shape, &shifted, expansion));
@@ -435,8 +483,6 @@ impl VelloCpuRenderer {
                             false,
                         );
                     } else {
-                        // Vello CPU's direct blur primitive currently accepts
-                        // rounded rectangles, not arbitrary paths.
                         self.context.fill_path(&shape_path(&shifted));
                     }
                     self.context.pop_clip();
@@ -1123,8 +1169,10 @@ pub(super) fn vello_blend(
         BlendMode::Saturation => Mix::Saturation,
         BlendMode::Color => Mix::Color,
         BlendMode::Luminosity => Mix::Luminosity,
+        BlendMode::PlusLighter => Mix::Normal,
     };
     let compose = match compose {
+        CompositeOperator::SourceOver if mode == BlendMode::PlusLighter => Compose::PlusLighter,
         CompositeOperator::SourceOver => Compose::SrcOver,
         CompositeOperator::SourceIn => Compose::SrcIn,
         CompositeOperator::SourceOut => Compose::SrcOut,
@@ -1147,6 +1195,21 @@ pub(super) fn text_shadow_blur(
     (blur > 0.0 && blur.is_finite()).then(|| {
         Filter::from_primitive(FilterPrimitive::GaussianBlur {
             std_deviation: blur / 2.0,
+            edge_mode: EdgeMode::None,
+        })
+    })
+}
+
+/// CSS Backgrounds 3 #shadow-blur: a box shadow's blur is a Gaussian blur
+/// with a standard deviation of half the blur radius. Rounded rectangles with
+/// one circular radius use Vello's analytic blurred rectangle instead; every
+/// other shadow shape is blurred as a filter layer, which, like text shadows,
+/// stays unclipped inside the caller's clip path.
+pub(super) fn shadow_blur(blur_radius: f32) -> Option<vello_common::filter_effects::Filter> {
+    use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
+    (blur_radius > 0.0 && blur_radius.is_finite()).then(|| {
+        Filter::from_primitive(FilterPrimitive::GaussianBlur {
+            std_deviation: blur_radius / 2.0,
             edge_mode: EdgeMode::None,
         })
     })

@@ -29,8 +29,13 @@ pub(super) struct TableCols {
     /// Horizontal border-spacing between columns (px).
     pub bs: f32,
     pub bs_y: f32,
-    /// The table's used content width (px): `Σ widths + bs·(ncols−1)`.
+    /// The table's used content width (px): `Σ widths + bs·(ncols−1)` over
+    /// the visible columns.
     pub table_w: f32,
+    /// CSS Tables 3 #visible-track: the columns `visibility: collapse`
+    /// removes (on the column or its column group). Their widths remain the
+    /// as-if-visible widths that cell layout uses.
+    pub collapsed: Vec<bool>,
 }
 
 impl Flow<'_> {
@@ -55,8 +60,18 @@ impl Flow<'_> {
                 bs,
                 bs_y,
                 table_w: 0.0,
+                collapsed: Vec::new(),
             };
         }
+        let collapsed = self.collapsed_tracks(&tb.col_boxes, ncols);
+        // CSS 2.2 §17.5.5: a collapsed column's space is made available;
+        // the layout is otherwise as if it were visible.
+        let hidden = |widths: &[f32]| -> f32 {
+            (0..ncols)
+                .filter(|&c| collapsed[c])
+                .map(|c| widths.get(c).copied().unwrap_or(0.0) + bs)
+                .sum()
+        };
         let spacing = bs * (ncols + 1) as f32;
         // Space available to the columns' content (the band, less spacing).
         let avail = (avail_w - spacing).max(1.0);
@@ -68,12 +83,15 @@ impl Flow<'_> {
         // Fixed layout: a definite width + `table-layout:fixed` ignores
         // content and divides by declared column widths (§17.5.2.1).
         if tb.fixed_layout && !width_auto {
+            let widths = fixed_columns(&col_w, ncols, avail);
+            let removed = hidden(&widths);
             return TableCols {
-                widths: fixed_columns(&col_w, ncols, avail),
+                widths,
                 bs,
                 bs_y,
                 // `avail` already == the definite content width − spacing.
-                table_w: avail + spacing,
+                table_w: (avail + spacing - removed).max(0.0),
+                collapsed,
             };
         }
 
@@ -93,13 +111,37 @@ impl Flow<'_> {
         };
 
         let target = distribute_widths(&col_min, &col_max, &col_w, used);
-        let table_w = target.iter().sum::<f32>() + spacing;
+        let table_w = (target.iter().sum::<f32>() + spacing - hidden(&target)).max(0.0);
         TableCols {
             widths: target,
             bs,
             bs_y,
             table_w,
+            collapsed,
         }
+    }
+
+    /// CSS Tables 3 #visible-track: whether each track (or its group) has
+    /// `visibility: collapse`.
+    fn collapsed_tracks(
+        &self,
+        boxes: &[(Option<NodeId>, Option<NodeId>)],
+        count: usize,
+    ) -> Vec<bool> {
+        let collapse = |node: Option<NodeId>| {
+            node.is_some_and(|node| {
+                self.dom
+                    .computed_value_resolved(node, "visibility")
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("collapse"))
+            })
+        };
+        (0..count)
+            .map(|index| {
+                boxes
+                    .get(index)
+                    .is_some_and(|&(track, group)| collapse(track) || collapse(group))
+            })
+            .collect()
     }
 
     /// Lay the table's cells at their resolved column widths and return the
@@ -125,13 +167,30 @@ impl Flow<'_> {
         }
         let bs = cols.bs;
         let bs_y = cols.bs_y;
-        // Column left edges (with inter-column spacing).
+        // Column left edges (with inter-column spacing). CSS Tables 3
+        // #bounding-box-assignment positions boxes by the visible tracks
+        // only: a collapsed column takes no width and no spacing.
+        let col_collapsed = |c: usize| cols.collapsed.get(c).copied().unwrap_or(false);
         let mut col_x = vec![0.0f32; ncols];
         let mut acc = bs;
         for (c, x) in col_x.iter_mut().enumerate() {
             *x = acc;
-            acc += cols.widths.get(c).copied().unwrap_or(1.0) + bs;
+            if !col_collapsed(c) {
+                acc += cols.widths.get(c).copied().unwrap_or(1.0) + bs;
+            }
         }
+        let row_collapsed = self.collapsed_tracks(&tb.row_boxes, nrows);
+        // The breadth of the visible tracks a span covers, with the spacing
+        // between them.
+        let visible_span =
+            |sizes: &[f32], hidden: &dyn Fn(usize) -> bool, start: usize, end: usize, gap: f32| {
+                let visible: Vec<usize> = (start..end).filter(|&i| !hidden(i)).collect();
+                visible
+                    .iter()
+                    .map(|&i| sizes.get(i).copied().unwrap_or(0.0))
+                    .sum::<f32>()
+                    + gap * visible.len().saturating_sub(1) as f32
+            };
 
         // Lay every cell at its spanned-column width. HTML's `cellpadding`
         // is an ordinary padding hint on the cells (HTML Rendering #tables-2).
@@ -291,7 +350,9 @@ impl Flow<'_> {
         let mut acc = bs_y;
         for r in 0..nrows {
             row_y[r] = acc;
-            acc += row_h[r] + bs_y;
+            if !row_collapsed[r] {
+                acc += row_h[r] + bs_y;
+            }
         }
         let table_h = acc.max(0.0);
 
@@ -300,8 +361,11 @@ impl Flow<'_> {
         let mut frags: Vec<Frag> = Vec::with_capacity(laid.len());
         for ((cell, mut l), (row, group)) in tb.cells.iter().zip(laid).zip(cell_rows) {
             let end = (cell.row + cell.rowspan).min(nrows);
-            let span_h = row_h[cell.row..end].iter().sum::<f32>()
-                + bs_y * (end.saturating_sub(cell.row + 1)) as f32;
+            let hidden_row = |r: usize| row_collapsed[r];
+            let span_h = visible_span(&row_h, &hidden_row, cell.row, end, bs_y);
+            let col_end = (cell.col + cell.colspan).min(ncols);
+            let spans_collapsed =
+                (cell.row..end).any(hidden_row) || (cell.col..col_end).any(col_collapsed);
             let dy_valign = self.cell_valign_offset(cell.b.node, l.content_h, span_h);
             // §9.4.3 relative offset / transform translation — a cell's CB for
             // percentages is its own box.
@@ -313,7 +377,13 @@ impl Flow<'_> {
             for child in &mut l.frag.children {
                 Flow::offset_frag(child, 0.0, dy_valign);
             }
-            l.frag.h = span_h.max(l.frag.h);
+            if spans_collapsed {
+                // CSS 2.2 §17.5.5: the cell keeps only its visible tracks.
+                l.frag.h = span_h;
+                l.frag.w = visible_span(&cols.widths, &col_collapsed, cell.col, col_end, bs);
+            } else {
+                l.frag.h = span_h.max(l.frag.h);
+            }
             let mut layers = Vec::new();
             if let Some(group) = group {
                 let (first, end) = group_rows[&group];
@@ -615,6 +685,11 @@ impl Flow<'_> {
         // td/th presentational hints, and no DOM identity to query.
         if cell == super::NO_NODE {
             return 0.0;
+        }
+        // CSS Box Alignment 3 #distribution-block: a table cell's
+        // `align-content` other than `normal` replaces its vertical-align.
+        if let Some(align) = super::style::block_content_align(self.dom, cell) {
+            return align.offset(span_h - cell_h);
         }
         let slack = (span_h - cell_h).max(0.0);
         if slack <= 0.0 {

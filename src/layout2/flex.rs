@@ -42,6 +42,10 @@ pub(crate) enum Justify {
     Between,
     Around,
     Evenly,
+    /// CSS Box Alignment 3 #overflow-values: `safe center` / `safe end`
+    /// start-align instead when the subject overflows its container.
+    SafeCenter,
+    SafeEnd,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -51,6 +55,9 @@ pub(crate) enum AlignItem {
     End,
     Center,
     Baseline,
+    /// `safe center` / `safe end` (CSS Box Alignment 3 #overflow-values).
+    SafeCenter,
+    SafeEnd,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -62,6 +69,44 @@ pub(crate) enum AlignContent {
     Between,
     Around,
     Evenly,
+    /// `safe center` / `safe end` (CSS Box Alignment 3 #overflow-values).
+    SafeCenter,
+    SafeEnd,
+}
+
+/// CSS Box Alignment 3 #overflow-values: a leading `safe` or `unsafe`
+/// keyword (`Some(true)` for safe) and the rest of an alignment value,
+/// ASCII-lowercased and trimmed.
+pub(crate) fn overflow_position(value: &str) -> (Option<bool>, String) {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(rest) = value.strip_prefix("safe ") {
+        (Some(true), rest.trim().to_string())
+    } else if let Some(rest) = value.strip_prefix("unsafe ") {
+        (Some(false), rest.trim().to_string())
+    } else {
+        (None, value)
+    }
+}
+
+impl Justify {
+    /// The `safe` form of a positional alignment (#overflow-values).
+    pub(crate) fn safe(self, safe: Option<bool>) -> Self {
+        match (safe, self) {
+            (Some(true), Self::Center) => Self::SafeCenter,
+            (Some(true), Self::End) => Self::SafeEnd,
+            _ => self,
+        }
+    }
+}
+
+impl AlignItem {
+    pub(crate) fn safe(self, safe: Option<bool>) -> Self {
+        match (safe, self) {
+            (Some(true), Self::Center) => Self::SafeCenter,
+            (Some(true), Self::End) => Self::SafeEnd,
+            _ => self,
+        }
+    }
 }
 
 /// Read a container's flex style.
@@ -75,7 +120,7 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
         if matches!(
             dom.computed_display(id).as_deref(),
             Some("-webkit-box" | "-webkit-inline-box")
-        ) && cv("-webkit-box-orient").as_deref() == Some("vertical")
+        ) && dom.legacy_box_vertical(id)
         {
             "column".into()
         } else {
@@ -111,12 +156,9 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     } else {
         (Justify::Start, Justify::End)
     };
-    let justify = match cv("justify-content")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let (justify_safe, justify_value) =
+        overflow_position(&cv("justify-content").unwrap_or_default());
+    let justify = match justify_value.as_str() {
         "flex-end" => Justify::End,
         "start" | "left" => start,
         "end" => end,
@@ -127,23 +169,22 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
         "space-around" => Justify::Around,
         "space-evenly" => Justify::Evenly,
         _ => Justify::Start,
-    };
+    }
+    .safe(justify_safe);
     let align_items = align_item_from(
         cv("align-items").as_deref().unwrap_or(""),
         AlignItem::Stretch,
     );
-    let align_content = match cv("align-content")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "flex-start" | "start" => AlignContent::Start,
-        "flex-end" | "end" => AlignContent::End,
-        "center" => AlignContent::Center,
-        "space-between" => AlignContent::Between,
-        "space-around" => AlignContent::Around,
-        "space-evenly" => AlignContent::Evenly,
+    let (content_safe, content_value) = overflow_position(&cv("align-content").unwrap_or_default());
+    let align_content = match (content_safe, content_value.as_str()) {
+        (_, "flex-start" | "start") => AlignContent::Start,
+        (Some(true), "flex-end" | "end") => AlignContent::SafeEnd,
+        (_, "flex-end" | "end") => AlignContent::End,
+        (Some(true), "center") => AlignContent::SafeCenter,
+        (_, "center") => AlignContent::Center,
+        (_, "space-between") => AlignContent::Between,
+        (_, "space-around") => AlignContent::Around,
+        (_, "space-evenly") => AlignContent::Evenly,
         _ => AlignContent::Stretch,
     };
     // `gap` is the `<row-gap> <column-gap>` shorthand; longhands win.
@@ -180,7 +221,8 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
 }
 
 pub(crate) fn align_item_from(v: &str, auto: AlignItem) -> AlignItem {
-    match v.trim().to_ascii_lowercase().as_str() {
+    let (safe, v) = overflow_position(v);
+    match v.as_str() {
         "flex-start" | "start" | "self-start" => AlignItem::Start,
         "flex-end" | "end" | "self-end" => AlignItem::End,
         "center" => AlignItem::Center,
@@ -188,6 +230,7 @@ pub(crate) fn align_item_from(v: &str, auto: AlignItem) -> AlignItem {
         "baseline" | "first baseline" | "last baseline" => AlignItem::Baseline,
         _ => auto,
     }
+    .safe(safe)
 }
 
 /// The `flex` shorthand + longhands → (grow, shrink, basis). Longhands win
@@ -416,8 +459,8 @@ pub(crate) fn justify_offsets(justify: Justify, free: f32, n: usize) -> (f32, f3
     }
     match justify {
         Justify::Start => (0.0, 0.0),
-        Justify::End => (free, 0.0),
-        Justify::Center => (free / 2.0, 0.0),
+        Justify::End | Justify::SafeEnd => (free, 0.0),
+        Justify::Center | Justify::SafeCenter => (free / 2.0, 0.0),
         Justify::Between => {
             if n == 1 {
                 (0.0, 0.0)
@@ -443,6 +486,8 @@ pub(crate) fn align_content_offsets(align: AlignContent, free: f32, n: usize) ->
         AlignContent::Start | AlignContent::Stretch => Justify::Start,
         AlignContent::End => Justify::End,
         AlignContent::Center => Justify::Center,
+        AlignContent::SafeCenter => Justify::SafeCenter,
+        AlignContent::SafeEnd => Justify::SafeEnd,
         AlignContent::Between => Justify::Between,
         AlignContent::Around => Justify::Around,
         AlignContent::Evenly => Justify::Evenly,

@@ -66,6 +66,7 @@ mod spatial;
 pub(crate) use overflow::{Overflow, scroll_reverse};
 mod style;
 mod table;
+mod text_overflow;
 mod transform;
 // The legacy Row/Item output is now explicitly a terminal compatibility
 // adapter. Its source filename is retained to keep this refactor reviewable.
@@ -441,7 +442,7 @@ pub(crate) fn rich_editor_presentation(
         if let FragKind::Line(line) = &f.kind
             && !line.sideways
             && let Some(piece) = line
-                .pieces
+                .laid_pieces()
                 .iter()
                 .find(|piece| piece.item.node == node && matches!(piece.item.kind, ItemKind::Form))
         {
@@ -5541,6 +5542,440 @@ mod tests {
     }
 
     #[test]
+    fn multicol_honours_break_controls() {
+        // CSS Fragmentation 3 #breaking-controls in a multi-column flow:
+        // break-inside:avoid keeps a card in one column (the masonry idiom),
+        // a forced break-before:column starts a column, break-after:avoid
+        // removes a class A break, page breaks do nothing in continuous
+        // media, and widows/orphans restrict class B breaks.
+        let cards = |card: &str, extra: &str| {
+            format!(
+                "<!doctype html><style>body{{margin:0}}\
+                 .m{{column-count:2;column-gap:20px;width:420px}}\
+                 .m>div div{{height:20px}} {extra}</style><div class=m id=m>\
+                 <div id=a{card}><div></div><div></div></div>\
+                 <div id=b{card}><div id=b1></div><div id=b2></div></div>\
+                 <div id=c{card}><div></div><div></div></div></div>"
+            )
+        };
+        let left = |html: &str, id: &str| {
+            let dom = Dom::parse_document(html);
+            let layout = lay_graphical(html, 800.0, &HashMap::new());
+            let r = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (r.left, r.top)
+        };
+        // (Line pieces sit a fraction below their line top: compare columns.)
+        // Without controls the middle card splits across the columns.
+        let html = cards("", "");
+        assert_eq!(left(&html, "b1"), (0.0, 40.0));
+        assert_eq!(left(&html, "b2"), (220.0, 0.0));
+        // break-inside: avoid keeps each card whole.
+        let html = cards(" style='break-inside:avoid'", "");
+        assert_eq!(left(&html, "b1").0, left(&html, "b2").0);
+        // The legacy page-break-inside shorthand sets break-inside.
+        let html = cards(" style='page-break-inside:avoid'", "");
+        assert_eq!(left(&html, "b1").0, left(&html, "b2").0);
+        // A forced column break before the last card.
+        let html = cards("", "#c{break-before:column}");
+        assert_eq!(left(&html, "c"), (220.0, 0.0));
+        assert_eq!(left(&html, "b2"), (0.0, 60.0));
+        // A page break has no effect in a continuous multicol.
+        let html = cards("", "#c{break-before:page}");
+        assert_eq!(left(&html, "b2"), (220.0, 0.0));
+        // Forced breaks propagate from a first child to its container.
+        let html = cards("", "#c>div:first-child{break-before:always}");
+        assert_eq!(left(&html, "c"), (220.0, 0.0));
+        // widows:3 leaves no allowed break inside a four-line paragraph.
+        let lines = |extra: &str| {
+            format!(
+                "<!doctype html><style>body{{margin:0}}\
+                 .m{{column-count:2;column-gap:20px;width:420px;font:16px/20px monospace}}\
+                 {extra}</style><div class=m><p style='margin:0'>\
+                 <span id=l1>aaaa</span><br><span>bbbb</span><br><span>cccc</span><br>\
+                 <span id=l4>dddd</span></p></div>"
+            )
+        };
+        assert_eq!(left(&lines(""), "l4").0, 220.0);
+        assert_eq!(left(&lines(".m{widows:3}"), "l4").0, 0.0);
+    }
+
+    #[test]
+    fn constrained_multicol_fills_overflow_columns() {
+        // css-multicol-1 #cf and #overflow-columns: a definite height is the
+        // column height; column-fill:auto fills columns sequentially and
+        // content beyond `column-count` columns continues in overflow
+        // columns in the inline direction.
+        let html = |fill: &str| {
+            format!(
+                "<!doctype html><style>body{{margin:0}}\
+                 .m{{column-count:2;column-gap:20px;width:420px;height:40px;column-fill:{fill}}}\
+                 .m div{{height:20px}}</style><div class=m id=m><div id=a></div><div id=b></div>\
+                 <div id=c></div><div id=d></div><div id=e></div></div>"
+            )
+        };
+        let rect = |html: &str, id: &str| {
+            let dom = Dom::parse_document(html);
+            let layout = lay_graphical(html, 800.0, &HashMap::new());
+            let r = layout.boxes[&dom.get_by_id(id).unwrap()];
+            (r.left, r.top)
+        };
+        let auto = html("auto");
+        assert_eq!(rect(&auto, "b"), (0.0, 20.0));
+        assert_eq!(rect(&auto, "c"), (220.0, 0.0));
+        assert_eq!(rect(&auto, "e"), (440.0, 0.0), "an overflow column");
+        assert_eq!(rect(&auto, "m").1, 0.0);
+        // Balancing cannot exceed the height either.
+        let balance = html("balance");
+        assert_eq!(rect(&balance, "e"), (440.0, 0.0));
+        // A flex item (an independently laid box) is a multicol container
+        // too.
+        let item = "<!doctype html><style>body{margin:0}</style><div style='display:flex'>\
+                    <div style='column-count:2;column-gap:0;width:200px'>\
+                    <div id=a style='height:20px'></div><div id=b style='height:20px'></div>\
+                    </div></div>";
+        assert_eq!(rect(item, "b"), (100.0, 0.0));
+    }
+
+    #[test]
+    fn collapsed_table_tracks_give_up_their_space() {
+        // CSS 2.2 §17.5.5 / CSS Tables 3 #visible-track: a collapsed row or
+        // column (or group) is removed with its spacing; the remaining
+        // tracks keep their sizes.
+        let html = "<!doctype html><style>body{margin:0}table{border-spacing:2px}\
+                    td{padding:0;width:30px;height:20px}</style><table id=t>\
+                    <colgroup><col><col id=mid><col></colgroup>\
+                    <tr><td id=a>a</td><td>b</td><td id=c>c</td></tr>\
+                    <tr id=r2><td>d</td><td>e</td><td>f</td></tr>\
+                    <tr><td id=g>g</td><td>h</td><td>i</td></tr></table>";
+        let rects = |extra: &str| {
+            let html = html.replace("</style>", &format!("{extra}</style>"));
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            ["t", "c", "g"].map(|id| {
+                let r = layout.boxes[&dom.get_by_id(id).unwrap()];
+                (r.left, r.top, r.width, r.height)
+            })
+        };
+        let [table, c, g] = rects("");
+        assert_eq!((c.0, g.1), (66.0, 46.0));
+        assert_eq!((table.2, table.3), (98.0, 68.0));
+        let [table, c, g] = rects("#r2{visibility:collapse}");
+        assert_eq!(g.1, 24.0, "the third row moves up");
+        assert_eq!(table.3, 46.0);
+        assert_eq!(c.0, 66.0);
+        let [table, c, _] = rects("#mid{visibility:collapse}");
+        assert_eq!(c.0, 34.0, "the third column moves left");
+        assert_eq!(table.2, 66.0);
+    }
+
+    #[test]
+    fn local_background_layers_scroll_with_the_contents() {
+        // CSS Backgrounds 3 #background-attachment: `local` positions and
+        // paints a scroll container's layer over its scrollable overflow
+        // area, inside its scroll; `scroll` stays with the scrollport.
+        let gradient = |attachment: &str| {
+            let html = format!(
+                "<!doctype html><style>body{{margin:0}}</style>\
+                 <div id=s style='overflow:auto;width:100px;height:50px;\
+                 background:linear-gradient(red,blue) {attachment}'><div style='height:200px'></div></div>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let node = dom.get_by_id("s").unwrap();
+            let mut scrolled = false;
+            let mut found = None;
+            for command in &layout.paint.primitives {
+                match command {
+                    crate::render::DisplayCommand::BeginScroll(id) if *id == node => {
+                        scrolled = true
+                    }
+                    crate::render::DisplayCommand::EndScroll => scrolled = false,
+                    crate::render::DisplayCommand::Fill {
+                        brush: crate::render::PaintBrush::LinearGradient { start, end, .. },
+                        ..
+                    } if found.is_none() => found = Some((scrolled, end.y - start.y)),
+                    _ => {}
+                }
+            }
+            found.expect("a gradient layer")
+        };
+        let (scrolled, length) = gradient("local");
+        assert!(scrolled, "a local layer paints inside the scroll");
+        assert!((length - 200.0).abs() < 0.5, "{length}");
+        let (scrolled, length) = gradient("scroll");
+        assert!(!scrolled);
+        assert!((length - 50.0).abs() < 0.5, "{length}");
+    }
+
+    #[test]
+    fn overflow_positions_choose_safe_or_unsafe_alignment() {
+        // CSS Box Alignment 3 #overflow-values: `safe` aligns an overflowing
+        // subject as `start`; `unsafe` honors the position; the keywords
+        // never discard the alignment itself.
+        let left = |container: &str, item: &str| {
+            let html = format!(
+                "<!doctype html><style>body{{margin:0}}</style>\
+                 <div style='display:flex;width:100px;height:50px;{container}'>\
+                 <div id=i style='flex:none;width:160px;height:80px;{item}'></div></div>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let r = layout.boxes[&dom.get_by_id("i").unwrap()];
+            (r.left, r.top)
+        };
+        assert_eq!(left("justify-content:center", "").0, -30.0);
+        assert_eq!(left("justify-content:unsafe center", "").0, -30.0);
+        assert_eq!(left("justify-content:safe center", "").0, 0.0);
+        assert_eq!(left("justify-content:safe end", "").0, 0.0);
+        assert_eq!(left("align-items:center", "").1, -15.0);
+        assert_eq!(left("align-items:safe center", "").1, 0.0);
+        assert_eq!(left("align-items:unsafe end", "").1, -30.0);
+        assert_eq!(left("", "align-self:safe end").1, 0.0);
+        // Fitting subjects align as their position says.
+        let fit = |container: &str| {
+            let html = format!(
+                "<!doctype html><style>body{{margin:0}}</style>\
+                 <div style='display:flex;width:100px;height:50px;{container}'>\
+                 <div id=i style='flex:none;width:20px;height:10px'></div></div>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let r = layout.boxes[&dom.get_by_id("i").unwrap()];
+            (r.left, r.top)
+        };
+        assert_eq!(
+            fit("justify-content:safe center;align-items:safe end"),
+            (40.0, 40.0)
+        );
+        // Grid content distribution.
+        let grid = |content: &str| {
+            let html = format!(
+                "<!doctype html><style>body{{margin:0}}</style>\
+                 <div style='display:grid;width:100px;grid-template-columns:160px;justify-content:{content}'>\
+                 <div id=i style='height:10px'></div></div>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            layout.boxes[&dom.get_by_id("i").unwrap()].left
+        };
+        assert_eq!(grid("safe center"), 0.0);
+        assert_eq!(grid("safe end"), 0.0);
+    }
+
+    #[test]
+    fn containment_types_apply_their_layout_effects() {
+        // CSS Containment 2 #containment-layout, #containment-paint and
+        // #containment-size.
+        let rects = |html: &str, ids: &[&str]| {
+            let dom = Dom::parse_document(html);
+            let layout = lay_graphical(html, 800.0, &HashMap::new());
+            ids.iter()
+                .map(|id| {
+                    let r = layout.boxes[&dom.get_by_id(id).unwrap()];
+                    (r.left, r.top, r.width, r.height)
+                })
+                .collect::<Vec<_>>()
+        };
+        // Layout and paint containment: containing blocks for absolute and
+        // fixed descendants, and independent formatting contexts.
+        for contain in ["layout", "paint", "content", "strict"] {
+            let html = format!(
+                "<!doctype html><style>body{{margin:0}}</style>\
+                 <div id=box style='contain:{contain};margin:20px 0 0 30px;width:100px;height:100px'>\
+                 <div id=a style='position:absolute;left:5px;top:5px;width:10px;height:10px'></div>\
+                 <div id=f style='position:fixed;right:0;bottom:0;width:10px;height:10px'></div></div>"
+            );
+            assert_eq!(
+                rects(&html, &["a", "f"]),
+                [(35.0, 25.0, 10.0, 10.0), (120.0, 110.0, 10.0, 10.0)],
+                "contain:{contain}"
+            );
+        }
+        let floats = "<!doctype html><style>body{margin:0}</style>\
+                      <div id=box style='contain:layout'><div style='float:left;width:10px;height:50px'></div></div>\
+                      <p id=p style='margin:0;height:5px'></p>";
+        assert_eq!(rects(floats, &["box", "p"])[1].1, 50.0);
+        // Size containment sizes the box as if empty; inline-size only in
+        // the inline axis.
+        let sized = |contain: &str| {
+            format!(
+                "<!doctype html><style>body{{margin:0}}</style>\
+                 <div id=s style='contain:{contain};display:inline-block'>\
+                 <div style='width:100px;height:50px'></div></div>"
+            )
+        };
+        assert_eq!(
+            rects(&sized("size"), &["s"])[0].2..=rects(&sized("size"), &["s"])[0].3,
+            0.0..=0.0
+        );
+        let inline = rects(&sized("inline-size"), &["s"])[0];
+        assert_eq!((inline.2, inline.3), (0.0, 50.0));
+        // A size-contained image has no natural size or ratio; its
+        // aspect-ratio and width still size it.
+        let mut images = HashMap::new();
+        images.insert(String::from("http://e.com/i.png"), (300u32, 100u32));
+        let image = |style: &str| {
+            let html = format!(
+                "<!doctype html><style>body{{margin:0}}</style>\
+                 <img id=i src=i.png style='{style}'>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &images);
+            let r = layout.boxes[&dom.get_by_id("i").unwrap()];
+            (r.width, r.height)
+        };
+        assert_eq!(image(""), (300.0, 100.0));
+        assert_eq!(image("contain:size"), (0.0, 0.0));
+        assert_eq!(image("contain:size;width:100px"), (100.0, 0.0));
+        assert_eq!(
+            image("contain:size;width:100px;aspect-ratio:1/1"),
+            (100.0, 100.0)
+        );
+        // Not for non-atomic inline boxes or internal table boxes.
+        let inline_box = "<!doctype html><style>body{margin:0}</style>\
+                          <span style='contain:layout'><div id=a style='position:absolute;left:5px;top:5px;width:1px;height:1px'></div></span>";
+        assert_eq!(rects(inline_box, &["a"])[0].0, 5.0);
+    }
+
+    #[test]
+    fn paint_containment_clips_its_contents() {
+        let html = "<!doctype html><style>body{margin:0}</style>\
+                    <div style='contain:paint;width:50px;height:20px;margin-left:10px'>\
+                    <div style='width:100px;height:40px;background:red'></div></div>";
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let clipped = layout.paint.primitives.iter().any(|command| {
+            matches!(
+                command,
+                crate::render::DisplayCommand::PushClip(crate::render::PaintShape::Rect(rect))
+                    if (rect.x, rect.y, rect.width, rect.height) == (10.0, 0.0, 50.0, 20.0)
+            )
+        });
+        assert!(clipped, "{:?}", layout.paint.primitives);
+    }
+
+    #[test]
+    fn column_span_all_splits_multicol_lines() {
+        // css-multicol-1 #column-span: content before a spanner balances in
+        // its own multi-column line, the spanner spans the content width,
+        // and the content after it starts a new line; a spanner nested in
+        // a block of the same formatting context spans too.
+        for nest in [false, true] {
+            let (open, close) = if nest {
+                ("<section>", "</section>")
+            } else {
+                ("", "")
+            };
+            let html = format!(
+                "<!doctype html><style>body{{margin:0}}\
+                 .m{{column-count:2;column-gap:20px;width:420px}}</style><div class=m id=m>{open}\
+                 <div id=a style='height:40px'></div><div id=b style='height:40px'></div>\
+                 <h2 id=s style='column-span:all;margin:10px 0;height:30px'>S</h2>\
+                 <div id=c style='height:20px'></div><div id=d style='height:20px'></div>{close}</div>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_graphical(&html, 800.0, &HashMap::new());
+            let rect = |id: &str| {
+                let r = layout.boxes[&dom.get_by_id(id).unwrap()];
+                (r.left, r.top, r.width, r.height)
+            };
+            assert_eq!(rect("a"), (0.0, 0.0, 200.0, 40.0), "nest {nest}");
+            assert_eq!(rect("b"), (220.0, 0.0, 200.0, 40.0), "nest {nest}");
+            assert_eq!(rect("s"), (0.0, 50.0, 420.0, 30.0), "nest {nest}");
+            assert_eq!(rect("c"), (0.0, 90.0, 200.0, 20.0), "nest {nest}");
+            assert_eq!(rect("d"), (220.0, 90.0, 200.0, 20.0), "nest {nest}");
+            assert_eq!(rect("m").3, 110.0, "nest {nest}");
+        }
+    }
+
+    #[test]
+    fn column_rules_paint_between_columns_with_content() {
+        // css-multicol-1 #column-gaps-and-rules: a rule in the middle of
+        // each gap between two columns that both have content, the column
+        // height long.
+        let html = |rule: &str, blocks: usize| {
+            format!(
+                "<!doctype html><style>body{{margin:0}}\
+                 .m{{column-count:3;column-gap:20px;width:440px;column-rule:{rule}}}\
+                 .m div{{height:30px}}</style><div class=m id=m>{}</div>",
+                "<div></div>".repeat(blocks)
+            )
+        };
+        let rules = |html: &str| {
+            let layout = lay_graphical(html, 800.0, &HashMap::new());
+            layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    crate::render::DisplayCommand::Fill {
+                        shape,
+                        brush: crate::render::PaintBrush::Solid(color),
+                    } if *color == crate::render::PaintColor::Rgba(255, 0, 0, 255) => {
+                        let points: Vec<crate::core::CssPoint> = match shape {
+                            crate::render::PaintShape::Rect(rect) => vec![
+                                crate::core::CssPoint::new(rect.x, rect.y),
+                                crate::core::CssPoint::new(
+                                    rect.x + rect.width,
+                                    rect.y + rect.height,
+                                ),
+                            ],
+                            crate::render::PaintShape::Path(elements) => elements
+                                .iter()
+                                .flat_map(|element| match element {
+                                    crate::render::PathElement::MoveTo(p)
+                                    | crate::render::PathElement::LineTo(p) => vec![*p],
+                                    crate::render::PathElement::CurveTo(a, b, c) => {
+                                        vec![*a, *b, *c]
+                                    }
+                                    _ => Vec::new(),
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let x0 = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+                        let y0 = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                        let x1 = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+                        let y1 = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+                        Some((x0, y0, x1 - x0, y1 - y0))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let three = rules(&html("4px solid red", 3));
+        // Columns are 133⅓px wide: the rules center at 143⅓ and 296⅔.
+        assert_eq!(three.len(), 2, "{three:?}");
+        for ((x, y, w, h), center) in three.iter().zip([143.333_33, 296.666_66]) {
+            assert!((x + w / 2.0 - center).abs() < 0.01, "{three:?}");
+            assert_eq!((*y, *w, *h), (0.0, 4.0, 30.0));
+        }
+        // Only two columns have content: one rule.
+        assert_eq!(rules(&html("4px solid red", 2)).len(), 1);
+        // Each multi-column line has its own rules, its column height long.
+        let spanned = html("4px solid red", 3).replace(
+            "</div></div>",
+            "</div><h2 style='column-span:all;margin:0;height:10px'></h2>\
+             <div></div><div></div><div></div></div>",
+        );
+        let lines = rules(&spanned);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!((lines[2].1, lines[2].3), (40.0, 30.0), "{lines:?}");
+        assert!(rules(&html("4px none red", 3)).is_empty());
+        let dom = Dom::parse_document(&html("thin dotted red", 3));
+        let m = dom.get_by_id("m").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(m, "column-rule-width")
+                .as_deref(),
+            Some("thin")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(m, "column-rule-style")
+                .as_deref(),
+            Some("dotted")
+        );
+    }
+
+    #[test]
     fn metadata_elements_render_when_authors_display_them() {
         // HTML Rendering #hidden-elements hides title, style and the other
         // metadata elements with an ordinary UA display:none rule, so an
@@ -6862,6 +7297,293 @@ b</xmp></body>"#;
         let (_, img) = first_image(&out);
         assert_eq!((img.width, img.height), (10, 5));
         assert!(img.crop, "cover fills the box and crops overflow");
+        // The visible box is the centered part of the 160×80px (20×5 cell)
+        // cover object.
+        assert_eq!(
+            img.image_clip,
+            Some(ImageClip {
+                source_width: 20,
+                source_height: 5,
+                col: 5,
+                row: 0,
+                width: 10,
+                height: 5,
+            })
+        );
+    }
+
+    /// Painted lines as (text, left, right), top to bottom.
+    fn painted_lines(layout: &GraphicalLayout) -> Vec<(String, f32, f32)> {
+        let mut lines: Vec<(f32, String, f32, f32)> = Vec::new();
+        for primitive in &layout.paint.primitives {
+            if let crate::render::Primitive::GlyphRun { origin, shaped, .. } = primitive {
+                match lines
+                    .iter_mut()
+                    .find(|line| (line.0 - origin.y).abs() < 1.0)
+                {
+                    Some(line) => {
+                        line.1.push_str(&shaped.text);
+                        line.2 = line.2.min(origin.x);
+                        line.3 = line.3.max(origin.x + shaped.advance);
+                    }
+                    None => lines.push((
+                        origin.y,
+                        shaped.text.clone(),
+                        origin.x,
+                        origin.x + shaped.advance,
+                    )),
+                }
+            }
+        }
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+        lines
+            .into_iter()
+            .map(|(_, text, left, right)| (text.trim().to_string(), left, right))
+            .collect()
+    }
+
+    /// CSS Text 3 #valdef-text-align-start: `start` and `end` are the line's
+    /// start and end edges for the block's direction, and justified text's
+    /// last line is start-aligned.
+    #[test]
+    fn text_align_start_and_end_follow_direction() {
+        let lines = |style: &str| {
+            painted_lines(&lay_graphical(
+                &format!(
+                    "<style>body{{margin:0;font:20px/24px monospace}}\
+                     p{{margin:0;width:300px;{style}}}</style><p>abc</p>"
+                ),
+                800.0,
+                &ImageSizes::new(),
+            ))
+        };
+        let right = |style: &str| lines(style)[0].2;
+        let left = |style: &str| lines(style)[0].1;
+        assert!(left("direction:ltr;text-align:start") < 1.0);
+        assert!((right("direction:rtl;text-align:start") - 300.0).abs() < 1.0);
+        assert!(left("direction:rtl;text-align:end") < 1.0);
+        assert!((right("direction:ltr;text-align:end") - 300.0).abs() < 1.0);
+        assert!((right("direction:rtl;text-align:justify") - 300.0).abs() < 1.0);
+        // HTML Rendering #bidi-rendering maps `dir` to `direction`.
+        let rtl = painted_lines(&lay_graphical(
+            "<style>body{margin:0;font:20px/24px monospace}p{margin:0;width:300px}</style>\
+             <p dir=rtl>abc</p>",
+            800.0,
+            &ImageSizes::new(),
+        ));
+        assert!((rtl[0].2 - 300.0).abs() < 1.0, "{rtl:?}");
+    }
+
+    /// CSS 2.2 #propdef-vertical-align: `text-top`/`text-bottom` align with
+    /// the parent's content area (its font's ascent and descent), not the
+    /// line box; a percentage raises by a share of the element's own
+    /// `line-height`.
+    #[test]
+    fn vertical_align_text_edges_and_percentages() {
+        let html = "<style>body{margin:0;font:20px/60px monospace}\
+            i{display:inline-block;width:10px;height:10px;line-height:40px}</style>\
+            <p style='margin:0'>Text<i id=tt style='vertical-align:text-top'></i>\
+            <i id=tb style='vertical-align:text-bottom'></i>\
+            <i id=base></i><i id=pct style='vertical-align:50%'></i>\
+            <i id=top style='vertical-align:top'></i></p>";
+        let dom = Dom::parse_document(html);
+        let layout = lay_out_graphical(
+            &dom,
+            &Url::parse("http://e.com/").unwrap(),
+            Viewport::new(400.0, 300.0),
+            &[],
+            &Default::default(),
+            &ImageSizes::new(),
+        );
+        let (content_top, content_bottom) = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                    if shaped.text.contains("Text") =>
+                {
+                    let baseline = origin.y + shaped.baseline;
+                    Some((baseline - shaped.ascent, baseline + shaped.descent))
+                }
+                _ => None,
+            })
+            .expect("text");
+        let rect = |id: &str| layout.boxes[&dom.get_by_id(id).unwrap()];
+        assert!((rect("tt").top as f32 - content_top).abs() < 0.01);
+        let tb = rect("tb");
+        assert!(((tb.top + tb.height) as f32 - content_bottom).abs() < 0.01);
+        // An empty inline-block's baseline is its bottom edge; 50% of its
+        // 40px line-height raises it 20px.
+        assert!((rect("base").top - rect("pct").top - 20.0).abs() < 0.01);
+        // `top` aligns with the line box instead, above the content area.
+        assert!(rect("top").top < rect("tt").top);
+    }
+
+    /// CSS Text 4 #text-wrap-style: `balance` evens out the remaining space
+    /// in each line box without changing the number of line boxes.
+    #[test]
+    fn text_wrap_balance_evens_line_lengths_keeping_the_line_count() {
+        let html = |style: &str| {
+            format!(
+                "<style>body{{margin:0;font:20px/24px monospace}}\
+                 h1{{margin:0;font:inherit;width:300px;{style}}}</style>\
+                 <h1>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk</h1>"
+            )
+        };
+        let lines =
+            |style: &str| painted_lines(&lay_graphical(&html(style), 800.0, &ImageSizes::new()));
+        let auto = lines("");
+        assert_eq!(auto.len(), 3, "{auto:?}");
+        for style in ["text-wrap:balance", "text-wrap-style:balance"] {
+            let balanced = lines(style);
+            assert_eq!(balanced.len(), auto.len(), "{style}: {balanced:?}");
+            let widths: Vec<f32> = balanced.iter().map(|(_, l, r)| r - l).collect();
+            let spread = widths.iter().copied().fold(0.0f32, f32::max)
+                - widths.iter().copied().fold(f32::INFINITY, f32::min);
+            let auto_widths: Vec<f32> = auto.iter().map(|(_, l, r)| r - l).collect();
+            let auto_spread = auto_widths.iter().copied().fold(0.0f32, f32::max)
+                - auto_widths.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(
+                spread < auto_spread,
+                "{style}: {widths:?} vs {auto_widths:?}"
+            );
+            // Eleven five-cell words (24px each, five to a 300px line) over
+            // three lines: four, four and three instead of five, five, one.
+            assert_eq!(
+                balanced
+                    .iter()
+                    .map(|(t, ..)| t.split(' ').count())
+                    .collect::<Vec<_>>(),
+                [4, 4, 3],
+                "{balanced:?}"
+            );
+        }
+        // Alignment still uses the full line box.
+        let centered = lines("text-wrap:balance;text-align:center");
+        let (_, left, right) = &centered[1];
+        assert!(((left + right) / 2.0 - 150.0).abs() < 1.0, "{centered:?}");
+        // `auto` and `stable` keep greedy breaking.
+        assert_eq!(lines("text-wrap-style:stable"), auto);
+    }
+
+    #[test]
+    fn text_wrap_balance_leaves_long_and_single_line_text_alone() {
+        let lines = |text: &str| {
+            painted_lines(&lay_graphical(
+                &format!(
+                    "<style>body{{margin:0;font:20px/24px monospace}}\
+                     p{{margin:0;width:300px;text-wrap:balance}}</style><p>{text}</p>"
+                ),
+                800.0,
+                &ImageSizes::new(),
+            ))
+        };
+        assert_eq!(lines("aaaa bbbb").len(), 1);
+        // More than ten lines may be treated as `auto`: greedy lines fill.
+        let long = lines(&"aaaa bbbb ".repeat(40));
+        assert!(long.len() > 10);
+        assert_eq!(long[0].0.split(' ').count(), 5, "{:?}", long[0]);
+    }
+
+    /// `pretty` and `avoid-short-last-line` avoid a short last line by
+    /// evening out the last two lines; earlier lines keep their breaks.
+    #[test]
+    fn text_wrap_pretty_avoids_a_short_last_line() {
+        let html = |style: &str| {
+            format!(
+                "<style>body{{margin:0;font:20px/24px monospace}}\
+                 p{{margin:0;width:300px;{style}}}</style>\
+                 <p>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj z</p>"
+            )
+        };
+        let lines =
+            |style: &str| painted_lines(&lay_graphical(&html(style), 800.0, &ImageSizes::new()));
+        let auto = lines("");
+        assert_eq!(auto.last().unwrap().0, "z", "{auto:?}");
+        for style in ["text-wrap:pretty", "text-wrap-style:avoid-short-last-line"] {
+            let pretty = lines(style);
+            assert_eq!(pretty.len(), auto.len(), "{style}");
+            assert_eq!(pretty[0], auto[0], "{style}: earlier lines are kept");
+            // The two last lines even out: "ffff gggg hhhh" / "iiii jjjj z".
+            assert_eq!(pretty[2].0, "iiii jjjj z", "{style}: {pretty:?}");
+        }
+        // A last line that is not short is left alone.
+        let fine = painted_lines(&lay_graphical(
+            &html("text-wrap:pretty").replace(" z<", " kkkk llll<"),
+            800.0,
+            &ImageSizes::new(),
+        ));
+        assert_eq!(fine.last().unwrap().0, "kkkk llll", "{fine:?}");
+    }
+
+    #[test]
+    fn object_position_selects_the_visible_part_of_a_terminal_cover_image() {
+        let images = img_sizes(&[("http://e.com/i.png", 20, 5)]);
+        for (position, col) in [("left", 0), ("right", 10), ("25%", 3)] {
+            let out = lay_images(
+                &format!(
+                    r#"<body style="margin:0"><img src="i.png" style="width:80px;height:80px;object-fit:cover;object-position:{position}"></body>"#
+                ),
+                40,
+                &images,
+            );
+            let (_, img) = first_image(&out);
+            assert_eq!((img.col, img.width, img.height), (0, 10, 5), "{position}");
+            assert_eq!(img.image_clip.map(|clip| clip.col), Some(col), "{position}");
+        }
+        // `object-fit: none` crops the natural-size object instead of
+        // scaling it down.
+        let out = lay_images(
+            r#"<body style="margin:0"><img src="i.png" style="width:80px;height:80px;object-fit:none;object-position:right bottom"></body>"#,
+            40,
+            &images,
+        );
+        let (_, img) = first_image(&out);
+        assert_eq!((img.width, img.height), (10, 5));
+        assert_eq!(
+            img.image_clip,
+            Some(ImageClip {
+                source_width: 20,
+                source_height: 5,
+                col: 10,
+                row: 0,
+                width: 10,
+                height: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn graphical_object_position_paints_the_object_clipped_to_the_content_box() {
+        let images: ImageSizes =
+            std::collections::HashMap::from([("http://e.com/i.png".into(), (200, 100))]);
+        let layout = lay_graphical(
+            r#"<body style="margin:0"><img src="i.png" style="display:block;margin:10px;width:100px;height:100px;object-fit:cover;object-position:right top"></body>"#,
+            400.0,
+            &images,
+        );
+        let (rect, clip, fit) = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::Image {
+                    rect, clip, fit, ..
+                } => Some((*rect, *clip, *fit)),
+                _ => None,
+            })
+            .expect("image");
+        assert_eq!(fit, crate::render::ImageFit::Fill);
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (-90.0, 10.0, 200.0, 100.0)
+        );
+        let clip = clip.expect("the content box clips the object");
+        assert_eq!(
+            (clip.x, clip.y, clip.width, clip.height),
+            (10.0, 10.0, 100.0, 100.0)
+        );
     }
 
     #[test]
@@ -16070,5 +16792,73 @@ b</xmp></body>"#;
             cols.iter().any(|&c| (38..48).contains(&c)),
             "col 2 region: {cols:?}"
         );
+    }
+
+    #[test]
+    fn align_content_aligns_block_container_contents() {
+        // CSS Box Alignment 3 #distribution-block: the contents as a unit in
+        // the block axis, safe by default, with content-distribution
+        // fallbacks; the block becomes an independent formatting context.
+        let top = |style: &str, child: &str| {
+            let html = format!(
+                "<style>body{{margin:0}}</style><div style='height:100px;{style}'>{child}</div>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_out_graphical(
+                &dom,
+                &Url::parse("http://e.com/").unwrap(),
+                Viewport::new(400.0, 300.0),
+                &[],
+                &Default::default(),
+                &ImageSizes::new(),
+            );
+            layout.boxes[&dom.get_by_id("c").unwrap()].top
+        };
+        let child = "<p id=c style='margin:0;height:20px'></p>";
+        assert_eq!(top("", child), 0.0);
+        assert_eq!(top("align-content:normal", child), 0.0);
+        assert_eq!(top("align-content:center", child), 40.0);
+        assert_eq!(top("align-content:end", child), 80.0);
+        assert_eq!(top("align-content:flex-end", child), 80.0);
+        assert_eq!(top("align-content:space-around", child), 40.0);
+        assert_eq!(top("align-content:space-between", child), 0.0);
+        assert_eq!(top("align-content:last baseline", child), 80.0);
+        // Overflowing contents stay at the start unless `unsafe`.
+        let tall = "<p id=c style='margin:0;height:140px'></p>";
+        assert_eq!(top("align-content:center", tall), 0.0);
+        assert_eq!(top("align-content:safe end", tall), 0.0);
+        assert_eq!(top("align-content:unsafe center", tall), -20.0);
+        // Child margins stay inside the independent formatting context.
+        let margins = "<p id=c style='margin:10px 0;height:20px'></p>";
+        assert_eq!(top("align-content:end", margins), 70.0);
+        // A min-height grows the box past its contents.
+        assert_eq!(
+            top("height:auto;min-height:60px;align-content:center", child),
+            20.0
+        );
+        // Flex items and table cells align their contents too.
+        let item = |style: &str| {
+            let html = format!(
+                "<style>body{{margin:0}}</style><div style='display:flex;height:100px'>\
+                 <div style='{style}'><p id=c style='margin:0;height:20px'></p></div></div>\
+                 <table style='border-spacing:0'><tr><td style='height:100px;padding:0;{style}'>\
+                 <p id=d style='margin:0;height:20px'></p></td></tr></table>"
+            );
+            let dom = Dom::parse_document(&html);
+            let layout = lay_out_graphical(
+                &dom,
+                &Url::parse("http://e.com/").unwrap(),
+                Viewport::new(400.0, 300.0),
+                &[],
+                &Default::default(),
+                &ImageSizes::new(),
+            );
+            (
+                layout.boxes[&dom.get_by_id("c").unwrap()].top,
+                layout.boxes[&dom.get_by_id("d").unwrap()].top - 100.0,
+            )
+        };
+        assert_eq!(item("vertical-align:top"), (0.0, 0.0));
+        assert_eq!(item("vertical-align:top;align-content:end"), (80.0, 80.0));
     }
 }

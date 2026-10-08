@@ -1575,7 +1575,7 @@ fn collect_positioned<'a>(
 }
 
 fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
-    if fragment.flow.hidden {
+    if fragment.flow.hidden || fragment.flow.elided {
         return;
     }
     if let Some(collapsed) = &fragment.paint.collapsed_borders
@@ -1712,6 +1712,7 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
             paint_nested_document_canvas(fragment, builder);
         }
         paint_borders(fragment, radii, builder);
+        paint_column_rules(fragment, style, builder);
         if let Some(collapsed) = &fragment.paint.collapsed_borders
             && collapsed.cell.is_some()
         {
@@ -2260,13 +2261,12 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                             rect: snap_to_device_pixels(rect, ratio),
                             handle,
                             source_rect: None,
-                            // Layout already resolved object-fit into the
-                            // paint rectangle (css-images-3 §5.5: `fill`
-                            // stretches). Only an image whose natural size
-                            // layout did not know keeps its aspect ratio.
-                            fit: if piece.item.crop {
-                                ImageFit::Cover
-                            } else if natural_size_known {
+                            // Layout already resolved object-fit and
+                            // object-position into the paint rectangle
+                            // (css-images-3 §5.5/§5.6), so the object fills
+                            // it. Only an image whose natural size layout
+                            // did not know keeps its aspect ratio.
+                            fit: if natural_size_known {
                                 ImageFit::Fill
                             } else {
                                 ImageFit::Contain
@@ -2291,13 +2291,21 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
                             } else {
                                 ImageSampling::Smooth
                             },
-                            clip,
+                            // css-images-3 #the-object-fit: replaced
+                            // elements clip their content to the content box.
+                            clip: if piece.item.crop {
+                                intersect_css_rects(clip, content)
+                            } else {
+                                clip
+                            },
                             node,
                             link: piece.item.link.clone(),
                         },
                         content_clip,
                     );
                 }
+                // Hit testing follows the element's box, not the object.
+                let rect = if piece.item.crop { content } else { rect };
                 if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
                     builder.has_media_controls |=
                         matches!(piece.item.link, Some(crate::doc::Link::Media(_)));
@@ -2844,7 +2852,7 @@ fn canvas_surface(dom: &Dom, root: NodeId) -> Option<PaintColor> {
 /// end of this fragment's paint keeps it visible over the fragment's own text
 /// while preserving the surrounding Appendix E traversal.
 fn paint_outline(fragment: &Frag, builder: &mut Builder<'_>) {
-    if fragment.flow.hidden {
+    if fragment.flow.hidden || fragment.flow.elided {
         return;
     }
     let Some(style) = PaintStyle::of(fragment) else {
@@ -3577,17 +3585,44 @@ fn paint_background_images_for_style(
                 )));
             blending = true;
         }
+        // CSS Backgrounds 3 #background-attachment: a `local` layer is fixed
+        // to the element's contents. In a scroll container it scrolls with
+        // them, positioned and painted over the scrollable overflow area;
+        // elsewhere `local` behaves as `scroll`.
+        let local_area = (!fixed
+            && canvas.is_none()
+            && layer_value(&attachment_layers, index, "scroll")
+                .trim()
+                .eq_ignore_ascii_case("local"))
+        .then(|| {
+            builder
+                .scroll_containers
+                .iter()
+                .find(|container| container.node == fragment.node)
+                .map(|container| {
+                    CssRect::new(
+                        container.viewport.x,
+                        container.viewport.y,
+                        container.content.width.max(container.viewport.width),
+                        container.content.height.max(container.viewport.height),
+                    )
+                })
+        })
+        .flatten();
+        let local_depth = local_area.map(|_| builder.push_scroll_content_chain(fragment.node));
         let shape = if fixed && canvas.is_some() {
             PaintShape::Rect(viewport)
+        } else if let Some(area) = local_area {
+            PaintShape::Rect(area)
         } else {
             shape.clone()
         };
         let positioning_override = if fixed {
             Some(viewport)
         } else {
-            positioning_override
+            local_area.or(positioning_override)
         };
-        let layer_shape = if canvas.is_some() {
+        let layer_shape = if canvas.is_some() || local_area.is_some() {
             shape.clone()
         } else {
             background_layer_shape(
@@ -3601,7 +3636,7 @@ fn paint_background_images_for_style(
         let origin = layer_value(&origin_layers, index, "padding-box");
         let positioning = positioning_override
             .unwrap_or_else(|| background_box(origin, border_box, padding_box, content_box));
-        let clip = canvas.unwrap_or_else(|| {
+        let clip = canvas.or(local_area).unwrap_or_else(|| {
             background_box(
                 layer_value(&clip_layers, index, "border-box"),
                 border_box,
@@ -3625,6 +3660,9 @@ fn paint_background_images_for_style(
                 lengths,
             },
         );
+        if let Some(depth) = local_depth {
+            builder.pop_scroll_ancestors(depth);
+        }
     }
     pin_fixed(builder, &mut fixed_start, &mut rescroll, &mut blending);
 }
@@ -4195,7 +4233,7 @@ fn background_length(value: &str, basis: f32, lengths: LengthBasis) -> Option<f3
     lengths.resolve(value, basis).map(|value| value.max(0.0))
 }
 
-fn background_position(
+pub(super) fn background_position(
     value: &str,
     area: CssRect,
     image: (f32, f32),
@@ -4718,6 +4756,7 @@ fn text_clip_line(
             ascent: line.ascent,
             descent: line.descent,
             forced: line.forced,
+            laid: None,
         })),
         children: Vec::new(),
     })
@@ -4764,6 +4803,45 @@ fn paint_borders(fragment: &Frag, radii: CornerRadii, builder: &mut Builder<'_>)
         },
         false,
     );
+}
+
+/// css-multicol-1 #column-gaps-and-rules: each rule in the middle of its
+/// column gap, the column height long, drawn just above the multicol
+/// container's border in `column-rule-style` and `column-rule-color`. The
+/// rules scroll along with the columns.
+fn paint_column_rules(fragment: &Frag, style: PaintStyle, builder: &mut Builder<'_>) {
+    let Some(rules) = fragment.paint.column_rules.as_deref() else {
+        return;
+    };
+    let rule_style = style
+        .value(builder.dom, "column-rule-style")
+        .unwrap_or_else(|| "none".into())
+        .trim()
+        .to_ascii_lowercase();
+    let color = style
+        .value(builder.dom, "column-rule-color")
+        .and_then(|value| resolve_color_for_style(builder.dom, style, &value))
+        .unwrap_or_else(|| text_color_for_style(builder.dom, style));
+    let scroll_depth = builder.push_scroll_content_chain(fragment.node);
+    for &[x, y, height] in &rules.lines {
+        paint_border_edges(
+            builder,
+            BorderEdges {
+                rect: CssRect::new(
+                    fragment.x + x - rules.width / 2.0,
+                    fragment.y + y,
+                    rules.width,
+                    height.max(0.0),
+                ),
+                radii: CornerRadii::default(),
+                widths: [0.0, 0.0, 0.0, rules.width],
+                styles: ["none", "none", "none", rule_style.as_str()],
+                colors: [color; 4],
+            },
+            false,
+        );
+    }
+    builder.pop_scroll_ancestors(scroll_depth);
 }
 
 /// The two edges of a band `width` wide centered on `center`, in device
@@ -6092,6 +6170,15 @@ fn rectangular_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<Clip> {
     }
     let [x, y] =
         overflow_axes(dom, fragment.node).map(|value| matches!(value.as_str(), "hidden" | "clip"));
+    // CSS Containment 2 #containment-paint: the used overflow of a paint
+    // containment box clips a `visible` axis.
+    let used = fragment.paint.overflow.map(|axis| {
+        matches!(
+            axis,
+            super::overflow::Overflow::Hidden | super::overflow::Overflow::Clip
+        )
+    });
+    let (x, y) = (x || used[0], y || used[1]);
     if !x && !y {
         return None;
     }
@@ -6131,7 +6218,12 @@ fn rounded_overflow_clip(dom: &Dom, fragment: &Frag) -> Option<PaintShape> {
     if y == "visible" && scrollable(x) {
         y = "auto";
     }
-    if !(scrollable(x) && scrollable(y) || x == "clip" && y == "clip") {
+    let contained = fragment
+        .paint
+        .overflow
+        .iter()
+        .all(|axis| *axis == super::overflow::Overflow::Clip);
+    if !(scrollable(x) && scrollable(y) || x == "clip" && y == "clip" || contained) {
         return None;
     }
     let border = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
@@ -7581,6 +7673,7 @@ fn blend_mode(value: &str) -> BlendMode {
         "saturation" => BlendMode::Saturation,
         "color" => BlendMode::Color,
         "luminosity" => BlendMode::Luminosity,
+        "plus-lighter" => BlendMode::PlusLighter,
         _ => BlendMode::Normal,
     }
 }
@@ -7709,13 +7802,13 @@ fn split_ws(value: &str) -> Vec<&str> {
 /// their authored units, so `em`, `rem`, `vw` or `calc()` must not be read
 /// as if every length were `px`.
 #[derive(Clone, Copy)]
-struct LengthBasis {
+pub(super) struct LengthBasis {
     units: Units,
     viewport: Vp,
 }
 
 impl LengthBasis {
-    fn of(dom: &Dom, node: NodeId, viewport: Vp) -> Self {
+    pub(super) fn of(dom: &Dom, node: NodeId, viewport: Vp) -> Self {
         Self {
             units: if node == NO_NODE {
                 Units::default()

@@ -13,10 +13,10 @@ use crate::layout2::Units;
 use super::value::{Len, Vp};
 
 /// A replaced element's used geometry: the BOX (what layout flows around,
-/// the element's used content size) and the PAINT rect inside it (what the
-/// pixels map to — differing from the box only under `contain`/`scale-down`,
-/// where the image letterboxes at its natural ratio, centered per the
-/// `object-position` initial value).
+/// the element's used content size) and the PAINT rect (what the pixels map
+/// to): the object's concrete object size (css-images-3 `object-fit`)
+/// placed by `object-position`, relative to the content box. The paint rect
+/// can extend past the box (`cover`, `none`, or an offset position).
 #[derive(Debug, PartialEq)]
 pub(crate) struct Replaced {
     pub box_w: f32,
@@ -25,7 +25,9 @@ pub(crate) struct Replaced {
     pub paint_h: f32,
     pub off_x: f32,
     pub off_y: f32,
-    /// `object-fit: cover` — the encoder fills the box and crops overflow.
+    /// The paint rect extends past the content box, to which css-images-3
+    /// #the-object-fit clips replaced content ("replaced elements always clip
+    /// their contents to the content box").
     pub crop: bool,
 }
 
@@ -67,6 +69,20 @@ pub(crate) fn size(
         // CSS Content 3 #replaced: an unavailable replacement has zero
         // natural dimensions, never the HTML source's fallback/alt contents.
         .or_else(|| replacement.then_some((0.0, 0.0)));
+    // CSS Containment 2 #containment-size: a size-contained replaced element
+    // has a natural width and height of 0 and no natural aspect ratio.
+    let size_contained = super::style::Containment::of(
+        dom.computed_value_resolved(node, "contain").as_deref(),
+        dom.effective_display(node).as_deref(),
+        true,
+    )
+    .size
+        == 2;
+    let natural = if size_contained {
+        Some((0.0, 0.0))
+    } else {
+        natural
+    };
     let u = Units::of(dom, node);
     let css = |prop: &str, basis: Option<f32>| {
         dom.computed_value_resolved(node, prop)
@@ -161,7 +177,7 @@ pub(crate) fn size(
     // axis can use its metadata. Min/max still clamp those axes below, and
     // object-fit still receives the decoded natural size independently.
     // Test the resolved dimensions: an indefinite percentage remains auto.
-    let svg_ratio = if spec_w.is_none() || spec_h.is_none() {
+    let svg_ratio = if !size_contained && (spec_w.is_none() || spec_h.is_none()) {
         svg_view_box_ratio(url)
     } else {
         None
@@ -177,7 +193,14 @@ pub(crate) fn size(
     // resource must not hide the ratio before asynchronous raster decoding.
     let ratio = svg_ratio
         .or_else(|| inline_svg_ratio(dom, node))
-        .or_else(|| ratio_of(dom, node, dimension_source, natural))
+        .or_else(|| {
+            ratio_of(
+                dom,
+                node,
+                dimension_source,
+                natural.filter(|_| !size_contained),
+            )
+        })
         .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
@@ -265,13 +288,19 @@ pub(crate) fn size(
     // A one-pixel floor here changed inline flow and fabricated image area.
     let (box_w, box_h) = (box_w.max(0.0), box_h.max(0.0));
 
-    // object-fit (css-images-3 §5.5). Meaningful only with a natural size to
-    // map; a reserved-but-undecoded box paints blank regardless. `none` maps
-    // to `scale-down` (painting the natural size CLIPPED by the box needs
-    // sub-image crop offsets the emission model doesn't carry — the
-    // documented paint-model approximation; `scale-down` is its ≤-natural
-    // half and identical whenever the image doesn't overflow the box).
-    Some(apply_fit(dom, node, natural, box_w, box_h))
+    // object-fit / object-position (css-images-3 §5.5/§5.6) over the used box.
+    // Only the content's own ratio fits the object: an attribute-mapped or
+    // CSS `aspect-ratio` sizes the box, not the image inside it.
+    let object_ratio = svg_ratio.or_else(|| inline_svg_ratio(dom, node));
+    Some(apply_fit(
+        dom,
+        node,
+        natural,
+        object_ratio,
+        box_w,
+        box_h,
+        vp,
+    ))
 }
 
 /// HTML Rendering #images-3: an img with no image to show (no source, or
@@ -319,51 +348,80 @@ pub(crate) fn represents_alt_text(
     !(sized("width") && sized("height"))
 }
 
-/// css-images-3 §5.5 `object-fit` over a used box: the paint rect and crop
-/// flag. `fill` (initial) stretches to the box; `cover` fills and crops;
-/// `contain` letterboxes centered (`object-position` initial 50% 50%);
-/// `none` maps to `scale-down` (sub-image crop offsets don't exist in the
-/// emission model — the documented paint-model approximation, identical
-/// whenever the image doesn't overflow its box).
+/// css-images-3 #the-object-fit and #the-object-position (local CSSWG
+/// snapshot 81c27f686901) over a used content box: the object's concrete
+/// object size, positioned with `object-position` as a `<position>` resolved
+/// with the concrete object size as the object area and the content box as
+/// the positioning area. `natural` is the natural size in CSS px; `ratio` the
+/// natural aspect ratio of an object without natural dimensions (a
+/// viewBox-only SVG). Without either, the object fills the box.
 pub(crate) fn apply_fit(
     dom: &Dom,
     node: NodeId,
     natural: Option<(f32, f32)>,
+    ratio: Option<f32>,
     box_w: f32,
     box_h: f32,
+    vp: Vp,
 ) -> Replaced {
+    const EPSILON: f32 = 0.01;
     let fit = dom
         .computed_value_resolved(node, "object-fit")
         .map(|v| v.trim().to_ascii_lowercase());
-    let mut out = Replaced {
+    let natural = natural.filter(|&(w, h)| w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite());
+    let ratio = natural
+        .map(|(w, h)| w / h)
+        .or(ratio)
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    // css-images-3 #contain-constraint / #cover-constraint: the largest
+    // (smallest) size with the ratio that fits within (covers) the box.
+    let constrained = |ratio: f32, cover: bool| {
+        let by_width = (box_w, box_w / ratio);
+        let by_height = (box_h * ratio, box_h);
+        if (by_width.1 <= box_h) != cover {
+            by_width
+        } else {
+            by_height
+        }
+    };
+    // `none`: the default sizing algorithm with no specified size, and the
+    // used box as the default object size.
+    let unscaled = |ratio: f32| natural.unwrap_or_else(|| constrained(ratio, false));
+    let (paint_w, paint_h) = match (fit.as_deref(), ratio) {
+        (Some("contain"), Some(ratio)) => constrained(ratio, false),
+        (Some("cover"), Some(ratio)) => constrained(ratio, true),
+        (Some("none"), Some(ratio)) => unscaled(ratio),
+        (Some("scale-down"), Some(ratio)) => {
+            // Whichever of `none` and `contain` is smaller; both keep the
+            // ratio, so comparing widths decides.
+            let (none, contain) = (unscaled(ratio), constrained(ratio, false));
+            if none.0 <= contain.0 { none } else { contain }
+        }
+        _ => (box_w, box_h),
+    };
+    let (paint_w, paint_h) = (paint_w.max(0.0), paint_h.max(0.0));
+    let position = dom
+        .computed_value_resolved(node, "object-position")
+        .unwrap_or_else(|| String::from("50% 50%"));
+    let (off_x, off_y) = super::graphics::background_position(
+        &position,
+        crate::render::CssRect::new(0.0, 0.0, box_w, box_h),
+        (paint_w, paint_h),
+        super::graphics::LengthBasis::of(dom, node, vp),
+    );
+    let crop = off_x < -EPSILON
+        || off_y < -EPSILON
+        || off_x + paint_w > box_w + EPSILON
+        || off_y + paint_h > box_h + EPSILON;
+    Replaced {
         box_w,
         box_h,
-        paint_w: box_w,
-        paint_h: box_h,
-        off_x: 0.0,
-        off_y: 0.0,
-        crop: false,
-    };
-    if let Some((nw, nh)) = natural {
-        match fit.as_deref() {
-            Some("cover") => out.crop = true,
-            Some("contain") | Some("none") | Some("scale-down") => {
-                let scale = (box_w / nw.max(1.0)).min(box_h / nh.max(1.0));
-                let scale = if matches!(fit.as_deref(), Some("none") | Some("scale-down")) {
-                    scale.min(1.0)
-                } else {
-                    scale
-                };
-                let (pw, ph) = (nw * scale, nh * scale);
-                out.paint_w = pw.max(0.0);
-                out.paint_h = ph.max(0.0);
-                out.off_x = (box_w - out.paint_w) / 2.0;
-                out.off_y = (box_h - out.paint_h) / 2.0;
-            }
-            _ => {}
-        }
+        paint_w,
+        paint_h,
+        off_x,
+        off_y,
+        crop,
     }
-    out
 }
 
 /// HTML #maps-to-the-dimension-property: an img dimension attribute as the
@@ -409,6 +467,14 @@ fn inline_svg_ratio(dom: &Dom, node: NodeId) -> Option<f32> {
 
 /// The natural ratio `size` uses: a ratio-only SVG's `viewBox` before the
 /// decoder's default object size, then `ratio_of`.
+/// The natural aspect ratio of replaced content without natural dimensions
+/// (an SVG with only a `viewBox`), for `object-fit`.
+pub(crate) fn object_ratio(dom: &Dom, node: NodeId, url: Option<&str>) -> Option<f32> {
+    svg_view_box_ratio(url)
+        .or_else(|| inline_svg_ratio(dom, node))
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+}
+
 pub(crate) fn natural_ratio(
     dom: &Dom,
     node: NodeId,
@@ -562,6 +628,107 @@ mod tests {
         )
         .unwrap();
         (result, crate::img::SVG_URL_RATIO_READS.get() - before)
+    }
+
+    /// `apply_fit` for a 200×100 natural image in a 100×100 content box.
+    fn fit(style: &str, natural: Option<(f32, f32)>, ratio: Option<f32>) -> Replaced {
+        let dom = Dom::parse_document(&format!(
+            "<!doctype html><img id=fitted style='font-size:10px;{style}'>"
+        ));
+        let node = dom.get_by_id("fitted").unwrap();
+        apply_fit(
+            &dom,
+            node,
+            natural,
+            ratio,
+            100.0,
+            100.0,
+            Vp { w: 400.0, h: 300.0 },
+        )
+    }
+
+    fn rect(result: &Replaced) -> (f32, f32, f32, f32, bool) {
+        (
+            result.off_x,
+            result.off_y,
+            result.paint_w,
+            result.paint_h,
+            result.crop,
+        )
+    }
+
+    /// css-images-3 #the-object-fit: each value's concrete object size,
+    /// centered by the initial `object-position: 50% 50%`.
+    #[test]
+    fn object_fit_values_size_the_object() {
+        let natural = Some((200.0, 100.0));
+        for (style, expected) in [
+            ("", (0.0, 0.0, 100.0, 100.0, false)),
+            ("object-fit:fill", (0.0, 0.0, 100.0, 100.0, false)),
+            ("object-fit:contain", (0.0, 25.0, 100.0, 50.0, false)),
+            ("object-fit:cover", (-50.0, 0.0, 200.0, 100.0, true)),
+            // `none` keeps the natural size, clipped by the content box.
+            ("object-fit:none", (-50.0, 0.0, 200.0, 100.0, true)),
+            // Smaller of none and contain.
+            ("object-fit:scale-down", (0.0, 25.0, 100.0, 50.0, false)),
+        ] {
+            assert_eq!(rect(&fit(style, natural, None)), expected, "{style}");
+        }
+        // A small image: `none` and `scale-down` keep its natural size.
+        for style in ["object-fit:none", "object-fit:scale-down"] {
+            assert_eq!(
+                rect(&fit(style, Some((40.0, 20.0)), None)),
+                (30.0, 40.0, 40.0, 20.0, false),
+                "{style}"
+            );
+        }
+        // Without natural dimensions, the natural ratio still fits the
+        // object; `none` is a contain constraint against the default object
+        // size (css-images-3 #default-sizing).
+        for style in ["object-fit:contain", "object-fit:none"] {
+            assert_eq!(
+                rect(&fit(style, None, Some(2.0))),
+                (0.0, 25.0, 100.0, 50.0, false),
+                "{style}"
+            );
+        }
+        assert_eq!(
+            rect(&fit("object-fit:cover", None, None)),
+            (0.0, 0.0, 100.0, 100.0, false)
+        );
+    }
+
+    /// css-images-3 #the-object-position: a `<position>` resolved with the
+    /// concrete object size as the object area and the content box as the
+    /// positioning area; percentages are of the box minus the object.
+    #[test]
+    fn object_position_places_the_object_in_the_box() {
+        let natural = Some((200.0, 100.0));
+        for (style, expected) in [
+            ("object-fit:cover;object-position:left top", (0.0, 0.0)),
+            ("object-fit:cover;object-position:right", (-100.0, 0.0)),
+            ("object-fit:cover;object-position:25% 0", (-25.0, 0.0)),
+            ("object-fit:cover;object-position:10px 2em", (10.0, 20.0)),
+            (
+                "object-fit:cover;object-position:right 10px top",
+                (-110.0, 0.0),
+            ),
+            (
+                "object-fit:contain;object-position:left 5px bottom 10%",
+                (5.0, 45.0),
+            ),
+            (
+                "object-fit:contain;object-position:calc(50% + 5px) top",
+                (5.0, 0.0),
+            ),
+            ("object-fit:contain;object-position:bottom", (0.0, 50.0)),
+        ] {
+            let result = fit(style, natural, None);
+            assert_eq!((result.off_x, result.off_y), expected, "{style}");
+        }
+        // Moving a fitting object outside the box needs clipping.
+        assert!(fit("object-fit:contain;object-position:0 80px", natural, None).crop);
+        assert!(!fit("object-fit:contain;object-position:0 50px", natural, None).crop);
     }
 
     #[test]

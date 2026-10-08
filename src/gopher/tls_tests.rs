@@ -110,9 +110,10 @@ fn gophers_menu_links_inherit_tls_only_for_the_same_endpoint() {
     ] {
         assert!(matches!(&doc.lines[row].link, Some(Link::Gopher(url)) if url.tls == tls));
     }
+    // Telnet targets never inherit Gophers' TLS.
     assert!(matches!(
-        doc.lines[6].link,
-        Some(Link::Telnet { tls: false, .. })
+        &doc.lines[6].link,
+        Some(Link::Gopher(url)) if url.item_type == '8' && !url.tls
     ));
     let Some(Link::Gopher(search)) = &doc.lines[1].link else {
         panic!()

@@ -71,6 +71,7 @@ mod locale;
 pub mod lumen_backend;
 pub mod media;
 pub mod oneshot;
+mod pattern_regexp;
 mod performance;
 pub mod telnet;
 pub mod terminal;

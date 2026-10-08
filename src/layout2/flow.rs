@@ -199,6 +199,32 @@ pub(crate) struct LineFrag {
     /// canonical line-box boundaries; the terminal adapter may reflow them
     /// again after CSS pixels are quantized to display cells.
     pub forced: bool,
+    /// The laid content of a line whose painted `pieces`/`atom_boxes`
+    /// `text-overflow: ellipsis` replaced. CSS Overflow 3
+    /// #ellipsing-details: ellipsing only affects rendering, so CSSOM
+    /// geometry, scrollable overflow and layout read this instead.
+    pub laid: Option<Box<LaidLine>>,
+}
+
+/// A line box's content as laid out, before ellipsing.
+#[derive(Clone, Debug)]
+pub(crate) struct LaidLine {
+    pub pieces: Vec<Piece>,
+    pub atom_boxes: Vec<Piece>,
+}
+
+impl LineFrag {
+    /// The line's laid pieces: what layout and CSSOM View measure.
+    pub(crate) fn laid_pieces(&self) -> &[Piece] {
+        self.laid.as_ref().map_or(&self.pieces, |laid| &laid.pieces)
+    }
+
+    /// The line's laid atomic inline placeholders.
+    pub(crate) fn laid_atom_boxes(&self) -> &[Piece] {
+        self.laid
+            .as_ref()
+            .map_or(&self.atom_boxes, |laid| &laid.atom_boxes)
+    }
 }
 
 /// Retain a completed fragment tree so graphical paint can be replayed against
@@ -264,6 +290,8 @@ pub(crate) struct PaintFlags {
     /// background (CSS 2.2 Appendix E: "all table borders"); or a positioned
     /// cell, which repaints them over its own background.
     pub collapsed_borders: Option<std::sync::Arc<super::table::CollapsedRef>>,
+    /// A multi-column container's column rules (css-multicol-1 #crs).
+    pub column_rules: Option<std::sync::Arc<ColumnRules>>,
 }
 
 impl Default for PaintFlags {
@@ -287,6 +315,7 @@ impl Default for PaintFlags {
             float: false,
             border_collapsed: false,
             collapsed_borders: None,
+            column_rules: None,
         }
     }
 }
@@ -315,16 +344,25 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         child_viewport: s.child_viewport,
         bg: s.bg,
         outline: s.outline,
+        // CSS Containment 2: layout and paint containment establish both
+        // positioning containing blocks.
         cb_abs: s.position.positioned()
             || s.has_transform
+            || s.contain_layout
+            || s.contain_paint
             || (s.filter_containing_block && !s.filters.is_empty()),
-        cb_fixed: s.has_transform || (s.filter_containing_block && !s.filters.is_empty()),
+        cb_fixed: s.has_transform
+            || s.contain_layout
+            || s.contain_paint
+            || (s.filter_containing_block && !s.filters.is_empty()),
         // Set on the laid float fragment by `lay_inlines`, not from style
         // (positioning wins over `float`, so the style bit alone is ambiguous).
         float: false,
         // Set on collapsed tables and their cells by table layout.
         border_collapsed: false,
         collapsed_borders: None,
+        // Set on multi-column containers once their columns are laid.
+        column_rules: None,
     }
 }
 
@@ -400,7 +438,7 @@ fn button_content_bounds(f: &Frag) -> Option<ButtonContentBounds> {
     }
     let mut bounds = match &f.kind {
         FragKind::Line(line) => {
-            line.pieces
+            line.laid_pieces()
                 .iter()
                 .fold(None::<ButtonContentBounds>, |bounds, piece| {
                     let rect = ButtonContentBounds {
@@ -1005,6 +1043,7 @@ impl Flow<'_> {
                 .flatten()
         });
 
+        let mut column_rules = None;
         let mut y_border: Option<f32> = None;
         if bt > 0.0 || own_bfc {
             let yb = cur.flush();
@@ -1063,11 +1102,17 @@ impl Flow<'_> {
                 });
                 cur.y = content_top_of(yb).max(cur.y);
                 let top = cur.y;
-                let (frags, ch, mut anc) =
-                    self.lay_multicol(b, content_x, top, n, col_w, gap_px, ifc_cb_h, &inl);
-                children.extend(frags);
-                cur.anchors.append(&mut anc);
-                cur.y = top + ch;
+                // css-multicol-1 #overflow-columns: a definite height (or a
+                // max-height) constrains the column height.
+                let limit = spec_h
+                    .map(|h| h.clamp(min_h, max_h.max(min_h)))
+                    .or_else(|| max_h.is_finite().then_some(max_h.max(min_h)));
+                let mut laid =
+                    self.lay_multicol(b, content_x, top, n, col_w, gap_px, ifc_cb_h, limit, &inl);
+                column_rules = self.column_rules(b, &laid, content_x - x_border, top - yb);
+                children.append(&mut laid.frags);
+                cur.anchors.append(&mut laid.anchors);
+                cur.y = top + laid.height;
             } else {
                 match &b.content {
                     Content::Blocks(kids) => {
@@ -1155,6 +1200,7 @@ impl Flow<'_> {
                             marker_image,
                             &inl,
                             cfc,
+                            b.style.line_clamp,
                         );
                         let InlineLaid {
                             lines,
@@ -1472,6 +1518,10 @@ impl Flow<'_> {
             cur.pos = 0.0;
             cur.neg = 0.0;
         }
+        if super::text_overflow::applies(s) {
+            let rtl = super::style::right_to_left(self.dom, inl.node);
+            super::text_overflow::apply(&mut children, &inl, rtl);
+        }
 
         // ---- the ::marker (outside position) ----
         if let Some(marker) = marker {
@@ -1485,6 +1535,18 @@ impl Flow<'_> {
             // instead of losing its leading character.
             children.insert(0, marker);
         }
+
+        // CSS Box Alignment 3 #distribution-block: the block's contents as a
+        // unit, floats included (an alignment-establishing block contains
+        // them as an independent formatting context).
+        let content_align = self.content_align(b);
+        let content_extent = content_align.map(|_| {
+            let mut bottom = cur.preview();
+            if !own_fc.is_empty() {
+                bottom = bottom.max(own_fc.bottom());
+            }
+            bottom - content_top_of(y_border.unwrap_or(box_top))
+        });
 
         // ---- bottom edge / used height (§10.6.3, §10.7, §8.3.1) ----
         let frag_h;
@@ -1596,6 +1658,10 @@ impl Flow<'_> {
                 }
             }
         }
+        if let (Some(align), Some(extent)) = (content_align, content_extent) {
+            let offset = align.offset((frag_h - bt - bb).max(0.0) - extent);
+            Self::offset_contents(&mut children, &mut cur.anchors[a0..], offset);
+        }
         self.center_button_content(
             b,
             &mut children,
@@ -1605,7 +1671,7 @@ impl Flow<'_> {
             (frag_h - bt - bb).max(0.0),
             &mut cur.anchors[a0..],
         );
-        self.finish_frag(
+        let mut frag = self.finish_frag(
             b,
             x_border,
             y_final,
@@ -1615,7 +1681,9 @@ impl Flow<'_> {
             (cb_w, cb_h),
             cur,
             a0,
-        )
+        );
+        frag.paint.column_rules = column_rules;
+        frag
     }
 
     /// Lay a table's contents down from `cur` (CSS 2.2 §17.4): its top
@@ -1819,7 +1887,7 @@ impl Flow<'_> {
             let align = flex.as_ref().map(|fs| {
                 let flip = |justify| match justify {
                     Justify::Start | Justify::Between => Justify::End,
-                    Justify::End => Justify::Start,
+                    Justify::End | Justify::SafeEnd => Justify::Start,
                     other => other,
                 };
                 let main = if fs.reverse {
@@ -1830,6 +1898,8 @@ impl Flow<'_> {
                 let cross = match self.item_align(ob.node, fs.align_items) {
                     AlignItem::Center => Justify::Center,
                     AlignItem::End => Justify::End,
+                    AlignItem::SafeCenter => Justify::SafeCenter,
+                    AlignItem::SafeEnd => Justify::SafeEnd,
                     AlignItem::Start | AlignItem::Stretch | AlignItem::Baseline => Justify::Start,
                 };
                 let cross = if fs.wrap_reverse { flip(cross) } else { cross };
@@ -1996,6 +2066,7 @@ impl Flow<'_> {
                 ascent: line.ascent,
                 descent: line.descent,
                 forced: line.forced,
+                laid: None,
             };
             out.push(Frag {
                 flow: Default::default(),
@@ -2188,6 +2259,7 @@ impl Flow<'_> {
                     ascent: baseline,
                     descent: (h - baseline).max(0.0),
                     forced: false,
+                    laid: None,
                 }
                 .into(),
             ),
@@ -2669,6 +2741,9 @@ pub(super) fn cross_shift(extra: f32, auto_start: bool, auto_end: bool, align: A
             AlignItem::Start | AlignItem::Stretch | AlignItem::Baseline => 0.0,
             AlignItem::Center => extra / 2.0,
             AlignItem::End => extra,
+            // `safe`: an overflowing item aligns as `start`.
+            AlignItem::SafeCenter => extra.max(0.0) / 2.0,
+            AlignItem::SafeEnd => extra.max(0.0),
         },
     }
 }
@@ -3728,7 +3803,23 @@ impl Flow<'_> {
         if flow_content {
             self.marker_line.set(marker.as_ref().map(|m| m.baseline));
         }
+        let multicol = matches!(b.content, Content::Blocks(_) | Content::Inlines(_))
+            .then(|| self.resolve_multicol(b.node, content_w))
+            .flatten();
+        let mut column_rules = None;
         match &b.content {
+            // css-multicol-1: a multicol item lays its columns like a block.
+            Content::Blocks(_) | Content::Inlines(_) if let Some((n, col_w, gap)) = multicol => {
+                let max_h = self
+                    .height_px(&s.max_height, s, bt, bb, def_h)
+                    .filter(|h| h.is_finite());
+                let mut laid =
+                    self.lay_multicol(b, bp_l, bt, n, col_w, gap, def_h, def_h.or(max_h), &inl);
+                column_rules = self.column_rules(b, &laid, bp_l, bt);
+                children.append(&mut laid.frags);
+                cur.anchors.append(&mut laid.anchors);
+                cur.y = bt + laid.height;
+            }
             Content::Blocks(kids) => {
                 for k in kids {
                     children.push(self.block(
@@ -3768,6 +3859,7 @@ impl Flow<'_> {
                         .flatten(),
                     &inl,
                     &mut own_fc,
+                    s.line_clamp,
                 );
                 let InlineLaid {
                     lines,
@@ -3950,6 +4042,10 @@ impl Flow<'_> {
             cur.pos = 0.0;
             cur.neg = 0.0;
         }
+        if super::text_overflow::applies(s) {
+            let rtl = super::style::right_to_left(self.dom, inl.node);
+            super::text_overflow::apply(&mut children, &inl, rtl);
+        }
         // The marker hangs outside the item's content box, before its first
         // child in painting order.
         if let Some(marker) = marker {
@@ -3958,6 +4054,13 @@ impl Flow<'_> {
             children.insert(0, marker);
         }
         let mut content_h = (cur.flush() - bt).max(0.0);
+        // CSS Box Alignment 3 #distribution-block: the contents as a unit,
+        // floats included.
+        let content_extent = if own_fc.is_empty() {
+            content_h
+        } else {
+            content_h.max(own_fc.bottom() - bt)
+        };
         // Contain floats (§9.5): an auto-height item box grows to the lowest
         // float bottom in its own context; a definite height overflows.
         if def_h.is_none() && s.line_clamp.is_none() && !own_fc.is_empty() {
@@ -3969,6 +4072,10 @@ impl Flow<'_> {
             content_h = 0.0;
         }
         let mut anchors = std::mem::take(&mut cur.anchors);
+        if let Some(align) = self.content_align(b) {
+            let offset = align.offset(content_h - content_extent);
+            Self::offset_contents(&mut children, &mut anchors, offset);
+        }
 
         // This is button layout, not `text-align`: it centers an image, SVG,
         // inline-block, or multi-box subtree after flex stretch has supplied
@@ -4007,6 +4114,7 @@ impl Flow<'_> {
                 // out-of-flow ones the item bit can't change the result.
                 paint: PaintFlags {
                     border_collapsed: collapsed_table(b),
+                    column_rules,
                     ..paint_flags(s, true)
                 },
                 clip: None,
@@ -4048,8 +4156,18 @@ impl Flow<'_> {
             })
             .or(natural.map(|(_, nh)| nh))
             .unwrap_or_else(|| (content_w / 2.0).min(150.0));
-        let r =
-            super::replaced::apply_fit(self.dom, node, natural, content_w.max(1.0), box_h.max(1.0));
+        let r = super::replaced::apply_fit(
+            self.dom,
+            node,
+            natural,
+            natural
+                .is_none()
+                .then(|| super::replaced::object_ratio(self.dom, node, url))
+                .flatten(),
+            content_w.max(1.0),
+            box_h.max(1.0),
+            self.vp,
+        );
         let pixelated = matches!(
             self.dom
                 .computed_value_resolved(node, "image-rendering")
@@ -4112,6 +4230,7 @@ impl Flow<'_> {
                     ascent: r.box_h,
                     descent: 0.0,
                     forced: false,
+                    laid: None,
                 }
                 .into(),
             ),
@@ -4167,6 +4286,34 @@ impl Flow<'_> {
             }
         }
         false
+    }
+
+    /// CSS Box Alignment 3 #distribution-block: a block container's
+    /// `align-content` other than `normal`. Flex, grid and table boxes align
+    /// their content in their own layout; sideways content is not aligned.
+    fn content_align(&self, b: &BoxNode) -> Option<super::style::BlockContentAlign> {
+        if !matches!(b.content, Content::Blocks(_) | Content::Inlines(_))
+            || b.style.vertical.is_some()
+        {
+            return None;
+        }
+        let align = super::style::block_content_align(self.dom, b.node)?;
+        // A table cell aligns in its row band, where `vertical-align` would
+        // (`Table::cell_valign_offset`).
+        (self.dom.effective_display(b.node).as_deref() != Some("table-cell")).then_some(align)
+    }
+
+    /// Shift a box's laid contents (and their anchor marks) down by `dy`.
+    fn offset_contents(children: &mut [Frag], anchors: &mut [(NodeId, f32)], dy: f32) {
+        if dy == 0.0 {
+            return;
+        }
+        for child in children {
+            Self::offset_frag(child, 0.0, dy);
+        }
+        for anchor in anchors {
+            anchor.1 += dy;
+        }
     }
 
     pub(super) fn offset_frag(f: &mut Frag, dx: f32, dy: f32) {
@@ -4331,7 +4478,16 @@ impl Flow<'_> {
         // CSS Overflow 4 #line-clamp-containers: invisible content retains
         // layout boxes. Suppression follows the containing-block chain for
         // abspos/fixed descendants, just like overflow clipping.
-        let own_clip = if f.flow.hidden {
+        // CSS Overflow 3 #text-overflow: an elided atomic inline box (and its
+        // in-flow content) paints nothing, but keeps its layout.
+        if f.flow.elided {
+            for child in &mut f.children {
+                if !matches!(child.kind, FragKind::Oof(..) | FragKind::Fixed(_)) {
+                    child.flow.elided = true;
+                }
+            }
+        }
+        let own_clip = if f.flow.hidden || f.flow.elided {
             Some(Clip {
                 x0: 0.0,
                 x1: 0.0,
@@ -4349,7 +4505,7 @@ impl Flow<'_> {
                 }),
             )
         };
-        if own_clip.is_some_and(|c| c.x0 == c.x1 && c.y0 == c.y1) {
+        if !f.flow.elided && own_clip.is_some_and(|c| c.x0 == c.x1 && c.y0 == c.y1) {
             f.flow.hidden = true;
         }
         f.clip = own_clip;
@@ -4841,7 +4997,12 @@ impl Flow<'_> {
     /// scroll containers). Flex/grid/table items and out-of-flow boxes lay
     /// through `item_frag`, which establishes its own context directly.
     fn establishes_bfc(&self, b: &BoxNode) -> bool {
-        if b.style.size_container != 0 || b.style.vertical.is_some() {
+        // CSS Containment 2 #containment-layout / #containment-paint.
+        if b.style.size_container != 0
+            || b.style.vertical.is_some()
+            || b.style.contain_layout
+            || b.style.contain_paint
+        {
             return true;
         }
         if b.node == NO_NODE {
@@ -4859,6 +5020,20 @@ impl Flow<'_> {
             return true;
         }
         if self.dom.effective_display(b.node).as_deref() == Some("flow-root") {
+            return true;
+        }
+        // CSS Box Alignment 3 #distribution-block: `align-content` other than
+        // `normal` makes a block container an independent formatting context.
+        if self.content_align(b).is_some() {
+            return true;
+        }
+        // css-multicol-1 #column-span: a `column-span: all` box always
+        // establishes an independent formatting context.
+        if self
+            .dom
+            .computed_value_resolved(b.node, "column-span")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("all"))
+        {
             return true;
         }
         // CSS Overflow 3 #overflow-propagation: a body whose overflow went to
@@ -5083,7 +5258,11 @@ impl Flow<'_> {
         let y = value("overflow-y").unwrap_or_else(|| y.into());
         let scrollable = |axis: &str| matches!(axis, "hidden" | "auto" | "scroll" | "overlay");
         let scrolls_block = scrollable(&y) || (y == "visible" && scrollable(&x));
-        let baseline = if matches!(ab.content, Content::Flex(_) | Content::Grid(_)) {
+        // CSS Containment 2 #containment-layout: a layout containment box
+        // has no baseline for vertical-align.
+        let baseline = if s.contain_layout {
+            None
+        } else if matches!(ab.content, Content::Flex(_) | Content::Grid(_)) {
             // CSS Inline 3 #baseline-source: `auto` aligns an inline flex
             // or grid container by its first baseline set.
             self.container_first_baseline(ab, &frag)
@@ -5141,6 +5320,7 @@ impl Flow<'_> {
         marker_image: Option<&str>,
         inl: &InlineStyle,
         fc: &mut FloatCtx,
+        line_clamp: Option<usize>,
     ) -> InlineLaid<'t> {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::Inline);
         // This content's first line holds a pending outside marker; floats
@@ -5178,31 +5358,50 @@ impl Flow<'_> {
             });
             prelaid_atoms.push(Some(pa));
         }
-        let mut ifc = Ifc::new(
-            self.dom,
-            self.base,
-            self.images,
-            self.forms,
-            self.vp,
-            content_w,
-            cb_h,
-            align,
-            indent_px,
-            Some(FloatEnv {
-                fc,
-                boxes: &boxes,
-                left_x: content_x,
-                top_y: content_top_y,
-            }),
-            &atom_sizes,
-        );
-        if let Some(align_last) = super::style::block_align_last(self.dom, inl.node) {
-            ifc.set_align_last(align_last);
-        }
-        ifc.set_first_line_ascent(first_line_ascent);
-        ifc.inside_marker(marker, marker_image, inl);
-        ifc.run(inls, inl);
-        let (lines, marks, oofs, placements, atom_places) = ifc.finish();
+        // CSS Text 3 #valdef-text-align-last-auto: justified text's last line
+        // is start-aligned, which is the right edge in right-to-left text.
+        let align_last = super::style::block_align_last(self.dom, inl.node).or_else(|| {
+            (align == super::style::Align2::Justify
+                && super::style::right_to_left(self.dom, inl.node))
+            .then_some(super::style::Align2::Right)
+        });
+        let rtl = super::style::right_to_left(self.dom, inl.node);
+        // One line layout of this content; `inset` narrows line breaking
+        // from line `from` on (CSS Text 4 #text-wrap-style).
+        let lay = |fc: &mut FloatCtx, inset: f32, from: usize| {
+            let mut ifc = Ifc::new(
+                self.dom,
+                self.base,
+                self.images,
+                self.forms,
+                self.vp,
+                content_w,
+                cb_h,
+                align,
+                indent_px,
+                Some(FloatEnv {
+                    fc,
+                    boxes: &boxes,
+                    left_x: content_x,
+                    top_y: content_top_y,
+                }),
+                &atom_sizes,
+            );
+            if let Some(align_last) = align_last {
+                ifc.set_align_last(align_last);
+            }
+            ifc.set_rtl(rtl);
+            ifc.set_first_line_ascent(first_line_ascent);
+            ifc.inside_marker(marker, marker_image, inl);
+            ifc.set_break_inset(inset, from);
+            ifc.run(inls, inl);
+            ifc.finish()
+        };
+        let (inset, from) = wrap_style_inset(inl, content_w, line_clamp, |inset, from| {
+            lay(&mut fc.clone(), inset, from).0
+        })
+        .unwrap_or((0.0, 0));
+        let (lines, marks, oofs, placements, atom_places) = lay(fc, inset, from);
         if lines.is_empty() {
             self.marker_line.set(first_line_ascent);
         }
@@ -5335,13 +5534,15 @@ impl Flow<'_> {
 
     /// Lay a multi-column container's content (css-multicol-1): lay the content
     /// ONCE as ordinary block/inline flow at the column content width `col_w`,
-    /// then BALANCE (`column-fill:balance`, the default with an indefinite
-    /// height): choose column starts among the content's break opportunities
-    /// for the least column height, and move each fragment into its column
-    /// (`place_in_columns`). Returns the placed fragments, the container's used
-    /// content height, and the (column-translated) anchors. `content_top` is
-    /// the content-box top; column 0 sits at `content_x`, column k at
-    /// `content_x + k·(col_w + gap)`.
+    /// then choose the column starts among the content's break opportunities
+    /// (CSS Fragmentation 3 #breaking-rules) and move each fragment into its
+    /// column (`place_in_columns`). Forced breaks start new columns. With an
+    /// unconstrained column height the columns balance (#cf, the least height
+    /// for `n` columns); a definite `limit` (the container's used content
+    /// height) is the column height, which `column-fill: auto` fills
+    /// sequentially, and content that does not fit continues in overflow
+    /// columns in the inline direction (#overflow-columns). `content_top` is
+    /// the content-box top; column k sits at `content_x + k·(col_w + gap)`.
     #[allow(clippy::too_many_arguments)]
     fn lay_multicol(
         &self,
@@ -5352,8 +5553,9 @@ impl Flow<'_> {
         col_w: f32,
         gap_px: f32,
         cb_h: Option<f32>,
+        limit: Option<f32>,
         inl: &InlineStyle,
-    ) -> (Vec<Frag>, f32, Vec<(NodeId, f32)>) {
+    ) -> MulticolLaid {
         // ---- lay the content once, as a single tall column at col_w ----
         // A multicol container establishes an independent formatting context.
         let mut cur = Cursor {
@@ -5383,6 +5585,7 @@ impl Flow<'_> {
                         .flatten(),
                     inl,
                     &mut sub_fc,
+                    b.style.line_clamp,
                 );
                 self.emit_lines(laid.lines, content_x, &mut cur, &mut single);
                 single.extend(laid.float_frags);
@@ -5392,124 +5595,699 @@ impl Flow<'_> {
             // never reach here (`resolve_multicol` gates the caller).
             _ => {}
         }
-        let end = cur.flush().max(content_top);
-        let mut anchors = std::mem::take(&mut cur.anchors);
-
-        // ---- balance (css-multicol-1 #cf): the shortest columns that the
-        // content's break opportunities allow ----
-        let mut breaks = Vec::new();
-        break_opportunities(self.dom, &single, &mut breaks);
-        breaks.retain(|&y| y > content_top + 0.01 && y < end - 0.01);
-        breaks.sort_by(f32::total_cmp);
-        breaks.dedup_by(|a, b| (*a - *b).abs() < 0.01);
-        let starts = balance_columns(&breaks, content_top, end, n);
+        let mut end = cur.flush().max(content_top);
+        if !sub_fc.is_empty() {
+            end = end.max(sub_fc.bottom());
+        }
+        let anchors = std::mem::take(&mut cur.anchors);
+        let container = if b.node == NO_NODE { inl.node } else { b.node };
+        let balance = !self
+            .dom
+            .computed_value_resolved(container, "column-fill")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("auto"));
         let step = col_w + gap_px;
-        for a in &mut anchors {
-            let k = column_of(&starts, a.1);
-            a.1 += content_top - starts[k];
+
+        // ---- multi-column lines and spanners (css-multicol-1 #column-span) ----
+        // A spanner takes its content out of the columns: the content before
+        // it balances in one multi-column line, the spanner lays at the full
+        // content width below that line, and the content after it starts a
+        // new multi-column line.
+        let spanners = self.column_spanners(b, inl);
+        let mut rows: Vec<MulticolSegment> = Vec::new();
+        let mut pending = single;
+        let mut pending_anchors = anchors;
+        let mut segment_start = content_top;
+        let mut spanner_boxes = Vec::new();
+        for (spanner, parent_inl) in &spanners {
+            let Some((top, bottom)) = find_fragment_extent(&pending, spanner.node) else {
+                continue;
+            };
+            let (mut before, mut after) = (Vec::new(), Vec::new());
+            split_at_spanner(pending, spanner.node, top, &mut before, &mut after);
+            let in_flow = |f: &&Frag| !matches!(f.kind, FragKind::Oof(..) | FragKind::Fixed(_));
+            let before_end = before
+                .iter()
+                .filter(in_flow)
+                .map(|f| f.y + f.h)
+                .fold(segment_start, f32::max);
+            let next_start = after
+                .iter()
+                .filter(in_flow)
+                .map(|f| f.y)
+                .fold(f32::INFINITY, f32::min)
+                .min(end)
+                .max(bottom);
+            let (mut before_anchors, mut after_anchors) = (Vec::new(), Vec::new());
+            for anchor in pending_anchors {
+                if self.within(anchor.0, spanner.node) {
+                    continue;
+                }
+                if anchor.1 < bottom {
+                    before_anchors.push(anchor);
+                } else {
+                    after_anchors.push(anchor);
+                }
+            }
+            rows.push((before, before_anchors, segment_start, before_end));
+            spanner_boxes.push((spanner.clone(), parent_inl.clone()));
+            pending = after;
+            pending_anchors = after_anchors;
+            segment_start = next_start;
         }
-        let mut bottoms = vec![content_top; starts.len()];
+        rows.push((
+            pending,
+            pending_anchors,
+            segment_start,
+            end.max(segment_start),
+        ));
+
         let mut out: Vec<Frag> = Vec::new();
-        for f in single {
-            place_in_columns(f, &starts, step, content_top, &mut bottoms, &mut out);
-        }
-        // CSS Fragmentation 3 #break-margins truncates margins at a column
-        // break; the last column keeps the content's own end.
-        let last = starts.len() - 1;
-        let col_h_px = bottoms[..last]
-            .iter()
-            .map(|bottom| bottom - content_top)
-            .fold(end - starts[last], f32::max)
-            .max(0.0);
-        (out, col_h_px, anchors)
-    }
-}
-
-/// CSS Fragmentation 3 #possible-breaks in a multi-column flow laid as one
-/// tall column: before each in-flow block-level box after the first among
-/// its siblings (class A) and between line boxes (class B) where at least
-/// `orphans` lines stay before and `widows` lines after (both 2 initially).
-/// Table cells, floats, atomic inlines and out-of-flow boxes are not
-/// descended into.
-fn break_opportunities(dom: &Dom, frags: &[Frag], out: &mut Vec<f32>) {
-    const ORPHANS: usize = 2;
-    const WIDOWS: usize = 2;
-    let block = |f: &Frag| {
-        matches!(f.kind, FragKind::Block)
-            && !f.paint.float
-            && !f.paint.outside_marker
-            && (f.node == NO_NODE
-                || !dom
-                    .effective_display(f.node)
-                    .is_some_and(|display| display.starts_with("inline")))
-    };
-    let lines = frags
-        .iter()
-        .filter(|f| matches!(f.kind, FragKind::Line(_)) && !f.paint.outside_marker)
-        .count();
-    let (mut line, mut blocks) = (0, 0);
-    for f in frags {
-        if matches!(f.kind, FragKind::Line(_)) && !f.paint.outside_marker {
-            if line >= ORPHANS && lines - line >= WIDOWS {
-                out.push(f.y);
+        let mut out_anchors = Vec::new();
+        let mut lines = Vec::new();
+        let mut y = content_top;
+        let content_w = n as f32 * col_w + n.saturating_sub(1) as f32 * gap_px;
+        let row_count = rows.len();
+        for (index, (frags, mut anchors, start, finish)) in rows.into_iter().enumerate() {
+            let last_row = index + 1 == row_count;
+            // ---- the column starts (css-multicol-1 #cf, css-break-3) ----
+            // Lines before a spanner always balance; column-fill applies to
+            // the last line, and a constrained height to what remains of it.
+            let mut breaks = ColumnBreaks::default();
+            self.column_breaks(&frags, false, container, &mut breaks);
+            let row_limit = if last_row {
+                limit.map(|limit| (limit - (y - content_top)).max(0.0))
+            } else {
+                None
+            };
+            let (starts, row_height) = column_starts(
+                &breaks,
+                start,
+                finish,
+                n,
+                row_limit,
+                !last_row || balance || row_limit.is_none(),
+            );
+            for a in &mut anchors {
+                let k = column_of(&starts, a.1);
+                a.1 += y - starts[k];
             }
-            line += 1;
-        } else if block(f) {
-            if blocks > 0 {
-                out.push(f.y);
+            out_anchors.append(&mut anchors);
+            let mut bottoms = vec![y; starts.len()];
+            let mut filled = vec![false; starts.len()];
+            for f in frags {
+                place_in_columns(f, &starts, step, y, &mut bottoms, &mut filled, &mut out);
             }
-            blocks += 1;
-            if !f
-                .children
+            // CSS Fragmentation 3 #break-margins truncates margins at a
+            // column break; the last column keeps the content's own end.
+            let last = starts.len() - 1;
+            let tallest = bottoms[..last]
                 .iter()
-                .any(|c| matches!(c.kind, FragKind::TableCell(_)))
+                .map(|bottom| bottom - y)
+                .fold(finish - starts[last], f32::max)
+                .max(0.0);
+            let height = if row_limit.is_some() {
+                row_height
+            } else {
+                tallest
+            };
+            lines.push(MulticolLine {
+                top: y - content_top,
+                height,
+                filled,
+            });
+            y += height;
+            if let Some((spanner, parent_inl)) = spanner_boxes.get(index).filter(|_| !last_row) {
+                // The spanner, an independent formatting context, at the
+                // multicol container's content width.
+                let mut cursor = Cursor {
+                    y,
+                    ..Default::default()
+                };
+                let mut fc = FloatCtx::new();
+                out.push(self.block(
+                    spanner,
+                    content_x,
+                    content_w,
+                    cb_h,
+                    &mut cursor,
+                    parent_inl,
+                    &mut fc,
+                ));
+                out_anchors.append(&mut cursor.anchors);
+                y = cursor.flush();
+            }
+        }
+        MulticolLaid {
+            frags: out,
+            height: (y - content_top).max(0.0),
+            anchors: out_anchors,
+            lines,
+            col_w,
+            gap: gap_px,
+        }
+    }
+
+    /// css-multicol-1 #column-span: the spanners of a multicol container —
+    /// in-flow block-level descendants with `column-span: all` in its own
+    /// block formatting context — in tree order, with the inline style of
+    /// their parent.
+    fn column_spanners(&self, b: &BoxNode, inl: &InlineStyle) -> Vec<(SharedBox, InlineStyle)> {
+        let mut out = Vec::new();
+        let Content::Blocks(kids) = &b.content else {
+            return out;
+        };
+        for k in kids {
+            if k.style.float.is_some() || k.style.position.out_of_flow() {
+                continue;
+            }
+            if k.node != NO_NODE
+                && self
+                    .dom
+                    .computed_value_resolved(k.node, "column-span")
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("all"))
             {
-                break_opportunities(dom, &f.children, out);
+                out.push((k.clone(), inl.clone()));
+                continue;
             }
+            if matches!(k.content, Content::Blocks(_))
+                && !self.establishes_bfc(k)
+                && self.resolve_multicol(k.node, 1.0e6).is_none()
+            {
+                let child_inl = if k.node == NO_NODE {
+                    inl.clone()
+                } else {
+                    InlineStyle::derive(self.dom, k.node, inl, self.base)
+                };
+                out.extend(self.column_spanners(k, &child_inl));
+            }
+        }
+        out
+    }
+
+    /// Whether `node` is `ancestor` or one of its descendants.
+    fn within(&self, node: NodeId, ancestor: NodeId) -> bool {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            current = self.dom.node(id).parent;
+        }
+        false
+    }
+
+    /// CSS Fragmentation 3 #possible-breaks and #unforced-breaks for a
+    /// multi-column flow laid as one tall column: class A points before each
+    /// in-flow block-level box after the first among its siblings, class B
+    /// points between line boxes, and forced breaks (`column`, and css-break-4's
+    /// `always`/`all`) where a `break-before`/`break-after` applied to or
+    /// propagated to the adjoining boxes demands one. Table cells, floats,
+    /// atomic inlines, out-of-flow boxes and scroll containers (monolithic)
+    /// are not descended into. `avoid_inside`: an ancestor's `break-inside`
+    /// avoids column breaks; `container` supplies `orphans`/`widows`.
+    fn column_breaks(
+        &self,
+        frags: &[Frag],
+        avoid_inside: bool,
+        container: NodeId,
+        out: &mut ColumnBreaks,
+    ) {
+        let dom = self.dom;
+        let block = |f: &Frag| {
+            matches!(f.kind, FragKind::Block)
+                && !f.paint.float
+                && !f.paint.outside_marker
+                && (f.node == NO_NODE
+                    || !dom
+                        .effective_display(f.node)
+                        .is_some_and(|display| display.starts_with("inline")))
+        };
+        let count = |property: &str| {
+            dom.computed_value_resolved(container, property)
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(2)
+        };
+        let (orphans, widows) = (count("orphans"), count("widows"));
+        let lines = frags
+            .iter()
+            .filter(|f| matches!(f.kind, FragKind::Line(_)) && !f.paint.outside_marker)
+            .count();
+        let mut line = 0;
+        let mut previous: Option<&Frag> = None;
+        for f in frags {
+            if matches!(f.kind, FragKind::Line(_)) && !f.paint.outside_marker {
+                // Rule 3 (orphans, widows) and Rule 4 (break-inside).
+                if line > 0 {
+                    let tier = if avoid_inside {
+                        2
+                    } else if line >= orphans && lines - line >= widows {
+                        0
+                    } else {
+                        1
+                    };
+                    out.points.push(ColumnBreak { y: f.y, tier });
+                }
+                line += 1;
+            } else if block(f) {
+                if let Some(previous) = previous {
+                    let after = self.break_after(previous);
+                    let before = self.break_before(f);
+                    if after == BreakValue::Force || before == BreakValue::Force {
+                        out.forced.push(f.y);
+                    } else {
+                        // Rules 1 and 2.
+                        let avoided = after == BreakValue::Avoid
+                            || before == BreakValue::Avoid
+                            || avoid_inside;
+                        out.points.push(ColumnBreak {
+                            y: f.y,
+                            tier: if avoided { 2 } else { 0 },
+                        });
+                    }
+                }
+                previous = Some(f);
+                let monolithic = f
+                    .children
+                    .iter()
+                    .any(|c| matches!(c.kind, FragKind::TableCell(_)))
+                    || f.paint.overflow.iter().any(|overflow| {
+                        matches!(
+                            overflow,
+                            super::overflow::Overflow::Auto | super::overflow::Overflow::Scroll
+                        )
+                    });
+                if !monolithic {
+                    let avoid = avoid_inside
+                        || (f.node != NO_NODE
+                            && dom
+                                .computed_value_resolved(f.node, "break-inside")
+                                .is_some_and(|value| {
+                                    matches!(
+                                        value.trim().to_ascii_lowercase().as_str(),
+                                        "avoid" | "avoid-column"
+                                    )
+                                }));
+                    let inner = if f.node == NO_NODE { container } else { f.node };
+                    self.column_breaks(&f.children, avoid, inner, out);
+                }
+            }
+        }
+    }
+
+    /// CSS Containment 2 #containment-layout: forced breaks inside a layout
+    /// containment box do not propagate to its parent.
+    fn traps_breaks(&self, f: &Frag) -> bool {
+        f.node != NO_NODE
+            && super::style::Containment::of(
+                self.dom
+                    .computed_value_resolved(f.node, "contain")
+                    .as_deref(),
+                self.dom.effective_display(f.node).as_deref(),
+                false,
+            )
+            .layout
+    }
+
+    /// CSS Fragmentation 3 #break-propagation: a box's `break-before`, with
+    /// that of its first in-flow block child (and so on down).
+    fn break_before(&self, f: &Frag) -> BreakValue {
+        let own = BreakValue::of(self.dom, f.node, "break-before");
+        if self.traps_breaks(f) {
+            return own;
+        }
+        let first = f.children.iter().find(|c| {
+            matches!(c.kind, FragKind::Block | FragKind::Line(_))
+                && !c.paint.float
+                && !c.paint.outside_marker
+        });
+        match first {
+            Some(child) if matches!(child.kind, FragKind::Block) => {
+                own.combine(self.break_before(child))
+            }
+            _ => own,
+        }
+    }
+
+    /// css-multicol-1 #crs: the rules `laid` paints, relative to the
+    /// container's border box whose content box starts at (`dx`, `dy`), or
+    /// none when its rule style is `none`/`hidden` or no two adjacent
+    /// columns both have content.
+    fn column_rules(
+        &self,
+        b: &BoxNode,
+        laid: &MulticolLaid,
+        dx: f32,
+        dy: f32,
+    ) -> Option<std::sync::Arc<ColumnRules>> {
+        if b.node == NO_NODE {
+            return None;
+        }
+        let style = self
+            .dom
+            .computed_value_resolved(b.node, "column-rule-style")?;
+        if matches!(
+            style.trim().to_ascii_lowercase().as_str(),
+            "none" | "hidden"
+        ) {
+            return None;
+        }
+        // <line-width>: thin, medium, thick or a non-negative length,
+        // snapped as a border width (#snap-a-length-as-a-border-width).
+        let width = match self
+            .dom
+            .computed_value_resolved(b.node, "column-rule-width")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("thin") => 1.0,
+            Some("thick") => 5.0,
+            None | Some("medium") => 3.0,
+            Some(value) => Len::parse(value, crate::layout2::Units::of(self.dom, b.node), self.vp)
+                .and_then(|length| length.resolve(None))
+                .unwrap_or(3.0)
+                .max(0.0),
+        };
+        let width = if width > 0.0 && width < 1.0 {
+            1.0
+        } else {
+            width.floor()
+        };
+        let lines: Vec<[f32; 3]> = laid
+            .rule_lines()
+            .into_iter()
+            .map(|[x, y, h]| [x + dx, y + dy, h])
+            .collect();
+        (width > 0.0 && !lines.is_empty())
+            .then(|| std::sync::Arc::new(ColumnRules { width, lines }))
+    }
+
+    /// `break-after`, with that of the last in-flow block child.
+    fn break_after(&self, f: &Frag) -> BreakValue {
+        let own = BreakValue::of(self.dom, f.node, "break-after");
+        if self.traps_breaks(f) {
+            return own;
+        }
+        let last = f.children.iter().rev().find(|c| {
+            matches!(c.kind, FragKind::Block | FragKind::Line(_))
+                && !c.paint.float
+                && !c.paint.outside_marker
+        });
+        match last {
+            Some(child) if matches!(child.kind, FragKind::Block) => {
+                own.combine(self.break_after(child))
+            }
+            _ => own,
         }
     }
 }
 
-/// CSS Multi-column 1 #cf (`column-fill: balance`): the start of each of at
-/// most `n` columns, in the single tall column's coordinates, for the least
-/// column height that fits the content into `n` columns breaking only at
-/// `breaks`. A piece taller than that height overflows its column.
-fn balance_columns(breaks: &[f32], top: f32, end: f32, n: usize) -> Vec<f32> {
-    let fill = |height: f32| -> Vec<f32> {
-        let mut starts = vec![top];
-        while starts.len() < n {
-            let start = starts[starts.len() - 1];
-            if end - start <= height + 0.01 {
-                break;
-            }
-            // `breaks` is ascending: the furthest one within `height`.
-            let next = breaks
-                .iter()
-                .copied()
-                .rev()
-                .find(|&b| b > start + 0.01 && b <= start + height + 0.01)
-                .or_else(|| breaks.iter().copied().find(|&b| b > start + 0.01));
-            match next {
-                Some(next) => starts.push(next),
-                None => break,
+/// One multi-column container's laid content: the column-placed fragments,
+/// its used content height, its anchors, which columns hold content, and the
+/// geometry its column rules follow (css-multicol-1 #column-gaps-and-rules).
+pub(super) struct MulticolLaid {
+    frags: Vec<Frag>,
+    height: f32,
+    anchors: Vec<(NodeId, f32)>,
+    lines: Vec<MulticolLine>,
+    col_w: f32,
+    gap: f32,
+}
+
+/// The tall column's content of one multi-column line before placement:
+/// its fragments, anchors, and start and end in the tall column.
+type MulticolSegment = (Vec<Frag>, Vec<(NodeId, f32)>, f32, f32);
+
+/// One multi-column line (css-multicol-1 #multi-column-line): its top
+/// relative to the content box, its column height, and which of its
+/// columns hold content.
+struct MulticolLine {
+    top: f32,
+    height: f32,
+    filled: Vec<bool>,
+}
+
+impl MulticolLaid {
+    /// The rules between adjacent columns of a line that both have content,
+    /// relative to the content box's top-left corner (x of each rule's
+    /// center), each the line's column height long.
+    fn rule_lines(&self) -> Vec<[f32; 3]> {
+        let step = self.col_w + self.gap;
+        self.lines
+            .iter()
+            .flat_map(|line| {
+                line.filled
+                    .windows(2)
+                    .enumerate()
+                    .filter(|(_, pair)| pair[0] && pair[1])
+                    .map(move |(k, _)| {
+                        [
+                            k as f32 * step + self.col_w + self.gap / 2.0,
+                            line.top,
+                            line.height,
+                        ]
+                    })
+            })
+            .collect()
+    }
+}
+
+/// The column rules a multi-column container paints (css-multicol-1 #crs):
+/// their used width and, per rule, its center x and top y relative to the
+/// container's border box, and its length.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ColumnRules {
+    pub width: f32,
+    pub lines: Vec<[f32; 3]>,
+}
+
+/// A possible column break in the tall column (CSS Fragmentation 3
+/// #possible-breaks): tier 0 is allowed by every rule, tier 1 only once
+/// Rule 3 (orphans/widows) is dropped, tier 2 only once Rules 1, 2 and 4
+/// (the `avoid` values) are dropped (#unforced-breaks).
+#[derive(Clone, Copy, Debug)]
+struct ColumnBreak {
+    y: f32,
+    tier: u8,
+}
+
+#[derive(Default)]
+struct ColumnBreaks {
+    points: Vec<ColumnBreak>,
+    forced: Vec<f32>,
+}
+
+/// The column-break meaning of a `break-before`/`break-after` value
+/// (CSS Fragmentation 3 #break-between): page and region values have no
+/// effect in a continuous multi-column context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BreakValue {
+    Auto,
+    Avoid,
+    Force,
+}
+
+impl BreakValue {
+    fn of(dom: &Dom, node: NodeId, property: &str) -> Self {
+        if node == NO_NODE {
+            return Self::Auto;
+        }
+        match dom
+            .computed_value_resolved(node, property)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("column" | "always" | "all") => Self::Force,
+            Some("avoid" | "avoid-column") => Self::Avoid,
+            _ => Self::Auto,
+        }
+    }
+
+    /// #forced-breaks: a forced value wins over an avoid value.
+    fn combine(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+/// css-multicol-1 #cf with css-break-3 #breaking-rules: the start of each
+/// column, in the single tall column's coordinates, and the column height.
+/// Forced breaks start new columns. Balancing finds the least height for
+/// which the content fits `n` columns at breaks every rule allows; a
+/// `limit` caps the height (and is the height when not balancing), and
+/// then rules are dropped in order where a column would otherwise
+/// overflow, and columns beyond `n` are overflow columns.
+fn column_starts(
+    breaks: &ColumnBreaks,
+    top: f32,
+    end: f32,
+    n: usize,
+    limit: Option<f32>,
+    balance: bool,
+) -> (Vec<f32>, f32) {
+    let mut forced: Vec<f32> = breaks
+        .forced
+        .iter()
+        .copied()
+        .filter(|&y| y > top + 0.01 && y < end - 0.01)
+        .collect();
+    forced.sort_by(f32::total_cmp);
+    forced.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    let mut points: Vec<ColumnBreak> = breaks
+        .points
+        .iter()
+        .copied()
+        .filter(|point| point.y > top + 0.01 && point.y < end - 0.01)
+        .collect();
+    points.sort_by(|a, b| a.y.total_cmp(&b.y));
+    let mut segments = Vec::with_capacity(forced.len() + 1);
+    let mut start = top;
+    for &y in &forced {
+        segments.push((start, y));
+        start = y;
+    }
+    segments.push((start, end));
+    // Greedy sequential fill at column height `height`, using breaks of at
+    // most `max_tier`, preferring the lowest tier that keeps each column
+    // within the height.
+    let fill = |height: f32, max_tier: u8| -> Vec<f32> {
+        let mut starts = Vec::new();
+        for &(segment_start, segment_end) in &segments {
+            let mut start = segment_start;
+            starts.push(start);
+            while segment_end - start > height + 0.01 {
+                let within = |tier: u8| {
+                    points
+                        .iter()
+                        .rev()
+                        .find(|p| {
+                            p.tier <= tier
+                                && p.y > start + 0.01
+                                && p.y <= start + height + 0.01
+                                && p.y < segment_end - 0.01
+                        })
+                        .map(|p| p.y)
+                };
+                let next = (0..=max_tier).find_map(within).or_else(|| {
+                    points
+                        .iter()
+                        .find(|p| {
+                            p.tier <= max_tier && p.y > start + 0.01 && p.y < segment_end - 0.01
+                        })
+                        .map(|p| p.y)
+                });
+                match next {
+                    Some(next) => {
+                        starts.push(next);
+                        start = next;
+                    }
+                    None => break,
+                }
             }
         }
         starts
     };
-    let fits = |height: f32| end - fill(height)[..].last().copied().unwrap_or(top) <= height + 0.01;
-    let (mut lo, mut hi) = (((end - top) / n as f32).max(0.0), (end - top).max(0.0));
-    if fits(lo) {
-        return fill(lo);
-    }
-    for _ in 0..24 {
-        let mid = (lo + hi) / 2.0;
-        if fits(mid) {
-            hi = mid;
+    let tallest = |starts: &[f32]| {
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &start)| {
+                let next = starts.get(i + 1).copied().unwrap_or(end);
+                // A forced break ends a column too.
+                let segment_end = segments
+                    .iter()
+                    .find(|(s, e)| start >= *s - 0.01 && start < *e - 0.01)
+                    .map_or(end, |(_, e)| *e);
+                next.min(segment_end) - start
+            })
+            .fold(0.0f32, f32::max)
+    };
+    let balanced = balance.then(|| {
+        let longest = segments.iter().map(|(s, e)| e - s).fold(0.0f32, f32::max);
+        let fits = |height: f32| {
+            let starts = fill(height, 0);
+            starts.len() <= n.max(segments.len()) && tallest(&starts) <= height + 0.01
+        };
+        let (mut lo, mut hi) = (((end - top) / n as f32).max(0.0), longest.max(0.0));
+        if fits(lo) {
+            hi = lo;
+        } else if fits(hi) {
+            for _ in 0..24 {
+                let mid = (lo + hi) / 2.0;
+                if fits(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
         } else {
-            lo = mid;
+            // Unbreakable content taller than any balanced height: one
+            // segment per column at most, overflowing where it must.
+            let starts = fill(longest, 0);
+            hi = if starts.len() <= n {
+                longest
+            } else {
+                tallest(&starts)
+            };
+        }
+        hi
+    });
+    match (limit, balanced) {
+        (None, Some(height)) => {
+            let starts = fill(height, 0);
+            let height = tallest(&starts);
+            (starts, height)
+        }
+        (Some(limit), balanced) => {
+            let height = balanced
+                .map_or(limit, |balanced| balanced.min(limit))
+                .max(1.0);
+            let starts = fill(height, 2);
+            (starts, limit)
+        }
+        (None, None) => {
+            let starts = fill(end - top, 0);
+            let height = tallest(&starts);
+            (starts, height)
         }
     }
-    fill(hi)
+}
+
+/// The block-axis extent (top, bottom) of `node`'s fragment in a fragment
+/// tree.
+fn find_fragment_extent(frags: &[Frag], node: NodeId) -> Option<(f32, f32)> {
+    frags.iter().find_map(|f| {
+        if f.node == node && matches!(f.kind, FragKind::Block) {
+            Some((f.y, f.y + f.h))
+        } else {
+            find_fragment_extent(&f.children, node)
+        }
+    })
+}
+
+/// Split a tall column's fragments around the spanner `node` (whose border
+/// box starts at `top`): the fragments before it and after it,
+/// dropping the spanner itself; a box containing the spanner is split into
+/// its children, as `place_in_columns` splits a box straddling columns.
+fn split_at_spanner(
+    frags: Vec<Frag>,
+    node: NodeId,
+    top: f32,
+    before: &mut Vec<Frag>,
+    after: &mut Vec<Frag>,
+) {
+    for mut f in frags {
+        if f.node == node && matches!(f.kind, FragKind::Block) {
+            continue;
+        }
+        if find_fragment_extent(&f.children, node).is_some() {
+            let children = std::mem::take(&mut f.children);
+            split_at_spanner(children, node, top, before, after);
+        } else if f.y < top - 0.01 {
+            before.push(f);
+        } else {
+            after.push(f);
+        }
+    }
 }
 
 /// The column whose start is the last at or above `y`.
@@ -5524,13 +6302,15 @@ fn column_of(starts: &[f32], y: f32) -> usize {
 /// that fits in the column its top falls in moves as a unit, keeping its
 /// own background and border; a block straddling a column start is split
 /// into its children (its own box decoration is not repeated per column).
-/// `bottoms` records each column's lowest placed edge.
+/// `bottoms` records each column's lowest placed edge, `filled` whether it
+/// received content.
 fn place_in_columns(
     mut f: Frag,
     starts: &[f32],
     step: f32,
     top: f32,
     bottoms: &mut [f32],
+    filled: &mut [bool],
     out: &mut Vec<Frag>,
 ) {
     let k = column_of(starts, f.y);
@@ -5541,11 +6321,12 @@ fn place_in_columns(
         Flow::offset_frag(&mut f, k as f32 * step, top - starts[k]);
         if !matches!(f.kind, FragKind::Oof(..) | FragKind::Fixed(_)) {
             bottoms[k] = bottoms[k].max(f.y + f.h);
+            filled[k] = true;
         }
         out.push(f);
     } else {
         for c in std::mem::take(&mut f.children) {
-            place_in_columns(c, starts, step, top, bottoms, out);
+            place_in_columns(c, starts, step, top, bottoms, filled, out);
         }
     }
 }
@@ -5691,6 +6472,75 @@ struct InlineLaid<'t> {
     /// positioned in the content frame (absolute, like `float_frags`) — the
     /// caller appends them to its children.
     atom_frags: Vec<Frag>,
+}
+
+/// CSS Text 4 #text-wrap-style: the line-breaking inset (and the first line it
+/// applies to) that `balance`, `pretty` and `avoid-short-last-line` choose,
+/// or `None` to break as `auto`. `lines(inset, from)` lays the content's line
+/// boxes on a scratch float context.
+///
+/// * `balance` narrows every line to the least width that keeps the number
+///   of line boxes, which evens out the remaining space in each line box
+///   (equal widths for an even run of words). The count never changes. The
+///   specification lets a UA treat more than ten lines as `auto`, and applies
+///   `line-clamp` first; a block whose clamp hides lines is broken as `auto`.
+/// * `pretty` and `avoid-short-last-line` avoid an excessively short last
+///   line, here one filling less than a third of its line box: they narrow
+///   the next-to-last line until the last two lines are as even as possible
+///   with the same line count, leaving earlier lines as `auto` broke them.
+fn wrap_style_inset(
+    inl: &InlineStyle,
+    width: f32,
+    line_clamp: Option<usize>,
+    lines: impl Fn(f32, usize) -> Vec<LineOut>,
+) -> Option<(f32, usize)> {
+    use super::style::WrapStyle;
+    const MAX_BALANCED_LINES: usize = 10;
+    const MAX_PRETTY_LINES: usize = 64;
+    if inl.wrap_style == WrapStyle::Auto || !inl.ws.wraps() || width <= 0.0 {
+        return None;
+    }
+    let auto = lines(0.0, 0);
+    let count = auto.len();
+    // The largest inset in [0, width] for which `accept` holds, to half a
+    // CSS pixel; `accept(0)` holds for the auto layout.
+    let search = |from: usize, accept: &dyn Fn(&[LineOut]) -> bool| {
+        let (mut low, mut high) = (0.0f32, width);
+        while high - low > 0.5 {
+            let middle = (low + high) / 2.0;
+            if accept(&lines(middle, from)) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        (low > 0.0).then_some((low, from))
+    };
+    match inl.wrap_style {
+        WrapStyle::Balance => {
+            if !(2..=MAX_BALANCED_LINES).contains(&count)
+                || line_clamp.is_some_and(|clamp| clamp < count)
+            {
+                return None;
+            }
+            search(0, &|laid| laid.len() == count)
+        }
+        WrapStyle::Pretty | WrapStyle::AvoidShortLastLine => {
+            if !(2..=MAX_PRETTY_LINES).contains(&count) {
+                return None;
+            }
+            let (previous, last) = (&auto[count - 2], &auto[count - 1]);
+            // Lines separated by a forced break cannot exchange content.
+            if previous.forced || last.width * 3.0 >= (last.right - last.left).max(0.0) {
+                return None;
+            }
+            let from = count - 2;
+            search(from, &|laid| {
+                laid.len() == count && laid[count - 1].width <= laid[count - 2].width + 0.5
+            })
+        }
+        WrapStyle::Auto => None,
+    }
 }
 
 /// An anonymous block holding only floats, out-of-flow boxes and collapsible

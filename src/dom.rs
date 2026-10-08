@@ -66,6 +66,7 @@ mod slotting;
 mod svg_dependencies;
 pub(crate) mod svg_geometry;
 mod transitions;
+mod validity;
 mod xml;
 mod xml_serialize;
 pub use xml_serialize::NotWellFormed;
@@ -5341,14 +5342,33 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
 }
 
 impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
+    /// Whether a legacy `-webkit-box` lays its children out vertically. The
+    /// 2009 Flexible Box Layout draft (adopted by WHATWG Compatibility
+    /// #css-property-mappings) defines `inline-axis` and `block-axis` along
+    /// the box's writing mode: in horizontal writing `block-axis` is
+    /// `vertical` and `inline-axis` `horizontal` (Blink computes them so).
+    pub(crate) fn legacy_box_vertical(&self, id: NodeId) -> bool {
+        let horizontal_writing = !self
+            .computed_value_resolved(id, "writing-mode")
+            .as_deref()
+            .is_some_and(|mode| mode.starts_with("vertical") || mode.starts_with("sideways"));
+        match self
+            .computed_value_resolved(id, "-webkit-box-orient")
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("vertical") => true,
+            Some("block-axis") => horizontal_writing,
+            Some("inline-axis") => !horizontal_writing,
+            _ => false,
+        }
+    }
+
     pub(crate) fn legacy_line_clamp(&self, id: NodeId) -> Option<usize> {
         if !matches!(
             self.computed_display(id).as_deref(),
             Some("-webkit-box" | "-webkit-inline-box")
-        ) || self
-            .computed_value_resolved(id, "-webkit-box-orient")
-            .as_deref()
-            != Some("vertical")
+        ) || !self.legacy_box_vertical(id)
         {
             return None;
         }
@@ -5782,6 +5802,11 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             });
         }
         let value = self.computed_value_unschemed(id, name);
+        if matches!(name, "text-align" | "text-align-last")
+            && value.as_deref().is_some_and(is_match_parent)
+        {
+            return Some(self.match_parent_alignment(id, name));
+        }
         if !color_scheme::holds_colors(name) {
             return value;
         }
@@ -5804,6 +5829,54 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             });
         }
         value
+    }
+
+    /// CSS Text 3 #valdef-text-align-match-parent: the parent's computed
+    /// alignment, with an inherited `start`/`end` resolved against the
+    /// parent's `direction` to `left`/`right`; `start` on the root element.
+    fn match_parent_alignment(&self, id: NodeId, name: &str) -> String {
+        let Some(parent) = self
+            .style_parent(id)
+            .filter(|&parent| crate::layout2::StyleSource::is_element(self, parent))
+        else {
+            return String::from(if name == "text-align" {
+                "start"
+            } else {
+                "auto"
+            });
+        };
+        let parent_value = self
+            .computed_value_resolved(parent, name)
+            .unwrap_or_else(|| {
+                String::from(if name == "text-align" {
+                    "start"
+                } else {
+                    "auto"
+                })
+            });
+        let rtl = self
+            .computed_value_resolved(parent, "direction")
+            .is_some_and(|direction| direction.trim().eq_ignore_ascii_case("rtl"));
+        match parent_value.trim().to_ascii_lowercase().as_str() {
+            "start" => String::from(if rtl { "right" } else { "left" }),
+            "end" => String::from(if rtl { "left" } else { "right" }),
+            _ => parent_value,
+        }
+    }
+
+    /// HTML Rendering #bidi-rendering: `[dir]:dir(ltr), bdi:dir(ltr),
+    /// input[type=tel i]:dir(ltr) { direction: ltr }` and `[dir]:dir(rtl),
+    /// bdi:dir(rtl) { direction: rtl }` — `Some(rtl)` for an element those
+    /// UA rules match. Style sharing keys computed rows by it too.
+    pub(super) fn ua_direction(&self, id: NodeId, tag: &str) -> Option<bool> {
+        (self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
+            && (self.attr(id, "dir").is_some()
+                || tag == "bdi"
+                || (tag == "input"
+                    && self
+                        .attr(id, "type")
+                        .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("tel")))))
+        .then(|| self.style_view().direction_rtl(id))
     }
 
     /// CSS Color 4 #currentcolor-color: in the `color` property, `currentcolor`
@@ -6856,6 +6929,13 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 "bold"
             }
             "font-style" if matches!(tag, "i" | "em") => "italic",
+            "direction" if let Some(rtl) = self.ua_direction(id, tag) => {
+                if rtl {
+                    "rtl"
+                } else {
+                    "ltr"
+                }
+            }
             // HTML Rendering #phrasing-content-3, at the UA origin so
             // explicit none/initial can suppress an element's own decoration.
             "text-decoration-line" if matches!(tag, "u" | "ins") => "underline",
@@ -13408,6 +13488,7 @@ impl<'a> StyleView<'a> {
         match st {
             StatePseudo::Focus => self.matches_focus(id),
             StatePseudo::FocusWithin => self.matches_focus_within(id),
+            StatePseudo::FocusVisible => self.matches_focus_visible(id),
             StatePseudo::AnyLink => matches!(tag, "a" | "area") && self.attr(id, "href").is_some(),
             // HTML #selector-checked: checkedness and option selectedness.
             StatePseudo::Checked => match tag {
@@ -13476,6 +13557,17 @@ impl<'a> StyleView<'a> {
             StatePseudo::Fullscreen => self.matches_fullscreen(id),
             StatePseudo::Defined => self.is_defined(id),
             StatePseudo::Custom(name) => self.has_custom_state(id, name),
+            StatePseudo::Valid => self.matches_validity(id, tag, true),
+            StatePseudo::Invalid => self.matches_validity(id, tag, false),
+            StatePseudo::UserValid => self.matches_user_validity(id, tag, true),
+            StatePseudo::UserInvalid => self.matches_user_validity(id, tag, false),
+            StatePseudo::InRange => self.range_state(id, tag) == Some(false),
+            StatePseudo::OutOfRange => self.range_state(id, tag) == Some(true),
+            StatePseudo::Default => self.matches_default(id, tag),
+            StatePseudo::Open => self.matches_open(id, tag),
+            StatePseudo::Heading(levels) => self.matches_heading(id, tag, levels.as_deref()),
+            StatePseudo::Active => self.matches_active(id),
+            StatePseudo::Media(state) => self.matches_media_state(id, tag, *state),
         }
     }
 
@@ -13672,25 +13764,209 @@ impl<'a> StyleView<'a> {
         None
     }
 
-    /// The element's directionality per the nearest `dir` attribute; the
-    /// document default is ltr, and `dir=auto` approximates to ltr (the
-    /// engine lays out LTR only — no bidi resolution to consult).
-    fn direction_rtl(&self, id: NodeId) -> bool {
-        let mut cur = Some(id);
-        while let Some(n) = cur {
-            if let Some(d) = self.attr(n, "dir") {
-                return match d.trim().to_ascii_lowercase().as_str() {
-                    "rtl" => true,
-                    "ltr" | "auto" => false,
-                    _ => {
-                        cur = self.style_parent(n);
-                        continue;
+    /// HTML #the-directionality: whether `id`'s directionality is 'rtl'.
+    /// Elements of other namespaces, and HTML elements whose `dir` attribute
+    /// is in the Undefined state, take their parent's (the shadow host for a
+    /// shadow root's child), ltr at the root.
+    pub(super) fn direction_rtl(&self, id: NodeId) -> bool {
+        let mut cur = id;
+        loop {
+            if self.namespace_uri(cur) == Some("http://www.w3.org/1999/xhtml") {
+                match self.dir_state(cur) {
+                    Some(DirState::Ltr) => return false,
+                    Some(DirState::Rtl) => return true,
+                    Some(DirState::Auto) => return self.auto_directionality(cur).unwrap_or(false),
+                    None if self.tag_name(cur) == Some("bdi") => {
+                        return self.auto_directionality(cur).unwrap_or(false);
                     }
-                };
+                    None if self.tag_name(cur) == Some("input")
+                        && self.input_type(cur) == "tel" =>
+                    {
+                        return false;
+                    }
+                    None => {}
+                }
             }
-            cur = self.style_parent(n);
+            // #parent-directionality: the parent node, a shadow root's host.
+            let Some(parent) = self.parent_composed(cur) else {
+                return false;
+            };
+            if !self.nodes.is_element(parent) {
+                return false;
+            }
+            cur = parent;
         }
-        false
+    }
+
+    /// HTML #attr-dir: the state of `id`'s `dir` attribute; `None` is the
+    /// Undefined state (absent or an invalid value).
+    fn dir_state(&self, id: NodeId) -> Option<DirState> {
+        let value = self.attr(id, "dir")?.trim();
+        if value.eq_ignore_ascii_case("ltr") {
+            Some(DirState::Ltr)
+        } else if value.eq_ignore_ascii_case("rtl") {
+            Some(DirState::Rtl)
+        } else if value.eq_ignore_ascii_case("auto") {
+            Some(DirState::Auto)
+        } else {
+            None
+        }
+    }
+
+    /// HTML #auto-directionality: `Some(true)` for 'rtl', `Some(false)` for
+    /// 'ltr', `None` for null.
+    fn auto_directionality(&self, id: NodeId) -> Option<bool> {
+        let tag = self.tag_name(id).unwrap_or("");
+        let form_associated = tag == "textarea"
+            || (tag == "input"
+                && matches!(
+                    self.input_type(id).as_str(),
+                    "hidden"
+                        | "text"
+                        | "search"
+                        | "tel"
+                        | "url"
+                        | "email"
+                        | "password"
+                        | "submit"
+                        | "reset"
+                        | "button"
+                ));
+        if form_associated {
+            let value = if tag == "input" {
+                self.input_value(id)
+            } else {
+                self.state
+                    .input_values
+                    .get(&id)
+                    .map(|value| value.value.clone())
+                    .unwrap_or_else(|| {
+                        self.nodes
+                            .child_iter(id)
+                            .filter_map(|child| self.nodes.text(child))
+                            .collect()
+                    })
+            };
+            // An R/AL character with no L before it is rtl; any other
+            // non-empty value is ltr.
+            return match text_node_directionality(&value) {
+                Some(true) => Some(true),
+                _ => (!value.is_empty()).then_some(false),
+            };
+        }
+        if tag == "slot" && self.in_shadow_tree(id) {
+            let assigned = self.slot_assigned(id);
+            if !assigned.is_empty() {
+                return assigned.into_iter().find_map(|child| {
+                    if self.nodes.is_element(child) {
+                        self.contained_text_directionality(child, true)
+                    } else {
+                        self.nodes.text(child).and_then(text_node_directionality)
+                    }
+                });
+            }
+            return None;
+        }
+        self.contained_text_directionality(id, false)
+    }
+
+    /// HTML #contained-text-auto-directionality: the first strong character
+    /// of the descendant Text nodes, skipping `bdi`, `script`, `style`,
+    /// `textarea` and `dir`-attributed subtrees (and, with
+    /// `can_exclude_root`, a root that is one of those).
+    fn contained_text_directionality(&self, root: NodeId, can_exclude_root: bool) -> Option<bool> {
+        let excluded = |id: NodeId| {
+            self.nodes.is_element(id)
+                && (matches!(
+                    self.tag_name(id),
+                    Some("bdi" | "script" | "style" | "textarea")
+                ) || self.dir_state(id).is_some())
+        };
+        if can_exclude_root && excluded(root) {
+            return None;
+        }
+        let mut stack: Vec<NodeId> = self.nodes.child_iter(root).collect();
+        stack.reverse();
+        while let Some(node) = stack.pop() {
+            if excluded(node) {
+                continue;
+            }
+            if self.tag_name(node) == Some("slot") && self.in_shadow_tree(node) {
+                // That shadow root's host's directionality.
+                let mut top = node;
+                while let Some(parent) = self.nodes.parent_of(top) {
+                    top = parent;
+                }
+                return self
+                    .state
+                    .shadow_hosts
+                    .get(&top)
+                    .map(|&host| self.direction_rtl(host));
+            }
+            if let Some(text) = self
+                .nodes
+                .text(node)
+                .filter(|_| !self.nodes.is_element(node))
+            {
+                if let Some(result) = text_node_directionality(text) {
+                    return Some(result);
+                }
+                continue;
+            }
+            let mut children: Vec<NodeId> = self.nodes.child_iter(node).collect();
+            children.reverse();
+            stack.extend(children);
+        }
+        None
+    }
+
+    /// Whether `id`'s root is a shadow root.
+    fn in_shadow_tree(&self, id: NodeId) -> bool {
+        let mut top = id;
+        while let Some(parent) = self.nodes.parent_of(top) {
+            top = parent;
+        }
+        self.state.shadow_hosts.contains_key(&top)
+    }
+
+    /// DOM #find-slotables for a slot in a shadow tree: the host's children
+    /// whose slot name matches, when this is that name's first slot.
+    fn slot_assigned(&self, slot: NodeId) -> Vec<NodeId> {
+        let mut top = slot;
+        while let Some(parent) = self.nodes.parent_of(top) {
+            top = parent;
+        }
+        let Some(&host) = self.state.shadow_hosts.get(&top) else {
+            return Vec::new();
+        };
+        if self
+            .state
+            .shadow_data
+            .get(&top)
+            .is_some_and(|data| data.manual_slot_assignment)
+        {
+            return Vec::new();
+        }
+        let name = self.attr(slot, "name").unwrap_or("");
+        let first = self.nodes.descendants(top).find(|&node| {
+            self.tag_name(node) == Some("slot") && self.attr(node, "name").unwrap_or("") == name
+        });
+        if first != Some(slot) {
+            return Vec::new();
+        }
+        self.nodes
+            .child_iter(host)
+            .filter(|&child| {
+                let slot_name = if self.nodes.is_element(child) {
+                    self.attr(child, "slot").unwrap_or("")
+                } else if self.nodes.text(child).is_some() {
+                    ""
+                } else {
+                    return false;
+                };
+                slot_name == name
+            })
+            .collect()
     }
 
     /// The nearest following sibling that is an element (skips text/comments).
@@ -13746,6 +14022,14 @@ impl<'a> StyleView<'a> {
         }
         false
     }
+}
+
+/// HTML #attr-dir: the `dir` attribute's ltr, rtl and auto states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirState {
+    Ltr,
+    Rtl,
+    Auto,
 }
 
 /// HTML #text-node-directionality: only the first L, R, or AL code point
@@ -14099,6 +14383,14 @@ fn complex_has_boxless_content_dependency(complex: &Complex) -> bool {
 
 fn compound_has_boxless_content_dependency(compound: &Compound) -> bool {
     !compound.has.is_empty()
+        // A form or fieldset's `:valid`/`:invalid`, and a form's default
+        // button, read controls whose own boxes can be omitted.
+        || compound.states.iter().any(|state| {
+            matches!(
+                state,
+                StatePseudo::Valid | StatePseudo::Invalid | StatePseudo::Default
+            )
+        })
         || compound
             .structural
             .iter()
@@ -14368,6 +14660,9 @@ enum StatePseudo {
     /// Selectors 4 / HTML focus state, synchronized before focus events fire.
     Focus,
     FocusWithin,
+    /// `:focus-visible` — Selectors 4 #the-focus-visible-pseudo: the focused
+    /// element while focus is indicated (`Dom::set_input_modality`).
+    FocusVisible,
     /// `:link` / `:any-link` — an `<a>`/`<area>` with an `href`. History-
     /// based styling isn't modeled yet, so `:link` matches every hyperlink
     /// and `:visited` is a never-pseudo for now.
@@ -14398,8 +14693,8 @@ enum StatePseudo {
     /// `:lang(<ranges>)` — language ranges matched against the inherited
     /// `lang` attribute (RFC 4647 prefix filtering, `*` wildcard).
     Lang(Vec<String>),
-    /// `:dir(rtl)` / `:dir(ltr)` — the nearest `dir` attribute (`auto`
-    /// approximates to `ltr`: the engine lays out LTR only). `true` = rtl.
+    /// `:dir(rtl)` / `:dir(ltr)` — HTML #the-directionality of the element
+    /// (`StyleView::direction_rtl`). `true` = rtl.
     Dir(bool),
     /// `:modal` — HTML #selector-modal: a `dialog` shown with `showModal()`
     /// (`Dom::is_modal`) or an element whose fullscreen flag is set.
@@ -14412,6 +14707,32 @@ enum StatePseudo {
     /// `:state(<ident>)` — HTML #selector-custom: a custom element whose
     /// states set contains the identifier.
     Custom(String),
+    /// `:valid` / `:invalid` — HTML #selector-valid / #selector-invalid:
+    /// candidates for constraint validation by their validity states, forms
+    /// by the candidates they own, fieldsets by their descendants.
+    Valid,
+    Invalid,
+    /// `:user-valid` / `:user-invalid` — the same, for input, textarea and
+    /// select elements whose user validity is true.
+    UserValid,
+    UserInvalid,
+    /// `:in-range` / `:out-of-range` — candidates with range limitations,
+    /// by their underflow/overflow states.
+    InRange,
+    OutOfRange,
+    /// `:default` — HTML #selector-default.
+    Default,
+    /// `:open` — HTML #selector-open: open details and dialogs, and a
+    /// select's drop-down box or an input's picker while it is shown.
+    Open,
+    /// `:heading` / `:heading(<integer>#)` — HTML #selector-heading: h1–h6,
+    /// optionally only those whose computed heading level is listed.
+    Heading(Option<Vec<i64>>),
+    /// `:active` — HTML #selector-active (`Dom::set_active_element`).
+    Active,
+    /// `:playing`, `:paused`, `:seeking`, `:buffering`, `:stalled`, `:muted`
+    /// and `:volume-locked` — HTML's media element pseudo-classes.
+    Media(validity::MediaState),
 }
 
 /// Parse a state pseudo-class by name (+ its argument for the functional
@@ -14422,6 +14743,7 @@ fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
     Some(match name {
         "focus" if arg.is_none() => StatePseudo::Focus,
         "focus-within" if arg.is_none() => StatePseudo::FocusWithin,
+        "focus-visible" if arg.is_none() => StatePseudo::FocusVisible,
         "link" | "any-link" => StatePseudo::AnyLink,
         "checked" => StatePseudo::Checked,
         "indeterminate" => StatePseudo::Indeterminate,
@@ -14435,6 +14757,43 @@ fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
         "modal" if arg.is_none() => StatePseudo::Modal,
         "fullscreen" if arg.is_none() => StatePseudo::Fullscreen,
         "defined" if arg.is_none() => StatePseudo::Defined,
+        "valid" if arg.is_none() => StatePseudo::Valid,
+        "invalid" if arg.is_none() => StatePseudo::Invalid,
+        "user-valid" if arg.is_none() => StatePseudo::UserValid,
+        "user-invalid" if arg.is_none() => StatePseudo::UserInvalid,
+        "in-range" if arg.is_none() => StatePseudo::InRange,
+        "out-of-range" if arg.is_none() => StatePseudo::OutOfRange,
+        "default" if arg.is_none() => StatePseudo::Default,
+        "open" if arg.is_none() => StatePseudo::Open,
+        "active" if arg.is_none() => StatePseudo::Active,
+        _ if arg.is_none()
+            && let Some(state) = validity::MediaState::parse(name) =>
+        {
+            StatePseudo::Media(state)
+        }
+        "heading" => match arg {
+            None => StatePseudo::Heading(None),
+            // HTML #selector-heading-functional: a comma-separated list of
+            // CSS <integer>s (CSS Values 4 #integers: an optional sign and
+            // digits; an out-of-range integer clamps).
+            Some(arg) => {
+                let mut levels = Vec::new();
+                for level in split_top_level(arg, ',') {
+                    let level = level.trim();
+                    let (negative, digits) = match level.as_bytes().first() {
+                        Some(b'-') => (true, &level[1..]),
+                        Some(b'+') => (false, &level[1..]),
+                        _ => (false, level),
+                    };
+                    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    let magnitude = digits.parse::<i64>().unwrap_or(i64::MAX);
+                    levels.push(if negative { -magnitude } else { magnitude });
+                }
+                StatePseudo::Heading(Some(levels))
+            }
+        },
         "state" => {
             // CSS Selectors 4 / HTML: `:state(<ident>)`; anything else in the
             // argument fails the selector.
@@ -15368,6 +15727,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                             | "lang"
                             | "dir"
                             | "state"
+                            | "heading"
                     )
                 {
                     return None;
@@ -15544,7 +15904,12 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // argument fails the parse (rule dropped, fail-open).
                     compound.states.push(state);
                     compound.pseudos += 1;
-                } else if matches!(name.as_str(), "active" | "focus-visible" | "visited") {
+                } else if matches!(name.as_str(), "visited" | "autofill" | "-webkit-autofill")
+                    && arg.is_none()
+                {
+                    // HTML #selector-autofill: TRust never autofills a
+                    // field, so `:autofill` (and its `-webkit-` alias) is a
+                    // defined pseudo-class that matches nothing.
                     compound.never = true;
                     compound.pseudos += 1;
                 } else if name == "first-line" && arg.is_none() {
@@ -16080,6 +16445,8 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "overflow-wrap",
     "word-break",
     "tab-size",
+    "orphans",
+    "widows",
 ];
 
 const PROPS: &[PropDef] = &[
@@ -16316,6 +16683,16 @@ const PROPS: &[PropDef] = &[
     prop("column-width", false, true),
     prop("column-fill", false, true),
     prop("column-span", false, true),
+    // CSS Multi-column 1 #crs: the rule between adjacent columns.
+    prop("column-rule-width", false, true),
+    prop("column-rule-style", false, true),
+    prop("column-rule-color", false, true),
+    // CSS Fragmentation 3 #breaking-controls: column breaks in multicol.
+    prop("break-before", false, true),
+    prop("break-after", false, true),
+    prop("break-inside", false, true),
+    prop("orphans", true, true),
+    prop("widows", true, true),
     prop("grid-template-columns", false, true),
     prop("grid-template-rows", false, true),
     // Containment participates in formatting-context/subgrid eligibility in
@@ -16530,6 +16907,9 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "object-position" => Some("50% 50%"),
         "tab-size" => Some("8"),
         "hyphens" => Some("manual"),
+        "column-rule-width" => Some("medium"),
+        "break-before" | "break-after" | "break-inside" => Some("auto"),
+        "orphans" | "widows" => Some("2"),
         _ => None,
     }
 }
@@ -17483,6 +17863,52 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // to the outline initials (medium/none/auto) and it also admits `auto` as
     // a style. `outline-offset` is intentionally separate and is not part of
     // this shorthand.
+    // CSS Multi-column 1 #crs: `column-rule: <'column-rule-width'> ||
+    // <'column-rule-style'> || <'column-rule-color'>`, omitted components
+    // reset to their initial values.
+    if prop == "column-rule" {
+        const STYLES: &[&str] = &[
+            "none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset",
+            "outset",
+        ];
+        let longhands = |w: &str, s: &str, c: &str| {
+            vec![
+                ("column-rule-width".to_string(), w.to_string()),
+                ("column-rule-style".to_string(), s.to_string()),
+                ("column-rule-color".to_string(), c.to_string()),
+            ]
+        };
+        if wide_keyword(value).is_some() {
+            return longhands(value, value, value);
+        }
+        let (w, st, c) = parse_line_shorthand(value, STYLES);
+        if w.is_none() && st.is_none() && c.is_none() {
+            return Vec::new();
+        }
+        return longhands(
+            w.unwrap_or("medium"),
+            st.unwrap_or("none"),
+            c.unwrap_or("currentcolor"),
+        );
+    }
+    // CSS Fragmentation 3 #page-break-properties: `page-break-*` are legacy
+    // shorthands of `break-*`, mapping `always` to `page`.
+    if let Some(side) = prop.strip_prefix("page-break-")
+        && matches!(side, "before" | "after" | "inside")
+    {
+        let keyword = value.trim().to_ascii_lowercase();
+        let mapped = if wide_keyword(value).is_some() {
+            value.trim().to_string()
+        } else {
+            match (side, keyword.as_str()) {
+                (_, "auto" | "avoid") => keyword,
+                ("before" | "after", "left" | "right") => keyword,
+                ("before" | "after", "always") => String::from("page"),
+                _ => return Vec::new(),
+            }
+        };
+        return vec![(format!("break-{side}"), mapped)];
+    }
     if prop == "outline" {
         if wide_keyword(value).is_some() {
             return outline_longhands(Some(value), Some(value), Some(value));
@@ -19537,6 +19963,9 @@ impl Compound {
                     .saturating_add(ranges.capacity() * std::mem::size_of::<String>())
                     .saturating_add(ranges.iter().map(String::capacity).sum::<usize>());
             }
+            if let StatePseudo::Heading(Some(levels)) = state {
+                bytes = bytes.saturating_add(levels.capacity() * std::mem::size_of::<i64>());
+            }
         }
         for boxed in [host_inner, slotted].into_iter().flatten() {
             bytes = bytes
@@ -20435,7 +20864,93 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     {
         return None;
     }
+    // CSS Compositing 2: an unknown blend mode is invalid, so an earlier
+    // declaration stays in force rather than the value painting as normal.
+    if matches!(k.as_str(), "mix-blend-mode" | "background-blend-mode")
+        && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+        && !cssom::accepts_longhand(&k, &value)
+    {
+        return None;
+    }
+    // CSS Sizing 3 #sizing-values: the sizing properties take `auto` (or
+    // `none` for the maxima), a non-negative <length-percentage>,
+    // `min-content`, `max-content`, `fit-content` and `fit-content()`.
+    // Anything else, including box sizes layout does not implement such as
+    // `stretch` and its `-webkit-fill-available` alias, is invalid at parse
+    // time, so an earlier fallback declaration stays in force.
+    if is_sizing_property(&k)
+        && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+        && (!cssom::accepts_longhand(&k, &grammar_lengths(&value))
+            || (!crate::layout2::value::is_math_function(value.trim())
+                && value.trim_start().starts_with('-')))
+    {
+        return None;
+    }
     Some((k, value, important))
+}
+
+/// `value` with every CSS Values 4 #lengths unit the declaration-time
+/// grammar check cannot evaluate (font-relative `lh`/`cap`/`ic`/`r…`,
+/// logical viewport `vi`/`vb`, container `cq…`) rewritten as `px`. The
+/// declaration keeps its own units; this only decides whether it is a
+/// <length>, as unit resolution belongs to computed values and layout.
+fn grammar_lengths(value: &str) -> Cow<'_, str> {
+    const UNITS: &[&str] = &[
+        "rex", "cap", "rcap", "rch", "ic", "ric", "lh", "rlh", "vi", "vb", "svi", "svb", "lvi",
+        "lvb", "dvi", "dvb", "cqw", "cqh", "cqi", "cqb", "cqmin", "cqmax",
+    ];
+    let bytes = value.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        // A number starts at a digit not inside an identifier.
+        let in_identifier = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || (bytes[i - 1] == b'-' && i >= 2 && bytes[i - 2].is_ascii_alphanumeric()));
+        let starts_number = bytes[i].is_ascii_digit() && !in_identifier;
+        if !starts_number {
+            i += 1;
+            continue;
+        }
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let unit = &value[start..i];
+        if UNITS.iter().any(|known| known.eq_ignore_ascii_case(unit)) {
+            out.push_str(&value[copied..start]);
+            out.push_str("px");
+            copied = i;
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(value);
+    }
+    out.push_str(&value[copied..]);
+    Cow::Owned(out)
+}
+
+/// CSS Text 3 `match-parent`, and the `-webkit-match-parent` spelling that
+/// WPT's css-text `text-align-webkit-match-parent` covers.
+fn is_match_parent(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("match-parent") || value.eq_ignore_ascii_case("-webkit-match-parent")
+}
+
+/// CSS Sizing 3 #sizing-properties and their CSS Logical 1 equivalents, plus
+/// `flex-basis`, whose value grammar is `content | <'width'>`.
+fn is_sizing_property(property: &str) -> bool {
+    matches!(
+        logical_to_physical(property).unwrap_or(property),
+        "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" | "flex-basis"
+    )
 }
 
 /// Whether a component value list has a `:` token outside any block or
@@ -20562,6 +21077,7 @@ fn property_rejects_unitless_nonzero_length(property: &str) -> bool {
             | "border-bottom-left-radius"
             | "outline-width"
             | "outline-offset"
+            | "column-rule-width"
             | "background-position"
             | "background-size"
             | "object-position"
@@ -21704,6 +22220,7 @@ fn is_color_property(prop: &str) -> bool {
             | "border-bottom-color"
             | "border-left-color"
             | "outline-color"
+            | "column-rule-color"
             | "text-decoration-color"
     )
 }
@@ -26490,6 +27007,149 @@ mod tests {
             dom.computed_value_resolved(node, "background-color")
                 .as_deref(),
             Some("#111110")
+        );
+    }
+
+    /// HTML #the-directionality and HTML Rendering #bidi-rendering: the
+    /// `dir` attribute (including `auto` and `bdi`) sets `direction` and
+    /// `:dir()`.
+    #[test]
+    fn style_sharing_keeps_the_ua_direction_of_dir_attributes() {
+        // HTML Rendering #bidi-rendering: siblings with equal rules but
+        // different dir attributes compute different directions.
+        let dom = Dom::parse_document(
+            "<style>.t{width:10px}</style><div class=t id=a dir=rtl>a</div>\
+             <div class=t id=b>b</div><div class=t id=c dir=ltr>c</div>",
+        );
+        let direction =
+            |id: &str| dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "direction");
+        assert_eq!(direction("a").as_deref(), Some("rtl"));
+        assert_ne!(direction("b").as_deref(), Some("rtl"));
+        assert_eq!(direction("c").as_deref(), Some("ltr"));
+    }
+
+    #[test]
+    fn dir_attribute_directionality_sets_direction_and_dir_pseudo() {
+        let mut dom = Dom::parse_document(
+            "<html dir=rtl><style>p:dir(rtl){margin-top:7px}</style><body>\
+             <p id=inherit>x</p><p id=auto dir=auto>123 \u{5e9}\u{5dc}\u{5d5}\u{5dd} abc</p>\
+             <p id=latin dir=auto>abc \u{5e9}</p><p id=empty dir=auto>123</p>\
+             <bdi id=bdi>\u{627}\u{644}</bdi><input id=tel type=tel>\
+             <p id=skip dir=auto><span dir=ltr>abc</span><script>x</script>\u{5d0}</p>\
+             <p id=bogus dir=sideways>x</p><svg id=svg></svg>",
+        );
+        let direction = |dom: &Dom, id: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "direction")
+        };
+        let root = dom.document_element().unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(root, "direction").as_deref(),
+            Some("rtl")
+        );
+        for (id, expected) in [
+            ("inherit", "rtl"),
+            ("auto", "rtl"),
+            ("latin", "ltr"),
+            // No strong character: ltr, whatever the parent.
+            ("empty", "ltr"),
+            ("bdi", "rtl"),
+            ("tel", "ltr"),
+            // `dir`-attributed descendants and scripts are skipped.
+            ("skip", "rtl"),
+            // An invalid value is the Undefined state: the parent's.
+            ("bogus", "rtl"),
+            ("svg", "rtl"),
+        ] {
+            assert_eq!(direction(&dom, id).as_deref(), Some(expected), "{id}");
+        }
+        let auto = dom.get_by_id("auto").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(auto, "margin-top").as_deref(),
+            Some("7px")
+        );
+        // Editing the text re-decides the automatic direction.
+        let text = dom.child_iter(auto).next().unwrap();
+        dom.set_text(text, "abc \u{5e9}");
+        assert_eq!(direction(&dom, "auto").as_deref(), Some("ltr"));
+        assert_ne!(
+            dom.computed_value_resolved(auto, "margin-top").as_deref(),
+            Some("7px")
+        );
+    }
+
+    /// CSS Text 3 #valdef-text-align-match-parent: the parent's alignment,
+    /// with `start`/`end` resolved against the parent's direction.
+    #[test]
+    fn match_parent_text_alignment_computes_from_the_parent() {
+        let dom = Dom::parse_document(
+            "<html style='text-align:match-parent'><body>\
+             <div id=rtl dir=rtl style='text-align:start'><p id=a style='text-align:match-parent'>a</p>\
+             <p id=b style='text-align:-webkit-match-parent' dir=ltr>b</p></div>\
+             <div style='text-align:center'><p id=c style='text-align:match-parent'>c</p></div>\
+             <div style='text-align:end'><p id=d style='text-align-last:match-parent'>d</p></div>",
+        );
+        let value = |id: &str, property: &str| {
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), property)
+        };
+        assert_eq!(value("a", "text-align").as_deref(), Some("right"));
+        // The parent's direction decides, not the element's own.
+        assert_eq!(value("b", "text-align").as_deref(), Some("right"));
+        assert_eq!(value("c", "text-align").as_deref(), Some("center"));
+        assert_eq!(value("d", "text-align-last").as_deref(), Some("auto"));
+        let root = dom.document_element().unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(root, "text-align").as_deref(),
+            Some("start")
+        );
+    }
+
+    /// CSS Sizing 3 #sizing-values: an unsupported or invalid size is
+    /// dropped at parse time, preserving an earlier fallback such as the
+    /// iOS `100vh` / `-webkit-fill-available` pair.
+    #[test]
+    fn invalid_sizing_declarations_preserve_earlier_fallbacks() {
+        let dom = Dom::parse_document(
+            "<style>#x {min-height:100vh; min-height:-webkit-fill-available; \
+             width:50%; width:-10px; height:2em; height:stretch; \
+             max-width:none; max-width:auto; min-width:min-content; min-width:none; \
+             max-height:fit-content(20px); flex-basis:content}</style><p id=x>x</p>",
+        );
+        let node = dom.get_by_id("x").unwrap();
+        for (property, expected) in [
+            ("min-height", "100vh"),
+            ("width", "50%"),
+            ("height", "2em"),
+            ("max-width", "none"),
+            ("min-width", "min-content"),
+            ("max-height", "fit-content(20px)"),
+            ("flex-basis", "content"),
+        ] {
+            assert_eq!(
+                dom.computed_value_resolved(node, property).as_deref(),
+                Some(expected),
+                "{property}"
+            );
+        }
+        // Every CSS length unit is a length for the grammar, including
+        // container-relative ones resolved at computed-value time.
+        for value in ["5cqi", "calc(100cqw - 10px)", "2lh", "3rlh", "10dvi"] {
+            let dom = Dom::parse_document(&format!(
+                "<style>#x {{width:1px; width:{value}}}</style><p id=x>x</p>"
+            ));
+            let node = dom.get_by_id("x").unwrap();
+            assert!(
+                dom.computed_value(node, "width").as_deref() != Some("1px"),
+                "{value}"
+            );
+        }
+        // Calculations clamp instead (CSS Values 4 #calc-range).
+        let dom = Dom::parse_document(
+            "<style>#x {width:10px; width:calc(-10px + 5%)}</style><p id=x>x</p>",
+        );
+        let node = dom.get_by_id("x").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(node, "width").as_deref(),
+            Some("calc(-10px + 5%)")
         );
     }
 

@@ -521,6 +521,10 @@ pub(super) fn condition(text: &str) -> Option<bool> {
     evaluate(text.trim(), 0)
 }
 
+/// CSS Compositing 2 `<blend-mode>`.
+const BLEND_MODES: &str = "normal darken multiply color-burn lighten screen color-dodge overlay \
+    soft-light hard-light difference exclusion hue saturation color luminosity";
+
 pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
     if property.starts_with("--")
         || value.starts_with(PENDING_BOX_SHORTHAND)
@@ -587,11 +591,26 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "border-collapse" => one_of("collapse separate"),
         "caption-side" => one_of("top bottom"),
         "list-style-position" => one_of("inside outside"),
-        "column-fill" => one_of("auto balance"),
+        "column-fill" => one_of("auto balance balance-all"),
         "column-span" => one_of("none all"),
+        // CSS Fragmentation 3 #break-between / #break-within (with
+        // css-break-4's `always` and `all`).
+        "break-before" | "break-after" => one_of(
+            "auto avoid always all avoid-page page left right recto verso avoid-column column \
+             avoid-region region",
+        ),
+        "break-inside" => one_of("auto avoid avoid-page avoid-column avoid-region"),
+        "orphans" | "widows" => value.parse::<u32>().is_ok_and(|n| n > 0),
         "container-type" => one_of("normal size inline-size"),
         "interactivity" => one_of("auto inert"),
         "isolation" => one_of("auto isolate"),
+        // CSS Compositing 2 #mix-blend-mode / #background-blend-mode.
+        "mix-blend-mode" => one_of(&format!("{BLEND_MODES} plus-lighter")),
+        "background-blend-mode" => split_top_level(value, ',').iter().all(|mode| {
+            BLEND_MODES
+                .split_ascii_whitespace()
+                .any(|m| m == mode.trim())
+        }),
         "filter" => crate::layout2::filter::valid(value),
         "clip-path" => value == "none" || crate::layout2::clip_path::supports(value),
         "z-index" => value == "auto" || crate::dom::css_integer(value).is_some(),
@@ -620,7 +639,9 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
             (100., 100.),
         )
         .is_some(),
-        p if p.ends_with("-style") && (p.starts_with("border-") || p == "outline-style") => {
+        p if p.ends_with("-style")
+            && (p.starts_with("border-") || p == "outline-style" || p == "column-rule-style") =>
+        {
             one_of("none hidden solid double dotted dashed groove ridge inset outset")
                 || p == "outline-style" && value == "auto"
         }
@@ -658,7 +679,9 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
                     one_of("baseline sub super text-top text-bottom middle top bottom")
                 }
                 p if p.ends_with("-width")
-                    && (p.starts_with("border-") || p == "outline-width") =>
+                    && (p.starts_with("border-")
+                        || p == "outline-width"
+                        || p == "column-rule-width") =>
                 {
                     one_of("thin medium thick")
                 }
@@ -1356,6 +1379,13 @@ fn resolved_shorthand_of(name: &str, longhand: &dyn Fn(&str) -> Option<String>) 
         // <'outline-width'>`, each stated like the border shorthands'.
         "outline" => all(&["outline-color", "outline-style", "outline-width"])
             .map_or_else(String::new, |parts| parts.join(" ")),
+        // CSS Multi-column 1 #crs.
+        "column-rule" => all(&[
+            "column-rule-width",
+            "column-rule-style",
+            "column-rule-color",
+        ])
+        .map_or_else(String::new, |parts| parts.join(" ")),
         // CSS Align 3 #gap-shorthand and #place-content / #place-self: the
         // first value, then the second when it differs.
         "gap" => pair(all(&["row-gap", "column-gap"])),
@@ -1749,6 +1779,19 @@ mod tests {
             dom.computed_value_resolved(p, "width").as_deref(),
             Some("50px")
         );
+    }
+
+    #[test]
+    fn blend_mode_grammars_are_exact() {
+        for value in ["normal", "multiply", "plus-lighter", "LUMINOSITY"] {
+            assert!(supports("mix-blend-mode", value), "{value}");
+        }
+        for value in ["plus-darker", "foo", "multiply screen"] {
+            assert!(!supports("mix-blend-mode", value), "{value}");
+        }
+        assert!(supports("background-blend-mode", "multiply, screen"));
+        assert!(!supports("background-blend-mode", "plus-lighter"));
+        assert!(!supports("background-blend-mode", "multiply,, screen"));
     }
 
     #[test]

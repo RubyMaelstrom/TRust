@@ -515,6 +515,9 @@ pub struct CompositeLayer {
     pub crop: bool,
     /// `image-rendering: pixelated` for this layer (nearest-neighbour scaling).
     pub pixelated: bool,
+    /// The layer's part of an object extending past its content box
+    /// (css-images-3 #the-object-fit), fitted to the clip's source box.
+    pub clip: Option<ImageClip>,
 }
 
 impl Carousel {

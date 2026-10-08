@@ -320,6 +320,11 @@ pub enum UserAction {
     PageFocus {
         actor: Option<usize>,
     },
+    /// `PageFocus` by sequential (keyboard) focus navigation, which
+    /// indicates focus (Selectors 4 #the-focus-visible-pseudo).
+    KeyboardFocus {
+        actor: Option<usize>,
+    },
     /// User-edited value/checkedness for a live form control.
     SetFormValue {
         actor: Option<usize>,
@@ -1394,6 +1399,10 @@ impl BrowserController {
             }
             UserAction::PageFocus { actor } => {
                 self.send_user(crate::js::PageCmd::Focus(actor));
+                false
+            }
+            UserAction::KeyboardFocus { actor } => {
+                self.send_user(crate::js::PageCmd::KeyboardFocus(actor));
                 false
             }
             UserAction::SetFormValue {

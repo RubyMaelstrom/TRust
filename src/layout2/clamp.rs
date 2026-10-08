@@ -16,6 +16,10 @@ pub(super) struct FlowInfo {
     pub independent: bool,
     pub inline_box: bool,
     pub hidden: bool,
+    /// An atomic inline box that `text-overflow: ellipsis` hides (CSS
+    /// Overflow 3 #text-overflow). Unlike `hidden`, ellipsing affects only
+    /// rendering: the box keeps its CSSOM geometry and scrollable overflow.
+    pub elided: bool,
     pub clamp_container: bool,
     /// Visible floats in the clamp BFC are clipped at this content edge,
     /// relative to their own border-box top, and contribute only ink overflow.
@@ -133,6 +137,12 @@ fn ellipsis(children: &mut [Frag], dom: &Dom, base: &Url, inl: &InlineStyle) -> 
         }
         if let FragKind::Line(line) = &mut fragment.kind {
             let line = std::sync::Arc::make_mut(line);
+            // The block ellipsis displaces laid content; any text-overflow
+            // ellipsing is reapplied to the result afterwards.
+            if let Some(laid) = line.laid.take() {
+                line.pieces = laid.pieces;
+                line.atom_boxes = laid.atom_boxes;
+            }
             let old_atoms = line.atom_boxes.clone();
             super::inline::block_ellipsis(line, dom, base, inl);
             fragment.w = line.width;
@@ -214,6 +224,24 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    /// The legacy flexible box's `block-axis` orientation is `vertical` in
+    /// horizontal writing (`inline-axis` is `horizontal`), so it clamps.
+    #[test]
+    fn writing_mode_relative_box_orientations_select_line_clamping() {
+        for (orient, clamped) in [
+            ("block-axis", true),
+            ("inline-axis", false),
+            ("horizontal", false),
+        ] {
+            let (dom, layout) = render(
+                "one two three four five six seven eight nine",
+                &format!("-webkit-box-orient:{orient}"),
+            );
+            assert_eq!(height(&dom, &layout, "clamp") == 40.0, clamped, "{orient}");
+            assert_eq!(text(&layout).contains('…'), clamped, "{orient}");
+        }
     }
 
     #[test]

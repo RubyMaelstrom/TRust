@@ -2,31 +2,51 @@
 //! #transition-events; CSS Easing 1. CSSWG snapshot 81c27f686901 (2026-09-06).
 //!
 //! The canonical style owns the transition, so CSSOM, layout, observers and
-//! both frontends see the same intermediate value. Currently interpolates
-//! box lengths/percentages, opacity, and matching transform primitives.
+//! both frontends see the same intermediate value. Box lengths/percentages,
+//! opacity and transforms have dedicated endpoints for every element; the
+//! other interpolable properties (`EXTENDED`: colors, shadows, filters,
+//! lengths, numbers, `visibility`, …) use the animation value model and are
+//! tracked for the elements whose style transitions them.
+use super::animations::values::{self, Kind};
 use super::*;
 use crate::layout2::value::{Len, Node as Length, Vp};
 
 mod transform;
 use transform::Transform;
 
+/// The animation-model color source for `currentcolor` endpoints.
+type Current<'a> = &'a dyn Fn() -> Option<values::Color>;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Animated {
     Linear(Linear),
     Transform(Transform),
+    /// An `EXTENDED` property's computed value (Web Animations 1
+    /// #animation-types through the animation value model).
+    Value(Kind, values::Value),
 }
 impl Animated {
-    fn compatible(&self, other: &Self) -> bool {
+    /// CSS Transitions 1 #transitionable: neither not animatable nor
+    /// discrete for this pair of values.
+    fn compatible(&self, other: &Self, current: Current<'_>) -> bool {
         match (self, other) {
             (Self::Linear(_), Self::Linear(_)) => true,
             (Self::Transform(a), Self::Transform(b)) => a.compatible(b),
+            (Self::Value(kind, a), Self::Value(_, b)) => {
+                values::mix_value(*kind, a, b, 0.5, current).is_some()
+            }
             _ => false,
         }
     }
-    fn mix(&self, end: &Self, t: f32) -> Self {
+    fn mix(&self, end: &Self, t: f32, current: Current<'_>) -> Self {
         match (self, end) {
             (Self::Linear(a), Self::Linear(b)) => Self::Linear(a.mix(*b, t)),
             (Self::Transform(a), Self::Transform(b)) => Self::Transform(a.mix(b, t)),
+            (Self::Value(kind, a), Self::Value(_, b)) => Self::Value(
+                *kind,
+                values::mix_value(*kind, a, b, t, current)
+                    .unwrap_or_else(|| if t < 0.5 { a.clone() } else { b.clone() }),
+            ),
             _ => unreachable!("transition endpoints have matching animation types"),
         }
     }
@@ -34,11 +54,13 @@ impl Animated {
         match self {
             Self::Linear(v) => v.css(property),
             Self::Transform(v) => v.css(),
+            Self::Value(kind, v) => v.css(*kind),
         }
     }
     fn retained_bytes(&self) -> usize {
         match self {
             Self::Transform(v) => v.retained_bytes(),
+            Self::Value(..) => std::mem::size_of::<values::Value>(),
             _ => 0,
         }
     }
@@ -66,6 +88,78 @@ pub(super) const PROPERTIES: [&str; 20] = [
     "opacity",
     "transform",
 ];
+/// The other interpolable properties: Web Animations 1 #animation-types
+/// other than discrete, by the animation value model (`values::Kind`).
+pub(super) const EXTENDED: [&str; 45] = [
+    "color",
+    "background-color",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "outline-color",
+    "text-decoration-color",
+    "caret-color",
+    "-webkit-text-fill-color",
+    "-webkit-text-stroke-color",
+    "stop-color",
+    "fill",
+    "stroke",
+    "box-shadow",
+    "text-shadow",
+    "filter",
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "outline-width",
+    "outline-offset",
+    "font-size",
+    "flex-basis",
+    "column-gap",
+    "row-gap",
+    "text-indent",
+    "vertical-align",
+    "text-underline-offset",
+    "-webkit-text-stroke-width",
+    "stroke-width",
+    "stroke-dashoffset",
+    "letter-spacing",
+    "word-spacing",
+    "background-position-x",
+    "background-position-y",
+    "flex-grow",
+    "flex-shrink",
+    "z-index",
+    "order",
+    "fill-opacity",
+    "stroke-opacity",
+    "font-weight",
+    "visibility",
+];
+/// Every transitioned property: `PROPERTIES`, then `EXTENDED`.
+const COUNT: usize = PROPERTIES.len() + EXTENDED.len();
+
+fn property_name(index: usize) -> &'static str {
+    if index < PROPERTIES.len() {
+        PROPERTIES[index]
+    } else {
+        EXTENDED[index - PROPERTIES.len()]
+    }
+}
+
+fn property_index(name: &str) -> Option<usize> {
+    PROPERTIES.iter().position(|p| *p == name).or_else(|| {
+        EXTENDED
+            .iter()
+            .position(|p| *p == name)
+            .map(|i| i + PROPERTIES.len())
+    })
+}
+
+/// One element's `EXTENDED` endpoints.
+type ExtendedValues = Box<[Option<Animated>]>;
+
 const LONGHANDS: [&str; 4] = [
     "transition-property",
     "transition-duration",
@@ -300,7 +394,7 @@ struct Parameters {
     delay: f64,
     easing: Easing,
 }
-fn parameters(dom: &Dom, id: NodeId) -> [Option<Parameters>; PROPERTIES.len()] {
+fn parameters(dom: &Dom, id: NodeId) -> [Option<Parameters>; COUNT] {
     let values = LONGHANDS.map(|p| {
         dom.computed_value_resolved(id, p).unwrap_or_else(|| {
             match p {
@@ -312,7 +406,7 @@ fn parameters(dom: &Dom, id: NodeId) -> [Option<Parameters>; PROPERTIES.len()] {
         })
     });
     let lists = values.each_ref().map(|v| split_top_level_commas(v));
-    let mut out = [None; PROPERTIES.len()];
+    let mut out = [None; COUNT];
     for (i, property) in lists[0].iter().enumerate() {
         let property = property.trim();
         let value = |n: usize| {
@@ -331,7 +425,7 @@ fn parameters(dom: &Dom, id: NodeId) -> [Option<Parameters>; PROPERTIES.len()] {
             continue;
         };
         let names = cssom::property_names(property);
-        for (j, p) in PROPERTIES.iter().enumerate() {
+        for (j, p) in PROPERTIES.iter().chain(EXTENDED.iter()).enumerate() {
             if property == "all" || names.iter().any(|name| name == p) {
                 out[j] = Some(Parameters {
                     duration,
@@ -368,15 +462,15 @@ impl Running {
                 .sample(((now - self.start) / self.duration).clamp(0., 1.) as f32)
         }
     }
-    fn value(&self, now: f64) -> Animated {
-        self.from.mix(&self.to, self.progress(now))
+    fn value(&self, now: f64, current: Current<'_>) -> Animated {
+        self.from.mix(&self.to, self.progress(now), current)
     }
     fn elapsed(&self, now: f64) -> f64 {
         (now - self.start).clamp(0., self.duration)
     }
     fn event(&self, key: Key, kind: &'static str, elapsed: f64, time: f64) -> PendingEvent {
         PendingEvent {
-            event: (key.0, PROPERTIES[key.1], kind, elapsed),
+            event: (key.0, property_name(key.1), kind, elapsed),
             time,
             generation: self.generation,
             tree_order: self.tree_order,
@@ -392,6 +486,9 @@ pub(super) struct State {
     all_invalid: Cell<bool>,
     now: f64,
     before: FxHashMap<NodeId, Values>,
+    /// `EXTENDED` endpoints of the elements whose style transitions any of
+    /// them (see `extended_interest`).
+    before_extended: FxHashMap<NodeId, ExtendedValues>,
     running: FxHashMap<Key, Running>,
     completed: FxHashMap<Key, Animated>,
     values: FxHashMap<Key, String>,
@@ -434,7 +531,8 @@ impl State {
     pub(super) fn remove_node(&mut self, node: NodeId) {
         self.invalid.get_mut().remove(&node);
         self.before.remove(&node);
-        for property in 0..PROPERTIES.len() {
+        self.before_extended.remove(&node);
+        for property in 0..COUNT {
             // Running and pending transition targets are native roots. Completed/value caches
             // do not root nodes and can be removed directly without scanning old transitions.
             debug_assert!(!self.running.contains_key(&(node, property)));
@@ -448,7 +546,7 @@ impl State {
                 }
             )+};
         }
-        shrink!(before, completed, values);
+        shrink!(before, before_extended, completed, values);
         let invalid = self.invalid.get_mut();
         if invalid.capacity() > invalid.len().saturating_mul(4).max(64) {
             invalid.shrink_to(invalid.len().saturating_mul(2));
@@ -467,6 +565,7 @@ impl State {
     pub(super) fn retain_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) {
         self.invalid.get_mut().retain(|&id| live(id));
         self.before.retain(|&id, _| live(id));
+        self.before_extended.retain(|&id, _| live(id));
         self.running.retain(|(id, _), _| live(*id));
         self.completed.retain(|(id, _), _| live(*id));
         self.values.retain(|(id, _), _| live(*id));
@@ -478,7 +577,7 @@ impl State {
                 }
             )+};
         }
-        shrink!(before, running, completed, values, events);
+        shrink!(before, before_extended, running, completed, values, events);
         let invalid = self.invalid.get_mut();
         if invalid.capacity() > invalid.len().saturating_mul(4).max(64) {
             invalid.shrink_to(invalid.len().saturating_mul(2));
@@ -497,18 +596,23 @@ impl State {
         self.running.is_empty() && self.values.is_empty()
     }
     pub(super) fn affects_computation(&self, name: &str) -> bool {
-        !self.values.is_empty() && PROPERTIES.contains(&name)
+        !self.values.is_empty() && property_index(name).is_some()
     }
     pub(super) fn value(&self, id: NodeId, name: &str) -> Option<String> {
         if self.values.is_empty() {
             return None;
         }
-        let property = PROPERTIES.iter().position(|p| *p == name)?;
+        let property = property_index(name)?;
         self.values.get(&(id, property)).cloned()
     }
     pub(super) fn retained_bytes(&self) -> usize {
         self.invalid.borrow().capacity() * std::mem::size_of::<NodeId>()
             + self.before.capacity() * std::mem::size_of::<(NodeId, Values)>()
+            + self
+                .before_extended
+                .values()
+                .map(|v| v.len() * std::mem::size_of::<Option<Animated>>())
+                .sum::<usize>()
             + self.running.capacity() * std::mem::size_of::<(Key, Running)>()
             + self.completed.capacity() * std::mem::size_of::<(Key, Animated)>()
             + self.values.capacity() * std::mem::size_of::<(Key, String)>()
@@ -624,6 +728,46 @@ fn endpoints<D: crate::layout2::UnitSource + ?Sized>(dom: &D, id: NodeId, vp: Vp
             _ => None,
         }
     })
+}
+
+/// The `EXTENDED` endpoints, as animation-model computed values.
+fn extended_endpoints(dom: &Dom, id: NodeId, vp: Vp) -> ExtendedValues {
+    EXTENDED
+        .iter()
+        .map(|&name| {
+            let value = dom.computed_value_resolved(id, name);
+            let value = value.as_deref().or_else(|| cssom_initial_value(name))?;
+            let kind = Kind::of(name);
+            Some(Animated::Value(
+                kind,
+                values::Value::parse(dom, id, kind, value, vp),
+            ))
+        })
+        .collect()
+}
+
+/// Whether `id`'s style transitions any `EXTENDED` property: a matching
+/// `transition-property` with a positive combined duration (CSS Transitions
+/// 1 #starting). Only such elements keep `EXTENDED` before-change values.
+fn extended_interest(params: &[Option<Parameters>; COUNT]) -> bool {
+    params[PROPERTIES.len()..]
+        .iter()
+        .flatten()
+        .any(|p| p.duration.max(0.) + p.delay > 0.)
+}
+
+/// Whether `id` declares any transition timing at all; the common
+/// untransitioned element skips reading the transition lists.
+fn declares_transition(dom: &Dom, id: NodeId) -> bool {
+    ["transition-duration", "transition-delay"]
+        .iter()
+        .any(|name| {
+            dom.computed_value_resolved(id, name).is_some_and(|value| {
+                split_top_level_commas(&value)
+                    .iter()
+                    .any(|v| v.trim() != "0s")
+            })
+        })
 }
 
 /// Resolve participation only along paths whose styles/tree membership changed.
@@ -810,7 +954,8 @@ impl Dom {
                 };
                 if !participating {
                     state.before.remove(&id);
-                    for property in 0..PROPERTIES.len() {
+                    state.before_extended.remove(&id);
+                    for property in 0..COUNT {
                         state.cancel((id, property), now);
                         state.completed.remove(&(id, property));
                     }
@@ -830,17 +975,42 @@ impl Dom {
                     }
                     _ => endpoints(&*self, id, vp),
                 };
+                // `EXTENDED` endpoints for elements transitioning them.
+                let declares = declares_transition(self, id);
+                let params = declares.then(|| parameters(self, id));
+                let extended = params
+                    .as_ref()
+                    .is_some_and(extended_interest)
+                    .then(|| extended_endpoints(self, id, vp));
+                let before_extended = state.before_extended.get(&id).cloned();
+                // The element's `currentcolor`: its computed `color`.
+                let color = || {
+                    self.computed_value_resolved(id, "color")
+                        .and_then(|value| values::Color::parse(self, id, &value))
+                };
                 if let Some(before) = state.before.get(&id).cloned() {
                     if before == values
+                        && before_extended == extended
                         && !active_nodes.contains(&id)
-                        && !(0..PROPERTIES.len()).any(|i| state.completed.contains_key(&(id, i)))
+                        && !(0..COUNT).any(|i| state.completed.contains_key(&(id, i)))
                     {
                         continue;
                     }
-                    let params = parameters(self, id);
-                    for i in 0..PROPERTIES.len() {
+                    let params = params.unwrap_or_else(|| parameters(self, id));
+                    for i in 0..COUNT {
                         let key = (id, i);
-                        let Some(end) = values[i].clone() else {
+                        let (end, before_value) = if i < PROPERTIES.len() {
+                            (values[i].clone(), before[i].clone())
+                        } else {
+                            let j = i - PROPERTIES.len();
+                            (
+                                extended.as_ref().and_then(|values| values[j].clone()),
+                                before_extended
+                                    .as_ref()
+                                    .and_then(|values| values[j].clone()),
+                            )
+                        };
+                        let Some(end) = end else {
                             state.cancel(key, now);
                             state.completed.remove(&key);
                             continue;
@@ -857,10 +1027,7 @@ impl Dom {
                             continue;
                         }
                         let old = state.running.remove(&key);
-                        let start = old
-                            .as_ref()
-                            .map(|r| r.value(now))
-                            .or_else(|| before[i].clone());
+                        let start = old.as_ref().map(|r| r.value(now, &color)).or(before_value);
                         if let Some(old) = &old {
                             state.events.push(old.event(
                                 key,
@@ -872,7 +1039,7 @@ impl Dom {
                         let Some(start) = start else {
                             continue;
                         };
-                        if !start.compatible(&end)
+                        if !start.compatible(&end, &color)
                             || start == end
                             || p.duration + p.delay <= 0.
                             || state.completed.get(&key) == Some(&end)
@@ -936,6 +1103,14 @@ impl Dom {
                     }
                 }
                 state.before.insert(id, values);
+                match extended {
+                    Some(extended) => {
+                        state.before_extended.insert(id, extended);
+                    }
+                    None => {
+                        state.before_extended.remove(&id);
+                    }
+                }
             }
             state.epoch = Some(self.epoch);
             state.style_stamp = stamp;
@@ -944,7 +1119,13 @@ impl Dom {
         let values: FxHashMap<Key, String> = state
             .running
             .iter()
-            .map(|(&key, r)| (key, r.value(now).css(key.1)))
+            .map(|(&key, r)| {
+                let color = || {
+                    self.computed_value_resolved(key.0, "color")
+                        .and_then(|value| values::Color::parse(self, key.0, &value))
+                };
+                (key, r.value(now, &color).css(key.1))
+            })
             .collect();
         if state.values != values {
             // A presentation revision, not a DOM mutation: live collections
@@ -1001,6 +1182,160 @@ mod tests {
     }
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 0.001, "{a} != {b}");
+    }
+
+    /// CSS Transitions 1 #starting with the animation types of Web
+    /// Animations 1 #animation-types: colors, shadows, lengths, numbers and
+    /// `visibility` transition, and fire their events.
+    #[test]
+    fn extended_properties_transition_by_animation_type() {
+        let mut dom = Dom::parse_document(
+            "<!doctype html><style>#box{color:rgb(0,0,0);background-color:transparent;\
+             box-shadow:0 0 0 rgb(0,0,0);border-top:0 solid;font-weight:400;\
+             transition:color 1s linear,background-color 1s linear,box-shadow 1s linear,\
+             border-top-width 1s linear,font-weight 1s linear,visibility 1s linear}\
+             #box.on{color:rgb(200,100,0);background-color:rgb(0,0,200);\
+             box-shadow:4px 8px 2px rgb(0,0,0);border-top-width:10px;font-weight:700;\
+             visibility:hidden}</style><div id=box></div><p id=plain>p</p>",
+        );
+        dom.set_viewport_px(640., 480.);
+        let id = dom.get_by_id("box").unwrap();
+        let plain = dom.get_by_id("plain").unwrap();
+        dom.update_css_transitions(0.);
+        // Only elements transitioning `EXTENDED` properties keep them.
+        assert!(dom.transitions.before_extended.contains_key(&id));
+        assert!(!dom.transitions.before_extended.contains_key(&plain));
+        dom.set_attr(id, "class", "on");
+        dom.update_css_transitions(1.);
+        let events = dom.take_css_transition_events();
+        assert!(
+            events
+                .iter()
+                .any(|(_, property, kind, _)| *property == "background-color"
+                    && *kind == "transitionrun")
+        );
+        dom.update_css_transitions(1.5);
+        let value = |dom: &Dom, property: &str| dom.computed_value_resolved(id, property);
+        assert_eq!(value(&dom, "color").as_deref(), Some("rgb(100, 50, 0)"));
+        assert_eq!(
+            value(&dom, "background-color").as_deref(),
+            Some("rgba(0, 0, 200, 0.5)")
+        );
+        assert_eq!(
+            value(&dom, "box-shadow").as_deref(),
+            Some("rgb(0, 0, 0) 2px 4px 1px 0px")
+        );
+        assert_eq!(value(&dom, "border-top-width").as_deref(), Some("5px"));
+        assert_eq!(value(&dom, "font-weight").as_deref(), Some("550"));
+        // Web Animations 1 #animating-visibility: visible until the end.
+        assert_eq!(value(&dom, "visibility").as_deref(), Some("visible"));
+        dom.update_css_transitions(2.);
+        assert_eq!(value(&dom, "visibility").as_deref(), Some("hidden"));
+        assert_eq!(value(&dom, "color").as_deref(), Some("rgb(200,100,0)"));
+        assert!(!dom.css_transitions_active());
+        let events = dom.take_css_transition_events();
+        for property in ["color", "box-shadow", "visibility", "font-weight"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|(_, p, kind, _)| *p == property && *kind == "transitionend"),
+                "{property}: {events:?}"
+            );
+        }
+    }
+
+    /// CSS Transitions 1 #transitionable: a pair whose animation type is
+    /// discrete (mismatched `inset`, `hidden`/`collapse`) changes at once.
+    #[test]
+    fn discrete_value_pairs_do_not_transition() {
+        let mut dom = Dom::parse_document(
+            "<!doctype html><style>#box{box-shadow:0 0 4px red;visibility:hidden;\
+             transition:all 1s linear}\
+             #box.on{box-shadow:inset 0 0 4px red;visibility:collapse}</style><div id=box></div>",
+        );
+        dom.set_viewport_px(640., 480.);
+        let id = dom.get_by_id("box").unwrap();
+        dom.update_css_transitions(0.);
+        dom.set_attr(id, "class", "on");
+        dom.update_css_transitions(1.);
+        dom.update_css_transitions(1.25);
+        assert_eq!(
+            dom.computed_value_resolved(id, "box-shadow").as_deref(),
+            Some("inset 0 0 4px red")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(id, "visibility").as_deref(),
+            Some("collapse")
+        );
+    }
+
+    /// CSS Transforms 1 #interpolation-of-transforms with Transforms 2
+    /// primitives: 3D rotations interpolate their angles, matrices and
+    /// mismatched remainders decompose.
+    #[test]
+    fn transform_transitions_cover_3d_functions_and_mismatched_lists() {
+        let sample = |from: &str, to: &str, t: f64| {
+            let mut dom = Dom::parse_document(&format!(
+                "<!doctype html><style>#box{{transform:{from};transition:transform 1s linear}}\
+                 #box.on{{transform:{to}}}</style><div id=box></div>"
+            ));
+            dom.set_viewport_px(640., 480.);
+            let id = dom.get_by_id("box").unwrap();
+            dom.update_css_transitions(0.);
+            dom.set_attr(id, "class", "on");
+            dom.update_css_transitions(1.);
+            dom.update_css_transitions(1. + t);
+            dom.computed_value_resolved(id, "transform").unwrap()
+        };
+        assert_eq!(
+            sample("rotateY(0deg)", "rotateY(180deg)", 1. / 3.),
+            "rotate3d(0, 1, 0, 60deg)"
+        );
+        // translateX and translateZ share translate3d.
+        assert_eq!(
+            sample("translateX(10px)", "translateZ(20px)", 0.5),
+            "translate3d(5px, 0px, 10px)"
+        );
+        assert_eq!(
+            sample("matrix(1, 0, 0, 1, 0, 0)", "matrix(2, 0, 0, 2, 10, 0)", 0.5),
+            "matrix(1.5, 0, 0, 1.5, 5, 0)"
+        );
+        // The rotations interpolate by function; the remainders as matrices.
+        assert_eq!(
+            sample(
+                "rotate(0deg) scale(1) translate(20px)",
+                "rotate(270deg) translate(10px) scale(2)",
+                0.5
+            ),
+            "rotate(135deg) matrix(1.5, 0, 0, 1.5, 15, 0)"
+        );
+        // A remainder with a percentage needs layout's reference box: the
+        // value changes without a transition.
+        assert_eq!(
+            sample("scale(1) translate(10%)", "translate(10px) scale(2)", 0.5),
+            "translate(10px) scale(2)"
+        );
+    }
+
+    /// `currentcolor` interpolates as the element's used color.
+    #[test]
+    fn currentcolor_endpoints_use_the_element_color() {
+        let mut dom = Dom::parse_document(
+            "<!doctype html><style>#box{color:rgb(0,0,200);border-top-color:currentcolor;\
+             transition:border-top-color 1s linear}\
+             #box.on{border-top-color:rgb(200,0,0)}</style><div id=box></div>",
+        );
+        dom.set_viewport_px(640., 480.);
+        let id = dom.get_by_id("box").unwrap();
+        dom.update_css_transitions(0.);
+        dom.set_attr(id, "class", "on");
+        dom.update_css_transitions(1.);
+        dom.update_css_transitions(1.5);
+        assert_eq!(
+            dom.computed_value_resolved(id, "border-top-color")
+                .as_deref(),
+            Some("rgb(100, 0, 100)")
+        );
     }
 
     #[test]

@@ -191,7 +191,8 @@ impl GopherUrl {
     pub fn is_image(&self) -> bool {
         !self.is_metadata()
             && self.view_mime().map_or_else(
-                || matches!(self.item_type, 'I' | 'g' | 'p'),
+                // UMN Gopher+ §2.9 `:` is a bitmap image.
+                || matches!(self.item_type, 'I' | 'g' | 'p' | ':'),
                 |mime| mime.starts_with("image/") && file_is_renderable(&mime),
             )
     }
@@ -204,8 +205,14 @@ impl GopherUrl {
     }
     /// RFC 1436 §3.8 leaves presentation of these binary files to the client.
     /// Their type controls EOF framing, not whether they need a download.
+    /// An item type this client does not otherwise know (§3.8 reserves '0'
+    /// to 'Z'; servers also use local letters such as `P` or `x`) is
+    /// presented the same way: its content, sniffed, picks the viewer or a
+    /// download, rather than the type being refused.
     pub fn is_binary_file(&self) -> bool {
-        !self.is_metadata() && self.view_mime().is_none() && matches!(self.item_type, '5' | '9')
+        !self.is_metadata()
+            && self.view_mime().is_none()
+            && (matches!(self.item_type, '5' | '9') || !known_item_type(self.item_type))
     }
     pub fn is_text(&self) -> bool {
         self.is_metadata()
@@ -224,6 +231,36 @@ impl GopherUrl {
         )
         .into_owned()
     }
+}
+
+/// Item types with their own presentation: RFC 1436 §3.8, the common `h`/`i`
+/// extensions, and the UMN Gopher+ media types. `2` (CSO) and `T` (tn3270)
+/// name interactive services, not files.
+fn known_item_type(item_type: char) -> bool {
+    matches!(
+        item_type,
+        '0' | '1'
+            | '2'
+            | '3'
+            | '4'
+            | '5'
+            | '6'
+            | '7'
+            | '8'
+            | '9'
+            | '+'
+            | 'T'
+            | 'g'
+            | 'I'
+            | 'h'
+            | 'i'
+            | 's'
+            | 'd'
+            | 'p'
+            | ':'
+            | ';'
+            | '<'
+    )
 }
 
 /// Gophers uses the RFC 4266 URL form over TLS, conventionally on port 70
@@ -667,16 +704,13 @@ fn menu_item<'a>(
             {
                 target.gopher_plus = Some(capability.to_vec());
             }
+            // RFC 1436 §3.8: a type 8 selector is the name to log in as;
+            // both frontends open the (plaintext) Telnet session and show it.
+            if t == '8' {
+                target.tls = false;
+            }
             if target.validate().is_ok() {
-                link = Some(if t == '8' {
-                    Link::Telnet {
-                        host,
-                        port,
-                        tls: false,
-                    }
-                } else {
-                    Link::Gopher(target)
-                });
+                link = Some(Link::Gopher(target));
             }
         }
     }
@@ -1496,10 +1530,31 @@ mod regression_tests {
             false,
             80,
         );
+        // The selector survives as the frontends' login hint.
         assert!(matches!(
             &doc.lines[0].link,
-            Some(Link::Telnet { host, port: 2323, tls: false }) if host == "mud.example"
+            Some(Link::Gopher(url)) if url.host == "mud.example" && url.port == 2323
+                && url.item_type == '8' && url.selector == b"guest" && !url.tls
         ));
+    }
+
+    /// RFC 1436 §3.8 lets the client present item types it does not know;
+    /// they take the sniffed binary-file path instead of being refused.
+    #[test]
+    fn unknown_item_types_are_presented_by_their_content() {
+        for (item_type, binary, image) in [
+            ('9', true, false),
+            ('P', true, false),
+            ('x', true, false),
+            (':', false, true),
+            ('0', false, false),
+            ('T', false, false),
+            ('2', false, false),
+        ] {
+            let url = GopherUrl::new("e.org".into(), 70, item_type, b"/f".to_vec());
+            assert_eq!(url.is_binary_file(), binary, "{item_type}");
+            assert_eq!(url.is_image(), image, "{item_type}");
+        }
     }
 
     #[test]

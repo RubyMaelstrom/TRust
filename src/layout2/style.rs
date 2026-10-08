@@ -81,6 +81,8 @@ pub(crate) trait StyleSource: UnitSource {
     fn inherited_lang(&self, id: NodeId) -> Option<&str>;
     fn is_document_element(&self, id: NodeId) -> bool;
     fn computed_display(&self, id: NodeId) -> Option<String>;
+    /// The used display: the cascade's, else the element's UA default.
+    fn effective_display(&self, id: NodeId) -> Option<String>;
     fn css_animation_definitions(&self, id: NodeId) -> Vec<crate::dom::CssAnimationDefinition>;
     fn legacy_line_clamp(&self, id: NodeId) -> Option<usize>;
     fn size_container_kind(&self, id: NodeId) -> u8;
@@ -215,6 +217,9 @@ pub(crate) fn display_of(dom: &Dom, id: NodeId) -> Disp {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BoxStyle {
     pub overflow: [super::overflow::Overflow; 2],
+    /// CSS Overflow 3 #text-overflow: `ellipsis` (`clip` is the initial
+    /// value). Applies to block containers; not inherited.
+    pub text_overflow_ellipsis: bool,
     /// CSS Overflow 4 #webkit-line-clamp, active only for a vertical legacy box.
     pub line_clamp: Option<usize>,
     /// CSS Writing Modes 4: vertical inline progression, with columns ordered
@@ -227,8 +232,17 @@ pub(crate) struct BoxStyle {
     /// and pseudo identity so graphical paint reads that style rather than
     /// treating the fragment as an unstyled anonymous box.
     pub pseudo: Option<(NodeId, PseudoEl)>,
-    /// CSS Conditional 5: inline-size (1) or two-axis (2) containment.
+    /// CSS Conditional 5 / CSS Containment 2 #containment-size: inline-size
+    /// (1) or two-axis (2) size containment, from `container-type` or
+    /// `contain`.
     pub size_container: u8,
+    /// CSS Containment 2 #containment-layout: an independent formatting
+    /// context, stacking context and containing block, without a baseline.
+    pub contain_layout: bool,
+    /// CSS Containment 2 #containment-paint: contents clipped to the
+    /// overflow clip edge; an independent formatting context, stacking
+    /// context and containing block.
+    pub contain_paint: bool,
     pub margin: [Len; 4],
     pub padding: [Len; 4],
     pub border: [f32; 4],
@@ -314,11 +328,14 @@ impl BoxStyle {
     pub fn anonymous() -> BoxStyle {
         BoxStyle {
             overflow: [super::overflow::Overflow::Visible; 2],
+            text_overflow_ellipsis: false,
             line_clamp: None,
             vertical: None,
             sideways_text: Some(false),
             pseudo: None,
             size_container: 0,
+            contain_layout: false,
+            contain_paint: false,
             margin: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
             padding: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
             border: [0.0; 4],
@@ -448,19 +465,40 @@ impl BoxStyle {
         let side = |prop: &str, i: usize, ua: [f32; 4]| -> Len {
             Len::parse_or(cv(prop).as_deref(), u, vp, Len::px(ua[i]))
         };
+        let containment = Containment::of(
+            cv("contain").as_deref(),
+            dom.effective_display(id).as_deref(),
+            matches!(
+                tag,
+                "img"
+                    | "video"
+                    | "canvas"
+                    | "iframe"
+                    | "embed"
+                    | "object"
+                    | "input"
+                    | "select"
+                    | "textarea"
+                    | "button"
+                    | "svg"
+            ),
+        );
         BoxStyle {
             line_clamp: dom.legacy_line_clamp(id),
-            overflow: super::overflow::Overflow::axes_from_longhands(
+            overflow: containment.used_overflow(super::overflow::Overflow::axes_from_longhands(
                 cv("overflow-x"),
                 cv("overflow-y"),
-            ),
+            )),
+            text_overflow_ellipsis: text_overflow_ellipsis(cv("text-overflow").as_deref()),
             vertical: vertical_mode(cv("writing-mode").as_deref()),
             sideways_text: sideways_text(
                 cv("writing-mode").as_deref(),
                 cv("text-orientation").as_deref(),
             ),
             pseudo: None,
-            size_container: dom.size_container_kind(id),
+            size_container: dom.size_container_kind(id).max(containment.size),
+            contain_layout: containment.layout,
+            contain_paint: containment.paint,
             margin: [
                 side("margin-top", TOP, ua_margin),
                 side("margin-right", RIGHT, ua_margin),
@@ -607,16 +645,24 @@ impl BoxStyle {
                     )
             })
         };
+        let containment = Containment::of(
+            cv("contain").as_deref(),
+            Some(cv("display").as_deref().unwrap_or("inline")),
+            false,
+        );
         BoxStyle {
             line_clamp: None,
-            overflow: super::overflow::Overflow::axes(cv),
+            overflow: containment.used_overflow(super::overflow::Overflow::axes(cv)),
+            text_overflow_ellipsis: text_overflow_ellipsis(cv("text-overflow").as_deref()),
             vertical: vertical_mode(cv("writing-mode").as_deref()),
             sideways_text: sideways_text(
                 cv("writing-mode").as_deref(),
                 cv("text-orientation").as_deref(),
             ),
             pseudo: Some((id, which)),
-            size_container: 0,
+            size_container: containment.size,
+            contain_layout: containment.layout,
+            contain_paint: containment.paint,
             margin: [
                 len("margin-top", Len::px(0.0)),
                 len("margin-right", Len::px(0.0)),
@@ -690,6 +736,9 @@ impl BoxStyle {
     pub fn stacking_context(&self, item: bool) -> bool {
         (self.position.positioned() && self.z_index.is_some())
             || matches!(self.position, Pos::Fixed | Pos::Sticky)
+            // CSS Containment 2 #containment-layout / #containment-paint.
+            || self.contain_layout
+            || self.contain_paint
             || self.has_transform
             || self.has_clip_path
             || self.has_mask
@@ -700,8 +749,84 @@ impl BoxStyle {
     }
 }
 
+/// CSS Containment 2 #contain-property: `none | strict | content |
+/// [ [size | inline-size] || layout || style || paint ]`, with the types a
+/// box's display admits (#containment-size, #containment-layout,
+/// #containment-paint: none for a box without a principal box, internal
+/// table and ruby boxes (but a table cell's layout and paint) and
+/// non-atomic inline boxes; size containment also not for tables).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Containment {
+    pub size: u8,
+    pub layout: bool,
+    pub paint: bool,
+}
+
+impl Containment {
+    /// `replaced`: the element is a replaced element, whose inline box is
+    /// atomic.
+    pub(crate) fn of(value: Option<&str>, display: Option<&str>, replaced: bool) -> Self {
+        let Some(value) = value else {
+            return Self::default();
+        };
+        let mut contain = Self::default();
+        for token in value.split_ascii_whitespace() {
+            match token.to_ascii_lowercase().as_str() {
+                "strict" => {
+                    contain.size = 2;
+                    contain.layout = true;
+                    contain.paint = true;
+                }
+                "content" => {
+                    contain.layout = true;
+                    contain.paint = true;
+                }
+                "size" => contain.size = 2,
+                "inline-size" => contain.size = contain.size.max(1),
+                "layout" => contain.layout = true,
+                "paint" => contain.paint = true,
+                _ => {}
+            }
+        }
+        let display = display.unwrap_or("inline").trim().to_ascii_lowercase();
+        let no_box = matches!(display.as_str(), "none" | "contents");
+        let internal = display.starts_with("table-") && display != "table-caption"
+            || display.starts_with("ruby-")
+            || (matches!(display.as_str(), "inline" | "ruby") && !replaced);
+        if no_box || (internal && display != "table-cell") {
+            contain.layout = false;
+            contain.paint = false;
+        }
+        if no_box || internal || matches!(display.as_str(), "table" | "inline-table") {
+            contain.size = 0;
+        }
+        contain
+    }
+
+    /// Paint containment clips like `overflow: clip` on an axis whose
+    /// overflow is `visible` (#containment-paint).
+    pub(crate) fn used_overflow(
+        self,
+        axes: [super::overflow::Overflow; 2],
+    ) -> [super::overflow::Overflow; 2] {
+        if !self.paint {
+            return axes;
+        }
+        axes.map(|axis| match axis {
+            super::overflow::Overflow::Visible => super::overflow::Overflow::Clip,
+            other => other,
+        })
+    }
+}
+
 /// CSS Filter Effects 1 #FilterProperty, its lengths in px and its
 /// drop-shadow default color the element's color.
+/// CSS Overflow 3 #text-overflow: `clip | ellipsis`, an ASCII
+/// case-insensitive keyword.
+fn text_overflow_ellipsis(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim().eq_ignore_ascii_case("ellipsis"))
+}
+
 fn filters_of(
     cv: &dyn Fn(&str) -> Option<String>,
     u: Units,
@@ -1019,7 +1144,7 @@ pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
         return Align2::Left;
     }
     if let Some(v) = dom.computed_value_resolved(id, "text-align")
-        && let Some(a) = align_from_css(&v)
+        && let Some(a) = align_from_css_in(&v, right_to_left(dom, id))
     {
         return a;
     }
@@ -1028,7 +1153,12 @@ pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
     if dom.effective_display(id).as_deref() == Some("table-caption") {
         return Align2::Center;
     }
-    Align2::Left
+    // The initial value, `start`.
+    if right_to_left(dom, id) {
+        Align2::Right
+    } else {
+        Align2::Left
+    }
 }
 
 /// The `text-align` of text control `id`'s `::placeholder` text. CSS
@@ -1040,7 +1170,7 @@ pub(crate) fn placeholder_align(dom: &Dom, id: NodeId) -> Align2 {
         && let Some(align) = dom
             .pseudo_layout_value(id, PseudoEl::Placeholder, "text-align")
             .as_deref()
-            .and_then(align_from_css)
+            .and_then(|value| align_from_css_in(value, right_to_left(dom, id)))
     {
         return align;
     }
@@ -1113,14 +1243,93 @@ pub(crate) fn block_align_last(dom: &Dom, id: NodeId) -> Option<Align2> {
     if value.trim().eq_ignore_ascii_case("auto") {
         return None;
     }
-    align_from_css(&value)
+    align_from_css_in(&value, right_to_left(dom, id))
+}
+
+/// CSS Box Alignment 3 #distribution-block: a block container's
+/// `align-content`, which aligns its contents as a whole in the block axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct BlockContentAlign {
+    /// 0 start, 0.5 center, 1 end of the free space.
+    fraction: f32,
+    /// `unsafe`: the contents may overflow the start edge.
+    unsafe_overflow: bool,
+}
+
+impl BlockContentAlign {
+    /// The block-axis shift of the contents for `free` space in the content
+    /// box (negative when they overflow it). Without an overflow position a
+    /// block container's alignment is `safe`, as is that of a block-axis
+    /// scroll container in a UA without the "smart" default (#overflow-values).
+    pub(super) fn offset(self, free: f32) -> f32 {
+        if free < 0.0 && !self.unsafe_overflow {
+            0.0
+        } else {
+            free * self.fraction
+        }
+    }
+}
+
+/// The used `align-content` of a block container other than `normal`, which
+/// behaves as `start` (and lets the contents stay where they were laid).
+/// <<content-distribution>> values use their fallback alignment, and a
+/// baseline position its fallback outside a shared baseline context.
+pub(super) fn block_content_align(dom: &Dom, id: NodeId) -> Option<BlockContentAlign> {
+    if id == NO_NODE {
+        return None;
+    }
+    let value = dom.computed_value_resolved(id, "align-content")?;
+    let value = value.to_ascii_lowercase();
+    let tokens: Vec<&str> = value.split_ascii_whitespace().collect();
+    let (unsafe_overflow, position) = match tokens.as_slice() {
+        ["normal"] => return None,
+        ["baseline"] | ["first", "baseline"] | ["space-between"] | ["stretch"] => (false, "start"),
+        ["last", "baseline"] => (false, "end"),
+        ["space-around"] | ["space-evenly"] => (false, "center"),
+        ["safe", position] => (false, *position),
+        ["unsafe", position] => (true, *position),
+        [position] => (false, *position),
+        _ => return None,
+    };
+    let fraction = match position {
+        "start" | "flex-start" => 0.0,
+        "center" => 0.5,
+        "end" | "flex-end" => 1.0,
+        _ => return None,
+    };
+    Some(BlockContentAlign {
+        fraction,
+        unsafe_overflow,
+    })
+}
+
+/// CSS Writing Modes 4 #direction: whether `id`'s inline base direction is
+/// right-to-left.
+pub(super) fn right_to_left(dom: &Dom, id: NodeId) -> bool {
+    id != NO_NODE
+        && dom
+            .computed_value_resolved(id, "direction")
+            .is_some_and(|direction| direction.trim().eq_ignore_ascii_case("rtl"))
 }
 
 fn align_from_css(value: &str) -> Option<Align2> {
+    align_from_css_in(value, false)
+}
+
+/// CSS Text 3 #text-align-property, with `start`/`end` at the line's
+/// start/end edge for the block's `direction` (#valdef-text-align-start).
+fn align_from_css_in(value: &str, right_to_left: bool) -> Option<Align2> {
+    let (start, end) = if right_to_left {
+        (Align2::Right, Align2::Left)
+    } else {
+        (Align2::Left, Align2::Right)
+    };
     match value.trim().to_ascii_lowercase().as_str() {
-        "left" | "start" | "-webkit-left" | "-moz-left" => Some(Align2::Left),
+        "start" => Some(start),
+        "end" => Some(end),
+        "left" | "-webkit-left" | "-moz-left" => Some(Align2::Left),
         "center" | "-webkit-center" | "-moz-center" => Some(Align2::Center),
-        "right" | "end" | "-webkit-right" | "-moz-right" => Some(Align2::Right),
+        "right" | "-webkit-right" | "-moz-right" => Some(Align2::Right),
         "justify" => Some(Align2::Justify),
         _ => None,
     }
@@ -1178,12 +1387,37 @@ pub(crate) struct InlineStyle {
     pub keep_all: bool,
     /// `tab-size`: a number of space advances or an absolute CSS-pixel length.
     pub tab: TabSize,
+    /// CSS Text 4 #text-wrap-style (inherited).
+    pub wrap_style: WrapStyle,
     pub font_zero: bool,
     /// Paint suppression for this element's text: the sticky opacity chain OR
     /// its own computed `visibility:hidden` (re-clearable per element).
     pub invisible: bool,
     /// The `opacity:0` chain alone — what element children derive from.
     opacity_chain: bool,
+}
+
+/// CSS Text 4 #text-wrap-style: how a block container's line breaker chooses
+/// among the soft wrap opportunities. `stable` is `auto` here: the greedy
+/// breaker never considers content on subsequent lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WrapStyle {
+    #[default]
+    Auto,
+    Balance,
+    Pretty,
+    AvoidShortLastLine,
+}
+
+impl WrapStyle {
+    pub(crate) fn from_css(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("balance") => Self::Balance,
+            Some(v) if v.eq_ignore_ascii_case("pretty") => Self::Pretty,
+            Some(v) if v.eq_ignore_ascii_case("avoid-short-last-line") => Self::AvoidShortLastLine,
+            _ => Self::Auto,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1203,6 +1437,62 @@ pub(crate) enum VerticalAlign {
     Middle(f32),
     /// Positive values raise the inline box relative to the baseline.
     Shift(f32),
+    /// CSS 2.2 §10.8.1 `text-top`: the box's top at the top of the parent's
+    /// content area, this far above the parent's baseline.
+    TextTop(f32),
+    /// `text-bottom`: the box's bottom at the bottom of the parent's content
+    /// area, this far below the parent's baseline.
+    TextBottom(f32),
+}
+
+/// CSS 2.2 #propdef-vertical-align for an inline box whose own style is `s`
+/// inside `parent`: keywords, lengths, and percentages of the element's own
+/// `line-height`.
+fn vertical_align_value(
+    value: &str,
+    parent: &InlineStyle,
+    s: &InlineStyle,
+    u: Units,
+) -> VerticalAlign {
+    let value = value.trim();
+    match value {
+        "top" => VerticalAlign::Top,
+        "bottom" => VerticalAlign::Bottom,
+        "text-top" | "text-bottom" => {
+            // The parent's content area is its font's ascent and descent.
+            let metrics = crate::text::shape(" ", &parent.text_style());
+            if value == "text-top" {
+                VerticalAlign::TextTop(metrics.ascent)
+            } else {
+                VerticalAlign::TextBottom(metrics.descent)
+            }
+        }
+        "middle" => VerticalAlign::Middle(crate::text::x_height(&parent.text_style()) * 0.5),
+        // The box's middle on the parent's baseline (HTML Rendering
+        // #attributes-for-embedded-content-and-images, `align=middle`).
+        "-webkit-baseline-middle" => VerticalAlign::Middle(0.0),
+        "sub" => VerticalAlign::Shift(-0.2 * s.font_size),
+        "super" => VerticalAlign::Shift(0.35 * s.font_size),
+        value => match value
+            .strip_suffix('%')
+            .and_then(|n| n.trim().parse::<f32>().ok())
+        {
+            // "a percentage of the 'line-height' value" of the element.
+            Some(percent) => {
+                let line_height = match s.line_height {
+                    crate::text::CssLineHeight::Length(px) => px,
+                    crate::text::CssLineHeight::Number(n) => n * s.font_size,
+                    crate::text::CssLineHeight::Normal => {
+                        crate::text::shape(" ", &s.text_style()).line_height
+                    }
+                };
+                VerticalAlign::Shift(percent / 100.0 * line_height)
+            }
+            None => css_length_px(value, u)
+                .map(VerticalAlign::Shift)
+                .unwrap_or_default(),
+        },
+    }
 }
 
 impl InlineStyle {
@@ -1228,6 +1518,7 @@ impl InlineStyle {
             brk: WordBrk::Normal,
             keep_all: false,
             tab: TabSize::Spaces(8.0),
+            wrap_style: WrapStyle::Auto,
             font_zero: false,
             invisible: false,
             opacity_chain: false,
@@ -1370,20 +1661,8 @@ impl InlineStyle {
         // the enclosing box's accumulated alignment instead of snapping its
         // text back to the line baseline.
         if dom.author_declares(id, "vertical-align") {
-            s.vertical_align = match dom.computed_value_resolved(id, "vertical-align").as_deref() {
-                Some("top") | Some("text-top") => VerticalAlign::Top,
-                Some("bottom") | Some("text-bottom") => VerticalAlign::Bottom,
-                Some("middle") => {
-                    VerticalAlign::Middle(crate::text::x_height(&parent.text_style()) * 0.5)
-                }
-                // The box's middle on the parent's baseline (HTML Rendering
-                // #attributes-for-embedded-content-and-images, `align=middle`).
-                Some("-webkit-baseline-middle") => VerticalAlign::Middle(0.0),
-                Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
-                Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
-                Some(value) => css_length_px(value, u)
-                    .map(VerticalAlign::Shift)
-                    .unwrap_or_default(),
+            s.vertical_align = match dom.computed_value_resolved(id, "vertical-align") {
+                Some(value) => vertical_align_value(&value, parent, &s, u),
                 None => VerticalAlign::Baseline,
             };
         }
@@ -1428,6 +1707,10 @@ impl InlineStyle {
                     .as_deref(),
                 nowrap_longhand(dom, id),
             );
+        s.wrap_style = WrapStyle::from_css(
+            dom.computed_value_resolved(id, "text-wrap-style")
+                .as_deref(),
+        );
         if let Some(zero) = dom.font_size_zero(id) {
             s.font_zero = zero;
         }
@@ -1573,18 +1856,8 @@ impl InlineStyle {
             };
         }
         if declared("vertical-align") {
-            s.vertical_align = match value("vertical-align").as_deref() {
-                Some("top" | "text-top") => VerticalAlign::Top,
-                Some("bottom" | "text-bottom") => VerticalAlign::Bottom,
-                Some("middle") => {
-                    VerticalAlign::Middle(crate::text::x_height(&self.text_style()) * 0.5)
-                }
-                Some("-webkit-baseline-middle") => VerticalAlign::Middle(0.0),
-                Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
-                Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
-                Some(v) => css_length_px(v, u)
-                    .map(VerticalAlign::Shift)
-                    .unwrap_or_default(),
+            s.vertical_align = match value("vertical-align") {
+                Some(v) => vertical_align_value(&v, self, &s, u),
                 None => VerticalAlign::Baseline,
             };
         }
@@ -1592,6 +1865,9 @@ impl InlineStyle {
             value("white-space-collapse").as_deref(),
             value("text-wrap-mode").as_deref().map(|v| v == "nowrap"),
         );
+        if let Some(wrap) = value("text-wrap-style") {
+            s.wrap_style = WrapStyle::from_css(Some(&wrap));
+        }
         if declared("visibility") {
             s.invisible = matches!(value("visibility").as_deref(), Some("hidden" | "collapse"));
         }

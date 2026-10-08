@@ -718,8 +718,18 @@ impl SharedBytes {
                 .pieces
                 .iter()
                 .chain(&line.atom_boxes)
+                .chain(
+                    line.laid
+                        .iter()
+                        .flat_map(|laid| laid.pieces.iter().chain(&laid.atom_boxes)),
+                )
                 .map(super::inline::Piece::retained_bytes)
-                .sum::<usize>();
+                .sum::<usize>()
+            + line.laid.as_ref().map_or(0, |laid| {
+                size_of::<super::flow::LaidLine>()
+                    + (laid.pieces.capacity() + laid.atom_boxes.capacity())
+                        * size_of::<super::inline::Piece>()
+            });
         self.lines.insert(key, (Arc::downgrade(line), bytes));
         bytes
     }

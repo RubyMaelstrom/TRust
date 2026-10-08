@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use crate::core::CssPoint;
+use crate::render::matrix3d as m3;
 use crate::render::{Affine2d, CssRect, TransformStep};
 
 use super::Units;
@@ -20,12 +21,17 @@ use super::value::{Len, Vp};
 enum Operation {
     Translate([Len; 2]),
     Matrix(Affine2d),
+    /// A three-dimensional transform function (CSS Transforms 2
+    /// #three-d-transform-functions) as its 4x4 matrix.
+    Matrix3d(crate::render::matrix3d::Matrix3d),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Transform {
     operations: Vec<Operation>,
     origin: [Len; 2],
+    /// The `transform-origin` z offset in CSS px.
+    origin_z: f32,
     content_box: bool,
 }
 
@@ -44,14 +50,20 @@ impl Transform {
             && let Some(y) = parts
                 .get(1)
                 .map_or(Some(Len::px(0.)), |s| length(s, units, viewport))
+            && let Some(z) = parts
+                .get(2)
+                .map_or(Some(0.), |s| absolute_length(s, units, viewport))
         {
             operations.push(Operation::Translate([x, y]));
+            if z != 0. {
+                operations.push(Operation::Matrix3d(m3::translate(0., 0., z)));
+            }
             present = true;
         }
         if let Some(text) = value("rotate").filter(|v| !none(v))
             && let Some(rotation) = individual_rotation(&text)
         {
-            operations.push(Operation::Matrix(rotation));
+            operations.push(rotation);
             present = true;
         }
         if let Some(text) = value("scale").filter(|v| !none(v))
@@ -59,8 +71,13 @@ impl Transform {
             && (1..=3).contains(&parts.len())
             && let Some(x) = scale(parts[0])
             && let Some(y) = parts.get(1).map_or(Some(x), |s| scale(s))
+            && let Some(z) = parts.get(2).map_or(Some(1.), |s| scale(s))
         {
-            operations.push(Operation::Matrix(Affine2d::scale(x, y)));
+            operations.push(if z == 1. {
+                Operation::Matrix(Affine2d::scale(x, y))
+            } else {
+                Operation::Matrix3d(m3::scale(x, y, z))
+            });
             present = true;
         }
         if let Some(text) = value("transform").filter(|v| !none(v))
@@ -72,12 +89,18 @@ impl Transform {
         if !present {
             return None;
         }
-        let origin = value("transform-origin")
+        let origin_value = value("transform-origin");
+        let origin_z = origin_value
+            .as_deref()
+            .and_then(|s| origin_depth(s, units, viewport))
+            .unwrap_or(0.);
+        let origin = origin_value
             .and_then(|s| origin(&s, units, viewport))
             .unwrap_or_else(|| [percent(50.), percent(50.)]);
         Some(Arc::new(Self {
             operations,
             origin,
+            origin_z,
             // Transforms 1 #transform-box: for CSS layout boxes fill-box
             // maps to content-box; stroke-box and view-box map to border-box.
             content_box: value("transform-box")
@@ -98,14 +121,47 @@ impl Transform {
             reference.x + self.origin[0].resolve(Some(reference.width)).unwrap_or(0.),
             reference.y + self.origin[1].resolve(Some(reference.height)).unwrap_or(0.),
         );
+        let translation = |[x, y]: &[Len; 2]| {
+            (
+                x.resolve(Some(reference.width)).unwrap_or(0.),
+                y.resolve(Some(reference.height)).unwrap_or(0.),
+            )
+        };
+        if self
+            .operations
+            .iter()
+            .any(|op| matches!(op, Operation::Matrix3d(_)))
+        {
+            // CSS Transforms 2 #ctm: compose in three dimensions, about the
+            // origin's depth too, then flatten the box into its parent's
+            // plane (`transform-style: flat`).
+            let mut matrix = m3::translate(origin.x, origin.y, self.origin_z);
+            for op in &self.operations {
+                let factor = match op {
+                    Operation::Translate(lengths) => {
+                        let (x, y) = translation(lengths);
+                        m3::translate(x, y, 0.)
+                    }
+                    Operation::Matrix(matrix) => m3::from_affine(*matrix),
+                    Operation::Matrix3d(matrix) => *matrix,
+                };
+                matrix = m3::multiply(&matrix, &factor);
+            }
+            let matrix = m3::multiply(
+                &matrix,
+                &m3::translate(-origin.x, -origin.y, -self.origin_z),
+            );
+            return m3::flatten(&matrix, origin);
+        }
         let mut matrix = Affine2d::translate(origin.x, origin.y);
         for op in &self.operations {
             matrix = matrix.then(match op {
-                Operation::Translate([x, y]) => Affine2d::translate(
-                    x.resolve(Some(reference.width)).unwrap_or(0.),
-                    y.resolve(Some(reference.height)).unwrap_or(0.),
-                ),
+                Operation::Translate(lengths) => {
+                    let (x, y) = translation(lengths);
+                    Affine2d::translate(x, y)
+                }
                 Operation::Matrix(matrix) => *matrix,
+                Operation::Matrix3d(_) => unreachable!("composed in three dimensions above"),
             });
         }
         matrix.then(Affine2d::translate(-origin.x, -origin.y))
@@ -125,7 +181,7 @@ impl Transform {
                 .iter()
                 .map(|op| match op {
                     Operation::Translate(values) => values.iter().map(super::memo::len_bytes).sum(),
-                    Operation::Matrix(_) => 0,
+                    Operation::Matrix(_) | Operation::Matrix3d(_) => 0,
                 })
                 .sum::<usize>()
     }
@@ -177,6 +233,20 @@ fn length(text: &str, units: Units, viewport: Vp) -> Option<Len> {
         value @ Len::Val(_) => Some(value),
         _ => None,
     }
+}
+
+/// A `<length>` that cannot be a percentage (z offsets, depths), in px.
+fn absolute_length(text: &str, units: Units, viewport: Vp) -> Option<f32> {
+    if text.contains('%') {
+        return None;
+    }
+    length(text, units, viewport)?.resolve(None)
+}
+
+/// The z component of `transform-origin` (its third value), in px.
+fn origin_depth(text: &str, units: Units, viewport: Vp) -> Option<f32> {
+    let parts = components(text)?;
+    absolute_length(parts.get(2)?, units, viewport)
 }
 
 fn percent(value: f32) -> Len {
@@ -244,23 +314,41 @@ fn origin(text: &str, units: Units, viewport: Vp) -> Option<[Len; 2]> {
     Some([axis(x, true)?, axis(y, false)?])
 }
 
-fn individual_rotation(text: &str) -> Option<Affine2d> {
+/// CSS Transforms 2 #individual-transforms `rotate`: an angle about `z`,
+/// a named axis, or an `x y z` vector.
+fn individual_rotation(text: &str) -> Option<Operation> {
     let mut parts = components(text)?;
-    let index = parts.iter().position(|s| angle(s).is_some())?;
+    // The <angle> is the component with an angle unit; a bare zero may
+    // be one only when nothing else is (`0 0 1 45deg`).
+    let index = parts
+        .iter()
+        .position(|s| angle(s).is_some() && number(s).is_none())
+        .or_else(|| parts.iter().position(|s| angle(s).is_some()))?;
     let radians = angle(parts.remove(index))?;
-    match parts.as_slice() {
-        [] | ["z"] => Some(rotate(radians)),
-        [x, y, z] if number(x)? == 0. && number(y)? == 0. => {
-            let z = number(z)?;
-            Some(if z == 0. {
-                Affine2d::IDENTITY
-            } else {
-                rotate(radians * z.signum())
-            })
-        }
-        // Non-planar transforms still require the renderer's 3D rendering
-        // context contract; do not misrepresent them as a 2D rotation.
-        _ => None,
+    let axis = match parts.as_slice() {
+        [] => [0., 0., 1.],
+        [name] => match name.to_ascii_lowercase().as_str() {
+            "x" => [1., 0., 0.],
+            "y" => [0., 1., 0.],
+            "z" => [0., 0., 1.],
+            _ => return None,
+        },
+        [x, y, z] => [number(x)?, number(y)?, number(z)?],
+        _ => return None,
+    };
+    Some(rotation_operation(axis, radians))
+}
+
+/// `rotate3d()` about `axis`: a 2D rotation when the axis is ±z.
+fn rotation_operation([x, y, z]: [f32; 3], radians: f32) -> Operation {
+    if x == 0. && y == 0. {
+        Operation::Matrix(if z == 0. {
+            Affine2d::IDENTITY
+        } else {
+            rotate(radians * z.signum())
+        })
+    } else {
+        Operation::Matrix3d(m3::rotate(x, y, z, radians))
     }
 }
 
@@ -293,11 +381,30 @@ fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
                 ]));
                 continue;
             }
-            ("translate", [x, y]) | ("translate3d", [x, y, _]) => {
+            ("translate", [x, y]) => {
                 operations.push(Operation::Translate([
                     length(x, units, viewport)?,
                     length(y, units, viewport)?,
                 ]));
+                continue;
+            }
+            ("translate3d", [x, y, z]) => {
+                operations.push(Operation::Translate([
+                    length(x, units, viewport)?,
+                    length(y, units, viewport)?,
+                ]));
+                let z = absolute_length(z, units, viewport)?;
+                if z != 0. {
+                    operations.push(Operation::Matrix3d(m3::translate(0., 0., z)));
+                }
+                continue;
+            }
+            ("translatez", [z]) => {
+                operations.push(Operation::Matrix3d(m3::translate(
+                    0.,
+                    0.,
+                    absolute_length(z, units, viewport)?,
+                )));
                 continue;
             }
             ("matrix", [a, b, c, d, e, f]) => Affine2d([
@@ -313,28 +420,53 @@ fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
                     .iter()
                     .map(|v| number(v))
                     .collect::<Option<Vec<_>>>()?;
-                Affine2d([m[0], m[1], m[4], m[5], m[12], m[13]])
+                operations.push(Operation::Matrix3d(std::array::from_fn(|i| m[i])));
+                continue;
             }
             ("scale", [x]) => Affine2d::scale(scale(x)?, scale(x)?),
-            ("scale", [x, y]) | ("scale3d", [x, y, _]) => Affine2d::scale(scale(x)?, scale(y)?),
+            ("scale", [x, y]) => Affine2d::scale(scale(x)?, scale(y)?),
+            ("scale3d", [x, y, z]) => {
+                operations.push(Operation::Matrix3d(m3::scale(
+                    scale(x)?,
+                    scale(y)?,
+                    scale(z)?,
+                )));
+                continue;
+            }
             ("scalex", [x]) => Affine2d::scale(scale(x)?, 1.),
             ("scaley", [y]) => Affine2d::scale(1., scale(y)?),
+            ("scalez", [z]) => {
+                operations.push(Operation::Matrix3d(m3::scale(1., 1., scale(z)?)));
+                continue;
+            }
             ("rotate" | "rotatez", [a]) => rotate(angle(a)?),
-            ("rotate3d", [x, y, z, a]) if number(x)? == 0. && number(y)? == 0. => {
-                let z = number(z)?;
-                if z == 0. {
-                    Affine2d::IDENTITY
+            ("rotatex", [a]) => {
+                operations.push(Operation::Matrix3d(m3::rotate(1., 0., 0., angle(a)?)));
+                continue;
+            }
+            ("rotatey", [a]) => {
+                operations.push(Operation::Matrix3d(m3::rotate(0., 1., 0., angle(a)?)));
+                continue;
+            }
+            ("rotate3d", [x, y, z, a]) => {
+                operations.push(rotation_operation(
+                    [number(x)?, number(y)?, number(z)?],
+                    angle(a)?,
+                ));
+                continue;
+            }
+            ("perspective", [depth]) => {
+                let depth = if depth.trim().eq_ignore_ascii_case("none") {
+                    f32::INFINITY
                 } else {
-                    rotate(angle(a)? * z.signum())
-                }
+                    absolute_length(depth, units, viewport).filter(|d| *d >= 0.)?
+                };
+                operations.push(Operation::Matrix3d(m3::perspective(depth)));
+                continue;
             }
             ("skewx", [a]) | ("skew", [a]) => Affine2d([1., 0., angle(a)?.tan(), 1., 0., 0.]),
             ("skewy", [a]) => Affine2d([1., angle(a)?.tan(), 0., 1., 0., 0.]),
             ("skew", [x, y]) => Affine2d([1., angle(y)?.tan(), angle(x)?.tan(), 1., 0., 0.]),
-            // Preserve the existing 2D adapter's treatment of genuinely 3D
-            // functions pending its separate projective/flattening contract.
-            ("translatez" | "scalez" | "rotatex" | "rotatey" | "perspective", [_])
-            | ("rotate3d", [_, _, _, _]) => Affine2d::IDENTITY,
             _ => return None,
         };
         operations.push(Operation::Matrix(matrix));
@@ -372,18 +504,31 @@ pub(super) fn animation_steps(
         steps.push(match (name.as_str(), args.as_slice()) {
             ("translate" | "translatex", [x]) => TransformStep::Translate(x_length(x)?, 0.),
             ("translatey", [y]) => TransformStep::Translate(0., y_length(y)?),
-            ("translate", [x, y]) | ("translate3d", [x, y, _]) => {
-                TransformStep::Translate(x_length(x)?, y_length(y)?)
+            ("translate", [x, y]) => TransformStep::Translate(x_length(x)?, y_length(y)?),
+            ("translate3d", [x, y, z]) => TransformStep::Translate3d(
+                x_length(x)?,
+                y_length(y)?,
+                absolute_length(z, units, viewport)?,
+            ),
+            ("translatez", [z]) => {
+                TransformStep::Translate3d(0., 0., absolute_length(z, units, viewport)?)
             }
             ("scale", [x]) => TransformStep::Scale(scale(x)?, scale(x)?),
-            ("scale", [x, y]) | ("scale3d", [x, y, _]) => {
-                TransformStep::Scale(scale(x)?, scale(y)?)
-            }
+            ("scale", [x, y]) => TransformStep::Scale(scale(x)?, scale(y)?),
+            ("scale3d", [x, y, z]) => TransformStep::Scale3d(scale(x)?, scale(y)?, scale(z)?),
             ("scalex", [x]) => TransformStep::Scale(scale(x)?, 1.),
             ("scaley", [y]) => TransformStep::Scale(1., scale(y)?),
+            ("scalez", [z]) => TransformStep::Scale3d(1., 1., scale(z)?),
             ("rotate" | "rotatez", [a]) => TransformStep::Rotate(angle(a)?),
-            ("rotate3d", [x, y, z, a]) if number(x)? == 0. && number(y)? == 0. => {
-                TransformStep::Rotate(angle(a)? * number(z)?.signum())
+            ("rotatex", [a]) => TransformStep::Rotate3d([1., 0., 0.], angle(a)?),
+            ("rotatey", [a]) => TransformStep::Rotate3d([0., 1., 0.], angle(a)?),
+            ("rotate3d", [x, y, z, a]) => {
+                let (x, y, z, a) = (number(x)?, number(y)?, number(z)?, angle(a)?);
+                if x == 0. && y == 0. {
+                    TransformStep::Rotate(a * if z == 0. { 0. } else { z.signum() })
+                } else {
+                    TransformStep::Rotate3d([x, y, z], a)
+                }
             }
             ("skew" | "skewx", [a]) => TransformStep::Skew(angle(a)?, 0.),
             ("skewy", [a]) => TransformStep::Skew(0., angle(a)?),
@@ -401,10 +546,14 @@ pub(super) fn animation_steps(
                     .iter()
                     .map(|v| number(v))
                     .collect::<Option<Vec<_>>>()?;
-                TransformStep::Matrix(Affine2d([m[0], m[1], m[4], m[5], m[12], m[13]]))
+                TransformStep::Matrix3d(std::array::from_fn(|i| m[i]))
             }
-            ("translatez" | "scalez" | "rotatex" | "rotatey" | "perspective", [_]) => {
-                TransformStep::Matrix(Affine2d::IDENTITY)
+            ("perspective", [depth]) => {
+                TransformStep::Perspective(if depth.trim().eq_ignore_ascii_case("none") {
+                    f32::INFINITY
+                } else {
+                    absolute_length(depth, units, viewport).filter(|d| *d >= 0.)?
+                })
             }
             _ => return None,
         });
@@ -510,6 +659,94 @@ mod tests {
             t.matrix(&f).map_point(CssPoint::default()),
             CssPoint::new(100., 43.)
         );
+    }
+
+    /// CSS Transforms 2 #ctm with `transform-style: flat`: 3D functions
+    /// compose as 4x4 matrices and the box flattens into its parent's plane.
+    #[test]
+    fn three_dimensional_functions_flatten_orthographically() {
+        let f = fragment();
+        let map = |values: &[(&str, &str)], x: f32, y: f32| {
+            let mut values = values.to_vec();
+            values.push(("transform-origin", "0 0"));
+            transform(&values)
+                .matrix(&f)
+                .map_point(CssPoint::new(f.x + x, f.y + y))
+        };
+        let near = |p: CssPoint, x: f32, y: f32| {
+            assert!(
+                (p.x - (f.x + x)).abs() < 1e-3 && (p.y - (f.y + y)).abs() < 1e-3,
+                "{p:?} vs ({x}, {y})"
+            );
+        };
+        near(map(&[("transform", "rotateY(60deg)")], 100., 10.), 50., 10.);
+        near(map(&[("transform", "rotateX(60deg)")], 10., 100.), 10., 50.);
+        near(
+            map(&[("transform", "rotate3d(0, 1, 0, 60deg)")], 100., 0.),
+            50.,
+            0.,
+        );
+        near(map(&[("rotate", "y 60deg")], 100., 0.), 50., 0.);
+        near(map(&[("rotate", "0 1 0 60deg")], 100., 0.), 50., 0.);
+        // Two quarter turns about x compose before flattening.
+        near(
+            map(&[("transform", "rotateX(90deg) rotateX(-90deg)")], 10., 20.),
+            10.,
+            20.,
+        );
+        // A z translation or z scale does not move a flat box.
+        near(
+            map(&[("transform", "translateZ(40px) scaleZ(3)")], 10., 20.),
+            10.,
+            20.,
+        );
+        near(map(&[("translate", "5px 6px 70px")], 0., 0.), 5., 6.);
+        near(
+            map(
+                &[("transform", "matrix3d(2,0,0,0, 0,1,0,0, 0,0,1,0, 7,8,9,1)")],
+                10.,
+                10.,
+            ),
+            27.,
+            18.,
+        );
+        // The origin's depth: a quarter turn about y about a point 20px
+        // behind the box moves its origin 20px right.
+        let t = transform(&[
+            ("transform", "rotateY(90deg)"),
+            ("transform-origin", "0 0 -20px"),
+        ]);
+        near(t.matrix(&f).map_point(CssPoint::new(f.x, f.y)), 20., 0.);
+    }
+
+    #[test]
+    fn three_dimensional_animation_steps_interpolate_their_angles() {
+        let steps = |text: &str| {
+            animation_steps(
+                text,
+                Units::default(),
+                Vp { w: 800., h: 600. },
+                CssRect::default(),
+            )
+            .unwrap()
+        };
+        // rotateY(0) → rotateY(180deg) passes through 60deg at one third.
+        let m = crate::render::interpolate_transform_steps_for_test(
+            &steps("rotateY(0deg)"),
+            &steps("rotateY(180deg)"),
+            1. / 3.,
+        );
+        assert!(
+            (m.0[0] - 0.5).abs() < 1e-4 && (m.0[3] - 1.).abs() < 1e-4,
+            "{m:?}"
+        );
+        // A 2D and a 3D translate share the translate3d primitive.
+        let m = crate::render::interpolate_transform_steps_for_test(
+            &steps("translateX(10px)"),
+            &steps("translateZ(10px) "),
+            0.5,
+        );
+        assert!((m.0[4] - 5.).abs() < 1e-4, "{m:?}");
     }
 
     #[test]

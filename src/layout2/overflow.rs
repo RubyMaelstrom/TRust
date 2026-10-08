@@ -275,7 +275,7 @@ impl ScrollAreas {
             && let FragKind::Line(line) = &f.kind
             && !line.sideways
         {
-            for piece in &line.pieces {
+            for piece in line.laid_pieces() {
                 if let Some(rect) = textarea_scrolling_area(dom, f, piece) {
                     merge_area(&mut self.nodes, piece.item.node, rect);
                 }

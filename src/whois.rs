@@ -316,6 +316,28 @@ pub fn command_target(arguments: &str) -> Result<OneShotUrl, String> {
     server_target(server, query).ok_or_else(|| "Invalid WHOIS query or server address.".to_string())
 }
 
+/// An RWhois referral (`rwhois://host[:port]/auth-area=…`, RFC 2167 §3.1.9
+/// and the ARIN `ReferralServer:` field) as a `whois://` server address.
+/// An RWhois server answers a query line sent on connection and, with its
+/// default `holdconnect` state off, closes the connection after that query
+/// (RFC 2167 §3.3.5), so the referral is followed with the same exchange as
+/// a WHOIS hop. The port defaults to RWhois's registered 4321.
+fn rwhois_server(server: &str) -> Option<String> {
+    let scheme = server.get(..9)?;
+    if !scheme.eq_ignore_ascii_case("rwhois://") {
+        return None;
+    }
+    let authority = server[9..].split('/').next().unwrap_or_default();
+    let has_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
+        !port.is_empty() && !host.ends_with(':') && !port.contains(']')
+    });
+    Some(if has_port {
+        format!("whois://{authority}")
+    } else {
+        format!("whois://{authority}:4321")
+    })
+}
+
 fn endpoint(target: &OneShotUrl) -> (String, u16) {
     (
         target.host.trim_end_matches('.').to_ascii_lowercase(),
@@ -348,6 +370,8 @@ fn referral(hop: &Hop) -> Result<Option<OneShotUrl>, String> {
         if server.is_empty() {
             continue;
         }
+        let rwhois = rwhois_server(server);
+        let server = rwhois.as_deref().unwrap_or(server);
         if server.contains("://") && !server.to_ascii_lowercase().starts_with("whois://") {
             return Err(
                 "Referral uses an unsupported protocol; its address remains in the reply.".into(),
@@ -1193,11 +1217,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.host, "first.test");
+        // RFC 2167 RWhois referrals are followed at their host and port
+        // (4321 by default) with the same query.
+        for (value, host, port) in [
+            (
+                "rwhois://rwhois.example.net:4321/auth-area=example",
+                "rwhois.example.net",
+                4321,
+            ),
+            (
+                "RWHOIS://rwhois.example.net:4322",
+                "rwhois.example.net",
+                4322,
+            ),
+            ("rwhois://rwhois.example.net/", "rwhois.example.net", 4321),
+            ("rwhois://[2001:db8::1]:4321/", "2001:db8::1", 4321),
+        ] {
+            let result = referral(&hop(format!("ReferralServer: {value}\n").as_bytes()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (&*result.host, result.port, &*result.query),
+                (host, port, "example.com"),
+                "{value}"
+            );
+        }
         for value in [
             "bad host.test",
             "host.test:99999",
             "whois://host.test/changed",
-            "rwhois://host.test:4321/",
+            "rwhois://host.test:99999/",
+            "ldap://host.test/",
         ] {
             assert!(
                 referral(&hop(format!("refer: {value}\n").as_bytes())).is_err(),

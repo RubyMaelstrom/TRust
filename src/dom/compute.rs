@@ -399,6 +399,10 @@ impl crate::layout2::StyleSource for Dom {
         Dom::computed_display(self, id)
     }
     #[inline]
+    fn effective_display(&self, id: NodeId) -> Option<String> {
+        Dom::effective_display(self, id)
+    }
+    #[inline]
     fn css_animation_definitions(&self, id: NodeId) -> Vec<CssAnimationDefinition> {
         Dom::css_animation_definitions(self, id)
     }
@@ -513,6 +517,10 @@ impl<B: StyleBackend + ?Sized> crate::layout2::StyleSource for ComputeView<'_, B
         ComputeView::computed_display(self, id)
     }
     #[inline]
+    fn effective_display(&self, id: NodeId) -> Option<String> {
+        ComputeView::effective_display(self, id)
+    }
+    #[inline]
     fn css_animation_definitions(&self, id: NodeId) -> Vec<CssAnimationDefinition> {
         ComputeView::css_animation_definitions(self, id)
     }
@@ -614,6 +622,10 @@ impl Dom {
     #[inline]
     pub(crate) fn legacy_line_clamp(&self, id: NodeId) -> Option<usize> {
         ComputeView(self).legacy_line_clamp(id)
+    }
+    #[inline]
+    pub(crate) fn legacy_box_vertical(&self, id: NodeId) -> bool {
+        ComputeView(self).legacy_box_vertical(id)
     }
     #[inline]
     pub fn establishes_anonymous_table(&self, id: NodeId) -> bool {

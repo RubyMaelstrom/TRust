@@ -66,6 +66,34 @@ pub(super) struct ElementState {
     /// page's `File` objects; the arena keeps the names for the control's
     /// rendering and its filename-mode value (#dom-input-value-filename).
     pub(super) selected_files: Vec<String>,
+    /// HTML #custom-validity-error-message is not the empty string
+    /// (`setCustomValidity()`; for a form-associated custom element, the
+    /// customError flag of `face_validity`).
+    pub(super) custom_error: bool,
+    /// The validity flags `ElementInternals.setValidity()` gave a
+    /// form-associated custom element (`validity::ValidityFlags` bits).
+    pub(super) face_validity: u16,
+    /// HTML #concept-fe-value: the value was last changed by a user edit (as
+    /// opposed to a script), which `maxlength`/`minlength` observe.
+    pub(super) user_edited: bool,
+    /// HTML #user-validity, which `:user-valid`/`:user-invalid` observe.
+    pub(super) user_validity: bool,
+    /// HTML #selector-open: the select's drop-down box, or the input's
+    /// picker, is open.
+    pub(super) picker_open: bool,
+    /// On a Document: whether its focused area indicates focus
+    /// (Selectors 4 #indicate-focus, which `:focus-visible` matches).
+    pub(super) focus_indicated: bool,
+    /// On the arena's root Document: the user last interacted through a
+    /// pointing device rather than a keyboard (the `:focus-visible`
+    /// heuristics' modality; keyboard until a pointer is used).
+    pub(super) pointer_modality: bool,
+    /// HTML #selector-active: the element is being activated, or is a flat
+    /// tree ancestor of one, or a label's labeled control.
+    pub(super) active: bool,
+    /// A media element's muted IDL attribute once script set it
+    /// (HTML #dom-media-muted); `None` keeps the `muted` content attribute's.
+    pub(super) muted: Option<bool>,
 }
 
 /// The selector-dependency names under which custom element state changes
@@ -73,6 +101,17 @@ pub(super) struct ElementState {
 /// name (DOM #valid-attribute-local-name), so they cannot collide.
 pub(super) const DEFINED_DEPENDENCY: &str = "\0defined";
 pub(super) const CUSTOM_STATE_DEPENDENCY: &str = "\0state";
+/// The dependency name under which constraint validation state that is not
+/// an attribute (custom validity, user validity, user edits) invalidates the
+/// validity pseudo-classes. A file selection change is a value change
+/// (`Dom::set_input_files` touches the input value).
+pub(super) const VALIDITY_DEPENDENCY: &str = "\0validity";
+/// The dependency name of a select's drop-down box or an input's picker
+/// opening or closing (`:open`).
+pub(super) const OPEN_DEPENDENCY: &str = "\0open";
+/// The dependency names of `:active` and of a media element's muted state.
+pub(super) const ACTIVE_DEPENDENCY: &str = "\0active";
+pub(super) const MUTED_DEPENDENCY: &str = "\0muted";
 
 impl ElementState {
     fn is_default(&self) -> bool {
@@ -88,6 +127,15 @@ impl ElementState {
             && self.is_value.is_none()
             && !self.design_mode
             && self.selected_files.is_empty()
+            && !self.custom_error
+            && self.face_validity == 0
+            && !self.user_edited
+            && !self.user_validity
+            && !self.picker_open
+            && !self.focus_indicated
+            && !self.pointer_modality
+            && !self.active
+            && self.muted.is_none()
     }
     pub(super) fn retained_bytes(&self) -> usize {
         self.raw_value.as_ref().map_or(0, String::capacity)
@@ -146,7 +194,11 @@ pub(crate) fn is_valid_custom_element_name(name: &str) -> bool {
 }
 
 impl Dom {
-    fn update_control_state(&mut self, id: NodeId, update: impl FnOnce(&mut ElementState)) {
+    pub(super) fn update_control_state(
+        &mut self,
+        id: NodeId,
+        update: impl FnOnce(&mut ElementState),
+    ) {
         let mut state = self.element_states.remove(&id).unwrap_or_default();
         update(&mut state);
         if !state.is_default() {
@@ -486,6 +538,26 @@ impl Dom {
             out.push_str(" data-trust-states=\"");
             out.push_str(&super::escape_attr(&states));
             out.push('"');
+        }
+        // Constraint validation state that is not an attribute (see
+        // `ElementState`), for the validity and `:open` pseudo-classes.
+        if state.custom_error {
+            out.push_str(" data-trust-custom-error=\"\"");
+        }
+        if state.face_validity != 0 {
+            out.push_str(&format!(
+                " data-trust-face-validity=\"{}\"",
+                state.face_validity
+            ));
+        }
+        if state.user_edited {
+            out.push_str(" data-trust-user-edited=\"\"");
+        }
+        if state.user_validity {
+            out.push_str(" data-trust-user-validity=\"\"");
+        }
+        if state.picker_open {
+            out.push_str(" data-trust-open=\"\"");
         }
     }
     pub fn control_selection(&self, id: NodeId) -> Option<crate::doc::ControlSelection> {
@@ -1121,9 +1193,33 @@ impl<'a> StyleView<'a> {
     }
     fn sanitize_input_value(&self, id: NodeId, value: &str) -> String {
         if let Some(config) = self.numeric_input(id) {
-            config.sanitize(value)
-        } else {
-            value.replace(['\r', '\n'], "")
+            return config.sanitize(value);
+        }
+        let value = value.replace(['\r', '\n'], "");
+        let strip = |value: &str| {
+            value
+                .trim_matches(['\t', '\n', '\x0c', '\r', ' '])
+                .to_owned()
+        };
+        match self.input_type(id).as_str() {
+            // HTML #url-state-(type=url) and #email-state-(type=email): strip
+            // newlines, then leading and trailing ASCII whitespace.
+            "url" => strip(&value),
+            // With `multiple`: split on commas, strip each token, and join
+            // the values with commas.
+            "email" if self.attr(id, "multiple").is_some() => {
+                if value.is_empty() {
+                    return value;
+                }
+                let mut tokens: Vec<String> = value.split(',').map(strip).collect();
+                // Infra's "split on commas" adds no token after a final comma.
+                if value.ends_with(',') {
+                    tokens.pop();
+                }
+                tokens.join(",")
+            }
+            "email" => strip(&value),
+            _ => value,
         }
     }
     pub(super) fn input_value(&self, id: NodeId) -> String {

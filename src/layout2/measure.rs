@@ -319,7 +319,7 @@ fn walk(dom: &Dom, f: &Frag, o: &mut Own, parent: Affine2d, visual: bool) {
         }
     }
     if let FragKind::Line(line) = &f.kind {
-        for p in &line.pieces {
+        for p in line.laid_pieces() {
             if p.item.node == NO_NODE {
                 continue;
             }
@@ -364,7 +364,7 @@ fn inline_box_fragments(f: &Frag, line: &LineFrag) -> Vec<(NodeId, Rect)> {
     // CSS 2 §10.8: an empty inline box has a fragment too. A relatively
     // positioned box is measured at its offset (CSS 2 §9.4.3).
     super::inline::line_box_fragments(
-        line.pieces.iter().chain(&line.atom_boxes),
+        line.laid_pieces().iter().chain(line.laid_atom_boxes()),
         &line.empty_boxes,
         |entry| entry.key.1.is_none(),
     )
@@ -620,7 +620,7 @@ pub(super) fn client_metrics(
             // atomic inline replaced element or control reports its padding
             // box and border widths like a block.
             if let FragKind::Line(line) = &frag.kind {
-                for piece in &line.pieces {
+                for piece in line.laid_pieces() {
                     let Some(replaced) = piece.replaced_box else {
                         continue;
                     };

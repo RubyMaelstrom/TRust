@@ -4749,8 +4749,23 @@ mod desktop {
         edit_key: Option<Option<String>>,
     ) -> bool {
         prepare_interaction(page, interrupt);
+        // Selectors 4 #the-focus-visible-pseudo: keyboard interaction
+        // indicates the current focus.
+        page.dom.borrow_mut().set_input_modality(true);
         let key = key_name(&input.key);
         let released = input.state == crate::core::KeyState::Released;
+        // HTML #selector-active: pressing Space on an element with activation
+        // behavior holds it in a formal activation state until the key is
+        // released.
+        if key == " " && !input.repeat {
+            let mut dom = page.dom.borrow_mut();
+            let target = node.or_else(|| dom.focused_area(crate::dom::DOCUMENT));
+            if released {
+                dom.set_active_element(None);
+            } else if let Some(target) = target.filter(|&target| dom.has_key_activation(target)) {
+                dom.set_active_element(Some(target));
+            }
+        }
         let mut prevented = call_trust(
             page,
             "key",
@@ -5061,6 +5076,16 @@ mod desktop {
                 metadata,
             } => {
                 prepare_interaction(page, interrupt);
+                // Selectors 4 #the-focus-visible-pseudo: pointer interaction;
+                // HTML #selector-active: the element actively pointed at.
+                if button == 0 {
+                    let mut dom = page.dom.borrow_mut();
+                    if pressed {
+                        dom.set_input_modality(false);
+                    }
+                    let target = node.filter(|&node| pressed && dom.is_valid(node));
+                    dom.set_active_element(target);
+                }
                 let _ = call_trust(
                     page,
                     "pointerButton",
@@ -5079,8 +5104,11 @@ mod desktop {
                 checkpoint(page, "pointer button");
                 finish_task_with_ack(page, events, false)
             }
-            PageCmd::Focus(node) => {
+            PageCmd::Focus(node) | PageCmd::KeyboardFocus(node) => {
                 prepare_interaction(page, interrupt);
+                if matches!(command, PageCmd::KeyboardFocus(_)) {
+                    page.dom.borrow_mut().set_input_modality(true);
+                }
                 let _ = call_trust(
                     page,
                     "focusPage",
@@ -5292,6 +5320,14 @@ mod desktop {
                 );
                 checkpoint(page, "hover");
                 finish_task(page, events)
+            }
+            PageCmd::PickerOpen { node, open } => {
+                prepare_interaction(page, interrupt);
+                if page.dom.borrow().is_valid(node) {
+                    page.dom.borrow_mut().set_picker_open(node, open);
+                    page.render_pending = true;
+                }
+                finish_internal_task(page, events)
             }
             PageCmd::RegionGeom { items } => {
                 let mut dom = page.dom.borrow_mut();
@@ -15531,11 +15567,16 @@ fn dispatch_websocket_task(
         Value::Bool(false),
         Value::Bool(false),
         Value::from_string(String::new()),
+        Value::from_string(String::new()),
     ];
     match event {
-        crate::ws::WsIn::Open { protocol } => {
+        crate::ws::WsIn::Open {
+            protocol,
+            extensions,
+        } => {
             args[1] = Value::from_string(String::from("open"));
             args[8] = Value::from_string(protocol);
+            args[9] = Value::from_string(extensions);
         }
         crate::ws::WsIn::Text(message) => {
             args[1] = Value::from_string(String::from("message"));
@@ -16887,6 +16928,74 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
             None => Value::Null,
         });
     }
+    // HTML #constraints: constraint validation state and the validity
+    // states (`dom::validity`), shared with the validity pseudo-classes, and
+    // HTML #selector-open's picker state.
+    if matches!(
+        op.as_str(),
+        "constraint-validity"
+            | "will-validate"
+            | "custom-validity"
+            | "face-validity"
+            | "user-edited"
+            | "user-validity"
+            | "form-user-validity"
+            | "picker-open"
+            | "focus-visible"
+            | "focus-visible-get"
+            | "media-muted"
+    ) {
+        let Some(id) = host_arg_node(&dom, args, 0).filter(|id| dom.tag_name(*id).is_some()) else {
+            return Ok(Value::Null);
+        };
+        let on = matches!(arg, Value::Bool(true));
+        return Ok(match op.as_str() {
+            "constraint-validity" => Value::Num(f64::from(dom.validity_flags(id))),
+            "will-validate" => Value::Bool(dom.will_validate(id)),
+            "custom-validity" => {
+                dom.set_custom_validity_error(id, on);
+                Value::Undefined
+            }
+            "face-validity" => {
+                let bits = arg.as_num_opt().unwrap_or(0.0);
+                dom.set_face_validity(id, if bits.is_finite() { bits as u16 } else { 0 });
+                Value::Undefined
+            }
+            "user-edited" => {
+                dom.set_user_edited(id, on);
+                Value::Undefined
+            }
+            "user-validity" => {
+                dom.set_user_validity(id, on);
+                Value::Undefined
+            }
+            "form-user-validity" => {
+                dom.set_form_user_validity(id);
+                Value::Undefined
+            }
+            "media-muted" => {
+                dom.set_media_muted(id, on);
+                Value::Undefined
+            }
+            // Selectors 4 #indicate-focus for the element's Document, when
+            // it is that Document's focused area.
+            "focus-visible-get" => {
+                let document = dom.node(id).owner_document;
+                Value::Bool(dom.focused_area(document) == Some(id) && dom.focus_indicated(document))
+            }
+            "focus-visible" => {
+                let document = dom.node(id).owner_document;
+                if dom.focused_area(document) == Some(id) {
+                    dom.set_focus_indicated(document, on);
+                }
+                Value::Undefined
+            }
+            _ => {
+                dom.set_picker_open(id, on);
+                Value::Undefined
+            }
+        });
+    }
     // HTML #custom-element-state and #customstateset: what `:defined` and
     // `:state()` match for an element.
     if op == "custom-defined"
@@ -17080,28 +17189,6 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
                 Ok(changed) => Value::Bool(changed),
                 Err(()) => Value::Null,
             }
-        }
-        "validity" => {
-            let (mut under, mut over, mut mismatch) = (false, false, false);
-            if let Some(c) = dom.numeric_input(id)
-                && let Some(n) = c.kind.parse(&dom.input_value(id))
-            {
-                under = c.min.is_some_and(|min| n < min);
-                over = c.max.is_some_and(|max| n > max);
-                if c.kind == crate::input::NumericType::Time
-                    && c.min.zip(c.max).is_some_and(|(a, b)| a > b)
-                {
-                    under = under && over;
-                    over = under;
-                }
-                mismatch = c.mismatch(n);
-            }
-            ctx.make_array(vec![
-                Value::Bool(under),
-                Value::Bool(over),
-                Value::Bool(mismatch),
-                Value::Bool(dom.input_bad_input(id)),
-            ])
         }
         _ => Value::Undefined,
     })
@@ -22546,6 +22633,86 @@ mod tests {
             "true|true|true|true|true|true|false|true|true|true|false|a,b,c,d,s,textarea|true|custom|false|a|\
              true|[object ValidityState]|true|0|1|false|false|true|function"
         );
+    }
+
+    #[test]
+    fn validity_pseudo_classes_share_the_constraint_validation_state() {
+        // HTML #selector-valid, #selector-invalid, #selector-user-valid and
+        // #selector-user-invalid observe the same validity states as the
+        // constraint validation API: custom errors, user edits for
+        // maxlength, user validity from commits, select update
+        // notifications, reset and submission, and ElementInternals.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><html><body></body></html>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://example.test/",
+        );
+        eval(&mut engine, r#"
+            const check = (v,m) => { if (!v) throw Error(m); };
+            const form = document.createElement('form'); document.body.appendChild(form);
+            form.innerHTML = '<input name=a required><input name=b maxlength=3 value="abcdef">' +
+                '<select name=s required><option value="">-</option><option>x</option></select>';
+            const [a, b] = form.querySelectorAll('input'), s = form.querySelector('select');
+            check(a.matches(':invalid') && !a.matches(':user-invalid') && form.matches(':invalid'), 'initial');
+            check(b.matches(':valid') && form.querySelectorAll(':invalid').length === 2, 'default value is no user edit');
+            a.setCustomValidity('nope'); a.value = 'x';
+            check(a.matches(':invalid') && a.validity.customError, 'custom error');
+            a.setCustomValidity(''); check(a.matches(':valid') && a.validity.valid, 'custom error cleared');
+            __trust.formSet(b.__id, 'abcdefg', null);
+            check(b.validity.tooLong && b.matches(':invalid'), 'user edit too long');
+            b.value = 'abcdefgh'; check(!b.validity.tooLong && b.matches(':valid'), 'script edit');
+            __trust.formCommit(a.__id, '', null);
+            check(a.matches(':user-invalid') && a.validity.valueMissing, 'commit sets user validity');
+            __trust.formSet(s.__id, 'x', null); check(s.matches(':user-valid'), 'select update notifications');
+            form.reset(); check(!a.matches(':user-invalid') && !s.matches(':user-valid'), 'reset');
+            form.requestSubmit();
+            check(a.matches(':user-invalid') && s.matches(':user-invalid'), 'submission sets user validity');
+            class Field extends HTMLElement {
+                static formAssociated = true;
+                constructor() { super(); this.internals = this.attachInternals(); }
+            }
+            customElements.define('x-field', Field);
+            const field = document.createElement('x-field'); form.appendChild(field);
+            a.value = 'x'; s.selectedIndex = 1;
+            check(field.matches(':valid') && form.matches(':valid'), 'form-associated custom element');
+            field.internals.setValidity({valueMissing: true}, 'need');
+            check(field.matches(':invalid') && form.matches(':invalid'), 'setValidity');
+            field.internals.setValidity({}); check(field.matches(':valid'), 'validity cleared');
+            form.insertAdjacentHTML('beforeend', '<input name=p pattern="[0-9]+" value="12a">');
+            const p = form.querySelector('[name=p]');
+            check(p.matches(':invalid') && p.validity.patternMismatch, 'pattern');
+            p.setAttribute('pattern', 'a)|(b'); check(p.matches(':valid'), 'a pattern invalid on its own is ignored');
+        "#, "validity pseudo-classes").unwrap();
+    }
+
+    #[test]
+    fn focus_options_focus_visible_indicates_focus() {
+        // HTML #dom-focus step 3 and Selectors 4 #the-focus-visible-pseudo.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<!doctype html><html><body><button id=a>a</button><button id=b>b</button></body></html>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://example.test/",
+        );
+        eval(&mut engine, r#"
+            const check = (v,m) => { if (!v) throw Error(m); };
+            const a = document.getElementById('a'), b = document.getElementById('b');
+            a.focus({focusVisible: false});
+            check(a.matches(':focus') && !a.matches(':focus-visible'), 'focusVisible false');
+            b.focus();
+            check(b.matches(':focus') && !b.matches(':focus-visible'), 'script focus keeps the indication');
+            a.focus({focusVisible: true});
+            check(a.matches(':focus-visible') && !b.matches(':focus-visible'), 'focusVisible true');
+            b.focus(); check(b.matches(':focus-visible'), 'carried over');
+            check(document.querySelector(':focus-visible') === b, 'query');
+        "#, "focus-visible").unwrap();
     }
 
     #[test]

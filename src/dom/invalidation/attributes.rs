@@ -40,6 +40,9 @@ enum Axis {
     HostScope,
     /// From a slot to the elements assigned to it after flattening.
     Assigned,
+    /// From an element whose validity inputs changed to the elements whose
+    /// validity pseudo-classes can change (`Dom::validity_subjects`).
+    Validity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -127,6 +130,29 @@ impl Step {
     }
 }
 
+/// The attributes (and validity state) that HTML #constraints reads from a
+/// control, its options or its barring ancestors.
+const VALIDITY_INPUTS: [&str; 18] = [
+    "value",
+    "type",
+    "required",
+    "min",
+    "max",
+    "step",
+    "pattern",
+    "maxlength",
+    "minlength",
+    "multiple",
+    "size",
+    "disabled",
+    "readonly",
+    "checked",
+    "selected",
+    "command",
+    "commandfor",
+    super::super::input::VALIDITY_DEPENDENCY,
+];
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Route {
     source_tag: Option<String>,
@@ -163,6 +189,9 @@ pub(super) struct Dependencies {
     routes: usize,
     steps: usize,
     direction: bool,
+    /// A validity pseudo-class or `:default` occurs: changes that move a
+    /// control between form owners or radio groups take the fallback.
+    form_state: bool,
 }
 
 /// Where a dependency path starts: an attribute (or class token) name, or a
@@ -350,11 +379,13 @@ impl Dependencies {
                 // The focus update steps name every element whose state
                 // changes, its flat-tree ancestors included for
                 // :focus-within (`Dom::set_focused_area`).
-                StatePseudo::Focus | StatePseudo::FocusWithin => {
-                    let state = if matches!(state, StatePseudo::Focus) {
-                        LiveState::Focus
-                    } else {
+                // :focus-visible changes with focus, and with indication
+                // changes that name the focused element under Focus.
+                StatePseudo::Focus | StatePseudo::FocusWithin | StatePseudo::FocusVisible => {
+                    let state = if matches!(state, StatePseudo::FocusWithin) {
                         LiveState::FocusWithin
+                    } else {
+                        LiveState::Focus
                     };
                     self.add_source(Source::State(state), tag, path, broad);
                     continue;
@@ -409,6 +440,70 @@ impl Dependencies {
                     self.add("dir", false, &None, &[], true);
                     continue;
                 }
+                // HTML #constraints: a control's validity reads its own
+                // attributes, value, checkedness and validity state, its
+                // radio group, option list, barring ancestors (a disabled
+                // fieldset, handled by the Validity axis) and datalist
+                // ancestors (structural); forms and fieldsets read their
+                // controls. The Validity axis names every element whose
+                // match can change; ownership changes take the fallback in
+                // `subjects`.
+                StatePseudo::Valid
+                | StatePseudo::Invalid
+                | StatePseudo::UserValid
+                | StatePseudo::UserInvalid
+                | StatePseudo::InRange
+                | StatePseudo::OutOfRange => {
+                    self.form_state = true;
+                    let mut validity_path = path.to_vec();
+                    if let Some(first) = validity_path.first_mut() {
+                        first.axis = Axis::Validity;
+                    }
+                    for name in VALIDITY_INPUTS {
+                        self.add(name, false, &None, &validity_path, broad);
+                    }
+                    continue;
+                }
+                // HTML #selector-default: the element's own `checked` or
+                // `selected` attribute, or its being the first submit button
+                // its form owner has (button types and ownership take the
+                // fallback; tree order is structural).
+                StatePseudo::Default => {
+                    self.form_state = true;
+                    for name in [
+                        "checked",
+                        "selected",
+                        "type",
+                        "form",
+                        "command",
+                        "commandfor",
+                    ] {
+                        self.add(name, false, &None, &[], true);
+                    }
+                    continue;
+                }
+                // HTML #selector-open: the open attribute, the picker state,
+                // and whether a select is a drop-down box or an input type
+                // supports a picker.
+                StatePseudo::Open => (
+                    &[
+                        "open",
+                        super::super::input::OPEN_DEPENDENCY,
+                        "type",
+                        "multiple",
+                        "size",
+                    ],
+                    false,
+                ),
+                // HTML #selector-heading: the heading level adds the
+                // `headingoffset` of every inclusive ancestor up to one with
+                // `headingreset`.
+                StatePseudo::Heading(None) => (&[], false),
+                // HTML #selector-active: `set_active_element` names every
+                // element whose state flips.
+                StatePseudo::Active => (&[super::super::input::ACTIVE_DEPENDENCY], false),
+                StatePseudo::Media(_) => (&[super::super::input::MUTED_DEPENDENCY, "muted"], false),
+                StatePseudo::Heading(Some(_)) => (&["headingoffset", "headingreset"], true),
             };
             for name in names {
                 if inherited {
@@ -436,6 +531,13 @@ impl Dependencies {
             || (self.direction
                 && ((name == "value" && dom.text_may_change_direction(node))
                     || (name == "type" && dom.tag_name(node) == Some("input"))))
+            // HTML #reset-the-form-owner and #radio-button-group: the old
+            // owner or group no longer reaches the changed control.
+            || (self.form_state
+                && (name == "form"
+                    || (name == "id" && dom.tag_name(node) == Some("form"))
+                    || (matches!(name.as_str(), "name" | "type")
+                        && dom.tag_name(node) == Some("input"))))
         {
             return None;
         }
@@ -573,6 +675,11 @@ impl Dependencies {
                                 for id in dom.flat_slot_nodes(node) {
                                     visit(id)?;
                                 }
+                            }
+                        }
+                        Axis::Validity => {
+                            for id in dom.validity_subjects(node) {
+                                visit(id)?;
                             }
                         }
                         Axis::Parent => {

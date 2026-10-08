@@ -20,6 +20,9 @@ pub enum Command {
     LineModeRequest {
         edit: bool,
     },
+    /// The user's terminal character set changed. With the RFC 2066 CHARSET
+    /// option in effect, the transport tells the server.
+    Charset(crate::terminal::Encoding),
     Close,
 }
 
@@ -44,6 +47,8 @@ pub enum Event {
     Slc {
         disabled: u32,
     },
+    /// RFC 2066 CHARSET: both sides now encode text in this character set.
+    Charset(crate::terminal::Encoding),
     Closed(Option<String>),
 }
 
@@ -94,7 +99,13 @@ mod tests {
             assert_eq!(buf, [255, 253, 1]); // IAC DO ECHO came back through TLS
         });
 
-        let (handle, mut events) = connect("localhost".into(), port, (80, 24), true);
+        let (handle, mut events) = connect(
+            "localhost".into(),
+            port,
+            (80, 24),
+            true,
+            crate::terminal::Encoding::Utf8,
+        );
         let event = events.recv().await.unwrap();
         assert!(
             matches!(event, Event::Connected { tls: true, .. }),
@@ -121,7 +132,13 @@ mod tests {
             let _ = acceptor.accept(sock).await; // handshake will fail
         });
 
-        let (_handle, mut events) = connect("localhost".into(), port, (80, 24), true);
+        let (_handle, mut events) = connect(
+            "localhost".into(),
+            port,
+            (80, 24),
+            true,
+            crate::terminal::Encoding::Utf8,
+        );
         loop {
             match events.recv().await.unwrap() {
                 Event::Closed(Some(err)) => {
@@ -158,7 +175,13 @@ mod tests {
             wire
         });
 
-        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            crate::terminal::Encoding::Utf8,
+        );
 
         let event = events.recv().await.unwrap();
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
@@ -214,7 +237,13 @@ mod tests {
             assert_eq!(reply, *b"\xff\xfa\x18\x00VT100\xff\xf0");
         });
 
-        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            crate::terminal::Encoding::Utf8,
+        );
         let event = events.recv().await.unwrap();
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
 
@@ -238,7 +267,13 @@ mod tests {
             assert_eq!(buf, [255, 254, 1]); // IAC DONT ECHO
         });
 
-        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            crate::terminal::Encoding::Utf8,
+        );
 
         let event = events.recv().await.unwrap();
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
@@ -288,7 +323,13 @@ mod tests {
             assert_eq!(reply, *b"\xff\xfa\x20\x0038400,38400\xff\xf0");
         });
 
-        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            crate::terminal::Encoding::Utf8,
+        );
         let event = events.recv().await.unwrap();
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
 
@@ -316,7 +357,13 @@ mod tests {
             assert_eq!(reply, [255, 250, 39, 0, 255, 240]);
         });
 
-        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            crate::terminal::Encoding::Utf8,
+        );
         let event = events.recv().await.unwrap();
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
 
@@ -347,7 +394,13 @@ mod tests {
             assert_eq!(reply, [255, 250, 5, 0, 253, 1, 251, 5, 255, 240]);
         });
 
-        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            crate::terminal::Encoding::Utf8,
+        );
         let event = events.recv().await.unwrap();
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
 
@@ -367,7 +420,13 @@ mod tests {
             assert_eq!(buf, [255, 243]); // IAC BRK
         });
 
-        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let (handle, mut events) = connect(
+            "127.0.0.1".into(),
+            port,
+            (80, 24),
+            false,
+            crate::terminal::Encoding::Utf8,
+        );
         let event = events.recv().await.unwrap();
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
 

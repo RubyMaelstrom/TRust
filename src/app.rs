@@ -317,6 +317,7 @@ struct CompositeInput {
     off_cells: (u16, u16),
     crop: bool,
     pixelated: bool,
+    clip: Option<crate::layout2::ImageClip>,
 }
 
 /// One page image finished the parallel fetch+decode pipeline.
@@ -663,6 +664,9 @@ pub struct App {
     /// quantized to ints, so a geometry command is sent only when the box changed
     /// (rarely — it's viewport-tied). Cleared with the live page. (Phase 3.)
     region_geom_sent: std::collections::HashMap<usize, (i64, i64)>,
+    /// The live select whose drop-down box the page was last told is open
+    /// (`PageCmd::PickerOpen`, for `:open`).
+    picker_open_sent: Option<usize>,
     /// Per-region `scrollTop` (rows) last written BACK to the live page on a
     /// wheel/page scroll (`PageCmd::SetScroll`), keyed by the actor node id — so
     /// the same offset isn't re-sent and the page's `scroll` handler fires only
@@ -1003,6 +1007,7 @@ impl App {
             hover_want: None,
             scroll_intent: 0,
             region_geom_sent: std::collections::HashMap::new(),
+            picker_open_sent: None,
             live_boundaries_sent: std::collections::HashSet::new(),
             region_scroll_sent: std::collections::HashMap::new(),
             region_live: std::collections::HashMap::new(),
@@ -1478,6 +1483,8 @@ impl App {
             // so its `scrollHeight`/`clientHeight` getters read TRUE values (the
             // conditional chat-pin reads them). Diffed — a no-op when unchanged.
             self.sync_region_state();
+            // HTML #selector-open: the select whose drop-down box is shown.
+            self.sync_picker_state();
             // Tell the actor which scroll boxes are CURRENTLY clipped regions, so
             // it patches a mutation only when confined to one (and a non-region
             // scroll box takes the full path, never a failed patch). Diffed.
@@ -4614,6 +4621,7 @@ impl App {
                 off_cells: (l.dcol, l.drow),
                 crop: l.crop,
                 pixelated: l.pixelated,
+                clip: l.clip,
             });
         }
         let picker = self.picker.clone();
@@ -4632,6 +4640,7 @@ impl App {
                         off_cells: i.off_cells,
                         crop: i.crop,
                         pixelated: i.pixelated,
+                        clip: i.clip,
                     })
                     .collect();
                 let protocol = crate::img::encode_composite(
@@ -5496,6 +5505,7 @@ impl App {
         self.pressed_js_link = None;
         self.hover_want = None;
         self.region_geom_sent.clear();
+        self.picker_open_sent = None;
         self.region_scroll_sent.clear();
         self.region_live.clear();
         self.pending_decoded_urls.clear();
@@ -6047,6 +6057,40 @@ impl App {
             for (node, key) in keys {
                 self.region_geom_sent.insert(node, key);
             }
+        }
+    }
+
+    /// HTML #selector-open: tell the page actor which select's drop-down box
+    /// (`select_menu`) is shown, so `:open` matches it while it is. Diffed.
+    fn sync_picker_state(&mut self) {
+        let Some(handle) = self.live_page.as_ref() else {
+            self.picker_open_sent = None;
+            return;
+        };
+        let open = self.select_menu.as_ref().and_then(|menu| {
+            self.browser
+                .as_ref()?
+                .doc
+                .forms
+                .get(menu.form)?
+                .fields
+                .get(menu.field)?
+                .live_node
+        });
+        if open == self.picker_open_sent {
+            return;
+        }
+        let mut sent = true;
+        for (node, open) in [(self.picker_open_sent, false), (open, true)] {
+            if let Some(node) = node {
+                sent &= handle
+                    .cmds
+                    .try_send(crate::js::PageCmd::PickerOpen { node, open })
+                    .is_ok();
+            }
+        }
+        if sent {
+            self.picker_open_sent = open;
         }
     }
 
@@ -9991,7 +10035,7 @@ impl App {
         self.sweep_image_caches();
         self.reset_screen();
         let size = crate::terminal::bounded_size(self.last_inner.0, self.last_inner.1);
-        let (handle, events) = telnet::connect(host.clone(), port, size, use_tls);
+        let (handle, events) = telnet::connect(host.clone(), port, size, use_tls, self.encoding);
         self.conn = Some(handle);
         self.events = Some(events);
         self.connected = false;
@@ -10029,6 +10073,16 @@ impl App {
                 if self.take_bell() {
                     ring_terminal_bell();
                 }
+            }
+            telnet::Event::Charset(encoding) => {
+                self.encoding = encoding;
+                self.status = format!(
+                    "Server negotiated the {} character set",
+                    match encoding {
+                        Encoding::Utf8 => "UTF-8",
+                        Encoding::Cp437 => "CP437",
+                    }
+                );
             }
             telnet::Event::Negotiation { .. }
             | telnet::Event::LineMode { .. }
@@ -12523,6 +12577,57 @@ mod tests {
                 assert_eq!(top, 3.0 * cell_h, "scrollTop in px = voffset × cell height");
             }
             other => panic!("expected SetScroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_picker_state_reports_the_open_drop_down_box() {
+        // HTML #selector-open: the page actor learns which select's
+        // drop-down box the terminal shows, once per change.
+        let mut app = super::App::new(None, 23);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            b"<html><body><form><select name=s data-trust-node='42'><option>a</option>\
+              <option>b</option></select></form></body></html>",
+            80,
+            10,
+            &Default::default(),
+        ));
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.forms[0].fields[0].live_node,
+            Some(42)
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        app.select_menu = Some(super::SelectMenu {
+            form: 0,
+            field: 0,
+            options: vec![(String::from("a"), String::from("a"))],
+            highlight: 0,
+            scroll: 0,
+            anchor_row: 0,
+            anchor_col: 0,
+        });
+        app.sync_picker_state();
+        match rx.try_recv() {
+            Ok(crate::js::PageCmd::PickerOpen {
+                node: 42,
+                open: true,
+            }) => {}
+            other => panic!("expected the drop-down box to open, got {other:?}"),
+        }
+        app.sync_picker_state();
+        assert!(rx.try_recv().is_err(), "unchanged state is not re-sent");
+        app.select_menu = None;
+        app.sync_picker_state();
+        match rx.try_recv() {
+            Ok(crate::js::PageCmd::PickerOpen {
+                node: 42,
+                open: false,
+            }) => {}
+            other => panic!("expected the drop-down box to close, got {other:?}"),
         }
     }
 

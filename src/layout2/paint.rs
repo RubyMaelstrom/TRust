@@ -796,7 +796,16 @@ fn project_terminal(
         && !matrix.is_identity()
     {
         let line = std::sync::Arc::make_mut(line);
-        for piece in line.pieces.iter_mut().chain(&mut line.atom_boxes) {
+        let laid = line
+            .laid
+            .iter_mut()
+            .flat_map(|laid| laid.pieces.iter_mut().chain(&mut laid.atom_boxes));
+        for piece in line
+            .pieces
+            .iter_mut()
+            .chain(&mut line.atom_boxes)
+            .chain(laid)
+        {
             let rect_piece = super::transform::bounds(
                 matrix,
                 CssRect::new(
@@ -2661,13 +2670,24 @@ fn inflow_content(
                 } else {
                     (terminal_piece_text(p).to_owned(), 0.0)
                 };
-                let mut item_x = c.x + p.x + p.paint_x + text_x_offset;
-                let canonical_paint_right = c.x + p.x + p.paint_x + p.paint_width;
+                // css-images-3 #the-object-fit: an object extending past
+                // its content box shows only the part inside it.
+                let object = object_crop(p, cw, ch);
+                if object.as_ref().is_some_and(|(_, clip)| clip.is_none()) {
+                    continue;
+                }
+                let [paint_x, paint_y, paint_w, paint_h] = object
+                    .as_ref()
+                    .map_or([p.paint_x, p.paint_y, p.paint_width, p.paint_height], |o| {
+                        o.0
+                    });
+                let mut item_x = c.x + p.x + paint_x + text_x_offset;
+                let canonical_paint_right = c.x + p.x + paint_x + paint_w;
                 let bounds = clipped_paint_bounds(
                     item_x,
-                    c.y + p.y + p.paint_y,
+                    c.y + p.y + paint_y,
                     canonical_paint_right,
-                    c.y + p.y + p.paint_y + p.paint_height,
+                    c.y + p.y + paint_y + paint_h,
                     c.clip,
                 );
                 // A terminal row has no typographic baseline. Anchor adapted
@@ -2675,7 +2695,7 @@ fn inflow_content(
                 // not to the glyph/image baseline offset: a short inline image
                 // and the following line may otherwise round onto the same row
                 // and overwrite each other in the cell compositor.
-                let item_y = c.y + p.paint_y;
+                let item_y = c.y + paint_y;
                 let mut item = Item {
                     col: 0,
                     width: 0,
@@ -2698,6 +2718,13 @@ fn inflow_content(
                     item.link = Some(link);
                 }
                 quantize_item(&mut item, p, cw, ch);
+                if let Some((_, Some(clip))) = object {
+                    // The visible part of the object, cropped from the
+                    // object fitted to its own cell box.
+                    item.width = clip.width;
+                    item.height = clip.height;
+                    item.image_clip = Some(clip);
+                }
                 if p.space_before
                     && text_x_offset <= 0.01
                     && item.image.is_none()
@@ -2736,7 +2763,7 @@ fn inflow_content(
                 } else {
                     (p.y / ch).round() as i64
                 };
-                let mut row = placement.row + baseline_offset + (p.paint_y / ch).round() as i64;
+                let mut row = placement.row + baseline_offset + (paint_y / ch).round() as i64;
                 let mut preferred_col = ((item_x - ox) / cw).round() as i64;
                 if text_x_offset <= 0.01
                     && abuts_previous_text(&line.pieces, index)
@@ -2872,6 +2899,47 @@ fn inflow_content(
         }
         inflow_content(dom, c, ops, cw, ch, ox, oy, links, line_rows);
     }
+}
+
+/// css-images-3 #the-object-fit: the part of an image object that extends
+/// past its content box (`cover`, `none`, or an offset `object-position`)
+/// lying inside the box, as a paint rect relative to the piece box, with
+/// that part as a crop of the object fitted to its own cell box. `None` for
+/// an object inside its box; `Some((_, None))` when nothing is visible.
+fn object_crop(
+    piece: &super::inline::Piece,
+    cw: f32,
+    ch: f32,
+) -> Option<([f32; 4], Option<ImageClip>)> {
+    if !piece.item.crop || piece.item.image.is_none() {
+        return None;
+    }
+    let x0 = piece.paint_x.max(0.0);
+    let y0 = piece.paint_y.max(0.0);
+    let x1 = (piece.paint_x + piece.paint_width).min(piece.box_width);
+    let y1 = (piece.paint_y + piece.paint_height).min(piece.box_height);
+    let visible = [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)];
+    let cells = |length: f32, cell: f32| (length / cell).round().clamp(0.0, f32::from(u16::MAX));
+    let source_width = cells(piece.paint_width, cw).max(1.0);
+    let source_height = cells(piece.paint_height, ch).max(1.0);
+    let col = cells(x0 - piece.paint_x, cw).min(source_width - 1.0);
+    let row = cells(y0 - piece.paint_y, ch).min(source_height - 1.0);
+    let width = cells(x1 - piece.paint_x, cw).min(source_width) - col;
+    let height = cells(y1 - piece.paint_y, ch).min(source_height) - row;
+    if visible[2] <= 0.0 || visible[3] <= 0.0 || width < 1.0 || height < 1.0 {
+        return Some((visible, None));
+    }
+    Some((
+        visible,
+        Some(ImageClip {
+            source_width: source_width as u16,
+            source_height: source_height as u16,
+            col: col as u16,
+            row: row as u16,
+            width: width as u16,
+            height: height as u16,
+        }),
+    ))
 }
 
 /// The one canonical CSS-pixel → terminal-cell adaptation for inline items.
@@ -3153,6 +3221,27 @@ fn fill_op(
                 ops.push(Op::Item {
                     row,
                     col: col1 - 1,
+                    item: border_item(f.node, String::from("│")),
+                    clip,
+                    bounds: None,
+                    text_clip_resolved: false,
+                });
+            }
+        }
+    }
+    // css-multicol-1 #crs: column rules are border chrome drawn in the
+    // middle of each column gap.
+    if BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(rules) = f.paint.column_rules.as_deref()
+    {
+        for &[x, y, height] in &rules.lines {
+            let col = ((f.x + x - ox) / cw).floor() as i64;
+            let top = ((f.y + y - oy) / ch).round() as i64;
+            let bottom = ((f.y + y + height - oy) / ch).round() as i64;
+            for row in top..bottom {
+                ops.push(Op::Item {
+                    row,
+                    col,
                     item: border_item(f.node, String::from("│")),
                     clip,
                     bounds: None,
@@ -3763,6 +3852,7 @@ fn composite(
                     h: p.item.height.max(1),
                     crop: p.item.crop,
                     pixelated: p.item.pixelated,
+                    clip: p.item.image_clip,
                 }
             })
             .collect();
@@ -3977,7 +4067,19 @@ fn emit_image_clips(rows: &mut [Row], item: Item, top: usize, clips: Vec<ImageCl
         piece.width = clip.width;
         piece.height = clip.height;
         piece.text.clear();
-        piece.image_clip = Some(clip);
+        // An object-fit crop already names the item's part of its object;
+        // the surviving rectangle is a part of that part.
+        piece.image_clip = Some(match item.image_clip {
+            Some(object) => ImageClip {
+                source_width: object.source_width,
+                source_height: object.source_height,
+                col: object.col.saturating_add(clip.col),
+                row: object.row.saturating_add(clip.row),
+                width: clip.width,
+                height: clip.height,
+            },
+            None => clip,
+        });
         rows[top + usize::from(clip.row)].items.push(piece);
     }
 }
