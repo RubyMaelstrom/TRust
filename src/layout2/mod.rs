@@ -718,7 +718,7 @@ fn graphical_paint_boundaries(
             if dom.render_live() && dom.paint_patch_host(node) {
                 Some(node)
             } else {
-                dom.attr(node, "data-trust-paint-node")
+                dom.internal_marker(node, "data-trust-paint-node")
                     .and_then(|actor| actor.parse().ok())
             }
             .map(|actor| GraphicalPaintBoundary { actor, node })

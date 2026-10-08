@@ -67,6 +67,8 @@ impl Outline {
 pub(crate) trait StyleSource: UnitSource {
     fn tag_name(&self, id: NodeId) -> Option<&str>;
     fn attr(&self, id: NodeId, name: &str) -> Option<&str>;
+    /// A TRust presentation marker; see `Dom::internal_marker`.
+    fn internal_marker(&self, id: NodeId, name: &str) -> Option<&str>;
     /// Tree parent. Panics for an unknown id.
     fn parent(&self, id: NodeId) -> Option<NodeId>;
     fn children(&self, id: NodeId) -> Vec<NodeId>;
@@ -901,10 +903,10 @@ fn ua_box<D: StyleSource + ?Sized>(
         // iframe's child BODY formatting box. HTML Rendering §15.3.2 gives
         // both the real BODY and that equivalent box the 8px UA margins.
         "body" => ([8.0; 4], p0),
-        _ if dom.attr(id, "data-trust-frame-body").is_some()
-            && dom
-                .parent(id)
-                .is_some_and(|parent| dom.attr(parent, "data-trust-frame").is_some()) =>
+        _ if dom.internal_marker(id, "data-trust-frame-body").is_some()
+            && dom.parent(id).is_some_and(|parent| {
+                dom.internal_marker(parent, "data-trust-frame").is_some()
+            }) =>
         {
             ([8.0; 4], p0)
         }
@@ -1291,9 +1293,9 @@ impl InlineStyle {
             // Transitional compatibility for stored/history documents made by
             // the former serialization boundary. New direct layouts never
             // need these attributes, but old snapshots remain renderable.
-            Some(_) if dom.attr(id, "data-trust-click").is_some() => {
+            Some(_) if dom.internal_marker(id, "data-trust-click").is_some() => {
                 if let Some(node) = dom
-                    .attr(id, "data-trust-node")
+                    .internal_marker(id, "data-trust-node")
                     .and_then(|value| value.parse().ok())
                 {
                     s.link = Some(crate::doc::Link::JsClick {

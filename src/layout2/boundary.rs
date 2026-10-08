@@ -28,7 +28,7 @@ pub(super) fn boundary_actor(dom: &Dom, node: NodeId) -> Option<usize> {
     let id = if dom.render_live() {
         node
     } else {
-        dom.attr(node, "data-trust-node")
+        dom.internal_marker(node, "data-trust-node")
             .and_then(|s| s.parse::<usize>().ok())?
     };
     // A block-filling IFC: flex/grid/flow-root, NOT a scroll/clip viewport (the

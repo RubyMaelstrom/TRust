@@ -230,7 +230,7 @@ impl TerminalPaintModel {
             let live_node = if dom.render_live() {
                 Some(node)
             } else {
-                dom.attr(node, "data-trust-node")
+                dom.internal_marker(node, "data-trust-node")
                     .and_then(|value| value.parse().ok())
             };
             let display = dom
@@ -299,7 +299,7 @@ impl TerminalPaintModel {
                     live_node,
                     boundary_actor: super::boundary::boundary_actor(dom, node),
                     scroll_top: dom
-                        .attr(node, "data-trust-scroll-top")
+                        .internal_marker(node, "data-trust-scroll-top")
                         .and_then(|value| value.parse().ok())
                         .or_else(|| {
                             dom.render_live()
@@ -307,7 +307,7 @@ impl TerminalPaintModel {
                                 .flatten()
                         }),
                     scroll_left: dom
-                        .attr(node, "data-trust-scroll-left")
+                        .internal_marker(node, "data-trust-scroll-left")
                         .and_then(|value| value.parse().ok())
                         .or_else(|| {
                             dom.render_live()

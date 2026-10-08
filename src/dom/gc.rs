@@ -154,6 +154,7 @@ impl Dom {
                 cssom_sheet_versions,
                 cssom_inline,
                 scroll_state,
+                marquee_pauses,
                 pending_allocations,
                 hover_hosts,
                 paint_patch_hosts,
@@ -268,6 +269,7 @@ impl Dom {
             cssom_sheet_versions,
             cssom_inline,
             scroll_state,
+            marquee_pauses,
             pending_allocations,
             hover_hosts,
             paint_patch_hosts,
@@ -365,6 +367,7 @@ impl Dom {
             cssom_sheet_versions,
             cssom_inline,
             scroll_state,
+            marquee_pauses,
         );
         set!(
             pending_allocations,

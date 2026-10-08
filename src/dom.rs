@@ -846,6 +846,11 @@ pub struct Dom {
     /// pseudo-class. A removed node's stale entry is harmless (the id stops
     /// rendering with the node).
     popover_open: FxHashSet<NodeId>,
+    /// HTML #the-marquee-element-2 `stop()`/`start()`: each stopped or
+    /// restarted marquee's pause clock in document-timeline seconds. Internal
+    /// state, never a content attribute; the serializer carries it to a
+    /// presentation arena as `data-trust-marquee-*` markers.
+    marquee_pauses: FxHashMap<NodeId, MarqueePause>,
     /// The documents' top layers (CSS Positioned Layout 4 #top-layer): one
     /// ordered set holding the showing popovers, modal dialogs and fullscreen
     /// elements of every document in the arena. Each document's top layer is
@@ -1191,6 +1196,7 @@ impl Dom {
             scroll_epoch,
             hover_chain,
             popover_open,
+            marquee_pauses,
             top_layer,
             modal_dialogs,
             fullscreen_flags,
@@ -1597,6 +1603,7 @@ impl Dom {
         }
 
         fixed_map!(scroll_state, (NodeId, ScrollBox));
+        fixed_map!(marquee_pauses, (NodeId, MarqueePause));
         bytes = bytes.saturating_add(
             scroll_changes
                 .capacity()
@@ -1733,6 +1740,7 @@ impl Dom {
             scroll_epoch: 0,
             hover_chain: FxHashSet::default(),
             popover_open: FxHashSet::default(),
+            marquee_pauses: FxHashMap::default(),
             top_layer: Vec::new(),
             modal_dialogs: FxHashSet::default(),
             fullscreen_flags: FxHashSet::default(),
@@ -1826,6 +1834,19 @@ impl Dom {
 
     pub fn render_live(&self) -> bool {
         self.render_live
+    }
+
+    /// TRust's own presentation marker `name` (a `data-trust-*` attribute) on
+    /// `id`. Only a serialized presentation arena carries these: the
+    /// serializer writes them and drops any authored attribute of that
+    /// prefix. A live arena keeps the same state natively, so a
+    /// `data-trust-*` attribute there is page content and never an
+    /// instruction to layout, paint or hit testing.
+    pub(crate) fn internal_marker(&self, id: NodeId, name: &str) -> Option<&str> {
+        if self.render_live {
+            return None;
+        }
+        self.attr(id, name)
     }
 
     /// Necessary candidates for an authored cursor declaration, using the
@@ -2033,6 +2054,45 @@ impl Dom {
     /// `:popover-open` both read this, so hidden/match memos must refresh —
     /// and marks the document dirty. Never touches `style_epoch`: the sheet
     /// set is unchanged.
+    /// HTML #dom-marquee-stop / #dom-marquee-start: stop or resume the
+    /// marquee's scrolling at document-timeline time `now` (seconds). The
+    /// time spent stopped is excluded from the scroll position.
+    pub(crate) fn set_marquee_running(&mut self, id: NodeId, running: bool, now: f32) {
+        let pause = self.marquee_pauses.entry(id).or_default();
+        let changed = match (running, pause.stopped_at) {
+            (false, None) => {
+                pause.stopped_at = Some(now.max(0.0));
+                true
+            }
+            (true, Some(stopped)) => {
+                pause.paused_total += (now - stopped).max(0.0);
+                pause.stopped_at = None;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.touch();
+        }
+    }
+
+    /// The marquee's pause clock: live state, or a presentation arena's
+    /// markers.
+    pub(crate) fn marquee_pause(&self, id: NodeId) -> MarqueePause {
+        if let Some(pause) = self.marquee_pauses.get(&id) {
+            return *pause;
+        }
+        let seconds = |name| {
+            self.internal_marker(id, name)
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        };
+        MarqueePause {
+            stopped_at: seconds("data-trust-marquee-stopped"),
+            paused_total: seconds("data-trust-marquee-paused-total").unwrap_or(0.0),
+        }
+    }
+
     pub fn set_popover_open(&mut self, id: NodeId, open: bool) {
         let changed = if open {
             let inserted = self.popover_open.insert(id);
@@ -2173,7 +2233,7 @@ impl Dom {
         !self.modal_dialogs.is_empty()
             || self
                 .document_element()
-                .is_some_and(|root| self.attr(root, "data-trust-blocked").is_some())
+                .is_some_and(|root| self.internal_marker(root, "data-trust-blocked").is_some())
     }
 
     /// HTML #dialog-setup-steps run for every connected `dialog` with an
@@ -4771,6 +4831,14 @@ impl Dom {
 impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     pub fn is_hidden(&self, id: NodeId) -> bool {
         self.box_generation(id).hidden
+    }
+
+    /// See `Dom::internal_marker`.
+    pub(crate) fn internal_marker(&self, id: NodeId, name: &str) -> Option<&str> {
+        if self.0.render_live() {
+            return None;
+        }
+        self.0.attr(id, name)
     }
 }
 
@@ -7838,12 +7906,12 @@ impl Dom {
         which: PseudoEl,
     ) -> Option<Vec<GeneratedContent>> {
         let (text_attr, items_attr) = which.baked_content_attrs()?;
-        if let Some(baked) = self.attr(id, items_attr)
+        if let Some(baked) = self.internal_marker(id, items_attr)
             && let Ok(items) = serde_json::from_str(baked)
         {
             return Some(items);
         }
-        if let Some(text) = self.attr(id, text_attr) {
+        if let Some(text) = self.internal_marker(id, text_attr) {
             return Some(vec![GeneratedContent::Text(text.to_string())]);
         }
         let raw = self.pseudo_style(id, which, "content").or_else(|| {
@@ -7930,7 +7998,7 @@ impl Dom {
     /// Whether `::first-letter` declarations apply to `id`, from the cascade
     /// or (in a stylesheet-free snapshot) from their baked attribute.
     pub(crate) fn has_first_letter_style(&self, id: NodeId) -> bool {
-        self.attr(id, PseudoEl::FirstLetter.baked_style_attr())
+        self.internal_marker(id, PseudoEl::FirstLetter.baked_style_attr())
             .is_some()
             || (self.style_index().has_first_letter
                 && !self.cascaded_maps(id).first_letter.is_empty())
@@ -7948,14 +8016,15 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     /// Whether `::marker` declarations apply to `id`, from the cascade or
     /// (in a stylesheet-free snapshot) from their baked attribute.
     pub(crate) fn has_marker_style(&self, id: NodeId) -> bool {
-        self.attr(id, PseudoEl::Marker.baked_style_attr()).is_some()
+        self.internal_marker(id, PseudoEl::Marker.baked_style_attr())
+            .is_some()
             || (self.style_index().has_marker && !self.cascaded_maps(id).marker.is_empty())
     }
 
     /// Whether author `::placeholder` declarations apply to `id`, from the
     /// cascade or (in a stylesheet-free snapshot) from their baked attribute.
     pub(crate) fn has_placeholder_style(&self, id: NodeId) -> bool {
-        self.attr(id, PseudoEl::Placeholder.baked_style_attr())
+        self.internal_marker(id, PseudoEl::Placeholder.baked_style_attr())
             .is_some()
             || (self.style_index().has_placeholder
                 && !self.cascaded_maps(id).placeholder.is_empty())
@@ -8145,7 +8214,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     ) -> Option<String> {
         let attr = which.baked_style_attr();
         let mut found = None;
-        for decl in split_top_level(self.attr(id, attr)?, ';') {
+        for decl in split_top_level(self.internal_marker(id, attr)?, ';') {
             let Some((name, value, _important)) = parse_decl(decl) else {
                 continue;
             };
@@ -8169,7 +8238,7 @@ impl Dom {
     pub fn has_clearing_pseudo(&self, id: NodeId) -> bool {
         // The baked marker (set by the serializer when the real CSS was still
         // in scope) — the layout re-parses without the `::after{clear}` rule.
-        if self.attr(id, "data-trust-clearfix").is_some() {
+        if self.internal_marker(id, "data-trust-clearfix").is_some() {
             return true;
         }
         [PseudoEl::Before, PseudoEl::After].into_iter().any(|p| {
@@ -9613,9 +9682,11 @@ impl Dom {
         // records that Document's base.
         let mut current = Some(id);
         while let Some(node) = current {
-            if self.attr(node, "data-trust-frame-root").is_some()
+            if self
+                .internal_marker(node, "data-trust-frame-root")
+                .is_some()
                 && let Some(base) = self
-                    .attr(node, "data-trust-frame-base")
+                    .internal_marker(node, "data-trust-frame-base")
                     .and_then(|base| url::Url::parse(base).ok())
             {
                 return Cow::Owned(base);
@@ -12085,6 +12156,15 @@ impl Dom {
             out.push_str(&format!(" data-trust-paint-node=\"{id}\""));
         }
         self.write_top_layer_markers(id, out);
+        if let Some(pause) = self.marquee_pauses.get(&id) {
+            if let Some(stopped) = pause.stopped_at {
+                out.push_str(&format!(" data-trust-marquee-stopped=\"{stopped}\""));
+            }
+            out.push_str(&format!(
+                " data-trust-marquee-paused-total=\"{}\"",
+                pause.paused_total
+            ));
+        }
         // A scroll container's current `scrollTop` signal (CSSOM View) rides the
         // HTML in CSS pixels so it survives the live snapshot/re-parse exactly
         // like a baked form value. A terminal consumer quantizes this value only
@@ -12177,6 +12257,18 @@ impl Dom {
         let mut style_done = false;
         for a in attrs {
             let name: &str = &a.name.local;
+            // `data-trust-*` names are TRust's presentation markers, which the
+            // presentation arena trusts. An authored attribute with that prefix
+            // is page content, not state: leave it out of the snapshot so a
+            // page cannot forge node ids, frames, top-layer or modal state.
+            // Styles are already baked, so no selector in the snapshot reads
+            // it.
+            if name
+                .get(..11)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data-trust-"))
+            {
+                continue;
+            }
             let replaced = rewrite(name, &a.value);
             let value = replaced.as_deref().unwrap_or(&a.value);
             out.push(' ');
@@ -14102,6 +14194,14 @@ pub enum PseudoEl {
     /// CSS Position 4 #backdrop: the box below an element rendered in the
     /// top layer.
     Backdrop,
+}
+
+/// A marquee's pause clock (HTML #dom-marquee-stop): when it was stopped, if
+/// it is, and the total time it spent stopped, in document-timeline seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct MarqueePause {
+    pub(crate) stopped_at: Option<f32>,
+    pub(crate) paused_total: f32,
 }
 
 impl PseudoEl {
@@ -27586,6 +27686,57 @@ mod tests {
         let _ = dom.text_content(a); // reads stay clean
         let _ = dom.serialize(DOCUMENT);
         assert!(!dom.take_dirty());
+    }
+
+    #[test]
+    fn authored_trust_markers_never_reach_presentation_or_live_layout() {
+        // `data-trust-*` names are TRust's presentation channel. A page that
+        // authors them (any case) must not forge node ids, activation targets,
+        // frames, top-layer, modal or inertness state: the live arena ignores
+        // them, and the serialized snapshot carries only TRust's own markers.
+        let mut dom = Dom::parse_document(
+            "<body><div id=forged data-trust-node=999 data-trust-click='x-trust-js:999:' \
+             data-trust-modal data-trust-top-layer=0 data-trust-frame DATA-TRUST-HOVER=999 \
+             data-trust-before=FAKE data-trust-score=5 data-other=kept>text</div>\
+             <html data-trust-blocked></html></body>",
+        );
+        let forged = dom.get_by_id("forged").unwrap();
+        dom.set_render_clickables(Default::default(), true);
+        for name in [
+            "data-trust-node",
+            "data-trust-click",
+            "data-trust-modal",
+            "data-trust-hover",
+        ] {
+            assert_eq!(dom.internal_marker(forged, name), None, "{name}");
+        }
+        assert!(!dom.is_modal(forged));
+        assert!(!dom.any_document_blocked());
+        // The page still sees its own attributes.
+        assert_eq!(dom.attr(forged, "data-trust-node"), Some("999"));
+
+        let html = dom.serialize_live(DOCUMENT, &Default::default());
+        for forged_marker in [
+            "data-trust-node=\"999\"",
+            "x-trust-js:999",
+            "data-trust-modal",
+            "data-trust-top-layer",
+            "data-trust-frame",
+            "data-trust-hover",
+            "FAKE",
+            "data-trust-score",
+            "data-trust-blocked",
+        ] {
+            assert!(!html.contains(forged_marker), "{forged_marker}: {html}");
+        }
+        assert!(html.contains("data-other=\"kept\""), "{html}");
+
+        let snapshot = Dom::parse_document(&html);
+        let copy = snapshot.get_by_id("forged").unwrap();
+        assert!(!snapshot.is_modal(copy));
+        assert_eq!(snapshot.top_layer_order(copy), None);
+        assert_eq!(snapshot.internal_marker(copy, "data-trust-node"), None);
+        assert!(!snapshot.any_document_blocked());
     }
 
     #[test]

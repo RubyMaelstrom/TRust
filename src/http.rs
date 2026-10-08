@@ -7948,7 +7948,7 @@ fn collect_hover_ids(
     let mut stack: Vec<(crate::dom::NodeId, Option<usize>)> = vec![(crate::dom::DOCUMENT, None)];
     while let Some((id, mut cur)) = stack.pop() {
         let marker = dom
-            .attr(id, "data-trust-hover")
+            .internal_marker(id, "data-trust-hover")
             .and_then(|v| v.parse().ok())
             .or_else(|| {
                 dom.attr(id, "href")
@@ -8024,11 +8024,11 @@ pub fn lay_region_patch(
     let boundary = dom
         .descendants(crate::dom::DOCUMENT)
         .into_iter()
-        .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
+        .find(|&id| dom.internal_marker(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
     let image_urls = collect_image_urls(&dom, url, css_viewport, 1.0).all;
     let scroll_top = dom
-        .attr(boundary, "data-trust-scroll-top")
+        .internal_marker(boundary, "data-trust-scroll-top")
         .and_then(|s| s.parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|px| (px / f32::from(cell_px.1.max(1))).round().max(0.0) as usize);
@@ -8119,7 +8119,7 @@ pub fn lay_subtree_patch(
     let boundary = dom
         .descendants(crate::dom::DOCUMENT)
         .into_iter()
-        .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
+        .find(|&id| dom.internal_marker(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
     let image_urls = collect_image_urls(&dom, url, css_viewport, 1.0).all;
     // The subtree lays through the SAME engine that rendered the page, so a
@@ -8761,7 +8761,7 @@ fn live_node(dom: &crate::dom::Dom, id: usize) -> Option<usize> {
     if dom.render_live() {
         Some(id)
     } else {
-        dom.attr(id, "data-trust-node")?.parse().ok()
+        dom.internal_marker(id, "data-trust-node")?.parse().ok()
     }
 }
 
@@ -15858,11 +15858,12 @@ mod tests {
         // 3↔5 columns between live updates and the first full resync).
         // `serialize_patch` now carries the real root on an `<html>` shell and
         // the boundary's inherited font-size resolved to px.
-        let mut dom = crate::dom::Dom::parse_document(
-            r#"<html style="font-size:62.5%"><body><div id="b"><div style="width:30rem"><img src="/x.jpg" style="width:100%"></div></div></body></html>"#,
+        // A flow-root is an independent formatting context, so the serializer
+        // writes its own `data-trust-node` boundary marker.
+        let dom = crate::dom::Dom::parse_document(
+            r#"<html style="font-size:62.5%"><body><div id="b" style="display:flow-root"><div style="width:30rem"><img src="/x.jpg" style="width:100%"></div></div></body></html>"#,
         );
         let b = dom.get_by_id("b").unwrap();
-        dom.set_attr(b, "data-trust-node", "42");
         let frag = dom.serialize_patch(b, &Default::default());
         assert!(
             frag.starts_with("<html style=\"font-size:10px;\">"),
@@ -15878,7 +15879,7 @@ mod tests {
             (200, 64),
             (8, 16),
             &images,
-            42,
+            b,
             false,
             (0.0, 0.0),
         )

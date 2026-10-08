@@ -4361,7 +4361,10 @@ impl Flow<'_> {
         // presentation wrapper used after serializing that navigable.
         let frame_viewport = f.node != NO_NODE
             && (matches!(self.dom.tag_name(f.node), Some("iframe" | "frame"))
-                || self.dom.attr(f.node, "data-trust-frame").is_some());
+                || self
+                    .dom
+                    .internal_marker(f.node, "data-trust-frame")
+                    .is_some());
         let establishes_abs_cb = f.paint.cb_abs || frame_viewport;
         let child_abs_clip = if establishes_abs_cb {
             content_clip
@@ -4848,7 +4851,10 @@ impl Flow<'_> {
         // root establishes an independent context. The marker represents that
         // same box only in a non-authoritative serialized presentation arena.
         if self.dom.is_document_element(b.node)
-            || self.dom.attr(b.node, "data-trust-frame-root").is_some()
+            || self
+                .dom
+                .internal_marker(b.node, "data-trust-frame-root")
+                .is_some()
         {
             return true;
         }

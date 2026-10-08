@@ -98,7 +98,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (None, Some(g)) => (format!("░▒▓ TRUST :: {} ▓▒░", g.doc.url), theme::NEON_CYAN),
         (None, None) => (
             match &app.host {
-                Some(host) => format!("░▒▓ TRUST :: {host}:{port} ▓▒░", port = app.port),
+                Some(host) if app.telnet_opened => {
+                    format!("░▒▓ TRUST :: {host}:{port} ▓▒░", port = app.port)
+                }
+                // The address being opened; only a telnet session has a port.
+                Some(host) => format!("░▒▓ TRUST :: {host} ▓▒░"),
                 None => String::from("░▒▓ TRUST :: TELNET/NVT ▓▒░"),
             },
             if app.connected {

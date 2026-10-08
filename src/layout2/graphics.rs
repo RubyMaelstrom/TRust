@@ -552,7 +552,7 @@ impl<'a> Builder<'a> {
                     Some(fragment.node)
                 } else {
                     self.dom
-                        .attr(fragment.node, "data-trust-node")
+                        .internal_marker(fragment.node, "data-trust-node")
                         .and_then(|value| value.parse().ok())
                 },
                 viewport,
@@ -597,7 +597,7 @@ impl<'a> Builder<'a> {
                 Some(fragment.node)
             } else {
                 self.dom
-                    .attr(fragment.node, "data-trust-node")
+                    .internal_marker(fragment.node, "data-trust-node")
                     .and_then(|value| value.parse().ok())
             }
         {
@@ -790,6 +790,7 @@ impl<'a> Builder<'a> {
                 .and_then(|value| value.trim().parse::<i64>().ok())
                 .filter(|count| *count >= 1)
                 .and_then(|count| u32::try_from(count).ok());
+            let pause = self.dom.marquee_pause(fragment.node);
             self.marquee_scopes.insert(
                 fragment.node,
                 MarqueeScope {
@@ -800,21 +801,9 @@ impl<'a> Builder<'a> {
                     scroll_interval_seconds: delay_ms as f32 / 1_000.0,
                     scroll_distance,
                     loop_count,
-                    running: self
-                        .dom
-                        .attr(fragment.node, "data-trust-marquee-stopped")
-                        .is_none(),
-                    paused_at_seconds: self
-                        .dom
-                        .attr(fragment.node, "data-trust-marquee-stopped")
-                        .and_then(|value| value.parse::<f32>().ok())
-                        .filter(|value| value.is_finite() && *value >= 0.0),
-                    paused_total_seconds: self
-                        .dom
-                        .attr(fragment.node, "data-trust-marquee-paused-total")
-                        .and_then(|value| value.parse::<f32>().ok())
-                        .filter(|value| value.is_finite() && *value >= 0.0)
-                        .unwrap_or(0.0),
+                    running: pause.stopped_at.is_none(),
+                    paused_at_seconds: pause.stopped_at,
+                    paused_total_seconds: pause.paused_total,
                 },
             );
         }
@@ -1490,7 +1479,7 @@ fn graphical_boundary(fragment: &Frag, builder: &Builder<'_>) -> Option<(usize, 
     } else {
         builder
             .dom
-            .attr(fragment.node, "data-trust-node")?
+            .internal_marker(fragment.node, "data-trust-node")?
             .parse()
             .ok()?
     };
@@ -2971,12 +2960,12 @@ fn interaction_actor(dom: &Dom, node: NodeId) -> Option<usize> {
     let mut current = Some(node);
     while let Some(node) = current {
         if let Some(actor) = dom
-            .attr(node, "data-trust-hover")
+            .internal_marker(node, "data-trust-hover")
             .and_then(|value| value.parse().ok())
         {
             return Some(actor);
         }
-        if let Some(marker) = dom.attr(node, "data-trust-click")
+        if let Some(marker) = dom.internal_marker(node, "data-trust-click")
             && let Some(actor) = marker
                 .strip_prefix("x-trust-js:")
                 .and_then(|rest| rest.split(':').next())
@@ -2988,7 +2977,7 @@ fn interaction_actor(dom: &Dom, node: NodeId) -> Option<usize> {
             dom.tag_name(node),
             Some("form" | "input" | "button" | "select" | "textarea")
         ) && let Some(actor) = dom
-            .attr(node, "data-trust-node")
+            .internal_marker(node, "data-trust-node")
             .and_then(|value| value.parse().ok())
         {
             return Some(actor);
@@ -3513,7 +3502,7 @@ fn paint_background_images_for_style(
     let dom = builder.dom;
     let owner = dom.frame_owner(style.node()).or_else(|| {
         std::iter::successors(dom.node(style.node()).parent, |&node| dom.node(node).parent)
-            .find(|&node| dom.attr(node, "data-trust-frame").is_some())
+            .find(|&node| dom.internal_marker(node, "data-trust-frame").is_some())
     });
     let frame = owner.and_then(|frame| {
         builder

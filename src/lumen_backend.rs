@@ -10164,6 +10164,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__body_buffer", 1, host_body_buffer),
     ("__base64_convert", 2, host_base64_convert),
     ("__dom_popover", 2, guarded_popover),
+    ("__dom_marquee", 3, guarded_marquee),
     ("__dom_dialog_modal", 2, guarded_dialog_modal),
     ("__dom_fullscreen", 2, guarded_fullscreen),
     ("__dom_top_layer", 1, guarded_top_layer),
@@ -10803,6 +10804,7 @@ node_access_guards! {
     guarded_set_hover = host_set_hover, [0], Invalidate;
     guarded_focus = host_focus, [0, 1], Invalidate;
     guarded_popover = host_dom_popover, [0], Invalidate;
+    guarded_marquee = host_dom_marquee, [0], Invalidate;
     guarded_dialog_modal = host_dom_dialog_modal, [0], Invalidate;
     guarded_fullscreen = host_dom_fullscreen, [0], Invalidate;
     guarded_top_layer = host_dom_top_layer, [0], Invalidate;
@@ -19909,6 +19911,24 @@ fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     Ok(Value::Bool(dom.is_popover_showing(id)))
 }
 
+/// `__dom_marquee(node, running, now)`: HTML #dom-marquee-start /
+/// #dom-marquee-stop at document-timeline time `now` (seconds). The pause
+/// clock is arena state, so pages never see or forge it as an attribute.
+fn host_dom_marquee(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    if let (Some(id), Some(Value::Bool(running)), Some(now)) = (
+        host_arg_node(&dom, args, 0),
+        args.get(1),
+        args.get(2).and_then(Value::as_num_opt),
+    ) && now.is_finite()
+        && dom.tag_name(id) == Some("marquee")
+    {
+        dom.set_marquee_running(id, *running, now as f32);
+    }
+    Ok(Value::Undefined)
+}
+
 /// `__dom_dialog_modal(node[, modal])`: optionally set a dialog's "is modal"
 /// flag, then return it. The arena owns the flag so removal and `:modal` agree.
 fn host_dom_dialog_modal(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -27090,7 +27110,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 227, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 228, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -27101,7 +27121,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 227);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 228);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -36107,27 +36127,45 @@ mod tests {
             marquee.scrollAmount = 9;
             marquee.scrollDelay = 20;
             marquee.loop = 3;
+            const records = [];
+            new MutationObserver((list) => records.push(...list)).observe(marquee, {attributes: true});
             marquee.stop();
-            const stopped = marquee.hasAttribute("data-trust-marquee-stopped");
+            globalThis.stoppedAttributes = marquee.getAttributeNames().join();
             marquee.start();
+            marquee.stop();
             globalThis.marqueeResult = [
                 marquee instanceof HTMLMarqueeElement,
                 marquee.direction,
                 marquee.scrollAmount,
                 marquee.scrollDelay,
                 marquee.loop,
-                stopped,
-                marquee.hasAttribute("data-trust-marquee-stopped"),
-                Number(marquee.getAttribute("data-trust-marquee-paused-total")) >= 0
+                stoppedAttributes,
+                marquee.getAttributeNames().some((name) => name.startsWith("data-trust-"))
             ].join("|");
+            queueMicrotask(() => { globalThis.marqueeRecords = records.length; });
             "#,
             "marquee interface",
         )
         .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        // The pause clock is internal state: no attribute, no mutation record.
         assert_eq!(
             string_value(&mut engine, "marqueeResult"),
-            "true|right|9|20|3|true|false|true"
+            "true|right|9|20|3|direction,scrollamount,scrolldelay,loop|false"
         );
+        assert_eq!(string_value(&mut engine, "String(marqueeRecords)"), "0");
+        // The stopped clock reaches presentation arenas as TRust's markers.
+        let host = engine.ctx().host_mut::<HostState>().unwrap();
+        let dom = host.dom.clone();
+        let dom = dom.borrow();
+        let marquee = dom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&id| dom.tag_name(id) == Some("marquee"))
+            .unwrap();
+        assert!(dom.marquee_pause(marquee).stopped_at.is_some());
+        let html = dom.serialize_live(crate::dom::DOCUMENT, &Default::default());
+        assert!(html.contains("data-trust-marquee-stopped="), "{html}");
+        assert!(html.contains("data-trust-marquee-paused-total="), "{html}");
     }
 
     #[test]

@@ -13359,18 +13359,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const n = Number(v);
             if (Number.isInteger(n) && (n > 0 || n === -1)) this.setAttribute("loop", String(n));
         }
-        start() {
-            const stopped = Number(this.getAttribute("data-trust-marquee-stopped"));
-            if (!Number.isFinite(stopped) || stopped < 0) return;
-            const now = currentTime() / 1000;
-            const total = Number(this.getAttribute("data-trust-marquee-paused-total")) || 0;
-            this.setAttribute("data-trust-marquee-paused-total", String(Math.max(0, total + now - stopped)));
-            this.removeAttribute("data-trust-marquee-stopped");
-        }
-        stop() {
-            if (this.hasAttribute("data-trust-marquee-stopped")) return;
-            this.setAttribute("data-trust-marquee-stopped", String(currentTime() / 1000));
-        }
+        // HTML #dom-marquee-start / #dom-marquee-stop. The pause clock is
+        // the arena's internal state, not a content attribute.
+        start() { __dom_marquee(nodeIds.get(this), true, currentTime() / 1000); }
+        stop() { __dom_marquee(nodeIds.get(this), false, currentTime() / 1000); }
     }
 
     // HTML §4.9 (tables), DOM §4.2.10 (collections), Web IDL integer/interface

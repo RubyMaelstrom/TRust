@@ -149,6 +149,13 @@ The project favors:
   measurements match rendered boxes.
 - Background panics and per-resource failures must remain contained; only the
   terminal-owner thread may tear down the TUI.
+- `data-trust-*` attributes are TRust's presentation channel from the live
+  arena to its serialized snapshot. The serializer writes them from arena
+  state and drops authored attributes with that prefix. Read them only through
+  `Dom::internal_marker` (or `StyleSource::internal_marker`), which ignores
+  them in a live arena, where such an attribute is page content. Never store
+  internal state as a content attribute; keep it in arena state and serialize
+  a marker.
 - Author script never reaches the host boundary. `js::private_bootstrap` captures
   every host binding lexically and deletes all `__` globals before author code
   runs; prelude code must use the captured bindings, not `g.__name` lookups at

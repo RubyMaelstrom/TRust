@@ -355,6 +355,10 @@ impl crate::layout2::StyleSource for Dom {
         Dom::attr(self, id, name)
     }
     #[inline]
+    fn internal_marker(&self, id: NodeId, name: &str) -> Option<&str> {
+        Dom::internal_marker(self, id, name)
+    }
+    #[inline]
     fn parent(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).parent
     }
@@ -463,6 +467,10 @@ impl<B: StyleBackend + ?Sized> crate::layout2::StyleSource for ComputeView<'_, B
     #[inline]
     fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
         self.0.attr(id, name)
+    }
+    #[inline]
+    fn internal_marker(&self, id: NodeId, name: &str) -> Option<&str> {
+        ComputeView::internal_marker(self, id, name)
     }
     #[inline]
     fn parent(&self, id: NodeId) -> Option<NodeId> {

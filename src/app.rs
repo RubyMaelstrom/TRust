@@ -743,6 +743,10 @@ pub struct App {
     pub(crate) last_status_row: u16,
     pub host: Option<String>,
     pub port: u16,
+    /// Whether `host`/`port` name a telnet session `open` started. Before
+    /// that, `host` is only the address being opened (a URL, a bare host or a
+    /// local path) and has no port to show.
+    pub(crate) telnet_opened: bool,
     /// Port explicitly given at startup (CLI), if any. `None` means the
     /// startup target had no port → it opens as web (https, falling back to
     /// http), the way a bare host typed in the command console does.
@@ -1025,6 +1029,7 @@ impl App {
             host,
             port,
             start_port: None,
+            telnet_opened: false,
             connected: false,
             tls: false,
             terminal_tls: false,
@@ -9999,6 +10004,7 @@ impl App {
         self.status = format!("Trying {host}:{port}{padlock}...");
         self.host = Some(host);
         self.port = port;
+        self.telnet_opened = true;
     }
 
     async fn on_telnet_event(&mut self, event: telnet::Event) {
@@ -15163,6 +15169,31 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(crate::telnet::Command::Send(bytes)) if bytes == b"\x03\r\n")
         );
+    }
+
+    #[test]
+    fn address_bar_names_the_target_until_a_telnet_session_opens() {
+        // Before the first document commits, the address bar shows the target
+        // being opened. A port belongs only to a telnet session: a URL or a
+        // local path is not `host:23`.
+        use ratatui::{Terminal, backend::TestBackend};
+        let title = |app: &mut super::App| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
+        let mut app = super::App::new(Some("fixtures/x.html".into()), 23);
+        let top = title(&mut app);
+        assert!(top.contains("TRUST :: fixtures/x.html ▓"), "{top}");
+        assert!(!top.contains(":23"), "{top}");
+        app.host = Some("bbs.example".into());
+        app.port = 2323;
+        app.telnet_opened = true;
+        let top = title(&mut app);
+        assert!(top.contains("TRUST :: bbs.example:2323"), "{top}");
     }
 
     #[test]
