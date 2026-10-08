@@ -1,6 +1,6 @@
 [package]
 name = "TRust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Telnet in Rust — a GNU-telnet-compatible client and small-net (gopher, TLS) browser with a cyberpunk TUI"
 license = "MPL-2.0"

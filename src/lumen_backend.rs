@@ -1925,7 +1925,7 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     eval(
         &mut engine,
         &format!(
-            "globalThis.__trust_cfg = {{ url: {url:?}, ua: 'TRust/0.1 Lumen spike', language: 'en-US', languages: ['en-US', 'en'], width: 640, height: 384 }};",
+            "globalThis.__trust_cfg = {{ url: {url:?}, ua: 'TRust/0.2 Lumen spike', language: 'en-US', languages: ['en-US', 'en'], width: 640, height: 384 }};",
             url = DEFAULT_URL
         ),
         "TRust configuration",

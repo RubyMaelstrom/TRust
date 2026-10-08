@@ -47,7 +47,7 @@ const MAX_BODY: usize = 512 * 1024 * 1024;
 // impose a wall-clock deadline on the event-loop task that initiated it.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS: usize = 10;
-pub(crate) const USER_AGENT: &str = "TRust/0.1";
+pub(crate) const USER_AGENT: &str = "TRust/0.2";
 
 /// Firefox's current User-Agent string for Linux x86_64, read out of the local
 /// Firefox 153 build (`libxul.so` reports the `Firefox/153.0` product token and
@@ -16912,7 +16912,7 @@ customElements.define('lit-counter', LitCounter);
                 let reply: Vec<u8> = if text.starts_with("GET /old ") {
                     b"HTTP/1.1 302 Found\r\nLocation: /new\r\n\r\n".to_vec()
                 } else if text.starts_with("GET /new ") {
-                    assert!(text.contains("User-Agent: TRust/0.1"));
+                    assert!(text.contains("User-Agent: TRust/0.2"));
                     assert!(text.contains("Accept-Language: en-US,en;q=0.9\r\n"));
                     assert!(text.contains("Connection: keep-alive"));
                     // Chunked HTML with a link.
