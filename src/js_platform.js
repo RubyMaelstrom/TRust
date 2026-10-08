@@ -6676,7 +6676,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return proxy;
     }
     function styleFor(el) {
-        return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(nodeIds.get(el)), JSON.stringify(pairs)); },
+        return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(nodeIds.get(el)), JSON.stringify([raw, pairs])); },
             null, null, () => __dom_document_quirks(nodeIds.get(el.ownerDocument)));
     }
     g.CSSStyleDeclaration = CSSStyleDeclaration;

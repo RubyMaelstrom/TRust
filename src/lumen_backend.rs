@@ -17010,13 +17010,15 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         ));
     }
     if op == "inline-write" {
-        if let (Ok(id), Ok(declarations)) = (
+        // `extra` is `[serialization, declarations]`: the prelude's single
+        // CSSOM #serialize-a-css-declaration-block result for this block.
+        if let (Ok(id), Ok((serialized, declarations))) = (
             text.parse::<usize>(),
-            serde_json::from_str::<crate::dom::cssom::Declarations>(&extra),
+            serde_json::from_str::<(String, crate::dom::cssom::Declarations)>(&extra),
         ) {
             let dom = host_dom(ctx);
             let mut dom = dom.borrow_mut();
-            dom.set_cssom_inline(id, declarations);
+            dom.set_cssom_inline_serialized(id, declarations, serialized);
         }
         return Ok(Value::from_engine_text("null".to_string()));
     }

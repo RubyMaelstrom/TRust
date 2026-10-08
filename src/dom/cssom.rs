@@ -88,11 +88,25 @@ impl Dom {
         flags
     }
 
+    #[cfg(test)]
     pub(crate) fn set_cssom_inline(&mut self, id: NodeId, declarations: Declarations) {
+        let text = serialize(&declarations, false);
+        self.set_cssom_inline_serialized(id, declarations, text);
+    }
+
+    /// CSSOM #update-style-attribute-for with the block's serialization
+    /// already in hand: the platform serializes once for the `style`
+    /// attribute it sets and passes that same text, so a write need not
+    /// serialize twice.
+    pub(crate) fn set_cssom_inline_serialized(
+        &mut self,
+        id: NodeId,
+        declarations: Declarations,
+        text: String,
+    ) {
         if !self.is_valid(id) || self.tag_name(id).is_none() {
             return;
         }
-        let text = serialize(&declarations, false);
         // CSSOM #update-style-attribute-for: an unchanged declaration block
         // serializes to the attribute value it already has. Neither the
         // cascade's declarations nor the attribute change, so nothing is
@@ -324,10 +338,39 @@ fn background_position_value(position: &str) -> String {
     parts.join(" ")
 }
 
-pub(super) fn property_names(property: &str) -> Vec<String> {
-    if property.starts_with("--") && property != "--" {
-        return vec![property.into()];
+/// The longhands a supported property name sets, in canonical order: itself
+/// for a longhand or custom property, its longhands for a shorthand, and
+/// nothing for an unsupported name (CSSOM #concept-declarations-specified-order).
+///
+/// Serializing a declaration block asks this for every candidate shorthand
+/// of every declaration, and every inline-style write serializes the whole
+/// block (CSSOM #update-style-attribute-for). The answer depends only on the
+/// name, so supported lowercase names are expanded once per thread. That set
+/// is the finite property registry; author-chosen and custom names are never
+/// retained.
+pub(super) fn property_names(property: &str) -> std::rc::Rc<[String]> {
+    thread_local! {
+        static NAMES: RefCell<FxHashMap<String, std::rc::Rc<[String]>>> =
+            RefCell::new(FxHashMap::default());
     }
+    if property.starts_with("--") && property != "--" {
+        return std::rc::Rc::from([property.to_string()]);
+    }
+    if let Some(names) = NAMES.with(|cache| cache.borrow().get(property).cloned()) {
+        return names;
+    }
+    let names: std::rc::Rc<[String]> = property_names_uncached(property).into();
+    if !names.is_empty() && !property.bytes().any(|b| b.is_ascii_uppercase()) {
+        NAMES.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(property.to_string(), names.clone())
+        });
+    }
+    names
+}
+
+fn property_names_uncached(property: &str) -> Vec<String> {
     if !valid_property_name(property) {
         return vec![];
     }
@@ -762,9 +805,18 @@ fn get(property: &str, declarations: &[(String, String, bool)]) -> String {
         "margin" | "padding" | "inset" | "border-width" | "border-style" | "border-color" => {
             compress_four(&v)
         }
-        "border" if v.len() == 12 => {
-            if v.chunks(3).all(|side| side == &v[..3]) {
-                v[..3].join(" ")
+        // CSS Backgrounds 3 #propdef-border sets all four sides alike and
+        // resets border-image; CSSOM #serialize-a-css-value returns the empty
+        // string when the shorthand cannot exactly represent the longhands.
+        "border" if v.len() == 12 + BORDER_IMAGE_LONGHANDS.len() => {
+            let (sides, image) = v.split_at(12);
+            if sides.chunks(3).all(|side| side == &sides[..3])
+                && image
+                    .iter()
+                    .zip(BORDER_IMAGE_LONGHANDS)
+                    .all(|(value, (_, initial))| *value == initial)
+            {
+                sides[..3].join(" ")
             } else {
                 String::new()
             }
@@ -918,34 +970,57 @@ fn mask_value(values: &[&str]) -> String {
         .join(", ")
 }
 
+/// Shorthands that declaration-block serialization tries to combine
+/// longhands into, in preference order.
+const SERIALIZED_SHORTHANDS: &[&str] = &[
+    "background",
+    "mask",
+    "border",
+    "border-width",
+    "border-style",
+    "border-color",
+    "border-radius",
+    "margin",
+    "padding",
+    "inset",
+    "font",
+    "flex",
+    "flex-flow",
+    "grid-area",
+    "grid-row",
+    "grid-column",
+    "gap",
+    "place-content",
+    "place-items",
+    "place-self",
+    "white-space",
+    "overflow",
+    "transition",
+];
+
+/// The [`SERIALIZED_SHORTHANDS`] that set `longhand`, in preference order.
+/// Serialization visits each declaration, so look up only the shorthands a
+/// declaration can belong to instead of expanding every shorthand for it.
+fn serialized_shorthands_of(longhand: &str) -> &'static [&'static str] {
+    static INDEX: std::sync::OnceLock<FxHashMap<String, Vec<&'static str>>> =
+        std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            let mut index = FxHashMap::<String, Vec<&'static str>>::default();
+            for &shorthand in SERIALIZED_SHORTHANDS {
+                for name in property_names_uncached(shorthand) {
+                    index.entry(name).or_default().push(shorthand);
+                }
+            }
+            index
+        })
+        .get(longhand)
+        .map_or(&[], Vec::as_slice)
+}
+
 /// CSSOM #serialize-a-css-declaration-block. Internal transport preserves
 /// pending-substitution values; public serialization never exposes them.
 fn serialize(declarations: &Declarations, internal: bool) -> String {
-    const SHORTHANDS: &[&str] = &[
-        "background",
-        "mask",
-        "border",
-        "border-width",
-        "border-style",
-        "border-color",
-        "border-radius",
-        "margin",
-        "padding",
-        "inset",
-        "font",
-        "flex",
-        "flex-flow",
-        "grid-area",
-        "grid-row",
-        "grid-column",
-        "gap",
-        "place-content",
-        "place-items",
-        "place-self",
-        "white-space",
-        "overflow",
-        "transition",
-    ];
     let mut done = FxHashSet::default();
     let mut result = Vec::new();
     // CSSOM #serialize-into-a-shorthand-form: all has the largest reset
@@ -962,7 +1037,7 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
             for shorthand in pending
                 .into_iter()
                 .chain(all)
-                .chain(SHORTHANDS.iter().copied())
+                .chain(serialized_shorthands_of(name).iter().copied())
             {
                 let names = property_names(shorthand);
                 if !names.iter().any(|n| n == name) || names.iter().any(|n| done.contains(n)) {
@@ -993,7 +1068,7 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
                 {
                     continue;
                 }
-                done.extend(names);
+                done.extend(names.iter().cloned());
                 serialized = Some((shorthand.to_string(), value));
                 break;
             }
@@ -1394,7 +1469,7 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
         ),
         "expand" => json!(expanded(text, extra)),
         "expand-quirks" => json!(expanded_in(text, extra, true)),
-        "names" => json!(property_names(text)),
+        "names" => json!(&*property_names(text)),
         "get" => json!(get(
             text,
             &serde_json::from_str::<Vec<(String, String, bool)>>(extra).unwrap_or_default()
@@ -1814,6 +1889,67 @@ mod tests {
         assert!(!serialize(&pending, false).contains('\0'));
         assert!(!supports("background", "not-a-color"));
         assert!(property_names("not-a-property").is_empty());
+    }
+
+    #[test]
+    fn serialization_consults_only_the_shorthands_of_each_longhand() {
+        // CSSOM #serialize-a-css-declaration-block tries the shorthands that
+        // contain a declaration's property, in preference order. The index
+        // must name exactly those shorthands, so skipping the others cannot
+        // change which shorthand wins.
+        for longhand in all_longhand_names() {
+            let expected: Vec<_> = SERIALIZED_SHORTHANDS
+                .iter()
+                .copied()
+                .filter(|shorthand| property_names(shorthand).contains(longhand))
+                .collect();
+            assert_eq!(serialized_shorthands_of(longhand), expected, "{longhand}");
+        }
+        assert_eq!(
+            serialized_shorthands_of("margin-top"),
+            ["margin"],
+            "margin-top belongs only to margin"
+        );
+        assert!(serialized_shorthands_of("--margin-top").is_empty());
+
+        // Memoized names match a fresh expansion, including legacy aliases,
+        // and unsupported or mixed-case author names stay unsupported.
+        for name in ["font", "border", "-webkit-mask", "margin-top", "--x"] {
+            assert_eq!(&*property_names(name), property_names_uncached(name));
+            assert_eq!(property_names(name), property_names(name));
+        }
+        assert!(property_names("Margin").is_empty());
+        assert!(property_names("not-a-property").is_empty());
+
+        // Many declarations still combine into shorthands and keep order.
+        let mut block = String::from("margin: 1px 2px; ");
+        for i in 0..200 {
+            block.push_str(&format!("--v{i}: {i}; "));
+        }
+        block.push_str("border: 1px solid red; color: blue");
+        let text = serialize(&parse(&block), false);
+        assert!(text.starts_with("margin: 1px 2px; --v0: 0; --v1: 1;"));
+        assert!(text.ends_with("--v199: 199; border: 1px solid red; color: blue;"));
+    }
+
+    #[test]
+    fn border_shorthand_serializes_only_what_it_can_represent() {
+        // CSS Backgrounds 3 #propdef-border: one width/style/color for all
+        // sides, and border-image reset to its initial value. CSSOM
+        // #serialize-a-css-value: otherwise the shorthand reads as "".
+        let block = parse("border: 1px dotted red");
+        assert_eq!(get("border", &block), "1px dotted red");
+        assert_eq!(serialize(&block, false), "border: 1px dotted red;");
+        assert_eq!(
+            get("border", &parse("border: green double thin")),
+            "thin double green"
+        );
+        let block = parse("border: 1px solid red; border-left-color: blue");
+        assert_eq!(get("border", &block), "");
+        assert!(serialize(&block, false).starts_with("border-width: 1px;"));
+        let block = parse("border: 1px solid red; border-image-source: url(a.png)");
+        assert_eq!(get("border", &block), "");
+        assert_eq!(get("border", &parse("border: inherit")), "inherit");
     }
 
     #[test]
