@@ -2,7 +2,8 @@
 //! Keep CSSOM scrolling areas and the desktop's scroll ranges on the same
 //! fragment calculation; clipped child content belongs to its own scrollport.
 use super::flow::{Frag, FragKind};
-use super::{Dom, NO_NODE, NodeId, PxRect};
+use super::inline::Piece;
+use super::{Dom, ItemKind, NO_NODE, NodeId, PxRect};
 use std::collections::HashMap;
 
 /// Computed overflow eligibility, independent of whether a frontend offers a
@@ -172,6 +173,10 @@ pub(crate) fn scroll_reverse(dom: &Dom, node: NodeId) -> [bool; 2] {
 pub(super) struct ScrollAreas {
     pub nodes: HashMap<NodeId, PxRect>,
     pub document: (f32, f32),
+    /// Whether textareas report the extent of their whole value. CSSOM View
+    /// needs it; paint, which lays only the lines that reach a scrollport,
+    /// does not, and must not pay for laying a long value in full.
+    text_controls: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -194,7 +199,20 @@ impl Edge {
 
 impl ScrollAreas {
     pub fn new(dom: &Dom, root: &Frag) -> Self {
-        let mut result = Self::default();
+        Self::build(dom, root, false)
+    }
+
+    /// The scrolling areas CSSOM View reports, including each textarea's
+    /// value (CSSOM View #scrolling-area, #dom-element-scrollheight).
+    pub fn cssom(dom: &Dom, root: &Frag) -> Self {
+        Self::build(dom, root, true)
+    }
+
+    fn build(dom: &Dom, root: &Frag, text_controls: bool) -> Self {
+        let mut result = Self {
+            text_controls,
+            ..Self::default()
+        };
         let mut escaping = Vec::new();
         let edge = result.walk(
             dom,
@@ -253,6 +271,16 @@ impl ScrollAreas {
                 Edge::rect(f.x + left, f.y + top, f.x + f.w - right, f.y + f.h - bottom),
             )
         };
+        if self.text_controls
+            && let FragKind::Line(line) = &f.kind
+            && !line.sideways
+        {
+            for piece in &line.pieces {
+                if let Some(rect) = textarea_scrolling_area(dom, f, piece) {
+                    merge_area(&mut self.nodes, piece.item.node, rect);
+                }
+            }
+        }
         let mut area = end;
         let mut flow_end = Edge::point(content.x, content.y);
         let mut pending = Vec::new();
@@ -306,17 +334,7 @@ impl ScrollAreas {
                 css_width: None,
                 css_height: None,
             };
-            self.nodes
-                .entry(f.node)
-                .and_modify(|old| {
-                    let end_x = (old.left + old.width).max(rect.left + rect.width);
-                    let end_y = (old.top + old.height).max(rect.top + rect.height);
-                    old.left = old.left.min(rect.left);
-                    old.top = old.top.min(rect.top);
-                    old.width = end_x - old.left;
-                    old.height = end_y - old.top;
-                })
-                .or_insert(rect);
+            merge_area(&mut self.nodes, f.node, rect);
         }
         if !root && Some(f.node) != viewport_source {
             let axes = overflow_axes(dom, f.node);
@@ -367,4 +385,77 @@ impl ScrollAreas {
         }
         area
     }
+}
+
+/// Union `rect` into `node`'s scrolling area: an element whose boxes span
+/// several fragments scrolls over all of them.
+fn merge_area(nodes: &mut HashMap<NodeId, PxRect>, node: NodeId, rect: PxRect) {
+    nodes
+        .entry(node)
+        .and_modify(|old| {
+            let end_x = (old.left + old.width).max(rect.left + rect.width);
+            let end_y = (old.top + old.height).max(rect.top + rect.height);
+            old.left = old.left.min(rect.left);
+            old.top = old.top.min(rect.top);
+            old.width = end_x - old.left;
+            old.height = end_y - old.top;
+        })
+        .or_insert(rect);
+}
+
+/// HTML Rendering #the-textarea-element-2: a textarea depicts a multiline
+/// text control whose value scrolls inside the control. Its lines are laid
+/// within the control's piece rather than as child fragments, so its
+/// scrolling area (CSSOM View #scrolling-area) is the padding box extended
+/// by the value's line boxes and the block-end and inline-end padding
+/// (CSS Overflow 3 #scrollable). A placeholder is not scrollable content.
+fn textarea_scrolling_area(dom: &Dom, f: &Frag, piece: &Piece) -> Option<PxRect> {
+    if piece.item.node == NO_NODE
+        || !matches!(piece.item.kind, ItemKind::Form)
+        || dom.tag_name(piece.item.node) != Some("textarea")
+    {
+        return None;
+    }
+    let text = piece.control_text.as_deref();
+    let content = (f.x + piece.x + piece.paint_x, f.y + piece.y + piece.paint_y);
+    // An inline-level control's piece is its border box. A blockified
+    // control's piece is its content box inside the block fragment, whose
+    // padding box that fragment already contributes.
+    let [mut x0, mut y0, mut x1, mut y1] = match (piece.replaced_box, text) {
+        (Some(replaced), _) => {
+            let [top, right, bottom, left] = replaced.border();
+            [
+                f.x + piece.x + left,
+                f.y + piece.y + top,
+                f.x + piece.x + piece.box_width - right,
+                f.y + piece.y + piece.box_height - bottom,
+            ]
+        }
+        (None, Some(text)) => {
+            let [top, right, bottom, left] = text.scrollport;
+            [
+                content.0 - left,
+                content.1 - top,
+                content.0 + piece.paint_width + right,
+                content.1 + piece.paint_height + bottom,
+            ]
+        }
+        (None, None) => return None,
+    };
+    if let Some(text) = text {
+        let [width, height] = text.extent(dom);
+        let [top, right, bottom, left] = text.scrollport;
+        x0 = x0.min(content.0 - left);
+        y0 = y0.min(content.1 - top);
+        x1 = x1.max(content.0 + width + right);
+        y1 = y1.max(content.1 + height + bottom);
+    }
+    Some(PxRect {
+        left: f64::from(x0),
+        top: f64::from(y0),
+        width: f64::from((x1 - x0).max(0.0)),
+        height: f64::from((y1 - y0).max(0.0)),
+        css_width: None,
+        css_height: None,
+    })
 }

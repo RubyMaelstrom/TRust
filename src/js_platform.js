@@ -6679,6 +6679,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return declarationFor(() => el.getAttribute("style") || "", (raw, pairs) => { el.setAttribute("style", raw); cssOp("inline-write", String(nodeIds.get(el)), JSON.stringify([raw, pairs])); },
             null, null, () => __dom_document_quirks(nodeIds.get(el.ownerDocument)));
     }
+    // Web IDL #js-iterable: CSSOM's `getter CSSOMString item(unsigned long
+    // index)` is an indexed property getter, so the interface prototype's
+    // @@iterator is %Array.prototype.values% and `[...el.style]` lists the
+    // declared longhands in order.
+    Object.defineProperty(CSSStyleDeclaration.prototype, Symbol.iterator,
+        {value: Array.prototype.values, writable: true, configurable: true});
     g.CSSStyleDeclaration = CSSStyleDeclaration;
     g.CSSStyleProperties = CSSStyleDeclaration;
 
@@ -10372,6 +10378,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // <textarea>.value is its raw text content (no `value` content attribute) —
     // the form-submit path and formSet read/write the same.
     class HTMLTextAreaElement extends HTMLElement {
+        // HTML #dom-textarea-type, #dom-textarea-defaultValue (child text
+        // content; the setter does "string replace all") and
+        // #dom-textarea-textLength (length of the API value).
+        get type() { requireHTMLInterface(this,["textarea"]); return "textarea"; }
+        get defaultValue() {
+            requireHTMLInterface(this,["textarea"]);
+            let text = "";
+            for (let child = this.firstChild; child; child = child.nextSibling) {
+                if (child.nodeType === 3) text += child.data;
+            }
+            return text;
+        }
+        set defaultValue(v) { requireHTMLInterface(this,["textarea"]); this.textContent = domString(v); }
+        get textLength() { requireHTMLInterface(this,["textarea"]); return this.value.length; }
         get value() { return this.textContent.replace(/\r\n?/g, "\n"); }
         set value(v) {
             const previous = this.value;
@@ -10381,6 +10401,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 queueControlSelectionChange(this);
             }
         }
+    }
+    // Web IDL attributes are enumerable accessors on the interface prototype.
+    for (const name of ["type", "defaultValue", "value", "textLength"]) {
+        Object.defineProperty(HTMLTextAreaElement.prototype, name, {
+            ...Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, name), enumerable: true,
+        });
     }
     // HTML #textFieldSelection: all offsets are UTF-16 code units, including
     // detached controls. Arena-owned state survives wrapper recreation and
@@ -15905,6 +15931,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.MathMLElement = MathMLElement;
     g.HTMLInputElement = HTMLInputElement; g.HTMLSelectElement = HTMLSelectElement;
     g.HTMLTextAreaElement = HTMLTextAreaElement; g.HTMLFormElement = HTMLFormElement;
+    // Web IDL #js-iterable: HTML's HTMLFormElement `getter Element (unsigned
+    // long index)` and CSSOM's MediaList `getter CSSOMString? item(unsigned
+    // long index)` are indexed property getters, so both iterate like Arrays.
+    for (const iface of [HTMLFormElement, MediaList])
+        Object.defineProperty(iface.prototype, Symbol.iterator,
+            {value: Array.prototype.values, writable: true, configurable: true});
     g.HTMLAnchorElement = HTMLAnchorElement; g.HTMLImageElement = HTMLImageElement;
     g.HTMLScriptElement = HTMLScriptElement; g.HTMLButtonElement = HTMLButtonElement;
     g.HTMLSlotElement = HTMLSlotElement;

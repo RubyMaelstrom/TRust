@@ -20818,6 +20818,43 @@ mod tests {
     }
 
     #[test]
+    fn indexed_getter_interfaces_iterate_like_arrays() {
+        // Web IDL #js-iterable: an interface with an indexed property getter
+        // gets %Array.prototype.values% as a writable, configurable,
+        // non-enumerable @@iterator. CSSOM's CSSStyleDeclaration (`getter
+        // item`), MediaList (`getter item`) and HTML's HTMLFormElement
+        // (`getter Element`) all have one. Spreading a detached element's
+        // style to subtract one declaration block from another is how
+        // atomic-CSS runtimes (ChatGPT's composer) manage inline styles.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "const html = document.createElement('html'); document.append(html);\n\
+                 html.append(document.createElement('head'), document.createElement('body'));\n\
+                 const d = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, Symbol.iterator);\n\
+                 const el = document.createElement('div');\n\
+                 el.style.cssText = 'color: red; margin: 1px 2px';\n\
+                 const subtract = (base, managed) => { const s = document.createElement('div').style;\n\
+                   s.cssText = managed; const names = [...s]; s.cssText = base;\n\
+                   for (const n of names) s.removeProperty(n); return s.cssText; };\n\
+                 const sheet = document.head.appendChild(document.createElement('style'));\n\
+                 sheet.textContent = '@media screen, print { p { color: red; padding: 1px } }';\n\
+                 const rule = sheet.sheet.cssRules[0];\n\
+                 const ruleNames = []; for (const name of rule.cssRules[0].style) ruleNames.push(name);\n\
+                 const form = document.body.appendChild(document.createElement('form'));\n\
+                 form.append(document.createElement('input'), document.createElement('button'));\n\
+                 const iterates = (i) => i.prototype[Symbol.iterator] === Array.prototype.values;\n\
+                 [d.value === Array.prototype.values, d.writable, d.enumerable, d.configurable,\n\
+                  [...el.style].join(), subtract('color: red; display: block', 'color: blue'),\n\
+                  ruleNames.join(), iterates(MediaList), [...rule.media].join(),\n\
+                  iterates(HTMLFormElement), [...form].map((e) => e.localName).join()].join('|')"
+            ),
+            "true|true|false|true|color,margin-top,margin-right,margin-bottom,margin-left|display: block;|color,padding-top,padding-right,padding-bottom,padding-left|true|screen,print|true|input,button"
+        );
+    }
+
+    #[test]
     fn location_is_a_location_with_unforgeable_members() {
         // HTML #the-location-interface: every member is [LegacyUnforgeable]
         // (own, non-configurable properties), creation adds own valueOf and
@@ -32563,6 +32600,52 @@ mod tests {
                 __trust.numberStep(input.__id,1,false); check(input.value==='6','first legend exception');
                 input.type=' NUMBER '; check(input.type==='text' && Number.isNaN(input.valueAsNumber),'invalid type defaults to text');
             "#, "numeric input conformance").unwrap();
+        }
+    }
+
+    #[test]
+    fn textarea_default_value_type_and_text_length() {
+        // WHATWG HTML e5071a20 #dom-textarea-type, #dom-textarea-defaultValue
+        // (child text content / string replace all) and
+        // #dom-textarea-textLength (API value length, newlines normalized).
+        // chatgpt.com's form binding reads `textarea.defaultValue.replace(...)`
+        // while hydrating; an undefined defaultValue aborted the whole app.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = configured_engine(
+                HostState::new(
+                    Rc::new(RefCell::new(Dom::parse_document(
+                        "<!doctype html><html><body></body></html>",
+                    ))),
+                    Rc::new(RealmClock::new()),
+                ),
+                "https://example.test/",
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, r#"
+                const check = (v,m) => { if (!v) throw Error(m); };
+                const throws = (f,name) => { try { f(); } catch(e) { check(e.name===name,'expected '+name+', got '+e); return; } throw Error('missing '+name); };
+                const proto = HTMLTextAreaElement.prototype;
+                const ta = document.createElement('textarea'); document.body.appendChild(ta);
+                check(ta.type === 'textarea', 'type');
+                check(ta.defaultValue === '' && ta.textLength === 0, 'empty control');
+                ta.append('a\r\nb'); const span = document.createElement('span'); span.textContent = 'x'; ta.append(span, 'c');
+                check(ta.defaultValue === 'a\r\nbc', 'child text content excludes descendants, keeps raw newlines');
+                ta.defaultValue = 'q';
+                check(ta.childNodes.length === 1 && ta.firstChild.nodeType === 3 && ta.firstChild.data === 'q', 'string replace all');
+                ta.defaultValue = ''; check(ta.childNodes.length === 0, 'empty replace all removes children');
+                ta.defaultValue = 'a\r\nb\rc'; check(ta.textLength === 5 && ta.value === 'a\nb\nc', 'API value normalizes newlines');
+                ta.defaultValue = '\u{1F600}'; check(ta.textLength === 2, 'UTF-16 length');
+                ta.defaultValue = null; check(ta.defaultValue === 'null', 'DOMString conversion');
+                for (const name of ['type', 'defaultValue', 'textLength', 'value']) {
+                    const d = Object.getOwnPropertyDescriptor(proto, name);
+                    check(d && d.enumerable && d.configurable && typeof d.get === 'function', 'IDL descriptor ' + name);
+                }
+                check(Object.getOwnPropertyDescriptor(proto, 'type').set === undefined, 'type is readonly');
+                check(Object.getOwnPropertyDescriptor(proto, 'textLength').set === undefined, 'textLength is readonly');
+                for (const name of ['type', 'defaultValue', 'textLength'])
+                    throws(() => Object.getOwnPropertyDescriptor(proto, name).get.call(document.createElement('div')), 'TypeError');
+            "#, "textarea defaultValue conformance").unwrap();
         }
     }
 

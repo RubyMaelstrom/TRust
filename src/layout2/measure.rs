@@ -531,7 +531,19 @@ pub(super) fn boxes(
     HashMap<NodeId, PxRect>,
     HashMap<NodeId, crate::render::CssRect>,
 ) {
-    project(dom, root, fixed, top_layer, true)
+    project(dom, root, fixed, top_layer, true, true)
+}
+
+/// [`boxes`] for graphical layout, which keeps only the border boxes. Its
+/// scrolling areas skip textarea values: paint lays only the lines of a value
+/// that reach the scrollport, and only CSSOM View pays to lay the rest.
+pub(super) fn painted_boxes(
+    dom: &Dom,
+    root: &Frag,
+    fixed: &[Frag],
+    top_layer: &[TopFrag],
+) -> HashMap<NodeId, PxRect> {
+    project(dom, root, fixed, top_layer, true, false).0
 }
 
 pub(super) fn layout_boxes(
@@ -540,7 +552,7 @@ pub(super) fn layout_boxes(
     fixed: &[Frag],
     top_layer: &[TopFrag],
 ) -> HashMap<NodeId, PxRect> {
-    project(dom, root, fixed, top_layer, false).0
+    project(dom, root, fixed, top_layer, false, false).0
 }
 
 /// Each element's first box fragment's `UsedBasis` (CSSOM #resolved-values).
@@ -640,6 +652,7 @@ fn project(
     fixed: &[Frag],
     top_layer: &[TopFrag],
     visual: bool,
+    text_controls: bool,
 ) -> (
     HashMap<NodeId, PxRect>,
     HashMap<NodeId, PxRect>,
@@ -676,7 +689,11 @@ fn project(
     if !visual {
         return (out, HashMap::new(), flow.frame_viewports);
     }
-    let mut areas = super::overflow::ScrollAreas::new(dom, root);
+    let mut areas = if text_controls {
+        super::overflow::ScrollAreas::cssom(dom, root)
+    } else {
+        super::overflow::ScrollAreas::new(dom, root)
+    };
     for f in fixed {
         areas.extend(dom, f);
     }

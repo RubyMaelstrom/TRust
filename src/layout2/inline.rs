@@ -171,6 +171,78 @@ pub(crate) struct ControlText {
     /// Blink's textarea, overflowing lines clip there, not at the content
     /// edge (CSS Overflow 3 #overflow-clip-edge of a scroll container).
     pub scrollport: [f32; 4],
+    /// The value's line boxes as (width, height) from the content-box
+    /// origin: the control's scrollable overflow (CSS Overflow 3
+    /// #scrollable), which CSSOM View #dom-element-scrollheight reports.
+    /// Known at layout when every line was laid; see [`ControlText::extent`].
+    extent: std::sync::OnceLock<[f32; 2]>,
+    /// What laying the whole value needs when paint laid only the lines
+    /// that reach the scrollport.
+    rest: Option<std::sync::Arc<ControlTextRest>>,
+}
+
+/// The inputs of a multiline control's value layout, retained when paint
+/// laid only a prefix of it.
+#[derive(Debug)]
+struct ControlTextRest {
+    text: String,
+    style: InlineStyle,
+    width: f32,
+    align: super::style::Align2,
+    align_last: Option<super::style::Align2>,
+    indent: f32,
+    vp: Vp,
+}
+
+impl ControlText {
+    /// The value's scrollable extent as (width, height) from the content
+    /// origin. Paint bounds its work by the scrollport, so a value with more
+    /// lines than reach it is laid in full only here, the first time CSSOM
+    /// View asks for the control's scrolling area, and once per layout.
+    pub(crate) fn extent(&self, dom: &Dom) -> [f32; 2] {
+        *self.extent.get_or_init(|| {
+            let Some(rest) = &self.rest else {
+                return [0.0; 2];
+            };
+            // The content is one text run in the control's own style: no
+            // URL, image or form participates in laying it.
+            static BASE: std::sync::LazyLock<Url> =
+                std::sync::LazyLock::new(|| Url::parse("about:blank").expect("valid URL"));
+            let images = ImageSizes::new();
+            let content = [Inline::Text(rest.text.clone())];
+            let mut ifc = Ifc::new(
+                dom,
+                &BASE,
+                &images,
+                &[],
+                rest.vp,
+                rest.width,
+                None,
+                rest.align,
+                rest.indent,
+                None,
+                &[],
+            );
+            if let Some(align_last) = rest.align_last {
+                ifc.set_align_last(align_last);
+            }
+            ifc.run(&content, &rest.style);
+            let (lines, _, _, _, _) = ifc.finish();
+            line_extent(&lines)
+        })
+    }
+}
+
+/// The (width, height) of laid line boxes from their content origin.
+fn line_extent(lines: &[LineOut]) -> [f32; 2] {
+    let mut extent = [0.0f32; 2];
+    for line in lines {
+        for piece in &line.pieces {
+            extent[0] = extent[0].max(piece.x + piece.box_width);
+        }
+        extent[1] += line.height;
+    }
+    extent
 }
 
 /// One shaped text run of a multiline control's content.
@@ -2101,6 +2173,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                             labels.geometry.paint_height,
                             Some(self.cb_w_px),
                             label.align,
+                            label.pseudo.is_some(),
                         )
                     })
                     .flatten();
@@ -2173,6 +2246,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         height: f32,
         padding_basis: Option<f32>,
         align: super::style::Align2,
+        placeholder: bool,
     ) -> Option<std::sync::Arc<ControlText>> {
         if self.measuring || text.is_empty() {
             return None;
@@ -2185,6 +2259,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // half-leading, CSS 2 §10.8.1) overflow it upwards into view.
         let visible = height.max(0.0) + padding[BOTTOM] + ctx.font_size.max(0.0);
         let budget = textarea_line_budget(ctx, visible);
+        let value = text;
         let text = budget.map_or(text, |budget| textarea_visible_prefix(text, ctx, budget));
         let indent = self
             .dom
@@ -2208,7 +2283,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             None,
             &[],
         );
-        if let Some(align_last) = super::style::block_align_last(self.dom, node) {
+        let align_last = super::style::block_align_last(self.dom, node);
+        if let Some(align_last) = align_last {
             ifc.set_align_last(align_last);
         }
         ifc.line_budget = budget;
@@ -2216,6 +2292,31 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         root.vertical_align = VerticalAlign::Baseline;
         ifc.run(&content, &root);
         let (lines, _, _, _, _) = ifc.finish();
+        // HTML #attr-textarea-placeholder: a placeholder is a hint shown in
+        // place of the empty value, not content that can be scrolled to.
+        // Otherwise these lines are the whole value unless the prefix cut
+        // it or the budget stopped breaking.
+        let extent = std::sync::OnceLock::new();
+        let complete = placeholder
+            || (text.len() == value.len() && budget.is_none_or(|budget| lines.len() < budget));
+        let rest = if complete {
+            let _ = extent.set(if placeholder {
+                [0.0; 2]
+            } else {
+                line_extent(&lines)
+            });
+            None
+        } else {
+            Some(std::sync::Arc::new(ControlTextRest {
+                text: value.to_string(),
+                style: root.clone(),
+                width: width.max(0.0),
+                align,
+                align_last,
+                indent,
+                vp: self.vp,
+            }))
+        };
         let mut runs = Vec::new();
         let mut top = 0.0;
         for line in &lines {
@@ -2236,6 +2337,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         Some(std::sync::Arc::new(ControlText {
             lines: runs,
             scrollport: padding,
+            extent,
+            rest,
         }))
     }
 
@@ -2319,6 +2422,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     height,
                     None,
                     label.align,
+                    label.pseudo.is_some(),
                 )
             })
             .flatten();

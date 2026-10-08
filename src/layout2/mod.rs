@@ -806,7 +806,7 @@ pub fn lay_out_graphical(
             return empty_graphical_layout(viewport);
         };
         let measure_started = std::time::Instant::now();
-        let (boxes, _, _) = measure::boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
+        let boxes = measure::painted_boxes(dom, &layout.root, &layout.fixed, &layout.top_layer);
         let measure_elapsed = measure_started.elapsed();
         let (paint, patch_boundaries, boundaries) = graphics::paint(
             dom,
@@ -1075,7 +1075,7 @@ pub fn lay_graphical_subtree(
         Flow::offset_frag(&mut top.fragment, rect.x, rect.y);
     }
     flow_bottom += rect.y;
-    let (boxes, _scrolling_areas, _) = measure::boxes(dom, &frag, &fixed, &top_layer);
+    let boxes = measure::painted_boxes(dom, &frag, &fixed, &top_layer);
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
@@ -6097,6 +6097,59 @@ b</xmp></body>"#;
                     "{id}: {rect:?} escapes {bounds:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn textarea_scrolling_area_holds_its_whole_value() {
+        // HTML Rendering #the-textarea-element-2 and CSS Overflow 3
+        // #scrollable: a textarea's value scrolls inside its padding box, so
+        // CSSOM View #dom-element-scrollheight reports every line box plus
+        // the block-end padding. That holds for inline-level and blockified
+        // controls, and for a value longer than the lines paint lays. A
+        // placeholder is a hint, not scrollable content. Auto-growing
+        // composers size the control from this value.
+        let style = "font:16px/20px monospace;padding:4px;border:1px solid;margin:0;width:200px";
+        let long = (0..200)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let html = format!(
+            "<body style=margin:0><form>\
+             <textarea id=a rows=2 style='{style}'>1\n2\n3\n4\n5</textarea>\
+             <textarea id=b rows=2 style='{style};display:block'>1\n2\n3\n4\n5</textarea>\
+             <textarea id=c rows=2 style='{style};display:block'>{long}</textarea>\
+             <textarea id=d rows=2 style='{style}' placeholder='one\ntwo\nthree'></textarea>\
+             <textarea id=e rows=2 style='{style};display:block'>x</textarea>\
+             </form></body>"
+        );
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let (boxes, _, scrolling) = measure_boxes_css(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let node = |id: &str| dom.get_by_id(id).unwrap();
+        // The padding box: the border box less its 1px borders.
+        let client = |id: &str| boxes[&node(id)].height - 2.0;
+        let scroll = |id: &str| scrolling.get(&node(id)).map_or(0.0, |area| area.height);
+        for id in ["a", "b"] {
+            assert!((client(id) - 48.0).abs() < 0.5, "{id}: {}", client(id));
+            assert!((scroll(id) - 108.0).abs() < 0.5, "{id}: {}", scroll(id));
+        }
+        assert!((scroll("c") - 4008.0).abs() < 0.5, "{}", scroll("c"));
+        for id in ["d", "e"] {
+            assert!(
+                (scroll(id) - client(id)).abs() < 0.5,
+                "{id}: {} {}",
+                scroll(id),
+                client(id)
+            );
         }
     }
 
