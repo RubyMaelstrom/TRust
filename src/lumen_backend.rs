@@ -622,6 +622,10 @@ struct HostState {
     clipboard_requests: Vec<(u64, String)>,
     clipboard_settlers: HashMap<u64, Value>,
     next_clipboard_request: u64,
+    /// Fullscreen API viewport changes for the frontend: `(request, true)`
+    /// enters fullscreen and is answered with `PageCmd::FullscreenResult`;
+    /// `(_, false)` restores the normal viewport.
+    fullscreen_requests: Vec<(u64, bool)>,
     audio_context_slots: Option<Value>,
     history_slots: Option<Value>,
     history_traversals: Vec<(u64, i32)>,
@@ -731,6 +735,7 @@ impl HostState {
             clipboard_requests: Vec::new(),
             clipboard_settlers: HashMap::new(),
             next_clipboard_request: 1,
+            fullscreen_requests: Vec::new(),
             audio_context_slots: None,
             history_slots: None,
             history_traversals: Vec::new(),
@@ -948,6 +953,7 @@ impl RetainedMemory for HostState {
             clipboard_requests,
             clipboard_settlers,
             next_clipboard_request: _,
+            fullscreen_requests: _,
             audio_context_slots,
             history_slots,
             history_traversals,
@@ -4080,8 +4086,19 @@ mod desktop {
         }
     }
 
+    /// HTML's popover and dialog removing steps and Fullscreen API
+    /// #removing-steps, for top-layer elements the arena saw leave their
+    /// Document during the task (see `Dom::take_top_layer_removals`).
+    fn sync_top_layer_removals(page: &mut LumenPage) {
+        if !page.dom.borrow().has_top_layer_removals() {
+            return;
+        }
+        let _ = call_trust(page, "syncTopLayerRemovals", &[], "top layer removals");
+    }
+
     fn checkpoint(page: &mut LumenPage, label: &str) {
         let started = Instant::now();
+        sync_top_layer_removals(page);
         let mut completed = false;
         // Images created by microtasks (an awaited continuation's innerHTML)
         // update within this checkpoint too: their own microtasks then run
@@ -4105,6 +4122,11 @@ mod desktop {
             if !completed || page.dom.borrow().created_images_generation() == created {
                 break;
             }
+        }
+        // Removals by microtasks run their removing steps in this checkpoint.
+        if completed && page.dom.borrow().has_top_layer_removals() {
+            sync_top_layer_removals(page);
+            let _ = page.engine.run_microtasks_interruptible();
         }
         drain_diagnostics(page);
         // HTML #perform-a-microtask-checkpoint completes jobs and ClearKeptObjects
@@ -4838,6 +4860,56 @@ mod desktop {
                     page.outcome.errors.push(message);
                 }
                 checkpoint(page, "clipboard result");
+                finish_task_with_ack(page, events, false)
+            }
+            PageCmd::CloseRequest { modifiers } => {
+                // HTML #close-requests: the close request steps run as a
+                // task on the user interaction task source.
+                prepare_interaction(page, interrupt);
+                let consumed = call_trust(
+                    page,
+                    "closeRequest",
+                    &[
+                        Value::Bool(modifiers.shift),
+                        Value::Bool(modifiers.control),
+                        Value::Bool(modifiers.alt),
+                        Value::Bool(modifiers.meta),
+                    ],
+                    "close request",
+                )
+                .is_none_or(|value| page.engine.ctx().to_boolean(&value));
+                checkpoint(page, "close request");
+                if let Some((url, replace)) = take_navigation(page) {
+                    if events
+                        .blocking_send(PageEvt::CloseRequestHandled { consumed: true })
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    return send_navigation(events, url, replace);
+                }
+                if !finish_task_with_ack(page, events, false) {
+                    return false;
+                }
+                events
+                    .blocking_send(PageEvt::CloseRequestHandled { consumed })
+                    .is_ok()
+            }
+            PageCmd::FullscreenResult { request, ok } => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "fullscreenResult",
+                    &[Value::Num(request as f64), Value::Bool(ok)],
+                    "fullscreen result",
+                );
+                checkpoint(page, "fullscreen result");
+                finish_task_with_ack(page, events, false)
+            }
+            PageCmd::ExitFullscreen => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(page, "exitFullscreenFromFrontend", &[], "exit fullscreen");
+                checkpoint(page, "exit fullscreen");
                 finish_task_with_ack(page, events, false)
             }
             PageCmd::ReleasePointerLock => {
@@ -5595,6 +5667,22 @@ mod desktop {
                 .blocking_send(PageEvt::ClipboardWrite { request, text })
                 .is_err()
             {
+                return false;
+            }
+        }
+        let fullscreen_requests = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| std::mem::take(&mut state.fullscreen_requests))
+            .unwrap_or_default();
+        for (request, enter) in fullscreen_requests {
+            let event = if enter {
+                PageEvt::FullscreenRequest { request }
+            } else {
+                PageEvt::FullscreenExit { request }
+            };
+            if events.blocking_send(event).is_err() {
                 return false;
             }
         }
@@ -9675,6 +9763,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__storage_len", 1, host_storage_len),
     ("__storage_manager", 2, host_storage_manager),
     ("__clipboard_write", 2, host_clipboard_write),
+    ("__fullscreen_frontend", 2, host_fullscreen_frontend),
     ("__blob_mirror", 3, host_blob_mirror),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
     ("__crypto_digest", 2, host_crypto_digest),
@@ -9691,6 +9780,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__base64_convert", 2, host_base64_convert),
     ("__dom_popover", 2, guarded_popover),
     ("__dom_dialog_modal", 2, guarded_dialog_modal),
+    ("__dom_fullscreen", 2, guarded_fullscreen),
+    ("__dom_top_layer", 1, guarded_top_layer),
+    ("__dom_top_layer_removals", 0, host_dom_top_layer_removals),
+    ("__dom_inert", 1, guarded_inert),
+    ("__dom_open_dialogs", 1, guarded_open_dialogs),
     ("__wasm_validate", 1, lumen_wasm::host_validate),
     ("__wasm_compile", 1, lumen_wasm::host_compile),
     ("__wasm_module_imports", 1, lumen_wasm::host_module_imports),
@@ -10325,6 +10419,10 @@ node_access_guards! {
     guarded_focus = host_focus, [0, 1], Invalidate;
     guarded_popover = host_dom_popover, [0], Invalidate;
     guarded_dialog_modal = host_dom_dialog_modal, [0], Invalidate;
+    guarded_fullscreen = host_dom_fullscreen, [0], Invalidate;
+    guarded_top_layer = host_dom_top_layer, [0], Invalidate;
+    guarded_inert = host_dom_inert, [0], Invalidate;
+    guarded_open_dialogs = host_dom_open_dialogs, [0], Invalidate;
     guarded_template_content = host_template_content, [0], Invalidate;
     guarded_shadow_root = host_shadow_root, [0], Invalidate;
     guarded_attach_shadow = host_attach_shadow, [0], Invalidate;
@@ -17509,6 +17607,8 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     Some(
                         "::placeholder" | "::-webkit-input-placeholder" | "::-moz-placeholder",
                     ) => Some(crate::dom::PseudoEl::Placeholder),
+                    // CSS Position 4 #backdrop.
+                    Some("::backdrop") => Some(crate::dom::PseudoEl::Backdrop),
                     _ => None,
                 };
                 if !dom.is_valid(id) || !dom.is_connected(id) || pseudo.is_some() && which.is_none()
@@ -18745,6 +18845,24 @@ fn host_clipboard_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(Value::Undefined)
 }
 
+/// `__fullscreen_frontend(request, enter)`: Fullscreen API's in-parallel
+/// viewport resize of the top-level traversable, which belongs to the
+/// frontend. The frontend answers with `PageCmd::FullscreenResult` once the
+/// page has the resized viewport.
+fn host_fullscreen_frontend(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let request = args.first().and_then(Value::as_num_opt).unwrap_or(0.0);
+    let enter = matches!(args.get(1), Some(Value::Bool(true)));
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        let request = if request.is_finite() && request >= 0.0 {
+            request as u64
+        } else {
+            0
+        };
+        state.fullscreen_requests.push((request, enter));
+    }
+    Ok(Value::Undefined)
+}
+
 /// Deliver a frontend's answer to a clipboard write request.
 fn settle_clipboard_request(ctx: &mut Ctx, request: u64, ok: bool) -> Result<(), Value> {
     let settle = ctx
@@ -19203,14 +19321,19 @@ fn host_base64_convert(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     Ok(Value::from_string(output))
 }
 
+/// `__dom_popover(node[, showing])`: optionally set the popover visibility
+/// state (adding the element to, or removing it from, the top layer), then
+/// return whether it is showing.
 fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let open = matches!(args.get(1), Some(Value::Bool(true)));
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    if let Some(id) = host_arg_node(&dom, args, 0) {
-        dom.set_popover_open(id, open);
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(false));
+    };
+    if let Some(Value::Bool(open)) = args.get(1) {
+        dom.set_popover_open(id, *open);
     }
-    Ok(Value::Undefined)
+    Ok(Value::Bool(dom.is_popover_showing(id)))
 }
 
 /// `__dom_dialog_modal(node[, modal])`: optionally set a dialog's "is modal"
@@ -19225,6 +19348,70 @@ fn host_dom_dialog_modal(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         dom.set_dialog_modal(id, *modal);
     }
     Ok(Value::Bool(dom.is_modal(id)))
+}
+
+/// `__dom_fullscreen(node[, flag])`: optionally run Fullscreen API
+/// #fullscreen-an-element / #unfullscreen-an-element on the arena state
+/// (fullscreen flag plus top-layer membership), then return the flag.
+fn host_dom_fullscreen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(false));
+    };
+    if let Some(Value::Bool(fullscreen)) = args.get(1) {
+        dom.set_fullscreen_flag(id, *fullscreen);
+    }
+    Ok(Value::Bool(dom.has_fullscreen_flag(id)))
+}
+
+/// `__dom_top_layer(document)`: the document's top layer (CSS Position 4
+/// #top-layer), in order.
+fn host_dom_top_layer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let ids = {
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)
+            .map(|document| dom.document_top_layer(document))
+            .unwrap_or_default()
+    };
+    Ok(host_ids_array(ctx, ids))
+}
+
+/// `__dom_top_layer_removals()`: the elements whose removal from their
+/// document cleared their top-layer state since the last call, so script can
+/// finish their removing steps (close watchers, fullscreen events).
+fn host_dom_top_layer_removals(
+    ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let ids = dom.borrow_mut().take_top_layer_removals();
+    Ok(host_ids_array(ctx, ids))
+}
+
+/// `__dom_open_dialogs(document)`: the connected open `dialog` elements of
+/// `document`, in shadow-including tree order (see `Dom::open_dialogs`).
+fn host_dom_open_dialogs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let ids = {
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)
+            .map(|document| dom.open_dialogs(document))
+            .unwrap_or_default()
+    };
+    Ok(host_ids_array(ctx, ids))
+}
+
+/// `__dom_inert(node)`: HTML #inert-subtrees, including the inertness of a
+/// document blocked by a modal dialog.
+fn host_dom_inert(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(Value::Bool(
+        host_arg_node(&dom, args, 0).is_some_and(|id| dom.is_inert(id)),
+    ))
 }
 
 fn eval(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<(), String> {
@@ -25341,6 +25528,319 @@ mod tests {
         }
     }
 
+    /// A Window realm over `html`, for the close request, dialog, popover and
+    /// fullscreen conformance tests below.
+    fn top_layer_engine(html: &str) -> lumen::Engine {
+        configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(html))),
+                Rc::new(RealmClock::new()),
+            ),
+            DEFAULT_URL,
+        )
+    }
+
+    #[test]
+    fn close_watchers_group_without_activation_and_cancel_before_close() {
+        // HTML #close-watcher-infrastructure (local WHATWG HTML e5071a20c856):
+        // watchers created without an intervening user activation share one
+        // group, so a single close request closes them all, newest first. Each
+        // cancel is non-cancelable without history-action activation.
+        let mut engine = top_layer_engine("<body><p>page</p></body>");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const log = [];
+            const a = new CloseWatcher();
+            a.oncancel = (e) => log.push("a-cancel:" + e.cancelable);
+            a.onclose = () => log.push("a-close");
+            const b = new CloseWatcher();
+            b.addEventListener("cancel", (e) => log.push("b-cancel:" + e.cancelable));
+            b.addEventListener("close", () => log.push("b-close"));
+            log.push(__trust.closeRequest());
+            log.push(__trust.closeRequest());
+            const aborted = new AbortController();
+            const c = new CloseWatcher({signal: aborted.signal});
+            c.onclose = () => log.push("c-close");
+            aborted.abort();
+            log.push(__trust.closeRequest());
+            const d = new CloseWatcher();
+            d.onclose = () => log.push("d-close");
+            d.destroy();
+            d.close();
+            const e = new CloseWatcher();
+            e.oncancel = () => log.push("e-cancel");
+            e.onclose = () => log.push("e-close");
+            e.close();
+            try { new CloseWatcher(1); } catch (error) { log.push(error.name); }
+            log.push(Object.prototype.toString.call(e), typeof CloseWatcher.prototype.requestClose);
+            log.join("|");
+        "#
+            ),
+            "b-cancel:false|b-close|a-cancel:false|a-close|true|false|false|e-close|TypeError|[object CloseWatcher]|function"
+        );
+    }
+
+    #[test]
+    fn close_requests_fire_keydown_and_need_history_action_activation_to_cancel() {
+        // HTML #close-requests: the Escape keydown fires first and canceling it
+        // consumes the request. A cancel event can prevent closing only with
+        // history-action activation, which a prevented cancel consumes, so a
+        // second request always closes (#close-watcher-request-close). Each
+        // user activation allows one new group.
+        let mut engine = top_layer_engine("<body><p>page</p></body>");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const log = [];
+            // A non-Escape keydown is an activation-triggering input event
+            // (HTML #activation-triggering-input-event) without light dismiss.
+            const activate = () => __trust.key(null, "a", "KeyA", false, false,
+                false, false, false, false, false, 0);
+            const w = new CloseWatcher();
+            w.onclose = () => log.push("w-close");
+            document.addEventListener("keydown", (e) => {
+                if (e.key !== "Escape") return;
+                log.push("keydown:" + e.isTrusted);
+                if (log.length === 1) e.preventDefault();
+            });
+            log.push(__trust.closeRequest());
+            log.push(__trust.closeRequest());
+            const v = new CloseWatcher();
+            v.oncancel = (e) => { log.push("cancel:" + e.cancelable); e.preventDefault(); };
+            v.onclose = () => log.push("v-close");
+            activate();
+            v.requestClose();
+            v.requestClose();
+            const first = new CloseWatcher();
+            first.onclose = () => log.push("first-close");
+            activate();
+            const second = new CloseWatcher();
+            second.onclose = () => log.push("second-close");
+            log.push(__trust.closeRequest());
+            log.push(__trust.closeRequest());
+            log.join("|");
+        "#
+            ),
+            "keydown:true|true|keydown:true|w-close|true|cancel:true|cancel:false|v-close|keydown:true|second-close|true|keydown:true|first-close|true"
+        );
+    }
+
+    #[test]
+    fn modal_dialogs_answer_close_requests_by_closedby_and_request_close() {
+        // HTML #the-dialog-element: showModal() establishes the dialog's close
+        // watcher (closedBy auto → closerequest), a close request fires a
+        // non-cancelable cancel and queues close; closedby=none disables it,
+        // requestClose() ignores closedby and sets the return value. The
+        // toggle events of one task coalesce (#queue-a-dialog-toggle-event-task).
+        let mut engine = top_layer_engine("<body><dialog id=d><p>hi</p></dialog></body>");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const d = document.getElementById("d");
+            const log = [];
+            d.addEventListener("cancel", (e) => log.push("cancel:" + e.cancelable));
+            d.addEventListener("close", () => log.push("close:" + d.returnValue));
+            d.addEventListener("toggle", (e) => log.push("toggle:" + e.oldState + ">" + e.newState));
+            log.push(d.closedBy);
+            d.showModal();
+            log.push(d.closedBy, d.matches(":modal"));
+            log.push(__trust.closeRequest());
+            while (__trust.hasPlatformTask()) __trust.runPlatformTask();
+            log.push(d.open);
+            d.setAttribute("closedby", "none");
+            d.showModal();
+            log.push(d.closedBy, __trust.closeRequest(), d.open);
+            d.requestClose("r");
+            while (__trust.hasPlatformTask()) __trust.runPlatformTask();
+            log.push(d.open);
+            d.closedBy = "ANY";
+            log.push(d.getAttribute("closedby"), d.closedBy);
+            d.show();
+            log.push(d.matches(":modal"), __trust.closeRequest(), d.open);
+            while (__trust.hasPlatformTask()) __trust.runPlatformTask();
+            log.join("|");
+        "#
+            ),
+            "none|closerequest|true|cancel:false|true|toggle:closed>closed|close:|false|none|false|true|cancel:false|toggle:closed>closed|close:r|false|ANY|any|cancel:false|false|true|false|toggle:closed>closed|close:r"
+        );
+    }
+
+    #[test]
+    fn modal_dialog_makes_the_document_inert_and_restores_focus() {
+        // HTML #modal-dialogs-and-inert-subtrees: while a modal dialog blocks
+        // its Document, nodes outside it are inert and unfocusable, and the
+        // dialog focusing steps focus its first sequentially focusable
+        // descendant; closing it refocuses the previously focused element.
+        let mut engine = top_layer_engine(
+            "<body><button id=outside>out</button>\
+             <dialog id=d><p>text</p><button id=inside>in</button></dialog></body>",
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const outside = document.getElementById("outside");
+            const inside = document.getElementById("inside");
+            const d = document.getElementById("d");
+            const log = [];
+            outside.focus();
+            log.push(document.activeElement === outside);
+            d.showModal();
+            log.push(document.activeElement === inside);
+            outside.focus();
+            log.push(document.activeElement === inside);
+            d.close();
+            log.push(document.activeElement === outside);
+            d.show();
+            log.push(document.activeElement === inside);
+            outside.focus();
+            log.push(document.activeElement === outside);
+            log.join("|");
+        "#
+            ),
+            "true|true|true|true|true|true"
+        );
+    }
+
+    #[test]
+    fn popover_stack_nests_hides_unrelated_and_light_dismisses() {
+        // HTML #the-popover-attribute: a nested auto popover keeps its
+        // ancestor open (#topmost-popover-ancestor), an unrelated one hides
+        // the stack, close requests close the newest group, and a click
+        // outside every open popover light-dismisses them
+        // (#light-dismiss-open-popovers). A manual popover stays open.
+        let mut engine = top_layer_engine(
+            "<body><div id=p1 popover><div id=p2 popover>inner</div></div>\
+             <div id=p3 popover=auto>other</div><div id=m popover=manual>manual</div>\
+             <button id=b popovertarget=p3>toggle</button></body>",
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const [p1, p2, p3, m] = ["p1", "p2", "p3", "m"].map((id) => document.getElementById(id));
+            const open = () => [p1, p2, p3, m].map((p) => p.matches(":popover-open") ? 1 : 0).join("");
+            // A non-Escape keydown is an activation-triggering input event
+            // (HTML #activation-triggering-input-event) without light dismiss.
+            const activate = () => __trust.key(null, "a", "KeyA", false, false,
+                false, false, false, false, false, 0);
+            const log = [];
+            m.showPopover();
+            p1.showPopover();
+            p2.showPopover();
+            log.push(open());
+            p3.showPopover();
+            log.push(open());
+            p3.hidePopover();
+            p1.showPopover();
+            activate();
+            log.push(open());
+            p1.showPopover({source: document.getElementById("b")});
+            activate();
+            p2.showPopover();
+            log.push(open(), __trust.closeRequest(), open(), __trust.closeRequest(), open());
+            p1.showPopover();
+            log.push(p1.togglePopover(), p1.togglePopover(true), p1.togglePopover({force: true}));
+            try { m.togglePopover(); m.popover = null; m.togglePopover(); } catch (e) { log.push(e.name); }
+            log.push(open());
+            document.getElementById("b").click();
+            log.push(open());
+            try { document.body.showPopover(); } catch (e) { log.push(e.name); }
+            // A trusted pointerdown/pointerup outside every popover.
+            __trust.pointerButton(null, true, 1, 1, 1, 1, 0, 0);
+            log.push(open());
+            __trust.pointerButton(null, false, 1, 1, 1, 1, 0, 0);
+            log.push(open());
+            log.join("|");
+        "#
+            ),
+            "1101|0011|1001|1101|true|1001|true|0001|false|true|true|NotSupportedError|1000|0010|NotSupportedError|0010|0000"
+        );
+    }
+
+    #[test]
+    fn fullscreen_requires_activation_uses_the_top_layer_and_exits_on_close_request() {
+        // Fullscreen API (local WHATWG 7c38d773): requestFullscreen needs
+        // transient activation; the frontend resizes the viewport before the
+        // element becomes the fullscreen element (top layer, :fullscreen,
+        // :modal); events fire at the rendering update; a close request fully
+        // exits fullscreen without firing keydown (HTML #close-requests).
+        let mut engine = top_layer_engine("<body><div id=player>video</div></body>");
+        // One task, its microtask checkpoint, the queued tasks with theirs,
+        // then a rendering update (which runs the fullscreen steps).
+        let step = |engine: &mut lumen::Engine, source: &str| {
+            eval(engine, source, "fullscreen step").unwrap();
+            run_microtask_checkpoint(engine);
+            while string_value(engine, "__trust.hasPlatformTask()") == "true" {
+                eval(engine, "__trust.runPlatformTask()", "fullscreen task").unwrap();
+                run_microtask_checkpoint(engine);
+            }
+            eval(
+                engine,
+                "__trust.runRenderingFrame(performance.now())",
+                "fullscreen frame",
+            )
+            .unwrap();
+            run_microtask_checkpoint(engine);
+        };
+        step(
+            &mut engine,
+            r#"
+            globalThis.player = document.getElementById("player");
+            globalThis.log = [];
+            document.addEventListener("fullscreenchange", (e) =>
+                log.push("change:" + (e.target === player ? "player" : "document") + ":" + e.bubbles + e.composed));
+            document.addEventListener("fullscreenerror", () => log.push("error"));
+            document.addEventListener("keydown", (e) => { if (e.key === "Escape") log.push("keydown"); });
+            log.push(document.fullscreenEnabled, document.fullscreenElement);
+            player.requestFullscreen().then(() => log.push("resolved"), (e) => log.push("rejected:" + e.name));
+        "#,
+        );
+        step(
+            &mut engine,
+            r#"
+            __trust.key(null, "a", "KeyA", false, false, false, false, false, false, false, 0);
+            player.requestFullscreen({navigationUI: "hide"}).then(() => log.push("resolved"));
+            log.push(document.fullscreenElement === null);
+        "#,
+        );
+        step(&mut engine, "__trust.fullscreenResult(1, true);");
+        step(
+            &mut engine,
+            r#"
+            log.push(document.fullscreenElement === player, player.matches(":fullscreen"),
+                player.matches(":modal"), document.fullscreen);
+            log.push(__trust.closeRequest());
+        "#,
+        );
+        // The exit continues once the frontend restored the viewport.
+        step(
+            &mut engine,
+            "log.push(document.fullscreenElement === player); __trust.fullscreenResult(2, true);",
+        );
+        step(
+            &mut engine,
+            r#"
+            log.push(document.fullscreenElement, player.matches(":fullscreen"));
+            document.exitFullscreen().catch((e) => log.push("exit:" + e.name));
+        "#,
+        );
+        assert_eq!(
+            string_value(&mut engine, "log.join('|')"),
+            "true||rejected:TypeError|error|true|resolved|change:player:truetrue|true|true|true|true|true|true|change:player:truetrue||false|exit:TypeError"
+        );
+        let requests = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| std::mem::take(&mut state.fullscreen_requests))
+            .unwrap();
+        assert_eq!(requests, vec![(1, true), (2, false)]);
+    }
+
     #[test]
     fn image_data_constructor_and_structured_clone_conformance() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -26017,7 +26517,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 218, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 224, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -26028,7 +26528,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 218);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 224);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

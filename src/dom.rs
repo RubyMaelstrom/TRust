@@ -15,7 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use compute::{ComputeView, StyleBackend};
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
-use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, ns};
+use html5ever::{Attribute, Namespace, ParseOpts, Prefix, QualName, local_name, ns};
 use style_view::{ClassMemo, StyleView};
 
 #[cfg(feature = "architecture-diagnostics")]
@@ -846,14 +846,35 @@ pub struct Dom {
     /// pseudo-class. A removed node's stale entry is harmless (the id stops
     /// rendering with the node).
     popover_open: FxHashSet<NodeId>,
-    /// Top-layer order for showing popovers. CSS Positioned Layout 4 §3 uses
-    /// an ordered set and paints its last element on top; a hash-set alone
-    /// loses that observable order when more than one manual popover is open.
-    popover_order: Vec<NodeId>,
+    /// The documents' top layers (CSS Positioned Layout 4 #top-layer): one
+    /// ordered set holding the showing popovers, modal dialogs and fullscreen
+    /// elements of every document in the arena. Each document's top layer is
+    /// the subsequence of its own elements; the last one paints on top. The
+    /// `__dom_popover`, `__dom_dialog_modal` and `__dom_fullscreen` syscalls
+    /// run the "add to"/"remove from the top layer" steps for their features.
+    /// TRust has no `overlay` transitions, so a requested removal is
+    /// processed at once (CSS Position 4 #process-top-layer-removals finds
+    /// `overlay: none` at the next rendering update).
+    top_layer: Vec<NodeId>,
     /// `dialog` elements whose "is modal" flag is true (HTML §4.11.4), written
     /// by `showModal()`/close through the `__dom_dialog_modal` syscall and
     /// cleared when the dialog is removed. Read by `:modal` (HTML #selector-modal).
     modal_dialogs: FxHashSet<NodeId>,
+    /// Elements whose fullscreen flag is set (Fullscreen API #model), written
+    /// by the `__dom_fullscreen` syscall's "fullscreen an element" and
+    /// "unfullscreen an element" steps. Read by `:fullscreen`, `:modal` and the
+    /// fullscreen UA style sheet.
+    fullscreen_flags: FxHashSet<NodeId>,
+    /// Top-layer elements whose removal from the document cleared their
+    /// popover/modal/fullscreen state here (HTML's dialog and popover removing
+    /// steps, Fullscreen API's removing steps). The page actor drains these to
+    /// run the remaining script-visible steps (close watchers, fullscreen
+    /// events) for elements the arena already took out of the top layer.
+    top_layer_removed: Vec<NodeId>,
+    /// HTML `dialog` elements ever created in this arena. While none exists,
+    /// the page actor skips searching for open dialogs whose setup steps ran
+    /// outside script (the parser, fragment parsing, cloning).
+    dialog_elements: usize,
     /// `script` elements whose "already started" flag is true (HTML
     /// #already-started): set by the HTML fragment parser's Inert scripting
     /// mode and when a script is prepared to run, copied by cloning, and
@@ -983,6 +1004,7 @@ struct CascadedMaps {
     first_letter: FxHashMap<String, String>,
     marker: FxHashMap<String, String>,
     placeholder: FxHashMap<String, String>,
+    backdrop: FxHashMap<String, String>,
     custom_bases: FxHashMap<(Option<PseudoEl>, String), std::sync::Arc<url::Url>>,
 }
 
@@ -995,6 +1017,7 @@ impl CascadedMaps {
             && self.first_letter == other.first_letter
             && self.marker == other.marker
             && self.placeholder == other.placeholder
+            && self.backdrop == other.backdrop
             && self.custom_bases.len() == other.custom_bases.len()
             && self
                 .custom_bases
@@ -1009,6 +1032,7 @@ impl CascadedMaps {
             PseudoEl::FirstLetter => &self.first_letter,
             PseudoEl::Marker => &self.marker,
             PseudoEl::Placeholder => &self.placeholder,
+            PseudoEl::Backdrop => &self.backdrop,
         }
     }
 
@@ -1020,6 +1044,7 @@ impl CascadedMaps {
             Some(PseudoEl::FirstLetter) => &mut self.first_letter,
             Some(PseudoEl::Marker) => &mut self.marker,
             Some(PseudoEl::Placeholder) => &mut self.placeholder,
+            Some(PseudoEl::Backdrop) => &mut self.backdrop,
         }
     }
 }
@@ -1166,8 +1191,11 @@ impl Dom {
             scroll_epoch,
             hover_chain,
             popover_open,
-            popover_order,
+            top_layer,
             modal_dialogs,
+            fullscreen_flags,
+            top_layer_removed,
+            dialog_elements: _,
             started_scripts,
         } = self;
         let _ = (
@@ -1592,11 +1620,11 @@ impl Dom {
         bytes += focused_areas.capacity() * std::mem::size_of::<(NodeId, NodeId)>();
         fixed_set!(popover_open, NodeId);
         bytes = bytes.saturating_add(
-            popover_order
-                .capacity()
+            (top_layer.capacity() + top_layer_removed.capacity())
                 .saturating_mul(std::mem::size_of::<NodeId>()),
         );
         fixed_set!(modal_dialogs, NodeId);
+        fixed_set!(fullscreen_flags, NodeId);
         fixed_set!(started_scripts, NodeId);
 
         match layout_cache.try_borrow() {
@@ -1705,8 +1733,11 @@ impl Dom {
             scroll_epoch: 0,
             hover_chain: FxHashSet::default(),
             popover_open: FxHashSet::default(),
-            popover_order: Vec::new(),
+            top_layer: Vec::new(),
             modal_dialogs: FxHashSet::default(),
+            fullscreen_flags: FxHashSet::default(),
+            top_layer_removed: Vec::new(),
+            dialog_elements: 0,
             started_scripts: FxHashSet::default(),
         };
         dom.new_node(NodeData::Document);
@@ -1978,23 +2009,41 @@ impl Dom {
         out
     }
 
+    /// CSS Position 4 #add-an-element-to-the-top-layer: an element already
+    /// contained (pending removal) is removed first, then appended last.
+    fn top_layer_add(&mut self, id: NodeId) {
+        self.top_layer.retain(|&node| node != id);
+        self.top_layer.push(id);
+    }
+
+    /// CSS Position 4 #remove-an-element-from-the-top-layer-immediately. TRust
+    /// has no `overlay` transitions, so "request an element to be removed from
+    /// the top layer" also lands here: its pending removal would be processed
+    /// at the next rendering update with `overlay` already `none`.
+    fn top_layer_remove(&mut self, id: NodeId) -> bool {
+        let before = self.top_layer.len();
+        self.top_layer.retain(|&node| node != id);
+        before != self.top_layer.len()
+    }
+
     /// Set/clear an element's popover SHOWING state (HTML §the popover
-    /// attribute). Bumps the main epoch on change — the UA hide rule and
+    /// attribute): the show popover algorithm adds the element to the top
+    /// layer before setting its visibility state to showing, and hiding
+    /// removes it again. Bumps the main epoch on change — the UA hide rule and
     /// `:popover-open` both read this, so hidden/match memos must refresh —
-    /// and marks the document dirty (an open/closed popover renders
-    /// differently by definition). Never touches `style_epoch`: the sheet set
-    /// is unchanged.
+    /// and marks the document dirty. Never touches `style_epoch`: the sheet
+    /// set is unchanged.
     pub fn set_popover_open(&mut self, id: NodeId, open: bool) {
         let changed = if open {
             let inserted = self.popover_open.insert(id);
             if inserted {
-                self.popover_order.push(id);
+                self.top_layer_add(id);
             }
             inserted
         } else {
             let removed = self.popover_open.remove(&id);
             if removed {
-                self.popover_order.retain(|&node| node != id);
+                self.top_layer_remove(id);
             }
             removed
         };
@@ -2010,54 +2059,201 @@ impl Dom {
         self.style_view().is_popover_showing(id)
     }
 
-    /// Stable position in the document top layer, used by the painter. The
-    /// presentation marker transports the actor arena's ordered-set index.
-    pub fn popover_top_layer_order(&self, id: NodeId) -> Option<usize> {
-        self.popover_order
-            .iter()
-            .position(|&node| node == id)
-            .or_else(|| {
-                self.attr(id, "data-trust-popover-open")
-                    .and_then(|value| value.parse().ok())
-            })
+    /// The element's position in its document's top layer (CSS Positioned
+    /// Layout 4 #top-layer), used to generate it as a root sibling and to
+    /// paint the layer in order. Presentation arenas read the marker carrying
+    /// the live arena's ordered-set index.
+    pub fn top_layer_order(&self, id: NodeId) -> Option<usize> {
+        self.style_view().top_layer_order(id)
     }
 
-    /// Set a `dialog`'s "is modal" flag (HTML §4.11.4: true from showing it
-    /// modally until it is closed or removed). Like popover state, a change
-    /// can alter `:modal` matches, so the match memos must refresh.
+    /// CSS Position 4 #rendered-in-the-top-layer (TRust has no `overlay`
+    /// transitions, so this is also "in the top layer").
+    pub fn in_top_layer(&self, id: NodeId) -> bool {
+        self.top_layer_order(id).is_some()
+    }
+
+    /// The elements of `document`'s top layer, in order.
+    pub fn document_top_layer(&self, document: NodeId) -> Vec<NodeId> {
+        self.top_layer
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.nodes
+                    .get(id)
+                    .is_some_and(|node| node.owner_document == document)
+            })
+            .collect()
+    }
+
+    /// Set or clear a `dialog`'s "is modal" flag together with its top-layer
+    /// membership (HTML #show-a-modal-dialog adds the dialog to the top layer
+    /// unless already contained; #close-the-dialog requests its removal when it
+    /// was modal). A change alters `:modal` and the document's blocking state.
     pub fn set_dialog_modal(&mut self, id: NodeId, modal: bool) {
         let changed = if modal {
-            self.modal_dialogs.insert(id)
+            let inserted = self.modal_dialogs.insert(id);
+            let added = !self.top_layer.contains(&id);
+            if added {
+                self.top_layer_add(id);
+            }
+            inserted || added
         } else {
-            self.modal_dialogs.remove(&id)
+            let removed = self.modal_dialogs.remove(&id);
+            if removed {
+                self.top_layer_remove(id);
+            }
+            removed
         };
         if changed {
             self.touch();
         }
     }
 
-    /// HTML #selector-modal: a `dialog` whose "is modal" flag is true. TRust
-    /// has no Fullscreen API, so no element has a fullscreen flag. Serialized
-    /// presentation arenas carry the state as an internal marker.
+    /// A `dialog`'s "is modal" flag (HTML §4.11.4). Serialized presentation
+    /// arenas carry the state as an internal marker.
     pub fn is_modal(&self, id: NodeId) -> bool {
         self.style_view().is_modal(id)
     }
 
-    /// The dialog removing steps set "is modal" to false. Removal is the only
-    /// tree mutation that changes the flag, and every modal dialog is connected,
-    /// so after unlinking a subtree the flag survives exactly on connected dialogs.
-    fn clear_modal_disconnected(&mut self) {
-        if self.modal_dialogs.is_empty() {
+    /// Fullscreen API #fullscreen-an-element (whose hide-popovers step script
+    /// runs first): set the fullscreen flag, remove the element from the top
+    /// layer immediately and add it again. `false` runs #unfullscreen-an-element:
+    /// clear the flag and remove the element from the top layer immediately.
+    pub fn set_fullscreen_flag(&mut self, id: NodeId, fullscreen: bool) {
+        if fullscreen {
+            self.fullscreen_flags.insert(id);
+            self.top_layer_add(id);
+            self.touch();
+        } else {
+            let cleared = self.fullscreen_flags.remove(&id);
+            if self.top_layer_remove(id) || cleared {
+                self.touch();
+            }
+        }
+    }
+
+    /// Fullscreen API #fullscreen-flag.
+    pub fn has_fullscreen_flag(&self, id: NodeId) -> bool {
+        self.style_view().has_fullscreen_flag(id)
+    }
+
+    /// Fullscreen API #fullscreen-element: the topmost element in `document`'s
+    /// top layer whose fullscreen flag is set.
+    pub fn fullscreen_element(&self, document: NodeId) -> Option<NodeId> {
+        self.top_layer.iter().rev().copied().find(|&id| {
+            self.fullscreen_flags.contains(&id)
+                && self
+                    .nodes
+                    .get(id)
+                    .is_some_and(|node| node.owner_document == document)
+        })
+    }
+
+    /// HTML #blocked-by-a-modal-dialog: the topmost modal `dialog` in
+    /// `document`'s top layer, if any.
+    pub fn blocking_modal_dialog(&self, document: NodeId) -> Option<NodeId> {
+        self.style_view().blocking_modal_dialog(document)
+    }
+
+    /// HTML #inert-subtrees: whether `id` is inert — beneath an element with
+    /// an `inert` attribute, or connected to a Document blocked by a modal
+    /// dialog without being that dialog or one of its flat-tree descendants
+    /// (HTML #modal-dialogs-and-inert-subtrees). The blocking dialog escapes
+    /// the inertness of its ancestors; content of an inert navigable
+    /// container is inert too, as its container is not hit-testable.
+    pub fn is_inert(&self, id: NodeId) -> bool {
+        self.style_view().is_inert(id)
+    }
+
+    /// Whether any document in this arena is blocked by a modal dialog
+    /// (live state, or the presentation marker on the root element), so
+    /// callers can skip per-node inertness walks on ordinary pages.
+    pub fn any_document_blocked(&self) -> bool {
+        !self.modal_dialogs.is_empty()
+            || self
+                .document_element()
+                .is_some_and(|root| self.attr(root, "data-trust-blocked").is_some())
+    }
+
+    /// HTML #dialog-setup-steps run for every connected `dialog` with an
+    /// `open` attribute: these are the members of `document`'s open dialogs
+    /// list, in shadow-including tree order. Script maintains the list's
+    /// order; this finds dialogs opened by the parser or other non-script
+    /// routes, and is empty without a single dialog element in the arena.
+    pub fn open_dialogs(&self, document: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        if self.dialog_elements == 0 {
+            return out;
+        }
+        self.visit_shadow_including_subtree(document, |id| {
+            if let NodeData::Element { name, .. } = &self.nodes[id].data
+                && name.local == local_name!("dialog")
+                && name.ns == ns!(html)
+                && self.nodes[id].owner_document == document
+                && self.attr(id, "open").is_some()
+            {
+                out.push(id);
+            }
+            true
+        });
+        out
+    }
+
+    /// Script-visible removing steps still owed for top-layer state the arena
+    /// cleared when its element left the document (see `top_layer_removed`).
+    pub fn take_top_layer_removals(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.top_layer_removed)
+    }
+
+    /// Whether removing steps of top-layer elements await script.
+    pub fn has_top_layer_removals(&self) -> bool {
+        !self.top_layer_removed.is_empty()
+    }
+
+    /// The removing steps of HTML's dialog (#the-dialog-element: remove from
+    /// the top layer immediately, set "is modal" to false) and popover
+    /// (#the-popover-attribute: hide a showing popover without events).
+    /// Removal is the only tree mutation that changes this state, and every
+    /// such element was connected, so after unlinking a subtree the state
+    /// survives exactly on connected elements. Fullscreen elements are only
+    /// recorded: their removing steps run in script (see
+    /// `take_top_layer_removals`).
+    fn clear_top_layer_disconnected(&mut self) {
+        if self.top_layer.is_empty()
+            && self.modal_dialogs.is_empty()
+            && self.popover_open.is_empty()
+            && self.fullscreen_flags.is_empty()
+        {
             return;
         }
-        let removed: Vec<_> = self
-            .modal_dialogs
-            .iter()
-            .copied()
-            .filter(|&id| !self.is_dom_connected(id))
-            .collect();
-        for id in removed {
-            self.set_dialog_modal(id, false);
+        let mut candidates: Vec<NodeId> = self.top_layer.clone();
+        candidates.extend(self.modal_dialogs.iter().copied());
+        candidates.extend(self.popover_open.iter().copied());
+        candidates.extend(self.fullscreen_flags.iter().copied());
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut changed = false;
+        for id in candidates {
+            if self.is_dom_connected(id) {
+                continue;
+            }
+            if !self.top_layer_removed.contains(&id) {
+                self.top_layer_removed.push(id);
+            }
+            // Fullscreen API #removing-steps decide between exiting fullscreen
+            // and unfullscreening by whether the node is still its Document's
+            // fullscreen element, so script runs them on the intact state.
+            if self.fullscreen_flags.contains(&id) {
+                continue;
+            }
+            self.popover_open.remove(&id);
+            self.modal_dialogs.remove(&id);
+            self.top_layer_remove(id);
+            changed = true;
+        }
+        if changed {
+            self.touch();
         }
     }
 
@@ -3328,6 +3524,12 @@ impl Dom {
     }
 
     fn new_node(&mut self, data: NodeData) -> NodeId {
+        if let NodeData::Element { name, .. } = &data
+            && name.local == local_name!("dialog")
+            && name.ns == ns!(html)
+        {
+            self.dialog_elements = self.dialog_elements.saturating_add(1);
+        }
         let id = self.nodes.allocate(Node {
             parent: None,
             first_child: None,
@@ -3685,7 +3887,7 @@ impl Dom {
         if let Some(parent) = parent {
             self.child_collection_changed(parent, id, false);
             self.note_picture_child_change(parent, id);
-            self.clear_modal_disconnected();
+            self.clear_top_layer_disconnected();
         }
         if let Some(select) = affected_select {
             self.run_selectedness_setting_algorithm(select);
@@ -3904,7 +4106,7 @@ impl Dom {
         }
         self.nodes[parent].first_child = None;
         self.nodes[parent].last_child = None;
-        self.clear_modal_disconnected();
+        self.clear_top_layer_disconnected();
 
         let owner_document = self.nodes[parent].owner_document;
         let mut previous = None;
@@ -4618,7 +4820,12 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         // declaration which author `display:block` can override. Tooltip
         // libraries commonly retain that inline display while hidden; allowing
         // it to win resurrects every closed menu in the presentation snapshot.
-        if !self.is_popover_showing(id) && self.attr(id, "popover").is_some() {
+        // HTML #flow-content-3 exempts an open dialog shown with show():
+        // `[popover]:not(:popover-open):not(dialog[open]) { display:none }`.
+        if !self.is_popover_showing(id)
+            && self.attr(id, "popover").is_some()
+            && !(self.tag_name(id) == Some("dialog") && self.attr(id, "open").is_some())
+        {
             return BoxGeneration::HIDDEN;
         }
         // `display:none` generates NO box (the element and subtree occupy no
@@ -4687,7 +4894,9 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         // A non-showing popover is in the UA's display:none state regardless
         // of a retained inline display declaration; showing state is separate
         // from the content attribute and author cascade.
-        !self.is_popover_showing(id) && self.attr(id, "popover").is_some()
+        !self.is_popover_showing(id)
+            && self.attr(id, "popover").is_some()
+            && !(self.tag_name(id) == Some("dialog") && self.attr(id, "open").is_some())
     }
 }
 
@@ -4747,14 +4956,7 @@ impl Dom {
         {
             return false;
         }
-        let mut cur = Some(id);
-        while let Some(node) = cur {
-            if self.attr(node, "inert").is_some() {
-                return false;
-            }
-            cur = self.parent_composed(node);
-        }
-        true
+        !self.is_inert(id)
     }
 }
 
@@ -4999,6 +5201,13 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 .and_then(|p| self.effective_display(p)),
             Some(WideKeyword::Initial | WideKeyword::Unset) => Some("inline".to_string()),
             Some(WideKeyword::Revert) => None,
+            // CSS Position 4 #top-styling: an element rendered in the top
+            // layer whose specified `display` is `contents` computes `block`.
+            None if v.trim().eq_ignore_ascii_case("contents")
+                && self.top_layer_order(id).is_some() =>
+            {
+                Some("block".to_string())
+            }
             None => Some(v),
         }
     }
@@ -5337,6 +5546,11 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         {
             return Some(String::from("hidden"));
         }
+        // Fullscreen API #user-agent-level-style-sheet-defaults: the
+        // fullscreen element's UA-important geometry.
+        if let Some(value) = self.fullscreen_ua_important(id, name) {
+            return Some(value.to_owned());
+        }
         // CSS Cascade 5 #computed: non-inherited properties have one current
         // value too. The same style/font invalidation that protects inherited
         // results protects these reads; formatting-dependent used values and
@@ -5371,6 +5585,18 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             None => author
                 .or_else(|| self.ua_default(id, name))
                 .or_else(|| inherited.then(parent_computed).flatten()),
+        };
+        // CSS Position 4 #top-styling: an element rendered in the top layer
+        // whose specified `position` is not `absolute` or `fixed` computes to
+        // `absolute`.
+        let v = if name == "position"
+            && self.top_layer_order(id).is_some()
+            && !v.as_deref().map(str::trim).is_some_and(|value| {
+                value.eq_ignore_ascii_case("absolute") || value.eq_ignore_ascii_case("fixed")
+            }) {
+            Some(String::from("absolute"))
+        } else {
+            v
         };
         // CSS Inline 3 #line-height-property: lengths and percentages compute
         // BEFORE inheritance; only unitless numbers remain relative to each
@@ -6497,6 +6723,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
     fn ua_default(&self, id: NodeId, name: &str) -> Option<String> {
         let tag = self.tag_name(id)?;
         let v = match name {
+            _ if let Some(value) = self.top_layer_ua_default(id, tag, name) => value,
             // HTML Rendering #tables-2: in quirks mode a table does not
             // inherit these from its context.
             "font-weight"
@@ -6672,6 +6899,111 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
 }
 
 impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
+    /// HTML #flow-content-3's `dialog`, `dialog:modal` and `[popover]` rules,
+    /// and the non-important `object-fit: contain` of Fullscreen API
+    /// #user-agent-level-style-sheet-defaults. Among them `dialog:modal`
+    /// (0,1,1) outranks `[popover]` (0,1,0), which outranks `dialog` (0,0,1).
+    fn top_layer_ua_default(&self, id: NodeId, tag: &str, name: &str) -> Option<&'static str> {
+        if self.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml") {
+            return (name == "object-fit" && self.fullscreen_ua_applies(id)).then_some("contain");
+        }
+        let dialog = tag == "dialog";
+        let popover = self.attr(id, "popover").is_some();
+        if !dialog && !popover {
+            return (name == "object-fit" && self.fullscreen_ua_applies(id)).then_some("contain");
+        }
+        let modal = dialog && self.is_dialog_modal(id);
+        // The logical insets resolve against the element's writing mode
+        // (CSS Logical 1 #inset-properties): `inset-inline-*` are the
+        // horizontal sides unless the inline axis is vertical.
+        let inline_side = |side: &str| {
+            // Read lazily: `writing-mode` itself reaches this UA default.
+            let vertical = self
+                .computed_value_resolved(id, "writing-mode")
+                .is_some_and(|mode| {
+                    mode.trim().starts_with("vertical") || mode.trim().starts_with("sideways")
+                });
+            if vertical {
+                matches!(side, "top" | "bottom")
+            } else {
+                matches!(side, "left" | "right")
+            }
+        };
+        Some(match name {
+            "position" if modal || popover => "fixed",
+            "position" => "absolute",
+            "overflow" | "overflow-x" | "overflow-y" if modal || popover => "auto",
+            "max-width" | "max-height" if modal => "calc(100% - 6px - 2em)",
+            "top" | "right" | "bottom" | "left" if popover => "0px",
+            "top" | "right" | "bottom" | "left" if modal && !inline_side(name) => "0px",
+            "top" | "right" | "bottom" | "left" if inline_side(name) => "0px",
+            "width" | "height" => "fit-content",
+            "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => "auto",
+            "border-top-style"
+            | "border-right-style"
+            | "border-bottom-style"
+            | "border-left-style" => "solid",
+            "padding-top" | "padding-right" | "padding-bottom" | "padding-left" if popover => {
+                "0.25em"
+            }
+            "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => "1em",
+            "color" => "canvastext",
+            "background-color" => "canvas",
+            "object-fit" if self.fullscreen_ua_applies(id) => "contain",
+            _ => return None,
+        })
+    }
+
+    /// Fullscreen API `*|*:not(:root):fullscreen`: the fullscreen flag on an
+    /// element other than the document element.
+    fn fullscreen_ua_applies(&self, id: NodeId) -> bool {
+        self.has_fullscreen_flag(id)
+            && !self
+                .style_view()
+                .nodes
+                .parent(id)
+                .is_some_and(|parent| self.style_view().nodes.is_document(parent))
+    }
+
+    /// The `!important` declarations of Fullscreen API
+    /// #user-agent-level-style-sheet-defaults. UA-important declarations
+    /// outrank every author declaration (CSS Cascade 5 #cascade-origin).
+    fn fullscreen_ua_important(&self, id: NodeId, name: &str) -> Option<&'static str> {
+        if !self.fullscreen_ua_applies(id) {
+            return None;
+        }
+        let iframe = self.tag_name(id) == Some("iframe")
+            && self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml");
+        Some(match name {
+            "position" => "fixed",
+            "top" | "right" | "bottom" | "left" => "0px",
+            "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => "0px",
+            "box-sizing" => "border-box",
+            "min-width" | "min-height" => "0px",
+            "max-width" | "max-height" => "none",
+            "width" | "height" => "100%",
+            "transform" => "none",
+            "border-top-style"
+            | "border-right-style"
+            | "border-bottom-style"
+            | "border-left-style"
+                if iframe =>
+            {
+                "none"
+            }
+            "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-left-width"
+                if iframe =>
+            {
+                "0px"
+            }
+            "padding-top" | "padding-right" | "padding-bottom" | "padding-left" if iframe => "0px",
+            _ => return None,
+        })
+    }
+
     fn ol_marker_default(&self, id: NodeId) -> &'static str {
         match self.attr(id, "type") {
             Some("a") => "lower-alpha",
@@ -6940,6 +7272,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             mut first_letter,
             mut marker,
             mut placeholder,
+            mut backdrop,
             conditional: conditional_pseudos,
             ..
         } = winners;
@@ -6960,6 +7293,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     first_letter: Default::default(),
                     marker: Default::default(),
                     placeholder: Default::default(),
+                    backdrop: Default::default(),
                     custom_bases: Default::default(),
                 }),
             );
@@ -6976,6 +7310,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     Some(PseudoEl::FirstLetter) => &mut first_letter,
                     Some(PseudoEl::Marker) => &mut marker,
                     Some(PseudoEl::Placeholder) => &mut placeholder,
+                    Some(PseudoEl::Backdrop) => &mut backdrop,
                     _ => &mut after,
                 };
                 for (pk, (imp, value)) in &r.decls {
@@ -7004,6 +7339,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             first_letter: strip_winners(&first_letter),
             marker: strip_winners(&marker),
             placeholder: strip_winners(&placeholder),
+            backdrop: strip_winners(&backdrop),
             custom_bases: Default::default(),
         };
         for (pseudo, name, order) in custom_property_sources([
@@ -7013,6 +7349,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             (Some(PseudoEl::FirstLetter), &first_letter),
             (Some(PseudoEl::Marker), &marker),
             (Some(PseudoEl::Placeholder), &placeholder),
+            (Some(PseudoEl::Backdrop), &backdrop),
         ]) {
             if let Some(base) = index.rule_bases.get(&order) {
                 maps.custom_bases.insert((pseudo, name), base.clone());
@@ -7031,6 +7368,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 (Some(PseudoEl::FirstLetter), &first_letter),
                 (Some(PseudoEl::Marker), &marker),
                 (Some(PseudoEl::Placeholder), &placeholder),
+                (Some(PseudoEl::Backdrop), &backdrop),
             ] {
                 let custom_count = winners.keys().filter(|k| k.starts_with("--")).count();
                 for pass in 0..=custom_count + 1 {
@@ -7117,9 +7455,17 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         // CSS Logical 1 #box: compute axes before pairing declarations.
         // Keep every layer candidate, including a physical fallback below a
         // logical revert-layer. Source order includes declaration order.
-        if [&elem, &before, &after, &first_letter, &marker, &placeholder]
-            .iter()
-            .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
+        if [
+            &elem,
+            &before,
+            &after,
+            &first_letter,
+            &marker,
+            &placeholder,
+            &backdrop,
+        ]
+        .iter()
+        .any(|map| map.keys().any(|key| logical_to_physical(key).is_some()))
         {
             self.cascaded_cache().borrow_mut().put(
                 id,
@@ -7133,6 +7479,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 (Some(PseudoEl::FirstLetter), &mut first_letter),
                 (Some(PseudoEl::Marker), &mut marker),
                 (Some(PseudoEl::Placeholder), &mut placeholder),
+                (Some(PseudoEl::Backdrop), &mut backdrop),
             ] {
                 let logical: Vec<_> = winners
                     .keys()
@@ -7690,6 +8037,15 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         let Some(guard) = self.property_guard(id, Some(which), prop) else {
             return self.computed_value_resolved(id, prop);
         };
+        // HTML #flow-content-3: `:popover-open::backdrop { pointer-events:
+        // none !important }` outranks every author declaration.
+        if which == PseudoEl::Backdrop
+            && prop == "pointer-events"
+            && self.is_popover_showing(id)
+            && self.attr(id, "popover").is_some()
+        {
+            return Some("none".into());
+        }
         let direct = self
             .pseudo_style(id, which, prop)
             .or_else(|| self.baked_pseudo_value(id, which, prop))
@@ -7707,6 +8063,9 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         // The UA origin of `::placeholder` sets its `color`; `revert` rolls
         // an author declaration back to it (CSS Cascade 5 #default).
         let ua_value = || {
+            if which == PseudoEl::Backdrop {
+                return self.backdrop_ua_value(id, prop);
+            }
             (which == PseudoEl::Placeholder && prop == "color")
                 .then(|| self.placeholder_ua_color(id))
         };
@@ -7734,6 +8093,41 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             });
         }
         value
+    }
+}
+
+impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
+    /// The UA style sheet's `::backdrop` declarations, most specific first:
+    /// Fullscreen API #user-agent-level-style-sheet-defaults
+    /// (`*|*:not(:root):fullscreen::backdrop { background: black }`), HTML
+    /// #flow-content-3 (`:popover-open::backdrop` and `dialog::backdrop`) and
+    /// CSS Position 4 #backdrop (`::backdrop { position: fixed; inset: 0 }`).
+    fn backdrop_ua_value(&self, id: NodeId, prop: &str) -> Option<String> {
+        let html = self.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml");
+        let popover_open =
+            html && self.is_popover_showing(id) && self.attr(id, "popover").is_some();
+        let value = match prop {
+            "position" => "fixed",
+            "top" | "right" | "bottom" | "left" => "0px",
+            "background-color" => {
+                let root = self
+                    .style_view()
+                    .nodes
+                    .parent(id)
+                    .is_some_and(|parent| self.style_view().nodes.is_document(parent));
+                if !root && self.has_fullscreen_flag(id) {
+                    "black"
+                } else if popover_open {
+                    "transparent"
+                } else if html && self.tag_name(id) == Some("dialog") {
+                    "rgba(0, 0, 0, 0.1)"
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        Some(value.to_owned())
     }
 }
 
@@ -9318,11 +9712,49 @@ impl Dom {
         element
     }
 
+    /// Popover visibility, "is modal", the fullscreen flag and top-layer
+    /// membership are DOM state, not content attributes. Carry them into the
+    /// stylesheet-free presentation DOM, whose selectors, UA defaults, layout
+    /// and hit testing read them: the ordered-set position lets layout
+    /// generate the box as a root sibling and paint it after the document
+    /// (CSS Position 4 #top-layer); `data-trust-blocking`/`data-trust-blocked`
+    /// carry HTML #blocked-by-a-modal-dialog for inertness. Child navigables
+    /// are flattened into the parent's presentation, so only the top-level
+    /// Document's top layer is promoted there.
+    fn write_top_layer_markers(&self, id: NodeId, out: &mut String) {
+        if self.nodes[id].owner_document == DOCUMENT
+            && let Some(order) = self.top_layer.iter().position(|&node| node == id)
+        {
+            out.push_str(&format!(" data-trust-top-layer=\"{order}\""));
+        }
+        if self.popover_open.contains(&id) {
+            out.push_str(" data-trust-popover-open=\"\"");
+        }
+        if self.modal_dialogs.contains(&id) {
+            out.push_str(" data-trust-modal=\"\"");
+        }
+        if self.fullscreen_flags.contains(&id) {
+            out.push_str(" data-trust-fullscreen=\"\"");
+        }
+        if !self.modal_dialogs.is_empty() {
+            let document = self.nodes[id].owner_document;
+            if self.blocking_modal_dialog(document) == Some(id) {
+                out.push_str(" data-trust-blocking=\"\"");
+            }
+            if self.node(id).parent == Some(document)
+                && self.blocking_modal_dialog(document).is_some()
+            {
+                out.push_str(" data-trust-blocked=\"\"");
+            }
+        }
+    }
+
     fn write_serialized_frame_root_open(&self, root: NodeId, out: &mut String) {
         // HTML elements cannot be nested in serialized HTML. Preserve the
         // child Document's root as a presentation-only box with its computed
         // styles; layout recognizes its independent formatting boundary.
         out.push_str("<div data-trust-frame-root=\"\"");
+        self.write_top_layer_markers(root, out);
         // Its baked url() values still resolve against the child Document's
         // base (`style_resource_base`), which the flattened copy would lose.
         if let Some(frame) = self.frame_owner(root)
@@ -11455,7 +11887,11 @@ impl Dom {
         // distinct boxes (see the static serializer + `frame_body`). This also
         // keeps an empty/unrealized iframe's normal replaced-element footprint.
         if matches!(tag, "iframe" | "frame") {
-            out.push_str("<div data-trust-frame=\"\" style=\"");
+            out.push_str("<div data-trust-frame=\"\"");
+            // An iframe can itself be in the top layer (Fullscreen API's
+            // container chain) or be the blocking element's descendant.
+            self.write_top_layer_markers(id, out);
+            out.push_str(" style=\"");
             out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
             out.push_str("\">");
             if let Some(root) = self.frame_root(id) {
@@ -11648,17 +12084,7 @@ impl Dom {
         if self.paint_patch_hosts.contains(&id) {
             out.push_str(&format!(" data-trust-paint-node=\"{id}\""));
         }
-        // Popover visibility/top-layer membership is DOM state, not reflected
-        // by the `popover` content attribute. Carry its ordered-set position
-        // into the presentation DOM so layout can generate the box as a root
-        // sibling and paint it after the document (CSS Position 4 §3).
-        if let Some(order) = self.popover_top_layer_order(id) {
-            out.push_str(&format!(" data-trust-popover-open=\"{order}\""));
-        }
-        // A dialog's "is modal" flag is likewise DOM state, not an attribute.
-        if self.modal_dialogs.contains(&id) {
-            out.push_str(" data-trust-modal=\"\"");
-        }
+        self.write_top_layer_markers(id, out);
         // A scroll container's current `scrollTop` signal (CSSOM View) rides the
         // HTML in CSS pixels so it survives the live snapshot/re-parse exactly
         // like a baked form value. A terminal consumer quantizes this value only
@@ -11887,6 +12313,18 @@ impl Dom {
                 out.push_str(PseudoEl::Placeholder.baked_style_attr());
                 out.push_str("=\"");
                 out.push_str(&escape_attr(&placeholder));
+                out.push('"');
+            }
+        }
+        // CSS Position 4 #backdrop: an element in the top layer carries its
+        // `::backdrop` declarations into the stylesheet-free presentation.
+        if self.top_layer.contains(&id) {
+            let backdrop = self.baked_pseudo_style(id, PseudoEl::Backdrop);
+            if !backdrop.is_empty() {
+                out.push(' ');
+                out.push_str(PseudoEl::Backdrop.baked_style_attr());
+                out.push_str("=\"");
+                out.push_str(&escape_attr(&backdrop));
                 out.push('"');
             }
         }
@@ -12277,12 +12715,177 @@ impl<'a> StyleView<'a> {
 
     /// See `Dom::is_popover_showing`.
     pub(super) fn is_popover_showing(&self, id: NodeId) -> bool {
-        self.state.popover_open.contains(&id) || self.attr(id, "data-trust-popover-open").is_some()
+        self.state.popover_open.contains(&id)
+            || self.presentation_marker(id, "data-trust-popover-open")
+    }
+
+    /// A presentation arena's internal marker of live DOM state. The resident
+    /// page's own arena owns that state and never trusts authored markers.
+    fn presentation_marker(&self, id: NodeId, name: &str) -> bool {
+        !self.state.render_live && self.attr(id, name).is_some()
     }
 
     /// See `Dom::is_modal`.
     pub(super) fn is_modal(&self, id: NodeId) -> bool {
-        self.state.modal_dialogs.contains(&id) || self.attr(id, "data-trust-modal").is_some()
+        self.state.modal_dialogs.contains(&id) || self.presentation_marker(id, "data-trust-modal")
+    }
+
+    /// See `Dom::has_fullscreen_flag`.
+    pub(super) fn has_fullscreen_flag(&self, id: NodeId) -> bool {
+        self.state.fullscreen_flags.contains(&id)
+            || self.presentation_marker(id, "data-trust-fullscreen")
+    }
+
+    /// See `Dom::top_layer_order`.
+    pub(super) fn top_layer_order(&self, id: NodeId) -> Option<usize> {
+        self.state
+            .top_layer
+            .iter()
+            .position(|&node| node == id)
+            .or_else(|| {
+                (!self.state.render_live)
+                    .then(|| self.attr(id, "data-trust-top-layer"))
+                    .flatten()
+                    .and_then(|value| value.parse().ok())
+            })
+    }
+
+    /// See `Dom::fullscreen_element`. Presentation arenas mark the element.
+    pub(super) fn fullscreen_element(&self, document: NodeId) -> Option<NodeId> {
+        self.state.top_layer.iter().rev().copied().find(|&id| {
+            self.state.fullscreen_flags.contains(&id)
+                && self.nodes.contains(id)
+                && self.nodes.owner_document(id) == document
+        })
+    }
+
+    /// HTML #selector-modal: a `dialog` whose "is modal" is true, or an
+    /// element whose fullscreen flag is set.
+    pub(super) fn matches_modal(&self, id: NodeId) -> bool {
+        (self.nodes.tag_name(id) == Some("dialog")
+            && self.nodes.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml")
+            && self.is_modal(id))
+            || self.has_fullscreen_flag(id)
+    }
+
+    /// Fullscreen API #:fullscreen-pseudo-class: the element's fullscreen flag
+    /// is set, or it is a shadow host and retargeting its node document's
+    /// fullscreen element against it yields the host itself.
+    pub(super) fn matches_fullscreen(&self, id: NodeId) -> bool {
+        if self.has_fullscreen_flag(id) {
+            return true;
+        }
+        if !self.state.shadow_roots.contains_key(&id) || self.state.fullscreen_flags.is_empty() {
+            return false;
+        }
+        let Some(fullscreen) = self.fullscreen_element(self.nodes.owner_document(id)) else {
+            return false;
+        };
+        // DOM #retarget: climb from the fullscreen element's shadow root to its
+        // host until that root is a shadow-including inclusive ancestor of `id`.
+        let mut candidate = fullscreen;
+        loop {
+            let root = self.tree_root(candidate);
+            let Some(&host) = self.state.shadow_hosts.get(&root) else {
+                return candidate == id;
+            };
+            if self.is_shadow_including_inclusive_ancestor(root, id) {
+                return candidate == id;
+            }
+            candidate = host;
+        }
+    }
+
+    /// The root of `id`'s tree (DOM #concept-tree-root), not crossing shadow
+    /// boundaries.
+    fn tree_root(&self, id: NodeId) -> NodeId {
+        let mut current = id;
+        while let Some(parent) = self.nodes.parent(current) {
+            current = parent;
+        }
+        current
+    }
+
+    fn is_shadow_including_inclusive_ancestor(&self, ancestor: NodeId, id: NodeId) -> bool {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if node == ancestor {
+                return true;
+            }
+            current = self.parent_composed(node);
+        }
+        false
+    }
+
+    /// See `Dom::blocking_modal_dialog`.
+    pub(super) fn blocking_modal_dialog(&self, document: NodeId) -> Option<NodeId> {
+        self.state.top_layer.iter().rev().copied().find(|&id| {
+            self.state.modal_dialogs.contains(&id)
+                && self.nodes.contains(id)
+                && self.nodes.owner_document(id) == document
+                && self.nodes.tag_name(id) == Some("dialog")
+        })
+    }
+
+    /// Whether `id` is the dialog blocking its own document. Presentation
+    /// arenas carry the live answer as a marker.
+    fn is_blocking_dialog(&self, id: NodeId) -> bool {
+        self.presentation_marker(id, "data-trust-blocking")
+            || (!self.state.modal_dialogs.is_empty()
+                && self.blocking_modal_dialog(self.nodes.owner_document(id)) == Some(id))
+    }
+
+    /// Whether `id` is the document element of a Document blocked by a modal
+    /// dialog. A presentation arena flattens child navigables, so their
+    /// document elements carry the marker too.
+    fn is_blocked_document_element(&self, id: NodeId) -> bool {
+        if self.presentation_marker(id, "data-trust-blocked") {
+            return true;
+        }
+        if self.state.modal_dialogs.is_empty() {
+            return false;
+        }
+        self.nodes
+            .parent(id)
+            .filter(|&parent| self.nodes.is_document(parent))
+            .is_some_and(|document| self.blocking_modal_dialog(document).is_some())
+    }
+
+    /// See `Dom::is_inert`.
+    pub(super) fn is_inert(&self, id: NodeId) -> bool {
+        // Whether the walk passed the blocking dialog of the current
+        // document: it escapes that document's blocking and the `inert`
+        // attributes of its ancestors (HTML #modal-dialogs-and-inert-subtrees).
+        let mut escaped = false;
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if self.nodes.is_document(node) {
+                // A child navigable's Document: continue in its container's
+                // document, whose blocking state is independent.
+                escaped = false;
+            } else if self.nodes.is_element(node) && !escaped {
+                if self.attr(node, "inert").is_some() {
+                    return true;
+                }
+                if self.is_blocking_dialog(node) {
+                    escaped = true;
+                } else if self.is_blocked_document_element(node) {
+                    return true;
+                }
+            } else if self.nodes.is_element(node)
+                && self.presentation_marker(node, "data-trust-frame-root")
+            {
+                // A flattened child navigable's root starts its own document.
+                escaped = false;
+                if self.attr(node, "inert").is_some() || self.is_blocked_document_element(node) {
+                    return true;
+                }
+            }
+            // Inertness follows the flat tree: a slotted node is inside its
+            // slot's (and so a modal dialog's) subtree.
+            current = self.parent_flat(node);
+        }
+        false
     }
 
     pub(super) fn namespace_uri(&self, id: NodeId) -> Option<&'a str> {
@@ -12777,7 +13380,8 @@ impl<'a> StyleView<'a> {
                 })
             }
             StatePseudo::Dir(want_rtl) => self.direction_rtl(id) == *want_rtl,
-            StatePseudo::Modal => tag == "dialog" && self.is_modal(id),
+            StatePseudo::Modal => self.matches_modal(id),
+            StatePseudo::Fullscreen => self.matches_fullscreen(id),
             StatePseudo::Defined => self.is_defined(id),
             StatePseudo::Custom(name) => self.has_custom_state(id, name),
         }
@@ -13495,6 +14099,9 @@ pub enum PseudoEl {
     FirstLetter,
     Marker,
     Placeholder,
+    /// CSS Position 4 #backdrop: the box below an element rendered in the
+    /// top layer.
+    Backdrop,
 }
 
 impl PseudoEl {
@@ -13507,6 +14114,7 @@ impl PseudoEl {
             PseudoEl::FirstLetter => "data-trust-first-letter-style",
             PseudoEl::Marker => "data-trust-marker-style",
             PseudoEl::Placeholder => "data-trust-placeholder-style",
+            PseudoEl::Backdrop => "data-trust-backdrop-style",
         }
     }
 
@@ -13521,7 +14129,7 @@ impl PseudoEl {
             PseudoEl::Before => Some(("data-trust-before", "data-trust-before-items")),
             PseudoEl::After => Some(("data-trust-after", "data-trust-after-items")),
             PseudoEl::Marker => Some(("data-trust-marker", "data-trust-marker-items")),
-            PseudoEl::FirstLetter | PseudoEl::Placeholder => None,
+            PseudoEl::FirstLetter | PseudoEl::Placeholder | PseudoEl::Backdrop => None,
         }
     }
 
@@ -13534,6 +14142,7 @@ impl PseudoEl {
             PseudoEl::Marker => 2,
             PseudoEl::FirstLetter => 3,
             PseudoEl::Placeholder => 4,
+            PseudoEl::Backdrop => 5,
         }
     }
 }
@@ -13692,8 +14301,11 @@ enum StatePseudo {
     /// `:dir(rtl)` / `:dir(ltr)` — the nearest `dir` attribute (`auto`
     /// approximates to `ltr`: the engine lays out LTR only). `true` = rtl.
     Dir(bool),
-    /// `:modal` — a `dialog` shown with `showModal()` (`Dom::is_modal`).
+    /// `:modal` — HTML #selector-modal: a `dialog` shown with `showModal()`
+    /// (`Dom::is_modal`) or an element whose fullscreen flag is set.
     Modal,
+    /// `:fullscreen` — Fullscreen API #:fullscreen-pseudo-class.
+    Fullscreen,
     /// `:defined` — HTML #selector-defined: an element whose custom element
     /// state is "uncustomized" or "custom".
     Defined,
@@ -13721,6 +14333,7 @@ fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
         "read-only" => StatePseudo::ReadOnly,
         "placeholder-shown" => StatePseudo::PlaceholderShown,
         "modal" if arg.is_none() => StatePseudo::Modal,
+        "fullscreen" if arg.is_none() => StatePseudo::Fullscreen,
         "defined" if arg.is_none() => StatePseudo::Defined,
         "state" => {
             // CSS Selectors 4 / HTML: `:state(<ident>)`; anything else in the
@@ -14603,18 +15216,18 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         name.as_str(),
                         "before" | "after" | "first-letter" | "slotted"
                     )
-                    // A list item's ::marker and a text control's
-                    // ::placeholder are rendered; those of a ::slotted()
-                    // element stay inert like ::backdrop below.
-                    && !((name == "marker" || placeholder_pseudo_element(&name))
+                    // A list item's ::marker, a text control's ::placeholder
+                    // and a top-layer element's ::backdrop (CSS Positioned
+                    // Layout 4 #backdrop) are rendered; those of a ::slotted()
+                    // element stay inert.
+                    && !((name == "marker" || name == "backdrop" || placeholder_pseudo_element(&name))
                         && compound.slotted.is_none())
                 {
                     if unrendered_pseudo_element(&name, arg.is_some()) {
                         // Defined pseudo-elements we do not render (e.g. CSS
-                        // Positioned Layout 4 §3.2 ::backdrop) are still valid:
-                        // their presence must not invalidate a strict selector
-                        // list such as the common `*,:before,:after,::backdrop`
-                        // reset rule or `h1, p::first-line`.
+                        // Pseudo 4 ::first-line) are still valid: their
+                        // presence must not invalidate a strict selector
+                        // list such as `h1, p::first-line`.
                         compound.never = true;
                         compound.inert_pseudo_element = true;
                         element_backed = matches!(name.as_str(), "part" | "details-content");
@@ -14724,7 +15337,10 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     compound.slotted = Some(Box::new(inner));
                     compound.pseudos += 1;
                 } else if matches!(name.as_str(), "before" | "after" | "first-letter")
-                    || (double_colon && (name == "marker" || placeholder_pseudo_element(&name)))
+                    || (double_colon
+                        && (name == "marker"
+                            || name == "backdrop"
+                            || placeholder_pseudo_element(&name)))
                 {
                     // Generated-content pseudo-element: the compound still
                     // matches the element (tag/class parts), but the rule
@@ -14741,6 +15357,8 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         "after" => PseudoEl::After,
                         "marker" => PseudoEl::Marker,
                         "first-letter" => PseudoEl::FirstLetter,
+                        // CSS Position 4 #backdrop.
+                        "backdrop" => PseudoEl::Backdrop,
                         _ => PseudoEl::Placeholder,
                     });
                 } else if name == "scope" {
@@ -14961,7 +15579,7 @@ fn placeholder_pseudo_element(name: &str) -> bool {
 
 /// Pseudo-elements defined by CSS Pseudo 4, Shadow Parts, Highlight API,
 /// WebVTT and View Transitions that this engine parses but does not render
-/// (and ::marker and ::placeholder after ::slotted()).
+/// (and ::marker, ::placeholder and ::backdrop after ::slotted()).
 fn unrendered_pseudo_element(name: &str, functional: bool) -> bool {
     if functional {
         matches!(
@@ -18221,6 +18839,7 @@ struct CascadeWinners<'r> {
     first_letter: FxHashMap<String, CascadeWinner>,
     marker: FxHashMap<String, CascadeWinner>,
     placeholder: FxHashMap<String, CascadeWinner>,
+    backdrop: FxHashMap<String, CascadeWinner>,
     /// Pseudo-element rules whose container conditions need layout sizes.
     conditional: Vec<&'r StyleRule>,
     preserve_layers: bool,
@@ -18275,7 +18894,7 @@ fn strip_winners(map: &FxHashMap<String, CascadeWinner>) -> FxHashMap<String, St
 /// The source order (`StyleRule::order`) of each custom property's winning
 /// declaration, for resolving its `url()`s against its sheet.
 fn custom_property_sources<'m>(
-    maps: [(Option<PseudoEl>, &'m FxHashMap<String, CascadeWinner>); 6],
+    maps: [(Option<PseudoEl>, &'m FxHashMap<String, CascadeWinner>); 7],
 ) -> impl Iterator<Item = (Option<PseudoEl>, String, usize)> + 'm {
     maps.into_iter().flat_map(|(pseudo, winners)| {
         winners
@@ -18320,6 +18939,7 @@ impl StyleView<'_> {
         let mut first_letter = Winners::default();
         let mut marker = Winners::default();
         let mut placeholder = Winners::default();
+        let mut backdrop = Winners::default();
         let mut conditional_pseudos = Vec::new();
         // HTML rendering hints have their own origin below every author
         // layer. `revert` discards them, while `revert-layer` can reveal them
@@ -18382,6 +19002,7 @@ impl StyleView<'_> {
                 Some(PseudoEl::FirstLetter) => &mut first_letter,
                 Some(PseudoEl::Marker) => &mut marker,
                 Some(PseudoEl::Placeholder) => &mut placeholder,
+                Some(PseudoEl::Backdrop) => &mut backdrop,
             };
             for (pk, (imp, v)) in &r.decls {
                 consider_into(
@@ -18490,6 +19111,7 @@ impl StyleView<'_> {
             first_letter,
             marker,
             placeholder,
+            backdrop,
             conditional: conditional_pseudos,
             preserve_layers,
             declarations: declaration_order.get(),
@@ -28828,6 +29450,141 @@ mod tests {
         assert!(
             (reparsed.effective_opacity(reparsed_backdrop) - 0.6).abs() < f32::EPSILON,
             "the native frontend receives the same compositing alpha: {html}"
+        );
+    }
+
+    #[test]
+    fn top_layer_state_drives_modal_fullscreen_backdrop_and_inertness() {
+        // CSS Position 4 #top-layer and HTML #modal-dialogs-and-inert-subtrees
+        // (local csswg-drafts 81c27f68, WHATWG HTML e5071a20c856) with
+        // Fullscreen API #model (WHATWG 7c38d773): the arena's ordered top
+        // layer, the topmost modal dialog blocking its Document, the flat-tree
+        // inertness it causes, and the presentation markers carrying them.
+        let mut dom = Dom::parse_document(
+            "<body><button id=out>o</button>\
+             <dialog id=d open><button id=in>i</button></dialog>\
+             <div id=f>full</div><div id=p popover>pop</div></body>",
+        );
+        let id = |dom: &Dom, name: &str| dom.get_by_id(name).unwrap();
+        let (out, d, inside, f, p) = (
+            id(&dom, "out"),
+            id(&dom, "d"),
+            id(&dom, "in"),
+            id(&dom, "f"),
+            id(&dom, "p"),
+        );
+        let matches = |dom: &Dom, node, selector: &str| {
+            dom.query(DOCUMENT, &SelectorList::parse(selector).unwrap(), false)
+                .contains(&node)
+        };
+        assert!(!dom.is_inert(out));
+        dom.set_popover_open(p, true);
+        dom.set_dialog_modal(d, true);
+        assert_eq!(dom.document_top_layer(DOCUMENT), vec![p, d]);
+        assert_eq!(dom.blocking_modal_dialog(DOCUMENT), Some(d));
+        assert!(dom.is_inert(out) && dom.is_inert(p) && !dom.is_inert(inside) && !dom.is_inert(d));
+        assert!(!dom.point_hit_testable(out) && dom.point_hit_testable(inside));
+        assert!(matches(&dom, d, ":modal") && !matches(&dom, f, ":fullscreen"));
+        // Top-layer styling: a popover computes `position: fixed` (HTML UA
+        // sheet), an author `position: static` computes `absolute`.
+        assert_eq!(dom.computed_value(d, "position").as_deref(), Some("fixed"));
+        assert_eq!(dom.computed_value(d, "top").as_deref(), Some("0px"));
+        assert_eq!(
+            dom.computed_value(d, "margin-left").as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            dom.pseudo_layout_value(d, PseudoEl::Backdrop, "background-color")
+                .as_deref(),
+            Some("rgba(0, 0, 0, 0.1)")
+        );
+        assert_eq!(
+            dom.pseudo_layout_value(p, PseudoEl::Backdrop, "background-color")
+                .as_deref(),
+            Some("transparent")
+        );
+        assert_eq!(
+            dom.pseudo_layout_value(p, PseudoEl::Backdrop, "pointer-events")
+                .as_deref(),
+            Some("none")
+        );
+        // "Fullscreen an element" re-adds it last; its UA-important geometry
+        // outranks author declarations, and it matches :fullscreen and :modal.
+        dom.set_attr(f, "style", "position:static;width:10px;margin:7px");
+        dom.set_fullscreen_flag(f, true);
+        assert_eq!(dom.document_top_layer(DOCUMENT), vec![p, d, f]);
+        assert_eq!(dom.fullscreen_element(DOCUMENT), Some(f));
+        assert!(matches(&dom, f, ":fullscreen") && matches(&dom, f, ":modal"));
+        assert_eq!(dom.computed_value(f, "position").as_deref(), Some("fixed"));
+        assert_eq!(dom.computed_value(f, "width").as_deref(), Some("100%"));
+        assert_eq!(dom.computed_value(f, "margin-top").as_deref(), Some("0px"));
+        assert_eq!(
+            dom.pseudo_layout_value(f, PseudoEl::Backdrop, "background-color")
+                .as_deref(),
+            Some("black")
+        );
+        // The topmost modal dialog still blocks: a later fullscreen element
+        // outside it is inert (HTML #blocked-by-a-modal-dialog).
+        assert!(dom.is_inert(f));
+        // The stylesheet-free presentation arena reads the same state.
+        let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(html.contains("data-trust-blocked=\"\""), "{html}");
+        let presentation = Dom::parse_document(&html);
+        let (out2, inside2, d2) = (
+            id(&presentation, "out"),
+            id(&presentation, "in"),
+            id(&presentation, "d"),
+        );
+        assert!(presentation.is_inert(out2) && !presentation.is_inert(inside2));
+        assert_eq!(presentation.top_layer_order(d2), Some(1));
+        assert!(presentation.is_modal(d2) && presentation.any_document_blocked());
+        assert_eq!(
+            presentation.computed_value(d2, "position").as_deref(),
+            Some("fixed")
+        );
+        // Removal clears the dialog's and popover's state at once; the
+        // fullscreen element keeps its flag for script's removing steps.
+        dom.detach(d);
+        dom.detach(p);
+        assert!(!dom.is_modal(d) && !dom.in_top_layer(d) && !dom.is_popover_showing(p));
+        assert_eq!(dom.blocking_modal_dialog(DOCUMENT), None);
+        assert!(!dom.is_inert(out));
+        dom.detach(f);
+        assert_eq!(dom.fullscreen_element(DOCUMENT), Some(f));
+        let mut removed = dom.take_top_layer_removals();
+        removed.sort_unstable();
+        let mut expected = vec![d, p, f];
+        expected.sort_unstable();
+        assert_eq!(removed, expected);
+        dom.set_fullscreen_flag(f, false);
+        assert_eq!(dom.fullscreen_element(DOCUMENT), None);
+        // Authored markers never spoof state in a live arena.
+        let mut live = Dom::parse_document(
+            "<html data-trust-blocked><body><p id=x data-trust-modal>x</p></body></html>",
+        );
+        live.set_render_clickables(Default::default(), true);
+        let x = id(&live, "x");
+        assert!(!live.is_inert(x) && !live.is_modal(x));
+    }
+
+    #[test]
+    fn open_dialogs_are_found_in_shadow_including_tree_order() {
+        // HTML #the-dialog-element insertion steps: every connected dialog
+        // with an `open` attribute ran the dialog setup steps, including ones
+        // the parser created.
+        let dom = Dom::parse_document(
+            "<body><dialog id=a open></dialog><dialog id=b></dialog>\
+             <div><template shadowrootmode=open><dialog id=c open></dialog></template></div></body>",
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let open = dom.open_dialogs(DOCUMENT);
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert_eq!(open[0], a);
+        assert_eq!(dom.open_dialogs(DOCUMENT).first(), Some(&a));
+        assert!(
+            Dom::parse_document("<p>no dialogs</p>")
+                .open_dialogs(DOCUMENT)
+                .is_empty()
         );
     }
 

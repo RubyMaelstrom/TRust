@@ -165,6 +165,9 @@ impl Dom {
         let mut owners = FxHashMap::default();
         let mut scopes: FxHashMap<NodeId, Vec<(NodeId, i32, bool)>> = FxHashMap::default();
         let mut inert = std::collections::HashSet::new();
+        // HTML #modal-dialogs-and-inert-subtrees: while a document is blocked
+        // by a modal dialog, only that dialog's flat-tree subtree is focusable.
+        let blocked = self.any_document_blocked();
         // Unlike the layout flat iterator, retain slot elements: each is a
         // focus scope owner, even when it generates no box of its own.
         let mut walk = self.children(DOCUMENT);
@@ -214,6 +217,7 @@ impl Dom {
                 _ => self.is_contenteditable_host(node),
             };
             let focusable = (index.is_some() || default || subwidgets.contains(&node))
+                && !(blocked && self.is_inert(node))
                 && !self.actually_disabled(node, tag)
                 && boxes.contains_key(&node)
                 && !self.visibility_hidden(node)

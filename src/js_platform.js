@@ -1763,8 +1763,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (focusedArea) {
             // Focus-fixup: once the focused element leaves its document, the
             // viewport is the surviving focusable area. The activeElement
-            // getter must not return a detached stale wrapper.
-            if (!focusedArea.isConnected || __dom_focus(nodeIds.get(g.document)) !== nodeIds.get(focusedArea))
+            // getter must not return a detached stale wrapper. An element made
+            // inert (a modal dialog now blocks its Document) is no longer a
+            // focusable area either (HTML #focus-fixup-rule).
+            if (!focusedArea.isConnected || __dom_focus(nodeIds.get(g.document)) !== nodeIds.get(focusedArea)
+                || (!internalsOf(focusedArea).contentRealmWindow && __dom_inert(nodeIds.get(focusedArea))))
                 setFocusedArea(null);
         }
         if (!focusedArea) return root.nodeType === 9 ? viewportFocusAnchor(root) : null;
@@ -1834,6 +1837,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function elementCanFocus(el) {
         if (!el || !el.isConnected || isActuallyDisabled(el)) return false;
+        // HTML #inert-subtrees: inert nodes, including everything outside a
+        // modal dialog blocking the Document, cannot be focused.
+        if (__dom_inert(nodeIds.get(el))) return false;
         // HTML #table-fa / #the-popover-attribute: hidden popover contents
         // are not rendered and cannot take focus. Walk through shadow roots
         // and slot assignment, which also carry inherited inertness.
@@ -2171,6 +2177,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             customElementState: null, customElementRegistry: null,
             scopedGlobalDescriptors: null, authorGlobalDescriptors: null,
             lastActivation: Infinity,
+            // HTML #last-history-action-activation-timestamp and the Window's
+            // close watcher manager (HTML #close-watcher-manager).
+            lastHistoryActionActivation: Infinity,
+            closeWatcherManager: null,
             // HTML has a 1:1 mapping between a realm, global object, and
             // environment settings object. Lumen uses this opaque token both
             // to restore promise-job settings and to partition module maps.
@@ -4478,6 +4488,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function createFrameWindowRealm(frame, frameUrl, contentType = "text/html", navigationTiming = null) {
         if (typeof __dom_create_window_realm !== "function") return null;
+        // HTML: `allow` and `allowfullscreen` take effect when the content
+        // navigable is navigated (Permissions Policy container policy).
+        snapshotFullscreenContainerPolicy(frame, frameUrl);
         const windowState = windowStateForFrame(frame);
         let childWindow;
         try {
@@ -5154,41 +5167,43 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const event = createTrustedEvent(CommandEvent, "command", {cancelable: true, command, source: button});
         if (!dispatch(target, event, false)) return;
         if (!target.isConnected || command.startsWith("--")) return;
-        const showing = !!POPOVER_OPEN[nodeIds.get(target)];
-        const hasPopover = messageApply(elementGetAttribute, target, ["popover"]) !== null;
-        if (command === "hide-popover") { if (hasPopover && showing) try { target.hidePopover(); } catch (_) {} return; }
-        if (command === "toggle-popover") { if (hasPopover) try { target.togglePopover(); } catch (_) {} return; }
-        if (command === "show-popover") { if (hasPopover && !showing) try { target.showPopover(); } catch (_) {} return; }
-        // HTML #the-dialog-element command steps.
-        if (htmlElementName(target) !== "dialog" || showing) return;
-        const open = target.hasAttribute("open");
-        const value = reflectedValue(button, "value");
-        if (command === "close" && open) target.close(value === null ? "" : value);
-        else if (command === "request-close" && open) target.requestClose(value === null ? "" : value);
-        else if (command === "show-modal" && !open) target.showModal();
+        if (command === "hide-popover") {
+            if (checkedPopoverValidity(target, true, null) === true)
+                hidePopoverAlgorithm(target, true, true, false, button);
+        } else if (command === "toggle-popover") {
+            if (checkedPopoverValidity(target, false, null) === true) showPopoverAlgorithm(target, false, button);
+            else if (checkedPopoverValidity(target, true, null) === true)
+                hidePopoverAlgorithm(target, true, true, false, button);
+        } else if (command === "show-popover") {
+            if (checkedPopoverValidity(target, false, null) === true) showPopoverAlgorithm(target, false, button);
+        } else if (htmlElementName(target) === "dialog") {
+            // HTML #the-dialog-element command steps, with the button's
+            // optional value (#concept-fe-optional-value).
+            if (popoverShowing(target)) return;
+            const open = hasOpenAttribute(target);
+            const value = reflectedValue(button, "value");
+            try {
+                if (command === "close" && open) closeTheDialog(target, value, button);
+                else if (command === "request-close" && open) requestCloseTheDialog(target, value, button);
+                else if (command === "show-modal" && !open) showModalDialog(target, button);
+            } catch (e) { reportException(e, "dialog command"); }
+        }
     }
-    // HTML #popover-target-element and
-    // #popover-target-attribute-activation-behavior.
-    function popoverTargetElement(node) {
-        const name = htmlElementName(node);
-        if (name !== "button" && !(name === "input" && ["submit", "reset", "image", "button"].includes(inputTypeOf(node)))) return null;
-        if (isActuallyDisabled(node)) return null;
-        if (formOwner(node) && isSubmitButtonElement(node)) return null;
-        const popover = attrAssociatedElement(node, "popovertarget", g.Element);
-        if (!popover || messageApply(elementGetAttribute, popover, ["popover"]) === null) return null;
-        return popover;
-    }
+    // HTML #popover-target-attribute-activation-behavior (the popover target
+    // element is with the popover algorithms).
     function popoverTargetActivation(node, eventTarget) {
         const popover = popoverTargetElement(node);
         if (!popover) return false;
-        if (eventTarget && eventTarget !== node && Node.prototype.contains.call(popover, eventTarget) &&
-            Node.prototype.contains.call(node, popover)) return true;
+        if (eventTarget && isShadowIncludingInclusiveDescendant(eventTarget, popover)
+            && popover !== node && isShadowIncludingInclusiveDescendant(popover, node)) return true;
         const value = reflectedValue(node, "popovertargetaction");
-        const action = value === null ? "toggle" : asciiLower(value);
-        const showing = !!POPOVER_OPEN[nodeIds.get(popover)];
+        const keyword = value === null ? "toggle" : asciiLower(value);
+        const action = keyword === "show" || keyword === "hide" ? keyword : "toggle";
+        const showing = popoverShowing(popover);
         if (action === "show" && showing) return true;
         if (action === "hide" && !showing) return true;
-        try { if (showing) popover.hidePopover(); else popover.showPopover(); } catch (_) {}
+        if (showing) hidePopoverAlgorithm(popover, true, true, false, node);
+        else if (checkedPopoverValidity(popover, false, null) === true) showPopoverAlgorithm(popover, false, node);
         return true;
     }
     function nearestDialog(form) {
@@ -5203,9 +5218,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // activation for every route, including author-created Mouse/PointerEvents.
     // The per-dispatch context keeps nested synthetic clicks from overwriting
     // the foreground click's read-once navigation/submit acknowledgment.
-    // Popovers currently SHOWING, keyed by node id (the arena set is the
-    // render truth; this mirror drives the API logic + auto-closing).
-    const POPOVER_OPEN = Object.create(null);
     // A user-interaction click per the specs: Pointer Events makes `click` a
     // PointerEvent; UI Events gives it bubbles + cancelable + COMPOSED (it
     // must escape shadow trees — a listener outside a component hears clicks
@@ -5459,7 +5471,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!nativePointerPosition) notifyPointerActivation();
         if (pointerLockState.target && pointerLockState.owner !== trust)
             return pointerLockState.owner.click(nodeIds.get(pointerLockState.target));
-        const target = pointerLockState.target || wrap(id);
+        let target = pointerLockState.target || wrap(id);
+        // HTML #inert-subtrees: an inert command is inoperable.
+        if (target && !pointerLockState.target && target.nodeType === 1 && __dom_inert(nodeIds.get(target))) {
+            if (!nativePointerPosition) return false;
+            target = nonInertPointerTarget(target);
+        }
         pointerInput.clickDefault = target ? {target,owner:trust} : null;
         if (cfg.frameTrace && target) {
             const path = [];
@@ -5924,7 +5941,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!pressed && !pointerInput.buttons) trust.hover(hit,x,y,screenX,screenY,modifiers,false,false);
             return canceled;
         }
-        const target = id === null || id === undefined ? g.document.documentElement : wrap(id);
+        const target = nonInertPointerTarget(id === null || id === undefined ? g.document.documentElement : wrap(id));
         if (!target) return false;
         pointerInput.document = target.ownerDocument;
         pointerInput.lastTarget = target;
@@ -5951,6 +5968,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const type = !pointerInput.beforeButtons && pressed ? "pointerdown" : !buttons && !pressed ? "pointerup" : "pointermove";
         const captured = !!pointerInput.capture;
         const pointer = createTrustedEvent(PointerEvent, type, {...init, detail:0});
+        // HTML #run-light-dismiss-activities for a trusted pointerdown or
+        // pointerup ("pointerType" mouse), before its dispatch.
+        if (type === "pointerdown" || type === "pointerup") runLightDismissActivities(type, target, x, y);
         dispatch(target, pointer, false);
         if (type === "pointerdown") pointerInput.suppress = pointer.defaultPrevented;
         let canceled = pointerInput.suppress;
@@ -6640,11 +6660,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     result = coordinate[0] + "," + coordinate[1];
                 } else if (submitter !== form && isSubmitButtonElement(submitter)) {
                     // HTML #concept-fe-optional-value.
-                    const value = messageApply(elementGetAttribute, submitter, ["value"]);
-                    result = value === null && htmlElementName(submitter) === "input" ? null
-                        : value === null ? "" : value;
+                    result = messageApply(elementGetAttribute, submitter, ["value"]);
                 }
-                subject.close(result);
+                closeTheDialog(subject, result, null);
             }
             return {handled: true};
         }
@@ -9349,67 +9367,38 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return parsed === null ? defaultTabIndex(this) : parsed;
         }
         set tabIndex(v) { this.setAttribute("tabindex", String(Number(v) | 0)); }
-        // --- The Popover API (HTML §the popover attribute) ---------------
-        // State truth lives in the ARENA (`__dom_popover` → the UA hide rule
-        // + `:popover-open`); POPOVER_OPEN mirrors it for the API logic.
-        // Light dismiss (click-outside closes auto popovers) is DEFERRED —
-        // the terminal's click dispatch has no pointerdown/up pair to track.
-        // `popover` reflects as the enumerated keyword state: missing → null,
-        // ""/"auto" → "auto", "hint" → "hint", anything else → "manual".
-        get popover() {
-            const v = this.getAttribute("popover");
-            if (v === null) return null;
-            const s = String(v).toLowerCase();
-            return (s === "" || s === "auto") ? "auto" : s === "hint" ? "hint" : "manual";
-        }
+        // --- The Popover API (HTML #the-popover-attribute) --------------
+        // The arena owns the popover visibility state and the top layer
+        // (`__dom_popover`, read by `:popover-open`, the UA hide rule and
+        // layout); the algorithms, popover stacks and light dismiss are with
+        // the close watchers below.
+        // `popover` reflects the attribute, limited to only known values.
+        get popover() { return popoverAttributeState(this); }
         set popover(v) {
-            if (v === null || v === undefined) this.removeAttribute("popover");
-            else this.setAttribute("popover", String(v));
+            if (v === null || v === undefined) removeReflectedValue(this, "popover");
+            else setReflectedValue(this, "popover", idlDOMString(v));
         }
-        showPopover() {
-            const state = this.popover;
-            if (state === null) throw new DOMException("Element has no popover attribute", "NotSupportedError");
-            // Already showing: "check popover validity" RETURNS FALSE on a
-            // state mismatch — show popover then just returns (HTML; only a
-            // no-popover attribute or a disconnected element throws). Steam's
-            // tooltip re-calls showPopover on every hover tick and a throw
-            // here fed its error boundary.
-            if (POPOVER_OPEN[nodeIds.get(this)]) return;
-            if (!this.isConnected) throw new DOMException("Popover is not connected", "InvalidStateError");
-            const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
-            dispatch(this, bev, false);
-            if (bev.defaultPrevented) return;
-            // An auto/hint popover closes the other showing auto/hint
-            // popovers (the spec's stack, flattened: last one wins).
-            if (state !== "manual") {
-                for (const k in POPOVER_OPEN) {
-                    const other = POPOVER_OPEN[k];
-                    if (other && other !== this && other.popover !== "manual") {
-                        try { other.hidePopover(); } catch (e) {}
-                    }
+        // HTML #dom-showpopover.
+        showPopover(options = undefined) {
+            showPopoverAlgorithm(this, true, popoverOptionSource(options));
+        }
+        // HTML #dom-hidepopover.
+        hidePopover() { hidePopoverAlgorithm(this, true, true, true, null); }
+        // HTML #dom-togglepopover: (TogglePopoverOptions or boolean).
+        togglePopover(options = undefined) {
+            let force = null, source = null;
+            if (typeof options === "boolean") force = options;
+            else if (options === undefined || options === null || typeof options === "object" || typeof options === "function") {
+                if (options !== undefined && options !== null) {
+                    if (options.force !== undefined) force = !!options.force;
+                    source = popoverOptionSource(options);
                 }
-            }
-            POPOVER_OPEN[nodeIds.get(this)] = this;
-            __dom_popover(nodeIds.get(this), true);
-            const self = this;
-            g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: "closed", newState: "open" }), false); }, 0);
-        }
-        hidePopover() {
-            if (this.popover === null) throw new DOMException("Element has no popover attribute", "NotSupportedError");
-            // Already hidden: silent return, same validity rule as show.
-            if (!POPOVER_OPEN[nodeIds.get(this)]) return;
-            // beforetoggle open→closed is NOT cancelable (spec).
-            dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
-            delete POPOVER_OPEN[nodeIds.get(this)];
-            __dom_popover(nodeIds.get(this), false);
-            const self = this;
-            g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: "open", newState: "closed" }), false); }, 0);
-        }
-        togglePopover(force) {
-            const open = !!POPOVER_OPEN[nodeIds.get(this)];
-            if (open && (force === undefined || !force)) { this.hidePopover(); return false; }
-            if (!open && (force === undefined || !!force)) { this.showPopover(); return true; }
-            return open;
+            } else force = !!options;
+            if (popoverShowing(this) && (force === null || force === false))
+                hidePopoverAlgorithm(this, true, true, true, null);
+            else if (force === null || force === true) showPopoverAlgorithm(this, true, source);
+            else checkPopoverValidity(this, popoverShowing(this), null);
+            return popoverShowing(this);
         }
         // Element scrolling (CSSOM View, Phase 3 inner-scroll regions). A
         // definite-height `overflow-y:auto|scroll` box is a real scroll viewport
@@ -13272,75 +13261,46 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get sheet() { return elementSheet(this); }
 
     }
-    // <dialog> (HTML §4.11.4). We implement the observable method/event surface;
-    // the modal TOP LAYER + backdrop + inertness are deliberately NOT rendered
-    // (her call — a dialog just paints where it flows, overlaps allowed). `open`
-    // reflects the boolean attribute (the layout's visibility gate); the "is
-    // modal" flag lives in the arena (`__dom_dialog_modal`, read by `:modal` and
-    // cleared on removal). show/showModal/close/requestClose follow the spec
-    // steps: InvalidStateError on an already-open show(Modal), showModal
-    // also requires connection; requestClose fires a cancelable `cancel` and
-    // aborts if prevented; "close the dialog" removes `open`, sets returnValue,
-    // and fires `close`. beforetoggle/toggle (ToggleEvent) fire like popovers.
-    // `closedBy` is intentionally omitted (its enumerated defaults are too new
-    // to implement without guessing — feature-detectable as undefined).
-    function dialogClose(result) {
-        if (!this.hasAttribute("open")) return;
-        dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
-        if (!this.hasAttribute("open")) return;
-        this.removeAttribute("open");
-        __dom_dialog_modal(nodeIds.get(this), false);
-        if (result !== null) internalsFor(this).dlgReturn = result;
-        const self = this;
-        g.setTimeout(function () {
-            dispatch(self, new g.ToggleEvent("toggle", { oldState: "open", newState: "closed" }), false);
-            dispatch(self, new Event("close"), false);
-        }, 0);
-    }
-    function dialogToggle(oldState, newState) {
-        const self = this;
-        g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: oldState, newState: newState }), false); }, 0);
-    }
+    // <dialog> (HTML #the-dialog-element). The arena owns "is modal" and the
+    // top layer (`__dom_dialog_modal`, read by `:modal`, the UA style sheet,
+    // layout and inertness); the algorithms are with the close watchers below.
     class HTMLDialogElement extends HTMLElement {
-        get open() { return this.hasAttribute("open"); }
-        set open(v) { if (v) this.setAttribute("open", ""); else this.removeAttribute("open"); }
+        get open() { return reflectedValue(this, "open") !== null; }
+        set open(v) { if (v) setReflectedValue(this, "open", ""); else removeReflectedValue(this, "open"); }
         get returnValue() { return internalsFor(this).dlgReturn == null ? "" : internalsFor(this).dlgReturn; }
-        set returnValue(v) { internalsFor(this).dlgReturn = v == null ? "" : String(v); }
+        set returnValue(v) { internalsFor(this).dlgReturn = idlDOMString(v); }
+        // HTML #dom-dialog-closedby: the computed closed-by state's keyword;
+        // [ReflectSetter].
+        get closedBy() {
+            requireHTMLInterface(this, ["dialog"]);
+            return computedClosedByState(this);
+        }
+        set closedBy(v) { setReflectedValue(this, "closedby", idlDOMString(v)); }
+        // HTML #dom-dialog-show.
         show() {
-            if (this.hasAttribute("open")) {
-                if (!__dom_dialog_modal(nodeIds.get(this))) return; // already open (non-modal): no-op
+            syncPopoverRemovals();
+            if (hasOpenAttribute(this) && !dialogIsModal(this)) return;
+            if (hasOpenAttribute(this))
                 throw new DOMException("The dialog is already open as a modal dialog", "InvalidStateError");
-            }
-            const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
-            dispatch(this, bev, false);
-            if (bev.defaultPrevented || this.hasAttribute("open")) return;
-            this.setAttribute("open", "");
-            dialogToggle.call(this, "closed", "open");
+            if (!dispatch(this, toggleEvent("beforetoggle", "closed", "open", null, true), false)) return;
+            if (hasOpenAttribute(this)) return;
+            queueDialogToggleEventTask(this, "closed", "open", null);
+            setReflectedValue(this, "open", "");
+            internalsFor(this).previouslyFocused = focusedAnchorOf(this.ownerDocument);
+            const document = this.ownerDocument;
+            hidePopoversUntil(document, topmostPopoverAncestor(this, null, false), false, true);
+            dialogFocusingSteps(this);
         }
-        showModal() {
-            if (this.hasAttribute("open")) {
-                if (__dom_dialog_modal(nodeIds.get(this))) return;  // already open as a modal: no-op
-                throw new DOMException("The dialog is already open", "InvalidStateError");
-            }
-            if (!this.isConnected) throw new DOMException("The dialog is not connected", "InvalidStateError");
-            const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
-            dispatch(this, bev, false);
-            if (bev.defaultPrevented || this.hasAttribute("open")) return;
-            this.setAttribute("open", "");
-            __dom_dialog_modal(nodeIds.get(this), true);
-            dialogToggle.call(this, "closed", "open");
+        // HTML #dom-dialog-showmodal.
+        showModal() { showModalDialog(this, null); }
+        // HTML #dom-dialog-close.
+        close(returnValue = undefined) {
+            closeTheDialog(this, returnValue === undefined ? null : idlDOMString(returnValue), null);
         }
-        close(returnValue) {
-            dialogClose.call(this, arguments.length ? String(returnValue) : null);
+        // HTML #dom-dialog-requestclose.
+        requestClose(returnValue = undefined) {
+            requestCloseTheDialog(this, returnValue === undefined ? null : idlDOMString(returnValue), null);
         }
-        requestClose(returnValue) {
-            if (!this.hasAttribute("open")) return;
-            const cev = new Event("cancel", { cancelable: true });
-            dispatch(this, cev, false);
-            if (cev.defaultPrevented) return;
-            dialogClose.call(this, arguments.length ? String(returnValue) : null);
-        }
-        // "Close the dialog": remove `open`, set returnValue, queue toggle + close.
     }
 
     // Obsolete but required by HTML §16.3.1. The rendering layer samples the
@@ -17842,8 +17802,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // HTML #event-handler-attributes: on* content attributes change the
         // element's (or its Window's) event handler.
         const handlerOld = lower.length > 2 && lower.startsWith("on") ? read(element, n) : undefined;
+        // HTML's dialog `open` and popover attribute change steps.
+        const topLayerOld = (lower === "open" && localName === "dialog") || lower === "popover"
+            ? read(element, n) : undefined;
         write(element, n, v);
         attributesChanged(element);
+        if (topLayerOld !== undefined) topLayerAttributeChanged(element, lower, topLayerOld, v);
         if (handlerOld !== undefined) eventHandlerAttributeChanged(element, lower, handlerOld, v);
         if (explicitAttrElements.has(element)) clearExplicitAttrElement(element, lower);
         if (lower === "selected" && localName === "option" && htmlElementName(element) === "option")
@@ -17873,8 +17837,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const localName = nodeLocalName(element);
         const old = (internalsFor(element).ceUpgraded || MO.length) ? read() : null;
         const handlerOld = lower.length > 2 && lower.startsWith("on") ? read() : undefined;
+        const topLayerOld = (lower === "open" && localName === "dialog") || lower === "popover"
+            ? read() : undefined;
         remove();
         attributesChanged(element);
+        if (topLayerOld !== undefined && topLayerOld !== null)
+            topLayerAttributeChanged(element, lower, topLayerOld, null);
         // HTML #event-handler-attributes: the steps do not run when removing
         // an attribute that does not exist.
         if (handlerOld !== undefined && handlerOld !== null) eventHandlerAttributeChanged(element, lower, handlerOld, null);
@@ -24836,7 +24804,43 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return {x:origin.x+rect.left,y:origin.y+rect.top};
         },
         parent() { return cfg.parentWindow ? windowMessageState(cfg.parentWindow) : null; },
-        activate() { topWindowState.lastActivation = currentTime(); },
+        // HTML #activation-notification: each Window of this Realm (its own
+        // and its same-Realm, same-origin child navigables') records the
+        // activation and notifies its close watcher manager.
+        activate() {
+            const now = currentTime();
+            for (const state of realmWindowStates()) {
+                state.lastActivation = now;
+                notifyCloseWatcherManagerAboutActivation(state);
+            }
+        },
+        // HTML #consume-history-action-user-activation, from the top-level
+        // traversable down.
+        consumeHistoryActionDescendants() {
+            for (const state of realmWindowStates()) state.lastHistoryActionActivation = state.lastActivation;
+            for (const child of childActivationWindows) {
+                const state = windowMessageState(child);
+                if (state) state.consumeHistoryActionDescendants();
+            }
+        },
+        // HTML #consume-user-activation, from the top-level traversable down.
+        consumeActivationDescendants() {
+            for (const state of realmWindowStates())
+                if (state.lastActivation !== Infinity) state.lastActivation = -Infinity;
+            for (const child of childActivationWindows) {
+                const state = windowMessageState(child);
+                if (state) state.consumeActivationDescendants();
+            }
+        },
+        // Fullscreen API: this Realm's Documents, for other Realms' algorithms.
+        get fullscreenAgent() { return trust.fullscreenAgent; },
+        fullscreenAllowedForChild(frameId, origin) {
+            const frame = wrap(frameId);
+            if (!frame || frame.nodeType !== 1 || !fullscreenAllowedForDocument(frame.ownerDocument)) return false;
+            return containerAllowsFullscreen(containerPolicyOf(frame), messageWindowState.originKey, origin);
+        },
+        registerFullscreenRequest(callback) { return registerFullscreenRequest(callback); },
+        syncTopLayerRemovals() { trust.syncTopLayerRemovals(); },
         activateDescendants(origin) {
             if (this.originKey === origin) this.activate();
             for (const child of childActivationWindows) {
@@ -25127,6 +25131,1384 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     installHandlerProps(g.HTMLFrameSetElement.prototype, WINDOW_EVENT_HANDLER_TYPES);
     // HTML #handler-onslotchange: ShadowRoot's onslotchange.
     installHandlerProps(ShadowRoot.prototype, ["slotchange"]);
+    // ---- HTML #close-requests, #close-watchers, the dialog element and the
+    // popover attribute (local WHATWG HTML e5071a20c856, 2026-09-06), with CSS
+    // Positioned Layout 4 #top-layer (csswg-drafts 81c27f68) owned by the
+    // arena: `__dom_popover`, `__dom_dialog_modal` and `__dom_fullscreen`
+    // run the top-layer steps, `__dom_top_layer` reads a document's top layer
+    // and `__dom_top_layer_removals` reports state the removing steps cleared.
+
+    // HTML #fully-active, through #dom-document-location: the location of a
+    // Document is null exactly when it is not fully active.
+    function documentFullyActive(document) {
+        try { return !!document && messageApply(documentLocation, document, []) !== null; }
+        catch (_) { return false; }
+    }
+    // An element's relevant global object, as this Realm's Window state for
+    // its node document (the Realm's own Document or a same-Realm frame's).
+    function windowStateForNode(node) {
+        const frame = frameOwnerForNode(node && node.nodeType === 9 ? node : node && node.ownerDocument);
+        return frame ? windowStateForFrame(frame) : topWindowState;
+    }
+    // The Window states this Realm multiplexes: its own Window and those of
+    // same-Realm (same-origin) child navigables.
+    function realmWindowStates() {
+        const states = [topWindowState];
+        for (const frame of windowSettingsFrames.values()) {
+            if (frame === realmRootFrame) continue;
+            const state = frameWindowStates.get(frame);
+            if (state && !states.includes(state)) states.push(state);
+        }
+        return states;
+    }
+    // HTML #flat-tree parent: the assigned slot, else the parent, crossing a
+    // shadow root to its host.
+    function flatTreeParent(node) {
+        const slot = assignedSlotInternal(node);
+        if (slot) return slot;
+        const parent = node.parentNode;
+        if (parent && parent.nodeType === 11) return internalsFor(parent).host || null;
+        return parent || null;
+    }
+    function isFlatTreeDescendant(node, ancestor) {
+        for (let current = node && flatTreeParent(node); current; current = flatTreeParent(current))
+            if (current === ancestor) return true;
+        return false;
+    }
+    function isShadowIncludingInclusiveDescendant(node, ancestor) {
+        return !!node && !!ancestor && shadowInclusiveContains(ancestor, node);
+    }
+    // The elements of `document`'s top layer, in order (CSS Position 4).
+    function topLayerOf(document) {
+        const ids = __dom_top_layer(nodeIds.get(document)) || [];
+        const out = [];
+        for (let i = 0; i < ids.length; i++) { const element = wrap(ids[i]); if (element) out.push(element); }
+        return out;
+    }
+    function toggleEvent(type, oldState, newState, source, cancelable) {
+        return createTrustedEvent(ToggleEvent, type, {oldState, newState, source: source || null,
+            cancelable: !!cancelable});
+    }
+    // HTML #toggle-task-tracker: queue (or coalesce into) an element task
+    // that fires `toggle`. A pending task is removed from its queue and its
+    // old state carried into the new one.
+    function queueToggleEventTask(element, slot, oldState, newState, source) {
+        const record = internalsFor(element);
+        const tracker = record[slot];
+        if (tracker) {
+            oldState = tracker.oldState;
+            tracker.cancelled = true;
+            record[slot] = null;
+        }
+        const next = {oldState, cancelled: false};
+        __queue_dom_task(() => {
+            if (next.cancelled) return;
+            dispatch(element, toggleEvent("toggle", oldState, newState, source, false), false);
+            if (internalsOf(element)[slot] === next) internalsFor(element)[slot] = null;
+        });
+        record[slot] = next;
+    }
+
+    // HTML #user-activation-data-model: the last history-action activation
+    // timestamp, and the history-action activation it defines.
+    function hasHistoryActionActivation(state) {
+        return state.lastHistoryActionActivation !== state.lastActivation;
+    }
+    function topMessageWindowState() {
+        let top = messageWindowState;
+        for (let parent = top.parent(); parent; parent = parent.parent()) top = parent;
+        return top;
+    }
+    // HTML #consume-history-action-user-activation: every Window of the
+    // top-level traversable's inclusive descendant navigables.
+    function consumeHistoryActionUserActivation() {
+        topMessageWindowState().consumeHistoryActionDescendants();
+    }
+    // HTML #consume-user-activation.
+    function consumeUserActivationEverywhere() {
+        topMessageWindowState().consumeActivationDescendants();
+    }
+
+    // HTML #close-watcher-infrastructure.
+    function closeWatcherManager(state) {
+        return state.closeWatcherManager || (state.closeWatcherManager =
+            {groups: [], allowedGroups: 1, nextUserInteractionAllowsNewGroup: true});
+    }
+    // HTML #notify-the-close-watcher-manager-about-user-activation.
+    function notifyCloseWatcherManagerAboutActivation(state) {
+        const manager = closeWatcherManager(state);
+        if (manager.nextUserInteractionAllowsNewGroup) manager.allowedGroups++;
+        manager.nextUserInteractionAllowsNewGroup = false;
+    }
+    // HTML #establish-a-close-watcher. `document` is the Window's associated
+    // Document, whose full activity the later algorithms test.
+    function establishCloseWatcher(state, document, cancelAction, closeAction, getEnabledState) {
+        const watcher = {window: state, document, cancelAction, closeAction,
+            isRunningCancelAction: false, getEnabledState};
+        const manager = closeWatcherManager(state);
+        if (manager.groups.length < manager.allowedGroups) manager.groups.push([watcher]);
+        else manager.groups[manager.groups.length - 1].push(watcher);
+        manager.nextUserInteractionAllowsNewGroup = true;
+        return watcher;
+    }
+    // HTML #close-watcher-active.
+    function closeWatcherIsActive(watcher) {
+        const manager = closeWatcherManager(watcher.window);
+        for (const group of manager.groups) if (group.includes(watcher)) return true;
+        return false;
+    }
+    // HTML #close-watcher-request-close.
+    function requestCloseWatcher(watcher, requireHistoryActionActivation) {
+        if (!closeWatcherIsActive(watcher)) return true;
+        if (!watcher.getEnabledState()) return true;
+        if (watcher.isRunningCancelAction) return true;
+        const state = watcher.window;
+        if (!documentFullyActive(watcher.document)) return true;
+        const manager = closeWatcherManager(state);
+        // ((A || B) && C), as the source's note on this step states.
+        const canPreventClose = (!requireHistoryActionActivation
+            || manager.groups.length < manager.allowedGroups) && hasHistoryActionActivation(state);
+        watcher.isRunningCancelAction = true;
+        let shouldContinue = true;
+        try { shouldContinue = watcher.cancelAction(canPreventClose); }
+        catch (e) { reportException(e, "close watcher cancel"); }
+        finally { watcher.isRunningCancelAction = false; }
+        if (!shouldContinue) {
+            consumeHistoryActionUserActivation();
+            return false;
+        }
+        closeCloseWatcher(watcher);
+        return true;
+    }
+    // HTML #close-watcher-close.
+    function closeCloseWatcher(watcher) {
+        if (!closeWatcherIsActive(watcher)) return;
+        if (!watcher.getEnabledState()) return;
+        if (!documentFullyActive(watcher.document)) return;
+        destroyCloseWatcher(watcher);
+        try { watcher.closeAction(); }
+        catch (e) { reportException(e, "close watcher close"); }
+    }
+    // HTML #close-watcher-destroy.
+    function destroyCloseWatcher(watcher) {
+        const manager = closeWatcherManager(watcher.window);
+        for (const group of manager.groups) {
+            const index = group.indexOf(watcher);
+            if (index >= 0) group.splice(index, 1);
+        }
+        manager.groups = manager.groups.filter((group) => group.length > 0);
+    }
+    // HTML #process-close-watchers.
+    function processCloseWatchers(state) {
+        let processedACloseWatcher = false;
+        const manager = closeWatcherManager(state);
+        if (manager.groups.length) {
+            const group = manager.groups[manager.groups.length - 1].slice();
+            for (let i = group.length - 1; i >= 0; i--) {
+                const watcher = group[i];
+                if (watcher.getEnabledState()) processedACloseWatcher = true;
+                if (!requestCloseWatcher(watcher, true)) break;
+            }
+        }
+        if (manager.allowedGroups > 1) manager.allowedGroups--;
+        return processedACloseWatcher;
+    }
+
+    // HTML #the-closewatcher-interface.
+    class CloseWatcher extends EventTarget {
+        constructor(options = undefined) {
+            let signal = null;
+            if (options !== undefined && options !== null) {
+                if (typeof options !== "object" && typeof options !== "function")
+                    throw new TypeError("CloseWatcherOptions must be a dictionary");
+                const value = options.signal;
+                if (value !== undefined) {
+                    if (!isAbortSignalObject(value))
+                        throw new TypeError("CloseWatcherOptions.signal must be an AbortSignal");
+                    signal = value;
+                }
+            }
+            super();
+            const document = g.document;
+            if (!documentFullyActive(document))
+                throw new DOMException("The Document is not fully active", "InvalidStateError");
+            const self = this;
+            const watcher = establishCloseWatcher(activeWindowState(), document,
+                (canPreventClose) => dispatch(self, createTrustedEvent(Event, "cancel",
+                    {cancelable: canPreventClose}), false),
+                () => { dispatch(self, createTrustedEvent(Event, "close", {}), false); },
+                () => true);
+            if (signal) {
+                if (abortSignalState(signal).reason !== undefined) destroyCloseWatcher(watcher);
+                else abortSignalAddAlgorithm(signal, () => destroyCloseWatcher(watcher));
+            }
+            internalsFor(this).closeWatcher = watcher;
+        }
+        requestClose() { requestCloseWatcher(closeWatcherOf(this), false); }
+        close() { closeCloseWatcher(closeWatcherOf(this)); }
+        destroy() { destroyCloseWatcher(closeWatcherOf(this)); }
+    }
+    function closeWatcherOf(object) {
+        const watcher = object !== null && (typeof object === "object" || typeof object === "function")
+            ? internalsOf(object).closeWatcher : undefined;
+        if (!watcher) throw new TypeError("Illegal invocation");
+        return watcher;
+    }
+    for (const name of ["requestClose", "close", "destroy"])
+        Object.defineProperty(CloseWatcher.prototype, name, {enumerable: true});
+    Object.defineProperty(CloseWatcher.prototype, Symbol.toStringTag, {value: "CloseWatcher", configurable: true});
+    g.CloseWatcher = CloseWatcher;
+
+    // ---- Focus helpers shared by dialogs and popovers (HTML #focus) ----
+    // HTML #allow-focus-steps. The "focus-without-user-activation" feature's
+    // default allowlist is 'self', so a top-level or same-origin child
+    // Document may focus; a cross-origin child needs transient activation.
+    function allowFocusSteps(document) {
+        if (!cfg.parentWindow || sameOriginWindow(cfg.parentWindow)) return true;
+        return hasTransientActivation(windowStateForNode(document));
+    }
+    function sequentiallyFocusable(element) {
+        if (!elementCanFocus(element)) return false;
+        const index = parsedTabIndex(element);
+        return (index === null ? defaultTabIndex(element) : index) >= 0
+            || (index === null && (ceHost(element) || !!internalsOf(element).contentRealmWindow));
+    }
+    function shadowRootForFocus(host) {
+        const id = __dom_shadow_root(nodeIds.get(host));
+        return id === null || id === undefined ? null : wrap(id);
+    }
+    // HTML #get-the-focusable-area for a non-focusable-area element: a shadow
+    // host delegating focus yields its focus delegate.
+    function focusableAreaFor(element, trigger) {
+        const root = shadowRootForFocus(element);
+        if (root && internalsOf(root).delegatesFocus) return focusDelegate(element, trigger);
+        return null;
+    }
+    // HTML #autofocus-delegate.
+    function autofocusDelegate(target, trigger) {
+        const walker = [];
+        for (let child = target.lastChild; child; child = child.previousSibling) walker.push(child);
+        while (walker.length) {
+            const node = walker.pop();
+            for (let child = node.lastChild; child; child = child.previousSibling) walker.push(child);
+            if (node.nodeType !== 1 || !node.hasAttribute("autofocus")) continue;
+            const area = elementCanFocus(node) ? node : focusableAreaFor(node, trigger);
+            if (area === null) continue;
+            return area;
+        }
+        return null;
+    }
+    // HTML #focus-delegate.
+    function focusDelegate(focusTarget, trigger = "other") {
+        const root = shadowRootForFocus(focusTarget);
+        if (root && !internalsOf(root).delegatesFocus) return null;
+        const whereToLook = root || focusTarget;
+        const delegate = autofocusDelegate(whereToLook, trigger);
+        if (delegate !== null) return delegate;
+        const dialog = htmlElementName(focusTarget) === "dialog";
+        const walker = [];
+        for (let child = whereToLook.lastChild; child; child = child.previousSibling) walker.push(child);
+        while (walker.length) {
+            const descendant = walker.pop();
+            for (let child = descendant.lastChild; child; child = child.previousSibling) walker.push(child);
+            if (descendant.nodeType !== 1) continue;
+            let area = null;
+            if (dialog && sequentiallyFocusable(descendant)) area = descendant;
+            else if (!dialog && elementCanFocus(descendant)) area = descendant;
+            else area = focusableAreaFor(descendant, trigger);
+            if (area !== null) return area;
+        }
+        return null;
+    }
+    // HTML #focusing-steps for an element (the focused area moves only when
+    // the element is a focusable area that is not inert).
+    function focusingSteps(target, options) {
+        if (!target) return;
+        // The Document's viewport: focus leaves the focused element.
+        if (target.nodeType === 9) {
+            if (target === g.document && focusedArea) blurElement(focusedArea);
+            return;
+        }
+        let area = elementCanFocus(target) ? target : focusableAreaFor(target, "other");
+        if (!area) return;
+        if (__dom_inert(nodeIds.get(area))) return;
+        focusElement(area, options || {preventScroll: true});
+    }
+    // The DOM anchor of `document`'s focused area of the document. This
+    // reads the focused area as it is, before any focus fixup: a modal
+    // dialog's previously focused element is the one focused when it became
+    // inert (HTML #show-a-modal-dialog: the fixup happens "soon").
+    function focusedAnchorOf(document) {
+        const id = __dom_focus(nodeIds.get(document));
+        const element = typeof id === "number" && id >= 0 ? wrap(id) : null;
+        return element && element.isConnected ? element : document;
+    }
+
+    // ---- Per-Document state of dialogs and popovers ----
+    function topLayerDocumentState(document) {
+        const record = internalsFor(document);
+        return record.topLayerState || (record.topLayerState = {
+            openDialogs: [], dialogPointerdownTarget: null, popoverPointerdownTarget: null,
+            hidingPopoverNestingCount: 0, showingPopover: false, hintStackParent: null,
+        });
+    }
+
+    // ---- The dialog element (HTML #the-dialog-element) ----
+    // HTML #attr-dialog-closedby: an enumerated attribute whose missing and
+    // invalid value defaults are the Auto state.
+    function dialogClosedByState(dialog) {
+        const value = reflectedValue(dialog, "closedby");
+        const keyword = value === null ? "" : asciiLower(value);
+        return keyword === "any" || keyword === "closerequest" || keyword === "none" ? keyword : "auto";
+    }
+    // HTML #computed-closed-by-state.
+    function computedClosedByState(dialog) {
+        const state = dialogClosedByState(dialog);
+        if (state === "auto") return __dom_dialog_modal(nodeIds.get(dialog)) ? "closerequest" : "none";
+        return state;
+    }
+    function dialogIsModal(dialog) { return __dom_dialog_modal(nodeIds.get(dialog)) === true; }
+    function hasOpenAttribute(element) { return reflectedValue(element, "open") !== null; }
+    // HTML #set-the-dialog-close-watcher.
+    function setDialogCloseWatcher(dialog) {
+        const record = internalsFor(dialog);
+        record.dialogCloseWatcher = establishCloseWatcher(windowStateForNode(dialog), dialog.ownerDocument,
+            (canPreventClose) => dispatch(dialog, createTrustedEvent(Event, "cancel",
+                {cancelable: canPreventClose}), false),
+            () => closeTheDialog(dialog, internalsOf(dialog).requestCloseReturnValue ?? null,
+                internalsOf(dialog).requestCloseSource || null),
+            () => !!internalsOf(dialog).enableCloseWatcherForRequestClose
+                || computedClosedByState(dialog) !== "none");
+    }
+    // HTML #dialog-setup-steps.
+    function dialogSetupSteps(dialog) {
+        const list = topLayerDocumentState(dialog.ownerDocument).openDialogs;
+        if (list.includes(dialog)) return;
+        list.push(dialog);
+        setDialogCloseWatcher(dialog);
+    }
+    // HTML #dialog-cleanup-steps.
+    function dialogCleanupSteps(dialog, document = dialog.ownerDocument) {
+        const list = topLayerDocumentState(document).openDialogs;
+        const index = list.indexOf(dialog);
+        if (index >= 0) list.splice(index, 1);
+        const record = internalsFor(dialog);
+        if (record.dialogCloseWatcher) {
+            destroyCloseWatcher(record.dialogCloseWatcher);
+            record.dialogCloseWatcher = null;
+        }
+    }
+    // HTML's dialog attribute change steps for `open`.
+    function dialogOpenAttributeChanged(dialog, oldValue, value) {
+        if (htmlElementName(dialog) !== "dialog") return;
+        if (value === null && oldValue !== null) dialogCleanupSteps(dialog);
+        if (!documentFullyActive(dialog.ownerDocument)) return;
+        if (!dialog.isConnected) return;
+        if (value !== null && oldValue === null) dialogSetupSteps(dialog);
+    }
+    // The dialog insertion and removing steps for every route the attribute
+    // change steps above do not observe (the parser, fragment parsing, node
+    // removal): reconcile `document`'s open dialogs list with the connected
+    // dialogs that have an `open` attribute.
+    function syncOpenDialogs(document) {
+        const state = topLayerDocumentState(document);
+        for (const dialog of state.openDialogs.slice())
+            if (!dialog.isConnected || dialog.ownerDocument !== document || !hasOpenAttribute(dialog))
+                dialogCleanupSteps(dialog, document);
+        if (!documentFullyActive(document)) return;
+        const ids = __dom_open_dialogs(nodeIds.get(document)) || [];
+        for (let i = 0; i < ids.length; i++) {
+            const dialog = wrap(ids[i]);
+            if (dialog && !state.openDialogs.includes(dialog)) dialogSetupSteps(dialog);
+        }
+    }
+    // HTML #queue-a-dialog-toggle-event-task.
+    function queueDialogToggleEventTask(dialog, oldState, newState, source) {
+        queueToggleEventTask(dialog, "dialogToggleTracker", oldState, newState, source);
+    }
+    // HTML #dialog-focusing-steps.
+    function dialogFocusingSteps(subject) {
+        if (!allowFocusSteps(subject.ownerDocument)) return;
+        let control = null;
+        if (subject.hasAttribute("autofocus")) control = subject;
+        if (control === null) control = focusDelegate(subject);
+        if (control === null) control = subject;
+        focusingSteps(control);
+    }
+    // HTML #show-a-modal-dialog.
+    function showModalDialog(subject, source) {
+        syncPopoverRemovals();
+        const id = nodeIds.get(subject);
+        if (hasOpenAttribute(subject) && dialogIsModal(subject)) return;
+        if (hasOpenAttribute(subject))
+            throw new DOMException("The dialog is already open", "InvalidStateError");
+        if (!documentFullyActive(subject.ownerDocument))
+            throw new DOMException("The dialog's Document is not fully active", "InvalidStateError");
+        if (!subject.isConnected) throw new DOMException("The dialog is not connected", "InvalidStateError");
+        if (popoverShowing(subject))
+            throw new DOMException("The dialog is showing as a popover", "InvalidStateError");
+        if (!dispatch(subject, toggleEvent("beforetoggle", "closed", "open", source, true), false)) return;
+        if (hasOpenAttribute(subject) || !subject.isConnected || popoverShowing(subject)) return;
+        queueDialogToggleEventTask(subject, "closed", "open", source);
+        setReflectedValue(subject, "open", "");
+        if (!internalsOf(subject).dialogCloseWatcher) syncOpenDialogs(subject.ownerDocument);
+        // "is modal", blocking the Document, and the top layer.
+        __dom_dialog_modal(id, true);
+        internalsFor(subject).previouslyFocused = focusedAnchorOf(subject.ownerDocument);
+        const document = subject.ownerDocument;
+        hidePopoversUntil(document, topmostPopoverAncestor(subject, null, false), false, true);
+        // Focus fixup: the focused area may just have become inert.
+        activeElementFor(g.document);
+        dialogFocusingSteps(subject);
+    }
+    // HTML #close-the-dialog.
+    function closeTheDialog(subject, result, source) {
+        syncPopoverRemovals();
+        if (!hasOpenAttribute(subject)) return;
+        dispatch(subject, toggleEvent("beforetoggle", "open", "closed", source, false), false);
+        if (!hasOpenAttribute(subject)) return;
+        queueDialogToggleEventTask(subject, "open", "closed", source);
+        removeReflectedValue(subject, "open");
+        const wasModal = dialogIsModal(subject);
+        // Requests removal from the top layer when modal, then clears it.
+        __dom_dialog_modal(nodeIds.get(subject), false);
+        const record = internalsFor(subject);
+        if (result !== null) record.dlgReturn = result;
+        record.requestCloseReturnValue = null;
+        record.requestCloseSource = null;
+        const element = record.previouslyFocused;
+        if (element) {
+            record.previouslyFocused = null;
+            const anchor = focusedAnchorOf(subject.ownerDocument);
+            if (wasModal || isShadowIncludingInclusiveDescendant(anchor, subject))
+                focusingSteps(element, {preventScroll: true});
+        }
+        __queue_dom_task(() => dispatch(subject, createTrustedEvent(Event, "close", {}), false));
+    }
+    // HTML #dialog-request-close.
+    function requestCloseTheDialog(subject, returnValue, source) {
+        syncPopoverRemovals();
+        if (!hasOpenAttribute(subject)) return;
+        if (!subject.isConnected || !documentFullyActive(subject.ownerDocument)) return;
+        if (!internalsOf(subject).dialogCloseWatcher) syncOpenDialogs(subject.ownerDocument);
+        const record = internalsFor(subject);
+        const watcher = record.dialogCloseWatcher;
+        if (!watcher) return;
+        record.enableCloseWatcherForRequestClose = true;
+        record.requestCloseReturnValue = returnValue;
+        record.requestCloseSource = source;
+        try { requestCloseWatcher(watcher, false); }
+        finally { record.enableCloseWatcherForRequestClose = false; }
+    }
+    // HTML #nearest-clicked-dialog.
+    function nearestClickedDialog(target, clientX, clientY) {
+        if (target && target.nodeType === 1 && htmlElementName(target) === "dialog"
+            && hasOpenAttribute(target) && dialogIsModal(target)) {
+            const rect = target.getBoundingClientRect();
+            if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom)
+                return null;
+        }
+        for (let current = target; current; current = flatTreeParent(current))
+            if (current.nodeType === 1 && htmlElementName(current) === "dialog" && hasOpenAttribute(current))
+                return current;
+        return null;
+    }
+    // HTML #light-dismiss-open-dialogs.
+    function lightDismissOpenDialogs(type, target, clientX, clientY) {
+        const document = target.nodeType === 9 ? target : target.ownerDocument;
+        syncOpenDialogs(document);
+        const state = topLayerDocumentState(document);
+        if (!state.openDialogs.length) return;
+        const ancestor = nearestClickedDialog(target, clientX, clientY);
+        if (type === "pointerdown") state.dialogPointerdownTarget = ancestor;
+        if (type === "pointerup") {
+            const sameTarget = ancestor === state.dialogPointerdownTarget;
+            state.dialogPointerdownTarget = null;
+            if (!sameTarget) return;
+            const topmostDialog = state.openDialogs[state.openDialogs.length - 1];
+            if (ancestor === topmostDialog) return;
+            if (computedClosedByState(topmostDialog) !== "any") return;
+            const watcher = internalsOf(topmostDialog).dialogCloseWatcher;
+            if (watcher) requestCloseWatcher(watcher, false);
+        }
+    }
+
+    // ---- The popover attribute (HTML #the-popover-attribute) ----
+    // The attribute's state: null (No Popover), "auto", "hint" or "manual".
+    function popoverAttributeState(element) {
+        if (!(element instanceof Element) || htmlElementName(element) === "") return null;
+        const value = messageApply(elementGetAttribute, element, ["popover"]);
+        if (value === null) return null;
+        const keyword = asciiLower(value);
+        return keyword === "" || keyword === "auto" ? "auto" : keyword === "hint" ? "hint" : "manual";
+    }
+    // The popover visibility state, owned by the arena (`:popover-open`).
+    function popoverShowing(element) {
+        const id = nodeIds.get(element);
+        return id !== undefined && __dom_popover(id) === true;
+    }
+    function popoverMode(element) { return internalsOf(element).openedInPopoverMode || null; }
+    // HTML #check-popover-validity.
+    function checkPopoverValidity(element, expectedToBeShowing, expectedDocument) {
+        if (popoverAttributeState(element) === null)
+            throw new DOMException("The element has no popover attribute", "NotSupportedError");
+        const showing = popoverShowing(element);
+        if ((expectedToBeShowing && !showing) || (!expectedToBeShowing && showing)) return false;
+        if (!element.isConnected || !documentFullyActive(element.ownerDocument)
+            || (expectedDocument !== null && element.ownerDocument !== expectedDocument)
+            || (htmlElementName(element) === "dialog" && dialogIsModal(element))
+            || __dom_fullscreen(nodeIds.get(element)) === true)
+            throw new DOMException("The popover cannot change state", "InvalidStateError");
+        return true;
+    }
+    function checkedPopoverValidity(element, expectedToBeShowing, expectedDocument) {
+        try { return checkPopoverValidity(element, expectedToBeShowing, expectedDocument); }
+        catch (e) { return e; }
+    }
+    // HTML #showing-auto-popover-list / #showing-hint-popover-list.
+    function showingPopoverList(document, mode) {
+        return topLayerOf(document).filter((element) => htmlElementName(element) !== ""
+            && popoverMode(element) === mode && popoverShowing(element));
+    }
+    // HTML #topmost-auto-popover.
+    function topmostAutoOrHintPopover(document) {
+        const hints = showingPopoverList(document, "hint");
+        if (hints.length) return hints[hints.length - 1];
+        const autos = showingPopoverList(document, "auto");
+        return autos.length ? autos[autos.length - 1] : null;
+    }
+    // HTML #topmost-popover-ancestor.
+    function topmostPopoverAncestor(newPopoverOrTopLayerElement, source, isPopover) {
+        const document = newPopoverOrTopLayerElement.ownerDocument;
+        const combined = showingPopoverList(document, "auto").concat(showingPopoverList(document, "hint"));
+        let popoverAncestorIndex = -1, sourceAncestorIndex = -1;
+        for (let i = 0; i < combined.length; i++) {
+            if (isFlatTreeDescendant(newPopoverOrTopLayerElement, combined[i])) popoverAncestorIndex = i;
+            if (source && isFlatTreeDescendant(source, combined[i])) sourceAncestorIndex = i;
+        }
+        const ancestorIndex = Math.max(popoverAncestorIndex, sourceAncestorIndex);
+        return ancestorIndex < 0 ? null : combined[ancestorIndex];
+    }
+    // HTML #nearest-inclusive-open-popover.
+    function nearestInclusiveOpenPopover(node) {
+        for (let current = node; current; current = flatTreeParent(current)) {
+            const mode = current.nodeType === 1 ? popoverMode(current) : null;
+            if ((mode === "auto" || mode === "hint") && popoverShowing(current)) return current;
+        }
+        return null;
+    }
+    // HTML #popover-target-element.
+    function popoverTargetElement(node) {
+        const name = htmlElementName(node);
+        if (name !== "button" && !(name === "input" && ["submit", "reset", "image", "button"].includes(inputTypeOf(node)))) return null;
+        if (isActuallyDisabled(node)) return null;
+        if (formOwner(node) && isSubmitButtonElement(node)) return null;
+        const popover = attrAssociatedElement(node, "popovertarget", g.Element);
+        if (!popover || popoverAttributeState(popover) === null) return null;
+        return popover;
+    }
+    // HTML #get-the-target-popover.
+    function targetPopoverOf(node) {
+        if (htmlElementName(node) !== "button") return popoverTargetElement(node);
+        if (isActuallyDisabled(node)) return null;
+        const target = attrAssociatedElement(node, "commandfor", g.Element);
+        if (!target) return popoverTargetElement(node);
+        if (formOwner(node)) {
+            if (isSubmitButtonElement(node)) return null;
+            const type = reflectedValue(node, "type");
+            const keyword = type === null ? "" : asciiLower(type);
+            if (keyword === "reset") return null;
+            if (keyword !== "submit" && keyword !== "button") return null;
+        }
+        const command = buttonCommand(node);
+        if (command !== "toggle-popover" && command !== "hide-popover" && command !== "show-popover") return null;
+        if (popoverAttributeState(target) === null) return null;
+        return target;
+    }
+    // HTML #nearest-inclusive-target-popover.
+    function nearestInclusiveTargetPopover(node) {
+        for (let current = node; current; current = flatTreeParent(current)) {
+            if (current.nodeType !== 1) continue;
+            const target = targetPopoverOf(current);
+            const state = target ? popoverAttributeState(target) : null;
+            if ((state === "auto" || state === "hint") && popoverShowing(target)) return target;
+        }
+        return null;
+    }
+    // HTML #popover-stack-position.
+    function popoverStackPosition(popover) {
+        if (!popover) return 0;
+        const hints = showingPopoverList(popover.ownerDocument, "hint");
+        const autos = showingPopoverList(popover.ownerDocument, "auto");
+        if (hints.includes(popover)) return hints.indexOf(popover) + autos.length + 1;
+        if (autos.includes(popover)) return autos.indexOf(popover) + 1;
+        return 0;
+    }
+    // HTML #topmost-clicked-popover.
+    function topmostClickedPopover(node) {
+        const clickedPopover = nearestInclusiveOpenPopover(node);
+        const targetPopover = nearestInclusiveTargetPopover(node);
+        if (popoverStackPosition(clickedPopover) > popoverStackPosition(targetPopover)) return clickedPopover;
+        return targetPopover;
+    }
+    // HTML #hide-popover-stack-until.
+    function hidePopoverStackUntil(document, endpoint, stackType, focusPreviousElement, fireEvents) {
+        const popoverList = showingPopoverList(document, stackType);
+        const lastHideIndex = endpoint !== null && popoverList.includes(endpoint) ? popoverList.indexOf(endpoint) + 1 : 0;
+        const toHide = popoverList.slice(lastHideIndex).reverse();
+        const toRemain = popoverList.slice(0, lastHideIndex);
+        for (const popover of toHide) hidePopoverAlgorithm(popover, focusPreviousElement, fireEvents, false, null);
+        const toCheck = showingPopoverList(document, stackType).reverse();
+        for (const popover of toCheck) {
+            if (toRemain.includes(popover)) continue;
+            hidePopoverAlgorithm(popover, focusPreviousElement, false, false, null);
+        }
+    }
+    // HTML #hide-popovers-until.
+    function hidePopoversUntil(document, endpoint, focusPreviousElement, fireEvents) {
+        const endpointIsHint = endpoint !== null && showingPopoverList(document, "hint").includes(endpoint);
+        hidePopoverStackUntil(document, endpoint, "hint", focusPreviousElement, fireEvents);
+        const autoEndpoint = endpointIsHint ? topLayerDocumentState(document).hintStackParent : endpoint;
+        hidePopoverStackUntil(document, autoEndpoint, "auto", focusPreviousElement, fireEvents);
+    }
+    // HTML #queue-a-popover-toggle-event-task.
+    function queuePopoverToggleEventTask(element, oldState, newState, source) {
+        queueToggleEventTask(element, "popoverToggleTracker", oldState, newState, source);
+    }
+    // HTML #popover-focusing-steps.
+    function popoverFocusingSteps(subject) {
+        if (!allowFocusSteps(subject.ownerDocument)) return;
+        if (htmlElementName(subject) === "dialog") { dialogFocusingSteps(subject); return; }
+        const control = subject.hasAttribute("autofocus") ? subject : autofocusDelegate(subject, "other");
+        if (control === null) return;
+        focusingSteps(control);
+    }
+    // HTML #show-popover.
+    function showPopoverAlgorithm(element, throwExceptions, source) {
+        source = source || null;
+        syncPopoverRemovals();
+        const document = element.ownerDocument;
+        const documentState = topLayerDocumentState(document);
+        if (documentState.showingPopover || documentState.hidingPopoverNestingCount !== 0) {
+            if (throwExceptions)
+                throw new DOMException("A popover is already being shown or hidden", "InvalidStateError");
+            return;
+        }
+        let validity = checkedPopoverValidity(element, false, null);
+        if (validity !== true) {
+            if (throwExceptions && validity instanceof DOMException) throw validity;
+            return;
+        }
+        documentState.showingPopover = true;
+        const cleanupShowingSteps = () => { documentState.showingPopover = false; };
+        try {
+            showPopoverSteps(element, throwExceptions, source, document, documentState, cleanupShowingSteps);
+        } finally {
+            cleanupShowingSteps();
+        }
+    }
+    function showPopoverSteps(element, throwExceptions, source, document, documentState, cleanupShowingSteps) {
+        let validity;
+        if (!dispatch(element, toggleEvent("beforetoggle", "closed", "open", source, true), false)) {
+            cleanupShowingSteps();
+            return;
+        }
+        validity = checkedPopoverValidity(element, false, document);
+        if (validity !== true) {
+            cleanupShowingSteps();
+            if (throwExceptions && validity instanceof DOMException) throw validity;
+            return;
+        }
+        let shouldRestoreFocus = false;
+        const originalType = popoverAttributeState(element);
+        let effectiveType = originalType;
+        let ancestor = null;
+        if (originalType === "auto" || originalType === "hint") {
+            ancestor = topmostPopoverAncestor(element, source, true);
+            if (ancestor !== null && popoverMode(ancestor) === "hint" && effectiveType === "auto")
+                effectiveType = "hint";
+            hidePopoverStackUntil(document, ancestor, "hint", shouldRestoreFocus, true);
+            if (effectiveType === "auto")
+                hidePopoverStackUntil(document, ancestor, "auto", shouldRestoreFocus, true);
+            if (originalType !== popoverAttributeState(element)) {
+                cleanupShowingSteps();
+                if (throwExceptions)
+                    throw new DOMException("The popover attribute changed while showing", "InvalidStateError");
+                return;
+            }
+            validity = checkedPopoverValidity(element, false, document);
+            if (validity !== true) {
+                cleanupShowingSteps();
+                if (throwExceptions && validity instanceof DOMException) throw validity;
+                return;
+            }
+            if (topmostAutoOrHintPopover(document) === null) shouldRestoreFocus = true;
+            internalsFor(element).openedInPopoverMode = effectiveType === "auto" ? "auto" : "hint";
+            internalsFor(element).popoverCloseWatcher = establishCloseWatcher(windowStateForNode(element),
+                document, () => true, () => hidePopoverAlgorithm(element, true, true, false, null), () => true);
+        }
+        internalsFor(element).previouslyFocused = null;
+        const originallyFocusedElement = focusedAnchorOf(document);
+        // Add to the top layer, then the popover visibility state "showing".
+        __dom_popover(nodeIds.get(element), true);
+        if (effectiveType === "hint" && ancestor !== null && popoverMode(ancestor) === "auto")
+            documentState.hintStackParent = ancestor;
+        internalsFor(element).popoverTrigger = source || null;
+        popoverFocusingSteps(element);
+        if (shouldRestoreFocus && popoverAttributeState(element) !== null)
+            internalsFor(element).previouslyFocused = originallyFocusedElement;
+        cleanupShowingSteps();
+        queuePopoverToggleEventTask(element, "closed", "open", source);
+    }
+    // HTML #hide-popover-algorithm.
+    function hidePopoverAlgorithm(element, focusPreviousElement, fireEvents, throwExceptions, source) {
+        syncPopoverRemovals();
+        let validity = checkedPopoverValidity(element, true, null);
+        if (validity !== true) {
+            if (throwExceptions && validity instanceof DOMException) throw validity;
+            return;
+        }
+        const document = element.ownerDocument;
+        const documentState = topLayerDocumentState(document);
+        const record = internalsFor(element);
+        const nestedHide = !!record.popoverHiding;
+        record.popoverHiding = true;
+        if (nestedHide) fireEvents = false;
+        documentState.hidingPopoverNestingCount++;
+        let cleaned = false;
+        const cleanupSteps = () => {
+            if (cleaned) return;
+            cleaned = true;
+            if (!nestedHide) record.popoverHiding = false;
+            if (record.popoverCloseWatcher) {
+                destroyCloseWatcher(record.popoverCloseWatcher);
+                record.popoverCloseWatcher = null;
+            }
+            documentState.hidingPopoverNestingCount--;
+        };
+        try {
+            const autoListContainsElement = showingPopoverList(document, "auto").includes(element);
+            const hintListContainsElement = showingPopoverList(document, "hint").includes(element);
+            const mode = popoverMode(element);
+            if (mode === "auto" || mode === "hint") {
+                if (hintListContainsElement)
+                    hidePopoverStackUntil(document, element, "hint", focusPreviousElement, fireEvents);
+                if (element === documentState.hintStackParent)
+                    hidePopoverStackUntil(document, null, "hint", focusPreviousElement, fireEvents);
+                if (autoListContainsElement)
+                    hidePopoverStackUntil(document, element, "auto", focusPreviousElement, fireEvents);
+                validity = checkedPopoverValidity(element, true, null);
+                if (validity !== true) {
+                    cleanupSteps();
+                    if (throwExceptions && validity instanceof DOMException) throw validity;
+                    return;
+                }
+            }
+            if (fireEvents) {
+                dispatch(element, toggleEvent("beforetoggle", "open", "closed", source, false), false);
+                validity = checkedPopoverValidity(element, true, null);
+                if (validity !== true) {
+                    cleanupSteps();
+                    if (throwExceptions && validity instanceof DOMException) throw validity;
+                    return;
+                }
+            }
+            // Request removal from the top layer (fireEvents) or remove it
+            // immediately; without `overlay` transitions both remove now.
+            // The visibility state becomes "hidden" with it.
+            record.popoverTrigger = null;
+            record.openedInPopoverMode = null;
+            __dom_popover(nodeIds.get(element), false);
+            if (element === documentState.hintStackParent || !showingPopoverList(document, "hint").length)
+                documentState.hintStackParent = null;
+            if (fireEvents) queuePopoverToggleEventTask(element, "open", "closed", source);
+            const previouslyFocusedElement = record.previouslyFocused;
+            if (previouslyFocusedElement) {
+                record.previouslyFocused = null;
+                if (focusPreviousElement
+                    && isShadowIncludingInclusiveDescendant(focusedAnchorOf(document), element))
+                    focusingSteps(previouslyFocusedElement, {preventScroll: true});
+            }
+        } catch (e) {
+            cleanupSteps();
+            throw e;
+        }
+        cleanupSteps();
+    }
+    // HTML #light-dismiss-open-popovers.
+    function lightDismissOpenPopovers(type, target) {
+        const document = target.nodeType === 9 ? target : target.ownerDocument;
+        if (topmostAutoOrHintPopover(document) === null) return;
+        const state = topLayerDocumentState(document);
+        if (type === "pointerdown") state.popoverPointerdownTarget = topmostClickedPopover(target);
+        if (type === "pointerup") {
+            const ancestor = topmostClickedPopover(target);
+            const sameTarget = ancestor === state.popoverPointerdownTarget;
+            state.popoverPointerdownTarget = null;
+            if (!sameTarget) return;
+            hidePopoversUntil(document, ancestor, false, true);
+        }
+    }
+    // HTML #run-light-dismiss-activities, for a trusted pointerdown/pointerup.
+    function runLightDismissActivities(type, target, clientX, clientY) {
+        if (!target) return;
+        try {
+            syncPopoverRemovals();
+            lightDismissOpenPopovers(type, target);
+            lightDismissOpenDialogs(type, target, clientX, clientY);
+        } catch (e) { reportException(e, "light dismiss"); }
+    }
+    // HTML's popover attribute change steps.
+    function popoverAttributeChanged(element, oldValue, value) {
+        if (!popoverShowing(element)) return;
+        const keyword = (v) => {
+            if (v === null) return null;
+            const k = asciiLower(v);
+            return k === "" || k === "auto" ? "auto" : k === "hint" ? "hint" : "manual";
+        };
+        if (keyword(oldValue) !== keyword(value)) {
+            try { hidePopoverAlgorithm(element, true, true, false, null); } catch (e) { reportException(e, "popover"); }
+        }
+    }
+    // The script-visible remainder of the removing steps of HTML's popover
+    // (#the-popover-attribute: the hide popover algorithm without events or
+    // focus) and dialog elements (#dialog-cleanup-steps) and of Fullscreen
+    // API #removing-steps, for elements the arena saw leave their Document.
+    // Each Realm handles the elements it has wrappers for.
+    function handleTopLayerRemovals(ids) {
+        for (let i = 0; i < ids.length; i++) {
+            const element = cachedWrapper(ids[i]);
+            if (!element || element.nodeType !== 1) continue;
+            const record = internalsFor(element);
+            if (!popoverShowing(element)) {
+                if (record.popoverCloseWatcher) {
+                    destroyCloseWatcher(record.popoverCloseWatcher);
+                    record.popoverCloseWatcher = null;
+                }
+                record.popoverTrigger = null;
+                record.openedInPopoverMode = null;
+                record.previouslyFocused = null;
+                const state = topLayerDocumentState(element.ownerDocument);
+                if (state.hintStackParent === element) state.hintStackParent = null;
+            }
+            if (htmlElementName(element) === "dialog" && record.dialogCloseWatcher) {
+                for (const document of [element.ownerDocument]) {
+                    dialogCleanupSteps(element, document);
+                    if (element.isConnected) syncOpenDialogs(document);
+                }
+            }
+            if (fullscreenFlag(element)) fullscreenRemovingSteps(element);
+        }
+    }
+    // Process the arena's pending removals in every Realm of this page.
+    function syncPopoverRemovals() {
+        const top = topMessageWindowState();
+        if (top.syncTopLayerRemovals) top.syncTopLayerRemovals();
+    }
+    trust.syncTopLayerRemovals = function (ids) {
+        if (ids === undefined) {
+            ids = __dom_top_layer_removals() || [];
+            if (!ids.length) return;
+        }
+        handleTopLayerRemovals(ids);
+        for (const child of childWindowTrusts)
+            if (child.syncTopLayerRemovals) child.syncTopLayerRemovals(ids);
+    };
+    // HTML's dialog `open` and popover attribute change steps (null
+    // namespace; setAttribute, removeAttribute and the reflecting setters).
+    function topLayerAttributeChanged(element, name, oldValue, value) {
+        if (name === "open") dialogOpenAttributeChanged(element, oldValue, value);
+        else popoverAttributeChanged(element, oldValue, value);
+    }
+    // HTML #dictdef-showpopoveroptions: `source` is an HTMLElement.
+    function popoverOptionSource(options) {
+        if (options === undefined || options === null) return null;
+        if (typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("ShowPopoverOptions must be a dictionary");
+        const source = options.source;
+        if (source === undefined) return null;
+        if (htmlElementName(source) === "") throw new TypeError("ShowPopoverOptions.source must be an HTMLElement");
+        return source;
+    }
+    // The topmost modal dialog in `document`'s top layer (HTML
+    // #blocked-by-a-modal-dialog).
+    function blockingDialogOf(document) {
+        const layer = topLayerOf(document);
+        for (let i = layer.length - 1; i >= 0; i--)
+            if (htmlElementName(layer[i]) === "dialog" && dialogIsModal(layer[i])) return layer[i];
+        return null;
+    }
+    // HTML #inert-subtrees: hit testing acts as if an inert node had
+    // `pointer-events: none`. A frontend hit on an inert node lands on what
+    // lies beneath: the blocking dialog's ::backdrop (whose events target
+    // the dialog) when one blocks the Document, else the root element.
+    function nonInertPointerTarget(target) {
+        if (!target || target.nodeType !== 1 || !__dom_inert(nodeIds.get(target))) return target;
+        const document = target.ownerDocument;
+        return blockingDialogOf(document) || document.documentElement || target;
+    }
+
+    // ---- Fullscreen API (local WHATWG Fullscreen 7c38d773, 2026-09-06) ----
+    // The fullscreen flag and top-layer membership live in the arena
+    // (`__dom_fullscreen`); script keeps the iframe fullscreen and keyboard
+    // lock flags and each Document's list of pending fullscreen events. Every
+    // Realm exposes `fullscreenAgent` for its own Documents, so the container
+    // chain and the exit algorithm can cross Realms without touching another
+    // origin's nodes.
+    function fullscreenFlag(element) {
+        const id = nodeIds.get(element);
+        return id !== undefined && __dom_fullscreen(id) === true;
+    }
+    // #fullscreen-element.
+    function fullscreenElementOf(document) {
+        const ids = __dom_top_layer(nodeIds.get(document)) || [];
+        for (let i = ids.length - 1; i >= 0; i--)
+            if (__dom_fullscreen(ids[i]) === true) return wrap(ids[i]);
+        return null;
+    }
+    function fullscreenElementsInTopLayer(document) {
+        return topLayerOf(document).filter(fullscreenFlag);
+    }
+    // #simple-fullscreen-document.
+    function simpleFullscreenDocument(document) {
+        return fullscreenElementsInTopLayer(document).length === 1;
+    }
+    // Request "update the rendering", whose fullscreen steps fire the
+    // Document's pending events.
+    function requestFullscreenRendering() {
+        if (animationFrames.deadline === null) animationFrames.deadline = currentTime();
+    }
+    // #list-of-pending-fullscreen-events: an ordered set of (type, element).
+    function appendPendingFullscreenEvent(document, type, element) {
+        const record = internalsFor(document);
+        const pending = record.pendingFullscreenEvents || (record.pendingFullscreenEvents = []);
+        if (!pending.some(([t, e]) => t === type && e === element)) pending.push([type, element]);
+        if (!fullscreenPendingDocuments.includes(document)) fullscreenPendingDocuments.push(document);
+        requestFullscreenRendering();
+    }
+    const fullscreenPendingDocuments = [];
+    // #run-the-fullscreen-steps, for this Realm's Documents in tree order of
+    // their containers (rendering order), run by "update the rendering".
+    function runFullscreenSteps() {
+        if (!fullscreenPendingDocuments.length) return;
+        const documents = fullscreenPendingDocuments.splice(0);
+        for (const document of documents) {
+            const record = internalsFor(document);
+            const pendingEvents = record.pendingFullscreenEvents || [];
+            record.pendingFullscreenEvents = [];
+            for (const [type, element] of pendingEvents) {
+                const target = element.isConnected && element.ownerDocument === document ? element : document;
+                dispatch(target, createTrustedEvent(Event, type, {bubbles: true, composed: true}), false);
+            }
+        }
+    }
+    // #fullscreen-an-element.
+    function fullscreenAnElement(element) {
+        const hideUntil = topmostPopoverAncestor(element, null, false);
+        hidePopoversUntil(element.ownerDocument, hideUntil, false, true);
+        __dom_fullscreen(nodeIds.get(element), true);
+    }
+    // #unfullscreen-an-element.
+    function unfullscreenAnElement(element) {
+        const record = internalsFor(element);
+        record.iframeFullscreen = false;
+        record.keyboardLock = false;
+        __dom_fullscreen(nodeIds.get(element), false);
+    }
+    // #unfullscreen-a-document.
+    function unfullscreenADocument(document) {
+        for (const element of fullscreenElementsInTopLayer(document)) unfullscreenAnElement(element);
+    }
+    // HTML #allowed-to-use the "fullscreen" policy-controlled feature
+    // (Permissions Policy #algo-define-inherited-policy-in-container), whose
+    // default allowlist is 'self'. The container policy comes from the
+    // iframe's `allow` and `allowfullscreen` attributes as they were when the
+    // child navigable was navigated; TRust has no Permissions-Policy header.
+    function fullscreenAllowedForDocument(document) {
+        if (!documentFullyActive(document)) return false;
+        const frame = frameOwnerForNode(document);
+        if (frame && frame !== realmRootFrame) {
+            if (!fullscreenAllowedForDocument(frame.ownerDocument)) return false;
+            return containerAllowsFullscreen(containerPolicyOf(frame),
+                originKeyOf(frame.ownerDocument), originKeyOf(document));
+        }
+        if (document === g.document && cfg.parentWindow) {
+            const parent = messageWindowState.parent();
+            return !!parent && parent.fullscreenAllowedForChild(messageWindowState.frameId, messageWindowState.originKey);
+        }
+        return true;
+    }
+    // Documents of one Realm share its origin (same-Realm child navigables
+    // are same origin with it).
+    function originKeyOf(document) { return messageWindowState.originKey; }
+    // Permissions Policy #parse-policy-directive for the "fullscreen" feature
+    // of an `allow` attribute, then #process-policy-attributes'
+    // `allowfullscreen` rule. Returns null (no declaration), "*" or a list of
+    // origin keys plus the 'src' marker.
+    function fullscreenContainerPolicy(frame, url = null) {
+        let declared = null;
+        const allow = reflectedValue(frame, "allow");
+        if (allow !== null) {
+            for (const serializedDirective of allow.split(";")) {
+                const tokens = serializedDirective.trim().split(/[\t\n\f\r ]+/).filter(Boolean);
+                if (!tokens.length || tokens[0] !== "fullscreen" || declared !== null) continue;
+                const targets = tokens.slice(1);
+                if (targets.includes("*")) { declared = "*"; continue; }
+                declared = [];
+                if (!targets.length) declared.push("'src'");
+                for (const target of targets) {
+                    const lower = asciiLower(target);
+                    if (lower === "'self'") { declared.push(originKeyOf(frame.ownerDocument)); continue; }
+                    if (lower === "'src'") { declared.push("'src'"); continue; }
+                    const parsed = __url_parse(target, null);
+                    if (parsed && parsed[8] !== "null") declared.push(parsed[8]);
+                }
+            }
+        }
+        if (declared === null && reflectedValue(frame, "allowfullscreen") !== null) declared = "*";
+        let src = null;
+        try {
+            const parsed = __url_parse(url || internalsOf(frame).frameUrl || "about:blank", null);
+            src = parsed && parsed[8] !== "null" ? parsed[8] : null;
+        } catch (_) {}
+        return {declared, src};
+    }
+    // Permissions Policy #algo-define-inherited-policy-in-container, after
+    // the container document's own "Enabled" check.
+    function containerAllowsFullscreen(policy, containerOrigin, origin) {
+        if (policy && policy.declared !== null) {
+            if (policy.declared === "*") return true;
+            return policy.declared.some((entry) => entry === "'src'"
+                ? policy.src !== null && policy.src === origin : entry === origin);
+        }
+        return typeof containerOrigin === "string" && containerOrigin === origin;
+    }
+    // HTML: the allow/allowfullscreen attributes take effect when the child
+    // navigable is navigated; snapshot them for the new Document.
+    function snapshotFullscreenContainerPolicy(frame, url) {
+        try { internalsFor(frame).fullscreenContainerPolicy = fullscreenContainerPolicy(frame, url); }
+        catch (_) {}
+    }
+    function containerPolicyOf(frame) {
+        return internalsOf(frame).fullscreenContainerPolicy || fullscreenContainerPolicy(frame);
+    }
+    // #fullscreen-element-ready-check.
+    function fullscreenElementReadyCheck(element) {
+        return element.isConnected && fullscreenAllowedForDocument(element.ownerDocument)
+            && (htmlElementName(element) === "" || !popoverShowing(element));
+    }
+    const fullscreenAgent = {
+        fullscreenElement: fullscreenElementOf,
+        simple: simpleFullscreenDocument,
+        unfullscreenElement: unfullscreenAnElement,
+        unfullscreenDocument: unfullscreenADocument,
+        appendPending: appendPendingFullscreenEvent,
+        iframeFullscreen(element) { return !!internalsOf(element).iframeFullscreen; },
+        nodeDocument(element) { return element.ownerDocument; },
+        frameById(id) {
+            const element = wrap(id);
+            return element && element.nodeType === 1 ? element : null;
+        },
+        rootDocument() { return g.document; },
+        // The container of `document`'s node navigable, as {agent, element}.
+        container(document) {
+            const frame = frameOwnerForNode(document);
+            if (frame && frame !== realmRootFrame) return {agent: fullscreenAgent, element: frame};
+            if (document === g.document && cfg.parentWindow) {
+                const parent = messageWindowState.parent();
+                const agent = parent && parent.fullscreenAgent;
+                const element = agent && agent.frameById(messageWindowState.frameId);
+                if (element) return {agent, element};
+            }
+            return null;
+        },
+        // "Fullscreen element within doc" for each container in the chain
+        // (#dom-element-requestfullscreen's fullscreenElements loop).
+        fullscreenChain(element, requested) {
+            let agent = fullscreenAgent;
+            while (element) {
+                const next = agent.fullscreenStep(element, requested);
+                if (!next) break;
+                agent = next.agent; element = next.element;
+            }
+        },
+        fullscreenStep(element, requested) {
+            const document = element.ownerDocument;
+            if (element !== fullscreenElementOf(document)) {
+                if (element === requested && htmlElementName(element) === "iframe")
+                    internalsFor(element).iframeFullscreen = true;
+                fullscreenAnElement(element);
+                appendPendingFullscreenEvent(document, "fullscreenchange", element);
+            }
+            return fullscreenAgent.container(document);
+        },
+        // The active Documents of `document`'s descendant navigables, in
+        // tree order, as {agent, document}.
+        descendantDocuments(document, out) {
+            const frames = (__dom_query(nodeIds.get(document), "iframe, frame", false) || [[]])[0] || [];
+            for (const id of frames) {
+                const frame = wrap(id);
+                if (!frame || frame.ownerDocument !== document) continue;
+                const childWindow = internalsOf(frame).contentRealmWindow;
+                if (childWindow && childWindow !== g) {
+                    const childTrust = trustOf(childWindow);
+                    const agent = childTrust && childTrust.fullscreenAgent;
+                    if (!agent) continue;
+                    const childDocument = agent.rootDocument();
+                    out.push({agent, document: childDocument});
+                    agent.descendantDocuments(childDocument, out);
+                } else {
+                    const childDocument = internalsOf(frame).contentDoc || null;
+                    if (!childDocument || childDocument === document) continue;
+                    out.push({agent: fullscreenAgent, document: childDocument});
+                    fullscreenAgent.descendantDocuments(childDocument, out);
+                }
+            }
+        },
+        // Fullscreen API #fully-exit-fullscreen for this Realm's top-level
+        // Document (`fromFrontend`: the user agent already left fullscreen).
+        fullyExit(document, fromFrontend) { fullyExitFullscreen(document, fromFrontend); },
+    };
+    trust.fullscreenAgent = fullscreenAgent;
+    // #collect-documents-to-unfullscreen, over {agent, document} entries.
+    function collectDocumentsToUnfullscreen(entry) {
+        const docs = [entry];
+        for (;;) {
+            const last = docs[docs.length - 1];
+            if (!last.agent.simple(last.document)) break;
+            const container = last.agent.container(last.document);
+            if (!container) break;
+            if (container.agent.iframeFullscreen(container.element)) break;
+            docs.push({agent: container.agent, document: container.agent.nodeDocument(container.element)});
+        }
+        return docs;
+    }
+    function topLevelDocumentEntry() {
+        const top = topMessageWindowState();
+        return top.fullscreenAgent ? {agent: top.fullscreenAgent, document: top.fullscreenAgent.rootDocument()} : null;
+    }
+    // #exit-fullscreen. `fromFrontend` skips asking the frontend to restore
+    // a viewport it already restored.
+    function exitFullscreenDocument(document, fromFrontend = false) {
+        return new Promise((resolve, reject) => {
+            syncPopoverRemovals();
+            if (!documentFullyActive(document) || fullscreenElementOf(document) === null) {
+                reject(new TypeError("The Document is not in fullscreen"));
+                return;
+            }
+            let entry = {agent: fullscreenAgent, document};
+            let resize = false;
+            const docs = collectDocumentsToUnfullscreen(entry);
+            const top = topLevelDocumentEntry();
+            if (top && docs.some((d) => d.document === top.document) && top.agent.simple(top.document)) {
+                entry = top;
+                resize = true;
+            }
+            const element = entry.agent.fullscreenElement(entry.document);
+            if (element && !element.isConnected) {
+                entry.agent.appendPending(entry.document, "fullscreenchange", element);
+                entry.agent.unfullscreenElement(element);
+            }
+            // In parallel: unlock the screen orientation (TRust never locks
+            // it) and resize the top-level viewport back to normal; the steps
+            // below continue once the frontend has restored it, so their
+            // events observe the normal viewport.
+            const continueExit = () => {
+                if (entry.agent.fullscreenElement(entry.document) === null) { resolve(undefined); return; }
+                const exitDocs = collectDocumentsToUnfullscreen(entry);
+                const descendantDocs = [];
+                entry.agent.descendantDocuments(entry.document, descendantDocs);
+                for (const exitDoc of exitDocs) {
+                    const fullscreen = exitDoc.agent.fullscreenElement(exitDoc.document);
+                    if (fullscreen) exitDoc.agent.appendPending(exitDoc.document, "fullscreenchange", fullscreen);
+                    if (resize) exitDoc.agent.unfullscreenDocument(exitDoc.document);
+                    else if (fullscreen) exitDoc.agent.unfullscreenElement(fullscreen);
+                }
+                for (const descendant of descendantDocs) {
+                    const fullscreen = descendant.agent.fullscreenElement(descendant.document);
+                    if (!fullscreen) continue;
+                    descendant.agent.appendPending(descendant.document, "fullscreenchange", fullscreen);
+                    descendant.agent.unfullscreenDocument(descendant.document);
+                }
+                resolve(undefined);
+            };
+            if (resize && !fromFrontend) {
+                const request = registerFullscreenRequest(() => __queue_dom_task(continueExit));
+                __fullscreen_frontend(request, false);
+            } else {
+                __queue_dom_task(continueExit);
+            }
+        });
+    }
+    // #fully-exit-fullscreen.
+    function fullyExitFullscreen(document, fromFrontend = false) {
+        const fullscreen = fullscreenElementOf(document);
+        if (fullscreen === null) return;
+        for (const element of fullscreenElementsInTopLayer(document))
+            if (element !== fullscreen) unfullscreenAnElement(element);
+        exitFullscreenDocument(document, fromFrontend).catch(() => {});
+    }
+    // #removing-steps for a removed node whose fullscreen flag is set (the
+    // arena kept its flag and top-layer membership for these steps).
+    function fullscreenRemovingSteps(node) {
+        const document = node.ownerDocument;
+        if (node === fullscreenElementOf(document)) exitFullscreenDocument(document).catch(() => {});
+        else unfullscreenAnElement(node);
+    }
+    // Frontend round trips: one request at a time per Realm tree, answered
+    // by PageCmd::FullscreenResult in the top-level Realm.
+    const fullscreenRequests = new Map();
+    let nextFullscreenRequest = 1;
+    function registerFullscreenRequest(callback) {
+        const top = topMessageWindowState();
+        if (top !== messageWindowState && top.registerFullscreenRequest)
+            return top.registerFullscreenRequest(callback);
+        const request = nextFullscreenRequest++;
+        fullscreenRequests.set(request, callback);
+        return request;
+    }
+    trust.fullscreenResult = function (request, ok) {
+        const callback = fullscreenRequests.get(request);
+        if (!callback) return;
+        fullscreenRequests.delete(request);
+        callback(!!ok);
+    };
+    // The user agent ended fullscreen (Fullscreen API #ui: "may end any
+    // fullscreen session"), e.g. the window left fullscreen.
+    trust.exitFullscreenFromFrontend = function () {
+        fullyExitFullscreen(g.document, true);
+    };
+    function fullscreenOptionsDictionary(options) {
+        if (options === undefined || options === null) return {keyboardLock: "none", navigationUI: "auto"};
+        if (typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("FullscreenOptions must be a dictionary");
+        const keyboardLock = options.keyboardLock === undefined ? "none" : idlDOMString(options.keyboardLock);
+        if (keyboardLock !== "browser" && keyboardLock !== "none")
+            throw new TypeError("Invalid FullscreenKeyboardLock value");
+        const navigationUI = options.navigationUI === undefined ? "auto" : idlDOMString(options.navigationUI);
+        if (navigationUI !== "auto" && navigationUI !== "show" && navigationUI !== "hide")
+            throw new TypeError("Invalid FullscreenNavigationUI value");
+        return {keyboardLock, navigationUI};
+    }
+    // #dom-element-requestfullscreen.
+    function requestFullscreen(options = undefined) {
+        if (elementIdentity(this) === undefined) return Promise.reject(new TypeError("Illegal invocation"));
+        let dictionary;
+        try { dictionary = fullscreenOptionsDictionary(options); }
+        catch (e) { return Promise.reject(e); }
+        const element = this;
+        const pendingDoc = element.ownerDocument;
+        return new Promise((resolve, reject) => {
+            if (!documentFullyActive(pendingDoc)) { reject(new TypeError("The Document is not fully active")); return; }
+            let error = false;
+            const namespace = element.namespaceURI, localName = element.localName;
+            if (!(namespace === HTML_NS || (namespace === SVG_NS && localName === "svg")
+                || (namespace === MATHML_NS && localName === "math"))) error = true;
+            if (htmlElementName(element) === "dialog") error = true;
+            if (!fullscreenElementReadyCheck(element)) error = true;
+            const state = windowStateForNode(element);
+            if (!hasTransientActivation(state)) error = true;
+            if (!error) consumeUserActivationEverywhere();
+            const finish = (ok) => {
+                // In parallel, after the viewport resize.
+                if (!ok || element.ownerDocument !== pendingDoc || !fullscreenElementReadyCheck(element)) {
+                    appendPendingFullscreenEvent(pendingDoc, "fullscreenerror", element);
+                    reject(new TypeError("Fullscreen request denied"));
+                    return;
+                }
+                fullscreenAgent.fullscreenChain(element, element);
+                internalsFor(element).keyboardLock = dictionary.keyboardLock === "browser";
+                resolve(undefined);
+            };
+            if (error) {
+                __queue_dom_task(() => finish(false));
+                return;
+            }
+            const request = registerFullscreenRequest((ok) => __queue_dom_task(() => finish(ok)));
+            __fullscreen_frontend(request, true);
+        });
+    }
+    Object.defineProperty(Element.prototype, "requestFullscreen", {configurable: true, enumerable: true,
+        writable: true, value: { requestFullscreen(options = undefined) {
+            return requestFullscreen.call(this, options);
+        } }.requestFullscreen});
+    installHandlerProps(Element.prototype, ["fullscreenchange", "fullscreenerror"]);
+    for (const DocumentInterface of [Document, FrameDocument]) {
+        installHandlerProps(DocumentInterface.prototype, ["fullscreenchange", "fullscreenerror"]);
+    }
+    {
+        const lenient = (name, get) => Object.defineProperty(Document.prototype, name, {
+            configurable: true, enumerable: true,
+            get: Object.getOwnPropertyDescriptor({get [name]() { return get(documentReceiver(this)); }}, name).get,
+            // [LegacyLenientSetter]: assignment is ignored.
+            set: Object.getOwnPropertyDescriptor({set [name](_) {}}, name).set,
+        });
+        // #dom-document-fullscreenenabled.
+        lenient("fullscreenEnabled", (document) => fullscreenAllowedForDocument(document));
+        // #dom-document-fullscreen (historical).
+        lenient("fullscreen", (document) => fullscreenElementOf(document) !== null);
+        // #dom-document-exitfullscreen.
+        Object.defineProperty(Document.prototype, "exitFullscreen", {configurable: true, enumerable: true,
+            writable: true, value: { exitFullscreen() {
+                let document;
+                try { document = documentReceiver(this); } catch (e) { return Promise.reject(e); }
+                return exitFullscreenDocument(document);
+            } }.exitFullscreen});
+        // #dom-documentorshadowroot-fullscreenelement.
+        const fullscreenElementGetter = function () {
+            const root = this;
+            if (!(root instanceof Node) || (root.nodeType !== 9 && root.nodeType !== 11))
+                throw new TypeError("Illegal invocation");
+            if (root.nodeType === 11) {
+                const host = internalsFor(root).host;
+                if (!host || !host.isConnected) return null;
+            }
+            const document = root.nodeType === 9 ? root : root.ownerDocument;
+            const element = fullscreenElementOf(document);
+            if (!element) return null;
+            const candidate = retarget(element, root);
+            return candidate && rootOfNode(candidate) === root ? candidate : null;
+        };
+        for (const Interface of [Document, ShadowRoot]) {
+            Object.defineProperty(Interface.prototype, "fullscreenElement", {configurable: true, enumerable: true,
+                get: Object.getOwnPropertyDescriptor({get fullscreenElement() {
+                    return fullscreenElementGetter.call(this);
+                }}, "fullscreenElement").get,
+                set: Object.getOwnPropertyDescriptor({set fullscreenElement(_) {}}, "fullscreenElement").set,
+            });
+        }
+    }
+
+    // ---- HTML #close-requests: the close request steps ----
+    // Run for a close request the frontend delivers (the Escape key) to this
+    // Realm's Document, or to the focused child navigable's. Returns whether
+    // the page consumed it; false means "alternative processing".
+    trust.closeRequest = function (shift = false, ctrl = false, alt = false, meta = false) {
+        activeElementFor(g.document);
+        const focusedFrame = focusedArea && internalsOf(focusedArea).contentRealmWindow ? focusedArea : null;
+        if (focusedFrame && internalsOf(focusedFrame).contentRealmWindow !== g) {
+            const childTrust = trustOf(internalsOf(focusedFrame).contentRealmWindow);
+            if (childTrust && childTrust.closeRequest) return childTrust.closeRequest(shift, ctrl, alt, meta);
+        }
+        const document = focusedArea && focusedArea.ownerDocument ? focusedArea.ownerDocument : g.document;
+        syncPopoverRemovals();
+        // 1. Fullscreen takes precedence over close watchers, firing no keydown.
+        if (fullscreenElementOf(document) !== null) {
+            const top = topLevelDocumentEntry();
+            if (top) top.agent.fullyExit(top.document, false);
+            return true;
+        }
+        // 3-5. The relevant event of the Escape key is its keydown.
+        const prevented = trust.key(null, "Escape", "Escape", false, false, shift, ctrl, alt, meta, false, 0);
+        if (prevented) return true;
+        if (!documentFullyActive(document)) return true;
+        syncOpenDialogs(document);
+        // 7-8. Process close watchers on the Document's relevant global object.
+        if (processCloseWatchers(windowStateForNode(document))) return true;
+        // Alternative processing belongs to the user agent.
+        return false;
+    };
+    installHandlerProps(CloseWatcher.prototype, ["cancel", "close"]);
     g.External = External;
 
     // HTML #making-entire-documents-editable:-the-designmode-idl-attribute.
@@ -26072,6 +27454,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const now = Math.max(currentTime(), frameTime);
         timers.now = now;
         __clockSync();
+        // HTML #update-the-rendering: "run the fullscreen steps" precedes the
+        // animation frame callbacks.
+        runFullscreenSteps();
         // Web Animations 1 #update-animations-and-send-events: the document
         // timeline takes this rendering update's time.
         documentTimelineFrame = frameTime;

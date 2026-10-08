@@ -96,6 +96,9 @@ impl Frag {
 pub(crate) struct TopFrag {
     pub fragment: Frag,
     pub fixed: bool,
+    /// Paint order: `2 * i` for the `::backdrop` of the `i`th element of the
+    /// top layer and `2 * i + 1` for that element, so each backdrop renders
+    /// immediately below its originating element (CSS Position 4 #backdrop).
     pub order: usize,
 }
 
@@ -4424,7 +4427,16 @@ impl Flow<'_> {
                 // commonly uses those dimensions to find eligible slides.
                 // Suppress transparent pixels in paint, never box generation.
                 let fixed = b.style.position == Pos::Fixed;
-                let top_layer = b.node != NO_NODE && self.dom.is_popover_showing(b.node);
+                // CSS Position 4 #top-layer: elements rendered in the top layer
+                // and their `::backdrop` boxes are promoted to root siblings.
+                let top_order = if b.node != NO_NODE {
+                    self.dom.top_layer_order(b.node).map(|order| 2 * order + 1)
+                } else if let Some((origin, crate::dom::PseudoEl::Backdrop)) = b.style.pseudo {
+                    self.dom.top_layer_order(origin).map(|order| 2 * order)
+                } else {
+                    None
+                };
+                let top_layer = top_order.is_some();
                 let pinned = fixed && child_fixed.is_none() && !top_layer;
                 // CSS 2 §10.1 item 4: a positioned inline ancestor, nearer
                 // than any fragment that establishes one, forms an absolute
@@ -4453,7 +4465,7 @@ impl Flow<'_> {
                     top_layer_out.push(TopFrag {
                         fragment: laid,
                         fixed,
-                        order: self.dom.popover_top_layer_order(b.node).unwrap_or(0),
+                        order: top_order.unwrap_or(0),
                     });
                     continue;
                 }

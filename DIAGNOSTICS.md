@@ -295,6 +295,13 @@ The terminal browser accepts `trust [URL-or-host] [port]`. Press Ctrl+] and type
 `help` for interactive prompt commands; the help text lives in
 [`src/command.rs`](src/command.rs).
 
+Esc on a live page is HTML's close request (`PageCmd::CloseRequest`): the page
+exits fullscreen or closes its topmost dialog, popover or `CloseWatcher`, and
+only an unconsumed request stops loading while the page keeps running. To stop
+a runaway page, use the `kill` command, which drops the live page and its
+scripts; `stop` stops loading without dropping it. Both frontends share these
+commands.
+
 ### `trust-headless`
 
 `trust-headless --help` is generated from the usage string in
@@ -478,6 +485,8 @@ engine to carry `href` into `SemanticNode`, not a driver-side guess from geometr
 
 `trust-desktop --help` accepts `[--renderer=auto|cpu|hybrid] [URL]`.
 `TRUST_DESKTOP_TRACE` and the desktop benchmark inputs are listed below.
+Escape, `stop` and `kill` behave as in the terminal browser; a page in
+fullscreen leaves it on Escape, and `kill` also restores the window.
 
 ### Developer replay and spike binaries
 

@@ -42,34 +42,56 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let collapse_input = !file_prompt
         && app.mode == Mode::Session
         && (app.browser.is_some() || app.viewer.is_some() || !terminal_line);
-    let (session_area, input_area, status_area) =
-        if terminal_view && app.mode == Mode::Command && !terminal_line {
-            // COMMAND overlays a character-mode terminal. Opening controls must
-            // not send NAWS or make the remote redraw its full-screen application.
-            let [session, status] =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-            let height = 3.min(session.height);
-            let input = Rect::new(
-                session.x,
-                session.bottom().saturating_sub(height),
-                session.width,
-                height,
-            );
-            (session, Some(input), status)
-        } else if collapse_input {
-            let [session_area, status_area] =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
-            (session_area, None, status_area)
-        } else {
+    // Fullscreen API: the live page asked to be shown fullscreen, so it fills
+    // the whole terminal and TRust hides its address and status rows.
+    // COMMAND, search and file prompts overlay the bottom rows instead of
+    // shrinking the page viewport.
+    let fullscreen = app.page_fullscreen && app.browser.is_some() && app.viewer.is_none();
+    app.chrome_hidden = fullscreen;
+    let fullscreen_overlay = fullscreen && (file_prompt || app.mode != Mode::Session);
+    let (session_area, input_area, status_area) = if fullscreen {
+        let area = frame.area();
+        if fullscreen_overlay {
             let input_height = if file_prompt { 4 } else { 3 };
-            let [session_area, input_area, status_area] = Layout::vertical([
-                Constraint::Min(3),
-                Constraint::Length(input_height),
-                Constraint::Length(1),
-            ])
-            .areas(frame.area());
-            (session_area, Some(input_area), status_area)
-        };
+            let status = Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                area.width,
+                1.min(area.height),
+            );
+            let height = input_height.min(area.height.saturating_sub(1));
+            let input = Rect::new(area.x, status.y.saturating_sub(height), area.width, height);
+            (area, Some(input), status)
+        } else {
+            (area, None, Rect::new(area.x, area.bottom(), area.width, 0))
+        }
+    } else if terminal_view && app.mode == Mode::Command && !terminal_line {
+        // COMMAND overlays a character-mode terminal. Opening controls must
+        // not send NAWS or make the remote redraw its full-screen application.
+        let [session, status] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+        let height = 3.min(session.height);
+        let input = Rect::new(
+            session.x,
+            session.bottom().saturating_sub(height),
+            session.width,
+            height,
+        );
+        (session, Some(input), status)
+    } else if collapse_input {
+        let [session_area, status_area] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+        (session_area, None, status_area)
+    } else {
+        let input_height = if file_prompt { 4 } else { 3 };
+        let [session_area, input_area, status_area] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(input_height),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        (session_area, Some(input_area), status_area)
+    };
 
     let (title, border_color) = match (&app.viewer, &app.browser) {
         (Some(v), _) => (format!("░▒▓ TRUST :: {} ▓▒░", v.url), theme::NEON_PINK),
@@ -86,21 +108,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             },
         ),
     };
-    let block = Block::bordered()
-        .border_type(BorderType::Thick)
-        .border_style(Style::new().fg(border_color))
-        .style(Style::new().bg(theme::BG))
-        .title(Line::styled(
-            title,
-            Style::new()
-                .fg(theme::NEON_PINK)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = if fullscreen {
+        Block::new().style(Style::new().bg(theme::BG))
+    } else {
+        Block::bordered()
+            .border_type(BorderType::Thick)
+            .border_style(Style::new().fg(border_color))
+            .style(Style::new().bg(theme::BG))
+            .title(Line::styled(
+                title,
+                Style::new()
+                    .fg(theme::NEON_PINK)
+                    .add_modifier(Modifier::BOLD),
+            ))
+    };
 
     let inner = block.inner(session_area);
     app.last_inner = (inner.width, inner.height);
     app.last_content_area = inner;
-    app.last_status_row = status_area.y;
+    app.last_status_row = if fullscreen && !fullscreen_overlay {
+        u16::MAX
+    } else {
+        status_area.y
+    };
 
     // Scrollbar tracks recorded this frame for the mouse hit-test (assigned to
     // `app` after the match — `g` borrows `app.browser` inside the arm).
@@ -209,7 +239,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // overflows the panel — plus a horizontal bar under each overflowing
             // carousel. Both are clickable/draggable (tracks recorded for the
             // mouse hit-test).
-            vbar = render_browser_scrollbar(frame, g, session_area, inner);
+            // A fullscreen page has no border column to carry the bar.
+            if !fullscreen {
+                vbar = render_browser_scrollbar(frame, g, session_area, inner);
+            }
             hbars = render_carousel_scrollbars(frame, g, inner);
         }
         (None, None) => {
@@ -247,6 +280,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     render_select_menu(frame, app, inner);
 
     if let Some(input_area) = input_area {
+        if fullscreen {
+            // The prompt overlays the fullscreen page.
+            frame.render_widget(Clear, input_area);
+            frame.render_widget(Clear, status_area);
+        }
         if file_prompt {
             render_file_dialog(frame, app, input_area);
         } else {
@@ -257,13 +295,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             );
         }
     }
-    frame.render_widget(status_bar(app), status_area);
+    if status_area.height > 0 {
+        frame.render_widget(status_bar(app), status_area);
+    }
 
     // Fetch in flight: a tiny beating heart, animated by the run loop's
     // ticker. Lub, dub, rest — filled bold, hollow, filled again, then dim
     // through the diastole. It rides the entry box's right edge when the
     // box is shown, otherwise the status line's right end.
-    if app.loading() {
+    if app.loading() && status_area.height > 0 {
         let area = match input_area {
             Some(a) if a.width > 8 => Some(Rect::new(a.right().saturating_sub(3), a.y + 1, 1, 1)),
             Some(_) => None,

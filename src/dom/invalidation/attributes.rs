@@ -363,6 +363,8 @@ impl Dependencies {
                 // invalidates every style; the `open` attribute alone does not
                 // change it (HTML dialog attribute change steps).
                 StatePseudo::Modal => (&[], false),
+                // Likewise `set_fullscreen_flag` invalidates every style.
+                StatePseudo::Fullscreen => (&[], false),
                 StatePseudo::AnyLink => (&["href"], false),
                 StatePseudo::Checked => {
                     // HTML #selector-checked. Radio-group state writers must

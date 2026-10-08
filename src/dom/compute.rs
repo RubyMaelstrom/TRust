@@ -131,6 +131,15 @@ pub(super) trait StyleBackend {
     fn is_popover_showing(&self, id: NodeId) -> bool {
         self.style_view().is_popover_showing(id)
     }
+    fn has_fullscreen_flag(&self, id: NodeId) -> bool {
+        self.style_view().has_fullscreen_flag(id)
+    }
+    fn is_dialog_modal(&self, id: NodeId) -> bool {
+        self.style_view().is_modal(id)
+    }
+    fn top_layer_order(&self, id: NodeId) -> Option<usize> {
+        self.style_view().top_layer_order(id)
+    }
 }
 
 impl StyleBackend for Dom {

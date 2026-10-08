@@ -592,6 +592,15 @@ pub struct App {
     /// The living page behind the current browser doc, if its JS left
     /// anything to interact with. ONE live engine, ever.
     live_page: Option<crate::js::PageHandle>,
+    /// Fullscreen API: the live page asked for the terminal (its top-level
+    /// viewport) to show it fullscreen. TRust's own chrome rows are hidden and
+    /// the page fills the terminal until it exits fullscreen.
+    pub(crate) page_fullscreen: bool,
+    /// A `PageEvt::FullscreenRequest`/`FullscreenExit` answered once the page
+    /// has been told the resized viewport (the in-parallel resize step).
+    fullscreen_reply: Option<u64>,
+    /// The last frame drew no address/status chrome rows (fullscreen).
+    pub(crate) chrome_hidden: bool,
     /// The current document's image requests (`page_images`), when its page
     /// actor ran: the image pipeline presents those responses.
     page_images: Option<std::sync::Arc<crate::page_images::PageImages>>,
@@ -963,6 +972,9 @@ impl App {
             js_enabled: true,
             web_storage: crate::site_storage::web_storage(),
             live_page: None,
+            page_fullscreen: false,
+            fullscreen_reply: None,
+            chrome_hidden: false,
             page_images: None,
             page_rx: None,
             last_scroll_sent: None,
@@ -1432,6 +1444,7 @@ impl App {
             // The true viewport goes FIRST (the engine's scroll clamp and IO
             // root read innerHeight), then the settled scroll position.
             self.sync_page_viewport();
+            self.answer_fullscreen_request();
             self.sync_page_scroll();
             self.start_visible_lazy_image_loads();
             // And any freshly decoded image sizes, so the engine measures
@@ -1479,7 +1492,7 @@ impl App {
         // chrome rows never overlap them). The top address bar prefills the
         // console with the current page's address (an editable address bar);
         // the bottom status line opens it as-is.
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && !self.chrome_hidden {
             let title_row = self.last_content_area.y.saturating_sub(1);
             if mouse.row == title_row {
                 if self.finish_form_edit() {
@@ -2010,6 +2023,31 @@ impl App {
             }
         }
 
+        // HTML #close-requests: on a live page, Esc is a close request the
+        // page handles first (exiting fullscreen, the Escape keydown, then its
+        // close watchers: modal dialogs, popovers, CloseWatcher). Only when
+        // nothing there consumes it does the reply stop loading — keeping
+        // the page and its scripts. `kill` drops the page instead.
+        if self.mode == Mode::Session
+            && key.code == KeyCode::Esc
+            && self.browser.is_some()
+            && self.live_page.is_some()
+        {
+            let modifiers = crate::core::Modifiers {
+                shift: key.modifiers.contains(KeyModifiers::SHIFT),
+                control: key.modifiers.contains(KeyModifiers::CONTROL),
+                alt: key.modifiers.contains(KeyModifiers::ALT),
+                meta: key.modifiers.contains(KeyModifiers::SUPER),
+            };
+            let sent = self.live_page.as_ref().is_some_and(|page| {
+                page.try_send_user(crate::js::PageCmd::CloseRequest { modifiers })
+                    .is_ok()
+            });
+            if !sent {
+                self.stop_loading_keep_page();
+            }
+            return;
+        }
         // The browser captures session-mode keys while open. HTTP laid-out
         // docs use the 2D item model (Enter follows, Backspace backs, arrows
         // move the selection laterally and vertically); gopher/gemini keep
@@ -2792,6 +2830,15 @@ impl App {
             Some("back") => self.browser_back(),
             Some("forward") => self.browser_forward(),
             Some("reload") => self.reload(),
+            // Drop the live page and stop its scripts (what Esc did before it
+            // became the page's close request).
+            Some("kill") => self.stop_loading(),
+            // The user agent's "stop loading": the page keeps running.
+            Some("stop") => {
+                if !self.stop_loading_keep_page() {
+                    self.status = String::from("Nothing is loading.");
+                }
+            }
             Some("close" | "c") => match self.conn.take() {
                 Some(conn) => {
                     let _ = conn.commands.send(telnet::Command::Close).await;
@@ -4253,6 +4300,7 @@ impl App {
         let g = self.browser.as_ref()?;
         let vh = self.last_inner.1 as usize;
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.page_fullscreen.hash(&mut h);
         g.scroll.hash(&mut h);
         g.doc.text_view().map(|v| v.horizontal).hash(&mut h);
         g.sel_item.hash(&mut h);
@@ -5415,6 +5463,10 @@ impl App {
         self.live_boundaries_sent.clear();
         self.page_busy = false;
         self.pending_live_submit = None;
+        // Fullscreen API #unloading-document-cleanup-steps: a retired page
+        // leaves fullscreen, so TRust's chrome returns.
+        self.page_fullscreen = false;
+        self.fullscreen_reply = None;
     }
 
     /// Push the current browser scroll position to the live page when it moved
@@ -5489,6 +5541,33 @@ impl App {
     /// engine was created with belongs to whatever view was on screen when
     /// the fetch started (at startup: the session layout, taller than the
     /// browser view), so the first push after display corrects it.
+    /// Fullscreen API #dom-element-requestfullscreen and #exit-fullscreen:
+    /// answer the page once a frame in the requested presentation (chrome
+    /// rows hidden, or shown again) was drawn and its viewport sent — on the
+    /// same channel, so the page's fullscreenchange observes the new size.
+    fn answer_fullscreen_request(&mut self) {
+        let Some(request) = self.fullscreen_reply else {
+            return;
+        };
+        let laid_out = self.browser.as_ref().is_some_and(|g| g.doc.laid_out());
+        if self.chrome_hidden != self.page_fullscreen
+            || (laid_out && self.viewport_sent != Some(self.last_inner))
+        {
+            return;
+        }
+        let Some(handle) = self.live_page.as_ref() else {
+            self.fullscreen_reply = None;
+            return;
+        };
+        if handle
+            .cmds
+            .try_send(crate::js::PageCmd::FullscreenResult { request, ok: true })
+            .is_ok()
+        {
+            self.fullscreen_reply = None;
+        }
+    }
+
     fn sync_page_viewport(&mut self) {
         {
             let Some(g) = self.browser.as_ref() else {
@@ -6094,6 +6173,34 @@ impl App {
         }
     }
 
+    /// The user agent's "stop loading" (HTML #nav-stop), which is also the
+    /// alternative processing of an unconsumed close request (HTML
+    /// #close-requests): cancel the navigation and the subresource fetches in
+    /// flight, but keep the live page and its scripts. Aborted images are
+    /// remembered as failed so the next live render does not refetch them.
+    /// Returns whether anything was loading.
+    fn stop_loading_keep_page(&mut self) -> bool {
+        let was_active = self.fetch_rx.is_some()
+            || !self.imgs_in_flight.is_empty()
+            || self.declarative_refresh.is_some();
+        self.retire_fetch("Incomplete reply: stopped");
+        self.declarative_refresh = None;
+        self.pending_travel = None;
+        let aborted: Vec<String> = self.imgs_in_flight.iter().cloned().collect();
+        self.abort_image_loads();
+        self.failed_images.extend(aborted);
+        let page_fetches = self
+            .live_page
+            .as_ref()
+            .is_some_and(crate::js::PageHandle::stop_loading);
+        let stopped = was_active || page_fetches;
+        if stopped {
+            self.notice = true;
+            self.status = String::from("Stopped loading.");
+        }
+        stopped
+    }
+
     /// Enter on a `Link::JsClick`: send the click to the living page.
     fn dispatch_click(&mut self, node: usize, may_navigate: bool) {
         let Some(handle) = &self.live_page else {
@@ -6234,6 +6341,9 @@ impl App {
         // applied AFTER any content update so they land on the new scrolling
         // boxes. Values are `(actor, scrollTop, scrollLeft)` in CSS pixels.
         let mut scrolled: Vec<(usize, f64, f64)> = Vec::new();
+        // HTML #close-requests "alternative processing" for a close request
+        // nothing on the page consumed.
+        let mut close_request_unconsumed = false;
         let mut pending = Some(evt);
         let mut drains = 0u32;
         loop {
@@ -6301,6 +6411,34 @@ impl App {
                             page.try_send_user(crate::js::PageCmd::ClipboardResult { request, ok });
                     }
                 }
+                Some(PageEvt::CloseRequestHandled { consumed }) => {
+                    close_request_unconsumed |= !consumed;
+                }
+                // Fullscreen API: the terminal is the top-level viewport. The
+                // page fills it with TRust's chrome rows hidden; the request
+                // is answered after the page learns the new viewport.
+                Some(PageEvt::FullscreenRequest { request }) => {
+                    self.page_fullscreen = true;
+                    if let Some(previous) = self.fullscreen_reply.replace(request)
+                        && let Some(page) = &self.live_page
+                    {
+                        let _ = page.try_send_user(crate::js::PageCmd::FullscreenResult {
+                            request: previous,
+                            ok: true,
+                        });
+                    }
+                }
+                Some(PageEvt::FullscreenExit { request }) => {
+                    self.page_fullscreen = false;
+                    if let Some(previous) = self.fullscreen_reply.replace(request)
+                        && let Some(page) = &self.live_page
+                    {
+                        let _ = page.try_send_user(crate::js::PageCmd::FullscreenResult {
+                            request: previous,
+                            ok: true,
+                        });
+                    }
+                }
                 Some(PageEvt::PointerLock { request, node, .. }) => {
                     if node.is_some()
                         && let Some(page) = &self.live_page
@@ -6316,6 +6454,9 @@ impl App {
             pending = self.page_rx.as_mut().and_then(|rx| rx.try_recv().ok());
         }
 
+        if close_request_unconsumed {
+            self.stop_loading_keep_page();
+        }
         let mut rendered = false;
         let full_replace = latest_update.is_some();
         if let Some((typed, html, outcome)) = latest_update {
@@ -16886,6 +17027,100 @@ mod tests {
         assert!(!app.loading(), "the load was cancelled");
         assert!(app.browser.is_some(), "browser stays open on Esc");
         assert!(app.status.starts_with("Stopped"), "got: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn esc_is_a_close_request_and_kill_drops_the_live_page() {
+        // HTML #close-requests (local WHATWG HTML e5071a20c856): on a live
+        // page Esc goes to the page actor as a close request. A consumed one
+        // changes nothing here; an unconsumed one is the alternative
+        // processing — stop loading (HTML #nav-stop) — which keeps the page
+        // and its scripts. The `kill` command drops the page as Esc used to.
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_browsing("text/html", "<p>x</p>");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let page = url::Url::parse("http://127.0.0.1:9/").unwrap();
+        app.start_image_loads(page, vec![String::from("http://127.0.0.1:9/a.png")]);
+        app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT)))
+            .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::CloseRequest { modifiers }) if modifiers.shift
+        ));
+        assert!(app.live_page.is_some() && !app.imgs_in_flight.is_empty());
+        app.on_page_evt(crate::js::PageEvt::CloseRequestHandled { consumed: true });
+        assert!(app.live_page.is_some() && !app.imgs_in_flight.is_empty());
+        app.on_page_evt(crate::js::PageEvt::CloseRequestHandled { consumed: false });
+        assert!(
+            app.live_page.is_some(),
+            "the page and its scripts keep running"
+        );
+        assert!(app.imgs_in_flight.is_empty() && app.imgs_tasks.is_empty());
+        assert!(
+            app.failed_images.contains("http://127.0.0.1:9/a.png"),
+            "a stopped image is not refetched by the next render"
+        );
+        assert_eq!(app.status, "Stopped loading.");
+        app.execute_command("kill").await;
+        assert!(app.live_page.is_none(), "kill drops the page");
+        assert!(app.browser.is_some(), "the browser stays open");
+    }
+
+    #[tokio::test]
+    async fn fullscreen_pages_fill_the_terminal_without_chrome_rows() {
+        // Fullscreen API: the terminal is the top-level viewport. A page's
+        // fullscreen request hides TRust's address and status rows, the
+        // request is answered after the full-terminal viewport was sent, and
+        // an exit (or a retired page) restores the chrome.
+        let mut app = app_browsing("text/html", "<p>hello</p>");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let normal = app.last_inner;
+        assert!(normal.0 < 40 && normal.1 < 12, "{normal:?}");
+        app.on_page_evt(crate::js::PageEvt::FullscreenRequest { request: 9 });
+        assert!(app.page_fullscreen);
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.last_inner, (40, 12), "the page fills the terminal");
+        assert!(app.chrome_hidden);
+        app.sync_page_viewport();
+        app.answer_fullscreen_request();
+        assert!(matches!(rx.try_recv(), Ok(crate::js::PageCmd::Viewport(_))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::FullscreenResult {
+                request: 9,
+                ok: true
+            })
+        ));
+        app.on_page_evt(crate::js::PageEvt::FullscreenExit { request: 11 });
+        app.answer_fullscreen_request();
+        assert!(rx.try_recv().is_err(), "answered after the restored frame");
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.last_inner, normal);
+        assert!(!app.chrome_hidden);
+        app.sync_page_viewport();
+        app.answer_fullscreen_request();
+        assert!(matches!(rx.try_recv(), Ok(crate::js::PageCmd::Viewport(_))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::FullscreenResult {
+                request: 11,
+                ok: true
+            })
+        ));
+        app.on_page_evt(crate::js::PageEvt::FullscreenRequest { request: 10 });
+        app.drop_live_page();
+        assert!(!app.page_fullscreen, "a retired page leaves fullscreen");
     }
 
     #[test]

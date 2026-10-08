@@ -211,6 +211,18 @@ pub enum ImeAction {
     Disabled,
 }
 
+/// A Fullscreen API change of the top-level viewport the embedding frontend
+/// must present (see [`BrowserController::take_fullscreen_change`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullscreenChange {
+    /// Make the page viewport fill the screen, then answer with
+    /// `UserAction::FullscreenResult` for this request.
+    Enter(u64),
+    /// Restore the normal viewport. A page's exit request is answered with
+    /// `UserAction::FullscreenResult` once the restored viewport was sent.
+    Exit(Option<u64>),
+}
+
 /// Input and browser commands accepted by the shared controller. Native
 /// frontends translate their own event types once at their boundary.
 #[derive(Clone, Debug, PartialEq)]
@@ -242,7 +254,23 @@ pub enum UserAction {
     Back,
     Forward,
     Reload,
+    /// The user agent's "stop loading" (HTML #nav-stop): cancel the ongoing
+    /// navigation and the document's in-flight fetches. A resident page and
+    /// its scripts keep running.
     Stop,
+    /// Drop the resident page and stop its scripts (the `kill` command).
+    Kill,
+    /// A close request (HTML #close-requests: the Escape key). With a live
+    /// page the page runs the close request steps first; when nothing there
+    /// consumes it, the controller stops loading ("alternative processing").
+    CloseRequest(Modifiers),
+    /// The frontend's answer to `FullscreenChange::Enter`.
+    FullscreenResult {
+        request: u64,
+        ok: bool,
+    },
+    /// The frontend left fullscreen on its own (Fullscreen API #ui).
+    ExitFullscreen,
     Resize(CssSize),
     /// Output-device pixels per CSS pixel (monitor scale / browser zoom
     /// density), kept separate from CSS viewport geometry.
@@ -621,6 +649,18 @@ pub struct BrowserController {
     user_input_retry: Option<JoinHandle<()>>,
     pending_fragment: Option<String>,
     pending_pointer_lock: VecDeque<(u64, Option<usize>, bool)>,
+    /// Fullscreen API viewport changes for a frontend that declared it can
+    /// present fullscreen (`set_fullscreen_available`); others refuse them.
+    fullscreen_available: bool,
+    pending_fullscreen: VecDeque<FullscreenChange>,
+    /// Page requests the frontend has yet to answer: true for an enter.
+    fullscreen_requests: std::collections::HashMap<u64, bool>,
+    /// The frontend presents the live page fullscreen.
+    page_fullscreen: bool,
+    /// Close requests sent to the live page and not yet answered, and the
+    /// answers for the frontend (`take_close_request_result`).
+    close_requests_in_flight: usize,
+    close_request_results: VecDeque<bool>,
     /// Clipboard API writes for the embedding frontend's system clipboard. A frontend that
     /// has one opts in with `set_clipboard_available`; otherwise requests are refused here.
     clipboard_available: bool,
@@ -660,6 +700,9 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
         crate::js::PageEvt::Trouble(_) => "Trouble",
         crate::js::PageEvt::Settled => "Settled",
         crate::js::PageEvt::Focused { .. } => "Focused",
+        crate::js::PageEvt::CloseRequestHandled { .. } => "CloseRequestHandled",
+        crate::js::PageEvt::FullscreenRequest { .. } => "FullscreenRequest",
+        crate::js::PageEvt::FullscreenExit { .. } => "FullscreenExit",
         _ => "Other",
     }
 }
@@ -696,6 +739,12 @@ impl BrowserController {
             user_input_retry: None,
             pending_fragment: None,
             pending_pointer_lock: VecDeque::new(),
+            fullscreen_available: false,
+            pending_fullscreen: VecDeque::new(),
+            fullscreen_requests: Default::default(),
+            page_fullscreen: false,
+            close_requests_in_flight: 0,
+            close_request_results: VecDeque::new(),
             clipboard_available: false,
             pending_clipboard_writes: VecDeque::new(),
             external_media: VecDeque::new(),
@@ -1028,6 +1077,35 @@ impl BrowserController {
         self.pending_pointer_lock.pop_front()
     }
 
+    /// Declare whether this frontend can present a page fullscreen (Fullscreen
+    /// API's viewport resize). Without it, page requests fail.
+    pub fn set_fullscreen_available(&mut self, available: bool) {
+        self.fullscreen_available = available;
+    }
+
+    /// The next fullscreen change the frontend must present. Answer
+    /// `FullscreenChange::Enter` with `UserAction::FullscreenResult`.
+    pub fn take_fullscreen_change(&mut self) -> Option<FullscreenChange> {
+        self.pending_fullscreen.pop_front()
+    }
+
+    /// Whether the frontend presents the live page fullscreen.
+    pub fn page_fullscreen(&self) -> bool {
+        self.page_fullscreen
+    }
+
+    /// The outcome of the oldest answered `UserAction::CloseRequest`: true
+    /// when the page consumed it, false when the controller performed the
+    /// alternative processing (stopped loading).
+    pub fn take_close_request_result(&mut self) -> Option<bool> {
+        self.close_request_results.pop_front()
+    }
+
+    /// Whether a close request awaits the live page's answer.
+    pub fn close_request_pending(&self) -> bool {
+        self.close_requests_in_flight != 0
+    }
+
     /// Declare whether this frontend can place text on a system clipboard. Without one,
     /// page clipboard writes are refused (Clipboard API: the permission is not granted).
     pub fn set_clipboard_available(&mut self, available: bool) {
@@ -1118,7 +1196,41 @@ impl BrowserController {
                 );
                 true
             }
-            UserAction::Stop => self.stop(),
+            UserAction::Stop => self.stop_loading(),
+            UserAction::Kill => self.stop(),
+            UserAction::CloseRequest(modifiers) => {
+                if self.live_page.is_some()
+                    && self.pending.is_none()
+                    && self.gemini_prompt.is_none()
+                {
+                    self.close_requests_in_flight = self.close_requests_in_flight.saturating_add(1);
+                    self.send_user(crate::js::PageCmd::CloseRequest { modifiers });
+                    false
+                } else {
+                    // No page can watch for it: "alternative processing".
+                    let stopped = self.stop_loading();
+                    self.close_request_results.push_back(false);
+                    stopped
+                }
+            }
+            UserAction::FullscreenResult { request, ok } => {
+                // An entered fullscreen is presented until its exit.
+                if self.fullscreen_requests.remove(&request) == Some(true) && ok {
+                    self.page_fullscreen = true;
+                }
+                // The frontend's resize reached the page as `Viewport` on the
+                // same channel, which keeps it ahead of this answer.
+                self.send_live(crate::js::PageCmd::FullscreenResult { request, ok });
+                false
+            }
+            UserAction::ExitFullscreen => {
+                if self.page_fullscreen {
+                    self.page_fullscreen = false;
+                    // After the restored `Viewport`, on the same channel.
+                    self.send_live(crate::js::PageCmd::ExitFullscreen);
+                }
+                false
+            }
             UserAction::Resize(size) => {
                 if self.viewport == size {
                     false
@@ -2521,6 +2633,41 @@ impl BrowserController {
         true
     }
 
+    /// The user agent's "stop loading" (HTML #nav-stop): cancel the ongoing
+    /// navigation and abort the current document's in-flight fetches. Unlike
+    /// [`Self::stop`], a resident page and its scripts keep running. This is
+    /// also the alternative processing of an unconsumed close request.
+    fn stop_loading(&mut self) -> bool {
+        if self.gemini_prompt.take().is_some() {
+            self.status = "Gemini input cancelled".into();
+            return true;
+        }
+        let pending = self.pending.take();
+        let had_refresh = self.declarative_refresh_task.is_some();
+        let page_fetches = self
+            .live_page
+            .as_ref()
+            .is_some_and(crate::js::PageHandle::stop_loading);
+        if pending.is_none() && !had_refresh && !page_fetches {
+            return false;
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.abort_declarative_refresh();
+        if let Some(pending) = pending {
+            // A navigation in flight has no live page beside it (`begin_fetch`
+            // retired it); retire its fetch and streams exactly like `stop`.
+            self.retire_query("Incomplete reply: stopped");
+            self.generation = self.generation.wrapping_add(1);
+            self.render_is_final = self.live_page.is_none();
+            self.status = format!("Stopped loading {}.", pending.target);
+        } else {
+            self.status = String::from("Stopped loading.");
+        }
+        true
+    }
+
     fn abort_declarative_refresh(&mut self) {
         if let Some(task) = self.declarative_refresh_task.take() {
             task.abort();
@@ -2640,6 +2787,17 @@ impl BrowserController {
     fn drop_live_page(&mut self) {
         self.pending_pointer_lock.clear();
         self.pending_clipboard_writes.clear();
+        // A retired page leaves fullscreen (Fullscreen API #unloading-document-
+        // cleanup-steps fully exits it); unanswered close requests end too.
+        self.pending_fullscreen.clear();
+        self.fullscreen_requests.clear();
+        if std::mem::take(&mut self.page_fullscreen) {
+            self.pending_fullscreen
+                .push_back(FullscreenChange::Exit(None));
+        }
+        for _ in 0..std::mem::take(&mut self.close_requests_in_flight) {
+            self.close_request_results.push_back(true);
+        }
         if let Some(retry) = self.user_input_retry.take() {
             retry.abort();
         }
@@ -2875,6 +3033,43 @@ impl BrowserController {
                 self.pending_pointer_lock
                     .push_back((request, node, unadjusted));
                 true
+            }
+            PageEvt::CloseRequestHandled { consumed } => {
+                self.close_requests_in_flight = self.close_requests_in_flight.saturating_sub(1);
+                // HTML #close-requests "alternative processing": nothing on
+                // the page watched for the request, so stop loading.
+                if !consumed {
+                    self.stop_loading();
+                }
+                self.close_request_results.push_back(consumed);
+                true
+            }
+            PageEvt::FullscreenRequest { request } => {
+                if self.fullscreen_available {
+                    self.fullscreen_requests.insert(request, true);
+                    self.pending_fullscreen
+                        .push_back(FullscreenChange::Enter(request));
+                    true
+                } else {
+                    self.send_user(crate::js::PageCmd::FullscreenResult { request, ok: false });
+                    false
+                }
+            }
+            PageEvt::FullscreenExit { request } => {
+                let entering = self
+                    .pending_fullscreen
+                    .iter()
+                    .any(|change| matches!(change, FullscreenChange::Enter(_)));
+                if std::mem::take(&mut self.page_fullscreen) || entering {
+                    self.fullscreen_requests.insert(request, false);
+                    self.pending_fullscreen
+                        .push_back(FullscreenChange::Exit(Some(request)));
+                    true
+                } else {
+                    // Nothing to restore: the viewport is already normal.
+                    self.send_live(crate::js::PageCmd::FullscreenResult { request, ok: true });
+                    false
+                }
             }
             PageEvt::ClipboardWrite { request, text } => {
                 if self.clipboard_available {
@@ -4212,6 +4407,148 @@ mod tests {
                 ok: true
             })
         ));
+    }
+
+    #[test]
+    fn close_requests_reach_the_page_and_unconsumed_ones_only_stop_loading() {
+        // HTML #close-requests (local WHATWG HTML e5071a20c856): with a live
+        // page the Escape close request goes to the page actor, which runs the
+        // close request steps. When nothing there consumes it the controller
+        // performs the alternative processing: stop loading (HTML #nav-stop),
+        // keeping the page and its scripts. `Kill` drops the page instead.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let shifted = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        browser.handle_action(UserAction::CloseRequest(shifted));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::CloseRequest { modifiers }) if modifiers.shift
+        ));
+        assert!(browser.close_request_pending());
+        browser.handle_page_event(crate::js::PageEvt::CloseRequestHandled { consumed: true });
+        assert!(!browser.close_request_pending());
+        assert_eq!(browser.take_close_request_result(), Some(true));
+        browser.declarative_refresh_task = Some(runtime.spawn(std::future::pending::<()>()));
+        browser.handle_action(UserAction::CloseRequest(Modifiers::default()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::CloseRequest { .. })
+        ));
+        browser.handle_page_event(crate::js::PageEvt::CloseRequestHandled { consumed: false });
+        assert_eq!(browser.take_close_request_result(), Some(false));
+        assert!(
+            browser.page_is_live(),
+            "alternative processing keeps the page"
+        );
+        assert!(browser.declarative_refresh_task.is_none());
+        assert_eq!(browser.snapshot().status, "Stopped loading.");
+        browser.handle_action(UserAction::Kill);
+        assert!(
+            !browser.page_is_live(),
+            "kill drops the page and its scripts"
+        );
+        // No page can watch for the request: alternative processing at once.
+        browser.handle_action(UserAction::CloseRequest(Modifiers::default()));
+        assert_eq!(browser.take_close_request_result(), Some(false));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fullscreen_changes_need_a_frontend_and_end_with_the_page() {
+        // Fullscreen API #dom-element-requestfullscreen (local WHATWG
+        // 7c38d773): the frontend's viewport resize answers the request on the
+        // channel that carried the resized Viewport; exits restore it, and a
+        // retired page leaves fullscreen (#unloading-document-cleanup-steps).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        browser.handle_page_event(crate::js::PageEvt::FullscreenRequest { request: 3 });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::FullscreenResult {
+                request: 3,
+                ok: false
+            })
+        ));
+        assert_eq!(browser.take_fullscreen_change(), None);
+        browser.set_fullscreen_available(true);
+        browser.handle_page_event(crate::js::PageEvt::FullscreenRequest { request: 4 });
+        assert_eq!(
+            browser.take_fullscreen_change(),
+            Some(FullscreenChange::Enter(4))
+        );
+        browser.handle_action(UserAction::FullscreenResult {
+            request: 4,
+            ok: true,
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::FullscreenResult {
+                request: 4,
+                ok: true
+            })
+        ));
+        assert!(browser.page_fullscreen());
+        browser.handle_page_event(crate::js::PageEvt::FullscreenExit { request: 7 });
+        assert_eq!(
+            browser.take_fullscreen_change(),
+            Some(FullscreenChange::Exit(Some(7)))
+        );
+        assert!(!browser.page_fullscreen());
+        browser.handle_action(UserAction::FullscreenResult {
+            request: 7,
+            ok: true,
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::FullscreenResult {
+                request: 7,
+                ok: true
+            })
+        ));
+        assert!(!browser.page_fullscreen(), "an answered exit stays exited");
+        // The window left fullscreen on its own: the page fully exits.
+        browser.handle_page_event(crate::js::PageEvt::FullscreenRequest { request: 5 });
+        assert_eq!(
+            browser.take_fullscreen_change(),
+            Some(FullscreenChange::Enter(5))
+        );
+        browser.handle_action(UserAction::FullscreenResult {
+            request: 5,
+            ok: true,
+        });
+        let _ = rx.try_recv();
+        browser.handle_action(UserAction::ExitFullscreen);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::ExitFullscreen)
+        ));
+        browser.handle_page_event(crate::js::PageEvt::FullscreenRequest { request: 6 });
+        let _ = browser.take_fullscreen_change();
+        browser.handle_action(UserAction::FullscreenResult {
+            request: 6,
+            ok: true,
+        });
+        browser.handle_action(UserAction::Kill);
+        assert_eq!(
+            browser.take_fullscreen_change(),
+            Some(FullscreenChange::Exit(None))
+        );
+        assert!(!browser.page_fullscreen());
     }
 
     #[test]

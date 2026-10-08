@@ -1248,6 +1248,16 @@ impl PageTaskScope {
         fetches.push(fetch);
     }
 
+    /// HTML #abort-a-document: cancel every fetch in the document's context,
+    /// discarding its response, while the document's other work (scripts,
+    /// timers, workers, WebSockets) continues and new fetches may start.
+    pub(crate) fn abort_fetches(&self) {
+        let fetches: Vec<_> = self.fetches.lock().unwrap().drain(..).collect();
+        for fetch in fetches {
+            fetch.abort();
+        }
+    }
+
     pub fn cancel(&self) {
         use std::sync::atomic::Ordering;
 
@@ -1353,6 +1363,23 @@ impl PageCache {
         F::Output: Send + 'static,
     {
         self.tasks.spawn(handle, future);
+    }
+
+    /// The user agent's "stop loading" (HTML #nav-stop: abort the document)
+    /// for a document whose resident page stays alive: cancel its in-flight
+    /// subresource fetches and forget their unfinished shared entries, so a
+    /// later request fetches anew instead of joining the cancelled one.
+    /// Returns whether any fetch was still in flight.
+    pub fn stop_loading(&self) -> bool {
+        let mut stopped = false;
+        self.map.lock().unwrap().retain(|_, entry| {
+            let done = entry.future.peek().is_some();
+            stopped |= !done;
+            done
+        });
+        stopped |= self.images.forget_unfinished();
+        self.tasks.abort_fetches();
+        stopped
     }
 
     /// Retire this page's subresource work. Completed response bodies may

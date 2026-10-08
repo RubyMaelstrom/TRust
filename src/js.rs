@@ -338,6 +338,23 @@ pub enum PageCmd {
     },
     /// Unconditional native release (Escape, focus loss, or retired window).
     ReleasePointerLock,
+    /// HTML #close-requests: the user's close request for the page (the
+    /// Escape key press). The actor runs the close request steps (exit
+    /// fullscreen, else the Escape keydown and the close watchers) and
+    /// answers `PageEvt::CloseRequestHandled`.
+    CloseRequest {
+        modifiers: crate::core::Modifiers,
+    },
+    /// The frontend's answer to `PageEvt::FullscreenRequest` (whether its
+    /// viewport now fills the screen) or `PageEvt::FullscreenExit`, sent after
+    /// the resized viewport.
+    FullscreenResult {
+        request: u64,
+        ok: bool,
+    },
+    /// The user agent ended fullscreen itself (Fullscreen API #ui), e.g. the
+    /// native window left fullscreen; the page fully exits fullscreen.
+    ExitFullscreen,
     InputModifiers(crate::core::Modifiers),
     PointerMotion {
         dx: f64,
@@ -446,6 +463,9 @@ impl PageCmd {
                 | Self::PointerLockResult { .. }
                 | Self::ClipboardResult { .. }
                 | Self::ReleasePointerLock
+                | Self::CloseRequest { .. }
+                | Self::FullscreenResult { .. }
+                | Self::ExitFullscreen
                 | Self::InputModifiers(_)
                 | Self::PointerMotion { .. }
                 | Self::LockedPointerButton { .. }
@@ -573,6 +593,24 @@ pub enum PageEvt {
     },
     Trouble(Vec<String>),
     Settled,
+    /// The close request steps for `PageCmd::CloseRequest` finished.
+    /// `consumed` is false when nothing handled the request: HTML's
+    /// "alternative processing", which the frontend performs (it stops
+    /// loading, keeping the page and its scripts).
+    CloseRequestHandled {
+        consumed: bool,
+    },
+    /// Fullscreen API #dom-element-requestfullscreen: resize the top-level
+    /// viewport to the screen (the frontend's fullscreen presentation) and
+    /// answer with `PageCmd::FullscreenResult`.
+    FullscreenRequest {
+        request: u64,
+    },
+    /// Fullscreen API #exit-fullscreen: restore the normal viewport, then
+    /// answer with `PageCmd::FullscreenResult`.
+    FullscreenExit {
+        request: u64,
+    },
     /// Acknowledges a native key. Suppress the frontend default when canceled
     /// by keyboard handlers, already applied by the actor, or inapplicable
     /// (e.g. Enter in a formless input).
@@ -714,6 +752,14 @@ impl PageHandle {
     pub fn retire(&self) {
         self.state.runtime_interrupt.cancel();
         self.state.cache.cancel();
+    }
+
+    /// HTML #nav-stop for a page whose actor and scripts stay alive (the
+    /// alternative processing of an unconsumed close request): cancel the
+    /// document's in-flight subresource fetches. Returns whether any fetch
+    /// was still loading.
+    pub fn stop_loading(&self) -> bool {
+        self.state.cache.stop_loading()
     }
 
     #[cfg(test)]

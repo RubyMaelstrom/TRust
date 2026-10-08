@@ -163,7 +163,8 @@ impl Dom {
             self.focused_areas
                 .retain(|&doc, node| doc != id && *node != id);
             changed_popovers |= self.popover_open.remove(&id);
-            self.modal_dialogs.remove(&id);
+            changed_popovers |= self.modal_dialogs.remove(&id);
+            changed_popovers |= self.fullscreen_flags.remove(&id);
             self.started_scripts.remove(&id);
             self.canvases.get_mut().remove(&id);
             self.container_sizes.get_mut().remove(&id);
@@ -215,13 +216,14 @@ impl Dom {
             // can contain the retired identity even when their light-DOM subjects remain old.
             *self.slot_assignments.get_mut() = SlotAssignments::default();
         }
-        if changed_popovers {
-            self.popover_order.retain(|id| !dead.contains(id));
+        if changed_popovers || !self.top_layer.is_empty() {
+            self.top_layer.retain(|id| !dead.contains(id));
         }
         // HTML #manually-assigned-nodes and DOM's manual slot assignment are
         // weak relationships; a retired slot or slottable leaves them.
         self.retain_slotting(&|id| !dead.contains(&id));
         self.ce_registries.retain(&|id| !dead.contains(&id));
+        self.top_layer_removed.retain(|id| !dead.contains(id));
         self.dirty_nodes.retain(|(id, _)| !dead.contains(id));
         self.created_images.retain(|(id, _)| !dead.contains(id));
         // Scroll and transition events are roots, so a dead target here is a host-tracing bug.
@@ -272,8 +274,10 @@ impl Dom {
             render_clickables,
             hover_chain,
             popover_open,
-            popover_order,
+            top_layer,
+            top_layer_removed,
             modal_dialogs,
+            fullscreen_flags,
             started_scripts,
             focused_areas,
             dirty_nodes
@@ -370,9 +374,11 @@ impl Dom {
             hover_chain,
             popover_open,
             modal_dialogs,
+            fullscreen_flags,
             started_scripts
         );
-        self.popover_order.retain(|&id| valid(id));
+        self.top_layer.retain(|&id| valid(id));
+        self.top_layer_removed.retain(|&id| valid(id));
         slotting::retain(&mut self.manual_slots, &mut self.slot_signals, &valid);
         self.ce_registries.retain(&valid);
         self.focused_areas
@@ -387,7 +393,7 @@ impl Dom {
                 }
             )+};
         }
-        shrink_vec!(popover_order, dirty_nodes, scroll_changes);
+        shrink_vec!(top_layer, top_layer_removed, dirty_nodes, scroll_changes);
         let canvases = self.canvases.get_mut();
         canvases.retain(|&id, _| valid(id));
         if canvases.capacity() > canvases.len().saturating_mul(4).max(64) {

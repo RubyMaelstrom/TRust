@@ -1756,16 +1756,18 @@ fn paint_fragment(fragment: &Frag, builder: &mut Builder<'_>) {
         let hit_testable = match style {
             PaintStyle::Element(node) => builder.dom.point_hit_testable(node),
             PaintStyle::Pseudo(..) => {
-                let mut suppressed =
-                    style.value(builder.dom, "visibility").as_deref() == Some("force-hidden");
+                // HTML #inert-subtrees: the originating element's inertness
+                // (an `inert` ancestor or a blocking modal dialog) applies.
+                let mut suppressed = style.value(builder.dom, "visibility").as_deref()
+                    == Some("force-hidden")
+                    || builder.dom.is_inert(node);
                 let mut ancestor = Some(node);
                 while let Some(id) = ancestor {
-                    suppressed |= builder.dom.attr(id, "inert").is_some()
-                        || builder
-                            .dom
-                            .computed_value_resolved(id, "visibility")
-                            .as_deref()
-                            == Some("force-hidden");
+                    suppressed |= builder
+                        .dom
+                        .computed_value_resolved(id, "visibility")
+                        .as_deref()
+                        == Some("force-hidden");
                     ancestor = builder.dom.parent_composed(id);
                 }
                 !suppressed

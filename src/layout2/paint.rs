@@ -66,6 +66,13 @@ pub(crate) struct TerminalPaintModel {
     cell_text: bool,
     /// Focus containers that are not terminal links (`focus_containers`).
     focus_only: std::collections::HashSet<NodeId>,
+    /// HTML #inert-subtrees: inert elements (an `inert` ancestor, or outside
+    /// the dialog blocking their document). Hit testing acts as if they had
+    /// `pointer-events: none`, so their items lose any inherited link.
+    inert: std::collections::HashSet<NodeId>,
+    /// Top-layer elements whose `::backdrop` background is opaque enough to
+    /// claim the terminal cells beneath it (CSS Position 4 #backdrop).
+    backdrop_covers: std::collections::HashSet<NodeId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -133,6 +140,8 @@ impl TerminalPaintModel {
         needed: Option<&std::collections::HashSet<NodeId>>,
     ) -> Self {
         let mut links = HashMap::new();
+        let mut inert = std::collections::HashSet::new();
+        let mut backdrop_covers = std::collections::HashSet::new();
         let mut nodes = crate::dom::arena::DenseIdMap::with_capacity(dom.node_count());
         for node in dom.live_ids() {
             // CSS Display 3 §2: descendants of a display:none/otherwise
@@ -149,6 +158,12 @@ impl TerminalPaintModel {
             }
             let tag = dom.tag_name(node).map(str::to_string);
             let point_hit = dom.point_hit_testable(node);
+            if !point_hit && dom.is_inert(node) {
+                inert.insert(node);
+            }
+            if dom.in_top_layer(node) && terminal_backdrop_covers(dom, node) {
+                backdrop_covers.insert(node);
+            }
             if point_hit {
                 if dom.is_contenteditable_host(node)
                     && let Some(&(form, field)) = controls.get(&node)
@@ -320,14 +335,24 @@ impl TerminalPaintModel {
             media_fallbacks: dom.retained_media_controls(),
             cell_text: crate::text::cell_metrics().is_some(),
             focus_only,
+            inert,
+            backdrop_covers,
         }
     }
 
     /// The terminal link an item inherits from its inline ancestors, unless
-    /// that ancestor is a focus container (`focus_containers`).
-    fn item_link(&self, link: &Option<Link>) -> Option<Link> {
+    /// that ancestor is a focus container (`focus_containers`) or the item is
+    /// inert (HTML #inert-subtrees: inert commands are inoperable).
+    fn item_link(&self, node: NodeId, link: &Option<Link>) -> Option<Link> {
+        if node != NO_NODE && self.inert.contains(&node) {
+            return None;
+        }
         match link {
-            Some(Link::JsClick { node, .. }) if self.focus_only.contains(node) => None,
+            Some(Link::JsClick { node, .. })
+                if self.focus_only.contains(node) || self.inert.contains(node) =>
+            {
+                None
+            }
             link => link.clone(),
         }
     }
@@ -2575,7 +2600,7 @@ fn inflow_content(
                                 image: None,
                                 emph: piece.item.emph,
                                 node: piece.item.node,
-                                link: dom.item_link(&piece.item.link),
+                                link: dom.item_link(piece.item.node, &piece.item.link),
                                 crop: false,
                                 pixelated: false,
                                 invisible: piece.item.invisible,
@@ -2660,7 +2685,7 @@ fn inflow_content(
                     image: p.item.image.clone(),
                     emph: p.item.emph,
                     node: p.item.node,
-                    link: dom.item_link(&p.item.link),
+                    link: dom.item_link(p.item.node, &p.item.link),
                     crop: p.item.crop,
                     pixelated: p.item.pixelated,
                     invisible: p.item.invisible,
@@ -2912,6 +2937,29 @@ fn terminal_background_covers_dom(dom: &Dom, node: NodeId) -> bool {
     })
 }
 
+/// A `::backdrop` claims terminal cells only when its background color is at
+/// least half opaque (the fullscreen UA backdrop is black). The terminal
+/// cannot blend, and HTML's `dialog::backdrop` tint (10% black) must leave the
+/// page beneath it readable.
+fn terminal_backdrop_covers(dom: &Dom, node: NodeId) -> bool {
+    let Some(color) =
+        dom.pseudo_layout_value(node, crate::dom::PseudoEl::Backdrop, "background-color")
+    else {
+        return false;
+    };
+    let color = color.trim().to_ascii_lowercase();
+    if matches!(color.as_str(), "" | "transparent" | "none") {
+        return false;
+    }
+    if color.starts_with("rgb") || color.starts_with("hsl") || color.starts_with("hwb") {
+        let Some((_, arguments)) = color.split_once('(') else {
+            return false;
+        };
+        return color_args_alpha(arguments.trim_end_matches(')')).is_none_or(|alpha| alpha >= 0.5);
+    }
+    true
+}
+
 fn gradient_mean_alpha(gradient: &str) -> f32 {
     let Some(open) = gradient.find('(') else {
         return 1.0;
@@ -3045,8 +3093,12 @@ fn fill_op(
             text_clip_resolved: false,
         });
     }
+    let covers = match f.paint.pseudo {
+        Some((origin, crate::dom::PseudoEl::Backdrop)) => dom.backdrop_covers.contains(&origin),
+        _ => dom.node(f.node).is_some_and(|node| node.background_covers),
+    };
     if f.paint.bg
-        && dom.node(f.node).is_some_and(|node| node.background_covers)
+        && covers
         && row1 > row0
         && col1 > col0
         && let Some(bounds) = clipped_paint_bounds(f.x, f.y, f.x + f.w, f.y + f.h, f.clip)

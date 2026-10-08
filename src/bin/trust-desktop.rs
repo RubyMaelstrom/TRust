@@ -18,8 +18,9 @@ use softbuffer::{Context, Surface};
 use tokio::runtime::Handle;
 use trust::accessibility::{Role as SemanticRole, SemanticTree};
 use trust::core::{
-    BrowserController, ButtonState, CssPoint, CssSize, FetchedDocument, ImeAction, Key, KeyInput,
-    KeyState, Modifiers, PhysicalSize, PointerButton, ScaleFactor, UserAction, ViewportMetrics,
+    BrowserController, ButtonState, CssPoint, CssSize, FetchedDocument, FullscreenChange,
+    ImeAction, Key, KeyInput, KeyState, Modifiers, PhysicalSize, PointerButton, ScaleFactor,
+    UserAction, ViewportMetrics,
 };
 use trust::doc::{FieldKind, Link};
 use trust::render::vello_cpu::VelloCpuRenderer;
@@ -44,7 +45,7 @@ use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
 };
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
-use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Window, WindowId};
+use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Fullscreen, Window, WindowId};
 
 const PAGE_ACCESS_BASE: u64 = 10_000;
 const ACCESS_ROOT: AccessNodeId = AccessNodeId(0);
@@ -53,6 +54,8 @@ const ACCESS_COMMAND: AccessNodeId = AccessNodeId(7);
 const ACCESS_TERMINAL: AccessNodeId = AccessNodeId(8);
 const ACCESS_TERMINAL_INPUT: AccessNodeId = AccessNodeId(9);
 const IMAGE_FETCH_CONCURRENCY: usize = 8;
+/// How long a page's fullscreen request waits for the window manager's resize.
+const FULLSCREEN_REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
 /// Encoded animation sources are much smaller than decoded frame sequences,
 /// but remain attacker-controlled cache data. Keep this document-local pool
 /// bounded independently of the 256 MiB current-frame `ImageStore`.
@@ -955,6 +958,20 @@ struct ImageLoadScheduler {
 }
 
 impl ImageLoadScheduler {
+    /// HTML #nav-stop for a document that stays live: requests in flight end
+    /// as broken (their fetches were aborted) and their completions become
+    /// inert, while the document may still request images afterwards.
+    fn stop_pending(&mut self) -> bool {
+        if self.retired || (self.pending.is_empty() && self.queued.is_empty()) {
+            return false;
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        self.queued.clear();
+        let pending: Vec<ImageHandle> = self.pending.drain().collect();
+        self.failed.extend(pending);
+        true
+    }
+
     fn reset(&mut self, generation: u64, page: &url::Url) -> bool {
         if self.generation == Some(generation) && self.page.as_deref() == Some(page.as_str()) {
             return false;
@@ -1495,6 +1512,12 @@ struct DesktopApp {
     cursor_custom: Option<(ImageHandle, u16, u16)>,
     cursor_visible: bool,
     pointer_lock: Option<NativePointerLock>,
+    /// Fullscreen API: the window shows the live page fullscreen at its
+    /// request (borderless, browse chrome hidden).
+    page_fullscreen: bool,
+    /// A fullscreen request answered once the resized viewport reached the
+    /// page, or at the deadline if the window manager never resizes.
+    fullscreen_reply: Option<(u64, std::time::Instant)>,
     custom_cursors: HashMap<(ImageHandle, u16, u16), CustomCursor>,
     cursor_hotspots: HashMap<ImageHandle, (u16, u16)>,
     modifiers: ModifiersState,
@@ -1832,6 +1855,7 @@ impl DesktopApp {
     ) -> Self {
         let clipboard = arboard::Clipboard::new().ok();
         browser.set_clipboard_available(clipboard.is_some());
+        browser.set_fullscreen_available(true);
         let style = chrome_text_style();
         let image_store = ImageStore::default();
         if let Err(error) = ensure_embedded_heart_assets(&image_store) {
@@ -1858,6 +1882,8 @@ impl DesktopApp {
             cursor_custom: None,
             cursor_visible: true,
             pointer_lock: None,
+            page_fullscreen: false,
+            fullscreen_reply: None,
             custom_cursors: HashMap::new(),
             cursor_hotspots: HashMap::new(),
             modifiers: ModifiersState::empty(),
@@ -2352,6 +2378,8 @@ impl DesktopApp {
         }
         let outcome = self.browser.handle_action(action);
         self.sync_pointer_lock();
+        self.sync_page_fullscreen();
+        self.sync_close_requests();
         self.sync_clipboard_writes();
         self.launch_external_media_requests();
         if outcome.loading_retired {
@@ -2378,17 +2406,124 @@ impl DesktopApp {
         }
     }
 
+    /// The user agent's "stop loading" (HTML #nav-stop): the controller
+    /// cancels the navigation and the document's fetches; the frontend stops
+    /// its own image loads. A live page and its scripts keep running, so its
+    /// layout stays live; without one, the stopped document is frozen.
     fn stop_current_page(&mut self) {
         let was_loading = self.chrome_loading(&self.browser.snapshot());
+        let live = self.browser.page_is_live();
         self.dispatch(UserAction::Stop);
-        // Image fetch/decode is frontend-owned, while the document fetch and
-        // resident script actor are controller-owned. Escape crosses both
-        // halves of that single abort boundary.
-        self.retire_page_loading();
+        if live && self.browser.page_is_live() {
+            self.stop_frontend_image_loads();
+        } else {
+            // Image fetch/decode is frontend-owned, while the document fetch
+            // is controller-owned; both halves share one abort boundary.
+            self.retire_page_loading();
+        }
         if was_loading && !self.browser.snapshot().status.starts_with("Stopped") {
             self.browser.set_status("Stopped loading page resources.");
         }
         self.request_redraw();
+    }
+
+    /// The `kill` command: drop the live page and stop its scripts, retiring
+    /// every load of the document (what Escape did before close requests).
+    fn kill_current_page(&mut self) {
+        self.dispatch(UserAction::Kill);
+        self.retire_page_loading();
+        self.request_redraw();
+    }
+
+    /// Stop the frontend's image loads for a document that stays live: the
+    /// requests in flight become broken, later requests may start.
+    fn stop_frontend_image_loads(&mut self) {
+        if self.image_loads.stop_pending() {
+            for (_, task) in self.image_tasks.drain() {
+                task.abort();
+            }
+            self.image_flush_scheduled = false;
+        }
+    }
+
+    /// HTML #close-requests "alternative processing" happened in the
+    /// controller (it stopped loading); stop the frontend's half as well.
+    fn sync_close_requests(&mut self) {
+        while let Some(consumed) = self.browser.take_close_request_result() {
+            if !consumed {
+                self.stop_frontend_image_loads();
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Fullscreen API: present the live page's top-level viewport fullscreen
+    /// as a borderless fullscreen window, and restore it on exit.
+    fn sync_page_fullscreen(&mut self) {
+        while let Some(change) = self.browser.take_fullscreen_change() {
+            match change {
+                FullscreenChange::Enter(request) => {
+                    let Some(window) = &self.window else {
+                        self.browser
+                            .handle_action(UserAction::FullscreenResult { request, ok: false });
+                        continue;
+                    };
+                    self.page_fullscreen = true;
+                    if window.fullscreen().is_some() {
+                        self.browser
+                            .handle_action(UserAction::FullscreenResult { request, ok: true });
+                        continue;
+                    }
+                    window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                    self.fullscreen_reply = Some((request, std::time::Instant::now()));
+                }
+                FullscreenChange::Exit(reply) => {
+                    if let Some((request, _)) = self.fullscreen_reply.take() {
+                        self.browser
+                            .handle_action(UserAction::FullscreenResult { request, ok: true });
+                    }
+                    let restored = std::mem::take(&mut self.page_fullscreen)
+                        && self.window.as_ref().is_some_and(|window| {
+                            let fullscreen = window.fullscreen().is_some();
+                            window.set_fullscreen(None);
+                            fullscreen
+                        });
+                    if let Some(request) = reply {
+                        if restored {
+                            // Answered once the restored size reached the page.
+                            self.fullscreen_reply = Some((request, std::time::Instant::now()));
+                        } else {
+                            self.browser
+                                .handle_action(UserAction::FullscreenResult { request, ok: true });
+                        }
+                    }
+                }
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Answer a pending fullscreen request: after the resize reached the page,
+    /// or once the deadline passed without one.
+    fn answer_fullscreen_request(&mut self, resized: bool) {
+        let Some((request, since)) = self.fullscreen_reply else {
+            return;
+        };
+        if !resized && since.elapsed() < FULLSCREEN_REPLY_DEADLINE {
+            return;
+        }
+        self.fullscreen_reply = None;
+        // An enter succeeded when the window is fullscreen; an exit always.
+        let ok = !self.page_fullscreen
+            || self
+                .window
+                .as_ref()
+                .is_some_and(|window| window.fullscreen().is_some());
+        if !ok {
+            self.page_fullscreen = false;
+        }
+        self.browser
+            .handle_action(UserAction::FullscreenResult { request, ok });
     }
 
     /// Apply the user-agent default for a live-page key after its cancelable
@@ -2538,6 +2673,8 @@ impl DesktopApp {
         let outcome = self.browser.process_async_events();
         self.sync_actor_focus();
         self.sync_pointer_lock();
+        self.sync_page_fullscreen();
+        self.sync_close_requests();
         self.sync_clipboard_writes();
         self.launch_external_media_requests();
         if self.browser.download_offer().is_some()
@@ -2823,6 +2960,7 @@ impl DesktopApp {
             find_count: (!self.find_matches.is_empty())
                 .then_some((self.find_index + 1, self.find_matches.len())),
             heart: HeartVisual::default(),
+            page_fullscreen: self.page_fullscreen,
         }
     }
 
@@ -4640,11 +4778,22 @@ impl DesktopApp {
                 _ => {}
             }
         }
-        // Escape is the browser stop key in every graphical browser mode. It
-        // never dismisses COMMAND. `BrowserController::Stop` implements HTML
-        // §7.5.11's abort boundary for native fetches and the resident actor.
+        // HTML #close-requests: Escape is the close request. On a live page
+        // the page runs the close request steps first (exiting fullscreen,
+        // the Escape keydown, then its close watchers). When nothing there
+        // consumes it the controller stops loading and keeps the page and its
+        // scripts (`sync_close_requests`). Elsewhere, and in COMMAND or Find,
+        // Escape stops loading; it never dismisses COMMAND. `kill` drops the
+        // page. The Escape release still reaches the page as its keyup.
         if pressed && input.key == Key::Escape && self.terminal.is_none() {
-            self.stop_current_page();
+            if matches!(self.focus, FocusTarget::Page | FocusTarget::Form { .. })
+                && self.browser.page_is_live()
+                && !input.composing
+            {
+                self.dispatch(UserAction::CloseRequest(input.modifiers));
+            } else {
+                self.stop_current_page();
+            }
             return;
         }
         if self.focus == FocusTarget::Page
@@ -5345,6 +5494,7 @@ impl DesktopApp {
                 self.dispatch(UserAction::Reload);
             }
             "stop" => self.stop_current_page(),
+            "kill" => self.kill_current_page(),
             "close" | "c" => {
                 if let Some(terminal) = self.terminal.take() {
                     let _ = terminal
@@ -7375,13 +7525,21 @@ impl DesktopApp {
 }
 
 impl ApplicationHandler<DesktopEvent> for DesktopApp {
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if std::mem::take(&mut self.browser_events_pending) {
             let outcome = self.process_browser_events();
             if outcome.invalidated {
                 self.scroll_to_fragment();
                 self.request_redraw();
             }
+        }
+        // A fullscreen request the window manager never resized for is
+        // answered at its deadline.
+        self.answer_fullscreen_request(false);
+        match self.fullscreen_reply {
+            Some((_, since)) => event_loop
+                .set_control_flow(ControlFlow::WaitUntil(since + FULLSCREEN_REPLY_DEADLINE)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -7781,6 +7939,20 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                     eprintln!("desktop: window resized");
                 }
                 self.update_metrics(None);
+                // The resized viewport went to the page first, on the same
+                // channel, so its fullscreenchange observes the new size.
+                self.answer_fullscreen_request(true);
+                // Fullscreen API #ui: the window left fullscreen on its own.
+                if self.page_fullscreen
+                    && self.fullscreen_reply.is_none()
+                    && self
+                        .window
+                        .as_ref()
+                        .is_some_and(|window| window.fullscreen().is_none())
+                {
+                    self.page_fullscreen = false;
+                    self.dispatch(UserAction::ExitFullscreen);
+                }
                 self.request_redraw();
             }
             WindowEvent::Moved(_) => {

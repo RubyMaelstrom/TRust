@@ -985,6 +985,7 @@ impl SelectorDependencies {
                     | StatePseudo::Enabled
                     | StatePseudo::Dir(_)
                     | StatePseudo::Modal
+                    | StatePseudo::Fullscreen
                     | StatePseudo::Indeterminate
                     | StatePseudo::Required
                     | StatePseudo::Optional

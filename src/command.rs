@@ -253,6 +253,8 @@ open <url>                gopher(s) gemini http(s) finger telnet …
 back / forward            travel browser history
 close                     drop the connection
 reload                    refetch the page on screen
+stop                      stop loading; the page and its scripts keep running
+kill                      drop the live page and stop its scripts
 post <url> [body]         POST a form body to a web URL
 finger [user]@<host>      finger query
 wrap [on|off]            wrap a Finger, WHOIS, RDAP or DICT reply
@@ -300,7 +302,8 @@ Alt-B          view bookmarks (except Telnet)
 Ctrl-F         find in page (Enter next, Shift-Enter prev)
 v              play the selected link in mpv
 y              copy the selected link URL (OSC 52)
-Esc            stop loading and page scripts
+Esc            close request: the page closes its fullscreen, dialog
+               or popover first; otherwise stop loading (page keeps running)
 ```
 
 Mouse: hover selects, click follows, wheel scrolls,

@@ -312,6 +312,26 @@ current behavior and limits; consult the governing standards before changing it.
   preserves the live page/scripts, updates the address, and restores scrolling
   through Back/Forward. Desktop pointer lock releases on Escape, focus loss, or
   navigation; the terminal frontend reports it unsupported.
+- Escape on a live page is HTML's close request in both frontends
+  (`PageCmd::CloseRequest`, answered by `PageEvt::CloseRequestHandled`): the
+  actor exits fullscreen, else fires the Escape keydown (canceling it consumes
+  the request), else processes the close watchers (modal dialogs by `closedby`,
+  auto/hint popovers, `CloseWatcher`, grouped per HTML's user-activation
+  rules). Only an unconsumed request makes the frontend stop loading (the
+  navigation, page subresource and image fetches) while the page and its scripts
+  keep running. Other modes keep their own Escape meaning. COMMAND `stop` stops
+  loading the same way; `kill` drops the live page and its scripts.
+- Showing popovers, modal dialogs and fullscreen elements share the arena's
+  ordered top layer (`Dom::top_layer`): each generates a root-sibling box above
+  its `::backdrop` (CSS Position 4). Without `overlay` transitions, removal from
+  the top layer is immediate. A modal dialog blocks its document; other nodes
+  are inert to hit testing, focus and activation in both frontends.
+  Presentation arenas carry this state as `data-trust-*` markers that the live
+  arena never trusts. Fullscreen needs transient activation and the
+  `fullscreen` policy (iframe `allow`/`allowfullscreen`, default 'self').
+  trust-desktop enters borderless window fullscreen and hides its overlays; the
+  terminal hides its address and status rows so the page fills it;
+  trust-headless refuses. A keyboard lock is recorded but never applied.
 - WebGL 1 uses lazy-loaded EGL/OpenGL ES with Rust shader preparation and
   validation, without bundled ANGLE. A missing robust context makes
   `getContext("webgl")` return `null`. WebGL 2 and multisample antialiasing are

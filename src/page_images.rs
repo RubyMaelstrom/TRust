@@ -467,6 +467,23 @@ impl PageImages {
     /// The document no longer makes requests. Waiting consumers fetch for
     /// themselves; completed responses remain available to the frozen
     /// presentation until the store itself is dropped with its page.
+    /// Forget the requests still in flight (their fetches are being
+    /// cancelled by the user agent's "stop loading"); completed responses stay
+    /// shared. Returns whether any request was unfinished.
+    pub(crate) fn forget_unfinished(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let mut forgot = false;
+        inner.entries.retain(|_, entries| {
+            entries.retain(|entry| {
+                let done = entry.fetch.peek().is_some();
+                forgot |= !done;
+                done
+            });
+            !entries.is_empty()
+        });
+        forgot
+    }
+
     pub(crate) fn close(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;

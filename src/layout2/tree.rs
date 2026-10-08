@@ -1465,6 +1465,42 @@ impl Builder<'_> {
         }))
     }
 
+    /// CSS Position 4 #backdrop: an element rendered in the top layer has a
+    /// `::backdrop` box unless its computed `content` is `none`. It is
+    /// generated as an out-of-flow placeholder just before its originating
+    /// element; the positioned pass promotes both to root siblings and paints
+    /// the backdrop immediately below the element.
+    fn backdrop(&self, id: NodeId) -> Option<Built> {
+        self.dom.top_layer_order(id)?;
+        let which = PseudoEl::Backdrop;
+        if self
+            .dom
+            .pseudo_layout_value(id, which, "content")
+            .is_some_and(|content| content.trim().eq_ignore_ascii_case("none"))
+            || self
+                .dom
+                .pseudo_layout_value(id, which, "display")
+                .is_some_and(|display| display.trim().eq_ignore_ascii_case("none"))
+        {
+            return None;
+        }
+        let mut style = BoxStyle::of_pseudo(self.dom, id, which, self.vp);
+        // Top-layer styling: a position other than absolute/fixed computes to
+        // absolute, so the box is always out of flow.
+        if !style.position.out_of_flow() {
+            style.position = Pos::Absolute;
+        }
+        Some(Built::Inline(Inline::OutOfFlow(Arc::new(BoxNode {
+            node: crate::layout2::NO_NODE,
+            style,
+            content: Content::Inlines(Vec::new()),
+            marker: None,
+            marker_image: None,
+            marker_inside: false,
+            oof: Vec::new(),
+        }))))
+    }
+
     /// Build a list of child node ids into box-level `Built`s: text runs become
     /// anonymous inline text, elements build (with `display:contents` and
     /// `<slot>` hoists flattened in), and a closed `<details>` keeps only its
@@ -1489,7 +1525,12 @@ impl Builder<'_> {
                 NodeData::Element { .. } => match self.element(c) {
                     Built::Hoist(kids) => out.extend(kids),
                     Built::Skip => {}
-                    b => out.push(b),
+                    b => {
+                        if let Some(backdrop) = self.backdrop(c) {
+                            out.push(backdrop);
+                        }
+                        out.push(b)
+                    }
                 },
                 _ => {}
             }

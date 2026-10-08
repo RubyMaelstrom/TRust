@@ -1602,6 +1602,9 @@ pub struct ChromeModel {
     pub find: Option<EditorVisual>,
     pub find_count: Option<(usize, usize)>,
     pub heart: HeartVisual,
+    /// Fullscreen API: the page is shown fullscreen, so the browse hints and
+    /// heart scrollbars are hidden (prompts the user opens still overlay it).
+    pub page_fullscreen: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3453,6 +3456,8 @@ pub fn paint_desktop_overlay(scene: &mut Scene, browser: &BrowserSnapshot, model
         paint_download_panel(scene, download);
     } else if let Some(find) = &model.find {
         paint_find_panel(scene, find, model.find_count);
+    } else if model.page_fullscreen {
+        return;
     } else {
         paint_browse_hints(scene, model);
     }

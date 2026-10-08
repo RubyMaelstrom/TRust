@@ -13037,14 +13037,16 @@ b</xmp></body>"#;
         // purposes: the positioned/overflow-hidden DOM parent must neither add
         // its offset nor clip the menu. Steam's supernav computes document-
         // space left/top before showPopover(), which exposed both mistakes.
+        // The authored style overrides the UA `[popover]` inset, margin,
+        // padding and border (HTML #flow-content-3) as such menus do.
         let dom = Dom::parse_document(
             r#"<body style="margin:0">
             <div style="position:relative;margin-left:300px;width:100px;height:20px;overflow:hidden">
-              <div id="tip" popover="manual" data-trust-popover-open="0" data-trust-hover="17"
-                   style="display:block;position:absolute;left:120px;top:40px;width:80px;height:30px;background:red">TIP</div>
+              <div id="tip" popover="manual" data-trust-popover-open="" data-trust-top-layer="0" data-trust-hover="17"
+                   style="display:block;position:absolute;left:120px;top:40px;right:auto;bottom:auto;margin:0;padding:0;border:0;width:80px;height:30px;background:red">TIP</div>
             </div>
             <div style="position:fixed;z-index:999999;left:0;top:0">ordinary overlay</div>
-            <div popover="manual" data-trust-popover-open="1" data-trust-hover="18"
+            <div popover="manual" data-trust-popover-open="" data-trust-top-layer="1" data-trust-hover="18"
                  style="display:block;position:fixed;left:10px;top:10px">SECOND</div>
             </body>"#,
         );
@@ -13068,8 +13070,9 @@ b</xmp></body>"#;
                 .iter()
                 .map(|entry| entry.fixed)
                 .collect::<Vec<_>>(),
-            vec![false, true],
-            "absolute and fixed entries retain one shared top-layer order"
+            vec![true, false, true, true],
+            "absolute and fixed entries retain one shared top-layer order, each \
+             below its fixed ::backdrop (CSS Position 4 #backdrop)"
         );
         assert!(
             layout.paint.primitives.iter().all(|command| !matches!(
@@ -13088,6 +13091,62 @@ b</xmp></body>"#;
                     crate::render::DisplayCommand::HitRegion(region) if region.actor == Some(17)
                 )),
             "popover paints in the dedicated post-document layer"
+        );
+    }
+
+    #[test]
+    fn modal_dialog_centers_over_its_backdrop_and_the_inert_page_has_no_hit_regions() {
+        // HTML #flow-content-3 (`dialog:modal`), CSS Position 4 #top-layer and
+        // #backdrop, HTML #modal-dialogs-and-inert-subtrees (local WHATWG HTML
+        // e5071a20c856, csswg-drafts 81c27f68): the modal dialog is a fixed,
+        // centered root sibling painted after its viewport-sized ::backdrop,
+        // whose hits target the dialog, while the blocked page is inert.
+        let dom = Dom::parse_document(
+            r#"<html data-trust-blocked=""><body style="margin:0">
+            <button id="out" data-trust-hover="5">outside</button>
+            <dialog id="d" open data-trust-modal="" data-trust-blocking="" data-trust-top-layer="0"
+                    data-trust-hover="7" style="width:200px;height:100px;padding:0;border:0">
+              <button id="in" data-trust-hover="8">inside</button></dialog>
+            </body></html>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let dialog = layout
+            .boxes
+            .get(&node_by_id(&dom, "d"))
+            .expect("dialog box");
+        assert!((dialog.left - 300.0).abs() < 0.01, "{dialog:?}");
+        assert!((dialog.top - 250.0).abs() < 0.01, "{dialog:?}");
+        assert_eq!(layout.paint.top_layer.len(), 2, "backdrop, then the dialog");
+        let hits = |primitives: &[crate::render::DisplayCommand], actor: usize| {
+            primitives.iter().any(|command| {
+                matches!(command,
+                crate::render::DisplayCommand::HitRegion(region) if region.actor == Some(actor))
+            })
+        };
+        let backdrop = &layout.paint.top_layer[0].primitives;
+        assert!(
+            backdrop.iter().any(|command| matches!(command,
+                crate::render::DisplayCommand::HitRegion(region)
+                    if region.actor == Some(7) && region.rect.width >= 800.0 && region.rect.height >= 600.0)),
+            "the ::backdrop covers the viewport and targets its dialog"
+        );
+        assert!(hits(&layout.paint.top_layer[1].primitives, 8));
+        assert!(
+            !hits(&layout.paint.primitives, 5)
+                && layout
+                    .paint
+                    .top_layer
+                    .iter()
+                    .all(|entry| !hits(&entry.primitives, 5)),
+            "inert content is not hit-testable"
         );
     }
 
