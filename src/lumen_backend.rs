@@ -22499,6 +22499,44 @@ mod tests {
         );
     }
 
+    /// DOM #concept-node-remove enqueues disconnectedCallback for every custom
+    /// element among the removed node's shadow-including inclusive
+    /// descendants, and HTML #cereactions runs it once the removal is done:
+    /// for removeChild, replaceChild, and the replace-all of textContent.
+    #[test]
+    fn removal_disconnects_custom_elements_after_the_removal() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const log = [];
+            customElements.define('x-gone', class extends HTMLElement {
+                disconnectedCallback() { log.push(this.id + ':' + this.isConnected); }
+            });
+            const make = id => { const el = document.createElement('x-gone'); el.id = id; return el; };
+            const box = document.createElement('div'); body.appendChild(box);
+            box.append(make('a'), make('b'));
+            const host = document.createElement('section'); box.appendChild(host);
+            host.attachShadow({ mode: 'closed' }).appendChild(make('in-shadow'));
+            box.textContent = 'text';
+            log.push('|');
+            box.appendChild(make('c'));
+            box.textContent = '';
+            log.push('|');
+            const old = make('d'); box.appendChild(old);
+            box.replaceChild(document.createElement('p'), old);
+            log.push('|');
+            box.appendChild(make('e')); box.innerHTML = '';
+            return log.join(',');
+        })()"#
+            ),
+            "a:false,b:false,in-shadow:false,|,c:false,|,d:false,|,e:false"
+        );
+    }
+
     /// HTML's iframe insertion and removing steps run whenever a navigable
     /// container is in the inserted or removed subtree, at any depth and on
     /// every path; the frame-free fast path never skips them.

@@ -5925,10 +5925,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // subtree observers still gain transient registrations.
         if (!silent) moChildRemove(parent, c);
         else if (MO.length) moRetainTransient(parent, c);
-        if (CE.defs.size) {
-            if (deferredCeReactions !== null) deferredCeReactions.push(() => ceDisconnect(c));
-            else ceDisconnect(c);
-        }
         const id = nodeIds.get(c);
         __dom_detach(id);
         const effects = __dom_removal_effects(id, nodeIds.get(parent));
@@ -5936,10 +5932,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             destroyFrameNavigablesIn(c);
             syncWrapperSubtreeRetention(id);
             slotQueueCheck(parent);
-            return c;
+        } else {
+            if (effects & REMOVE_LISTENERS) syncWrapperSubtreeRetention(id);
+            if (effects & REMOVE_SLOTS) slotQueueCheck(parent);
         }
-        if (effects & REMOVE_LISTENERS) syncWrapperSubtreeRetention(id);
-        if (effects & REMOVE_SLOTS) slotQueueCheck(parent);
+        // HTML #cereactions: disconnectedCallback runs once the removal is
+        // complete (after an enclosing operation's, when one is deferring).
+        if (CE.defs.size) {
+            if (deferredCeReactions !== null) deferredCeReactions.push(() => ceDisconnect(c));
+            else ceDisconnect(c);
+        }
         return c;
     }
     // An element's local name from its internal slots; any other node's
@@ -6051,6 +6053,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                         syncWrapperSubtreeRetention(removedRoots[i]);
                 }
                 slotQueueCheck(this);
+                // DOM #string-replace-all removes each child (#concept-node-remove).
+                if (CE.defs.size) for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]);
                 return;
             }
             if (t === 3 || t === 4 || t === 7 || t === 8) { const old = __dom_text(nodeIds.get(this)); __dom_set_text(nodeIds.get(this), v); moCharData(this, old); return; }
@@ -6064,6 +6068,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 syncWrapperSubtreeRetention(nodeIds.get(removed[i]));
             moChildBulk(this, removed, Array.from(this.childNodes));
             slotQueueCheck(this);
+            if (CE.defs.size) for (let i = 0; i < removed.length; i++) ceDisconnect(removed[i]);
         }
         get nodeValue() {
             const t = this.nodeType;
@@ -6205,7 +6210,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             rangesRemove(old, this, replacementIndex);
             rangesInsert(this, replacementIndex);
             syncWrapperSubtreeRetention(nodeIds.get(n));
-            if (CE.defs.size) ceDisconnect(old);
             if (MO.length) moRetainTransient(this, old);
             __dom_detach(nodeIds.get(old));
             destroyFrameNavigablesIn(old);
@@ -6214,7 +6218,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
             else moEnqueue();
-            if (CE.defs.size) ceScan(n);
+            // Reactions in enqueue order once the replacement is complete.
+            if (CE.defs.size) { ceDisconnect(old); ceScan(n); }
             maybeRunScript(n);
             maybeLoadStylesheet(n);
             if (internalsFor(n).trustLN === "base" || internalsFor(old).trustLN === "base") baseHrefCache = null;
@@ -7423,7 +7428,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (removedRoots.length || __dom_children(nodeIds.get(this)).length) moEnqueue();
                 syncKnownWrapperRetention(removedWrapperIds, false);
                 baseHrefCache = null;
-                if (CE.defs.size) ceScan(this);
+                if (CE.defs.size) { for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]); ceScan(this); }
                 slotQueueCheck(this);
                 // HTML §4.8.6: innerHTML insertion still processes iframe
                 // attributes and starts each newly inserted nested navigable.
@@ -7436,7 +7441,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             syncKnownWrapperRetention(removedWrapperIds, false);
             baseHrefCache = null;
             moChildBulk(this, removed, Array.from(this.childNodes));
-            if (CE.defs.size) ceScan(this);
+            if (CE.defs.size) { for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]); ceScan(this); }
             slotQueueCheck(this);
             queueFrameNavigationsIn(this);
         }
@@ -7524,7 +7529,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // precede this element.
             rangesRemove(this, parent, index);
             rangesInsert(parent, index, rangeIndex(this) - index);
-            if (CE.defs.size) ceDisconnect(this);
             if (MO.length) moRetainTransient(parent, this);
             __dom_detach(nodeIds.get(this));
             destroyFrameNavigablesIn(this);
@@ -7533,7 +7537,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (MO.length && moHasChildList) moNotify({ type: "childList", target: parent, addedNodes: added,
                 removedNodes: [this], previousSibling: prev, nextSibling: next });
             else moEnqueue();
-            if (CE.defs.size) ceScan(parent);
+            if (CE.defs.size) { ceDisconnect(this); ceScan(parent); }
             queueFrameNavigationsIn(parent);
         }
         get innerText() { return this.textContent; }
@@ -13980,7 +13984,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (removedRoots.length) destroyFrameNavigableDescendantsIn(this);
             __dom_set_inner_html(nodeIds.get(this), String(v));
             syncKnownWrapperRetention(removedWrapperIds, false);
-            if (CE.defs.size) ceScan(this);
+            if (CE.defs.size) { for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]); ceScan(this); }
             slotQueueCheck(this);
         }
         get adoptedStyleSheets() { return adoptedArray(this); }
@@ -14080,10 +14084,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         maybeConnect(el);
     }
+    // `ceConnected` records that a connected custom element received its
+    // connected reaction, whether or not it defines connectedCallback, so its
+    // disconnectedCallback runs when it is removed.
     function maybeConnect(el) {
-        if (internalsFor(el).ceUpgraded && !internalsFor(el).ceConnected && el.isConnected
-            && typeof el.connectedCallback === "function") {
+        if (internalsFor(el).ceUpgraded && !internalsFor(el).ceConnected && el.isConnected) {
             internalsFor(el).ceConnected = true;
+            if (typeof el.connectedCallback !== "function") return;
             try { el.connectedCallback(); }
             catch (e) { trust.errors.push("connectedCallback: " + ((e && e.message) || e)); }
         }
@@ -14142,14 +14149,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (internalsFor(el).ceUpgraded) maybeConnect(el);
         }
     }
+    // DOM #concept-node-remove: each custom element among the removed
+    // node's shadow-including inclusive descendants gets disconnectedCallback.
+    // Only a connected custom element's wrapper carries `ceConnected`, so
+    // candidates without a wrapper are skipped rather than created. `node` is
+    // a wrapper or a node id.
     function ceDisconnect(node) {
-        if (!node || typeof node !== "object") return;
-        if (internalsFor(node).ceConnected && typeof node.disconnectedCallback === "function") {
-            internalsFor(node).ceConnected = false;
-            try { node.disconnectedCallback(); }
+        const id = typeof node === "number" ? node : node && typeof node === "object" ? nodeIds.get(node) : undefined;
+        if (id === undefined) return;
+        const ids = __dom_ce_candidates(id);
+        for (let i = 0; i < ids.length; i++) {
+            const el = cachedWrapper(ids[i]);
+            if (!el || !internalsOf(el).ceConnected) continue;
+            internalsFor(el).ceConnected = false;
+            if (typeof el.disconnectedCallback !== "function") continue;
+            try { el.disconnectedCallback(); }
             catch (e) { trust.errors.push("disconnectedCallback: " + ((e && e.message) || e)); }
         }
-        if (node.childNodes) for (const c of node.childNodes) ceDisconnect(c);
     }
     // HTML #concept-element-attributes-change-ext: attributeChangedCallback
     // receives the attribute's local name, old and new values, and namespace.
