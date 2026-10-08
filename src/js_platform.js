@@ -14075,28 +14075,52 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
 
     // --- the custom elements registry ---
+    // HTML #concept-upgrade-an-element. The element's state is "failed"
+    // (`ceFailed`) until its constructor returns, so a reentrant upgrade
+    // exits early and, not yet custom, the element enqueues no reactions for
+    // what the constructor does to it. Its own attributeChangedCallback and
+    // connectedCallback reactions are enqueued first, from the attributes
+    // and connectedness it had before construction, and run once the
+    // constructor succeeds; one that throws leaves the element failed and
+    // empties those reactions.
     function upgradeElement(el, ctor) {
-        if (internalsFor(el).ceUpgraded) return;
-        internalsFor(el).ceUpgraded = true;
+        const internals = internalsFor(el);
+        if (internals.ceUpgraded || internals.ceFailed) return;
+        internals.ceFailed = true;
         // Read observedAttributes BEFORE constructing — the platform
         // contract define() relies on. Lit's static getter runs its
         // finalize() here, creating reactive accessors; construct
         // first and instance fields shadow them forever.
         let observed = [];
-        try { observed = ctor.observedAttributes || []; } catch (e) { observed = []; }
+        try { observed = Array.from(ctor.observedAttributes || [], String); } catch (e) { observed = []; }
         Object.setPrototypeOf(el, ctor.prototype);
-        CE.upgrading = el;
-        try { new ctor(); }
-        catch (e) { trust.errors.push("custom element ctor: " + ((e && e.message) || e)); }
-        finally { CE.upgrading = null; }
-        for (const a of observed) {
-            const v = el.getAttribute(a);
-            if (v !== null && typeof el.attributeChangedCallback === "function") {
-                try { el.attributeChangedCallback(a, null, v); }
-                catch (e) { trust.errors.push("attributeChangedCallback: " + ((e && e.message) || e)); }
+        const changed = [];
+        if (observed.length) {
+            const list = elementAttributeList(el);
+            for (let i = 0; i < list.length; i++) {
+                const [namespace, , localName, value] = list[i];
+                if (observed.includes(localName)) changed.push([localName, value, namespace]);
             }
         }
-        maybeConnect(el);
+        const connected = el.isConnected;
+        CE.upgrading = el;
+        try { new ctor(); }
+        catch (e) { trust.errors.push("custom element ctor: " + ((e && e.message) || e)); return; }
+        finally { CE.upgrading = null; }
+        internals.ceFailed = false;
+        internals.ceUpgraded = true;
+        // Connectedness from here on is tracked as for any custom element:
+        // a constructor that connected the element enqueued no reaction.
+        internals.ceConnected = el.isConnected;
+        for (const [name, value, namespace] of changed) {
+            if (typeof el.attributeChangedCallback !== "function") break;
+            try { el.attributeChangedCallback(name, null, value, namespace); }
+            catch (e) { trust.errors.push("attributeChangedCallback: " + ((e && e.message) || e)); }
+        }
+        if (connected && typeof el.connectedCallback === "function") {
+            try { el.connectedCallback(); }
+            catch (e) { trust.errors.push("connectedCallback: " + ((e && e.message) || e)); }
+        }
     }
     // `ceConnected` records that a connected custom element received its
     // connected reaction, whether or not it defines connectedCallback, so its
