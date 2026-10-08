@@ -363,6 +363,20 @@ current behavior and limits; consult the governing standards before changing it.
 - Input stepping and `valueAsNumber` are shared DOM behavior for number, range,
   date, month, week, time, and datetime-local. Preserve step/bounds validation
   and separate current/default values; desktop number inputs add spin controls.
+- TRust's User-Agent is `Mozilla/5.0 (<frozen platform>) TRust/0.2`
+  (`USER_AGENT` in `src/http.rs`). Fetch leaves it implementation-defined but
+  encourages the `Mozilla/5.0 (` shape; a bare `TRust/` token is refused by
+  bot-management services (DataDome) before any script runs. The platform
+  token is the frozen value major browsers send per OS family;
+  `navigator.platform` names the real one (`Linux aarch64`). Script sees
+  HTML's Gecko navigator compatibility mode. Held in reserve, not enabled:
+  appending a recent Chrome's tokens (` Chrome/153.0.0.0 AppleWebKit/537.36
+  Safari/537.36`, as Ladybird does) automatically switches `navigator` to
+  Chrome mode and sends low-entropy `Sec-CH-UA*` hints to potentially
+  trustworthy URLs. Try it when a site or Cloudflare rejects the plain form;
+  on 2026-10-08 it failed DataDome's device check on Reuters, which then
+  expects Chrome's own script environment. `TRUST_UA_FIREFOX` swaps in
+  Firefox's User-Agent for A/B tests.
 - The default language is US English regardless of OS locale:
   `Accept-Language: en-US,en;q=0.9`, `navigator.language === "en-US"`, and native
   Intl default `en-US`. Explicit locale requests remain supported.

@@ -520,20 +520,30 @@ scripts, dynamically inserted scripts and `fetch`/XHR requests fail offline. Lum
 | `TRUST_LAYOUT_TRACE` | presence flag | Prints graphical layout stage timing from `layout2::lay_out_graphical`. |
 | `TRUST_FRAG_DIAG` | presence flag | Dumps the resolved graphical fragment tree (tag, position, size, and clip). Used with `layout_dump` for layout/paint discrepancies. |
 | `TRUST_PANIC_LOG` | file path | Appends every panic, including background-thread panics, with thread name, terminal-owner status, message, and forced backtrace. The normal terminal panic hook remains separate. |
-| `TRUST_UA_FIREFOX` | affirmative value (`1`, `true`, `yes`, `on`) | Replaces TRust's `TRust/0.1` User-Agent with Firefox's current one (`Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0`) for diagnostics. Selection happens once per process, so the header on every HTTP/1.1, HTTP/2 and HTTP/3 request, fetch/XHR, WebSocket handshake and download matches `navigator.userAgent` in the page, every frame and every worker; HTML's `navigator.appVersion` then derives as `5.0 (X11)`. Prints one stderr line naming the active string. Nothing else about the request changes: `Accept`, `Accept-Language`, Fetch Metadata `Sec-*` and `Sec-GPC` keep TRust's own values. Unset, empty or `0` keeps TRust's User-Agent. |
+| `TRUST_UA_FIREFOX` | affirmative value (`1`, `true`, `yes`, `on`) | Replaces TRust's own User-Agent (`Mozilla/5.0 (X11; Linux x86_64) TRust/0.2`) with Firefox's current one (`Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0`) for diagnostics. Selection happens once per process, so the header on every HTTP/1.1, HTTP/2 and HTTP/3 request, fetch/XHR, WebSocket handshake and download matches `navigator.userAgent` in the page, every frame and every worker. Both are in HTML's Gecko navigator compatibility mode (`appVersion` `5.0 (X11)`, `productSub` `20100101`, empty `vendor`, `oscpu` and `taintEnabled()`), and neither sends `Sec-CH-UA*` client hints. Prints one stderr line naming the active string. TRust's `Accept`, `Accept-Language`, `Sec-Fetch-*` and `Sec-GPC` values are unchanged. Unset, empty or `0` keeps TRust's User-Agent. |
 | `TRUST_WEBGL_TRACE` | presence flag | Prints why a page's WebGL context could not be created. |
 | `TRUST_NO_SPARE_ENGINE` | presence flag | Disables the pre-warmed spare page engine in every frontend, so each navigation builds its Lumen engine cold. Read once per process. With `TRUST_NET_TRACE`, the spare's warm-up and claims appear as `js :` lines (see [Spare page engine](#spare-page-engine)). |
 | `TRUST_TRACE_PAGE_EVENTS` | presence flag | Prints a `[trace-event] <variant>` line to stderr for every page event the shared controller handles (`Updated`, `Static`, `Patched`, `Trouble`, navigation/settle events). Useful for proving which render path a page reached and in what order. |
 
 #### A/B-testing a site's User-Agent gate
 
-Sites sometimes gate features on the `User-Agent` string. Compare TRust's own
-string with Firefox's on the same navigation:
+Sites sometimes gate features on the `User-Agent` string. TRust's own is
+`Mozilla/5.0 (<frozen platform>) TRust/0.2` (`USER_AGENT` in `src/http.rs`).
+Compare it with Firefox's on the same navigation:
 
 ```sh
-target/release/trust https://example.org/                      # TRust/0.1
+target/release/trust https://example.org/                      # TRust/0.2
 TRUST_UA_FIREFOX=1 target/release/trust https://example.org/   # Firefox/153.0
 ```
+
+If neither is accepted where real browsers are, the reserved next step is a
+Chrome-compatible User-Agent: append ` Chrome/153.0.0.0 AppleWebKit/537.36
+Safari/537.36` to `USER_AGENT`. `navigator` then follows HTML's Chrome
+compatibility mode and requests to potentially trustworthy URLs carry
+low-entropy `Sec-CH-UA`, `Sec-CH-UA-Mobile` and `Sec-CH-UA-Platform` hints,
+both derived from that string. A first page load that answers 401/403 before
+any script ran points at such a server-side gate (check with
+`TRUST_NET_TRACE`).
 
 The enabled form prints `TRUST_UA_FIREFOX: diagnostics report Firefox's
 User-Agent: ...` once to stderr, and `navigator.userAgent` in the page agrees
@@ -541,6 +551,7 @@ with the header. The conformance tests for both halves are:
 
 ```sh
 cargo test --lib -- firefox_user_agent_diagnostic_is_opt_in one_user_agent_header_describes_both_wire_and_scripts
+cargo test --lib -- default_user_agent_names_trust_in_a_compatible_shape low_entropy_client_hints_describe_the_user_agent
 cargo test --lib -- navigator_user_agent_and_appversion_follow_the_environment_value
 ```
 

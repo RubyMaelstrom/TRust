@@ -17574,13 +17574,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // NavigatorConcurrentHardware; maxTouchPoints from Pointer Events).
         // appCodeName/appName/product/vendorSub are FROZEN compatibility
         // constants every conformant browser returns verbatim regardless of
-        // engine; vendor/productSub take the non-Chrome/non-WebKit (Gecko-mode)
-        // values — the honest residual for a client that is neither. appVersion
-        // is derived below using HTML's compatibility-mode algorithm (empty
-        // for TRust's non-Mozilla UA). hardwareConcurrency is the real host core count; we are not a
-        // touch device so maxTouchPoints is 0. These are honest values for our
-        // environment that legit feature-detection reads, NOT browser-spoofing
-        // (returning `undefined` makes us look subtly broken to standard code).
+        // engine. platform, vendor, productSub and appVersion depend on the
+        // navigator compatibility mode and are set by the shared Navigator
+        // block below. hardwareConcurrency is the real host core count; we are
+        // not a touch device so maxTouchPoints is 0.
         appCodeName: "Mozilla", appName: "Netscape", product: "Gecko",
         productSub: "20100101", vendor: "", vendorSub: "",
         appVersion: "",
@@ -17615,6 +17612,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const ordinaryDefine=Reflect.defineProperty, TypeErrorCtor=TypeError, StringCtor=String;
         const worker=typeof document==='undefined', interfaceName=worker?'WorkerNavigator':'Navigator';
         const nav=g.navigator, values=Object.create(null);
+        // HTML #concept-navigator-compatibility-mode follows the engine tokens
+        // of the User-Agent (crate::http::navigator_compatibility_mode):
+        // Gecko for TRust's own and Firefox's, Chrome only for a User-Agent
+        // carrying Chrome's tokens. #dom-navigator-platform names the actual
+        // platform, e.g. "Linux aarch64".
+        const config=(worker?g.__worker_cfg:g.__trust_cfg)||{};
+        const gecko=config.navigatorMode!=='chrome';
+        if(typeof config.platform==='string')nav.platform=config.platform;
+        nav.productSub=gecko?'20100101':'20030107';
+        nav.vendor=gecko?'':'Google Inc.';
         const read=object=>apply(weakGet,slots,[object]);
         function requireKind(object,kind) {
             const value=read(object);
@@ -17648,14 +17655,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             readonly(Constructor.prototype,name,interfaceName,state=>state.values[name]);
         }
         values.userAgent=values.userAgent===undefined?'TRust/0.1':values.userAgent;
-        // HTML #dom-navigator-appVersion, Gecko compatibility mode. This is
-        // derived metadata, never a change to TRust's actual User-Agent. With
-        // TRust's own UA the result is the empty string; under the
-        // TRUST_UA_FIREFOX diagnostic this UA starts with "Mozilla/5.0 (" and
-        // the Gecko-mode branch yields e.g. "5.0 (X11)", as the spec's own
-        // example requires.
+        // HTML #dom-navigator-appVersion: the User-Agent after "Mozilla/" in
+        // Chrome mode; in Gecko mode (e.g. "5.0 (X11)", as the spec's own
+        // example requires) only its platform family. A User-Agent not
+        // starting with "Mozilla/5.0 (" yields the empty string.
         const ua=values.userAgent;
         if(!ua.startsWith('Mozilla/5.0 ('))values.appVersion='';
+        else if(!gecko)values.appVersion=ua.slice(8);
         else {
             const trail=ua.slice(8), end=trail.indexOf(';');
             values.appVersion=trail.startsWith('5.0 (Windows')?'5.0 (Windows)':
@@ -17711,8 +17717,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     associatedNavigator(this);
                     define(this==null?g:this,'clientInformation',{value,writable:true,enumerable:true,configurable:true});
                 }}.set,'set clientInformation')});
-            readonly(Constructor.prototype,'oscpu',interfaceName,()=> '');
-            operation(Constructor.prototype,'taintEnabled',{taintEnabled(){requireKind(this,interfaceName);return false;}}.taintEnabled);
+            // HTML #NavigatorID-partial: only the Gecko compatibility mode
+            // has oscpu and taintEnabled().
+            if(gecko) {
+                readonly(Constructor.prototype,'oscpu',interfaceName,()=> '');
+                operation(Constructor.prototype,'taintEnabled',{taintEnabled(){requireKind(this,interfaceName);return false;}}.taintEnabled);
+            }
             operation(Constructor.prototype,'javaEnabled',{javaEnabled(){requireKind(this,interfaceName);return false;}}.javaEnabled);
             // HTML #pdf-viewer-supported: download::mime_is_renderable does
             // not support inline PDF. Expose truthful EMPTY legacy collections,

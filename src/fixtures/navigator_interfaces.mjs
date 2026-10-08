@@ -46,7 +46,7 @@
         const alias=Object.getOwnPropertyDescriptor(globalThis,'clientInformation');
         globalThis.clientInformation=17;check(clientInformation===17 && navigator===nav,'Replaceable alias does not replace Navigator');
         Object.defineProperty(globalThis,'clientInformation',alias);
-        check(nav.vendor==='' && nav.vendorSub==='' && nav.productSub==='20100101' && nav.taintEnabled()===false,'Gecko compatibility mode, not Gecko engine identity');
+        check(nav.vendor==='' && nav.vendorSub==='' && nav.productSub==='20100101' && nav.taintEnabled()===false && nav.oscpu==='','Gecko compatibility mode, not Gecko engine identity');
         check(nav.pdfViewerEnabled===false && nav.javaEnabled()===false,'unavailable inline PDF and Java');
         throws('TypeError',()=>new Plugin());throws('TypeError',()=>new MimeType());
         for(const [list,C] of [[nav.plugins,PluginArray],[nav.mimeTypes,MimeTypeArray]]) {

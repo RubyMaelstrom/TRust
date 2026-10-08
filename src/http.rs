@@ -47,7 +47,55 @@ const MAX_BODY: usize = 512 * 1024 * 1024;
 // impose a wall-clock deadline on the event-loop task that initiated it.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS: usize = 10;
-pub(crate) const USER_AGENT: &str = "TRust/0.2";
+
+// The parenthesized platform token of TRust's User-Agent. Servers sniff it
+// and recognize only the frozen tokens the major browsers send, serving
+// degraded or broken pages to anything else (an AArch64 Linux token, say), so
+// it names the operating system family the way those browsers do and is
+// decoupled from the real OS version and CPU. `navigator.platform` still
+// describes the actual platform.
+#[cfg(target_os = "windows")]
+macro_rules! user_agent_platform {
+    () => {
+        "Windows NT 10.0; Win64; x64"
+    };
+}
+#[cfg(target_os = "macos")]
+macro_rules! user_agent_platform {
+    () => {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    };
+}
+#[cfg(target_os = "android")]
+macro_rules! user_agent_platform {
+    () => {
+        "Linux; Android 10; K"
+    };
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "android")))]
+macro_rules! user_agent_platform {
+    () => {
+        "X11; Linux x86_64"
+    };
+}
+
+/// TRust's default `User-Agent` value (Fetch #default-user-agent-value).
+///
+/// Fetch leaves the value implementation-defined but, "for unfortunate web
+/// compatibility reasons", strongly encourages browsers to start it with
+/// `Mozilla/5.0 (` and model it after other browsers. A bare `TRust/0.2`
+/// is refused outright by bot-management services before any page script
+/// runs. So TRust takes that shape and names only itself (RFC 9110 §10.1.5),
+/// in the Gecko navigator compatibility mode.
+///
+/// Appending a recent Chrome's tokens (` Chrome/153.0.0.0 AppleWebKit/537.36
+/// Safari/537.36`, as Ladybird does) is the next step if sites need it:
+/// [`navigator_compatibility_mode`] and [`client_hints`] follow those tokens,
+/// switching script to Chrome's `NavigatorID` values and sending `Sec-CH-UA`
+/// hints. On 2026-10-08 that identity failed DataDome's device check, which
+/// then holds the client to Chrome's own script environment, so TRust keeps
+/// the plain form until a site requires more.
+pub(crate) const USER_AGENT: &str = concat!("Mozilla/5.0 (", user_agent_platform!(), ") TRust/0.2");
 
 /// Firefox's current User-Agent string for Linux x86_64, read out of the local
 /// Firefox 153 build (`libxul.so` reports the `Firefox/153.0` product token and
@@ -69,9 +117,11 @@ pub(crate) const FIREFOX_USER_AGENT: &str =
 /// reports Firefox's current User-Agent instead of TRust's own. It is read once
 /// per process, so every HTTP/1.1, HTTP/2 and HTTP/3 request, script realm,
 /// worker, WebSocket handshake and download agrees, and it says so on stderr
-/// once. Nothing else changes: TRust still sends its own `Accept`,
-/// `Accept-Language`, Fetch Metadata `Sec-*`, and `Sec-GPC` fields, so this is
-/// a User-Agent swap for A/B-testing a site's UA gate, not a Firefox clone.
+/// once. What derives from the User-Agent follows it: script sees the Gecko
+/// navigator compatibility mode and no `Sec-CH-UA` hints are sent, as Firefox
+/// sends none. TRust still sends its own `Accept`, `Accept-Language`, Fetch
+/// Metadata `Sec-Fetch-*`, and `Sec-GPC` fields, so this is a User-Agent swap
+/// for A/B-testing a site's UA gate, not a Firefox clone.
 pub(crate) fn user_agent() -> &'static str {
     static SELECTED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     SELECTED.get_or_init(|| {
@@ -97,6 +147,146 @@ fn firefox_ua_requested(requested: Option<&str>) -> bool {
             .as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+/// HTML #concept-navigator-compatibility-mode: which established browser's
+/// `NavigatorID` values (`appVersion`, `productSub`, `vendor`, and Gecko's
+/// `oscpu`/`taintEnabled()`) script sees. It follows the User-Agent's engine
+/// tokens, so the header and `navigator` describe the same browser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NavigatorCompatibilityMode {
+    Chrome,
+    Gecko,
+}
+
+impl NavigatorCompatibilityMode {
+    /// The spelling the platform prelude's `__trust_cfg.navigatorMode` uses.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Gecko => "gecko",
+        }
+    }
+}
+
+/// The navigator compatibility mode of the selected [`user_agent`].
+pub(crate) fn navigator_compatibility_mode() -> NavigatorCompatibilityMode {
+    navigator_compatibility_mode_for(user_agent())
+}
+
+/// Chrome mode only for a User-Agent carrying Chrome's token; any other,
+/// TRust's own and Firefox's included, reports Gecko's values, the residual
+/// that claims no engine-specific vendor.
+fn navigator_compatibility_mode_for(user_agent: &str) -> NavigatorCompatibilityMode {
+    if user_agent
+        .split(' ')
+        .any(|token| token.starts_with("Chrome/"))
+    {
+        NavigatorCompatibilityMode::Chrome
+    } else {
+        NavigatorCompatibilityMode::Gecko
+    }
+}
+
+/// HTML #dom-navigator-platform: the platform the browser runs on, in the
+/// form browsers report it ("Win32", "MacIntel", "Linux x86_64",
+/// "Linux aarch64"). Unlike the User-Agent's frozen platform token, this
+/// names the actual CPU architecture.
+pub(crate) fn navigator_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Win32"
+    } else if cfg!(target_os = "macos") {
+        "MacIntel"
+    } else {
+        match std::env::consts::ARCH {
+            "x86_64" => "Linux x86_64",
+            "aarch64" => "Linux aarch64",
+            "x86" => "Linux i686",
+            "arm" => "Linux armv7l",
+            "riscv64" => "Linux riscv64",
+            _ => "Linux",
+        }
+    }
+}
+
+/// User-Agent Client Hints' low-entropy hints (Client Hints Infrastructure
+/// #low-entropy-table): `Sec-CH-UA`, `Sec-CH-UA-Mobile` and
+/// `Sec-CH-UA-Platform`, sent on every request without an `Accept-CH`
+/// opt-in. They are derived from the User-Agent so the two never contradict
+/// each other: for a User-Agent with Chrome's token, TRust's own brand and a
+/// Chromium brand at that Chrome major version, plus the GREASE brand UA-CH
+/// #create-brands asks for (fixed for the build, as its note on caching
+/// suggests). A User-Agent without one, TRust's default and the
+/// `TRUST_UA_FIREFOX` diagnostic's included, sends none, as Gecko does not
+/// implement these hints.
+///
+/// Hints go only to potentially trustworthy URLs (the user agent may omit
+/// any hint, Client Hints Infrastructure #request-processing, and browsers
+/// send them only over secure transport). They are recomputed for every
+/// request, so a redirect to an insecure URL drops them, and a worker's own
+/// script request carries none (#append-client-hints-to-request step 1).
+pub(crate) fn client_hints(
+    url: &Url,
+    destination: Option<&str>,
+) -> &'static [(&'static str, String)] {
+    static HINTS: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
+    if !client_hints_allowed(url, destination) {
+        return &[];
+    }
+    HINTS.get_or_init(|| client_hints_for(user_agent()))
+}
+
+fn client_hints_allowed(url: &Url, destination: Option<&str>) -> bool {
+    potentially_trustworthy(url) && !matches!(destination, Some("worker" | "sharedworker"))
+}
+
+fn client_hints_for(user_agent: &str) -> Vec<(&'static str, String)> {
+    let version = |product: &str| {
+        user_agent
+            .split(' ')
+            .find_map(|token| token.strip_prefix(product)?.strip_prefix('/'))
+    };
+    // UA-CH #user-agent-significant-version: Chrome's is its major version.
+    let Some(chrome) = version("Chrome").and_then(|full| full.split('.').next()) else {
+        return Vec::new();
+    };
+    let mut brands = Vec::new();
+    if let Some(trust) = version("TRust") {
+        brands.push(("TRust", trust));
+    }
+    brands.push(("Not_A Brand", "8"));
+    brands.push(("Chromium", chrome));
+    // RFC 9651 §3.1: a List of Strings, each with a "v" parameter. None of
+    // these brands or versions contains a character that needs escaping.
+    let list = brands
+        .iter()
+        .map(|(brand, version)| format!("\"{brand}\";v=\"{version}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let platform_token = user_agent
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map_or("", |(token, _)| token);
+    // UA-CH #sec-ch-ua-platform's common values, read from the same token.
+    let platform = if platform_token.contains("Android") {
+        "Android"
+    } else if platform_token.contains("Windows") {
+        "Windows"
+    } else if platform_token.contains("iPhone") || platform_token.contains("iPad") {
+        "iOS"
+    } else if platform_token.contains("Macintosh") {
+        "macOS"
+    } else if platform_token.contains("Linux") {
+        "Linux"
+    } else {
+        "Unknown"
+    };
+    let mobile = user_agent.split(' ').any(|token| token == "Mobile");
+    vec![
+        ("Sec-CH-UA", list),
+        ("Sec-CH-UA-Mobile", if mobile { "?1" } else { "?0" }.into()),
+        ("Sec-CH-UA-Platform", format!("\"{platform}\"")),
+    ]
 }
 
 /// Global Privacy Control is enabled for this user agent. The W3C GPC
@@ -4332,6 +4522,9 @@ fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, Stri
         "accept-encoding",
         "accept-language",
         "sec-gpc",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
         "sec-fetch-dest",
         "sec-fetch-mode",
         "sec-fetch-site",
@@ -4350,7 +4543,16 @@ fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, Stri
         .find(|(k, _)| k.eq_ignore_ascii_case("accept-language"))
         .filter(|(_, v)| !v.contains(['\r', '\n']))
         .map(|(_, v)| v.as_str());
-    let mut headers = vec![
+    // Client Hints Infrastructure #fetch: appended in HTTP-network-or-cache
+    // fetch, so every hop of a redirect chain recomputes them for its URL.
+    let mut headers: Vec<(String, String)> = client_hints(
+        url,
+        request.fetch_metadata.map(|metadata| metadata.destination),
+    )
+    .iter()
+    .map(|(name, value)| ((*name).into(), value.clone()))
+    .collect();
+    headers.extend([
         ("User-Agent".into(), user_agent().into()),
         (
             "Accept".into(),
@@ -4365,7 +4567,7 @@ fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, Stri
                 .into(),
         ),
         ("Accept-Encoding".into(), "gzip, deflate, br, zstd".into()),
-    ];
+    ]);
     if GLOBAL_PRIVACY_CONTROL {
         // GPC §3.3: the field value is exactly the single character `1`.
         // It is user-agent-owned, so a page-supplied Sec-GPC is filtered by
@@ -16910,7 +17112,7 @@ customElements.define('lit-counter', LitCounter);
                 let reply: Vec<u8> = if text.starts_with("GET /old ") {
                     b"HTTP/1.1 302 Found\r\nLocation: /new\r\n\r\n".to_vec()
                 } else if text.starts_with("GET /new ") {
-                    assert!(text.contains("User-Agent: TRust/0.2"));
+                    assert!(text.contains(&format!("User-Agent: {USER_AGENT}\r\n")));
                     assert!(text.contains("Accept-Language: en-US,en;q=0.9\r\n"));
                     assert!(text.contains("Connection: keep-alive"));
                     // Chunked HTML with a link.
@@ -18282,6 +18484,133 @@ customElements.define('lit-counter', LitCounter);
         assert_eq!(reported.len(), 1, "exactly one User-Agent: {headers:?}");
         assert_eq!(reported[0], user_agent());
         assert!(!reported[0].contains("Spiteful"));
+    }
+
+    #[test]
+    fn default_user_agent_names_trust_in_a_compatible_shape() {
+        // Fetch #default-user-agent-value: implementation-defined, strongly
+        // encouraged to start with `Mozilla/5.0 (` and follow other browsers.
+        // The platform token is one of the frozen values major browsers send.
+        let platform = USER_AGENT
+            .strip_prefix("Mozilla/5.0 (")
+            .and_then(|rest| rest.split_once(')'))
+            .map(|(token, _)| token)
+            .expect("Mozilla/5.0 (platform) shape");
+        assert!(
+            [
+                "X11; Linux x86_64",
+                "Windows NT 10.0; Win64; x64",
+                "Macintosh; Intel Mac OS X 10_15_7",
+                "Linux; Android 10; K",
+            ]
+            .contains(&platform),
+            "{platform}"
+        );
+        // RFC 9110 §10.1.5: after the compatibility prefix, TRust names only
+        // itself, claiming no other engine's tokens.
+        assert!(USER_AGENT.ends_with(") TRust/0.2"), "{USER_AGENT}");
+        // HTML #concept-navigator-compatibility-mode follows the engine
+        // tokens: Gecko's values unless the User-Agent carries Chrome's.
+        assert_eq!(
+            navigator_compatibility_mode_for(USER_AGENT),
+            NavigatorCompatibilityMode::Gecko
+        );
+        assert_eq!(
+            navigator_compatibility_mode_for(FIREFOX_USER_AGENT),
+            NavigatorCompatibilityMode::Gecko
+        );
+        assert_eq!(
+            navigator_compatibility_mode_for(&format!(
+                "{USER_AGENT} Chrome/153.0.0.0 AppleWebKit/537.36 Safari/537.36"
+            )),
+            NavigatorCompatibilityMode::Chrome
+        );
+        // HTML #dom-navigator-platform names the actual platform.
+        let platform = navigator_platform();
+        assert!(
+            ["Win32", "MacIntel"].contains(&platform) || platform.starts_with("Linux"),
+            "{platform}"
+        );
+    }
+
+    #[test]
+    fn low_entropy_client_hints_describe_the_user_agent() {
+        // UA-CH #sec-ch-ua: a Structured Field List of brand strings with "v"
+        // parameters, here TRust, a GREASE brand and the Chromium equivalence
+        // class at the User-Agent's Chrome major version. #sec-ch-ua-mobile is
+        // an sf-boolean; #sec-ch-ua-platform a quoted common platform value.
+        let linux = "Mozilla/5.0 (X11; Linux x86_64) TRust/0.2 Chrome/153.0.0.0 AppleWebKit/537.36 Safari/537.36";
+        assert_eq!(
+            client_hints_for(linux),
+            [
+                (
+                    "Sec-CH-UA",
+                    String::from(r#""TRust";v="0.2", "Not_A Brand";v="8", "Chromium";v="153""#)
+                ),
+                ("Sec-CH-UA-Mobile", String::from("?0")),
+                ("Sec-CH-UA-Platform", String::from(r#""Linux""#)),
+            ]
+        );
+        for (platform_token, platform) in [
+            ("Windows NT 10.0; Win64; x64", "Windows"),
+            ("Macintosh; Intel Mac OS X 10_15_7", "macOS"),
+            ("Linux; Android 10; K", "Android"),
+        ] {
+            let ua = linux.replace("X11; Linux x86_64", platform_token);
+            assert_eq!(
+                client_hints_for(&ua)[2].1,
+                format!("\"{platform}\""),
+                "{ua}"
+            );
+        }
+        let android = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36";
+        assert_eq!(
+            client_hints_for(android),
+            [
+                (
+                    "Sec-CH-UA",
+                    String::from(r#""Not_A Brand";v="8", "Chromium";v="153""#)
+                ),
+                ("Sec-CH-UA-Mobile", String::from("?1")),
+                ("Sec-CH-UA-Platform", String::from(r#""Android""#)),
+            ]
+        );
+        // Gecko implements no client hints, so neither TRust's own
+        // User-Agent, which carries no Chrome token, nor Firefox's sends any.
+        assert!(client_hints_for(USER_AGENT).is_empty());
+        assert!(client_hints_for(FIREFOX_USER_AGENT).is_empty());
+
+        // Client Hints Infrastructure #request-processing: low-entropy hints
+        // need no opt-in, go only to potentially trustworthy URLs, and skip
+        // a worker's own script request.
+        let allowed =
+            |url: &str, destination| client_hints_allowed(&Url::parse(url).unwrap(), destination);
+        assert!(allowed("https://example.com/", None));
+        assert!(allowed("wss://example.com/socket", None));
+        assert!(allowed("http://localhost:8080/", None));
+        assert!(allowed("https://example.com/app.js", Some("script")));
+        assert!(!allowed("http://example.com/", None));
+        assert!(!allowed("https://example.com/worker.js", Some("worker")));
+        assert!(!allowed(
+            "https://example.com/shared.js",
+            Some("sharedworker")
+        ));
+
+        // They are user-agent-owned: the request carries exactly the hints
+        // the selected User-Agent implies, never a page-supplied copy.
+        let mut request = Request::get(parse_url("https://example.com/").unwrap());
+        request
+            .headers
+            .push(("Sec-CH-UA".into(), "\"Spiteful\";v=\"1\"".into()));
+        let sent: Vec<(String, String)> = request_headers(&request, None)
+            .into_iter()
+            .filter(|(name, _)| name.to_ascii_lowercase().starts_with("sec-ch-ua"))
+            .collect();
+        let expected: Vec<(String, String)> = client_hints_for(user_agent())
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect();
+        assert_eq!(sent, expected);
     }
 
     #[tokio::test]

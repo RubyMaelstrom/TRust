@@ -814,6 +814,10 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
             "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
             http::user_agent()
         );
+        // Each hop is a fetch, with the low-entropy client hints for its URL.
+        for (name, value) in http::client_hints(&current, None) {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
         cookie_request.url = current.clone();
         cookie_request.headers.clear();
         let cookies = http::request_cookies(&cookie_request);

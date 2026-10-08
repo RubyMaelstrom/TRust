@@ -11878,9 +11878,11 @@ fn main_window_config(
     traces: MainWindowTraces,
 ) -> String {
     format!(
-        "globalThis.__trust_cfg = {{ url: {}, ua: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {} }};",
+        "globalThis.__trust_cfg = {{ url: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {} }};",
         json_string(response_url.as_str()),
         json_string(crate::http::user_agent()),
+        json_string(crate::http::navigator_compatibility_mode().as_str()),
+        json_string(crate::http::navigator_platform()),
         json_string(crate::locale::LANGUAGE),
         json_string(crate::locale::LANGUAGES[0]),
         json_string(crate::locale::LANGUAGES[1]),
@@ -12207,6 +12209,8 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         let config = realm_ctx.new_object_with_proto(&Value::Null);
         for name in [
             "ua",
+            "navigatorMode",
+            "platform",
             "language",
             "languages",
             "width",
@@ -14009,12 +14013,16 @@ fn run_lumen_worker(
         "classic"
     };
     let config = format!(
-        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, ua: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {}, shared: {} }};",
+        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {}, timeOrigin: {}, shared: {} }};",
         launch.id,
         serde_json::to_string(&launch.name).unwrap_or_else(|_| String::from("\"\"")),
         serde_json::to_string(worker_type).expect("static worker type serializes"),
         serde_json::to_string(launch.script_url.as_str()).expect("URL serializes"),
         serde_json::to_string(crate::http::user_agent()).expect("static User-Agent serializes"),
+        serde_json::to_string(crate::http::navigator_compatibility_mode().as_str())
+            .expect("static compatibility mode serializes"),
+        serde_json::to_string(crate::http::navigator_platform())
+            .expect("static platform serializes"),
         serde_json::to_string(crate::locale::LANGUAGE).expect("locale serializes"),
         serde_json::to_string(crate::locale::LANGUAGES[0]).expect("locale serializes"),
         serde_json::to_string(crate::locale::LANGUAGES[1]).expect("locale serializes"),
@@ -33875,15 +33883,46 @@ mod tests {
     #[test]
     fn navigator_user_agent_and_appversion_follow_the_environment_value() {
         // WHATWG HTML §"navigator.userAgent" returns the environment settings
-        // object's default `<code>User-Agent</code>` value verbatim, and §
-        // "navigator.appVersion" derives its Gecko-mode result from that same
-        // value; the spec's own example for a Linux UA is "5.0 (X11)". The
-        // TRUST_UA_FIREFOX diagnostic supplies such a value to the HTTP client
-        // and to every realm, worker included, so the two views cannot drift.
+        // object's default `<code>User-Agent</code>` value verbatim, and the
+        // navigator compatibility mode decides what derives from it:
+        // appVersion is its platform family in Gecko mode (the spec's own
+        // Linux example is "5.0 (X11)") and the whole trail after "Mozilla/"
+        // in Chrome mode; productSub, vendor, oscpu and taintEnabled() differ
+        // too. TRust's own User-Agent and the TRUST_UA_FIREFOX diagnostic's
+        // are in Gecko mode; one carrying Chrome's tokens selects Chrome mode.
+        // Each reaches every realm, worker included, with its mode and the
+        // real platform, so the HTTP and script views cannot drift.
+        let chrome_ua = format!(
+            "{} Chrome/153.0.0.0 AppleWebKit/537.36 Safari/537.36",
+            crate::http::USER_AGENT
+        );
+        let chrome_trail = chrome_ua["Mozilla/".len()..].to_string();
         for worker in [false, true] {
-            for (ua, app_version) in [
-                (crate::http::USER_AGENT, ""),
-                (crate::http::FIREFOX_USER_AGENT, "5.0 (X11)"),
+            for (ua, mode, app_version, product_sub, vendor, gecko_members) in [
+                (
+                    crate::http::USER_AGENT,
+                    "gecko",
+                    "5.0 (X11)",
+                    "20100101",
+                    "",
+                    true,
+                ),
+                (
+                    crate::http::FIREFOX_USER_AGENT,
+                    "gecko",
+                    "5.0 (X11)",
+                    "20100101",
+                    "",
+                    true,
+                ),
+                (
+                    chrome_ua.as_str(),
+                    "chrome",
+                    chrome_trail.as_str(),
+                    "20030107",
+                    "Google Inc.",
+                    false,
+                ),
             ] {
                 let mut engine = configured_engine_before_prelude(
                     HostState::new(
@@ -33898,7 +33937,7 @@ mod tests {
                     eval(
                         &mut engine,
                         &format!(
-                            "globalThis.__worker_cfg = {{ id: 1, name: '', type: 'classic', url: {DEFAULT_URL:?}, ua: {ua_literal}, hwc: 4, globalPrivacyControl: true, secureContext: true }};"
+                            "globalThis.__worker_cfg = {{ id: 1, name: '', type: 'classic', url: {DEFAULT_URL:?}, ua: {ua_literal}, navigatorMode: '{mode}', platform: 'Linux aarch64', hwc: 4, globalPrivacyControl: true, secureContext: true }};"
                         ),
                         "worker User-Agent",
                     )
@@ -33913,7 +33952,11 @@ mod tests {
                 } else {
                     eval(
                         &mut engine,
-                        &format!("globalThis.__trust_cfg.ua = {ua_literal};"),
+                        &format!(
+                            "globalThis.__trust_cfg.ua = {ua_literal}; \
+                             globalThis.__trust_cfg.navigatorMode = '{mode}'; \
+                             globalThis.__trust_cfg.platform = 'Linux aarch64';"
+                        ),
                         "page User-Agent",
                     )
                     .unwrap();
@@ -33927,8 +33970,25 @@ mod tests {
                 assert_eq!(
                     string_value(&mut engine, "navigator.appVersion"),
                     app_version,
-                    "worker={worker}: HTML #dom-navigator-appVersion"
+                    "worker={worker} {mode}: HTML #dom-navigator-appVersion"
                 );
+                assert_eq!(
+                    string_value(&mut engine, "navigator.platform"),
+                    "Linux aarch64",
+                    "worker={worker}: HTML #dom-navigator-platform"
+                );
+                if !worker {
+                    assert_eq!(
+                        string_value(
+                            &mut engine,
+                            "[navigator.productSub, navigator.vendor, navigator.vendorSub, \
+                              'oscpu' in navigator, 'taintEnabled' in navigator].join('|')"
+                        ),
+                        format!("{product_sub}|{vendor}||{gecko_members}|{gecko_members}"),
+                        "{mode}: HTML #dom-navigator-productsub, #dom-navigator-vendor, \
+                         #NavigatorID-partial"
+                    );
+                }
             }
         }
     }

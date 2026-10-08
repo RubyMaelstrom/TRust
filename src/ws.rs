@@ -389,6 +389,11 @@ async fn handshake(
     if crate::http::GLOBAL_PRIVACY_CONTROL {
         req.push_str("Sec-GPC: 1\r\n");
     }
+    // The opening handshake is a fetch (WebSockets #concept-websocket-
+    // establish), so it carries the same low-entropy client hints.
+    for (name, value) in crate::http::client_hints(url, None) {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
     if let Some(request) = cookie {
         let cookies = crate::http::request_cookies(request);
         if !cookies.is_empty() {
