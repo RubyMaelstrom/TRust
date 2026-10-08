@@ -155,7 +155,124 @@ enum DesktopEvent {
         result: Result<u64, String>,
         open: bool,
     },
+    /// The native file dialog for a page's file prompt closed (`None`: dismissed).
+    FilesPicked {
+        request: u64,
+        files: Option<Vec<std::path::PathBuf>>,
+    },
+    /// The next iteration of a native file drag's processing model (HTML DnD: every 350ms).
+    FileDragTick {
+        session: u64,
+    },
 }
+
+/// A drag of native files from another application over the window. winit reports the files
+/// (`HoveredFile`, then `DroppedFile` or `HoveredFileCancelled`) one event per file and without
+/// a pointer position; the burst is collected until the event loop is about to wait, and the
+/// position comes from `native_pointer`.
+struct NativeFileDrag {
+    session: u64,
+    hovered: Vec<std::path::PathBuf>,
+    entered: bool,
+    dropped: Option<Vec<std::path::PathBuf>>,
+}
+
+impl NativeFileDrag {
+    /// `HoveredFile`: start a drag, or add to the burst that starts it.
+    fn hover(slot: &mut Option<Self>, next_session: &mut u64, path: std::path::PathBuf) {
+        match slot {
+            Some(drag) if !drag.entered => drag.hovered.push(path),
+            Some(_) => {}
+            None => {
+                *slot = Some(Self {
+                    session: *next_session,
+                    hovered: vec![path],
+                    entered: false,
+                    dropped: None,
+                });
+                *next_session += 1;
+            }
+        }
+    }
+
+    /// `DroppedFile`: one of the dropped files (a drop may arrive without a hover).
+    fn drop_file(slot: &mut Option<Self>, path: std::path::PathBuf) {
+        let drag = slot.get_or_insert_with(|| Self {
+            session: 0,
+            hovered: Vec::new(),
+            entered: false,
+            dropped: None,
+        });
+        drag.dropped.get_or_insert_with(Vec::new).push(path);
+    }
+}
+
+/// The pointer's position in the window while another application's drag holds the pointer
+/// grab (winit 0.30 delivers no motion then), in physical pixels.
+mod native_pointer {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    thread_local! {
+        static X11: std::cell::RefCell<Option<x11rb::rust_connection::RustConnection>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn query(window: &winit::window::Window) -> Option<(f64, f64)> {
+        use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let id = match window.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Xlib(handle) => u32::try_from(handle.window).ok()?,
+            RawWindowHandle::Xcb(handle) => handle.window.get(),
+            _ => return None,
+        };
+        X11.with(|cell| {
+            let mut connection = cell.borrow_mut();
+            if connection.is_none() {
+                *connection = x11rb::connect(None).ok().map(|(connection, _)| connection);
+            }
+            let reply = connection.as_ref()?.query_pointer(id).ok()?.reply().ok()?;
+            Some((f64::from(reply.win_x), f64::from(reply.win_y)))
+        })
+    }
+
+    /// Close the query connection when a drag ends.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn release() {
+        X11.with(|cell| cell.borrow_mut().take());
+    }
+
+    #[cfg(windows)]
+    pub fn query(window: &winit::window::Window) -> Option<(f64, f64)> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+        let RawWindowHandle::Win32(handle) = window.window_handle().ok()?.as_raw() else {
+            return None;
+        };
+        let mut point = POINT { x: 0, y: 0 };
+        // SAFETY: `point` is a valid, writable POINT and `hwnd` is the live
+        // window winit created; both calls only read or write that POINT.
+        let ok = unsafe {
+            GetCursorPos(&mut point) != 0 && ScreenToClient(handle.hwnd.get() as _, &mut point) != 0
+        };
+        ok.then(|| (f64::from(point.x), f64::from(point.y)))
+    }
+
+    #[cfg(windows)]
+    pub fn release() {}
+
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
+    pub fn query(_window: &winit::window::Window) -> Option<(f64, f64)> {
+        None
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
+    pub fn release() {}
+}
+
+/// HTML DnD: the processing model's iterations run every 350ms (±200ms) while a drag lasts.
+const FILE_DRAG_ITERATION: Duration = Duration::from_millis(350);
 
 #[derive(Default)]
 struct AnimationSourceStore {
@@ -1495,6 +1612,12 @@ struct NativePointerLock {
 
 struct DesktopApp {
     browser: BrowserController,
+    /// A page's file prompt is showing in the native dialog (one at a time),
+    /// for the document of this generation.
+    file_dialog_open: bool,
+    file_dialog_generation: u64,
+    file_drag: Option<NativeFileDrag>,
+    next_file_drag: u64,
     renderer: Option<DesktopRenderer>,
     renderer_preference: RendererPreference,
     surface: Option<Surface<OwnedDisplayHandle, Arc<Window>>>,
@@ -1856,6 +1979,7 @@ impl DesktopApp {
         let clipboard = arboard::Clipboard::new().ok();
         browser.set_clipboard_available(clipboard.is_some());
         browser.set_fullscreen_available(true);
+        browser.set_file_picker_available(true);
         let style = chrome_text_style();
         let image_store = ImageStore::default();
         if let Err(error) = ensure_embedded_heart_assets(&image_store) {
@@ -1864,6 +1988,10 @@ impl DesktopApp {
         let animations = AnimationPlayer::new(event_proxy.clone());
         Self {
             browser,
+            file_dialog_open: false,
+            file_dialog_generation: 0,
+            file_drag: None,
+            next_file_drag: 1,
             renderer: None,
             renderer_preference,
             surface: None,
@@ -2381,6 +2509,7 @@ impl DesktopApp {
         self.sync_page_fullscreen();
         self.sync_close_requests();
         self.sync_clipboard_writes();
+        self.sync_file_pickers();
         self.launch_external_media_requests();
         if outcome.loading_retired {
             self.retire_page_loading();
@@ -2676,6 +2805,7 @@ impl DesktopApp {
         self.sync_page_fullscreen();
         self.sync_close_requests();
         self.sync_clipboard_writes();
+        self.sync_file_pickers();
         self.launch_external_media_requests();
         if self.browser.download_offer().is_some()
             && !matches!(self.focus, FocusTarget::Command | FocusTarget::Download)
@@ -6091,6 +6221,19 @@ impl DesktopApp {
                 }
             }
             FieldKind::Reset => self.reset_form(form),
+            // HTML #file-upload-state-(type=file): the page's activation
+            // behavior shows the picker, which needs this click's transient
+            // activation.
+            FieldKind::File(_) => {
+                if let Some(actor) = control.live_node
+                    && self.browser.page_is_live()
+                {
+                    self.dispatch(UserAction::Activate(Link::JsClick {
+                        node: actor,
+                        href: String::new(),
+                    }));
+                }
+            }
             FieldKind::Hidden => {}
         }
     }
@@ -6480,6 +6623,161 @@ impl DesktopApp {
             self.browser
                 .handle_action(UserAction::ClipboardResult { request, ok });
         }
+    }
+
+    /// HTML #show-the-picker,-if-applicable: show a page's file prompt in the native dialog
+    /// (the XDG Desktop Portal's FileChooser on Linux, IFileOpenDialog on Windows). The dialog
+    /// runs on the tokio runtime, so the event loop keeps rendering; its answer returns as
+    /// `DesktopEvent::FilesPicked`. Prompts are shown one at a time.
+    fn sync_file_pickers(&mut self) {
+        if self.file_dialog_open {
+            return;
+        }
+        let Some(request) = self.browser.take_file_picker() else {
+            return;
+        };
+        self.file_dialog_open = true;
+        self.file_dialog_generation = self.browser.document_generation();
+        let mut dialog = rfd::AsyncFileDialog::new().set_title(if request.directory {
+            "Choose a folder"
+        } else if request.multiple {
+            "Choose files"
+        } else {
+            "Choose a file"
+        });
+        // HTML #attr-input-accept: the accepted types are the dialog's
+        // default filter; "All files" stays available, as for any picker.
+        let accept = trust::file_select::AcceptFilter::parse(&request.accept);
+        if !request.directory
+            && let Some(extensions) = accept.extensions()
+        {
+            dialog = dialog
+                .add_filter(accept.source().trim(), extensions.as_slice())
+                .add_filter("All files", &["*"]);
+        }
+        if let Some(window) = &self.window {
+            dialog = dialog.set_parent(window.as_ref());
+        }
+        let proxy = self.event_proxy.clone();
+        let id = request.request;
+        self.runtime.spawn(async move {
+            let files = if request.directory {
+                dialog
+                    .pick_folder()
+                    .await
+                    .map(|folder| vec![folder.path().to_path_buf()])
+            } else if request.multiple {
+                dialog.pick_files().await.map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| file.path().to_path_buf())
+                        .collect()
+                })
+            } else {
+                dialog
+                    .pick_file()
+                    .await
+                    .map(|file| vec![file.path().to_path_buf()])
+            };
+            let _ = proxy.send_event(DesktopEvent::FilesPicked { request: id, files });
+        });
+    }
+
+    /// The window's point under the pointer during a native drag, in CSS pixels.
+    fn native_drag_point(&mut self) -> CssPoint {
+        if let Some(window) = &self.window
+            && let Some((x, y)) = native_pointer::query(window)
+        {
+            self.pointer = self.metrics.physical_to_css(x, y);
+        }
+        self.pointer
+    }
+
+    /// The page node a native drag points at, and the point in viewport coordinates.
+    fn native_drag_target(&mut self) -> (Option<usize>, CssPoint, trust::js::PointerMetadata) {
+        let point = self.native_drag_point();
+        let hit = self
+            .scene
+            .as_ref()
+            .filter(|scene| scene.control_at(point).is_none())
+            .and_then(|scene| scene.page_hit_at(point));
+        let node = hit.as_ref().and_then(|hit| {
+            hit.actor.or(match &hit.link {
+                Some(Link::JsClick { node, .. }) => Some(*node),
+                Some(Link::Form { form, field }) => self
+                    .page_layout
+                    .as_ref()
+                    .and_then(|page| page.document.forms.get(*form))
+                    .and_then(|form| form.fields.get(*field))
+                    .and_then(|field| field.live_node),
+                _ => None,
+            })
+        });
+        let viewport = self.scene.as_ref().map_or(point, |scene| {
+            CssPoint::new(
+                point.x - scene.content_viewport.x,
+                point.y - scene.content_viewport.y,
+            )
+        });
+        (node, viewport, self.pointer_metadata())
+    }
+
+    /// Run the pending steps of a native file drag: its start (the drag data store's item
+    /// types), an iteration at the pointer, or the drop with its files.
+    fn service_file_drag(&mut self) {
+        let Some(drag) = &mut self.file_drag else {
+            return;
+        };
+        let session = drag.session;
+        if let Some(files) = drag.dropped.take() {
+            let entered = drag.entered;
+            let types = trust::js::FileDrag::item_types(&files);
+            self.file_drag = None;
+            if !entered {
+                self.dispatch(UserAction::FileDrag(trust::js::FileDrag::Enter { types }));
+            }
+            let (node, position, metadata) = self.native_drag_target();
+            self.dispatch(UserAction::FileDrag(trust::js::FileDrag::Drop {
+                node,
+                x: f64::from(position.x),
+                y: f64::from(position.y),
+                metadata,
+                files,
+            }));
+            native_pointer::release();
+            self.request_redraw();
+            return;
+        }
+        if drag.entered {
+            return;
+        }
+        drag.entered = true;
+        let types = trust::js::FileDrag::item_types(&drag.hovered);
+        self.dispatch(UserAction::FileDrag(trust::js::FileDrag::Enter { types }));
+        self.file_drag_iteration(session);
+    }
+
+    fn file_drag_iteration(&mut self, session: u64) {
+        if self
+            .file_drag
+            .as_ref()
+            .is_none_or(|drag| drag.session != session || !drag.entered)
+        {
+            return;
+        }
+        let (node, position, metadata) = self.native_drag_target();
+        self.dispatch(UserAction::FileDrag(trust::js::FileDrag::Over {
+            node,
+            x: f64::from(position.x),
+            y: f64::from(position.y),
+            metadata,
+        }));
+        let proxy = self.event_proxy.clone();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(FILE_DRAG_ITERATION).await;
+            let _ = proxy.send_event(DesktopEvent::FileDragTick { session });
+        });
+        self.request_redraw();
     }
 
     /// Pointer Lock 2.0: capture must succeed before acknowledging the page.
@@ -7526,6 +7824,7 @@ impl DesktopApp {
 
 impl ApplicationHandler<DesktopEvent> for DesktopApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.service_file_drag();
         if std::mem::take(&mut self.browser_events_pending) {
             let outcome = self.process_browser_events();
             if outcome.invalidated {
@@ -7691,6 +7990,17 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             DesktopEvent::DownloadFinished { path, result, open } => {
                 self.finish_download(path, result, open);
             }
+            DesktopEvent::FilesPicked { request, files } => {
+                self.file_dialog_open = false;
+                // A prompt belongs to its page: files chosen after the user
+                // left it must never reach the next document's actor.
+                if self.file_dialog_generation == self.browser.document_generation() {
+                    self.dispatch(UserAction::FilePickerResult { request, files });
+                }
+                self.sync_file_pickers();
+                self.request_redraw();
+            }
+            DesktopEvent::FileDragTick { session } => self.file_drag_iteration(session),
             DesktopEvent::ImageLoaded {
                 generation,
                 image_epoch,
@@ -8039,6 +8349,21 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 self.handle_pointer_button(state, button)
             }
+            // HTML #drag-and-drop-processing-model for files dragged in from
+            // another application; see `NativeFileDrag`.
+            WindowEvent::HoveredFile(path) => {
+                NativeFileDrag::hover(&mut self.file_drag, &mut self.next_file_drag, path);
+            }
+            WindowEvent::DroppedFile(path) => NativeFileDrag::drop_file(&mut self.file_drag, path),
+            WindowEvent::HoveredFileCancelled => {
+                if let Some(drag) = self.file_drag.take()
+                    && drag.entered
+                {
+                    self.dispatch(UserAction::FileDrag(trust::js::FileDrag::Leave));
+                    self.request_redraw();
+                }
+                native_pointer::release();
+            }
             WindowEvent::MouseWheel { delta, .. } => self.handle_scroll(delta),
             WindowEvent::Touch(touch) => {
                 let point = self
@@ -8156,6 +8481,7 @@ fn build_accessibility_update(frame: AccessibilityFrame<'_>, initial: bool) -> T
                 FieldKind::Password => Some(String::new()),
                 FieldKind::Hidden => None,
                 FieldKind::Number => Some(field.editing_value().to_string()),
+                FieldKind::File(_) => Some(field.label.clone()),
                 _ => Some(field.value.clone()),
             };
             if field.kind == FieldKind::Number {
@@ -8817,6 +9143,37 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use trust::render::scene_damage;
+
+    #[test]
+    fn native_file_drag_events_collect_one_burst_per_drag() {
+        // winit reports one HoveredFile/DroppedFile per file; the processing
+        // model starts once with every hovered file and drops them together.
+        let (mut slot, mut next) = (None, 1);
+        NativeFileDrag::hover(&mut slot, &mut next, "/a".into());
+        NativeFileDrag::hover(&mut slot, &mut next, "/b".into());
+        let drag = slot.as_mut().unwrap();
+        assert_eq!((drag.session, drag.hovered.len(), next), (1, 2, 2));
+        drag.entered = true;
+        NativeFileDrag::hover(&mut slot, &mut next, "/c".into());
+        assert_eq!(
+            slot.as_ref().unwrap().hovered.len(),
+            2,
+            "a started drag keeps its items"
+        );
+        NativeFileDrag::drop_file(&mut slot, "/a".into());
+        NativeFileDrag::drop_file(&mut slot, "/b".into());
+        assert_eq!(slot.as_ref().unwrap().dropped.as_ref().unwrap().len(), 2);
+        let mut fresh = None;
+        NativeFileDrag::drop_file(&mut fresh, "/d".into());
+        assert!(!fresh.as_ref().unwrap().entered);
+        assert_eq!(
+            trust::js::FileDrag::item_types(&[
+                std::path::PathBuf::from("/x/photo.JPG"),
+                "/x/data.unknownext".into()
+            ]),
+            ["image/jpeg", "application/octet-stream"]
+        );
+    }
 
     #[test]
     fn tab_opens_command_except_from_an_active_text_editor() {

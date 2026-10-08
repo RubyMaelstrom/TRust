@@ -626,6 +626,13 @@ struct HostState {
     /// enters fullscreen and is answered with `PageCmd::FullscreenResult`;
     /// `(_, false)` restores the normal viewport.
     fullscreen_requests: Vec<(u64, bool)>,
+    /// HTML #show-the-picker,-if-applicable prompts awaiting delivery to the frontend, and the
+    /// platform callbacks that update each control's selection (or fire `cancel`).
+    file_picker_requests: Vec<crate::js::FilePickerRequest>,
+    file_picker_settlers: HashMap<u64, FilePickerSettler>,
+    next_file_picker_request: u64,
+    /// The files this page's user selected or dropped: the only files the page can read.
+    user_files: crate::file_select::UserFiles,
     audio_context_slots: Option<Value>,
     history_slots: Option<Value>,
     history_traversals: Vec<(u64, i32)>,
@@ -736,6 +743,10 @@ impl HostState {
             clipboard_settlers: HashMap::new(),
             next_clipboard_request: 1,
             fullscreen_requests: Vec::new(),
+            file_picker_requests: Vec::new(),
+            file_picker_settlers: HashMap::new(),
+            next_file_picker_request: 1,
+            user_files: Default::default(),
             audio_context_slots: None,
             history_slots: None,
             history_traversals: Vec::new(),
@@ -954,6 +965,10 @@ impl RetainedMemory for HostState {
             clipboard_settlers,
             next_clipboard_request: _,
             fullscreen_requests: _,
+            file_picker_requests,
+            file_picker_settlers,
+            next_file_picker_request: _,
+            user_files,
             audio_context_slots,
             history_slots,
             history_traversals,
@@ -1347,6 +1362,27 @@ impl RetainedMemory for HostState {
         }
         for value in clipboard_settlers.values() {
             visitor.value(value);
+        }
+        for settler in file_picker_settlers.values() {
+            visitor.value(&settler.settle);
+        }
+        let picker_bytes: usize = file_picker_requests
+            .iter()
+            .map(|request| request.accept.capacity())
+            .sum();
+        if picker_bytes != 0 {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.file-picker-requests",
+                file_picker_requests.as_ptr() as usize,
+                picker_bytes,
+            ));
+        }
+        if !user_files.is_empty() {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.user-files",
+                user_files as *const _ as usize,
+                user_files.retained_bytes(),
+            ));
         }
         let clipboard_bytes: usize = clipboard_requests
             .iter()
@@ -4912,6 +4948,28 @@ mod desktop {
                 checkpoint(page, "exit fullscreen");
                 finish_task_with_ack(page, events, false)
             }
+            PageCmd::FilePickerResult { request, files } => {
+                prepare_interaction(page, interrupt);
+                match settle_file_picker_request(page.engine.ctx(), request, files) {
+                    Ok(Some(trouble)) => page.outcome.errors.push(trouble),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let message = describe_throw(&mut page.engine, error, "file picker result");
+                        page.outcome.errors.push(message);
+                    }
+                }
+                checkpoint(page, "file picker result");
+                finish_task_with_ack(page, events, false)
+            }
+            PageCmd::FileDrag(drag) => {
+                prepare_interaction(page, interrupt);
+                file_drag(page, drag);
+                checkpoint(page, "file drag");
+                if let Some((url, replace)) = take_navigation(page) {
+                    return send_navigation(events, url, replace);
+                }
+                finish_task_with_ack(page, events, false)
+            }
             PageCmd::ReleasePointerLock => {
                 prepare_interaction(page, interrupt);
                 let _ = call_trust(
@@ -5686,6 +5744,17 @@ mod desktop {
                 return false;
             }
         }
+        let file_pickers = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| std::mem::take(&mut state.file_picker_requests))
+            .unwrap_or_default();
+        for request in file_pickers {
+            if events.blocking_send(PageEvt::FilePicker(request)).is_err() {
+                return false;
+            }
+        }
         let submission = take_form_submit(page);
         let scrolls = page.dom.borrow_mut().take_scroll_changes();
         let mut sent_primary = false;
@@ -5962,7 +6031,13 @@ mod desktop {
         if form_method_is_dialog(page, form, submitter) {
             return None;
         }
-        let submission = form_submission(page, form, Some(submitter));
+        let submission = match form_submission(page, form, Some(submitter)) {
+            Ok(submission) => submission,
+            Err(error) => {
+                page.outcome.errors.push(error);
+                return None;
+            }
+        };
         Some((form, submitter, submission))
     }
 
@@ -5976,16 +6051,24 @@ mod desktop {
         let submitter = (!submitter.trim().is_empty())
             .then(|| submitter.trim().parse().ok())
             .flatten();
-        let submission = form_submission(page, form, submitter);
+        let submission = match form_submission(page, form, submitter) {
+            Ok(submission) => submission,
+            Err(error) => {
+                page.outcome.errors.push(error);
+                return None;
+            }
+        };
         Some((form, submitter, submission))
     }
 
+    /// The planned submission's record, `Ok(None)` when there is none, and `Err` when its entity
+    /// body cannot be read (the navigation's fetch would fail; HTML #submit-body).
     fn form_submission(
         page: &mut LumenPage,
         form: usize,
         submitter: Option<usize>,
-    ) -> Option<FormSubmission> {
-        let value = call_trust(
+    ) -> Result<Option<FormSubmission>, String> {
+        let Some(value) = call_trust(
             page,
             "formSubmission",
             &[
@@ -5993,22 +6076,72 @@ mod desktop {
                 submitter.map_or(Value::Null, |node| Value::Num(node as f64)),
             ],
             "form entry list",
-        )?;
-        let json = value_to_string(page, &value)?;
-        let value: serde_json::Value = serde_json::from_str(&json).ok()?;
-        let method = value.get("method")?.as_str()?.to_string();
-        let body = value.get("body")?.as_str()?;
-        // A POST body arrives as a byte string (one code unit per byte); a
-        // GET query is ASCII text.
-        let body = if method == "post" {
-            body.chars()
+        ) else {
+            return Ok(None);
+        };
+        let Some(json) = value_to_string(page, &value) else {
+            return Ok(None);
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+            return Ok(None);
+        };
+        let latin1 = |text: &str| -> Vec<u8> {
+            text.chars()
                 .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
                 .collect()
-        } else {
-            body.as_bytes().to_vec()
         };
-        Some(FormSubmission {
-            action: value.get("action")?.as_str()?.to_string(),
+        let Some(method) = value.get("method").and_then(|v| v.as_str()) else {
+            return Ok(None);
+        };
+        let method = method.to_string();
+        // A POST body arrives as a byte string (one code unit per byte), or for
+        // multipart/form-data with selected files as segments in which each
+        // `[id, start, end]` names a byte range of a user-selected file, read
+        // now against its snapshot (File API #snapshot-state). A GET query is
+        // ASCII text.
+        let body = match value.get("body") {
+            Some(serde_json::Value::String(body)) if method == "post" => latin1(body),
+            Some(serde_json::Value::String(body)) => body.as_bytes().to_vec(),
+            Some(serde_json::Value::Array(parts)) if method == "post" => {
+                let mut segments = Vec::with_capacity(parts.len());
+                for part in parts {
+                    segments.push(match part {
+                        serde_json::Value::String(text) => {
+                            crate::file_select::BodySegment::Bytes(latin1(text))
+                        }
+                        serde_json::Value::Array(range) => {
+                            let number = |index: usize| {
+                                range.get(index).and_then(|n| n.as_f64()).unwrap_or(0.0)
+                            };
+                            crate::file_select::BodySegment::File {
+                                id: number(0).max(0.0) as u64,
+                                start: number(1).max(0.0) as u64,
+                                end: number(2).max(0.0) as u64,
+                            }
+                        }
+                        _ => return Ok(None),
+                    });
+                }
+                let assembled = page.engine.ctx().host_mut::<HostState>().map(|state| {
+                    state
+                        .user_files
+                        .assemble(&segments, crate::file_select::MAX_READ_BYTES)
+                });
+                match assembled {
+                    Some(Ok(body)) => body,
+                    Some(Err(error)) => {
+                        return Err(format!("form submission failed: {}", error.message()));
+                    }
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
+            return Ok(None);
+        };
+        Ok(Some(FormSubmission {
+            action: action.to_string(),
             content_type: value
                 .get("enctype")
                 .and_then(|v| v.as_str())
@@ -6017,7 +6150,70 @@ mod desktop {
                 .to_string(),
             method,
             body,
-        })
+        }))
+    }
+
+    /// HTML #drag-and-drop-processing-model for native files dragged in from another
+    /// application. The prelude runs the model; dropped files become readable here, at the drop
+    /// (the drag data store is in protected mode until then).
+    fn file_drag(page: &mut LumenPage, drag: crate::js::FileDrag) {
+        use crate::js::FileDrag;
+        let position =
+            |node: Option<usize>, x: f64, y: f64, metadata: crate::js::PointerMetadata| {
+                vec![
+                    node.map_or(Value::Null, |node| Value::Num(node as f64)),
+                    Value::Num(finite_or_zero(x)),
+                    Value::Num(finite_or_zero(y)),
+                    Value::Num(finite_or_zero(metadata.screen.map_or(x, |p| p.0))),
+                    Value::Num(finite_or_zero(metadata.screen.map_or(y, |p| p.1))),
+                    Value::Num(f64::from(metadata.modifier_bits())),
+                ]
+            };
+        let args = match drag {
+            FileDrag::Enter { types } => {
+                let ctx = page.engine.ctx();
+                let types = types.into_iter().map(Value::from_string).collect();
+                vec![
+                    Value::from_string(String::from("enter")),
+                    ctx.make_array(types),
+                ]
+            }
+            FileDrag::Over {
+                node,
+                x,
+                y,
+                metadata,
+            } => {
+                let mut args = vec![Value::from_string(String::from("over"))];
+                args.extend(position(node, x, y, metadata));
+                args
+            }
+            FileDrag::Drop {
+                node,
+                x,
+                y,
+                metadata,
+                files,
+            } => {
+                let records = match crate::file_select::selection_from_paths(&files, false, true)
+                    .and_then(|files| user_file_records(page.engine.ctx(), &files))
+                {
+                    Ok(records) => records,
+                    Err(error) => {
+                        page.outcome
+                            .errors
+                            .push(format!("file drop failed: {error}"));
+                        Value::Null
+                    }
+                };
+                let mut args = vec![Value::from_string(String::from("drop"))];
+                args.extend(position(node, x, y, metadata));
+                args.push(records);
+                args
+            }
+            FileDrag::Leave => vec![Value::from_string(String::from("leave"))],
+        };
+        let _ = call_trust(page, "fileDrag", &args, "file drag");
     }
 
     fn form_method_is_dialog(page: &LumenPage, form: usize, submitter: usize) -> bool {
@@ -6032,6 +6228,192 @@ mod desktop {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn actor_file_prompts_select_files_and_submit_their_bytes() {
+            // HTML #show-the-picker,-if-applicable: a click's activation
+            // opens the frontend's prompt; its answer updates the selection
+            // (#update-the-file-selection) or fires cancel. The selected
+            // file's bytes travel in the multipart/form-data entity body
+            // (#multipart/form-data-encoding-algorithm), read when the
+            // submission is planned (File API #snapshot-state).
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("report \"1\".txt");
+            std::fs::write(&path, b"hello\x00world\xff").unwrap();
+            let html = r#"<form id="f" method="post" enctype="multipart/form-data" action="http://127.0.0.1:9/upload">
+                <input name="title" value="T"><input type="file" id="up" name="up" accept=".txt" multiple>
+                </form><output id="log"></output><script>
+                const up = document.getElementById('up'), log = document.getElementById('log'), seen = [];
+                for (const type of ['input', 'change', 'cancel'])
+                    up.addEventListener(type, e => { seen.push(type + ':' + up.files.length); log.textContent = seen.join(' '); });
+            </script>"#;
+            let parsed = Dom::parse_document(html);
+            let (input, form) = (
+                parsed.get_by_id("up").unwrap(),
+                parsed.get_by_id("f").unwrap(),
+            );
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            let next_prompt = async |events: &mut tokio::sync::mpsc::Receiver<PageEvt>| loop {
+                match events.recv().await {
+                    Some(PageEvt::FilePicker(request)) => break request,
+                    Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended"),
+                }
+            };
+            let wait_for = async |events: &mut tokio::sync::mpsc::Receiver<PageEvt>,
+                                  marker: &str| loop {
+                match events.recv().await {
+                    Some(PageEvt::Updated { html, outcome }) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        if html.contains(&format!(">{marker}</output>")) {
+                            break;
+                        }
+                    }
+                    Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                    Some(_) => {}
+                    None => panic!("actor ended"),
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                handle.try_send_user(PageCmd::Click(input)).unwrap();
+                let request = next_prompt(&mut events).await;
+                assert_eq!(
+                    (request.accept.as_str(), request.multiple, request.directory),
+                    (".txt", true, false)
+                );
+                handle
+                    .try_send_user(PageCmd::FilePickerResult {
+                        request: request.request,
+                        files: Some(vec![path.clone()]),
+                    })
+                    .unwrap();
+                wait_for(&mut events, "input:1 change:1").await;
+                handle.try_send_user(PageCmd::Click(input)).unwrap();
+                let request = next_prompt(&mut events).await;
+                handle
+                    .try_send_user(PageCmd::FilePickerResult {
+                        request: request.request,
+                        files: None,
+                    })
+                    .unwrap();
+                wait_for(&mut events, "input:1 change:1 cancel:1").await;
+                handle
+                    .try_send_user(PageCmd::Submit {
+                        form,
+                        submitter: None,
+                    })
+                    .unwrap();
+                let submission = loop {
+                    match events.recv().await {
+                        Some(PageEvt::SubmitForm {
+                            submission: Some(submission),
+                            ..
+                        }) => break submission,
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended"),
+                    }
+                };
+                assert_eq!(submission.method, "post");
+                let boundary = submission
+                    .content_type
+                    .strip_prefix("multipart/form-data; boundary=")
+                    .expect("multipart content type")
+                    .to_string();
+                let mut expected = Vec::new();
+                expected.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nT\r\n\
+                         --{boundary}\r\nContent-Disposition: form-data; name=\"up\"; \
+                         filename=\"report %221%22.txt\"\r\nContent-Type: text/plain\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                expected.extend_from_slice(b"hello\x00world\xff\r\n");
+                expected.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+                assert_eq!(submission.body, expected);
+            })
+            .await
+            .expect("file prompt actor timed out");
+        }
+
+        #[tokio::test]
+        async fn actor_file_uploads_fail_when_the_file_changed() {
+            // File API #snapshot-state: a body whose file no longer matches its
+            // snapshot cannot be read, so the planned navigation is not sent.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.bin");
+            std::fs::write(&path, b"original").unwrap();
+            let html = r#"<form id="f" method="post" enctype="multipart/form-data" action="http://127.0.0.1:9/upload">
+                <input type="file" id="up" name="up"></form><output id="log"></output><script>
+                document.getElementById('up').onchange = () => document.getElementById('log').textContent = 'picked';
+            </script>"#;
+            let parsed = Dom::parse_document(html);
+            let (input, form) = (
+                parsed.get_by_id("up").unwrap(),
+                parsed.get_by_id("f").unwrap(),
+            );
+            let (handle, mut events) = spawn_page(html.into(), PageEnv::bare(DEFAULT_URL));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(events.recv().await, Some(PageEvt::Updated { .. })) {}
+                handle.try_send_user(PageCmd::Click(input)).unwrap();
+                let request = loop {
+                    match events.recv().await {
+                        Some(PageEvt::FilePicker(request)) => break request.request,
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended"),
+                    }
+                };
+                handle
+                    .try_send_user(PageCmd::FilePickerResult {
+                        request,
+                        files: Some(vec![path.clone()]),
+                    })
+                    .unwrap();
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. })
+                            if html.contains(">picked</output>") =>
+                        {
+                            break;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("{errors:?}"),
+                        Some(_) => {}
+                        None => panic!("actor ended"),
+                    }
+                }
+                std::fs::write(&path, b"replaced with longer contents").unwrap();
+                handle
+                    .try_send_user(PageCmd::Submit {
+                        form,
+                        submitter: None,
+                    })
+                    .unwrap();
+                loop {
+                    let errors = match events.recv().await {
+                        Some(PageEvt::SubmitForm { .. }) => {
+                            panic!("an unreadable upload was submitted")
+                        }
+                        Some(PageEvt::Trouble(errors)) => errors,
+                        Some(PageEvt::Updated { outcome, .. }) => outcome.errors,
+                        Some(_) => continue,
+                        None => panic!("actor ended"),
+                    };
+                    if errors
+                        .iter()
+                        .any(|error| error.contains("changed after it was selected"))
+                    {
+                        break;
+                    }
+                    assert!(errors.is_empty(), "{errors:?}");
+                }
+            })
+            .await
+            .expect("changed file actor timed out");
+        }
 
         #[tokio::test]
         async fn actor_pointer_lock_captures_only_after_native_acknowledgement() {
@@ -9764,6 +10146,9 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__storage_manager", 2, host_storage_manager),
     ("__clipboard_write", 2, host_clipboard_write),
     ("__fullscreen_frontend", 2, host_fullscreen_frontend),
+    ("__file_picker", 4, host_file_picker),
+    ("__file_read", 3, host_file_read),
+    ("__file_expand", 1, host_file_expand),
     ("__blob_mirror", 3, host_blob_mirror),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
     ("__crypto_digest", 2, host_crypto_digest),
@@ -16565,6 +16950,28 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     }) else {
         return Ok(Value::Null);
     };
+    // HTML #concept-input-type-file-selected: the names of an input's selected
+    // files, for its rendering and filename-mode value (the File objects stay
+    // in the page realm).
+    if op == "files-set" && dom.tag_name(id) == Some("input") {
+        drop(dom);
+        let length = ctx
+            .member_get(&arg, "length")
+            .ok()
+            .and_then(|v| v.as_num_opt())
+            .unwrap_or(0.0)
+            .max(0.0) as usize;
+        let mut names = Vec::with_capacity(length.min(1024));
+        for index in 0..length {
+            let value = ctx
+                .member_get(&arg, &index.to_string())
+                .unwrap_or(Value::Undefined);
+            names.push(ctx.coerce_usv_string(&value).unwrap_or_default());
+        }
+        return Ok(Value::Bool(
+            host_dom(ctx).borrow_mut().set_input_files(id, names),
+        ));
+    }
     let flag = |ctx: &mut Ctx, index: usize| -> Option<bool> {
         match ctx.member_get(&arg, &index.to_string()).ok()? {
             Value::Bool(value) => Some(value),
@@ -18872,6 +19279,172 @@ fn settle_clipboard_request(ctx: &mut Ctx, request: u64, ok: bool) -> Result<(),
         ctx.invoke(settle, Value::Undefined, &[Value::Bool(ok)])?;
     }
     Ok(())
+}
+
+/// A File Upload control's pending picker prompt (HTML #show-the-picker,-if-applicable).
+struct FilePickerSettler {
+    /// Platform callback, in the control's Realm, that receives the chosen file records or
+    /// `null` for a dismissed prompt.
+    settle: Value,
+    multiple: bool,
+    directory: bool,
+}
+
+/// HTML #show-the-picker,-if-applicable step 5, after the prelude checked transient activation
+/// and mutability: ask the frontend to display a file prompt for a File Upload control.
+/// Arguments: the `accept` attribute value, `multiple`, `webkitdirectory` and the settle callback.
+fn host_file_picker(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let accept = host_arg_usv(ctx, args, 0);
+    let multiple = args.get(1).is_some_and(|value| ctx.to_boolean(value));
+    let directory = args.get(2).is_some_and(|value| ctx.to_boolean(value));
+    let settle = args.get(3).cloned().unwrap_or(Value::Undefined);
+    if !settle.is_callable() {
+        return Err(ctx.make_error("TypeError", "file pickers require a settle callback"));
+    }
+    let Some(state) = ctx.host_mut::<HostState>() else {
+        return Err(ctx.make_error("InvalidStateError", "missing browser host state"));
+    };
+    let request = state.next_file_picker_request;
+    state.next_file_picker_request = request.wrapping_add(1);
+    state
+        .file_picker_requests
+        .push(crate::js::FilePickerRequest {
+            request,
+            accept,
+            multiple,
+            directory,
+        });
+    state.file_picker_settlers.insert(
+        request,
+        FilePickerSettler {
+            settle,
+            multiple,
+            directory,
+        },
+    );
+    Ok(Value::Undefined)
+}
+
+/// Register user-chosen files and describe them for the prelude as
+/// `[id, name, type, size, lastModified | null, relativePath, isDirectory]` records.
+fn user_file_records(
+    ctx: &mut Ctx,
+    files: &[crate::file_select::SelectedFile],
+) -> Result<Value, String> {
+    let mut ids = Vec::with_capacity(files.len());
+    {
+        let state = ctx
+            .host_mut::<HostState>()
+            .ok_or_else(|| String::from("missing browser host state"))?;
+        for file in files {
+            ids.push(state.user_files.register(file)?);
+        }
+    }
+    let mut records = Vec::with_capacity(files.len());
+    for (file, id) in files.iter().zip(ids) {
+        records.push(ctx.make_array(vec![
+            Value::Num(id as f64),
+            Value::from_string(file.name.clone()),
+            Value::from_string(file.mime.clone()),
+            Value::Num(file.size as f64),
+            file.last_modified
+                .map_or(Value::Null, |ms| Value::Num(ms as f64)),
+            Value::from_string(file.relative_path.clone()),
+            Value::Bool(file.directory),
+        ]));
+    }
+    Ok(ctx.make_array(records))
+}
+
+/// Deliver a frontend's file prompt answer. A dismissed prompt settles with `null`; chosen paths
+/// are snapshotted (File API #file-section), registered as readable, and settle the control's
+/// selection. Without `multiple` at most one file is kept (HTML #file-upload-state).
+fn settle_file_picker_request(
+    ctx: &mut Ctx,
+    request: u64,
+    files: Option<Vec<std::path::PathBuf>>,
+) -> Result<Option<String>, Value> {
+    let Some(settler) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.file_picker_settlers.remove(&request))
+    else {
+        return Ok(None);
+    };
+    let mut trouble = None;
+    let records = match files {
+        None => Value::Null,
+        Some(mut paths) => {
+            if !settler.multiple {
+                paths.truncate(1);
+            }
+            match crate::file_select::selection_from_paths(&paths, settler.directory, false)
+                .and_then(|files| user_file_records(ctx, &files))
+            {
+                Ok(records) => records,
+                Err(error) => {
+                    trouble = Some(format!("file selection failed: {error}"));
+                    Value::Null
+                }
+            }
+        }
+    };
+    ctx.invoke(settler.settle, Value::Undefined, &[records])?;
+    Ok(trouble)
+}
+
+/// File API #blob-section reads of a user-selected file's bytes `start..end`: a byte string (one
+/// code unit per byte, the prelude's Blob byte form), or `[DOMException name, message]` when the
+/// file cannot be read as it was snapshotted.
+fn host_file_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let number = |index: usize| {
+        args.get(index)
+            .and_then(|value| value.as_num_opt())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map_or(0, |value| value as u64)
+    };
+    let (id, start, end) = (number(0), number(1), number(2));
+    let result = ctx
+        .host_mut::<HostState>()
+        .map(|state| state.user_files.read(id, start, end))
+        .unwrap_or_else(|| {
+            Err(crate::file_select::ReadError::NotReadable(String::from(
+                "missing browser host state",
+            )))
+        });
+    match result {
+        Ok(bytes) => Ok(Value::from_string(
+            bytes.into_iter().map(char::from).collect::<String>(),
+        )),
+        Err(error) => Ok(ctx.make_array(vec![
+            Value::from_string(error.dom_exception_name().to_string()),
+            Value::from_string(error.message().to_string()),
+        ])),
+    }
+}
+
+/// File and Directory Entries API #html-forms: a dropped directory selects, for a
+/// `webkitdirectory` control, every file below it. Only directories the user dropped (already
+/// registered) can be expanded; returns file records or `[DOMException name, message]`.
+fn host_file_expand(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = args
+        .first()
+        .and_then(|value| value.as_num_opt())
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map_or(0, |value| value as u64);
+    let path = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.user_files.directory_path(id));
+    let result = match path {
+        Some(path) => crate::file_select::selection_from_paths(&[path], true, false),
+        None => Err(String::from("not a selected directory")),
+    };
+    match result.and_then(|files| user_file_records(ctx, &files)) {
+        Ok(records) => Ok(records),
+        Err(error) => Ok(ctx.make_array(vec![
+            Value::from_string(String::from("NotReadableError")),
+            Value::from_string(error),
+        ])),
+    }
 }
 
 /// Indexed Database and Cache Storage quotas enforced by the platform prelude (`__idbQuota`,
@@ -26517,7 +27090,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 224, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 227, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -26528,7 +27101,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 224);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 227);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -42833,6 +43406,411 @@ mod tests {
             crate::js::transform(merged, &crate::js::PageEnv::bare(DEFAULT_URL));
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(rendered.contains("data-merged=\"function\""), "{rendered}");
+    }
+
+    /// Run queued platform tasks and microtasks until both queues are empty.
+    fn drain_platform_tasks(engine: &mut lumen::Engine, label: &str) {
+        for _ in 0..50 {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, "__trust.hasPlatformTask()") != "true" {
+                return;
+            }
+            eval(engine, "__trust.runPlatformTask()", label).unwrap();
+        }
+    }
+
+    fn settle_picker(
+        engine: &mut lumen::Engine,
+        request: u64,
+        files: Option<Vec<std::path::PathBuf>>,
+    ) {
+        match settle_file_picker_request(engine.ctx(), request, files) {
+            Ok(None) => {}
+            Ok(Some(trouble)) => panic!("{trouble}"),
+            Err(_) => panic!("the file picker settle callback threw"),
+        }
+    }
+
+    fn take_file_pickers(engine: &mut lumen::Engine) -> Vec<crate::js::FilePickerRequest> {
+        std::mem::take(
+            &mut engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .file_picker_requests,
+        )
+    }
+
+    #[test]
+    fn file_upload_controls_follow_the_file_upload_state() {
+        // HTML #file-upload-state-(type=file), #show-the-picker,-if-applicable,
+        // #update-the-file-selection, #dom-input-value-filename,
+        // #dom-input-files, the reset algorithm and constraint validation;
+        // File API #file-section snapshot state and #slice-blob.
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.txt");
+        let image = dir.path().join("pic.PNG");
+        std::fs::write(&alpha, b"alpha").unwrap();
+        std::fs::write(&image, b"\x89PNG").unwrap();
+        let mut engine = platform_engine_with_body();
+        eval(
+            &mut engine,
+            r#"
+            const form = document.createElement('form');
+            form.innerHTML = '<label for=up>Upload</label><input type=file id=up name=up accept="image/*, .txt" required>';
+            document.body.append(form);
+            globalThis.up = document.getElementById('up');
+            globalThis.label = form.querySelector('label');
+            globalThis.log = [];
+            for (const type of ['input', 'change', 'cancel'])
+                up.addEventListener(type, e => log.push(type + ':' + e.bubbles + ':' + e.composed + ':' + e.isTrusted));
+            globalThis.activate = () => {
+                __trust.pointerButton(up.__id, true, 1, 1);
+                __trust.pointerButton(up.__id, false, 1, 1);
+            };
+            globalThis.out = [];
+            up.click();
+            try { up.showPicker(); } catch (e) { out.push(e.name); }
+            globalThis.empty = up.files;
+            out.push(empty.length, up.value === '', empty === up.files, up.validity.valueMissing,
+                up.webkitdirectory, 'webkitRelativePath' in File.prototype);
+            activate();
+            up.click();
+            up.click();
+            "#,
+            "file input setup",
+        )
+        .unwrap();
+        let requests = take_file_pickers(&mut engine);
+        assert_eq!(
+            requests.len(),
+            1,
+            "activation is consumed by the first prompt"
+        );
+        assert_eq!(requests[0].accept, "image/*, .txt");
+        assert!(!requests[0].multiple && !requests[0].directory);
+        assert_eq!(
+            string_value(&mut engine, "out.join()"),
+            "NotAllowedError,0,true,true,true,false,true"
+        );
+        // Without `multiple` the host keeps the first chosen file.
+        settle_picker(
+            &mut engine,
+            requests[0].request,
+            Some(vec![alpha.clone(), image.clone()]),
+        );
+        drain_platform_tasks(&mut engine, "file selection");
+        eval(
+            &mut engine,
+            r#"
+            globalThis.out = [log.join(' ')];
+            const file = up.files[0];
+            out.push(up.files.length, up.files !== empty, up.files === up.files, file.name, file.type,
+                file.size, up.value, file.webkitRelativePath === '', typeof file.lastModified,
+                up.validity.valueMissing, file instanceof File, Object.prototype.toString.call(file));
+            file.text().then(text => out.push('text:' + text));
+            file.slice(1, 3, 'X/Y').text().then(text => out.push('slice:' + text));
+            out.push(file.slice(-2).size, file.slice(1, 3, 'X/Y').type);
+            "#,
+            "selected file",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "file reads");
+        assert_eq!(
+            string_value(&mut engine, "out.join('|')"),
+            "input:true:true:true change:true:false:true|1|true|true|alpha.txt|text/plain|5|\
+             C:\\fakepath\\alpha.txt|true|number|false|true|[object File]|2|x/y|text:alpha|slice:lp"
+        );
+        // A dismissed prompt fires cancel; re-choosing the same file counts
+        // as a dismissal; a label's activation reaches the control.
+        eval(
+            &mut engine,
+            "log.length = 0; activate(); label.click();",
+            "label activation",
+        )
+        .unwrap();
+        let requests = take_file_pickers(&mut engine);
+        assert_eq!(requests.len(), 1, "a label activates the control");
+        settle_picker(&mut engine, requests[0].request, None);
+        drain_platform_tasks(&mut engine, "dismissed prompt");
+        eval(&mut engine, "activate(); up.click();", "same file").unwrap();
+        let requests = take_file_pickers(&mut engine);
+        settle_picker(&mut engine, requests[0].request, Some(vec![alpha.clone()]));
+        drain_platform_tasks(&mut engine, "same file");
+        assert_eq!(
+            string_value(&mut engine, "log.join(' ')"),
+            "cancel:true:false:true cancel:true:false:true"
+        );
+        // File API: once the file changes on disk, reads fail with
+        // NotReadableError (promise rejection and FileReader error).
+        std::fs::write(&alpha, b"ALPHA, changed").unwrap();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.out = [];
+            const changed = up.files[0];
+            changed.text().then(() => out.push('read'), e => out.push(e.name));
+            const reader = new FileReader();
+            reader.onerror = () => out.push('reader:' + reader.error.name);
+            reader.readAsText(changed);
+            "#,
+            "changed file",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "changed file reads");
+        eval(
+            &mut engine,
+            "__trust.tickTo(__trust.now() + 10)",
+            "reader timer",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "reader result");
+        assert_eq!(
+            string_value(&mut engine, "out.join()"),
+            "NotReadableError,reader:NotReadableError"
+        );
+        // #dom-input-value-filename setter, the reset algorithm, disabled
+        // controls, and #dom-input-files's setter.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const out = [];
+                    try { up.value = 'x'; } catch (e) { out.push(e.name); }
+                    out.push(up.files.length);
+                    up.value = '';
+                    out.push(up.files.length, up.value === '', up.validity.valueMissing);
+                    const transfer = new DataTransfer();
+                    transfer.items.add(new File(['a'], 'one.txt'));
+                    transfer.items.add(new File(['bb'], 'two.txt'));
+                    up.files = transfer.files;
+                    out.push(up.files.length, up.files !== transfer.files, up.value);
+                    try { up.files = {}; } catch (e) { out.push(e.name); }
+                    up.files = null;
+                    out.push(up.files.length);
+                    up.form.reset();
+                    out.push(up.files.length);
+                    up.disabled = true;
+                    activate();
+                    try { up.showPicker(); } catch (e) { out.push(e.name); }
+                    up.click();
+                    const text = document.createElement('input');
+                    out.push(text.files, (text.files = transfer.files, text.files));
+                    return out.join();
+                })()"#
+            ),
+            "InvalidStateError,1,0,true,true,2,true,C:\\fakepath\\one.txt,TypeError,2,0,InvalidStateError,,"
+        );
+        assert!(
+            take_file_pickers(&mut engine).is_empty(),
+            "a disabled control shows no picker"
+        );
+    }
+
+    #[test]
+    fn directory_file_inputs_select_every_file_below_the_directory() {
+        // File and Directory Entries API #html-forms: webkitdirectory
+        // reflects, the picker chooses a directory and each file's
+        // webkitRelativePath starts with that directory's name.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("to_upload");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/1.txt"), b"1").unwrap();
+        std::fs::write(root.join("a/3.txt"), b"three").unwrap();
+        let mut engine = platform_engine_with_body();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.dirInput = document.createElement('input');
+            dirInput.type = 'file'; dirInput.webkitdirectory = true; dirInput.multiple = true;
+            document.body.append(dirInput);
+            __trust.pointerButton(dirInput.__id, true, 1, 1);
+            __trust.pointerButton(dirInput.__id, false, 1, 1);
+            dirInput.click();
+            "#,
+            "directory input",
+        )
+        .unwrap();
+        let requests = take_file_pickers(&mut engine);
+        assert!(requests[0].directory && requests[0].multiple);
+        settle_picker(&mut engine, requests[0].request, Some(vec![root]));
+        drain_platform_tasks(&mut engine, "directory selection");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[dirInput.hasAttribute('webkitdirectory'), ...Array.from(dirInput.files, f => f.name + '=' + f.webkitRelativePath + '=' + f.size)].join()"
+            ),
+            "true,3.txt=to_upload/a/3.txt=5,1.txt=to_upload/a/b/1.txt=1"
+        );
+    }
+
+    #[test]
+    fn data_transfer_interfaces_follow_the_drag_data_store() {
+        // HTML #the-datatransfer-interface, #the-datatransferitemlist-interface
+        // and #the-datatransferitem-interface for a constructed DataTransfer
+        // (read/write mode).
+        let mut engine = platform_engine_with_body();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.out = [];
+            const dt = new DataTransfer();
+            out.push(dt.dropEffect, dt.effectAllowed, dt.items.length, dt.types.length, dt.files.length,
+                dt.items === dt.items, dt.files === dt.files, String(dt), String(dt.items));
+            dt.setData('Text', 'hello');
+            dt.setData('URL', '# comment\r\nhttp://a.test/\r\nhttp://b.test/');
+            const types = dt.types;
+            out.push(types.join(), Object.isFrozen(types), types === dt.types, dt.getData('text/plain'),
+                dt.getData('url'), dt.getData('missing'));
+            const file = new File(['xyz'], 'x.txt', {type: 'Text/Plain', lastModified: 0});
+            const files = dt.files;
+            const item = dt.items.add(file);
+            out.push(item.kind, item.type, dt.types.join(), types === dt.types, files.length,
+                files[0] === file, dt.items[2] === item, item.getAsFile() !== file,
+                item.getAsFile().name, item.getAsFile().lastModified, dt.items[0].getAsFile());
+            try { dt.items.add('again', 'TEXT/PLAIN'); } catch (e) { out.push(e.name); }
+            try { dt.items.add('lonely'); } catch (e) { out.push(e.name); }
+            out.push(dt.items.add(file, 'text/x').kind);
+            dt.items.remove(3); dt.items.remove(99);
+            dt.items.remove(2);
+            out.push(files.length, dt.types.join(), item.kind === '', item.getAsFile());
+            dt.clearData('text');
+            out.push(dt.types.join());
+            dt.clearData();
+            out.push(dt.types.length);
+            dt.items.add(file); dt.setData('a', 'b');
+            out.push([...dt.items].map(i => i.kind).join('+'));
+            // File API #filelist-section: FileList is serializable.
+            const cloned = structuredClone(dt.files);
+            out.push(cloned instanceof FileList, cloned.length, cloned[0].name, cloned[0] !== file);
+            dt.items.clear();
+            out.push(dt.items.length, dt.types.length);
+            dt.effectAllowed = 'copyMove'; dt.effectAllowed = 'bogus';
+            dt.dropEffect = 'bogus'; dt.dropEffect = 'link';
+            out.push(dt.effectAllowed, dt.dropEffect);
+            for (const C of ['DataTransferItemList', 'DataTransferItem'])
+                try { new globalThis[C](); } catch (e) { out.push(C + ':' + e.name); }
+            try { dt.setDragImage({}, 0, 0); } catch (e) { out.push(e.name); }
+            dt.setDragImage(document.body, 1, 2);
+            dt.items.add('payload', 'text/x');
+            dt.items[0].getAsString(s => out.push('callback:' + s));
+            dt.items[0].getAsString(null);
+            out.push('sync');
+            "#,
+            "data transfer",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "getAsString");
+        assert_eq!(
+            string_value(&mut engine, "out.join('|')"),
+            "none|none|0|0|0|true|true|[object DataTransfer]|[object DataTransferItemList]|\
+             text/plain,text/uri-list|true|true|hello|http://a.test/||\
+             file|text/plain|text/plain,text/uri-list,Files|false|1|true|true|true|x.txt|0||\
+             NotSupportedError|TypeError|string|0|text/plain,text/uri-list|true||text/uri-list|0|\
+             file+string|true|1|x.txt|true|0|0|copyMove|link|DataTransferItemList:TypeError|DataTransferItem:TypeError|\
+             TypeError|sync|callback:payload"
+        );
+    }
+
+    #[test]
+    fn native_file_drags_run_the_drag_and_drop_processing_model() {
+        // HTML #drag-and-drop-processing-model and #fire-a-dnd-event for files
+        // dragged in from another application: protected mode until the
+        // drop, the body fallback, dragleave, the drop's read-only store, and
+        // a file input's selection by drop.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dropped.txt");
+        std::fs::write(&path, b"dropped!").unwrap();
+        let mut engine = platform_engine_with_body();
+        let file = crate::file_select::SelectedFile::from_path(&path, String::new()).unwrap();
+        let id = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .user_files
+            .register(&file)
+            .unwrap();
+        eval(
+            &mut engine,
+            &format!(
+                r#"
+            globalThis.record = [{id}, 'dropped.txt', 'text/plain', 8, 0, '', false];
+            document.body.innerHTML = '<div id=zone>zone</div><input type=file id=fi><p id=plain>p</p>';
+            globalThis.zone = document.getElementById('zone');
+            globalThis.fi = document.getElementById('fi');
+            globalThis.plain = document.getElementById('plain');
+            globalThis.log = [];
+            const describe = (e) => {{
+                const dt = e.dataTransfer;
+                return e.type + '@' + e.currentTarget.id + ':' + e.isTrusted + ':' + e.cancelable + ':' +
+                    dt.types.join('+') + ':' + dt.files.length + ':' + dt.items.length + ':' +
+                    (dt.items[0] && dt.items[0].kind) + ':' + (dt.items[0] && dt.items[0].getAsFile() !== null) +
+                    ':' + dt.dropEffect;
+            }};
+            zone.addEventListener('dragenter', e => {{ log.push(describe(e)); e.preventDefault(); }});
+            zone.addEventListener('dragover', e => {{ log.push(describe(e)); e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }});
+            zone.addEventListener('dragleave', e => log.push(describe(e)));
+            zone.addEventListener('drop', e => {{
+                log.push(describe(e));
+                e.preventDefault();
+                const file = e.dataTransfer.files[0];
+                globalThis.held = e.dataTransfer;
+                file.text().then(text => log.push('text:' + file.name + '=' + text));
+            }});
+            for (const type of ['dragenter', 'dragover', 'dragleave', 'drop'])
+                document.body.addEventListener(type, e => {{ if (e.target === document.body) log.push(type + '@body'); }});
+            for (const type of ['input', 'change']) fi.addEventListener(type, () => log.push(type + '@fi:' + fi.files[0].name));
+            "#
+            ),
+            "drag setup",
+        )
+        .unwrap();
+        eval(
+            &mut engine,
+            r#"
+            __trust.fileDrag('enter', ['text/plain']);
+            __trust.fileDrag('over', zone.__id, 5, 5, 5, 5, 0);
+            __trust.fileDrag('over', zone.__id, 6, 6, 6, 6, 0);
+            __trust.fileDrag('drop', zone.__id, 6, 6, 6, 6, 0, [record]);
+            log.push('held:' + held.files.length + ':' + held.items.length + ':' + held.types.length);
+            "#,
+            "drop on a drop zone",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "drop reads");
+        assert_eq!(
+            string_value(&mut engine, "log.join(' ')"),
+            "dragenter@zone:true:true:Files:0:1:file:false:copy \
+             dragover@zone:true:true:Files:0:1:file:false:copy \
+             dragover@zone:true:true:Files:0:1:file:false:copy \
+             dragover@zone:true:true:Files:0:1:file:false:copy \
+             drop@zone:true:true:Files:1:1:file:true:copy held:0:0:0 text:dropped.txt=dropped!"
+        );
+        eval(
+            &mut engine,
+            r#"
+            log.length = 0;
+            __trust.fileDrag('enter', ['text/plain']);
+            __trust.fileDrag('over', plain.__id, 1, 1, 1, 1, 0);
+            __trust.fileDrag('over', zone.__id, 5, 5, 5, 5, 0);
+            __trust.fileDrag('leave');
+            __trust.fileDrag('enter', ['text/plain']);
+            __trust.fileDrag('over', fi.__id, 1, 1, 1, 1, 0);
+            __trust.fileDrag('drop', fi.__id, 1, 1, 1, 1, 0, [record]);
+            "#,
+            "body fallback and file input drop",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "file input drop");
+        assert_eq!(
+            string_value(&mut engine, "log.join(' ') + '|' + fi.value"),
+            "dragenter@body dragover@body \
+             dragenter@zone:true:true:Files:0:1:file:false:copy \
+             dragleave@body \
+             dragover@zone:true:true:Files:0:1:file:false:copy \
+             dragleave@zone:true:false:Files:0:1:file:false:none \
+             input@fi:dropped.txt change@fi:dropped.txt|C:\\fakepath\\dropped.txt"
+        );
     }
 
     #[test]

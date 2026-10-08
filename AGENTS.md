@@ -106,6 +106,9 @@ The project favors:
   compositing, and terminal graphics encoding.
 - `src/ui.rs`: Ratatui rendering for browser documents, inline images, fixed
   layers, scrollbars, dialogs, and terminal sessions.
+- `src/file_select.rs`: user-chosen files (accept filters, MIME types,
+  directory expansion, snapshot-checked lazy reads); `src/file_picker.rs`:
+  the terminal's file chooser.
 - `src/core/`: shared browser controller and event delivery for desktop and
   headless clients.
 - `src/bin/trust-desktop.rs`: winit window, native input, and presentation loop.
@@ -383,6 +386,31 @@ current behavior and limits; consult the governing standards before changing it.
 - Input stepping and `valueAsNumber` are shared DOM behavior for number, range,
   date, month, week, time, and datetime-local. Preserve step/bounds validation
   and separate current/default values; desktop number inputs add spin controls.
+- `<input type=file>`: activation (or `showPicker()`) with transient
+  activation asks the frontend for one prompt at a time (`PageEvt::FilePicker`
+  → `PageCmd::FilePickerResult`); a dismissal fires `cancel`, a choice fires
+  `input`/`change`. trust-desktop shows rfd's native dialog on its tokio
+  runtime (XDG Desktop Portal via ashpd/zbus on Linux, no GTK; IFileOpenDialog
+  on Windows); the terminal shows its own browser (`src/file_picker.rs`: path
+  entry with Tab completion, Space/Insert marks for `multiple`, Ctrl-O
+  confirms, Ctrl-T lists files `accept` or a leading dot hides, Esc cancels);
+  trust-headless dismisses. Only chosen or dropped paths become readable: the
+  actor registers them (`file_select::UserFiles`) and File objects hold opaque
+  ids whose ranges are read lazily against a length/mtime/inode snapshot
+  (NotReadableError/NotFoundError), each read and every assembled upload
+  bounded by the 512 MiB body limit. Form navigations send multipart bodies
+  assembled from those ranges; a changed file fails the submission.
+  `webkitdirectory` expands at most 10,000 files, 64 levels deep, with
+  `webkitRelativePath`; `webkitEntries`/`webkitGetAsEntry` (FileSystemEntry)
+  are not exposed. Without page scripts (`set js off`) the terminal picker
+  fills the painted control, and static POSTs encode the form's enctype
+  (multipart reads the files at submission).
+- trust-desktop runs HTML drag-and-drop for files dragged in from other
+  applications: dragenter/dragover/dragleave/drop with `DataTransfer` in
+  protected mode until the drop, and a mutable file input takes dropped files
+  as its selection. winit 0.30 reports file drags without positions, so the
+  pointer is queried (X11 `QueryPointer`, Win32 `GetCursorPos`) on each 350ms
+  iteration; it delivers no file drags on Wayland. No drags start in pages.
 - TRust's User-Agent is `Mozilla/5.0 (<frozen platform>) TRust/0.2`
   (`USER_AGENT` in `src/http.rs`). Fetch leaves it implementation-defined but
   encourages the `Mozilla/5.0 (` shape; a bare `TRust/` token is refused by

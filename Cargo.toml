@@ -174,6 +174,12 @@ psl = "2.1.240"
 # is deliberately omitted; selected SVG fonts are read safely on demand.
 resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images"] }
 roxmltree = "0.21.1"
+# Native file dialogs for <input type=file> in trust-desktop. On Linux and the
+# BSDs the pure-Rust XDG Desktop Portal backend (ashpd over the zbus already in
+# the tree for AccessKit) runs on TRust's tokio runtime; no GTK is linked.
+# Windows uses the system IFileOpenDialog. 0.15 is the last line whose portal
+# backend is pure Rust (0.16+ loads libdbus through FFI).
+rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "tokio"] }
 # DOMParser's CDATA- and PI-preserving event reader (formerly published as `xml-rs`).
 xml = "1.0.0"
 rcgen = "0.14.10"
@@ -240,6 +246,16 @@ wuff = "0.2.9"
 # and CPU affinity for style worker threads on heterogeneous CPUs.
 # Already part of the native windowing stack; Linux uses Rust syscalls.
 rustix = { version = "1.1.5", features = ["fs", "thread"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+# winit 0.30 reports native file drags without a pointer position; X11
+# QueryPointer supplies the drop target's position (HTML DnD's immediate user
+# selection). The same x11rb release winit already uses; pure Rust connection.
+x11rb = { version = "0.13.2", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# GetCursorPos/ScreenToClient for native file drags (see x11rb above).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
 parley = { version = "0.11.1", default-features = false, features = ["system", "complex-scripts"] }

@@ -309,6 +309,21 @@ Esc            close request: the page closes its fullscreen, dialog
 Mouse: hover selects, click follows, wheel scrolls,
 back/forward side buttons travel history.
 
+## Choosing files
+
+A page's file control opens a chooser. The desktop browser uses the system
+file dialog and also takes files dropped on the page. The terminal browser
+shows its own chooser:
+
+```
+Up/Down/PgUp/PgDn  move · Enter/Right open a folder or choose a file
+Left/Backspace     parent folder (Backspace edits a typed path)
+type a path        absolute, ~/… or relative; Tab completes, Enter opens
+Space/Insert       mark files when several may be chosen; Ctrl-O confirms
+Ctrl-T             also list hidden files and types the page did not ask for
+Esc                cancel
+```
+
 ## Gopher
 
 Menus/text arrive progressively. W toggles wrap; Shift-Left/Right pans.

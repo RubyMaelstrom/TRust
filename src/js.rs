@@ -336,6 +336,15 @@ pub enum PageCmd {
         request: u64,
         ok: bool,
     },
+    /// The frontend's answer to `PageEvt::FilePicker` (HTML #show-the-picker,-if-applicable):
+    /// the paths the user chose, or `None` when the prompt was dismissed. Only these paths
+    /// become readable by the page.
+    FilePickerResult {
+        request: u64,
+        files: Option<Vec<std::path::PathBuf>>,
+    },
+    /// Native files dragged over the page from another application.
+    FileDrag(FileDrag),
     /// Unconditional native release (Escape, focus loss, or retired window).
     ReleasePointerLock,
     /// HTML #close-requests: the user's close request for the page (the
@@ -462,6 +471,8 @@ impl PageCmd {
                 | Self::TraverseHistory { .. }
                 | Self::PointerLockResult { .. }
                 | Self::ClipboardResult { .. }
+                | Self::FilePickerResult { .. }
+                | Self::FileDrag(_)
                 | Self::ReleasePointerLock
                 | Self::CloseRequest { .. }
                 | Self::FullscreenResult { .. }
@@ -482,6 +493,68 @@ impl PageCmd {
                 | Self::Hover { .. }
                 | Self::SetScroll { .. }
         )
+    }
+}
+
+/// HTML #show-the-picker,-if-applicable for a File Upload control: the prompt the page asks
+/// its frontend to display. The frontend answers with `PageCmd::FilePickerResult`, one prompt
+/// at a time ("optionally, wait until any prior execution of this algorithm has terminated").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePickerRequest {
+    pub request: u64,
+    /// The control's `accept` attribute (HTML #attr-input-accept), a hint for the prompt.
+    pub accept: String,
+    /// Without `multiple` the user may choose no more than one file.
+    pub multiple: bool,
+    /// File and Directory Entries API `webkitdirectory`: the user chooses a directory, which
+    /// selects every file below it.
+    pub directory: bool,
+}
+
+/// A drag of native files from another application (HTML #drag-and-drop-processing-model:
+/// "the drag actually started in another document or application"). Frontends translate their
+/// platform's drag notifications into these steps; the page actor runs the processing model.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileDrag {
+    /// Files entered the window. One drag data item per file, with its type string: the MIME
+    /// type of the file if known, or `application/octet-stream`.
+    Enter { types: Vec<String> },
+    /// One iteration of the processing model with the immediate user selection under the
+    /// pointer (CSS pixels in the viewport).
+    Over {
+        node: Option<usize>,
+        x: f64,
+        y: f64,
+        metadata: PointerMetadata,
+    },
+    /// The user ended the drag over the page by dropping these files.
+    Drop {
+        node: Option<usize>,
+        x: f64,
+        y: f64,
+        metadata: PointerMetadata,
+        files: Vec<std::path::PathBuf>,
+    },
+    /// The drag left the window or was canceled.
+    Leave,
+}
+
+impl FileDrag {
+    /// The drag data item type strings for `paths` (HTML #drag-and-drop-processing-model).
+    pub fn item_types<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| {
+                if path.as_ref().is_dir() {
+                    return String::new();
+                }
+                crate::file_select::mime_type_for_name(&crate::file_select::file_name_of(
+                    path.as_ref(),
+                ))
+                .unwrap_or("application/octet-stream")
+                .to_string()
+            })
+            .collect()
     }
 }
 
@@ -591,6 +664,9 @@ pub enum PageEvt {
         request: u64,
         text: String,
     },
+    /// HTML #show-the-picker,-if-applicable: display a file prompt and answer with
+    /// `PageCmd::FilePickerResult`. A frontend without a picker answers `None` (dismissed).
+    FilePicker(FilePickerRequest),
     Trouble(Vec<String>),
     Settled,
     /// The close request steps for `PageCmd::CloseRequest` finished.

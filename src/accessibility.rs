@@ -201,6 +201,8 @@ impl SemanticTree {
                     FieldKind::Password => Some(String::new()),
                     FieldKind::Hidden => None,
                     FieldKind::Number => Some(field.editing_value().to_string()),
+                    // The selection summary, not the filename-mode value.
+                    FieldKind::File(_) => Some(field.label.clone()),
                     _ => Some(field.value.clone()),
                 }),
                 numeric_value: numeric.and_then(|c| field.and_then(|f| c.kind.parse(&f.value))),
@@ -268,7 +270,10 @@ fn node_role(dom: &Dom, node: NodeId, controls: &ControlMap, forms: &[Form]) -> 
             FieldKind::Checkbox => Role::Checkbox,
             FieldKind::Radio => Role::Radio,
             FieldKind::Select(_) => Role::Select,
-            FieldKind::Submit | FieldKind::Button | FieldKind::Reset => Role::Button,
+            // HTML-AAM: a File Upload control is exposed as a button.
+            FieldKind::Submit | FieldKind::Button | FieldKind::Reset | FieldKind::File(_) => {
+                Role::Button
+            }
             FieldKind::Hidden => Role::Generic,
         };
     }

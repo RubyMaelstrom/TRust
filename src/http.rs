@@ -8572,6 +8572,13 @@ pub fn extract_forms_arena(
                         number.editing = b.number.as_ref().and_then(|n| n.editing.clone());
                     }
                     a.checked = b.checked;
+                    // A static control's chosen files (`set js off`).
+                    if let (FieldKind::File(new), FieldKind::File(old)) = (&mut a.kind, &b.kind)
+                        && !old.files.is_empty()
+                    {
+                        new.files = old.files.clone();
+                        a.label = b.label.clone();
+                    }
                 }
             }
         }
@@ -8598,9 +8605,17 @@ fn walk_forms_arena(
                 let action = base
                     .join(dom.attr(child, "action").unwrap_or(""))
                     .unwrap_or_else(|_| base.clone());
+                // HTML #attr-fs-enctype: an enumerated attribute whose
+                // missing and invalid value default is urlencoded.
+                let enctype = dom
+                    .attr(child, "enctype")
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .filter(|value| matches!(value.as_str(), "multipart/form-data" | "text/plain"))
+                    .unwrap_or_else(|| String::from(crate::js::FORM_URLENCODED));
                 forms.push(Form {
                     method,
                     action,
+                    enctype,
                     fields: Vec::new(),
                     live_node: live_node(dom, child),
                 });
@@ -8646,6 +8661,7 @@ fn walk_forms_arena(
                         forms.push(Form {
                             method: FormMethod::Get,
                             action: base.clone(),
+                            enctype: String::from(crate::js::FORM_URLENCODED),
                             fields: Vec::new(),
                             live_node: None,
                         });
@@ -8673,6 +8689,7 @@ fn walk_forms_arena(
                         forms.push(Form {
                             method: FormMethod::Get,
                             action: base.clone(),
+                            enctype: String::from(crate::js::FORM_URLENCODED),
                             fields: Vec::new(),
                             live_node: None,
                         });
@@ -8799,7 +8816,15 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                     };
                     FieldKind::Reset
                 }
-                "file" => return None,
+                "file" => {
+                    label = crate::doc::file_selection_summary(&dom.input_file_names(id));
+                    FieldKind::File(crate::doc::FileControl {
+                        accept: dom.attr(id, "accept").unwrap_or("").to_string(),
+                        multiple: dom.attr(id, "multiple").is_some(),
+                        directory: dom.attr(id, "webkitdirectory").is_some(),
+                        files: Vec::new(),
+                    })
+                }
                 _ => FieldKind::Text,
             }
         }

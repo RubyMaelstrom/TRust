@@ -5132,6 +5132,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const type = String(control.type).toLowerCase();
             if (type === "checkbox" || type === "radio") __dom_input(id, "checked-reset", null);
             if (!["button", "submit", "reset", "image", "file"].includes(type)) __dom_input(id, "reset", null);
+            // HTML #the-input-element reset algorithm: empty the list of
+            // selected files.
+            if (type === "file") setInputSelectedFiles(control, []);
         } else if (name === "output") {
             outputReset(control);
         } else if (isFormAssociatedCustomElement(control)) {
@@ -5364,6 +5367,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             const control = labeledControl(t);
             return control ? activateClick(control, !!(context && context.record), trusted) : false;
+        }
+        // HTML #file-upload-state-(type=file): the input activation behavior
+        // shows the picker, if applicable (a label's activation reaches it
+        // through the nested click above).
+        if (htmlElementName(t) === "input" && inputTypeOf(t) === "file") {
+            showPickerIfApplicable(t);
+            return true;
         }
         if (t.localName === "a" || t.localName === "area") {
             if (context && context.record) pendingClickHyperlink = t;
@@ -6232,7 +6242,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const group = radioGroupFor(el);
             return group.some((radio) => radio.hasAttribute("required")) && !group.some((radio) => radio.checked);
         }
-        if (type === "file") return el.hasAttribute("required") && (!el.files || el.files.length === 0);
+        // HTML #file-upload-state-(type=file) constraint validation.
+        if (type === "file") return el.hasAttribute("required") && inputSelectedFiles(el).length === 0;
         if (!READONLY_INPUT_TYPES.includes(type)) return false;
         return el.hasAttribute("required") && !isActuallyDisabled(el) && !el.hasAttribute("readonly") && el.value === "";
     }
@@ -6559,8 +6570,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     const value = messageApply(elementGetAttribute, field, ["value"]);
                     append(name, value === null ? "on" : value);
                 } else if (type === "file") {
-                    const files = field.files;
-                    if (!files || !files.length)
+                    const files = inputSelectedFiles(field);
+                    if (!files.length)
                         append(name, new g.File([], "", {type: "application/octet-stream"}));
                     else for (let i = 0; i < files.length; i++) append(name, files[i]);
                 } else if (type === "hidden" && asciiLower(name) === "_charset_") {
@@ -6615,7 +6626,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (enctype === "multipart/form-data") {
                 const formData = new g.FormData();
                 internalsFor(formData).entries = entries;
-                const wire = __formDataWire(formData);
+                const wire = __formDataWire(formData, true);
                 body = wire.wire; type = wire.type;
             } else if (enctype === "text/plain") {
                 body = utf8Binary(textPlainSerialize(nameValuePairs(entries))); type = "text/plain";
@@ -12261,7 +12272,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         set value(v) {
             requireHTMLInterface(this,["input"]);
             v = v === null ? "" : domString(v);
-            if (this.type === "file" && v !== "") throw new DOMException("File input value cannot be set", "InvalidStateError");
+            // HTML #dom-input-value-filename: setting the empty string empties
+            // the selected files; any other value throws.
+            if (inputTypeOf(this) === "file") {
+                if (v !== "") throw new DOMException("File input value cannot be set", "InvalidStateError");
+                setInputSelectedFiles(this, []);
+                return;
+            }
             const selection = __dom_input(elementIdentity(this),"selection-get",null);
             // A script change: the value was not last changed by a user edit
             // (HTML #concept-fe-value, for tooLong and tooShort).
@@ -18999,11 +19016,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (name === "select" && !element.getClientRects().length)
             throw new DOMException("The select element is not being rendered", "NotSupportedError");
         // HTML #show-the-picker,-if-applicable: consume the activation, then
-        // present the control's picker — the frontends present a focused
-        // control's choices (a select's options, a date or color editor).
-        if (windowState.lastActivation !== Infinity) windowState.lastActivation = -Infinity;
-        if (topWindowState.lastActivation !== Infinity) topWindowState.lastActivation = -Infinity;
-        trust.focusPage(elementIdentity(element));
+        // present the control's picker — a File Upload control's file
+        // prompt; otherwise the frontends present a focused control's
+        // choices (a select's options, a date or color editor).
+        showPickerIfApplicable(element);
     }
     Object.defineProperty(HTMLInputElement.prototype, "showPicker", {configurable: true, enumerable: true, writable: true,
         value: { showPicker() {
@@ -20476,64 +20492,247 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // bytes — string parts UTF-8, BufferSource parts raw — so slice()/text()/
     // arrayBuffer()/stream() round-trip binary instead of losing it (slice()
     // used to return an EMPTY blob, so upload chunkers sent nothing).
+    // File API #blob-section / #file-section (local w3c/FileAPI@1341d26). A
+    // Blob's byte sequence is its list of parts: strings (read as UTF-8),
+    // byte snapshots, nested Blobs, and host parts. A host part is a byte
+    // range of a file the user selected (HTML #concept-input-type-file-selected):
+    // the host reads it lazily, failing with NotFoundError/NotReadableError
+    // once the file no longer matches the snapshot state taken when it was
+    // selected (#snapshot-state), so a selected file costs no memory until it
+    // is read. Its read closure lives in the part's internal slots, where the
+    // structured-clone codec (a separate block) can use it too.
+    function hostFileRead(range) {
+        if (range.end <= range.start) return "";
+        const bytes = __file_read(range.id, range.start, range.end);
+        if (typeof bytes === "string") return bytes;
+        throw new DOMException(String(bytes[1]), String(bytes[0]));
+    }
+    function hostFilePart(id, start, end) {
+        const part = Object.freeze(Object.create(null));
+        internalsFor(part).hostFile = Object.freeze({id, start, end, read: hostFileRead});
+        return part;
+    }
+    function utf8ByteLength(text) {
+        if (/^[\x00-\x7f]*$/.test(text)) return text.length;
+        let length = 0;
+        for (let i = 0; i < text.length; i++) {
+            const unit = text.charCodeAt(i);
+            if (unit < 0x80) length += 1;
+            else if (unit < 0x800) length += 2;
+            else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length &&
+                (text.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { length += 4; i++; }
+            else length += 3; // BMP, or a lone surrogate encoded as U+FFFD
+        }
+        return length;
+    }
+    function blobPartByteLength(part) {
+        if (typeof part === "string") return utf8ByteLength(part);
+        if (part instanceof ArrayBuffer || ArrayBuffer.isView(part)) return part.byteLength;
+        const slots = internalsOf(part);
+        if (slots.hostFile) return slots.hostFile.end - slots.hostFile.start;
+        if (slots.blob) return slots.size;
+        if (part && typeof part.size === "number") return part.size;
+        return utf8ByteLength(String(part));
+    }
+    // The bytes of one non-host part as a Uint8Array.
+    function blobPartBytes(part) {
+        if (part instanceof ArrayBuffer) return new Uint8Array(part);
+        if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+        if (part && Array.isArray(internalsOf(part).parts)) return __latin1ToBytes(__blobBytes(part));
+        return __latin1ToBytes(utf8Binary(String(part)));
+    }
+    // File API #slice-blob over the parts: whole parts are shared (a Blob's
+    // bytes are immutable) and host ranges narrowed, so slicing a selected
+    // file reads nothing.
+    function sliceBlobParts(parts, start, end, out) {
+        let offset = 0;
+        for (let i = 0; i < parts.length && offset < end; i++) {
+            const part = parts[i], length = blobPartByteLength(part);
+            const from = Math.max(start - offset, 0), to = Math.min(end - offset, length);
+            if (to > from) {
+                const host = typeof part === "object" && part !== null ? internalsOf(part).hostFile : null;
+                if (from === 0 && to === length) out.push(part);
+                else if (host) out.push(hostFilePart(host.id, host.start + from, host.start + to));
+                else if (part && internalsOf(part).blob) sliceBlobParts(internalsOf(part).parts, from, to, out);
+                else out.push(blobPartBytes(part).slice(from, to));
+            }
+            offset += length;
+        }
+        return out;
+    }
+    // The leaf parts of a Blob, nested Blobs flattened.
+    function blobLeafParts(blob, out = []) {
+        for (const part of internalsOf(blob).parts || []) {
+            if (part && typeof part === "object" && internalsOf(part).blob) blobLeafParts(part, out);
+            else out.push(part);
+        }
+        return out;
+    }
+    // File API #constructorBlob step 3 and #slice-blob: a type with
+    // characters outside U+0020..U+007E is the empty string, else lowercase.
+    function blobTypeString(type) {
+        type = String(type);
+        return /^[\x20-\x7e]*$/.test(type) ? asciiLower(type) : "";
+    }
+    function blobSlots(blob) {
+        const slots = internalsOf(blob);
+        if (!slots.blob) throw new TypeError("Illegal invocation");
+        return slots;
+    }
+    const BLOB_STREAM_CHUNK = 1 << 20;
     g.Blob = class Blob {
         constructor(parts, opts) {
-            internalsFor(this).parts = Array.isArray(parts) ? parts.slice() : (parts ? [parts] : []);
-            let size = 0;
-            for (const p of internalsFor(this).parts) {
-                if (typeof p === "string") size += p.length;
-                else if (p && typeof p.byteLength === "number") size += p.byteLength;
-                else if (p && typeof p.size === "number") size += p.size;
-                else size += String(p).length;
+            // File API #process-blob-parts: BufferSource parts are copied, so
+            // later writes to the source cannot change the Blob.
+            const list = Array.isArray(parts) ? parts.slice() : (parts ? [parts] : []);
+            for (let i = 0; i < list.length; i++) {
+                const part = list[i];
+                if (part instanceof ArrayBuffer) list[i] = new Uint8Array(part.slice(0));
+                else if (ArrayBuffer.isView(part))
+                    list[i] = new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
             }
-            this.size = size;
-            this.type = (opts && opts.type) ? String(opts.type).toLowerCase() : "";
+            const slots = internalsFor(this);
+            slots.blob = true;
+            slots.parts = list;
+            let size = 0;
+            for (const part of list) size += blobPartByteLength(part);
+            slots.size = size;
+            slots.type = opts && opts.type !== undefined ? blobTypeString(idlDOMString(opts.type)) : "";
         }
-        // File API §slice: negative offsets are size-relative, the range is
-        // clamped, and the slice carries the given content type (or "").
+        get size() { return blobSlots(this).size; }
+        get type() { return blobSlots(this).type; }
+        // File API #dfn-slice / #slice-blob: negative offsets are
+        // size-relative, the range is clamped, and the slice carries the
+        // given content type (or "").
         slice(start, end, contentType) {
-            const bytes = __blobBytes(this);
-            const size = bytes.length;
+            const size = blobSlots(this).size;
             let s = start === undefined ? 0 : Math.trunc(+start) || 0;
             let e = end === undefined ? size : Math.trunc(+end) || 0;
             if (s < 0) s = Math.max(size + s, 0); else s = Math.min(s, size);
             if (e < 0) e = Math.max(size + e, 0); else e = Math.min(e, size);
-            const span = Math.max(e - s, 0);
-            return new g.Blob([__latin1ToBytes(bytes.slice(s, s + span))],
-                { type: contentType === undefined ? "" : String(contentType).toLowerCase() });
+            return new g.Blob(e > s ? sliceBlobParts(internalsOf(this).parts, s, e, []) : [],
+                { type: contentType === undefined ? "" : blobTypeString(contentType) });
         }
-        text() { return Promise.resolve(new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(this)))); }
-        arrayBuffer() { return Promise.resolve(__latin1ToBytes(__blobBytes(this)).buffer); }
+        // #text-method-algo, #arraybuffer-method-algo, #bytes-method-algo: a
+        // read failure rejects the promise.
+        text() {
+            blobSlots(this);
+            try { return Promise.resolve(new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(this)))); }
+            catch (error) { return Promise.reject(error); }
+        }
+        arrayBuffer() {
+            blobSlots(this);
+            try { return Promise.resolve(__latin1ToBytes(__blobBytes(this)).buffer); }
+            catch (error) { return Promise.reject(error); }
+        }
+        bytes() {
+            blobSlots(this);
+            try { return Promise.resolve(__latin1ToBytes(__blobBytes(this))); }
+            catch (error) { return Promise.reject(error); }
+        }
+        // #stream-method-algo / get stream: chunks are read on demand, so a
+        // selected file streams in bounded pieces; a failed read errors the
+        // stream.
         stream() {
-            const bytes = __latin1ToBytes(__blobBytes(this));
+            blobSlots(this);
+            const leaves = blobLeafParts(this);
+            let index = 0, offset = 0;
             return new g.ReadableStream({
-                start(c) { if (bytes.length) c.enqueue(bytes); c.close(); },
+                pull(controller) {
+                    while (index < leaves.length) {
+                        const part = leaves[index];
+                        const host = typeof part === "object" && part !== null ? internalsOf(part).hostFile : null;
+                        if (host) {
+                            const from = host.start + offset, to = Math.min(host.end, from + BLOB_STREAM_CHUNK);
+                            if (from >= host.end) { index++; offset = 0; continue; }
+                            const bytes = host.read({id: host.id, start: from, end: to});
+                            offset += to - from;
+                            controller.enqueue(__latin1ToBytes(bytes));
+                            return;
+                        }
+                        index++;
+                        const bytes = blobPartBytes(part);
+                        if (bytes.length) { controller.enqueue(bytes.slice()); return; }
+                    }
+                    controller.close();
+                },
             });
         }
     };
+    for (const name of ["size", "type", "slice", "text", "arrayBuffer", "bytes", "stream"])
+        Object.defineProperty(g.Blob.prototype, name, {
+            ...Object.getOwnPropertyDescriptor(g.Blob.prototype, name), enumerable: true,
+        });
+    Object.defineProperty(g.Blob.prototype, Symbol.toStringTag, {value: "Blob", configurable: true});
+    // File API #file-section. Entries API #file-interface adds
+    // webkitRelativePath: a file selected with a directory carries its path
+    // from (and including) that directory; other files return "".
     g.File = class File extends g.Blob {
-        constructor(parts, name, opts) { super(parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
+        constructor(parts, name, opts) {
+            if (arguments.length < 2) throw new TypeError("File constructor requires 2 arguments");
+            super(parts, opts);
+            const slots = internalsFor(this);
+            slots.name = idlUSVString(name);
+            let lastModified = Date.now();
+            if (opts && opts.lastModified !== undefined) {
+                const number = Number(opts.lastModified);
+                lastModified = Number.isFinite(number) ? Math.trunc(number) : 0;
+            }
+            slots.lastModified = lastModified;
+            slots.relativePath = "";
+        }
+        get name() { const slots = blobSlots(this); if (slots.name === undefined) throw new TypeError("Illegal invocation"); return slots.name; }
+        get lastModified() { const slots = blobSlots(this); if (slots.name === undefined) throw new TypeError("Illegal invocation"); return slots.lastModified; }
+        get webkitRelativePath() { const slots = blobSlots(this); if (slots.name === undefined) throw new TypeError("Illegal invocation"); return slots.relativePath; }
     };
-    // File API #filelist-section: a static, indexed list of File objects,
-    // not constructible by script. TRust has no file chooser yet, so a file
-    // input's selected files stay empty. Libraries test `instanceof FileList`
-    // while preparing requests (Inertia's router does on every visit), so a
-    // missing interface aborted their link navigation with a ReferenceError.
-    const FILE_LIST_FILES = new WeakMap();
+    for (const name of ["name", "lastModified", "webkitRelativePath"])
+        Object.defineProperty(g.File.prototype, name, {
+            ...Object.getOwnPropertyDescriptor(g.File.prototype, name), enumerable: true,
+        });
+    Object.defineProperty(g.File.prototype, Symbol.toStringTag, {value: "File", configurable: true});
+    // A File for one user-selected file record from the host:
+    // [id, name, type, size, lastModified | null, relativePath, isDirectory].
+    // File API #dfn-lastModified: an unknown modification time reads as now.
+    // A directory item (a dropped directory) is a zero-length File (Entries
+    // API #html-data).
+    function createUserFile(record) {
+        const file = new g.File([], record[1], {type: record[2],
+            lastModified: record[4] === null ? Date.now() : record[4]});
+        const slots = internalsFor(file);
+        if (!record[6] && record[3] > 0) {
+            slots.parts = [hostFilePart(record[0], 0, record[3])];
+            slots.size = record[3];
+        }
+        slots.relativePath = String(record[5] || "");
+        slots.userFile = record[0];
+        slots.userDirectory = !!record[6];
+        return file;
+    }
+    // File API #filelist-section: an indexed list of File objects, not
+    // constructible by script. A file input's list is fixed for its current
+    // selection; DataTransfer#files is live, refreshed whenever its drag
+    // data store changes. The files live in the shared internal slots, so a
+    // FileList from another Window of this Agent converts like any platform
+    // object. Libraries test `instanceof FileList` while preparing requests
+    // (Inertia's router does on every visit).
     const fileListToken = Symbol("FileList");
     const fileListFiles = (list) => {
-        const files = FILE_LIST_FILES.get(list);
+        const files = internalsOf(list).fileListFiles;
         if (!files) throw new TypeError("Illegal invocation");
         return files;
     };
+    function setFileListFiles(list, files) {
+        const slots = internalsFor(list), old = slots.fileListFiles || [];
+        for (let i = files.length; i < old.length; i++) delete list[i];
+        slots.fileListFiles = files;
+        files.forEach((file, index) => Object.defineProperty(list, index, {
+            value: file, enumerable: true, configurable: true,
+        }));
+    }
     class FileList {
         constructor(...args) {
             if (args[0] !== fileListToken) throw new TypeError("Illegal constructor");
-            const files = Array.from(args[1] || []);
-            FILE_LIST_FILES.set(this, files);
-            files.forEach((file, index) => Object.defineProperty(this, index, {
-                value: file, enumerable: true, configurable: true,
-            }));
+            setFileListFiles(this, Array.from(args[1] || []));
         }
         get length() { return fileListFiles(this).length; }
         item(index) {
@@ -20549,10 +20748,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     Object.defineProperty(FileList.prototype, Symbol.iterator, {
         value: Array.prototype[Symbol.iterator], writable: true, configurable: true,
     });
+    for (const name of ["length", "item"])
+        Object.defineProperty(FileList.prototype, name, {
+            ...Object.getOwnPropertyDescriptor(FileList.prototype, name), enumerable: true,
+        });
     g.FileList = FileList;
-    // HTML #dom-input-files: a file input exposes its selected files as one
-    // FileList object (null for other types); setting it to a FileList
-    // replaces the selection.
+    internalsFor(FileList).createFileList = (files) => new FileList(fileListToken, files);
     // HTML #dom-iscontenteditable and #dom-contenteditable: an element is
     // editable inside an editing host, unless a `contenteditable=false`
     // boundary intervenes. Inertia's link interception also reads
@@ -20606,23 +20807,568 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
         enumerable: true, configurable: true,
     });
-    const INPUT_FILE_LISTS = new WeakMap();
+    // HTML #file-upload-state-(type=file) (local whatwg/html@e5071a2). An
+    // input's selected files are File objects in its internal slots; the
+    // arena keeps their names for the control's rendering and its
+    // filename-mode value (#dom-input-value-filename, "C:\fakepath\" + the
+    // first name). #dom-input-files returns one FileList until the selection
+    // changes; setting it replaces the selection with the given list's files.
+    function inputSelectedFiles(input) { return internalsOf(input).selectedFiles || []; }
+    function setInputSelectedFiles(input, files) {
+        const slots = internalsFor(input);
+        slots.selectedFiles = files.slice();
+        slots.fileList = null;
+        __dom_input(elementIdentity(input), "files-set", files.map((file) => internalsOf(file).name));
+    }
     Object.defineProperty(g.HTMLInputElement.prototype, "files", {
         get() {
             requireHTMLInterface(this, ["input"]);
-            if (this.type !== "file") return null;
-            let list = INPUT_FILE_LISTS.get(this);
-            if (!list) INPUT_FILE_LISTS.set(this, list = new FileList(fileListToken, []));
-            return list;
+            if (inputTypeOf(this) !== "file") return null;
+            const slots = internalsFor(this);
+            if (!slots.fileList) slots.fileList = new FileList(fileListToken, inputSelectedFiles(this));
+            return slots.fileList;
         },
         set(value) {
             requireHTMLInterface(this, ["input"]);
-            if (this.type !== "file" || value === null) return;
-            if (!(value instanceof FileList)) throw new TypeError("files must be a FileList");
-            INPUT_FILE_LISTS.set(this, value);
+            // Web IDL: FileList? converts before the setter steps run.
+            if (value === undefined) value = null;
+            if (value !== null && !internalsOf(value).fileListFiles) throw new TypeError("files must be a FileList");
+            if (inputTypeOf(this) !== "file" || value === null) return;
+            setInputSelectedFiles(this, fileListFiles(value));
         },
         enumerable: true, configurable: true,
     });
+    // File and Directory Entries API #html-forms: webkitdirectory is a
+    // reflected boolean attribute; the picker then selects a directory.
+    Object.defineProperty(g.HTMLInputElement.prototype, "webkitdirectory", {
+        get() { requireHTMLInterface(this, ["input"]); return messageApply(elementGetAttribute, this, ["webkitdirectory"]) !== null; },
+        set(value) {
+            requireHTMLInterface(this, ["input"]);
+            if (value) this.setAttribute("webkitdirectory", ""); else this.removeAttribute("webkitdirectory");
+        },
+        enumerable: true, configurable: true,
+    });
+    // A File's own data and metadata in a new File object (HTML
+    // #dom-datatransferitem-getasfile returns a new object each time).
+    function copyFile(file) {
+        const source = internalsOf(file);
+        const copy = new g.File([], source.name, {type: source.type, lastModified: source.lastModified});
+        const slots = internalsFor(copy);
+        slots.parts = source.parts.slice(); slots.size = source.size;
+        slots.relativePath = source.relativePath;
+        if (source.userFile !== undefined) { slots.userFile = source.userFile; slots.userDirectory = source.userDirectory; }
+        return copy;
+    }
+    // HTML #update-the-file-selection: queue an element task on the user
+    // interaction task source that sets the selection and fires `input`
+    // (bubbles, composed) and `change` (bubbles). Re-choosing exactly the
+    // current files counts as a dismissal, which fires `cancel`
+    // (#show-the-picker,-if-applicable lets the user agent decide).
+    function sameUserFiles(current, files) {
+        return current.length === files.length && current.every((file, index) =>
+            internalsOf(file).userFile !== undefined && internalsOf(file).userFile === internalsOf(files[index]).userFile);
+    }
+    function applyFileSelection(input, files, fromPicker) {
+        if (fromPicker && sameUserFiles(inputSelectedFiles(input), files)) {
+            dispatch(input, createTrustedEvent(Event, "cancel", {bubbles: true}), false);
+            return;
+        }
+        setInputSelectedFiles(input, files);
+        dispatch(input, createTrustedEvent(Event, "input", {bubbles: true, composed: true}), false);
+        dispatch(input, createTrustedEvent(Event, "change", {bubbles: true}), false);
+    }
+    // HTML #show-the-picker,-if-applicable step 5 for a File Upload control,
+    // "in parallel": the frontend displays its prompt (one at a time) and the
+    // answer settles here. A dismissed prompt fires `cancel` (bubbles);
+    // otherwise the user's choice updates the selection. Without `multiple`
+    // the host keeps no more than one file.
+    function showFilePicker(element) {
+        const frame = trust.__activeFrame || null;
+        const accept = messageApply(elementGetAttribute, element, ["accept"]);
+        const multiple = messageApply(elementGetAttribute, element, ["multiple"]) !== null;
+        const directory = messageApply(elementGetAttribute, element, ["webkitdirectory"]) !== null;
+        __file_picker(accept === null ? "" : accept, multiple, directory, (records) => {
+            __queue_dom_task(() => {
+                if (records === null) {
+                    dispatch(element, createTrustedEvent(Event, "cancel", {bubbles: true}), false);
+                    return;
+                }
+                const files = [];
+                for (let i = 0; i < records.length; i++) files.push(createUserFile(records[i]));
+                applyFileSelection(element, files, true);
+            }, frame);
+        });
+    }
+    // HTML #show-the-picker,-if-applicable: requires transient activation and
+    // a mutable element, consumes the activation, then shows the element's
+    // picker. A File Upload control always supports one; other controls
+    // present their choices through the focused native editor.
+    function showPickerIfApplicable(element) {
+        const windowState = activeWindowState();
+        if (!hasTransientActivation(windowState)) return;
+        const name = htmlElementName(element);
+        const mutable = name === "input" ? __dom_input(elementIdentity(element), "mutable", null) === true
+            : !isActuallyDisabled(element);
+        if (!mutable) return;
+        if (windowState.lastActivation !== Infinity) windowState.lastActivation = -Infinity;
+        if (topWindowState.lastActivation !== Infinity) topWindowState.lastActivation = -Infinity;
+        if (name === "input" && inputTypeOf(element) === "file") showFilePicker(element);
+        else trust.focusPage(elementIdentity(element));
+    }
+
+    // HTML #the-drag-data-store and #the-datatransfer-interface. A drag data
+    // store holds its item list ({kind: "text" | "file", type, data}), mode
+    // ("rw" read/write, "ro" read-only, "p" protected), allowed effects state
+    // and the drag image set by setDragImage(). A file item's data is a File,
+    // or for files dragged in from another application a host record that
+    // each Realm turns into its own File. DataTransfer objects created for a
+    // DND event lose their store when the event's dispatch ends.
+    function createDragDataStore() {
+        return {items: [], mode: "p", allowedEffects: "uninitialized", bitmap: null, hotSpot: null, transfers: new Set()};
+    }
+    const DROP_EFFECTS = ["none", "copy", "link", "move"];
+    const EFFECTS_ALLOWED = ["none", "copy", "copyLink", "copyMove", "link", "linkMove", "move", "all", "uninitialized"];
+    function dataTransferState(object) {
+        const state = internalsOf(object).dataTransfer;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function dataTransferFile(state, item) {
+        if (internalsOf(item.data).blob) return item.data;
+        let file = state.fileObjects.get(item);
+        if (!file) state.fileObjects.set(item, file = createUserFile(item.data));
+        return file;
+    }
+    function dataTransferItemObject(state, item) {
+        let object = state.itemObjects.get(item);
+        if (!object) {
+            object = Object.create(DataTransferItem.prototype);
+            internalsFor(object).dataTransferItem = {transfer: state, item};
+            state.itemObjects.set(item, object);
+        }
+        return object;
+    }
+    // HTML #concept-DataTransfer-types, #dom-datatransfer-files (live) and
+    // the DataTransferItemList's supported property indices, recomputed when
+    // the item list changes or the association with the store ends.
+    function syncDataTransfer(state) {
+        const store = state.store, types = [], files = [], items = [];
+        if (store) {
+            for (const item of store.items) if (item.kind === "text") types.push(item.type);
+            if (store.items.some((item) => item.kind === "file")) types.push("Files");
+            for (const item of store.items) {
+                items.push(dataTransferItemObject(state, item));
+                if (item.kind === "file" && store.mode !== "p" && item.data) files.push(dataTransferFile(state, item));
+            }
+        }
+        if (types.length !== state.typeList.length || types.some((type, i) => type !== state.typeList[i])) {
+            state.typeList = types;
+            state.types = Object.freeze(types.slice());
+        }
+        setFileListFiles(state.files, files);
+        const list = state.itemList, old = internalsOf(list).dataTransferItems || [];
+        for (let i = items.length; i < old.length; i++) delete list[i];
+        internalsFor(list).dataTransferItems = items;
+        items.forEach((object, index) => Object.defineProperty(list, index, {
+            value: object, enumerable: true, configurable: true,
+        }));
+    }
+    function syncDragDataStore(store) {
+        for (const state of store.transfers) syncDataTransfer(state);
+    }
+    function createDataTransfer(store) {
+        const object = Object.create(DataTransfer.prototype);
+        const itemList = Object.create(DataTransferItemList.prototype);
+        const state = {store, dropEffect: "none", effectAllowed: "none", itemList, typeList: [],
+            types: Object.freeze([]), files: new FileList(fileListToken, []), fileObjects: new Map(),
+            itemObjects: new Map()};
+        internalsFor(object).dataTransfer = state;
+        internalsFor(itemList).dataTransferItemList = state;
+        store.transfers.add(state);
+        syncDataTransfer(state);
+        return object;
+    }
+    function dissociateDataTransfer(object) {
+        const state = internalsOf(object).dataTransfer;
+        if (!state || !state.store) return;
+        state.store.transfers.delete(state);
+        state.store = null;
+        syncDataTransfer(state);
+    }
+    // getData/setData/clearData's format normalization.
+    function dragDataFormat(format) {
+        format = asciiLower(idlDOMString(format));
+        return format === "text" ? "text/plain" : format === "url" ? "text/uri-list" : format;
+    }
+    class DataTransfer {
+        // HTML #dom-datatransfer: a new store in read/write mode;
+        // dropEffect and effectAllowed are "none".
+        constructor() {
+            const store = createDragDataStore();
+            store.mode = "rw";
+            const object = createDataTransfer(store);
+            Object.setPrototypeOf(object, new.target.prototype);
+            return object;
+        }
+        get dropEffect() { return dataTransferState(this).dropEffect; }
+        set dropEffect(value) {
+            const state = dataTransferState(this);
+            value = idlDOMString(value);
+            if (DROP_EFFECTS.includes(value)) state.dropEffect = value;
+        }
+        get effectAllowed() { return dataTransferState(this).effectAllowed; }
+        set effectAllowed(value) {
+            const state = dataTransferState(this);
+            value = idlDOMString(value);
+            if (state.store && state.store.mode === "rw" && EFFECTS_ALLOWED.includes(value)) state.effectAllowed = value;
+        }
+        get items() { return dataTransferState(this).itemList; }
+        setDragImage(image, x, y) {
+            const state = dataTransferState(this);
+            if (arguments.length < 3) throw new TypeError("setDragImage requires 3 arguments");
+            image = idlElement(image); x = idlLong(x); y = idlLong(y);
+            if (!state.store || state.store.mode !== "rw") return;
+            state.store.bitmap = image;
+            state.store.hotSpot = [x, y];
+        }
+        get types() { return dataTransferState(this).types; }
+        getData(format) {
+            const state = dataTransferState(this);
+            if (arguments.length < 1) throw new TypeError("getData requires 1 argument");
+            format = idlDOMString(format);
+            if (!state.store || state.store.mode === "p") return "";
+            let convertToURL = false;
+            format = asciiLower(format);
+            if (format === "text") format = "text/plain";
+            if (format === "url") { format = "text/uri-list"; convertToURL = true; }
+            const item = state.store.items.find((entry) => entry.kind === "text" && entry.type === format);
+            if (!item) return "";
+            let result = item.data;
+            // RFC 2483 text/uri-list: lines beginning with "#" are comments;
+            // the first URL, if any.
+            if (convertToURL) {
+                const urls = result.split(/\r\n|\r|\n/).map((line) => line.trim()).filter((line) => line && line[0] !== "#");
+                result = urls.length ? urls[0] : "";
+            }
+            return result;
+        }
+        setData(format, data) {
+            const state = dataTransferState(this);
+            if (arguments.length < 2) throw new TypeError("setData requires 2 arguments");
+            format = dragDataFormat(format); data = idlDOMString(data);
+            if (!state.store || state.store.mode !== "rw") return;
+            const store = state.store;
+            store.items = store.items.filter((item) => !(item.kind === "text" && item.type === format));
+            store.items.push({kind: "text", type: format, data});
+            syncDragDataStore(store);
+        }
+        clearData(format = undefined) {
+            const state = dataTransferState(this);
+            if (format !== undefined) format = dragDataFormat(format);
+            if (!state.store || state.store.mode !== "rw") return;
+            const store = state.store;
+            store.items = store.items.filter((item) => item.kind !== "text" || (format !== undefined && item.type !== format));
+            syncDragDataStore(store);
+        }
+        get files() { return dataTransferState(this).files; }
+    }
+    class DataTransferItemList {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get length() {
+            const state = internalsOf(this).dataTransferItemList;
+            if (!state) throw new TypeError("Illegal invocation");
+            return state.store ? state.store.items.length : 0;
+        }
+        // HTML #dom-datatransferitemlist-add: (DOMString data, DOMString type)
+        // or (File data), chosen by argument count (Web IDL overload
+        // resolution).
+        add(data, type) {
+            const state = internalsOf(this).dataTransferItemList;
+            if (!state) throw new TypeError("Illegal invocation");
+            if (arguments.length < 1) throw new TypeError("add requires at least 1 argument");
+            let item;
+            if (arguments.length === 1) {
+                const slots = internalsOf(data);
+                if (!slots.blob || slots.name === undefined) throw new TypeError("The value is not a File");
+                if (!state.store || state.store.mode !== "rw") return null;
+                item = {kind: "file", type: asciiLower(slots.type), data};
+            } else {
+                data = idlDOMString(data); type = idlDOMString(type);
+                if (!state.store || state.store.mode !== "rw") return null;
+                type = asciiLower(type);
+                if (state.store.items.some((entry) => entry.kind === "text" && entry.type === type))
+                    throw new DOMException("An item of this type already exists", "NotSupportedError");
+                item = {kind: "text", type, data};
+            }
+            state.store.items.push(item);
+            syncDragDataStore(state.store);
+            return dataTransferItemObject(state, item);
+        }
+        remove(index) {
+            const state = internalsOf(this).dataTransferItemList;
+            if (!state) throw new TypeError("Illegal invocation");
+            if (arguments.length < 1) throw new TypeError("remove requires 1 argument");
+            index = idlUnsignedLong(index);
+            if (!state.store || state.store.mode !== "rw")
+                throw new DOMException("The drag data store is not in read/write mode", "InvalidStateError");
+            if (index >= state.store.items.length) return;
+            state.store.items.splice(index, 1);
+            syncDragDataStore(state.store);
+        }
+        clear() {
+            const state = internalsOf(this).dataTransferItemList;
+            if (!state) throw new TypeError("Illegal invocation");
+            if (!state.store || state.store.mode !== "rw") return;
+            state.store.items = [];
+            syncDragDataStore(state.store);
+        }
+    }
+    Object.defineProperty(DataTransferItemList.prototype, Symbol.iterator, {
+        value: Array.prototype[Symbol.iterator], writable: true, configurable: true,
+    });
+    // HTML #the-datatransferitem-interface: an item's mode is its store's
+    // while the DataTransfer is associated and the item is still listed,
+    // else "disabled".
+    function dataTransferItemMode(object) {
+        const record = internalsOf(object).dataTransferItem;
+        if (!record) throw new TypeError("Illegal invocation");
+        const store = record.transfer.store;
+        return store && store.items.includes(record.item) ? store.mode : "disabled";
+    }
+    class DataTransferItem {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get kind() {
+            if (dataTransferItemMode(this) === "disabled") return "";
+            return internalsOf(this).dataTransferItem.item.kind === "text" ? "string" : "file";
+        }
+        get type() {
+            if (dataTransferItemMode(this) === "disabled") return "";
+            return internalsOf(this).dataTransferItem.item.type;
+        }
+        getAsString(callback) {
+            const mode = dataTransferItemMode(this);
+            if (arguments.length < 1) throw new TypeError("getAsString requires 1 argument");
+            if (callback !== null && callback !== undefined && typeof callback !== "function")
+                throw new TypeError("The callback is not a function");
+            if (callback === null || callback === undefined) return;
+            if (mode !== "rw" && mode !== "ro") return;
+            const item = internalsOf(this).dataTransferItem.item;
+            if (item.kind !== "text") return;
+            const data = item.data;
+            __queue_dom_task(() => {
+                try { messageApply(callback, undefined, [data]); }
+                catch (error) { reportException(error, "DataTransferItem callback"); }
+            });
+        }
+        getAsFile() {
+            const mode = dataTransferItemMode(this);
+            if (mode !== "rw" && mode !== "ro") return null;
+            const record = internalsOf(this).dataTransferItem, item = record.item;
+            if (item.kind !== "file" || !item.data) return null;
+            return copyFile(dataTransferFile(record.transfer, item));
+        }
+    }
+    for (const C of [DataTransfer, DataTransferItemList, DataTransferItem]) {
+        for (const name of Object.getOwnPropertyNames(C.prototype)) {
+            if (name === "constructor") continue;
+            Object.defineProperty(C.prototype, name, {...Object.getOwnPropertyDescriptor(C.prototype, name), enumerable: true});
+        }
+        Object.defineProperty(C.prototype, Symbol.toStringTag, {value: C.name, configurable: true});
+        g[C.name] = C;
+    }
+
+    // HTML #fire-a-dnd-event at an element of this Realm. `pointer` holds the
+    // viewport/screen position and modifier bits; `operation` is the current
+    // drag operation (drop and dragend report it as the dropEffect).
+    function fireDndEvent(element, e, store, relatedTarget, pointer, operation) {
+        let storeChanged = false;
+        if (e === "dragstart") { store.mode = "rw"; storeChanged = true; }
+        if (e === "drop") store.mode = "ro";
+        const dataTransfer = createDataTransfer(store);
+        const state = internalsOf(dataTransfer).dataTransfer;
+        state.effectAllowed = store.allowedEffects;
+        if (e === "dragstart" || e === "drag" || e === "dragleave") state.dropEffect = "none";
+        else if (e === "drop" || e === "dragend") state.dropEffect = operation;
+        else {
+            // The dragenter/dragover table; a drag from another application
+            // is "any other case": copy.
+            const allowed = store.allowedEffects;
+            state.dropEffect = allowed === "none" ? "none" : allowed === "link" || allowed === "linkMove" ? "link"
+                : allowed === "move" ? "move" : "copy";
+        }
+        const bits = pointer.modifiers | 0;
+        const event = createTrustedEvent(DragEvent, e, {
+            bubbles: true, cancelable: e !== "dragleave" && e !== "dragend", composed: true, view: g,
+            relatedTarget, dataTransfer, detail: 0, button: 0, buttons: 0,
+            clientX: pointer.x, clientY: pointer.y, screenX: pointer.screenX, screenY: pointer.screenY,
+            shiftKey: !!(bits & 1), ctrlKey: !!(bits & 2), altKey: !!(bits & 4), metaKey: !!(bits & 8),
+            pageX: pointer.x + (g.scrollX || 0), pageY: pointer.y + (g.scrollY || 0),
+        });
+        dispatch(element, event, false);
+        store.allowedEffects = state.effectAllowed;
+        if (storeChanged) store.mode = "p";
+        const result = {canceled: event.defaultPrevented, dropEffect: state.dropEffect, effectAllowed: state.effectAllowed};
+        dissociateDataTransfer(dataTransfer);
+        return result;
+    }
+    // A mutable File Upload control takes dropped files as a change of its
+    // selection (HTML #file-upload-state: "the user agent should allow the
+    // user to change the files on the list in other ways also, e.g., adding
+    // or removing files by drag-and-drop"), so like a text control receiving
+    // text it becomes the drop target and its drop default selects the files.
+    function dndFileInput(element, store) {
+        return htmlElementName(element) === "input" && inputTypeOf(element) === "file" &&
+            __dom_input(elementIdentity(element), "mutable", null) === true &&
+            store.items.some((item) => item.kind === "file");
+    }
+    // The immediate user selection under a viewport point, descending into
+    // child navigables; only elements can be selected (text resolves to its
+    // parent, empty space to the document element).
+    function dndResolve(id, x, y, screenX, screenY, modifiers) {
+        id = nativeFrameContentHit(id, x, y);
+        const childFrame = nativeInputChildFrame(id);
+        if (childFrame) {
+            const child = internalsOf(childFrame).contentRealmWindow;
+            const rect = frameContentClientRect(childFrame);
+            if (child) return trustOf(child).dndResolve(id, x - rect.left, y - rect.top, screenX, screenY, modifiers);
+        }
+        let node = id === null || id === undefined ? null : wrap(id);
+        while (node && node.nodeType !== 1) node = node.parentNode;
+        if (!node) node = g.document.documentElement;
+        return node ? {owner: trust, element: node, pointer: {x, y, screenX, screenY, modifiers}} : null;
+    }
+    trust.dndResolve = dndResolve;
+    // The dragenter step of #drag-and-drop-processing-model for an immediate
+    // user selection in this Realm: the new current target element, or
+    // `undefined` to leave the current target unchanged.
+    trust.dndEnter = function (element, store, pointer) {
+        if (fireDndEvent(element, "dragenter", store, null, pointer, "none").canceled) return element;
+        if (dndFileInput(element, store)) return element;
+        const body = g.document.body;
+        if (element === body) return undefined;
+        fireDndEvent(body || g.document, "dragenter", store, null, pointer, "none");
+        return body || null;
+    };
+    trust.dndFire = function (element, e, store, relatedTarget, pointer, operation) {
+        return fireDndEvent(element, e, store, relatedTarget, pointer, operation);
+    };
+    trust.dndFileInput = dndFileInput;
+    // The drop event's default action at a File Upload control: update the
+    // file selection with the dropped files (a webkitdirectory control takes
+    // every file below dropped directories; without `multiple`, the first).
+    trust.dndDropFiles = function (element, store) {
+        let files = [];
+        const directory = messageApply(elementGetAttribute, element, ["webkitdirectory"]) !== null;
+        for (const item of store.items) {
+            if (item.kind !== "file" || !item.data) continue;
+            const record = item.data;
+            if (internalsOf(record).blob) { files.push(record); continue; }
+            if (directory && record[6]) {
+                const expanded = __file_expand(record[0]);
+                if (expanded.length && typeof expanded[0] === "string") {
+                    trust.errors.push("file drop: " + expanded[1]);
+                    continue;
+                }
+                for (let i = 0; i < expanded.length; i++) files.push(createUserFile(expanded[i]));
+            } else if (!directory) files.push(createUserFile(record));
+        }
+        if (messageApply(elementGetAttribute, element, ["multiple"]) === null) files = files.slice(0, 1);
+        if (!files.length) return;
+        __queue_dom_task(() => applyFileSelection(element, files, false));
+    };
+    // HTML #drag-and-drop-processing-model for a drag of native files from
+    // another application ("the drag actually started in another document or
+    // application"): the source node is outside the page, so no dragstart,
+    // drag or dragend events fire here. The frontend reports the drag's
+    // start (the item type strings), each iteration's pointer position, the
+    // drop (with the files, which become readable only now: the store is in
+    // protected mode until the drop event's read-only mode), or its end.
+    let fileDragSession = null;
+    function sameDragTarget(a, b) {
+        return a === b || (!!a && !!b && a.element === b.element);
+    }
+    function dragIteration(session, target) {
+        const element = target ? target.element : null;
+        if (session.first || element !== session.immediate) {
+            session.first = false;
+            session.immediate = element;
+            if (!sameDragTarget(target, session.current)) {
+                let next = session.current;
+                if (!target) next = null;
+                else {
+                    const entered = target.owner.dndEnter(element, session.store, target.pointer);
+                    if (entered !== undefined) next = entered ? {owner: target.owner, element: entered, pointer: target.pointer} : null;
+                }
+                if (!sameDragTarget(next, session.current)) {
+                    const previous = session.current;
+                    session.current = next;
+                    if (previous) {
+                        const related = next && next.owner === previous.owner ? next.element : null;
+                        previous.owner.dndFire(previous.element, "dragleave", session.store, related, previous.pointer, "none");
+                    }
+                }
+            }
+        }
+        const current = session.current;
+        if (!current) { session.operation = "none"; return; }
+        if (target && target.owner === current.owner) current.pointer = target.pointer;
+        const over = current.owner.dndFire(current.element, "dragover", session.store, null, current.pointer, "none");
+        if (!over.canceled) {
+            session.operation = current.owner.dndFileInput(current.element, session.store) ? "copy" : "none";
+            return;
+        }
+        const allowed = over.effectAllowed, effect = over.dropEffect;
+        session.operation =
+            effect === "copy" && ["uninitialized", "copy", "copyLink", "copyMove", "all"].includes(allowed) ? "copy"
+            : effect === "link" && ["uninitialized", "link", "copyLink", "linkMove", "all"].includes(allowed) ? "link"
+            : effect === "move" && ["uninitialized", "move", "copyMove", "linkMove", "all"].includes(allowed) ? "move"
+            : "none";
+    }
+    function finishDrag(session) {
+        const current = session.current;
+        if (session.operation === "none" || !current) {
+            if (current) current.owner.dndFire(current.element, "dragleave", session.store, null, current.pointer, "none");
+            session.operation = "none";
+            return;
+        }
+        const drop = current.owner.dndFire(current.element, "drop", session.store, null, current.pointer, session.operation);
+        if (drop.canceled) {
+            session.operation = drop.dropEffect;
+            return;
+        }
+        if (current.owner.dndFileInput(current.element, session.store))
+            current.owner.dndDropFiles(current.element, session.store);
+        else session.operation = "none";
+    }
+    trust.fileDrag = function (phase, id, x, y, screenX, screenY, modifiers, records) {
+        if (phase === "enter") {
+            const store = createDragDataStore();
+            const types = Array.isArray(id) ? id : [];
+            for (let i = 0; i < types.length; i++)
+                store.items.push({kind: "file", type: asciiLower(String(types[i])), data: null});
+            fileDragSession = {store, current: null, immediate: null, first: true, operation: "none"};
+            return;
+        }
+        const session = fileDragSession;
+        if (!session) return;
+        if (phase === "leave") {
+            // The drag left the page for another application: the immediate
+            // user selection is outside the DOM and the drag ends here.
+            fileDragSession = null;
+            dragIteration(session, null);
+            return;
+        }
+        const target = dndResolve(id, +x || 0, +y || 0, +screenX || 0, +screenY || 0, modifiers | 0);
+        if (phase === "over") { dragIteration(session, target); return; }
+        if (phase !== "drop") return;
+        fileDragSession = null;
+        if (Array.isArray(records)) {
+            session.store.items = records.map((record) => ({kind: "file",
+                type: record[6] ? "" : asciiLower(String(record[2] || "application/octet-stream")), data: record}));
+        }
+        dragIteration(session, target);
+        finishDrag(session);
+    };
     // Text -> its UTF-8 bytes as a binary (latin1) string, so btoa() and
     // ArrayBuffer views see real bytes (not surrogate-pair chars).
     const utf8Binary = (s) => {
@@ -20739,7 +21485,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 self.result = r; self.readyState = 2;
                 readerFire.call(self, "progress"); readerFire.call(self, "load"); readerFire.call(self, "loadend");
             } catch (e) {
-                self.error = g.DOMException ? new g.DOMException(String((e && e.message) || e), "NotReadableError") : e;
+                // File API #dfn-error-codes: a selected file's failed read
+                // keeps its NotFoundError/NotReadableError.
+                self.error = e instanceof g.DOMException ? e
+                    : g.DOMException ? new g.DOMException(String((e && e.message) || e), "NotReadableError") : e;
                 self.readyState = 2;
                 readerFire.call(self, "error"); readerFire.call(self, "loadend");
             }
@@ -28788,6 +29537,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // encoded, BufferSource parts raw, nested Blobs recursed. More faithful than
     // our string-backed Blob.arrayBuffer() (which leaves binary empty), so a blob
     // built from a Uint8Array still round-trips through createObjectURL+fetch.
+    // A host part (a selected file's byte range) is read here, and its read
+    // may throw the File API's NotFoundError/NotReadableError DOMException.
     function __blobBytes(b) {
         if (!b || !Array.isArray(internalsFor(b).parts)) return "";
         let out = "";
@@ -28795,6 +29546,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (typeof p === "string") out += utf8Binary(p);
             else if (p instanceof ArrayBuffer) { const v = new Uint8Array(p); for (let i = 0; i < v.length; i++) out += String.fromCharCode(v[i]); }
             else if (p && typeof p.byteLength === "number" && p.buffer) { const v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (let i = 0; i < v.length; i++) out += String.fromCharCode(v[i]); }
+            else if (p && internalsOf(p).hostFile) out += internalsOf(p).hostFile.read(internalsOf(p).hostFile);
             else if (p && Array.isArray(internalsFor(p).parts)) out += __blobBytes(p);
             else if (p != null) out += utf8Binary(String(p));
         }
@@ -29130,7 +29882,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // `"`/CR/LF in names and filenames percent-escape (%22/%0D/%0A), newlines
     // in string values normalize to CRLF, File parts carry their content type.
     // Returns the latin1 wire body plus the content type with its boundary.
-    const __formDataWire = (fd) => {
+    // With `segments`, a selected file's bytes are not read here: the body is
+    // a list of byte strings and [file id, start, end] ranges that the host
+    // reads when it sends a form navigation (bounded by its body limit).
+    const __formDataWire = (fd, segments = false) => {
         let boundary = "----TRustFormBoundary";
         for (let i = 0; i < 16; i++) boundary += "0123456789abcdef"[(Math.random() * 16) | 0];
         // HTML #multipart/form-data-encoding-algorithm: names (and
@@ -29138,6 +29893,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const escape = (s) => String(s).replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
         const escName = (s) => escape(String(s).replace(/\r\n|\r|\n/g, "\r\n"));
         let out = "";
+        const pieces = [];
         const es = internalsFor(fd).entries;
         for (let i = 0; i < es.length; i++) {
             const e = es[i];
@@ -29145,15 +29901,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (e.value && Array.isArray(internalsFor(e.value).parts)) { // File
                 out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"; filename="' + escape(e.value.name == null ? "blob" : e.value.name) + '"') + "\r\n";
                 out += "Content-Type: " + (e.value.type || "application/octet-stream") + "\r\n\r\n";
-                out += __blobBytes(e.value) + "\r\n";
+                if (!segments) out += __blobBytes(e.value);
+                else for (const part of blobLeafParts(e.value)) {
+                    const host = part && typeof part === "object" ? internalsOf(part).hostFile : null;
+                    if (!host) { out += __latin1FromBytes(blobPartBytes(part)); continue; }
+                    if (out) pieces.push(out);
+                    out = "";
+                    pieces.push([host.id, host.start, host.end]);
+                }
+                out += "\r\n";
             } else {
                 out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"') + "\r\n\r\n";
                 out += utf8Binary(String(e.value).replace(/\r\n|\r|\n/g, "\r\n")) + "\r\n";
             }
         }
         out += "--" + boundary + "--\r\n";
-        return { wire: out, type: "multipart/form-data; boundary=" + boundary };
+        const type = "multipart/form-data; boundary=" + boundary;
+        if (!pieces.length) return { wire: out, type };
+        pieces.push(out);
+        return { wire: pieces, type };
     };
+    function __latin1FromBytes(bytes) {
+        let out = "";
+        for (let i = 0; i < bytes.length; i += 8192)
+            out += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+        return out;
+    }
     // The DEFAULT content type a body implies when the request sets none
     // (Fetch §"BodyInit extract"): a string is text/plain, URLSearchParams is
     // its form-urlencoded serialization, a Blob carries its own type, and raw
@@ -31819,6 +32592,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (typeof p === "string") { v = new G.TextEncoder().encode(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
                 else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
                 else if (p && typeof p.byteLength === "number" && p.buffer) { v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+                // File API #serialization-steps copy the byte sequence: a
+                // selected file's range is read now (in the page realm, which
+                // installed the read closure); a failed read is not cloneable.
+                else if (p && codecSlots(p).hostFile) out += codecSlots(p).hostFile.read(codecSlots(p).hostFile);
                 else if (p && codecSlots(p).parts) out += blobBytes(p);
             }
             return out;
@@ -31872,6 +32649,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // HTML #structuredserializeinternal: other platform objects are not
             // serializable (DOMRectList, DOMStringList, TimeRanges, …).
             const platformSlots = apply(weakGet, codecSlotsMap, [v]);
+            // File API #filelist-section: a FileList is serializable; its
+            // serialization steps serialize each of its File objects.
+            if (platformSlots && platformSlots.fileListFiles) {
+                const files = [];
+                for (let i = 0; i < platformSlots.fileListFiles.length; i++)
+                    files.push(enc(platformSlots.fileListFiles[i], heap, seen, forStorage));
+                return ["FL", files];
+            }
             if (platformSlots && (platformSlots.rectListItems || platformSlots.domStringList ||
                     platformSlots.timeRanges || platformSlots.mediaQueryList ||
                     platformSlots.mediaQueryListEvent || platformSlots.locationObject))
@@ -32001,7 +32786,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 case "A": return new Array(node[1]);
                 case "O": return {};
             }
-            return null; // TA / DV: built in pass 2 (need the buffer ref resolved)
+            return null; // TA / DV / FL: built in pass 2 (need their referents resolved)
         }
         function decRef(val, built) {
             switch (val[0]) {
@@ -32023,6 +32808,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 var n = heap[i];
                 if (n[0] === "TA") built[i] = new G[n[1]](decRef(n[2], built), n[3], n[4]);
                 else if (n[0] === "DV") built[i] = new DataView(decRef(n[1], built), n[2], n[3]);
+                else if (n[0] === "FL") {
+                    // A Realm without FileList (this worker realm) gets its Files.
+                    const files = n[1].map((file) => decRef(file, built));
+                    const make = G.FileList && apply(weakGet, codecSlotsMap, [G.FileList]);
+                    built[i] = make && make.createFileList ? make.createFileList(files) : files;
+                }
             }
             // ImageData's typed-array referent now exists, including shared graph identity.
             // A DOMQuad's sub-deserialized points were built in pass 1.

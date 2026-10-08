@@ -146,6 +146,22 @@ pub enum FieldKind {
     Button,
     /// Restores controls to their markup defaults.
     Reset,
+    /// A File Upload control (HTML #file-upload-state): activation shows the
+    /// file picker. `label` summarizes the selected files.
+    File(FileControl),
+}
+
+/// A File Upload control's picker hints and, for a page without a live script
+/// realm (`set js off`), the files the frontend's picker selected for it. A
+/// live page keeps its selection in the page realm instead.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileControl {
+    /// HTML #attr-input-accept.
+    pub accept: String,
+    pub multiple: bool,
+    /// File and Directory Entries API `webkitdirectory`.
+    pub directory: bool,
+    pub files: Vec<crate::file_select::SelectedFile>,
 }
 
 /// Numeric constraints copied from a `type=number` control's attributes.
@@ -277,6 +293,9 @@ impl Field {
             // HTML Rendering §15.5.10: checkbox/radio widgets contain the
             // control itself, with no implicit label. An authored <label>
             // remains ordinary DOM content and is laid out separately.
+            // HTML Rendering #the-input-element-as-a-file-upload-control: a
+            // button to open the picker and the selected files' names.
+            FieldKind::File(_) => format!("{FILE_BUTTON_LABEL} {}", self.label),
             FieldKind::Checkbox => (if self.checked { "☑" } else { "☐" }).to_string(),
             FieldKind::Radio => (if self.checked { "◉" } else { "○" }).to_string(),
             FieldKind::Select(options) => {
@@ -325,6 +344,7 @@ impl Field {
                 };
                 format!("[ {label} ]")
             }
+            FieldKind::File(_) => format!("[ {FILE_BUTTON_LABEL} ] {}", self.label),
             FieldKind::Checkbox => {
                 // The name is this control's visible label here.
                 format!("[{}] {name}", if self.checked { "x" } else { " " })
@@ -361,22 +381,53 @@ impl Field {
     }
 }
 
+/// The label of a File Upload control's picker button.
+pub const FILE_BUTTON_LABEL: &str = "Browse…";
+
+/// The text a File Upload control shows for its selected files' names.
+pub fn file_selection_summary(names: &[String]) -> String {
+    match names {
+        [] => String::from("No file selected."),
+        [name] => name.clone(),
+        names => format!("{} files selected.", names.len()),
+    }
+}
+
 /// A parsed HTML form: where it goes and what it carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Form {
     pub method: FormMethod,
     pub action: url::Url,
+    /// HTML #concept-fs-enctype: `application/x-www-form-urlencoded`,
+    /// `multipart/form-data` or `text/plain`.
+    pub enctype: String,
     pub fields: Vec<Field>,
     /// Original `<form>` DOM node id inside the living page actor.
     pub live_node: Option<usize>,
 }
 
+/// One entry of a static form's entry list (HTML #constructing-the-form-data-set).
+enum EntryValue<'a> {
+    Text(&'a str),
+    /// A selected file, or `None` for the empty File an empty control submits.
+    File(Option<&'a crate::file_select::SelectedFile>),
+}
+
+/// HTML: replace each CR not followed by LF, and each LF not preceded by CR,
+/// with CRLF.
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
+}
+
 impl Form {
-    /// Serialize the successful fields urlencoded. `submitter` is the index of
-    /// the submit control that fired; `None` is the HTML `requestSubmit()`
-    /// no-argument case, where no submit button contributes a name/value pair.
-    pub fn encode(&self, submitter: Option<usize>) -> String {
-        let mut out = url::form_urlencoded::Serializer::new(String::new());
+    /// HTML #constructing-the-form-data-set over the painted controls. The
+    /// static model never holds disabled, datalist or nameless-image
+    /// controls; `submitter` is the index of the submit control that fired
+    /// (`None` is `requestSubmit()` without a submitter).
+    fn entry_list(&self, submitter: Option<usize>) -> Vec<(&str, EntryValue<'_>)> {
+        let mut entries = Vec::new();
         for (i, field) in self.fields.iter().enumerate() {
             if field.name.is_empty() {
                 continue;
@@ -384,10 +435,19 @@ impl Form {
             match &field.kind {
                 FieldKind::Submit => {
                     if Some(i) == submitter {
-                        out.append_pair(&field.name, &field.value);
+                        entries.push((field.name.as_str(), EntryValue::Text(&field.value)));
                     }
                 }
                 FieldKind::Button | FieldKind::Reset => {}
+                // An empty selection submits one empty File.
+                FieldKind::File(control) => {
+                    if control.files.is_empty() {
+                        entries.push((field.name.as_str(), EntryValue::File(None)));
+                    }
+                    for file in &control.files {
+                        entries.push((field.name.as_str(), EntryValue::File(Some(file))));
+                    }
+                }
                 FieldKind::Checkbox | FieldKind::Radio => {
                     if field.checked {
                         // "on" is the HTML default for value-less boxes.
@@ -396,15 +456,122 @@ impl Form {
                         } else {
                             &field.value
                         };
-                        out.append_pair(&field.name, value);
+                        entries.push((field.name.as_str(), EntryValue::Text(value)));
                     }
                 }
-                _ => {
-                    out.append_pair(&field.name, &field.value);
-                }
+                _ => entries.push((field.name.as_str(), EntryValue::Text(&field.value))),
             }
         }
+        entries
+    }
+
+    /// Serialize the successful fields urlencoded (a file entry becomes its
+    /// name, HTML #convert-to-a-list-of-name-value-pairs). `submitter` is the
+    /// index of the submit control that fired; `None` is the HTML
+    /// `requestSubmit()` no-argument case, where no submit button contributes
+    /// a name/value pair.
+    pub fn encode(&self, submitter: Option<usize>) -> String {
+        let mut out = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in self.entry_list(submitter) {
+            match value {
+                EntryValue::Text(text) => out.append_pair(name, text),
+                EntryValue::File(file) => {
+                    out.append_pair(name, file.map_or("", |file| file.name.as_str()))
+                }
+            };
+        }
         out.finish()
+    }
+
+    /// HTML #submit-body: the entity body of a POST submission and its MIME
+    /// type, encoded as the form's enctype selects — urlencoded, the
+    /// `text/plain` encoding algorithm, or the `multipart/form-data` encoding
+    /// algorithm (RFC 7578), which reads each selected file now and fails
+    /// when one changed since it was selected (File API #snapshot-state) or
+    /// the body would exceed the request body limit.
+    pub fn entity_body(&self, submitter: Option<usize>) -> Result<(String, Vec<u8>), String> {
+        match self.enctype.as_str() {
+            "multipart/form-data" => self.multipart_body(submitter),
+            "text/plain" => {
+                let mut body = String::new();
+                for (name, value) in self.entry_list(submitter) {
+                    let value = match value {
+                        EntryValue::Text(text) => text,
+                        EntryValue::File(file) => file.map_or("", |file| file.name.as_str()),
+                    };
+                    body.push_str(&normalize_newlines(name));
+                    body.push('=');
+                    body.push_str(&normalize_newlines(value));
+                    body.push_str("\r\n");
+                }
+                Ok((String::from("text/plain"), body.into_bytes()))
+            }
+            _ => Ok((
+                String::from(crate::js::FORM_URLENCODED),
+                self.encode(submitter).into_bytes(),
+            )),
+        }
+    }
+
+    fn multipart_body(&self, submitter: Option<usize>) -> Result<(String, Vec<u8>), String> {
+        let mut random = [0u8; 8];
+        let _ = getrandom::fill(&mut random);
+        let boundary = format!(
+            "----TRustFormBoundary{}",
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let escape = |text: &str| {
+            text.replace('\r', "%0D")
+                .replace('\n', "%0A")
+                .replace('"', "%22")
+        };
+        let mut body = Vec::new();
+        for (name, value) in self.entry_list(submitter) {
+            let name = escape(&normalize_newlines(name));
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            match value {
+                EntryValue::Text(text) => {
+                    body.extend_from_slice(
+                        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                            .as_bytes(),
+                    );
+                    body.extend_from_slice(normalize_newlines(text).as_bytes());
+                }
+                EntryValue::File(file) => {
+                    let (filename, mime) =
+                        file.map_or(("", ""), |file| (file.name.as_str(), file.mime.as_str()));
+                    let mime = if mime.is_empty() {
+                        "application/octet-stream"
+                    } else {
+                        mime
+                    };
+                    body.extend_from_slice(
+                        format!(
+                            "Content-Disposition: form-data; name=\"{name}\"; filename=\"{}\"\r\n\
+                             Content-Type: {mime}\r\n\r\n",
+                            escape(filename)
+                        )
+                        .as_bytes(),
+                    );
+                    if let Some(file) = file {
+                        let bytes = file.read().map_err(|error| error.message().to_string())?;
+                        if (body.len() + bytes.len()) as u64 > crate::file_select::MAX_READ_BYTES {
+                            return Err(format!(
+                                "the upload is larger than the {} MiB request limit",
+                                crate::file_select::MAX_READ_BYTES / (1024 * 1024)
+                            ));
+                        }
+                        body.extend_from_slice(&bytes);
+                    }
+                }
+            }
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        Ok((format!("multipart/form-data; boundary={boundary}"), body))
     }
 }
 
@@ -819,6 +986,7 @@ mod tests {
         let mut form = Form {
             method: FormMethod::Post,
             action: url::Url::parse("https://example.com/chat").unwrap(),
+            enctype: String::from(crate::js::FORM_URLENCODED),
             fields: vec![
                 field("session", "cafe123", FieldKind::Hidden),
                 field("msg", "hello there & good night", FieldKind::Text),
@@ -846,6 +1014,72 @@ mod tests {
             form.encode(None),
             "session=cafe123&msg=hello+there+%26+good+night&box=on&pick=b",
             "requestSubmit() without a submitter excludes every submit button"
+        );
+    }
+
+    #[test]
+    fn static_forms_encode_their_enctype_entity_bodies() {
+        // HTML #submit-body with #multipart/form-data-encoding-algorithm
+        // (RFC 7578; names and filenames escape CR, LF and `"`), the
+        // text/plain encoding algorithm and urlencoded file names; File API
+        // #snapshot-state for the chosen file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a\"b.txt");
+        std::fs::write(&path, b"one\ntwo").unwrap();
+        let chosen = crate::file_select::SelectedFile::from_path(&path, String::new()).unwrap();
+        let file_field = |name: &str, files| {
+            field(
+                name,
+                "",
+                FieldKind::File(FileControl {
+                    files,
+                    ..FileControl::default()
+                }),
+            )
+        };
+        let mut form = Form {
+            method: FormMethod::Post,
+            action: url::Url::parse("https://example.com/up").unwrap(),
+            enctype: String::from("multipart/form-data"),
+            fields: vec![
+                field("no\nte", "x\ny", FieldKind::Text),
+                file_field("up", vec![chosen]),
+                file_field("none", Vec::new()),
+                field("go", "Send", FieldKind::Submit),
+            ],
+            live_node: None,
+        };
+        let (content_type, body) = form.entity_body(Some(3)).unwrap();
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"no%0D%0Ate\"\r\n\r\nx\r\ny\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"up\"; filename=\"a%22b.txt\"\r\n\
+                 Content-Type: text/plain\r\n\r\none\ntwo\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"none\"; filename=\"\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"go\"\r\n\r\nSend\r\n\
+                 --{boundary}--\r\n"
+            )
+        );
+        form.enctype = String::from("text/plain");
+        assert_eq!(
+            form.entity_body(None).unwrap(),
+            (
+                String::from("text/plain"),
+                b"no\r\nte=x\r\ny\r\nup=a\"b.txt\r\nnone=\r\n".to_vec()
+            )
+        );
+        assert_eq!(form.encode(None), "no%0Ate=x%0Ay&up=a%22b.txt&none=");
+        std::fs::write(&path, b"changed contents").unwrap();
+        form.enctype = String::from("multipart/form-data");
+        assert!(
+            form.entity_body(None)
+                .unwrap_err()
+                .contains("changed after it was selected")
         );
     }
 

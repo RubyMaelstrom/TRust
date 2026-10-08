@@ -56,6 +56,8 @@ mod document_encoding;
 pub mod dom;
 pub mod download;
 pub mod file;
+pub mod file_picker;
+pub mod file_select;
 mod font_system;
 pub mod gemini;
 pub mod gopher;

@@ -20,6 +20,10 @@ install -m 0755 target/release/trust target/release/trust-desktop ~/.local/bin/
 ```
 
 Make sure `~/.local/bin` is on your PATH. Install mpv for audio and video playback.
+trust-desktop's file chooser (for `<input type=file>`) uses the XDG Desktop
+Portal on Linux: run `xdg-desktop-portal` with a backend such as
+`xdg-desktop-portal-gtk`, `-kde` or `-gnome`. Without a portal it falls back to
+`zenity` when installed. The terminal browser has its own built-in chooser.
 WebGL needs an EGL/OpenGL ES driver. Add `--no-default-features` to the build
 command if you want the system allocator instead of mimalloc.
 

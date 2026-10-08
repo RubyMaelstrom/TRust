@@ -236,6 +236,15 @@ pub enum UserAction {
         request: u64,
         ok: bool,
     },
+    /// The frontend's answer to a file prompt from `take_file_picker`: the chosen paths, or
+    /// `None` when the user dismissed it.
+    FilePickerResult {
+        request: u64,
+        files: Option<Vec<std::path::PathBuf>>,
+    },
+    /// Native files dragged over the page from another application, with the immediate user
+    /// selection resolved by the frontend's hit test.
+    FileDrag(crate::js::FileDrag),
     ReleasePointerLock,
     InputModifiers(Modifiers),
     PointerMotion {
@@ -665,6 +674,10 @@ pub struct BrowserController {
     /// has one opts in with `set_clipboard_available`; otherwise requests are refused here.
     clipboard_available: bool,
     pending_clipboard_writes: VecDeque<(u64, String)>,
+    /// HTML #show-the-picker,-if-applicable prompts for a frontend that can show a file
+    /// picker (`set_file_picker_available`); otherwise each prompt is dismissed at once.
+    file_picker_available: bool,
+    pending_file_pickers: VecDeque<crate::js::FilePickerRequest>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
     gemini_prompt: Option<crate::gemini::Prompt>,
@@ -746,6 +759,8 @@ impl BrowserController {
             close_requests_in_flight: 0,
             close_request_results: VecDeque::new(),
             clipboard_available: false,
+            file_picker_available: false,
+            pending_file_pickers: VecDeque::new(),
             pending_clipboard_writes: VecDeque::new(),
             external_media: VecDeque::new(),
             download_offer: None,
@@ -1118,6 +1133,18 @@ impl BrowserController {
         self.pending_clipboard_writes.pop_front()
     }
 
+    /// Declare whether this frontend can display a file picker. Without one, a page's file
+    /// prompt is dismissed (HTML: the control then receives `cancel`).
+    pub fn set_file_picker_available(&mut self, available: bool) {
+        self.file_picker_available = available;
+    }
+
+    /// The next file prompt for a frontend that declared a picker, oldest first. Show one at a
+    /// time and answer each with `UserAction::FilePickerResult`.
+    pub fn take_file_picker(&mut self) -> Option<crate::js::FilePickerRequest> {
+        self.pending_file_pickers.pop_front()
+    }
+
     /// Queue the decoded intrinsic-size map for the resident page. The native
     /// frontend calls this from an event loop and must never block; a full
     /// command queue is therefore a normal retry condition, not a successful
@@ -1147,6 +1174,16 @@ impl BrowserController {
             }
             UserAction::ClipboardResult { request, ok } => {
                 self.send_user(crate::js::PageCmd::ClipboardResult { request, ok });
+                false
+            }
+            UserAction::FilePickerResult { request, files } => {
+                self.send_user(crate::js::PageCmd::FilePickerResult { request, files });
+                false
+            }
+            UserAction::FileDrag(drag) => {
+                if self.live_page.is_some() {
+                    self.send_user(crate::js::PageCmd::FileDrag(drag));
+                }
                 false
             }
             UserAction::ReleasePointerLock => {
@@ -2798,6 +2835,7 @@ impl BrowserController {
         for _ in 0..std::mem::take(&mut self.close_requests_in_flight) {
             self.close_request_results.push_back(true);
         }
+        self.pending_file_pickers.clear();
         if let Some(retry) = self.user_input_retry.take() {
             retry.abort();
         }
@@ -3071,6 +3109,18 @@ impl BrowserController {
                     false
                 }
             }
+            PageEvt::FilePicker(request) => {
+                if self.file_picker_available {
+                    self.pending_file_pickers.push_back(request);
+                    true
+                } else {
+                    self.send_user(crate::js::PageCmd::FilePickerResult {
+                        request: request.request,
+                        files: None,
+                    });
+                    false
+                }
+            }
             PageEvt::ClipboardWrite { request, text } => {
                 if self.clipboard_available {
                     self.pending_clipboard_writes.push_back((request, text));
@@ -3210,14 +3260,20 @@ impl BrowserController {
 
     fn submit_static(&mut self, form: crate::doc::Form, submitter: Option<usize>) {
         use crate::doc::FormMethod;
-        let body = form.encode(submitter);
         match form.method {
             FormMethod::Get => {
+                let body = form.encode(submitter);
                 let mut target = form.action;
                 target.set_query((!body.is_empty()).then_some(body.as_str()));
                 self.begin_page_fetch(Link::Http(target), false, NavigationIntent::New);
             }
-            FormMethod::Post => self.begin_form_post(form.action, body),
+            // HTML #submit-body: the enctype's entity body.
+            FormMethod::Post => match form.entity_body(submitter) {
+                Ok((content_type, body)) => {
+                    self.begin_form_post_body(form.action, content_type, body)
+                }
+                Err(error) => self.status = format!("Form submission failed: {error}"),
+            },
         }
     }
 
@@ -3232,14 +3288,6 @@ impl BrowserController {
             action.set_query(submission.query());
             self.begin_page_fetch(Link::Http(action), false, NavigationIntent::New);
         }
-    }
-
-    fn begin_form_post(&mut self, url: url::Url, body: String) {
-        self.begin_form_post_body(
-            url,
-            crate::js::FORM_URLENCODED.to_string(),
-            body.into_bytes(),
-        );
     }
 
     /// POST a form's entity body in the MIME type of its enctype
@@ -4549,6 +4597,63 @@ mod tests {
             Some(FullscreenChange::Exit(None))
         );
         assert!(!browser.page_fullscreen());
+    }
+
+    #[test]
+    fn page_file_prompts_need_a_frontend_picker_and_drags_reach_the_page() {
+        // HTML #show-the-picker,-if-applicable: a frontend without a picker
+        // dismisses the prompt; one with a picker receives prompts in order
+        // and answers them. Native file drags pass to the live page.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640., 480.));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let prompt = |request| crate::js::FilePickerRequest {
+            request,
+            accept: String::from("image/*"),
+            multiple: true,
+            directory: false,
+        };
+        browser.handle_page_event(crate::js::PageEvt::FilePicker(prompt(3)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::FilePickerResult {
+                request: 3,
+                files: None
+            })
+        ));
+        assert!(browser.take_file_picker().is_none());
+        browser.set_file_picker_available(true);
+        browser.handle_page_event(crate::js::PageEvt::FilePicker(prompt(4)));
+        browser.handle_page_event(crate::js::PageEvt::FilePicker(prompt(5)));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(browser.take_file_picker(), Some(prompt(4)));
+        let chosen = vec![std::path::PathBuf::from("/tmp/x.png")];
+        browser.handle_action(UserAction::FilePickerResult {
+            request: 4,
+            files: Some(chosen.clone()),
+        });
+        match rx.try_recv() {
+            Ok(crate::js::PageCmd::FilePickerResult {
+                request: 4,
+                files: Some(files),
+            }) => assert_eq!(files, chosen),
+            other => panic!("unexpected {other:?}"),
+        }
+        browser.handle_action(UserAction::FileDrag(crate::js::FileDrag::Leave));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::FileDrag(crate::js::FileDrag::Leave))
+        ));
+        browser.drop_live_page();
+        assert!(
+            browser.take_file_picker().is_none(),
+            "prompts end with their page"
+        );
     }
 
     #[test]

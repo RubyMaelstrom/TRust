@@ -218,7 +218,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // clips it to its on-screen slice (sixel bands stripped), so a
             // partly-scrolled image draws its visible portion and undecoded
             // boxes stay alt text.
-            if g.doc.laid_out() {
+            // An open file prompt covers the panel; terminal graphics would
+            // paint over it (the run loop clears the screen when it closes).
+            if g.doc.laid_out() && app.file_picker.is_none() {
                 render_inline_images(frame, g, inner, &app.image_protocols);
             }
             // Third pass: the PINNED fixed layer (sidebar/header rails captured
@@ -278,6 +280,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // An open <select> dropdown overlays everything in the panel.
     render_select_menu(frame, app, inner);
+    // A file prompt is modal over the panel, whatever it shows.
+    render_file_picker(frame, app, inner);
 
     if let Some(input_area) = input_area {
         if fullscreen {
@@ -450,6 +454,198 @@ fn render_select_menu(frame: &mut Frame, app: &mut App, inner: Rect) {
         m.scroll = scroll;
     }
     app.last_select_rect = Some(rect);
+}
+
+/// Draw the open file prompt (HTML #show-the-picker,-if-applicable for a File
+/// Upload control): the path entry with its block cursor, the listed
+/// directory with the active filter and marks, the listing, and the key
+/// hints (or the latest notice). Records the listing rows for the mouse.
+fn render_file_picker(frame: &mut Frame, app: &mut App, inner: Rect) {
+    use crate::file_picker::EntryKind;
+    let Some(picker) = &app.file_picker else {
+        app.last_file_picker_rows = None;
+        return;
+    };
+    let width = inner.width.min(100).max(inner.width.min(30));
+    let height = inner.height.min(32).max(inner.height.min(8));
+    let rect = Rect::new(
+        inner.x + (inner.width - width) / 2,
+        inner.y + (inner.height - height) / 2,
+        width,
+        height,
+    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::PASTEL_GREEN))
+        .style(Style::new().bg(theme::BG))
+        .title(Line::styled(
+            format!(" {} ", picker.title()),
+            Style::new()
+                .fg(theme::BG)
+                .bg(theme::PASTEL_GREEN)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let body = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    if body.height < 4 || body.width < 8 {
+        app.last_file_picker_rows = None;
+        return;
+    }
+    let body_width = body.width as usize;
+
+    // Path entry, windowed so the cursor stays visible.
+    let prompt = "path> ";
+    let chars: Vec<char> = picker.input.chars().collect();
+    let avail = body_width.saturating_sub(prompt.len()).max(1);
+    let start = window_start(picker.cursor, chars.len(), avail);
+    let mut spans = vec![Span::styled(
+        prompt,
+        Style::new()
+            .fg(theme::PASTEL_GREEN)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for i in start..(start + avail).min(chars.len() + 1) {
+        let ch = if i == start && start > 0 {
+            '…'
+        } else {
+            chars.get(i).copied().unwrap_or(' ')
+        };
+        let mut style = Style::new().fg(theme::NEON_CYAN);
+        if i == picker.cursor {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    let mut lines = vec![Line::from(spans)];
+
+    // Where the listing is, what it shows, and how many files are marked.
+    let mut status = picker.filter_label();
+    if picker.multiple && !picker.marked.is_empty() {
+        status = format!("{status} · {} marked", picker.marked.len());
+    }
+    let place = picker.dir.display().to_string();
+    let room = body_width.saturating_sub(crate::layout2::display_width(&status) + 3);
+    let place = truncate_left(&place, room);
+    let gap = body_width.saturating_sub(
+        crate::layout2::display_width(&place) + crate::layout2::display_width(&status),
+    );
+    lines.push(Line::from(vec![
+        Span::styled(place, Style::new().fg(theme::AMBER)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(status, Style::new().fg(theme::DIM)),
+    ]));
+
+    // The listing, scrolled to keep the highlight in view.
+    let visible = (body.height as usize).saturating_sub(3).max(1);
+    let scroll = if picker.highlight < picker.scroll {
+        picker.highlight
+    } else if picker.highlight >= picker.scroll + visible {
+        picker.highlight + 1 - visible
+    } else {
+        picker.scroll
+    }
+    .min(picker.entries.len().saturating_sub(visible));
+    for (index, entry) in picker.entries.iter().enumerate().skip(scroll).take(visible) {
+        let mark = if picker.is_marked(&entry.path) {
+            "✓ "
+        } else {
+            "  "
+        };
+        let name = match entry.kind {
+            EntryKind::Directory => format!("{}/", entry.name),
+            _ => entry.name.clone(),
+        };
+        let size = entry
+            .size
+            .map(crate::download::human_bytes)
+            .unwrap_or_default();
+        let name_room = body_width.saturating_sub(
+            2 + crate::layout2::display_width(&size) + usize::from(!size.is_empty()),
+        );
+        let name = truncate_right(&name, name_room);
+        let pad = body_width.saturating_sub(
+            2 + crate::layout2::display_width(&name) + crate::layout2::display_width(&size),
+        );
+        let text = format!("{mark}{name}{}{size}", " ".repeat(pad));
+        let style = if index == picker.highlight {
+            Style::new().fg(theme::BG).bg(theme::NEON_CYAN)
+        } else {
+            match entry.kind {
+                EntryKind::Parent | EntryKind::Directory => Style::new().fg(theme::NEON_CYAN),
+                EntryKind::ChooseDirectory => Style::new().fg(theme::PASTEL_GREEN),
+                EntryKind::File => Style::new().fg(theme::TEXT),
+            }
+        };
+        lines.push(Line::styled(text, style));
+    }
+    if picker.entries.len()
+        <= usize::from(picker.dir.parent().is_some()) + usize::from(picker.directory)
+    {
+        lines.push(Line::styled(
+            "  (nothing to show here — Ctrl-T lists every file)",
+            Style::new().fg(theme::DIM),
+        ));
+    }
+    while lines.len() < body.height as usize - 1 {
+        lines.push(Line::raw(""));
+    }
+    let footer = match &picker.message {
+        Some(message) => Line::styled(
+            truncate_right(message, body_width),
+            Style::new().fg(theme::AMBER),
+        ),
+        None => Line::styled(
+            truncate_right(&picker.hints(), body_width),
+            Style::new().fg(theme::DIM),
+        ),
+    };
+    lines.truncate(body.height as usize - 1);
+    lines.push(footer);
+    frame.render_widget(Paragraph::new(lines), body);
+
+    if let Some(picker) = app.file_picker.as_mut() {
+        picker.scroll = scroll;
+    }
+    app.last_file_picker_rows = Some(Rect::new(body.x, body.y + 2, body.width, visible as u16));
+}
+
+/// `text` cut to at most `width` display columns, ending in "…" when cut.
+fn truncate_right(text: &str, width: usize) -> String {
+    if crate::layout2::display_width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        if crate::layout2::display_width(&out) + crate::layout2::display_width(&ch.to_string()) + 1
+            > width
+        {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// `text` cut from the left to at most `width` display columns, starting with
+/// "…" when cut (a path keeps its most specific end).
+fn truncate_left(text: &str, width: usize) -> String {
+    if crate::layout2::display_width(text) <= width {
+        return text.to_string();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    for ch in text.chars().rev() {
+        let next: String = std::iter::once(ch)
+            .chain(kept.iter().rev().copied())
+            .collect();
+        if crate::layout2::display_width(&next) + 1 > width {
+            break;
+        }
+        kept.push(ch);
+    }
+    kept.reverse();
+    format!("…{}", kept.into_iter().collect::<String>())
 }
 
 /// The visible slice of a document, gopherus-style: the cursor line is
@@ -1350,6 +1546,7 @@ fn form_status(g: &BrowserView, form: usize, field: usize) -> String {
         FieldKind::Checkbox => format!(" {} — Enter toggles ", field.name),
         FieldKind::Radio => format!(" {} — Enter selects ", field.name),
         FieldKind::Select(_) => format!(" {} — Enter cycles options ", field.name),
+        FieldKind::File(_) => format!(" {} — Enter chooses files ", field.name),
         _ => format!(" {} — Enter edits ", field.name),
     }
 }

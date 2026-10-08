@@ -857,6 +857,20 @@ pub struct App {
     /// An open `<select>` dropdown, modal over the browser: it captures
     /// keys/mouse until the user picks an option or cancels.
     pub(crate) select_menu: Option<SelectMenu>,
+    /// The file prompt a File Upload control asked for (HTML
+    /// #show-the-picker,-if-applicable), modal over everything until the
+    /// user chooses or dismisses.
+    pub(crate) file_picker: Option<crate::file_picker::FilePicker>,
+    /// Prompts requested while one is open: shown one at a time.
+    pending_file_pickers: std::collections::VecDeque<crate::js::FilePickerRequest>,
+    /// The directory the last file prompt ended in; the next one opens there.
+    file_picker_dir: Option<std::path::PathBuf>,
+    /// The picker's listing rows as last drawn, for the mouse hit-test.
+    pub(crate) last_file_picker_rows: Option<ratatui::layout::Rect>,
+    /// The open picker belongs to this painted `(form, field)` of a page
+    /// without a live script realm (in this document generation), rather
+    /// than to the live page.
+    file_picker_static: Option<(usize, usize, u64)>,
     /// In-page find (Ctrl-F) state while `mode == Mode::Find`; None otherwise.
     pub(crate) find: Option<FindState>,
     /// The popup's last drawn screen rect (set by the renderer) so a mouse
@@ -1056,6 +1070,11 @@ impl App {
             masked_input: false,
             cert_for: None,
             select_menu: None,
+            file_picker: None,
+            pending_file_pickers: std::collections::VecDeque::new(),
+            file_picker_dir: None,
+            last_file_picker_rows: None,
+            file_picker_static: None,
             find: None,
             last_select_rect: None,
             last_vbar: None,
@@ -1160,7 +1179,7 @@ impl App {
             if let Some(error) = crate::site_storage::take_notice() {
                 self.status = error;
             }
-            let menu_open = self.select_menu.is_some();
+            let menu_open = self.select_menu.is_some() || self.file_picker.is_some();
             if menu_was_open && !menu_open && !self.image_protocols.is_empty() {
                 terminal.clear()?;
             }
@@ -1508,6 +1527,10 @@ impl App {
                 self.open_command();
                 return;
             }
+        }
+        if self.file_picker.is_some() {
+            self.file_picker_mouse(mouse);
+            return;
         }
         if self.file_dialog.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1884,6 +1907,13 @@ impl App {
             _ => return,
         };
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+
+        // An open file prompt is modal: it owns every key, Tab included (path
+        // completion), until the user chooses files or dismisses it.
+        if self.file_picker.is_some() {
+            self.file_picker_key(key);
             return;
         }
 
@@ -2627,6 +2657,10 @@ impl App {
     /// closed the page. Text lands where typed text would; control
     /// characters never act.
     async fn on_paste(&mut self, text: String) {
+        if let Some(picker) = &mut self.file_picker {
+            picker.insert(text.lines().next().unwrap_or_default());
+            return;
+        }
         match self.mode {
             // Browsing / image viewer: keys are navigation — there is no
             // text target, so swallow the paste rather than scatter it.
@@ -4293,6 +4327,7 @@ impl App {
         if self.viewer.is_some()
             || self.mode != Mode::Session
             || self.select_menu.is_some()
+            || self.file_picker.is_some()
             || self.loading()
         {
             return None;
@@ -5467,6 +5502,10 @@ impl App {
         // leaves fullscreen, so TRust's chrome returns.
         self.page_fullscreen = false;
         self.fullscreen_reply = None;
+        // The prompts belonged to the retired page; nothing awaits them.
+        self.file_picker = None;
+        self.file_picker_static = None;
+        self.pending_file_pickers.clear();
     }
 
     /// Push the current browser scroll position to the live page when it moved
@@ -6439,6 +6478,7 @@ impl App {
                         });
                     }
                 }
+                Some(PageEvt::FilePicker(request)) => self.open_file_picker(request),
                 Some(PageEvt::PointerLock { request, node, .. }) => {
                     if node.is_some()
                         && let Some(page) = &self.live_page
@@ -9159,6 +9199,26 @@ impl App {
                 self.refresh_forms();
             }
             FieldKind::Select(options) => self.open_select_menu(form, field, options, &value),
+            // HTML #file-upload-state-(type=file): the activation behavior
+            // (in the live page) shows the picker, which needs the click's
+            // transient activation.
+            FieldKind::File(control) => {
+                if let Some(node) = live_node
+                    && self.live_page.is_some()
+                {
+                    self.dispatch_click(node, false);
+                } else {
+                    // A page without scripts: the activation shows the
+                    // picker for the painted control itself.
+                    self.file_picker_static = Some((form, field, self.document_generation));
+                    self.open_file_picker(crate::js::FilePickerRequest {
+                        request: 0,
+                        accept: control.accept,
+                        multiple: control.multiple,
+                        directory: control.directory,
+                    });
+                }
+            }
             FieldKind::Submit => self.submit_form(form, field),
             FieldKind::Button => {
                 if let Some(node) = live_node {
@@ -9182,6 +9242,139 @@ impl App {
             }
             FieldKind::Hidden => {}
         }
+    }
+
+    /// HTML #show-the-picker,-if-applicable: display the page's file prompt,
+    /// or queue it behind the open one ("wait until any prior execution of
+    /// this algorithm has terminated").
+    fn open_file_picker(&mut self, request: crate::js::FilePickerRequest) {
+        if self.file_picker.is_some() {
+            self.pending_file_pickers.push_back(request);
+            return;
+        }
+        self.select_menu = None;
+        let picker = crate::file_picker::FilePicker::new(&request, self.file_picker_dir.clone());
+        self.status = format!("{} — {}", picker.title(), picker.hints());
+        self.file_picker = Some(picker);
+    }
+
+    /// Answer the open prompt and show the next queued one.
+    fn finish_file_picker(&mut self, outcome: crate::file_picker::Outcome) {
+        use crate::file_picker::Outcome;
+        let Some(picker) = self.file_picker.take() else {
+            return;
+        };
+        let files = match outcome {
+            Outcome::Pending => {
+                self.file_picker = Some(picker);
+                return;
+            }
+            Outcome::Dismissed => {
+                self.status = String::from("File selection canceled.");
+                None
+            }
+            Outcome::Chosen(files) => {
+                self.status = match files.as_slice() {
+                    [one] => format!("Selected {}", crate::file_select::file_name_of(one)),
+                    many => format!("Selected {} files", many.len()),
+                };
+                Some(files)
+            }
+        };
+        self.notice = true;
+        self.file_picker_dir = Some(picker.dir.clone());
+        if let Some((form, field, generation)) = self.file_picker_static.take() {
+            // Files chosen for a document the user has since left stay unused.
+            if let Some(files) = files
+                && generation == self.document_generation
+            {
+                self.select_static_files(form, field, &files);
+            }
+        } else if let Some(page) = &self.live_page {
+            let _ = page.try_send_user(crate::js::PageCmd::FilePickerResult {
+                request: picker.request,
+                files,
+            });
+        }
+        if let Some(next) = self.pending_file_pickers.pop_front() {
+            self.open_file_picker(next);
+        }
+    }
+
+    /// HTML #update-the-file-selection for a static control (no script realm
+    /// observes it): snapshot the chosen files for its form's submission.
+    fn select_static_files(&mut self, form: usize, field: usize, paths: &[std::path::PathBuf]) {
+        use crate::doc::FieldKind;
+        let Some(field) = self
+            .browser
+            .as_mut()
+            .and_then(|g| g.doc.forms.get_mut(form))
+            .and_then(|form| form.fields.get_mut(field))
+        else {
+            return;
+        };
+        let FieldKind::File(control) = &mut field.kind else {
+            return;
+        };
+        let mut paths = paths.to_vec();
+        if !control.multiple && !control.directory {
+            paths.truncate(1);
+        }
+        match crate::file_select::selection_from_paths(&paths, control.directory, false) {
+            Ok(files) => {
+                let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
+                field.label = crate::doc::file_selection_summary(&names);
+                field.value = names
+                    .first()
+                    .map_or_else(String::new, |name| format!("C:\\fakepath\\{name}"));
+                control.files = files;
+                self.refresh_forms();
+            }
+            Err(error) => {
+                self.status = format!("File selection failed: {error}");
+                self.notice = true;
+            }
+        }
+    }
+
+    fn file_picker_key(&mut self, key: KeyEvent) {
+        let page = self
+            .last_file_picker_rows
+            .map_or(10, |rect| rect.height as usize);
+        let Some(picker) = self.file_picker.as_mut() else {
+            return;
+        };
+        let outcome = picker.key(key, page);
+        self.finish_file_picker(outcome);
+    }
+
+    /// The picker grabs the mouse: the wheel moves the highlight, a click on
+    /// a row opens a directory or chooses (or marks) a file.
+    fn file_picker_mouse(&mut self, mouse: MouseEvent) {
+        let rows = self.last_file_picker_rows;
+        let Some(picker) = self.file_picker.as_mut() else {
+            return;
+        };
+        let outcome = match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                picker.highlight = picker.highlight.saturating_sub(1);
+                crate::file_picker::Outcome::Pending
+            }
+            MouseEventKind::ScrollDown => {
+                picker.highlight =
+                    (picker.highlight + 1).min(picker.entries.len().saturating_sub(1));
+                crate::file_picker::Outcome::Pending
+            }
+            MouseEventKind::Down(MouseButton::Left) => match rows {
+                Some(rect) if rect.contains((mouse.column, mouse.row).into()) => {
+                    let index = picker.scroll + usize::from(mouse.row - rect.y);
+                    picker.click(index)
+                }
+                _ => crate::file_picker::Outcome::Pending,
+            },
+            _ => crate::file_picker::Outcome::Pending,
+        };
+        self.finish_file_picker(outcome);
     }
 
     /// Open the dropdown overlay for a `<select>`, highlighting its current
@@ -9397,19 +9590,33 @@ impl App {
             return;
         };
         let query = form.encode(submitter);
+        // HTML #submit-body: a POST carries the enctype's entity body; a
+        // multipart body reads the chosen files now.
+        let body = match form.method {
+            FormMethod::Post => match form.entity_body(submitter) {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    self.status = format!("Form submission failed: {error}");
+                    self.notice = true;
+                    return;
+                }
+            },
+            FormMethod::Get => None,
+        };
         let action = form.action.clone();
-        let method = form.method;
         if !self.allow_page_file_navigation(&Link::Http(action.clone())) {
             return;
         }
         let referrer = self.http_referrer();
-        match method {
-            FormMethod::Get => {
+        match body {
+            None => {
                 let mut url = action;
                 url.set_query((!query.is_empty()).then_some(query.as_str()));
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
-            FormMethod::Post => self.start_post(action, query, referrer),
+            Some((content_type, body)) => {
+                self.start_post_body(action, content_type, body, referrer)
+            }
         }
     }
 
@@ -18248,5 +18455,142 @@ mod dict_tests {
             .await;
         assert!(app.status.contains("/m:neo:!:prefix"), "{}", app.status);
         app.retire_fetch("stopped");
+    }
+}
+
+#[cfg(test)]
+mod file_picker_tests {
+    use super::*;
+    use crate::js::{FilePickerRequest, PageCmd};
+    use crossterm::event::{Event, KeyCode, KeyEvent};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn request(request: u64) -> FilePickerRequest {
+        FilePickerRequest {
+            request,
+            accept: String::from(".txt"),
+            multiple: false,
+            directory: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn file_prompts_are_modal_one_at_a_time_and_answer_the_live_page() {
+        // HTML #show-the-picker,-if-applicable: one prompt at a time; the
+        // user's choice or dismissal answers the page.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.png"), b"b").unwrap();
+        let mut app = App::new(None, 23);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        app.file_picker_dir = Some(dir.path().to_path_buf());
+        app.open_file_picker(request(4));
+        app.open_file_picker(request(5));
+        assert_eq!(app.pending_file_pickers.len(), 1, "the second prompt waits");
+        // Tab completes in the picker instead of toggling the console.
+        let mode = app.mode;
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+            .await;
+        assert_eq!(app.mode, mode);
+        let picker = app.file_picker.as_ref().expect("picker stays open");
+        assert_eq!(
+            picker
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["..", "a.txt"],
+            "accept hides other types"
+        );
+        // The picker draws over the browser panel.
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("CHOOSE FILE"), "{screen}");
+        assert!(screen.contains("a.txt"), "{screen}");
+        assert!(app.last_file_picker_rows.is_some());
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        match rx.try_recv() {
+            Ok(PageCmd::FilePickerResult { request, files }) => {
+                assert_eq!(request, 4);
+                assert_eq!(files, Some(vec![dir.path().join("a.txt")]));
+            }
+            other => panic!("expected a picker result, got {other:?}"),
+        }
+        assert_eq!(
+            app.file_picker.as_ref().map(|picker| picker.request),
+            Some(5)
+        );
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
+            .await;
+        match rx.try_recv() {
+            Ok(PageCmd::FilePickerResult {
+                request: 5,
+                files: None,
+            }) => {}
+            other => panic!("expected a dismissal, got {other:?}"),
+        }
+        assert!(app.file_picker.is_none());
+        // Leaving the page drops its prompts.
+        app.open_file_picker(request(6));
+        app.drop_live_page();
+        assert!(app.file_picker.is_none() && app.pending_file_pickers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn static_file_controls_choose_files_without_page_scripts() {
+        // `set js off`: the painted control's activation shows the picker,
+        // and its chosen file survives form re-parses for submission.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), b"static upload").unwrap();
+        let base = url::Url::parse("https://ex.test/").unwrap();
+        let html = "<form method=post enctype=multipart/form-data action=/up>\
+                    <input type=file name=up accept=.txt><input type=submit name=go value=Go></form>";
+        let mut app = App::new(None, 23);
+        app.js_enabled = false;
+        app.last_inner = (60, 20);
+        let doc = crate::http::parse(
+            &base,
+            "text/html; charset=utf-8",
+            html.as_bytes(),
+            60,
+            20,
+            &crate::layout2::ImageSizes::new(),
+        );
+        app.navigate_to(doc);
+        let fields = |app: &App| app.browser.as_ref().unwrap().doc.forms[0].fields.clone();
+        assert_eq!(fields(&app)[0].row_label(), "[ Browse… ] No file selected.");
+        app.file_picker_dir = Some(dir.path().to_path_buf());
+        app.form_interact(0, 0);
+        assert!(app.file_picker.is_some());
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Enter)))
+            .await;
+        assert!(app.file_picker.is_none());
+        let field = &fields(&app)[0];
+        assert_eq!(field.row_label(), "[ Browse… ] note.txt");
+        let crate::doc::FieldKind::File(control) = &field.kind else {
+            panic!("file field");
+        };
+        assert_eq!(control.files.len(), 1);
+        let form = app.browser.as_ref().unwrap().doc.forms[0].clone();
+        let (content_type, body) = form.entity_body(Some(1)).unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains(
+                "filename=\"note.txt\"\r\nContent-Type: text/plain\r\n\r\nstatic upload\r\n"
+            ),
+            "{body}"
+        );
     }
 }

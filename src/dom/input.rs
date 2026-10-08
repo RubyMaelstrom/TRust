@@ -61,6 +61,11 @@ pub(super) struct ElementState {
     /// A Document's design mode enabled flag
     /// (HTML #making-entire-documents-editable).
     pub(super) design_mode: bool,
+    /// The names of a File Upload input's selected files
+    /// (HTML #concept-input-type-file-selected). Their bodies belong to the
+    /// page's `File` objects; the arena keeps the names for the control's
+    /// rendering and its filename-mode value (#dom-input-value-filename).
+    pub(super) selected_files: Vec<String>,
 }
 
 /// The selector-dependency names under which custom element state changes
@@ -82,6 +87,7 @@ impl ElementState {
             && self.custom_states.is_empty()
             && self.is_value.is_none()
             && !self.design_mode
+            && self.selected_files.is_empty()
     }
     pub(super) fn retained_bytes(&self) -> usize {
         self.raw_value.as_ref().map_or(0, String::capacity)
@@ -92,11 +98,18 @@ impl ElementState {
                 .iter()
                 .map(String::capacity)
                 .sum::<usize>()
+            + self.selected_files.capacity() * std::mem::size_of::<String>()
+            + self
+                .selected_files
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
     }
     /// The state an element's clone starts with (HTML's cloning steps copy
     /// checkedness and the textarea raw value; a clone is a new element for
     /// custom element purposes and its option selectedness is initialized
-    /// from its attribute).
+    /// from its attribute). The input cloning steps do not copy selected
+    /// files.
     pub(super) fn for_clone(&self) -> Option<Self> {
         let copy = Self {
             checked: self.checked,
@@ -533,7 +546,19 @@ impl Dom {
     }
 
     pub(super) fn write_input_presentation(&self, id: NodeId, out: &mut String) {
-        if self.tag_name(id) != Some("input") || !self.input_values.contains_key(&id) {
+        if self.tag_name(id) != Some("input") {
+            return;
+        }
+        if let Some(state) = self.element_states.get(&id)
+            && !state.selected_files.is_empty()
+        {
+            out.push_str(" data-trust-input-files=\"");
+            out.push_str(&super::escape_attr(
+                &serde_json::to_string(&state.selected_files).unwrap_or_default(),
+            ));
+            out.push('"');
+        }
+        if !self.input_values.contains_key(&id) {
             return;
         }
         out.push_str(" data-trust-input-value=\"");
@@ -612,8 +637,28 @@ impl Dom {
     pub(crate) fn input_editing_value(&self, id: NodeId) -> Option<&str> {
         self.style_view().input_editing_value(id)
     }
+    /// HTML #concept-fe-mutable: a disabled input is not mutable, nor is a
+    /// read-only one where #attr-input-readonly applies (text-like, date and
+    /// time, and number states). Where it does not apply (e.g. File Upload)
+    /// the attribute is ignored.
     pub fn input_mutable(&self, id: NodeId) -> bool {
-        !self.actually_disabled(id, "input") && self.attr(id, "readonly").is_none()
+        !self.actually_disabled(id, "input")
+            && (self.attr(id, "readonly").is_none()
+                || !matches!(
+                    self.input_type(id).as_str(),
+                    "text"
+                        | "search"
+                        | "url"
+                        | "tel"
+                        | "email"
+                        | "password"
+                        | "date"
+                        | "month"
+                        | "week"
+                        | "time"
+                        | "datetime-local"
+                        | "number"
+                ))
     }
     pub fn input_spin_buttons(&self, id: NodeId) -> bool {
         self.tag_name(id) == Some("input")
@@ -628,6 +673,28 @@ impl Dom {
         if self.input_values.remove(&id).is_some() {
             self.touch_input_value(id);
         }
+    }
+    /// The names of a File Upload input's selected files, in order.
+    pub fn input_file_names(&self, id: NodeId) -> Vec<String> {
+        self.style_view().input_file_names(id)
+    }
+    /// Replace the names of an input's selected files (HTML
+    /// #concept-input-type-file-selected); the page realm owns the matching
+    /// `File` objects. Returns whether the names changed.
+    pub(crate) fn set_input_files(&mut self, id: NodeId, names: Vec<String>) -> bool {
+        if !self.is_valid(id) || self.tag_name(id) != Some("input") {
+            return false;
+        }
+        if self
+            .element_states
+            .get(&id)
+            .map_or(names.is_empty(), |state| state.selected_files == names)
+        {
+            return false;
+        }
+        self.update_control_state(id, |state| state.selected_files = names);
+        self.touch_input_value(id);
+        true
     }
     pub(super) fn input_attribute_changed(
         &mut self,
@@ -1062,7 +1129,12 @@ impl<'a> StyleView<'a> {
     pub(super) fn input_value(&self, id: NodeId) -> String {
         let ty = self.input_type(id);
         if ty == "file" {
-            return String::new();
+            // HTML #dom-input-value-filename: "C:\fakepath\" and the first
+            // selected file's name, or the empty string.
+            return self
+                .input_file_names(id)
+                .first()
+                .map_or_else(String::new, |name| format!("C:\\fakepath\\{name}"));
         }
         if !Dom::input_value_mode(&ty) {
             return self
@@ -1086,6 +1158,19 @@ impl<'a> StyleView<'a> {
             self.attr(id, "value")
         };
         self.sanitize_input_value(id, value.unwrap_or(""))
+    }
+    /// The names of a File Upload input's selected files. A presentation
+    /// snapshot transports them in `data-trust-input-files` as a JSON array.
+    pub(super) fn input_file_names(&self, id: NodeId) -> Vec<String> {
+        if let Some(state) = self.state.element_states.get(&id) {
+            return state.selected_files.clone();
+        }
+        if !self.state.render_live
+            && let Some(names) = self.attr(id, "data-trust-input-files")
+        {
+            return serde_json::from_str(names).unwrap_or_default();
+        }
+        Vec::new()
     }
     pub(super) fn input_editing_value(&self, id: NodeId) -> Option<&'a str> {
         if let Some(state) = self.state.input_values.get(&id) {
