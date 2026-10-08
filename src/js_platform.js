@@ -1172,6 +1172,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return list;
     }
+    // Bootstrap-only rendezvous for platform blocks that return a
+    // DOMStringList (Indexed Database's objectStoreNames and indexNames).
+    g.__dom_string_list_create = createDOMStringList;
     for (const name of ["length", "item", "contains"])
         Object.defineProperty(DOMStringList.prototype, name, {enumerable: true});
     Object.defineProperty(DOMStringList.prototype, Symbol.iterator,
@@ -36113,6 +36116,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         setUpCrossRealmReadable(value, port, portOps) { setUpCrossRealmTransformReadable(streamOf(value), port, portOps); },
         setUpCrossRealmWritable(value, port, portOps) { setUpCrossRealmTransformWritable(writableOf(value), port, portOps); },
         writableLocked(value) { return isWritableStreamLocked(writableOf(value)); },
+        // #ts-transfer transfer-receiving steps 3-5: a transferred TransformStream
+        // holds only its deserialized sides.
+        setUpTransferredTransform(value, readable, writable) {
+            const transform = internal(value, "transformStream");
+            transform.readable = streamOf(readable);
+            transform.writable = writableOf(writable);
+            transform.backpressure = undefined;
+            transform.backpressureChangePromise = undefined;
+            transform.controller = undefined;
+        },
     };
 
     // #transferrable-streams: a transferred stream is driven through an
@@ -40020,69 +40033,115 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const Request = g.Request, Response = g.Response, Headers = g.Headers;
 
     // --- CacheStorage / Cache -------------------------------------------------
-    // Service Workers §5 exposes this API on every secure Window and worker.
-    // Cache storage is distinct from the HTTP cache: scripts explicitly create
-    // named request/response lists and those lists only change through this API.
-    // The host Web Storage map gives us a session-lifetime, origin-keyed backing
-    // store shared by successive page realms. Cache ids are separate from names
-    // so `caches.delete(name)` does not invalidate an already-referenced Cache,
-    // as required by §5.5.4.
-    const __cacheToken = {};
+    // The Window's view for the shared Cache Storage block: its storage key.
     // Cache objects retain their creating environment's map, including when
     // called from another Realm or after a document base/settings change.
     const __persistentStorageOrigin = messageWindowState.origin;
-    const __cacheNamesKind = "cache-storage-names:" + __persistentStorageOrigin;
-    const __cacheDataKind = "cache-storage-data:" + __persistentStorageOrigin;
-    const __cacheNamesKey = "map";
-    const __cacheQuota = 64 * 1024 * 1024;
-    const __cacheNameLimit = 1024;
+    g.__cache_storage_adapter = { origin: __persistentStorageOrigin, secure: secureContext };
+    /*__CACHE_STORAGE_BEGIN__*/
+    // Service Workers §5 (local w3c/ServiceWorker@92aba3b) exposes Cache and
+    // CacheStorage on every secure Window and worker ([SecureContext,
+    // Exposed=(Window,Worker)]); this block is shared by both. Cache storage is
+    // distinct from the HTTP cache: scripts explicitly create named
+    // request/response lists and those lists only change through this API.
+    //
+    // The relevant name to cache map is the origin's "caches" bottle in the
+    // host's storage shed, which every Window and worker of the origin share
+    // (#cachestorage-interface: "multiple separate objects ... across documents
+    // and workers can all be associated with the same name to cache map"). It
+    // is session-lifetime RAM. Cache ids are separate from names so
+    // `caches.delete(name)` does not invalidate an already-referenced Cache
+    // (§5.5.4). Each change of the map and each Batch Cache Operations run is
+    // one compare-and-set of the serialized list, retried if another agent
+    // changed it meanwhile, so the operations stay atomic across agents.
+    (function (g) {
+    "use strict";
+    const adapter = g.__cache_storage_adapter;
+    delete g.__cache_storage_adapter;
+    const fetchAPI = g.__fetch_api, platformFetch = g.fetch;
+    const Request = g.Request, URLCtor = g.URL, DOMExceptionCtor = g.DOMException;
+    const QuotaExceededErrorCtor = g.QuotaExceededError;
+    const apply = Reflect.apply, define = Object.defineProperty, freeze = Object.freeze;
+    const parse = JSON.parse, stringify = JSON.stringify, isArray = Array.isArray;
+    const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+    const PromiseCtor = Promise, promiseResolve = Promise.resolve.bind(Promise);
+    const promiseReject = Promise.reject.bind(Promise), promiseAll = Promise.all.bind(Promise);
+    const storageOrigin = adapter.origin;
+    const cacheNamesKind = "cache-storage-names:" + storageOrigin;
+    const cacheDataKind = "cache-storage-data:" + storageOrigin;
+    const cacheNamesKey = "map";
+    const cacheQuota = 64 * 1024 * 1024;
+    const cacheNameLimit = 1024;
+    const cacheToken = {};
 
-    function __cacheDOMString(value) {
+    function cacheDOMString(value) {
         // Web IDL DOMString conversion is ECMAScript ToString. Concatenation,
         // unlike String(Symbol), retains ToString's required Symbol exception.
         return "" + value;
     }
-    function __cacheNames() {
-        const encoded = __storage_get(__cacheNamesKind, __cacheNamesKey);
+    function parseNames(encoded) {
         if (encoded === null) return { next: 1, entries: [] };
         try {
-            const parsed = JSON.parse(encoded);
-            if (parsed && Number.isFinite(parsed.next) && Array.isArray(parsed.entries)) return parsed;
+            const parsed = parse(encoded);
+            if (parsed && Number.isFinite(parsed.next) && isArray(parsed.entries)) return parsed;
         } catch (e) {}
         return { next: 1, entries: [] };
     }
-    function __cacheSaveNames(names) {
-        if (names.entries.length > __cacheNameLimit)
-            throw new QuotaExceededError("The CacheStorage quota was exceeded.");
-        __storage_set(__cacheNamesKind, __cacheNamesKey, JSON.stringify(names));
+    function cacheNames() { return parseNames(__storage_get(cacheNamesKind, cacheNamesKey)); }
+    // Change the name to cache map atomically: `change` edits a fresh copy and
+    // returns {changed, value}, or throws without writing anything.
+    function updateNames(change) {
+        for (;;) {
+            const encoded = __storage_get(cacheNamesKind, cacheNamesKey);
+            const names = parseNames(encoded);
+            const result = change(names);
+            if (!result.changed) return result.value;
+            if (names.entries.length > cacheNameLimit)
+                throw new QuotaExceededErrorCtor("The CacheStorage quota was exceeded.");
+            if (__storage_cas(cacheNamesKind, cacheNamesKey, encoded, stringify(names))) return result.value;
+        }
     }
-    function __cacheLoad(id) {
-        const encoded = __storage_get(__cacheDataKind, id);
+    function parseRecords(encoded) {
         if (encoded === null) return [];
-        try { const parsed = JSON.parse(encoded); return Array.isArray(parsed) ? parsed : []; }
+        try { const parsed = parse(encoded); return isArray(parsed) ? parsed : []; }
         catch (e) { return []; }
     }
-    function __cacheSave(id, records) {
-        const encoded = JSON.stringify(records);
-        let total = encoded.length;
-        const count = __storage_len(__cacheDataKind);
+    function cacheLoad(id) { return parseRecords(__storage_get(cacheDataKind, id)); }
+    // The other caches' serialized size, which with `size` must fit the quota.
+    function checkQuota(id, size) {
+        let total = size;
+        const count = __storage_len(cacheDataKind);
         for (let index = 0; index < count; index++) {
-            const key = __storage_key(__cacheDataKind, index);
+            const key = __storage_key(cacheDataKind, index);
             if (key === null || key === id) continue;
-            const value = __storage_get(__cacheDataKind, key);
+            const value = __storage_get(cacheDataKind, key);
             if (value !== null) total += value.length;
         }
-        if (total > __cacheQuota)
-            throw new QuotaExceededError("The CacheStorage quota was exceeded.");
-        __storage_set(__cacheDataKind, id, encoded);
+        if (total > cacheQuota)
+            throw new QuotaExceededErrorCtor("The CacheStorage quota was exceeded.");
+    }
+    // Service Workers #batch-cache-operations-algorithm "try running the
+    // following substeps atomically": `change` edits a copy of the request
+    // response list, which replaces the relevant list in one host write, or
+    // throws and leaves it untouched (the backup cache).
+    function updateRecords(id, change) {
+        for (;;) {
+            const encoded = __storage_get(cacheDataKind, id);
+            const records = parseRecords(encoded);
+            const result = change(records);
+            if (!result.changed) return result.value;
+            const next = stringify(records);
+            checkQuota(id, next.length);
+            if (__storage_cas(cacheDataKind, id, encoded, next)) return result.value;
+        }
     }
     // Copies of internal header lists (Fetch #concept-header-list).
-    function __cacheHeaders(list) {
+    function cacheHeaders(list) {
         const entries = [];
         for (let index = 0; index < list.length; index++) entries.push([list[index][0], list[index][1]]);
         return entries;
     }
-    function __cacheHeader(entries, name) {
+    function cacheHeader(entries, name) {
         name = name.toLowerCase();
         for (let index = 0; index < entries.length; index++) {
             if (entries[index][0].toLowerCase() === name) return entries[index][1];
@@ -40091,15 +40150,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // Service Workers #cache-match and friends: a Request argument's
     // associated request, otherwise a new Request from the string.
-    function __cacheRequest(input) {
+    function cacheRequest(input) {
         return fetchAPI.isRequest(input) ? input : new Request(input);
     }
-    function __cacheRequestRecord(request) {
+    function cacheRequestRecord(request) {
         const inner = fetchAPI.request(request);
-        return { url: inner.url, method: inner.method, headers: __cacheHeaders(inner.headerList) };
+        return { url: inner.url, method: inner.method, headers: cacheHeaders(inner.headerList) };
     }
-    function __cacheComparableURL(value, ignoreSearch) {
-        const url = new URL(value);
+    function cacheComparableURL(value, ignoreSearch) {
+        const url = new URLCtor(value);
         url.hash = "";
         if (ignoreSearch) url.search = "";
         return url.href;
@@ -40107,440 +40166,568 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Service Workers §5 "Request Matches Cached Item". Fragments never
     // participate; query strings and Vary-selected request headers do unless
     // their corresponding CacheQueryOptions member says otherwise.
-    function __cacheMatches(query, record, options) {
+    function cacheMatches(query, record, options) {
         options = options || {};
         if (!options.ignoreMethod && query.method !== "GET") return false;
-        if (__cacheComparableURL(query.url, !!options.ignoreSearch) !==
-            __cacheComparableURL(record.request.url, !!options.ignoreSearch)) return false;
+        if (cacheComparableURL(query.url, !!options.ignoreSearch) !==
+            cacheComparableURL(record.request.url, !!options.ignoreSearch)) return false;
         if (options.ignoreVary) return true;
-        const vary = __cacheHeader(record.response.headers, "vary");
+        const vary = cacheHeader(record.response.headers, "vary");
         if (vary === null) return true;
         const fields = vary.split(",");
         for (let index = 0; index < fields.length; index++) {
             const field = fields[index].trim().toLowerCase();
             if (field === "*" ||
-                __cacheHeader(record.request.headers, field) !== __cacheHeader(query.headers, field))
+                cacheHeader(record.request.headers, field) !== cacheHeader(query.headers, field))
                 return false;
         }
         return true;
     }
     const cacheBytesFromBase64 = Uint8Array.fromBase64.bind(Uint8Array);
     const cacheBytesToBase64 = Function.prototype.call.bind(Uint8Array.prototype.toBase64);
+    function latin1Bytes(text) {
+        const bytes = new Uint8Array(text.length);
+        for (let index = 0; index < text.length; index++) bytes[index] = text.charCodeAt(index) & 0xff;
+        return bytes;
+    }
     // A cached response, as a Response object whose headers are immutable.
-    function __cacheResponse(record) {
-        const urlList = Array.isArray(record.urlList) ? record.urlList.slice()
+    function cacheResponse(record) {
+        const urlList = isArray(record.urlList) ? record.urlList.slice()
             : record.url ? (record.redirected ? [record.url, record.url] : [record.url]) : [];
-        // The old representation stored binary strings; new entries use the
-        // engine's native base64 codec over binary payloads.
-        const bytes = record.body64 === undefined ? __latin1ToBytes(record.body || "") : cacheBytesFromBase64(record.body64);
+        // Older entries stored binary strings; entries use the engine's
+        // native base64 codec over binary payloads.
+        const bytes = record.body64 === undefined ? latin1Bytes(record.body || "") : cacheBytesFromBase64(record.body64);
         return fetchAPI.createResponse({
             type: record.type, status: record.status, statusMessage: record.statusText,
-            headerList: __cacheHeaders(record.headers), urlList, guard: "immutable",
+            headerList: cacheHeaders(record.headers), urlList, guard: "immutable",
         }, record.type === "opaque" ? null : bytes);
     }
     // Service Workers #cache-put steps over the associated request and response.
-    function __cacheResponseRecord(request, response) {
+    function cacheResponseRecord(request, response) {
         const innerRequest = fetchAPI.request(request);
-        const protocol = new URL(innerRequest.url).protocol;
+        const protocol = new URLCtor(innerRequest.url).protocol;
         if ((protocol !== "http:" && protocol !== "https:") || innerRequest.method !== "GET")
-            return Promise.reject(new TypeError("Cache.put only accepts HTTP(S) GET requests"));
+            return promiseReject(new TypeError("Cache.put only accepts HTTP(S) GET requests"));
         if (!fetchAPI.isResponse(response))
-            return Promise.reject(new TypeError("Cache.put requires a Response"));
+            return promiseReject(new TypeError("Cache.put requires a Response"));
         const inner = fetchAPI.response(response);
         if (inner.status === 206)
-            return Promise.reject(new TypeError("A partial response cannot be stored in a Cache"));
-        const vary = __cacheHeader(inner.headerList, "vary");
+            return promiseReject(new TypeError("A partial response cannot be stored in a Cache"));
+        const vary = cacheHeader(inner.headerList, "vary");
         if (vary !== null && vary.split(",").some((field) => field.trim() === "*"))
-            return Promise.reject(new TypeError("A response with Vary: * cannot be stored in a Cache"));
+            return promiseReject(new TypeError("A response with Vary: * cannot be stored in a Cache"));
         if (fetchAPI.bodyUnusable(inner))
-            return Promise.reject(new TypeError("The response body is disturbed or locked"));
+            return promiseReject(new TypeError("The response body is disturbed or locked"));
         return fetchAPI.readBody(inner).then((bytes) => ({
-            request: __cacheRequestRecord(request),
+            request: cacheRequestRecord(request),
             response: {
                 status: inner.status,
                 statusText: inner.statusMessage,
-                headers: __cacheHeaders(inner.headerList),
+                headers: cacheHeaders(inner.headerList),
                 urlList: inner.urlList.slice(),
                 type: inner.type,
                 body64: cacheBytesToBase64(bytes),
             },
         }));
     }
-    function __cacheCommit(id, additions) {
-        let records = __cacheLoad(id);
-        const added = [];
-        for (let index = 0; index < additions.length; index++) {
-            const addition = additions[index];
-            if (added.some((record) => __cacheMatches(addition.request, record, {})))
-                throw new DOMException("A Cache batch operation contains duplicate requests.", "InvalidStateError");
-            records = records.filter((record) => !__cacheMatches(addition.request, record, {}));
-            records.push(addition);
-            added.push(addition);
-        }
-        __cacheSave(id, records);
+    // Batch Cache Operations for "put" operations.
+    function cacheCommit(id, additions) {
+        updateRecords(id, (records) => {
+            const added = [];
+            for (let index = 0; index < additions.length; index++) {
+                const addition = additions[index];
+                if (added.some((record) => cacheMatches(addition.request, record, {})))
+                    throw new DOMExceptionCtor("A Cache batch operation contains duplicate requests.", "InvalidStateError");
+                const kept = records.filter((record) => !cacheMatches(addition.request, record, {}));
+                records.length = 0;
+                for (let keep = 0; keep < kept.length; keep++) records.push(kept[keep]);
+                records.push(addition);
+                added.push(addition);
+            }
+            return { changed: true };
+        });
     }
 
-    const cacheIds = privateSlots();
+    const cacheIds = new WeakMap();
+    function cacheId(cache) {
+        const id = apply(weakGet, cacheIds, [cache]);
+        if (id === undefined) throw new TypeError("Illegal Cache invocation");
+        return id;
+    }
     class Cache {
         constructor(token, id) {
-            if (token !== __cacheToken) throw new TypeError("Illegal constructor");
-            cacheIds.set(this, id);
+            if (token !== cacheToken) throw new TypeError("Illegal constructor");
+            apply(weakSet, cacheIds, [this, id]);
         }
         match(request, options) {
-            if (arguments.length === 0) return Promise.reject(new TypeError("Cache.match requires a request"));
+            if (arguments.length === 0) return promiseReject(new TypeError("Cache.match requires a request"));
             return this.matchAll(request, options).then((responses) => responses[0]);
         }
         matchAll(request, options) {
             try {
+                const id = cacheId(this);
                 const omitted = arguments.length === 0;
-                const query = omitted ? null : __cacheRequestRecord(__cacheRequest(request));
+                const query = omitted ? null : cacheRequestRecord(cacheRequest(request));
                 if (query !== null && query.method !== "GET" && !(options && options.ignoreMethod))
-                    return Promise.resolve(Object.freeze([]));
-                const records = __cacheLoad(cacheIds.get(this));
+                    return promiseResolve(freeze([]));
+                const records = cacheLoad(id);
                 const responses = [];
                 for (let index = 0; index < records.length; index++) {
-                    if (query === null || __cacheMatches(query, records[index], options))
-                        responses.push(__cacheResponse(records[index].response));
+                    if (query === null || cacheMatches(query, records[index], options))
+                        responses.push(cacheResponse(records[index].response));
                 }
-                return Promise.resolve(Object.freeze(responses));
-            } catch (error) { return Promise.reject(error); }
+                return promiseResolve(freeze(responses));
+            } catch (error) { return promiseReject(error); }
         }
         add(request) {
-            if (arguments.length === 0) return Promise.reject(new TypeError("Cache.add requires a request"));
+            if (arguments.length === 0) return promiseReject(new TypeError("Cache.add requires a request"));
             return this.addAll([request]);
         }
         addAll(requests) {
-            let list;
-            try { list = Array.from(requests, (request) => __cacheRequest(request)); }
-            catch (error) { return Promise.reject(error); }
+            let list, id;
+            try {
+                id = cacheId(this);
+                list = Array.from(requests, (request) => cacheRequest(request));
+            } catch (error) { return promiseReject(error); }
             for (let index = 0; index < list.length; index++) {
                 const inner = fetchAPI.request(list[index]);
-                const protocol = new URL(inner.url).protocol;
+                const protocol = new URLCtor(inner.url).protocol;
                 if ((protocol !== "http:" && protocol !== "https:") || inner.method !== "GET")
-                    return Promise.reject(new TypeError("Cache.addAll only accepts HTTP(S) GET requests"));
+                    return promiseReject(new TypeError("Cache.addAll only accepts HTTP(S) GET requests"));
             }
-            return Promise.all(list.map((request) => platformFetch(request))).then((responses) => {
+            return promiseAll(list.map((request) => platformFetch(request))).then((responses) => {
                 for (let index = 0; index < responses.length; index++) {
                     const response = fetchAPI.response(responses[index]);
-                    const vary = __cacheHeader(response.headerList, "vary");
+                    const vary = cacheHeader(response.headerList, "vary");
                     if (response.type === "error" || response.status < 200 || response.status > 299 || response.status === 206 ||
                         (vary !== null && vary.split(",").some((field) => field.trim() === "*")))
                         throw new TypeError("Cache.addAll received an uncacheable response");
                 }
-                return Promise.all(responses.map((response, index) =>
-                    __cacheResponseRecord(list[index], response)));
-            }).then((records) => { __cacheCommit(cacheIds.get(this), records); return undefined; });
+                return promiseAll(responses.map((response, index) =>
+                    cacheResponseRecord(list[index], response)));
+            }).then((records) => { cacheCommit(id, records); return undefined; });
         }
         put(request, response) {
-            if (arguments.length < 2) return Promise.reject(new TypeError("Cache.put requires a request and response"));
-            let normalized;
-            try { normalized = __cacheRequest(request); }
-            catch (error) { return Promise.reject(error); }
-            return __cacheResponseRecord(normalized, response).then((record) => {
-                __cacheCommit(cacheIds.get(this), [record]);
+            if (arguments.length < 2) return promiseReject(new TypeError("Cache.put requires a request and response"));
+            let normalized, id;
+            try {
+                id = cacheId(this);
+                normalized = cacheRequest(request);
+            } catch (error) { return promiseReject(error); }
+            return cacheResponseRecord(normalized, response).then((record) => {
+                cacheCommit(id, [record]);
                 return undefined;
             });
         }
         delete(request, options) {
-            if (arguments.length === 0) return Promise.reject(new TypeError("Cache.delete requires a request"));
+            if (arguments.length === 0) return promiseReject(new TypeError("Cache.delete requires a request"));
             try {
-                const query = __cacheRequestRecord(__cacheRequest(request));
+                const id = cacheId(this);
+                const query = cacheRequestRecord(cacheRequest(request));
                 if (query.method !== "GET" && !(options && options.ignoreMethod))
-                    return Promise.resolve(false);
-                const records = __cacheLoad(cacheIds.get(this));
-                const kept = records.filter((record) => !__cacheMatches(query, record, options));
-                if (kept.length === records.length) return Promise.resolve(false);
-                __cacheSave(cacheIds.get(this), kept);
-                return Promise.resolve(true);
-            } catch (error) { return Promise.reject(error); }
+                    return promiseResolve(false);
+                return promiseResolve(updateRecords(id, (records) => {
+                    const kept = records.filter((record) => !cacheMatches(query, record, options));
+                    if (kept.length === records.length) return { changed: false, value: false };
+                    records.length = 0;
+                    for (let index = 0; index < kept.length; index++) records.push(kept[index]);
+                    return { changed: true, value: true };
+                }));
+            } catch (error) { return promiseReject(error); }
         }
         keys(request, options) {
             try {
+                const id = cacheId(this);
                 const omitted = arguments.length === 0;
-                const query = omitted ? null : __cacheRequestRecord(__cacheRequest(request));
+                const query = omitted ? null : cacheRequestRecord(cacheRequest(request));
                 if (query !== null && query.method !== "GET" && !(options && options.ignoreMethod))
-                    return Promise.resolve(Object.freeze([]));
-                const records = __cacheLoad(cacheIds.get(this));
+                    return promiseResolve(freeze([]));
+                const records = cacheLoad(id);
                 const requests = [];
                 for (let index = 0; index < records.length; index++) {
                     const record = records[index];
-                    if (query === null || __cacheMatches(query, record, options)) {
+                    if (query === null || cacheMatches(query, record, options)) {
                         requests.push(fetchAPI.createRequest(record.request.url, record.request.method,
-                            __cacheHeaders(record.request.headers), "immutable"));
+                            cacheHeaders(record.request.headers), "immutable"));
                     }
                 }
-                return Promise.resolve(Object.freeze(requests));
-            } catch (error) { return Promise.reject(error); }
+                return promiseResolve(freeze(requests));
+            } catch (error) { return promiseReject(error); }
         }
         get [Symbol.toStringTag]() { return "Cache"; }
     }
 
     class CacheStorage {
         constructor(token) {
-            if (token !== __cacheToken) throw new TypeError("Illegal constructor");
+            if (token !== cacheToken) throw new TypeError("Illegal constructor");
         }
         match(request, options) {
-            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.match requires a request"));
+            if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.match requires a request"));
             try {
-                const names = __cacheNames();
+                const names = cacheNames();
                 if (options && Object.prototype.hasOwnProperty.call(options, "cacheName")) {
-                    const name = __cacheDOMString(options.cacheName);
+                    const name = cacheDOMString(options.cacheName);
                     const entry = names.entries.find((item) => item[0] === name);
-                    return entry ? new Cache(__cacheToken, entry[1]).match(request, options)
-                        : Promise.resolve(undefined);
+                    return entry ? new Cache(cacheToken, entry[1]).match(request, options)
+                        : promiseResolve(undefined);
                 }
-                let promise = Promise.resolve(undefined);
+                let promise = promiseResolve(undefined);
                 for (let index = 0; index < names.entries.length; index++) {
-                    const cache = new Cache(__cacheToken, names.entries[index][1]);
+                    const cache = new Cache(cacheToken, names.entries[index][1]);
                     promise = promise.then((response) => response === undefined ? cache.match(request, options) : response);
                 }
                 return promise;
-            } catch (error) { return Promise.reject(error); }
+            } catch (error) { return promiseReject(error); }
         }
         has(cacheName) {
-            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.has requires a cache name"));
+            if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.has requires a cache name"));
             try {
-                const name = __cacheDOMString(cacheName);
-                return Promise.resolve(__cacheNames().entries.some((entry) => entry[0] === name));
-            } catch (error) { return Promise.reject(error); }
+                const name = cacheDOMString(cacheName);
+                return promiseResolve(cacheNames().entries.some((entry) => entry[0] === name));
+            } catch (error) { return promiseReject(error); }
         }
         open(cacheName) {
-            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.open requires a cache name"));
+            if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.open requires a cache name"));
             try {
-                const name = __cacheDOMString(cacheName);
-                const names = __cacheNames();
-                const existing = names.entries.find((entry) => entry[0] === name);
-                if (existing) return Promise.resolve(new Cache(__cacheToken, existing[1]));
-                const id = String(names.next++);
-                names.entries.push([name, id]);
-                if (names.entries.length > __cacheNameLimit)
-                    throw new QuotaExceededError("The CacheStorage quota was exceeded.");
-                // Create the request/response list before publishing its name.
-                // If quota rejects the list write, open() must not leave a
-                // visible half-created CacheStorage entry.
-                __cacheSave(id, []);
-                __cacheSaveNames(names);
-                return Promise.resolve(new Cache(__cacheToken, id));
-            } catch (error) { return Promise.reject(error); }
+                const name = cacheDOMString(cacheName);
+                // #cache-storage-open: an existing entry, or a new request
+                // response list set into the map. The empty list's quota is
+                // checked before its name becomes visible, so a rejected open
+                // never leaves a half-created entry.
+                const id = updateNames((names) => {
+                    const existing = names.entries.find((entry) => entry[0] === name);
+                    if (existing) return { changed: false, value: existing[1] };
+                    const created = String(names.next++);
+                    names.entries.push([name, created]);
+                    checkQuota(created, 2);
+                    return { changed: true, value: created };
+                });
+                return promiseResolve(new Cache(cacheToken, id));
+            } catch (error) { return promiseReject(error); }
         }
         delete(cacheName) {
-            if (arguments.length === 0) return Promise.reject(new TypeError("CacheStorage.delete requires a cache name"));
+            if (arguments.length === 0) return promiseReject(new TypeError("CacheStorage.delete requires a cache name"));
             try {
-                const name = __cacheDOMString(cacheName);
-                const names = __cacheNames();
-                const index = names.entries.findIndex((entry) => entry[0] === name);
-                if (index < 0) return Promise.resolve(false);
-                names.entries.splice(index, 1);
-                __cacheSaveNames(names);
-                return Promise.resolve(true);
-            } catch (error) { return Promise.reject(error); }
+                const name = cacheDOMString(cacheName);
+                return promiseResolve(updateNames((names) => {
+                    const index = names.entries.findIndex((entry) => entry[0] === name);
+                    if (index < 0) return { changed: false, value: false };
+                    names.entries.splice(index, 1);
+                    return { changed: true, value: true };
+                }));
+            } catch (error) { return promiseReject(error); }
         }
-        keys() { return Promise.resolve(__cacheNames().entries.map((entry) => entry[0])); }
+        keys() { return promiseResolve(cacheNames().entries.map((entry) => entry[0])); }
         get [Symbol.toStringTag]() { return "CacheStorage"; }
     }
 
-    if (secureContext) {
-        g.Cache = Cache;
-        g.CacheStorage = CacheStorage;
-        Object.defineProperty(g, "caches", {
+    if (adapter.secure) {
+        define(g, "Cache", { value: Cache, writable: true, configurable: true });
+        define(g, "CacheStorage", { value: CacheStorage, writable: true, configurable: true });
+        const storage = new CacheStorage(cacheToken);
+        define(g, "caches", {
             configurable: true,
             enumerable: true,
-            get: (() => {
-                const storage = new CacheStorage(__cacheToken);
-                return () => {
-                    if (__persistentStorageOrigin === "null")
-                        throw new DOMException("Cache storage is unavailable for an opaque origin.", "SecurityError");
-                    return storage;
-                };
-            })(),
+            get: Object.getOwnPropertyDescriptor({ get caches() {
+                if (storageOrigin === "null")
+                    throw new DOMExceptionCtor("Cache storage is unavailable for an opaque origin.", "SecurityError");
+                return storage;
+            } }, "caches").get,
         });
     }
+    })(globalThis);
+    /*__CACHE_STORAGE_END__*/
 
     // --- Indexed Database ----------------------------------------------------
-    // Indexed Database 3 §§2.7, 4, and 5. Requests complete on database tasks;
-    // a transaction is active while it is created and while one of its request
-    // events is dispatched, then commits atomically after its ordered request
-    // list drains. Values cross the same StructuredSerializeForStorage-style
-    // boundary as workers rather than retaining aliases to author objects.
+    // The Window's view for the shared Indexed Database block: its storage key,
+    // its DOM event dispatch (including IndexedDB's get-the-parent overrides
+    // and the legacy listener-exception output), its database task source
+    // (the eleventh platform task source below) and the nested navigable a task
+    // belongs to.
+    let indexedDBTasks = null;
+    g.__indexeddb_adapter = {
+        origin: __persistentStorageOrigin, EventTarget, Event,
+        setParent(target, parent) { eventParents.set(target, parent); },
+        fire(target, C, type, init) {
+            const event = createTrustedEvent(C, type, init);
+            dispatch(target, event, false);
+            return event;
+        },
+        listenerThrew(event) { return eventsWithListenerExceptions.has(event); },
+        handlers(proto, types) { installHandlerProps(proto, types); },
+        frame() { return trust.__activeFrame || null; },
+        runIn(frame, fn) { runInFrame(frame, fn); },
+        serialize(value) { return messageSerialize(value, true); },
+        deserialize(wire) { return messageDeserialize(wire); },
+        register(api) { indexedDBTasks = api; },
+    };
+    /*__INDEXEDDB_BEGIN__*/
+    // Indexed Database 3 (local w3c/IndexedDB@f704918), [Exposed=(Window,Worker)]:
+    // this block is shared by Window and worker realms (`js::worker_prelude()`).
     //
-    // The host map is session-lifetime and origin-keyed. Keeping one serialized
-    // database per key makes a read/write transaction's publication a single
-    // host operation: its private snapshot is either wholly installed or not
-    // installed at all.
-    const __idbToken = {};
-    const __idbDataKind = "indexed-database:" + __persistentStorageOrigin;
-    const __idbQuota = 64 * 1024 * 1024;
-    const __idbCatalog = new Map();
-    // Indexed Database 3 §2.8.2 serializes open/delete requests for each
-    // storage key + database name. A queue entry remains current while an
-    // upgrade is blocked or its versionchange transaction is live.
-    const __idbConnectionQueues = new Map();
-    const __idbConnectionFinishes = new WeakMap();
+    // Requests complete on database tasks; a transaction is active while it is
+    // created and while one of its request events is dispatched, then commits
+    // atomically after its ordered request list drains. Values cross the same
+    // StructuredSerializeForStorage boundary as messages rather than retaining
+    // aliases to author objects.
+    //
+    // Databases belong to the storage key (Storage #storage-keys), not to a
+    // realm: every Window and worker of an origin shares them. The committed
+    // data lives in the host's storage shed, one serialized database per
+    // name. The host's database coordinator (`indexed_db_host.rs`) owns what
+    // the standard keeps outside any event loop and that must therefore be
+    // shared across agents: the connection queues (#connection-queues), the
+    // set of connections of each database with their close pending flags,
+    // the versionchange/blocked handshake of #opening and #deleting-a-database,
+    // and transaction scheduling (#transaction-scheduling). It queues database
+    // tasks for the realm that owns each request, connection and transaction.
+    (function (g) {
+    "use strict";
+    const adapter = g.__indexeddb_adapter;
+    delete g.__indexeddb_adapter;
+    const createDOMStringList = g.__dom_string_list_create;
+    const EventTarget = adapter.EventTarget, Event = adapter.Event;
+    const DOMExceptionCtor = g.DOMException, QuotaExceededErrorCtor = g.QuotaExceededError;
+    const internalSlots = __platform_slots("internals", new WeakMap());
+    const apply = Reflect.apply, define = Object.defineProperty, getOwn = Object.getOwnPropertyDescriptor;
+    const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set, objectCreate = Object.create;
+    const parse = JSON.parse, stringify = JSON.stringify, isArray = Array.isArray;
+    const isView = ArrayBuffer.isView, DateCtor = Date;
+    const dateGetTime = Date.prototype.getTime;
+    const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
+    function internalsFor(object) {
+        let record = apply(weakGet, internalSlots, [object]);
+        if (record === undefined) {
+            record = objectCreate(null);
+            if ((typeof object === "object" && object !== null) || typeof object === "function")
+                apply(weakSet, internalSlots, [object, record]);
+        }
+        return record;
+    }
+    const storageKey = adapter.origin;
+    const idbToken = {};
+    const idbDataKind = "indexed-database:" + storageKey;
+    const idbQuota = 64 * 1024 * 1024;
 
-    function __idbCheckStorageKey() {
+    // --- the host database coordinator --------------------------------------
+    // This realm's database access task source (#queue-a-database-task): one
+    // FIFO for the tasks this block queues itself and those the coordinator
+    // queued for this realm. The coordinator's tasks for this realm caused by
+    // its own operation join the FIFO at once, so the order of every database
+    // task this realm caused is preserved; tasks caused by other agents join
+    // when this realm observes them.
+    const databaseQueue = [];
+    function queueDatabaseTask(fn) { databaseQueue.push({ fn, frame: adapter.frame(), task: null }); }
+    function takeCoordinatorTasks() {
+        for (;;) {
+            const task = __indexed_db("take", []);
+            if (task === null) return;
+            databaseQueue.push({ fn: null, frame: null, task });
+        }
+    }
+    function coordinator(op, argument) {
+        const result = __indexed_db(op, argument === undefined ? [] : argument);
+        takeCoordinatorTasks();
+        return result;
+    }
+    // This realm's requests, connections and transactions the coordinator
+    // knows, by its identifiers. Database tasks address them by identifier;
+    // while none is registered this realm has no database task to look for.
+    const requestsById = new Map(), connectionsById = new Map(), transactionsById = new Map();
+    function registered() { return requestsById.size + connectionsById.size + transactionsById.size; }
+    function runDatabaseTask() {
+        if (registered() > 0) takeCoordinatorTasks();
+        const entry = databaseQueue.shift();
+        if (entry === undefined) return false;
+        if (entry.fn !== null) {
+            adapter.runIn(entry.frame, entry.fn);
+            return true;
+        }
+        const task = entry.task, kind = task[0];
+        if (kind === "run" || kind === "blocked" || kind === "unblocked") {
+            const request = requestsById.get(task[1]);
+            if (!request) return true;
+            const record = internalsFor(request);
+            adapter.runIn(record.frame, function () {
+                if (kind === "run") record.run();
+                else if (kind === "unblocked") record.unblocked();
+                // #opening step 10.4 / #deleting-a-database step 8.
+                else idbVersionEvent(request, "blocked", task[2], task[3]);
+            });
+        } else if (kind === "versionchange") {
+            const connection = connectionsById.get(task[1]);
+            if (connection) {
+                const record = internalsFor(connection);
+                // #opening step 10.2: firing this event at another connection
+                // may already have closed this one, which then gets no event.
+                adapter.runIn(record.frame, function () {
+                    if (!record.closed && !record.closePending)
+                        idbVersionEvent(connection, "versionchange", task[3], task[4]);
+                });
+            }
+            // "Wait for all of the events to be fired."
+            coordinator("ack", [task[1], task[2]]);
+        } else if (kind === "start") {
+            const transaction = transactionsById.get(task[1]);
+            if (transaction) adapter.runIn(internalsFor(transaction).frame, function () { idbStart(transaction); });
+        }
+        return true;
+    }
+    adapter.register({
+        has() { return databaseQueue.length > 0 || (registered() > 0 && __indexed_db("has", [])); },
+        run: runDatabaseTask,
+    });
+
+    function idbCheckStorageKey() {
         // Indexed Database #dom-idbfactory-open / -deletedatabase / -databases
         // obtain a storage key BEFORE creating an open request or listing data.
-        if (__persistentStorageOrigin === "null")
-            throw new DOMException("Database storage is unavailable for an opaque origin.", "SecurityError");
+        if (storageKey === "null")
+            throw new DOMExceptionCtor("Database storage is unavailable for an opaque origin.", "SecurityError");
     }
-
-    function __idbStartConnectionRequest(name) {
-        const queue = __idbConnectionQueues.get(name);
-        if (!queue || !queue.length || queue[0].started) return;
-        const entry = queue[0]; entry.started = true;
-        __queue_dom_task(() => entry.run(() => {
-            if (entry.finished) return;
-            entry.finished = true;
-            const current = __idbConnectionQueues.get(name);
-            if (!current || current[0] !== entry) return;
-            current.shift();
-            if (!current.length) __idbConnectionQueues.delete(name);
-            else __idbStartConnectionRequest(name);
-        }));
-    }
-    function __idbEnqueueConnectionRequest(name, run) {
-        let queue = __idbConnectionQueues.get(name);
-        if (!queue) { queue = []; __idbConnectionQueues.set(name, queue); }
-        queue.push({ run: run, started: false, finished: false });
-        __idbStartConnectionRequest(name);
-    }
-    function __idbFinishConnectionRequest(request) {
-        const finish = __idbConnectionFinishes.get(request);
-        if (!finish) return;
-        __idbConnectionFinishes.delete(request);
-        finish();
-    }
-
-    function __idbException(name, message) { return new DOMException(message || name, name); }
-    function __idbDOMString(value) { return "" + value; }
-    function __idbCloneData(value) { return JSON.parse(JSON.stringify(value)); }
-    function __idbDefaultData() { return { version: 0, stores: [] }; }
-    function __idbLoadData(name) {
-        const encoded = __storage_get(__idbDataKind, name);
+    function idbException(name, message) { return new DOMExceptionCtor(message || name, name); }
+    function idbDOMString(value) { return "" + value; }
+    function idbCloneData(value) { return parse(stringify(value)); }
+    function idbDefaultData() { return { version: 0, stores: [] }; }
+    function idbParseData(encoded) {
         if (encoded === null) return null;
         try {
-            const data = JSON.parse(encoded);
-            if (data && Number.isSafeInteger(data.version) && Array.isArray(data.stores)) return data;
+            const data = parse(encoded);
+            if (data && Number.isSafeInteger(data.version) && isArray(data.stores)) return data;
         } catch (_) {}
         return null;
     }
-    function __idbSaveData(name, data) {
-        const encoded = JSON.stringify(data);
-        let total = encoded.length;
-        const count = __storage_len(__idbDataKind);
+    // The committed database named `name` in this storage key, or null.
+    function idbLoadData(name) { return idbParseData(__storage_get(idbDataKind, name)); }
+    function idbCheckQuota(name, size) {
+        let total = size;
+        const count = __storage_len(idbDataKind);
         for (let index = 0; index < count; index++) {
-            const key = __storage_key(__idbDataKind, index);
+            const key = __storage_key(idbDataKind, index);
             if (key === null || key === name) continue;
-            const value = __storage_get(__idbDataKind, key);
+            const value = __storage_get(idbDataKind, key);
             if (value !== null) total += value.length;
         }
-        if (total > __idbQuota)
-            throw new QuotaExceededError("The IndexedDB quota was exceeded.");
-        __storage_set(__idbDataKind, name, encoded);
+        if (total > idbQuota)
+            throw new QuotaExceededErrorCtor("The IndexedDB quota was exceeded.");
     }
-    function __idbDatabaseState(name, create) {
-        let state = __idbCatalog.get(name);
-        if (state) return state;
-        let data = __idbLoadData(name);
-        if (data === null && !create) return null;
-        if (data === null) data = __idbDefaultData();
-        state = {
-            name: name,
-            data: data,
-            connections: new Set(),
-            transactions: [],
-            connectionWaiters: new Set(),
+    // #commit-transaction "attempt to write any outstanding changes": one host
+    // write installs them wholly or not at all. A read/write transaction owns
+    // only its scope (#transaction-scheduling), so its object stores replace
+    // those of the latest committed database; other agents' non-overlapping
+    // transactions may have committed meanwhile, which the compare-and-set
+    // retry preserves. An upgrade transaction is exclusive and writes all.
+    function idbWriteData(transaction) {
+        const record = internalsFor(transaction), name = record.connection.name;
+        for (;;) {
+            const encoded = __storage_get(idbDataKind, name);
+            let data;
+            if (transaction.mode === "versionchange") data = record.data;
+            else {
+                data = idbParseData(encoded) || idbDefaultData();
+                for (const storeName of record.scope) {
+                    const changed = idbStore(record.data, storeName);
+                    const index = data.stores.findIndex((store) => store.name === storeName);
+                    if (changed && index >= 0) data.stores[index] = changed;
+                }
+            }
+            const next = stringify(data);
+            idbCheckQuota(name, next.length);
+            if (__storage_cas(idbDataKind, name, encoded, next)) return;
+        }
+    }
+    // A connection's object store set (#database-connection): the schema of
+    // its database without the records, which belong to transactions.
+    function idbSchema(data) {
+        return {
+            version: data.version,
+            stores: data.stores.map((store) => ({
+                name: store.name, keyPath: store.keyPath, autoIncrement: store.autoIncrement,
+                nextKey: store.nextKey, indexes: idbCloneData(store.indexes), records: [],
+            })),
         };
-        __idbCatalog.set(name, state);
-        return state;
     }
-    function __idbStore(data, name) {
+    function idbStore(data, name) {
         return data.stores.find((store) => store.name === name) || null;
     }
-    function __idbSortedNames(values) {
-        const names = values.map(String).sort();
-        const list = {};
-        Object.defineProperty(list, "length", { enumerable: false, value: names.length });
-        for (let index = 0; index < names.length; index++) {
-            Object.defineProperty(list, index, { enumerable: true, value: names[index] });
-        }
-        Object.defineProperties(list, {
-            item: { enumerable: false, value(index) {
-                index = Number(index);
-                return Number.isInteger(index) && index >= 0 && index < names.length ? names[index] : null;
-            } },
-            contains: { enumerable: false, value(name) { return names.includes(String(name)); } },
-            [Symbol.iterator]: { enumerable: false, value: function* () { yield* names; } },
-            [Symbol.toStringTag]: { enumerable: false, value: "DOMStringList" },
-        });
-        return Object.freeze(list);
+    function idbSortedNames(values) {
+        return createDOMStringList(values.map(String).sort());
     }
-    function __idbEncodeNumber(value) {
+    function idbEncodeNumber(value) {
         if (value === Infinity) return "+i";
         if (value === -Infinity) return "-i";
         if (Object.is(value, -0)) return "-0";
         return value;
     }
-    function __idbDecodeNumber(value) {
+    function idbDecodeNumber(value) {
         return value === "+i" ? Infinity : value === "-i" ? -Infinity : value === "-0" ? -0 : value;
+    }
+    function idbIsDate(value) {
+        try { apply(dateGetTime, value, []); return true; } catch (_) { return false; }
+    }
+    function idbIsBuffer(value) {
+        try { apply(bufferByteLength, value, []); return true; }
+        catch (_) { return false; }
     }
     // Indexed Database §7.4, "convert a value to a key". The compact tagged
     // form is storage-safe (including infinities and -0) and preserves the
     // standard type ordering used by cmp(), ranges, records, and cursors.
-    function __idbKey(value, seen) {
+    function idbKey(value, seen) {
         if (typeof value === "number") {
-            if (Number.isNaN(value)) throw __idbException("DataError", "NaN is not a valid IndexedDB key.");
-            return { t: "n", v: __idbEncodeNumber(value) };
+            if (Number.isNaN(value)) throw idbException("DataError", "NaN is not a valid IndexedDB key.");
+            return { t: "n", v: idbEncodeNumber(value) };
         }
-        if (value instanceof Date) {
-            const time = value.getTime();
-            if (Number.isNaN(time)) throw __idbException("DataError", "An invalid Date is not an IndexedDB key.");
+        if (typeof value === "object" && value !== null && idbIsDate(value)) {
+            const time = apply(dateGetTime, value, []);
+            if (Number.isNaN(time)) throw idbException("DataError", "An invalid Date is not an IndexedDB key.");
             return { t: "d", v: time };
         }
         if (typeof value === "string") return { t: "s", v: value };
-        if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-            const bytes = value instanceof ArrayBuffer
-                ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        if (typeof value === "object" && value !== null && (idbIsBuffer(value) || isView(value))) {
+            let bytes;
+            try {
+                bytes = idbIsBuffer(value)
+                    ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+            } catch (_) { throw idbException("DataError", "A detached buffer is not an IndexedDB key."); }
             return { t: "b", v: Array.from(bytes) };
         }
-        if (Array.isArray(value)) {
+        if (isArray(value)) {
             seen = seen || new Set();
-            if (seen.has(value)) throw __idbException("DataError", "A cyclic array is not an IndexedDB key.");
+            if (seen.has(value)) throw idbException("DataError", "A cyclic array is not an IndexedDB key.");
             seen.add(value);
             const keys = [];
             for (let index = 0; index < value.length; index++) {
                 if (!Object.prototype.hasOwnProperty.call(value, index))
-                    throw __idbException("DataError", "A sparse array is not an IndexedDB key.");
-                keys.push(__idbKey(value[index], seen));
+                    throw idbException("DataError", "A sparse array is not an IndexedDB key.");
+                keys.push(idbKey(value[index], seen));
             }
             seen.delete(value);
             return { t: "a", v: keys };
         }
-        throw __idbException("DataError", "The value is not a valid IndexedDB key.");
+        throw idbException("DataError", "The value is not a valid IndexedDB key.");
     }
-    function __idbMultiEntryKey(value) {
-        if (!Array.isArray(value)) return __idbKey(value);
+    function idbMultiEntryKey(value) {
+        if (!isArray(value)) return idbKey(value);
         const keys = [];
         for (let index = 0; index < value.length; index++) {
             let key;
-            try { key = __idbKey(value[index]); }
+            try { key = idbKey(value[index]); }
             catch (_) { continue; }
-            if (!keys.some((item) => __idbCompare(item, key) === 0)) keys.push(key);
+            if (!keys.some((item) => idbCompare(item, key) === 0)) keys.push(key);
         }
         return { t: "a", v: keys };
     }
-    function __idbKeyValue(key) {
-        if (key.t === "n") return __idbDecodeNumber(key.v);
-        if (key.t === "d") return new Date(key.v);
+    function idbKeyValue(key) {
+        if (key.t === "n") return idbDecodeNumber(key.v);
+        if (key.t === "d") return new DateCtor(key.v);
         if (key.t === "s") return key.v;
         if (key.t === "b") return new Uint8Array(key.v).buffer;
-        return key.v.map(__idbKeyValue);
+        return key.v.map(idbKeyValue);
     }
-    function __idbCompare(a, b) {
+    function idbCompare(a, b) {
         const order = { n: 0, d: 1, s: 2, b: 3, a: 4 };
         if (a.t !== b.t) return order[a.t] < order[b.t] ? -1 : 1;
         if (a.t === "n") {
-            const av = __idbDecodeNumber(a.v), bv = __idbDecodeNumber(b.v);
+            const av = idbDecodeNumber(a.v), bv = idbDecodeNumber(b.v);
             return av < bv ? -1 : av > bv ? 1 : 0;
         }
         if (a.t === "d") return a.v < b.v ? -1 : a.v > b.v ? 1 : 0;
@@ -40554,21 +40741,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         const length = Math.min(a.v.length, b.v.length);
         for (let index = 0; index < length; index++) {
-            const compared = __idbCompare(a.v[index], b.v[index]);
+            const compared = idbCompare(a.v[index], b.v[index]);
             if (compared) return compared;
         }
         return a.v.length < b.v.length ? -1 : a.v.length > b.v.length ? 1 : 0;
     }
-    function __idbKeyPathValid(path) {
-        if (Array.isArray(path)) return path.length > 0 && path.every(__idbKeyPathValid);
+    function idbKeyPathValid(path) {
+        if (isArray(path)) return path.length > 0 && path.every(idbKeyPathValid);
         if (typeof path !== "string") return false;
-        return path === "" || path.split(".").every((part) => /^[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*$/u.test(part));
+        return path === "" || path.split(".").every((part) => /^[$_\p{ID_Start}][$‌‍\p{ID_Continue}]*$/u.test(part));
     }
-    function __idbExtractPath(value, path) {
-        if (Array.isArray(path)) {
+    function idbExtractPath(value, path) {
+        if (isArray(path)) {
             const keys = [];
             for (const part of path) {
-                const extracted = __idbExtractPath(value, part);
+                const extracted = idbExtractPath(value, part);
                 if (extracted === undefined) return undefined;
                 keys.push(extracted);
             }
@@ -40582,7 +40769,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         return current;
     }
-    function __idbInjectPath(value, path, key) {
+    function idbInjectPath(value, path, key) {
         if (typeof path !== "string" || path === "" || value === null ||
             (typeof value !== "object" && typeof value !== "function")) return false;
         const parts = path.split(".");
@@ -40593,49 +40780,71 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             current = current[part];
             if (current === null || (typeof current !== "object" && typeof current !== "function")) return false;
         }
-        try { current[parts[parts.length - 1]] = __idbKeyValue(key); return true; }
+        try { current[parts[parts.length - 1]] = idbKeyValue(key); return true; }
         catch (_) { return false; }
     }
 
     class IDBKeyRange {
         constructor(token, lower, upper, lowerOpen, upperOpen) {
-            if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            internalsFor(this).lower = lower; internalsFor(this).upper = upper;
-            this.lowerOpen = !!lowerOpen; this.upperOpen = !!upperOpen;
+            if (token !== idbToken) throw new TypeError("Illegal constructor");
+            const record = internalsFor(this);
+            record.lower = lower; record.upper = upper;
+            record.lowerOpen = !!lowerOpen; record.upperOpen = !!upperOpen;
+            record.keyRange = true;
         }
-        get lower() { return internalsFor(this).lower === null ? undefined : __idbKeyValue(internalsFor(this).lower); }
-        get upper() { return internalsFor(this).upper === null ? undefined : __idbKeyValue(internalsFor(this).upper); }
-        includes(value) { return __idbRangeIncludes(this, __idbKey(value)); }
+        get lower() { const record = idbRangeRecord(this); return record.lower === null ? undefined : idbKeyValue(record.lower); }
+        get upper() { const record = idbRangeRecord(this); return record.upper === null ? undefined : idbKeyValue(record.upper); }
+        get lowerOpen() { return idbRangeRecord(this).lowerOpen; }
+        get upperOpen() { return idbRangeRecord(this).upperOpen; }
+        includes(value) {
+            idbRangeRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBKeyRange.includes requires a key.");
+            return idbRangeIncludes(this, idbKey(value));
+        }
         static only(value) {
-            const key = __idbKey(value); return new IDBKeyRange(__idbToken, key, key, false, false);
+            if (arguments.length < 1) throw new TypeError("IDBKeyRange.only requires a key.");
+            const key = idbKey(value); return new IDBKeyRange(idbToken, key, key, false, false);
         }
-        static lowerBound(value, open) {
-            return new IDBKeyRange(__idbToken, __idbKey(value), null, !!open, true);
+        static lowerBound(value, open = false) {
+            if (arguments.length < 1) throw new TypeError("IDBKeyRange.lowerBound requires a key.");
+            return new IDBKeyRange(idbToken, idbKey(value), null, !!open, true);
         }
-        static upperBound(value, open) {
-            return new IDBKeyRange(__idbToken, null, __idbKey(value), true, !!open);
+        static upperBound(value, open = false) {
+            if (arguments.length < 1) throw new TypeError("IDBKeyRange.upperBound requires a key.");
+            return new IDBKeyRange(idbToken, null, idbKey(value), true, !!open);
         }
-        static bound(lower, upper, lowerOpen, upperOpen) {
-            const low = __idbKey(lower), high = __idbKey(upper);
-            if (__idbCompare(low, high) > 0)
-                throw __idbException("DataError", "The lower key is greater than the upper key.");
-            return new IDBKeyRange(__idbToken, low, high, !!lowerOpen, !!upperOpen);
+        static bound(lower, upper, lowerOpen = false, upperOpen = false) {
+            if (arguments.length < 2) throw new TypeError("IDBKeyRange.bound requires two keys.");
+            const low = idbKey(lower), high = idbKey(upper);
+            const compared = idbCompare(low, high);
+            if (compared > 0 || (compared === 0 && (lowerOpen || upperOpen)))
+                throw idbException("DataError", "The lower key is greater than the upper key.");
+            return new IDBKeyRange(idbToken, low, high, !!lowerOpen, !!upperOpen);
         }
-        get [Symbol.toStringTag]() { return "IDBKeyRange"; }
     }
-    function __idbRange(query, nullMeansUnbounded) {
+    function idbRangeRecord(range) {
+        const record = (typeof range === "object" && range !== null) ? apply(weakGet, internalSlots, [range]) : undefined;
+        if (!record || !record.keyRange) throw new TypeError("Illegal IDBKeyRange invocation");
+        return record;
+    }
+    function idbIsRange(value) {
+        const record = (typeof value === "object" && value !== null) ? apply(weakGet, internalSlots, [value]) : undefined;
+        return !!(record && record.keyRange);
+    }
+    function idbRange(query, nullMeansUnbounded) {
         if ((query === undefined || query === null) && nullMeansUnbounded) return null;
-        return query instanceof IDBKeyRange ? query : IDBKeyRange.only(query);
+        return idbIsRange(query) ? query : IDBKeyRange.only(query);
     }
-    function __idbRangeIncludes(range, key) {
+    function idbRangeIncludes(range, key) {
         if (range === null) return true;
-        if (internalsFor(range).lower !== null) {
-            const lower = __idbCompare(key, internalsFor(range).lower);
-            if (lower < 0 || (lower === 0 && range.lowerOpen)) return false;
+        const record = internalsFor(range);
+        if (record.lower !== null) {
+            const lower = idbCompare(key, record.lower);
+            if (lower < 0 || (lower === 0 && record.lowerOpen)) return false;
         }
-        if (internalsFor(range).upper !== null) {
-            const upper = __idbCompare(key, internalsFor(range).upper);
-            if (upper > 0 || (upper === 0 && range.upperOpen)) return false;
+        if (record.upper !== null) {
+            const upper = idbCompare(key, record.upper);
+            if (upper > 0 || (upper === 0 && record.upperOpen)) return false;
         }
         return true;
     }
@@ -40643,249 +40852,326 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     class IDBRequest extends EventTarget {
         constructor(token, source, transaction) {
             super();
-            if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            internalsFor(this).source = source || null; internalsFor(this).transaction = transaction || null;
-            internalsFor(this).done = false; internalsFor(this).result = undefined; internalsFor(this).error = null;
+            if (token !== idbToken) throw new TypeError("Illegal constructor");
+            const record = internalsFor(this);
+            record.request = true;
+            record.source = source || null; record.transaction = transaction || null;
+            record.done = false; record.result = undefined; record.error = null;
         }
         get result() {
-            if (!internalsFor(this).done) throw __idbException("InvalidStateError", "The request is still pending.");
-            return internalsFor(this).result;
+            const record = idbRequestRecord(this);
+            if (!record.done) throw idbException("InvalidStateError", "The request is still pending.");
+            return record.result;
         }
         get error() {
-            if (!internalsFor(this).done) throw __idbException("InvalidStateError", "The request is still pending.");
-            return internalsFor(this).error;
+            const record = idbRequestRecord(this);
+            if (!record.done) throw idbException("InvalidStateError", "The request is still pending.");
+            return record.error;
         }
-        get source() { return internalsFor(this).source; }
-        get transaction() { return internalsFor(this).transaction; }
-        get readyState() { return internalsFor(this).done ? "done" : "pending"; }
-        get [Symbol.toStringTag]() { return "IDBRequest"; }
+        get source() { return idbRequestRecord(this).source; }
+        get transaction() { return idbRequestRecord(this).transaction; }
+        get readyState() { return idbRequestRecord(this).done ? "done" : "pending"; }
+    }
+    function idbRequestRecord(request) {
+        const record = (typeof request === "object" && request !== null) ? apply(weakGet, internalSlots, [request]) : undefined;
+        if (!record || !record.request) throw new TypeError("Illegal IDBRequest invocation");
+        return record;
     }
     class IDBOpenDBRequest extends IDBRequest {
         constructor(token) { super(token, null, null); }
-        get [Symbol.toStringTag]() { return "IDBOpenDBRequest"; }
     }
+    // #idbversionchangeevent: the IDBVersionChangeEventInit members follow
+    // EventInit's, each dictionary's in lexicographic order.
     class IDBVersionChangeEvent extends Event {
-        constructor(type, init) {
-            super(type, init);
-            this.oldVersion = init && init.oldVersion !== undefined ? Number(init.oldVersion) : 0;
-            this.newVersion = init && init.newVersion !== undefined ? init.newVersion : null;
-        }
-        get [Symbol.toStringTag]() { return "IDBVersionChangeEvent"; }
-    }
-    installHandlerProps(IDBRequest.prototype, ["success", "error"]);
-    installHandlerProps(IDBOpenDBRequest.prototype, ["blocked", "upgradeneeded"]);
-
-    function __idbVersionEvent(target, type, oldVersion, newVersion) {
-        const event = createTrustedEvent(IDBVersionChangeEvent, type,
-            { oldVersion: oldVersion, newVersion: newVersion });
-        dispatch(target, event, false);
-        return event;
-    }
-    function __idbRequestEvent(request, type, bubbles, cancelable) {
-        const event = createTrustedEvent(Event, type,
-            { bubbles: !!bubbles, cancelable: !!cancelable });
-        dispatch(request, event, false);
-        return event;
-    }
-    function __idbScopesOverlap(a, b) {
-        for (const name of internalsFor(a).scope) if (internalsFor(b).scope.includes(name)) return true;
-        return false;
-    }
-    function __idbCanStart(transaction) {
-        const transactions = internalsFor(transaction).db.transactions;
-        const index = transactions.indexOf(transaction);
-        for (let priorIndex = 0; priorIndex < index; priorIndex++) {
-            const prior = transactions[priorIndex];
-            if (internalsFor(prior).state === "finished" || !__idbScopesOverlap(transaction, prior)) continue;
-            if (transaction.mode !== "readonly" || prior.mode !== "readonly") return false;
-        }
-        return true;
-    }
-    function __idbMaybeStartTransactions(database) {
-        for (const transaction of database.transactions) {
-            if (internalsFor(transaction).started || internalsFor(transaction).state === "finished") continue;
-            if (!__idbCanStart(transaction)) continue;
-            internalsFor(transaction).started = true;
-            internalsFor(transaction).data = __idbCloneData(database.data);
-            __idbProcess(transaction);
-        }
-    }
-    function __idbFinishConnectionClose(connection) {
-        if (!internalsFor(connection).closePending) return;
-        if (internalsFor(connection).db.transactions.some((transaction) =>
-            internalsFor(transaction).connection === connection && internalsFor(transaction).state !== "finished")) return;
-        internalsFor(connection).closed = true;
-        internalsFor(connection).db.connections.delete(connection);
-        // §§5.1–5.3 wait on actual closure, not merely close-pending. Notify
-        // blocked open/delete operations without polling or an idle spin.
-        for (const waiter of Array.from(internalsFor(connection).db.connectionWaiters)) waiter();
-    }
-    function __idbCommit(transaction) {
-        if (internalsFor(transaction).state === "finished" || internalsFor(transaction).commitTask) return;
-        internalsFor(transaction).state = "committing";
-        internalsFor(transaction).commitTask = true;
-        __queue_dom_task(() => {
-            if (internalsFor(transaction).state === "finished") return;
-            try {
-                if (transaction.mode !== "readonly") {
-                    __idbSaveData(internalsFor(transaction).db.name, internalsFor(transaction).data);
-                    internalsFor(transaction).db.data = internalsFor(transaction).data;
-                    internalsFor(internalsFor(transaction).connection).version = internalsFor(transaction).data.version;
-                }
-                internalsFor(transaction).state = "finished";
-                internalsFor(transaction).db.transactions = internalsFor(transaction).db.transactions.filter((item) => item !== transaction);
-                dispatch(transaction, createTrustedEvent(Event, "complete"), false);
-                if (internalsFor(transaction).openRequest) {
-                    internalsFor(internalsFor(transaction).openRequest).transaction = null;
-                    internalsFor(internalsFor(internalsFor(transaction).connection).db).upgrade = null;
-                    __idbOpenSuccess(internalsFor(transaction).openRequest, internalsFor(transaction).connection);
-                }
-            } catch (error) { __idbAbort(transaction, error); return; }
-            __idbFinishConnectionClose(internalsFor(transaction).connection);
-            __idbMaybeStartTransactions(internalsFor(transaction).db);
-        });
-    }
-    function __idbAbort(transaction, error) {
-        if (internalsFor(transaction).state === "finished") return;
-        internalsFor(transaction).state = "finished";
-        internalsFor(transaction).error = error || null;
-        internalsFor(transaction).db.transactions = internalsFor(transaction).db.transactions.filter((item) => item !== transaction);
-        const pending = internalsFor(transaction).requests.splice(0);
-        for (const request of pending) {
-            internalsFor(request).done = true; internalsFor(request).result = undefined;
-            internalsFor(request).error = __idbException("AbortError", "The transaction was aborted.");
-            __queue_dom_task(() => __idbRequestEvent(request, "error", true, true));
-        }
-        __queue_dom_task(() => {
-            dispatch(transaction,
-                createTrustedEvent(Event, "abort", { bubbles: true }), false);
-            if (internalsFor(transaction).openRequest) {
-                internalsFor(internalsFor(internalsFor(transaction).connection).db).upgrade = null;
-                internalsFor(internalsFor(transaction).openRequest).transaction = null;
-                internalsFor(internalsFor(transaction).openRequest).done = true;
-                internalsFor(internalsFor(transaction).openRequest).result = undefined;
-                internalsFor(internalsFor(transaction).openRequest).error = __idbException("AbortError", "The version change transaction was aborted.");
-                __idbRequestEvent(internalsFor(transaction).openRequest, "error", true, true);
-                // §5.1 closes a connection whose upgrade request failed before
-                // allowing the next same-name connection request to proceed.
-                internalsFor(internalsFor(transaction).connection).closePending = true;
-                __idbFinishConnectionRequest(internalsFor(transaction).openRequest);
+        constructor(type, eventInitDict = undefined) {
+            if (arguments.length < 1) throw new TypeError("IDBVersionChangeEvent requires a type");
+            if (eventInitDict !== undefined && eventInitDict !== null &&
+                typeof eventInitDict !== "object" && typeof eventInitDict !== "function")
+                throw new TypeError("IDBVersionChangeEventInit must be a dictionary");
+            super(type, eventInitDict);
+            let newVersion = null, oldVersion = 0;
+            if (eventInitDict != null) {
+                const newer = eventInitDict.newVersion;
+                if (newer !== undefined && newer !== null) newVersion = idbVersionMember(newer);
+                const older = eventInitDict.oldVersion;
+                if (older !== undefined) oldVersion = idbVersionMember(older);
             }
-            __idbFinishConnectionClose(internalsFor(transaction).connection);
-            __idbMaybeStartTransactions(internalsFor(transaction).db);
-        });
-    }
-    function __idbProcess(transaction) {
-        if (!internalsFor(transaction).started || internalsFor(transaction).processing ||
-            internalsFor(transaction).state === "finished") return;
-        if (!internalsFor(transaction).requests.length) {
-            if (internalsFor(transaction).state === "inactive" || internalsFor(transaction).state === "committing") __idbCommit(transaction);
-            return;
+            const record = internalsFor(this);
+            record.versionChange = { oldVersion, newVersion };
         }
-        internalsFor(transaction).processing = true;
-        __queue_dom_task(() => {
-            if (internalsFor(transaction).state === "finished") { internalsFor(transaction).processing = false; return; }
-            const request = internalsFor(transaction).requests.shift();
-            let result, error = null;
-            try { result = internalsFor(request).operation(); }
-            catch (caught) { error = caught instanceof DOMException ? caught : __idbException("UnknownError", String(caught && caught.message || caught)); }
-            internalsFor(request).done = true;
-            internalsFor(request).result = error ? undefined : result;
-            internalsFor(request).error = error;
-            internalsFor(transaction).state = "active";
-            const event = __idbRequestEvent(request, error ? "error" : "success", !!error, !!error);
-            if (internalsFor(transaction).state === "active") internalsFor(transaction).state = "inactive";
-            internalsFor(transaction).processing = false;
-            // Indexed Database 3 §§5.9–5.10: a listener exception aborts with
-            // AbortError even if an error event was canceled. DOM dispatch
-            // reports that condition through its IndexedDB-only legacy output.
-            if (eventsWithListenerExceptions.has(event)) {
-                __idbAbort(transaction,
-                    __idbException("AbortError", "An IndexedDB event listener threw an exception."));
+        get oldVersion() { return idbVersionEventRecord(this).oldVersion; }
+        get newVersion() { return idbVersionEventRecord(this).newVersion; }
+    }
+    // Web IDL unsigned long long (without [EnforceRange]): ToNumber, then
+    // truncation modulo 2^64; versions stay within the safe integers.
+    function idbVersionMember(value) {
+        const number = +value;
+        if (!Number.isFinite(number)) return 0;
+        const truncated = Math.trunc(number);
+        return truncated < 0 ? 0 : truncated;
+    }
+    function idbVersionEventRecord(event) {
+        const record = (typeof event === "object" && event !== null) ? apply(weakGet, internalSlots, [event]) : undefined;
+        if (!record || !record.versionChange) throw new TypeError("Illegal IDBVersionChangeEvent invocation");
+        return record.versionChange;
+    }
+    adapter.handlers(IDBRequest.prototype, ["success", "error"]);
+    adapter.handlers(IDBOpenDBRequest.prototype, ["blocked", "upgradeneeded"]);
+
+    // #fire-a-version-change-event.
+    function idbVersionEvent(target, type, oldVersion, newVersion) {
+        return adapter.fire(target, IDBVersionChangeEvent, type,
+            { oldVersion: oldVersion, newVersion: newVersion });
+    }
+    function idbRequestEvent(request, type, bubbles, cancelable) {
+        return adapter.fire(request, Event, type, { bubbles: !!bubbles, cancelable: !!cancelable });
+    }
+    // #close-a-database-connection step 3: once every transaction created
+    // using the connection has finished, it is closed.
+    function idbFinishConnectionClose(connection) {
+        const record = internalsFor(connection);
+        if (!record.closePending || record.closed) return;
+        if (record.transactions.some((transaction) => internalsFor(transaction).state !== "finished")) return;
+        record.closed = true;
+        connectionsById.delete(record.id);
+        // §§5.1–5.3 wait on actual closure, not merely close-pending.
+        coordinator("closed", [record.id]);
+    }
+    function idbCloseConnection(connection) {
+        const record = internalsFor(connection);
+        if (!record.closePending) {
+            record.closePending = true;
+            if (!record.closed) coordinator("closepending", [record.id]);
+        }
+        idbFinishConnectionClose(connection);
+    }
+    // A transaction reached the finished state: the coordinator may start
+    // the transactions it blocked, and its connection may now close.
+    function idbTransactionFinished(transaction) {
+        const record = internalsFor(transaction);
+        if (record.id) {
+            transactionsById.delete(record.id);
+            coordinator("finished", [record.id]);
+        }
+        const connection = record.connection, list = internalsFor(connection).transactions;
+        const index = list.indexOf(transaction);
+        if (index >= 0) list.splice(index, 1);
+    }
+    // #transaction-lifecycle step 2: the coordinator found the scheduling
+    // constraints satisfied. The transaction sees the latest committed data.
+    function idbStart(transaction) {
+        const record = internalsFor(transaction);
+        if (record.started || record.state === "finished") return;
+        record.started = true;
+        record.data = idbLoadData(record.connection.name) || idbDefaultData();
+        idbProcess(transaction);
+    }
+    function idbCommit(transaction) {
+        const record = internalsFor(transaction);
+        if (record.state === "finished" || record.commitTask) return;
+        record.state = "committing";
+        record.commitTask = true;
+        queueDatabaseTask(() => {
+            if (record.state === "finished") return;
+            try {
+                if (transaction.mode !== "readonly") idbWriteData(transaction);
+            } catch (error) {
+                idbAbort(transaction, error instanceof DOMExceptionCtor ? error
+                    : idbException("UnknownError", String(error && error.message || error)));
                 return;
             }
-            if (error && !event.defaultPrevented) { __idbAbort(transaction, error); return; }
-            __idbProcess(transaction);
+            const connection = record.connection, connectionRecord = internalsFor(connection);
+            if (transaction.mode === "versionchange") {
+                connectionRecord.schema = idbSchema(record.data);
+                connectionRecord.upgrade = null;
+            }
+            record.state = "finished";
+            idbTransactionFinished(transaction);
+            adapter.fire(transaction, Event, "complete", {});
+            if (record.openRequest) {
+                internalsFor(record.openRequest).transaction = null;
+                idbOpenSuccess(record.openRequest, connection);
+            }
+            idbFinishConnectionClose(connection);
         });
     }
-    function __idbQueueRequest(source, operation, request) {
-        const transaction = source instanceof IDBCursor ? internalsFor(source).transaction
-            : source instanceof IDBIndex ? source.objectStore.transaction : source.transaction;
-        request = request || new IDBRequest(__idbToken, source, transaction);
-        internalsFor(request).operation = operation;
-        internalsFor(request).done = false; internalsFor(request).error = null; internalsFor(request).result = undefined;
+    function idbAbort(transaction, error) {
+        const record = internalsFor(transaction);
+        if (record.state === "finished") return;
+        const connection = record.connection, connectionRecord = internalsFor(connection);
+        if (transaction.mode === "versionchange") {
+            // #abort-an-upgrade-transaction: revert the connection's version
+            // and object store set to the database's (0 and empty if new).
+            connectionRecord.version = connectionRecord.previousVersion;
+            connectionRecord.schema = connectionRecord.previousSchema;
+        }
+        record.state = "finished";
+        record.error = error || null;
+        idbTransactionFinished(transaction);
+        const pending = record.requests.splice(0);
+        for (const request of pending) {
+            const requestRecord = internalsFor(request);
+            requestRecord.done = true; requestRecord.result = undefined;
+            requestRecord.error = idbException("AbortError", "The transaction was aborted.");
+            queueDatabaseTask(() => idbRequestEvent(request, "error", true, true));
+        }
+        queueDatabaseTask(() => {
+            if (transaction.mode === "versionchange") connectionRecord.upgrade = null;
+            adapter.fire(transaction, Event, "abort", { bubbles: true });
+            if (record.openRequest) {
+                const requestRecord = internalsFor(record.openRequest);
+                requestRecord.transaction = null;
+                requestRecord.done = true;
+                requestRecord.result = undefined;
+                requestRecord.error = idbException("AbortError", "The version change transaction was aborted.");
+                idbRequestEvent(record.openRequest, "error", true, true);
+                // #opening step 10.8 closes a connection whose upgrade failed
+                // before the next same-name connection request proceeds.
+                idbCloseConnection(connection);
+                idbFinishRequest(record.openRequest);
+            }
+            idbFinishConnectionClose(connection);
+        });
+    }
+    function idbProcess(transaction) {
+        const record = internalsFor(transaction);
+        if (!record.started || record.processing || record.state === "finished") return;
+        if (!record.requests.length) {
+            if (record.state === "inactive" || record.state === "committing") idbCommit(transaction);
+            return;
+        }
+        record.processing = true;
+        queueDatabaseTask(() => {
+            if (record.state === "finished") { record.processing = false; return; }
+            const request = record.requests.shift(), requestRecord = internalsFor(request);
+            let result, error = null;
+            try { result = requestRecord.operation(); }
+            catch (caught) {
+                error = caught instanceof DOMExceptionCtor ? caught
+                    : idbException("UnknownError", String(caught && caught.message || caught));
+            }
+            requestRecord.done = true;
+            requestRecord.result = error ? undefined : result;
+            requestRecord.error = error;
+            // #fire-a-success-event / #fire-an-error-event.
+            record.state = "active";
+            const event = idbRequestEvent(request, error ? "error" : "success", !!error, !!error);
+            if (record.state === "active") record.state = "inactive";
+            record.processing = false;
+            // A listener exception aborts with AbortError even if an error
+            // event was canceled (the DOM's legacy output flag).
+            if (adapter.listenerThrew(event)) {
+                idbAbort(transaction,
+                    idbException("AbortError", "An IndexedDB event listener threw an exception."));
+                return;
+            }
+            if (error && !event.defaultPrevented) { idbAbort(transaction, error); return; }
+            idbProcess(transaction);
+        });
+    }
+    function idbTransactionOf(source) {
+        const record = internalsFor(source);
+        if (record.cursor) return record.transaction;
+        if (record.index) return record.objectStore.transaction;
+        return source.transaction;
+    }
+    // #asynchronously-execute-a-request.
+    function idbQueueRequest(source, operation, request) {
+        const transaction = idbTransactionOf(source);
+        request = request || new IDBRequest(idbToken, source, transaction);
+        const requestRecord = internalsFor(request);
+        requestRecord.operation = operation;
+        requestRecord.done = false; requestRecord.error = null; requestRecord.result = undefined;
         // Indexed Database 3 §2.8: ordinary requests return their transaction
         // from EventTarget's get-the-parent algorithm. Open requests are never
         // queued here and therefore retain their required null parent.
-        eventParents.set(request, transaction);
+        adapter.setParent(request, transaction);
         internalsFor(transaction).requests.push(request);
-        __idbProcess(transaction);
+        idbProcess(transaction);
         return request;
     }
-    function __idbRequireActive(transaction) {
+    function idbRequireActive(transaction) {
         if (internalsFor(transaction).state !== "active")
-            throw __idbException("TransactionInactiveError", "The transaction is not active.");
+            throw idbException("TransactionInactiveError", "The transaction is not active.");
     }
 
     class IDBTransaction extends EventTarget {
-        constructor(token, connection, scope, mode, durability, upgradeData, openRequest) {
+        constructor(token, connection, scope, mode, durability, id, upgradeData, openRequest) {
             super();
-            if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            internalsFor(this).connection = connection; internalsFor(this).db = internalsFor(connection).db;
-            internalsFor(this).scope = scope.slice(); this.mode = mode; this.durability = durability;
-            internalsFor(this).state = "active"; internalsFor(this).started = mode === "versionchange";
-            internalsFor(this).processing = false; internalsFor(this).requests = []; internalsFor(this).error = null;
-            internalsFor(this).data = upgradeData || null; internalsFor(this).openRequest = openRequest || null;
-            internalsFor(this).handles = new Map(); internalsFor(this).commitTask = false;
+            if (token !== idbToken) throw new TypeError("Illegal constructor");
+            const record = internalsFor(this);
+            record.transactionRecord = true;
+            record.id = id;
+            record.connection = connection;
+            record.scope = scope.slice(); record.mode = mode; record.durability = durability;
+            record.state = "active"; record.started = mode === "versionchange";
+            record.processing = false; record.requests = []; record.error = null;
+            record.data = upgradeData || null; record.openRequest = openRequest || null;
+            record.handles = new Map(); record.commitTask = false;
+            record.frame = adapter.frame();
             // Indexed Database 3 §2.7.1: a transaction's event parent is its
             // database connection, whose own event parent is null.
-            eventParents.set(this, connection);
-            internalsFor(this).db.transactions.push(this);
+            adapter.setParent(this, connection);
+            internalsFor(connection).transactions.push(this);
+            if (id) transactionsById.set(id, this);
         }
-        get objectStoreNames() { return __idbSortedNames(internalsFor(this).scope); }
-        get db() { return internalsFor(this).connection; }
-        get error() { return internalsFor(this).error; }
+        get objectStoreNames() { return idbSortedNames(idbTransactionRecord(this).scope); }
+        get mode() { return idbTransactionRecord(this).mode; }
+        get durability() { return idbTransactionRecord(this).durability; }
+        get db() { return idbTransactionRecord(this).connection; }
+        get error() { return idbTransactionRecord(this).error; }
         objectStore(name) {
-            name = __idbDOMString(name);
-            if (internalsFor(this).state === "finished") throw __idbException("InvalidStateError", "The transaction has finished.");
-            if (!internalsFor(this).scope.includes(name)) throw __idbException("NotFoundError", "The object store is outside this transaction's scope.");
-            let handle = internalsFor(this).handles.get(name);
-            if (!handle) { handle = new IDBObjectStore(__idbToken, this, name); internalsFor(this).handles.set(name, handle); }
+            const record = idbTransactionRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBTransaction.objectStore requires a name.");
+            name = idbDOMString(name);
+            if (record.state === "finished") throw idbException("InvalidStateError", "The transaction has finished.");
+            if (!record.scope.includes(name)) throw idbException("NotFoundError", "The object store is outside this transaction's scope.");
+            let handle = record.handles.get(name);
+            if (!handle) { handle = new IDBObjectStore(idbToken, this, name); record.handles.set(name, handle); }
             return handle;
         }
         abort() {
-            if (internalsFor(this).state === "committing" || internalsFor(this).state === "finished")
-                throw __idbException("InvalidStateError", "The transaction cannot be aborted.");
-            __idbAbort(this, null);
+            const record = idbTransactionRecord(this);
+            if (record.state === "committing" || record.state === "finished")
+                throw idbException("InvalidStateError", "The transaction cannot be aborted.");
+            idbAbort(this, null);
         }
         commit() {
-            __idbRequireActive(this);
-            internalsFor(this).state = "committing";
-            if (!internalsFor(this).requests.length && !internalsFor(this).processing) __idbCommit(this);
+            const record = idbTransactionRecord(this);
+            idbRequireActive(this);
+            record.state = "committing";
+            if (!record.requests.length && !record.processing && record.started) idbCommit(this);
         }
-        get [Symbol.toStringTag]() { return "IDBTransaction"; }
     }
-    installHandlerProps(IDBTransaction.prototype, ["abort", "complete", "error"]);
+    function idbTransactionRecord(transaction) {
+        const record = (typeof transaction === "object" && transaction !== null) ? apply(weakGet, internalSlots, [transaction]) : undefined;
+        if (!record || !record.transactionRecord) throw new TypeError("Illegal IDBTransaction invocation");
+        return record;
+    }
+    adapter.handlers(IDBTransaction.prototype, ["abort", "complete", "error"]);
 
-    function __idbStoreForHandle(handle) {
-        const data = internalsFor(handle.transaction).data || internalsFor(handle.transaction).db.data;
-        const store = __idbStore(data, internalsFor(handle).name);
-        if (!store) throw __idbException("InvalidStateError", "The object store was deleted.");
+    // The object store of a handle: the transaction's snapshot once started,
+    // otherwise its connection's object store set.
+    function idbStoreForHandle(handle) {
+        const transactionRecord = internalsFor(handle.transaction);
+        const data = transactionRecord.data || internalsFor(transactionRecord.connection).schema;
+        const store = idbStore(data, internalsFor(handle).name);
+        if (!store) throw idbException("InvalidStateError", "The object store was deleted.");
         return store;
     }
-    function __idbRecordList(store, range, direction) {
-        const records = store.records.filter((record) => __idbRangeIncludes(range, record.key));
-        records.sort((left, right) => __idbCompare(left.key, right.key));
+    function idbRecordList(store, range, direction) {
+        const records = store.records.filter((record) => idbRangeIncludes(range, record.key));
+        records.sort((left, right) => idbCompare(left.key, right.key));
         if (direction === "prev" || direction === "prevunique") records.reverse();
         return records;
     }
-    function __idbIndexKeys(index, serialized) {
+    function idbIndexKeys(index, serialized) {
         let value, extracted, key;
         try {
-            value = messageDeserialize(serialized);
-            extracted = __idbExtractPath(value, index.keyPath);
+            value = adapter.deserialize(serialized);
+            extracted = idbExtractPath(value, index.keyPath);
             if (extracted === undefined) return [];
-            key = index.multiEntry ? __idbMultiEntryKey(extracted) : __idbKey(extracted);
+            key = index.multiEntry ? idbMultiEntryKey(extracted) : idbKey(extracted);
         } catch (_) { return []; }
         return index.multiEntry && key.t === "a" ? key.v : [key];
     }
@@ -40893,247 +41179,280 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // by the referenced object-store key. They are derived here from the
     // transaction snapshot, avoiding a second persisted copy that could drift
     // from its object store after rollback.
-    function __idbIndexRecordList(handle, range, direction) {
-        const index = indexRecord.call(handle), store = __idbStoreForHandle(handle.objectStore);
+    function idbIndexRecordList(handle, range, direction) {
+        const index = indexRecord.call(handle), store = idbStoreForHandle(handle.objectStore);
         let records = [];
         for (const record of store.records) {
-            for (const key of __idbIndexKeys(index, record.value)) {
-                if (__idbRangeIncludes(range, key)) records.push({
+            for (const key of idbIndexKeys(index, record.value)) {
+                if (idbRangeIncludes(range, key)) records.push({
                     key: key, primaryKey: record.key, value: record.value,
                 });
             }
         }
         records.sort((left, right) => {
-            const keyOrder = __idbCompare(left.key, right.key);
-            return keyOrder || __idbCompare(left.primaryKey, right.primaryKey);
+            const keyOrder = idbCompare(left.key, right.key);
+            return keyOrder || idbCompare(left.primaryKey, right.primaryKey);
         });
         if (direction === "nextunique" || direction === "prevunique") {
             records = records.filter((record, index) =>
-                index === 0 || __idbCompare(record.key, records[index - 1].key) !== 0);
+                index === 0 || idbCompare(record.key, records[index - 1].key) !== 0);
         }
         if (direction === "prev" || direction === "prevunique") records.reverse();
         return records;
     }
-    function __idbSourceRecordList(source, range, direction) {
-        return source instanceof IDBIndex
-            ? __idbIndexRecordList(source, range, direction)
-            : __idbRecordList(__idbStoreForHandle(source), range, direction);
+    function idbSourceRecordList(source, range, direction) {
+        return internalsFor(source).index
+            ? idbIndexRecordList(source, range, direction)
+            : idbRecordList(idbStoreForHandle(source), range, direction);
     }
-    function __idbValidateUniqueIndexes(store, candidate, replacedKey) {
+    function idbValidateUniqueIndexes(store, candidate, replacedKey) {
         for (const index of store.indexes) {
             if (!index.unique) continue;
-            const keys = __idbIndexKeys(index, candidate.value);
+            const keys = idbIndexKeys(index, candidate.value);
             for (const record of store.records) {
-                if (replacedKey && __idbCompare(record.key, replacedKey) === 0) continue;
-                const existing = __idbIndexKeys(index, record.value);
+                if (replacedKey && idbCompare(record.key, replacedKey) === 0) continue;
+                const existing = idbIndexKeys(index, record.value);
                 for (const key of keys) for (const other of existing) {
-                    if (__idbCompare(key, other) === 0)
-                        throw __idbException("ConstraintError", "A unique index key already exists.");
+                    if (idbCompare(key, other) === 0)
+                        throw idbException("ConstraintError", "A unique index key already exists.");
                 }
             }
         }
     }
-    function __idbCount(value) {
+    function idbCount(value) {
         if (value === undefined) return undefined;
         const number = Number(value);
         if (!Number.isFinite(number) || number < 0 || Math.floor(number) !== number || number > 4294967295)
             throw new TypeError("The count is outside the unsigned long range.");
         return number;
     }
-    function __idbStoreKey(store, serialized, keyGiven, suppliedKey) {
+    function idbStoreKey(store, serialized, keyGiven, suppliedKey) {
         let key;
         if (store.keyPath !== null) {
-            if (keyGiven) throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
-            const value = messageDeserialize(serialized);
-            const extracted = __idbExtractPath(value, store.keyPath);
-            if (extracted !== undefined) key = __idbKey(extracted);
-            else if (!store.autoIncrement) throw __idbException("DataError", "The inline key path produced no key.");
+            if (keyGiven) throw idbException("DataError", "An explicit key is not allowed for an inline-key store.");
+            const value = adapter.deserialize(serialized);
+            const extracted = idbExtractPath(value, store.keyPath);
+            if (extracted !== undefined) key = idbKey(extracted);
+            else if (!store.autoIncrement) throw idbException("DataError", "The inline key path produced no key.");
             else {
                 key = { t: "n", v: store.nextKey };
-                if (!__idbInjectPath(value, store.keyPath, key))
-                    throw __idbException("DataError", "The generated key could not be injected into the value.");
-                serialized = messageSerialize(value, true);
+                if (!idbInjectPath(value, store.keyPath, key))
+                    throw idbException("DataError", "The generated key could not be injected into the value.");
+                serialized = adapter.serialize(value);
             }
-        } else if (keyGiven) key = __idbKey(suppliedKey);
+        } else if (keyGiven) key = idbKey(suppliedKey);
         else if (store.autoIncrement) key = { t: "n", v: store.nextKey };
-        else throw __idbException("DataError", "An out-of-line key is required.");
+        else throw idbException("DataError", "An out-of-line key is required.");
         if (store.autoIncrement) {
-            const numeric = key.t === "n" ? __idbDecodeNumber(key.v) : NaN;
+            const numeric = key.t === "n" ? idbDecodeNumber(key.v) : NaN;
             if (Number.isFinite(numeric) && numeric >= store.nextKey)
                 store.nextKey = Math.min(Math.floor(numeric) + 1, 9007199254740992);
         }
         return { key: key, value: serialized };
     }
-    function objectStoreAddOrPut(value, key, keyGiven, noOverwrite) {
-        const transaction = this.transaction; __idbRequireActive(transaction);
-        if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-        // Clone during the method call, before the request is returned.
-        const serialized = messageSerialize(value, true);
-        const initialStore = __idbStoreForHandle(this);
-        if (initialStore.keyPath !== null && keyGiven)
-            throw __idbException("DataError", "An explicit key is not allowed for an inline-key store.");
-        if (initialStore.keyPath === null && !initialStore.autoIncrement && !keyGiven)
-            throw __idbException("DataError", "An out-of-line key is required.");
-        if (keyGiven) __idbKey(key);
-        return __idbQueueRequest(this, () => {
-            const store = __idbStoreForHandle(this);
+    // #object-store-storage-operation over a store handle's object store.
+    function idbStoreRecordOperation(handle, serialized, keyGiven, key, noOverwrite) {
+        return () => {
+            const store = idbStoreForHandle(handle);
             // A failed request reverts every change made by that operation
             // (§5.6), including key-generator advancement. Stage against a
             // private store copy and publish only after all constraints pass.
-            const staged = __idbCloneData(store);
-            const record = __idbStoreKey(staged, serialized, keyGiven, key);
-            const index = staged.records.findIndex((item) => __idbCompare(item.key, record.key) === 0);
-            if (index >= 0 && noOverwrite) throw __idbException("ConstraintError", "The key already exists.");
-            __idbValidateUniqueIndexes(staged, record, index >= 0 ? record.key : null);
+            const staged = idbCloneData(store);
+            const record = idbStoreKey(staged, serialized, keyGiven, key);
+            const index = staged.records.findIndex((item) => idbCompare(item.key, record.key) === 0);
+            if (index >= 0 && noOverwrite) throw idbException("ConstraintError", "The key already exists.");
+            idbValidateUniqueIndexes(staged, record, index >= 0 ? record.key : null);
             if (index >= 0) staged.records[index] = record; else staged.records.push(record);
             Object.assign(store, staged);
-            return __idbKeyValue(record.key);
-        });
+            return idbKeyValue(record.key);
+        };
+    }
+    function objectStoreAddOrPut(value, key, keyGiven, noOverwrite) {
+        const transaction = this.transaction; idbRequireActive(transaction);
+        if (transaction.mode === "readonly") throw idbException("ReadOnlyError", "The transaction is read-only.");
+        // Clone during the method call, before the request is returned.
+        const serialized = adapter.serialize(value);
+        const initialStore = idbStoreForHandle(this);
+        if (initialStore.keyPath !== null && keyGiven)
+            throw idbException("DataError", "An explicit key is not allowed for an inline-key store.");
+        if (initialStore.keyPath === null && !initialStore.autoIncrement && !keyGiven)
+            throw idbException("DataError", "An out-of-line key is required.");
+        if (keyGiven) idbKey(key);
+        return idbQueueRequest(this, idbStoreRecordOperation(this, serialized, keyGiven, key, noOverwrite));
     }
     function objectStoreFirst(query, keyOnly) {
-        __idbRequireActive(this.transaction);
-        const range = __idbRange(query, false);
-        return __idbQueueRequest(this, () => {
-            const record = __idbRecordList(__idbStoreForHandle(this), range, "next")[0];
+        idbRequireActive(this.transaction);
+        const range = idbRange(query, false);
+        return idbQueueRequest(this, () => {
+            const record = idbRecordList(idbStoreForHandle(this), range, "next")[0];
             if (!record) return undefined;
-            return keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value);
+            return keyOnly ? idbKeyValue(record.key) : adapter.deserialize(record.value);
         });
     }
     function objectStoreAll(query, count, keyOnly, queryGiven) {
-        __idbRequireActive(this.transaction);
-        const range = __idbRange(queryGiven ? query : null, true), limit = __idbCount(count);
-        return __idbQueueRequest(this, () => {
-            let records = __idbRecordList(__idbStoreForHandle(this), range, "next");
+        idbRequireActive(this.transaction);
+        const range = idbRange(queryGiven ? query : null, true), limit = idbCount(count);
+        return idbQueueRequest(this, () => {
+            let records = idbRecordList(idbStoreForHandle(this), range, "next");
             if (limit !== undefined && limit !== 0) records = records.slice(0, limit);
-            return records.map((record) => keyOnly ? __idbKeyValue(record.key) : messageDeserialize(record.value));
+            return records.map((record) => keyOnly ? idbKeyValue(record.key) : adapter.deserialize(record.value));
         });
     }
     function objectStoreOpenCursor(query, direction, keyOnly, queryGiven) {
-        __idbRequireActive(this.transaction);
+        idbRequireActive(this.transaction);
         direction = direction === undefined ? "next" : String(direction);
         if (!["next", "nextunique", "prev", "prevunique"].includes(direction)) throw new TypeError("Invalid cursor direction.");
-        const range = __idbRange(queryGiven ? query : null, true);
-        const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
-            : new IDBCursorWithValue(__idbToken, this, direction, range);
-        const request = new IDBRequest(__idbToken, this, this.transaction);
+        const range = idbRange(queryGiven ? query : null, true);
+        const cursor = keyOnly ? new IDBCursor(idbToken, this, direction, range)
+            : new IDBCursorWithValue(idbToken, this, direction, range);
+        const request = new IDBRequest(idbToken, this, this.transaction);
         internalsFor(cursor).request = request;
-        return __idbQueueRequest(this, () => cursorIterate.call(cursor), request);
+        return idbQueueRequest(this, () => cursorIterate.call(cursor), request);
     }
     class IDBObjectStore {
         constructor(token, transaction, name) {
-            if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.transaction = transaction; internalsFor(this).name = name; internalsFor(this).keyPathValue = undefined;
+            if (token !== idbToken) throw new TypeError("Illegal constructor");
+            const record = internalsFor(this);
+            record.objectStoreHandle = true;
+            record.transaction = transaction; record.name = name; record.keyPathValue = undefined;
         }
-        get name() { return internalsFor(this).name; }
+        get transaction() { return idbStoreHandleRecord(this).transaction; }
+        get name() { return idbStoreHandleRecord(this).name; }
         set name(value) {
-            const transaction = this.transaction;
-            if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Renaming requires a versionchange transaction.");
-            __idbRequireActive(transaction);
-            const name = __idbDOMString(value), store = __idbStoreForHandle(this);
-            if (name === internalsFor(this).name) return;
-            if (__idbStore(internalsFor(transaction).data, name)) throw __idbException("ConstraintError", "An object store already has that name.");
-            const old = internalsFor(this).name; store.name = name; internalsFor(this).name = name;
-            const scopeIndex = internalsFor(transaction).scope.indexOf(old); if (scopeIndex >= 0) internalsFor(transaction).scope[scopeIndex] = name;
-            internalsFor(transaction).handles.delete(old); internalsFor(transaction).handles.set(name, this);
+            const record = idbStoreHandleRecord(this), transaction = record.transaction;
+            const name = idbDOMString(value);
+            if (transaction.mode !== "versionchange") throw idbException("InvalidStateError", "Renaming requires a versionchange transaction.");
+            idbRequireActive(transaction);
+            const store = idbStoreForHandle(this), transactionRecord = internalsFor(transaction);
+            if (name === record.name) return;
+            if (idbStore(transactionRecord.data, name)) throw idbException("ConstraintError", "An object store already has that name.");
+            const old = record.name; store.name = name; record.name = name;
+            const scopeIndex = transactionRecord.scope.indexOf(old);
+            if (scopeIndex >= 0) transactionRecord.scope[scopeIndex] = name;
+            transactionRecord.handles.delete(old); transactionRecord.handles.set(name, this);
         }
         get keyPath() {
-            const path = __idbStoreForHandle(this).keyPath;
-            if (!Array.isArray(path)) return path;
-            if (internalsFor(this).keyPathValue === undefined) internalsFor(this).keyPathValue = path.slice();
-            return internalsFor(this).keyPathValue;
+            const record = idbStoreHandleRecord(this);
+            const path = idbStoreForHandle(this).keyPath;
+            if (!isArray(path)) return path;
+            if (record.keyPathValue === undefined) record.keyPathValue = path.slice();
+            return record.keyPathValue;
         }
-        get indexNames() { return __idbSortedNames(__idbStoreForHandle(this).indexes.map((index) => index.name)); }
-        get autoIncrement() { return !!__idbStoreForHandle(this).autoIncrement; }
-        put(value, key) { return objectStoreAddOrPut.call(this, value, key, arguments.length > 1, false); }
-        add(value, key) { return objectStoreAddOrPut.call(this, value, key, arguments.length > 1, true); }
+        get indexNames() { idbStoreHandleRecord(this); return idbSortedNames(idbStoreForHandle(this).indexes.map((index) => index.name)); }
+        get autoIncrement() { idbStoreHandleRecord(this); return !!idbStoreForHandle(this).autoIncrement; }
+        put(value, key = undefined) { idbStoreHandleRecord(this); return objectStoreAddOrPut.call(this, value, key, arguments.length > 1 && key !== undefined, false); }
+        add(value, key = undefined) { idbStoreHandleRecord(this); return objectStoreAddOrPut.call(this, value, key, arguments.length > 1 && key !== undefined, true); }
         delete(query) {
-            const transaction = this.transaction; __idbRequireActive(transaction);
-            if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-            const range = __idbRange(query, false);
-            return __idbQueueRequest(this, () => {
-                const store = __idbStoreForHandle(this);
-                store.records = store.records.filter((record) => !__idbRangeIncludes(range, record.key));
+            idbStoreHandleRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBObjectStore.delete requires a query.");
+            const transaction = this.transaction; idbRequireActive(transaction);
+            if (transaction.mode === "readonly") throw idbException("ReadOnlyError", "The transaction is read-only.");
+            const range = idbRange(query, false);
+            return idbQueueRequest(this, () => {
+                const store = idbStoreForHandle(this);
+                store.records = store.records.filter((record) => !idbRangeIncludes(range, record.key));
                 return undefined;
             });
         }
         clear() {
-            const transaction = this.transaction; __idbRequireActive(transaction);
-            if (transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-            return __idbQueueRequest(this, () => { __idbStoreForHandle(this).records = []; return undefined; });
+            idbStoreHandleRecord(this);
+            const transaction = this.transaction; idbRequireActive(transaction);
+            if (transaction.mode === "readonly") throw idbException("ReadOnlyError", "The transaction is read-only.");
+            return idbQueueRequest(this, () => { idbStoreForHandle(this).records = []; return undefined; });
         }
-        get(query) { return objectStoreFirst.call(this, query, false); }
-        getKey(query) { return objectStoreFirst.call(this, query, true); }
-        getAll(query, count) { return objectStoreAll.call(this, query, count, false, arguments.length > 0); }
-        getAllKeys(query, count) { return objectStoreAll.call(this, query, count, true, arguments.length > 0); }
+        get(query) {
+            idbStoreHandleRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBObjectStore.get requires a query.");
+            return objectStoreFirst.call(this, query, false);
+        }
+        getKey(query) {
+            idbStoreHandleRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBObjectStore.getKey requires a query.");
+            return objectStoreFirst.call(this, query, true);
+        }
+        getAll(query, count) { idbStoreHandleRecord(this); return objectStoreAll.call(this, query, count, false, arguments.length > 0); }
+        getAllKeys(query, count) { idbStoreHandleRecord(this); return objectStoreAll.call(this, query, count, true, arguments.length > 0); }
         count(query) {
-            __idbRequireActive(this.transaction);
-            const range = __idbRange(arguments.length ? query : null, true);
-            return __idbQueueRequest(this, () => __idbRecordList(__idbStoreForHandle(this), range, "next").length);
+            idbStoreHandleRecord(this);
+            idbRequireActive(this.transaction);
+            const range = idbRange(arguments.length ? query : null, true);
+            return idbQueueRequest(this, () => idbRecordList(idbStoreForHandle(this), range, "next").length);
         }
-        openCursor(query, direction) { return objectStoreOpenCursor.call(this, query, direction, false, arguments.length > 0); }
-        openKeyCursor(query, direction) { return objectStoreOpenCursor.call(this, query, direction, true, arguments.length > 0); }
+        openCursor(query, direction) { idbStoreHandleRecord(this); return objectStoreOpenCursor.call(this, query, direction, false, arguments.length > 0); }
+        openKeyCursor(query, direction) { idbStoreHandleRecord(this); return objectStoreOpenCursor.call(this, query, direction, true, arguments.length > 0); }
         createIndex(name, keyPath, options) {
+            idbStoreHandleRecord(this);
+            if (arguments.length < 2) throw new TypeError("IDBObjectStore.createIndex requires a name and key path.");
             const transaction = this.transaction;
-            if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Index creation requires a versionchange transaction.");
-            __idbRequireActive(transaction);
-            name = __idbDOMString(name); options = options || {};
-            if (!__idbKeyPathValid(keyPath)) throw __idbException("SyntaxError", "The index key path is invalid.");
-            if (Array.isArray(keyPath) && options.multiEntry) throw __idbException("InvalidAccessError", "A sequence key path cannot be multiEntry.");
-            const store = __idbStoreForHandle(this);
-            if (store.indexes.some((index) => index.name === name)) throw __idbException("ConstraintError", "The index already exists.");
-            store.indexes.push({ name: name, keyPath: Array.isArray(keyPath) ? keyPath.slice() : String(keyPath), unique: !!options.unique, multiEntry: !!options.multiEntry });
-            const handle = new IDBIndex(__idbToken, this, name);
+            if (transaction.mode !== "versionchange") throw idbException("InvalidStateError", "Index creation requires a versionchange transaction.");
+            idbRequireActive(transaction);
+            name = idbDOMString(name); options = options || {};
+            if (!idbKeyPathValid(keyPath)) throw idbException("SyntaxError", "The index key path is invalid.");
+            if (isArray(keyPath) && options.multiEntry) throw idbException("InvalidAccessError", "A sequence key path cannot be multiEntry.");
+            const store = idbStoreForHandle(this);
+            if (store.indexes.some((index) => index.name === name)) throw idbException("ConstraintError", "The index already exists.");
+            store.indexes.push({ name: name, keyPath: isArray(keyPath) ? keyPath.slice() : String(keyPath), unique: !!options.unique, multiEntry: !!options.multiEntry });
+            const handle = new IDBIndex(idbToken, this, name);
             // Index population is an asynchronous request in the upgrade
             // transaction. createIndex() still returns synchronously; an
             // existing-data uniqueness violation aborts the transaction later.
-            __idbQueueRequest(this, () => {
+            idbQueueRequest(this, () => {
                 if (!handle.unique) return undefined;
-                const records = __idbIndexRecordList(handle, null, "next");
+                const records = idbIndexRecordList(handle, null, "next");
                 for (let index = 1; index < records.length; index++) {
-                    if (__idbCompare(records[index - 1].key, records[index].key) === 0)
-                        throw __idbException("ConstraintError", "Existing records violate the unique index.");
+                    if (idbCompare(records[index - 1].key, records[index].key) === 0)
+                        throw idbException("ConstraintError", "Existing records violate the unique index.");
                 }
                 return undefined;
             });
             return handle;
         }
         index(name) {
-            name = __idbDOMString(name);
-            if (!__idbStoreForHandle(this).indexes.some((index) => index.name === name))
-                throw __idbException("NotFoundError", "The index does not exist.");
-            return new IDBIndex(__idbToken, this, name);
+            idbStoreHandleRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBObjectStore.index requires a name.");
+            name = idbDOMString(name);
+            if (internalsFor(this.transaction).state === "finished")
+                throw idbException("InvalidStateError", "The transaction has finished.");
+            if (!idbStoreForHandle(this).indexes.some((index) => index.name === name))
+                throw idbException("NotFoundError", "The index does not exist.");
+            return new IDBIndex(idbToken, this, name);
         }
         deleteIndex(name) {
+            idbStoreHandleRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBObjectStore.deleteIndex requires a name.");
             const transaction = this.transaction;
-            if (transaction.mode !== "versionchange") throw __idbException("InvalidStateError", "Index deletion requires a versionchange transaction.");
-            __idbRequireActive(transaction); name = __idbDOMString(name);
-            const store = __idbStoreForHandle(this), index = store.indexes.findIndex((item) => item.name === name);
-            if (index < 0) throw __idbException("NotFoundError", "The index does not exist.");
+            if (transaction.mode !== "versionchange") throw idbException("InvalidStateError", "Index deletion requires a versionchange transaction.");
+            idbRequireActive(transaction); name = idbDOMString(name);
+            const store = idbStoreForHandle(this), index = store.indexes.findIndex((item) => item.name === name);
+            if (index < 0) throw idbException("NotFoundError", "The index does not exist.");
             store.indexes.splice(index, 1);
         }
-        get [Symbol.toStringTag]() { return "IDBObjectStore"; }
+    }
+    function idbStoreHandleRecord(handle) {
+        const record = (typeof handle === "object" && handle !== null) ? apply(weakGet, internalSlots, [handle]) : undefined;
+        if (!record || !record.objectStoreHandle) throw new TypeError("Illegal IDBObjectStore invocation");
+        return record;
     }
 
     function indexRecord() {
-        const index = __idbStoreForHandle(this.objectStore).indexes.find((item) => item.name === internalsFor(this).name);
-        if (!index) throw __idbException("InvalidStateError", "The index was deleted.");
+        const index = idbStoreForHandle(this.objectStore).indexes.find((item) => item.name === internalsFor(this).name);
+        if (!index) throw idbException("InvalidStateError", "The index was deleted.");
         return index;
     }
     function indexFirst(query, keyOnly) {
-        __idbRequireActive(this.objectStore.transaction);
-        const range = __idbRange(query, false);
-        return __idbQueueRequest(this, () => {
-            const record = __idbIndexRecordList(this, range, "next")[0];
+        idbRequireActive(this.objectStore.transaction);
+        const range = idbRange(query, false);
+        return idbQueueRequest(this, () => {
+            const record = idbIndexRecordList(this, range, "next")[0];
             if (!record) return undefined;
-            return keyOnly ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value);
+            return keyOnly ? idbKeyValue(record.primaryKey) : adapter.deserialize(record.value);
         });
     }
     function indexAll(query, count, keyOnly, queryGiven) {
-        __idbRequireActive(this.objectStore.transaction);
+        idbRequireActive(this.objectStore.transaction);
         let direction = "next", rangeQuery = queryGiven ? query : null, limit = count;
-        if (queryGiven && query && typeof query === "object" && !(query instanceof IDBKeyRange) &&
-            !(query instanceof Date) && !Array.isArray(query) &&
-            !(query instanceof ArrayBuffer) && !ArrayBuffer.isView(query) &&
+        if (queryGiven && query && typeof query === "object" && !idbIsRange(query) &&
+            !idbIsDate(query) && !isArray(query) && !idbIsBuffer(query) && !isView(query) &&
             ("query" in query || "count" in query || "direction" in query)) {
             rangeQuery = query.query === undefined ? null : query.query;
             limit = query.count;
@@ -41141,269 +41460,421 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
             throw new TypeError("Invalid retrieval direction.");
-        const range = __idbRange(rangeQuery, true), bounded = __idbCount(limit);
-        return __idbQueueRequest(this, () => {
-            let records = __idbIndexRecordList(this, range, direction);
+        const range = idbRange(rangeQuery, true), bounded = idbCount(limit);
+        return idbQueueRequest(this, () => {
+            let records = idbIndexRecordList(this, range, direction);
             if (bounded !== undefined && bounded !== 0) records = records.slice(0, bounded);
             return records.map((record) => keyOnly
-                ? __idbKeyValue(record.primaryKey) : messageDeserialize(record.value));
+                ? idbKeyValue(record.primaryKey) : adapter.deserialize(record.value));
         });
     }
     function indexOpenCursor(query, direction, keyOnly, queryGiven) {
-        __idbRequireActive(this.objectStore.transaction);
+        idbRequireActive(this.objectStore.transaction);
         direction = direction === undefined ? "next" : String(direction);
         if (!["next", "nextunique", "prev", "prevunique"].includes(direction))
             throw new TypeError("Invalid cursor direction.");
-        const range = __idbRange(queryGiven ? query : null, true);
-        const cursor = keyOnly ? new IDBCursor(__idbToken, this, direction, range)
-            : new IDBCursorWithValue(__idbToken, this, direction, range);
-        const request = new IDBRequest(__idbToken, this, this.objectStore.transaction);
+        const range = idbRange(queryGiven ? query : null, true);
+        const cursor = keyOnly ? new IDBCursor(idbToken, this, direction, range)
+            : new IDBCursorWithValue(idbToken, this, direction, range);
+        const request = new IDBRequest(idbToken, this, this.objectStore.transaction);
         internalsFor(cursor).request = request;
-        return __idbQueueRequest(this, () => cursorIterate.call(cursor), request);
+        return idbQueueRequest(this, () => cursorIterate.call(cursor), request);
     }
     class IDBIndex {
         constructor(token, objectStore, name) {
-            if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.objectStore = objectStore; internalsFor(this).name = name; internalsFor(this).keyPathValue = undefined;
+            if (token !== idbToken) throw new TypeError("Illegal constructor");
+            const record = internalsFor(this);
+            record.index = true;
+            record.objectStore = objectStore; record.name = name; record.keyPathValue = undefined;
         }
-        get name() { return internalsFor(this).name; }
+        get objectStore() { return idbIndexHandleRecord(this).objectStore; }
+        get name() { return idbIndexHandleRecord(this).name; }
         set name(value) {
-            const transaction = this.objectStore.transaction;
+            const record = idbIndexHandleRecord(this);
+            const transaction = record.objectStore.transaction;
+            const name = idbDOMString(value);
             if (transaction.mode !== "versionchange")
-                throw __idbException("InvalidStateError", "Renaming an index requires a versionchange transaction.");
-            __idbRequireActive(transaction);
-            const name = __idbDOMString(value), index = indexRecord.call(this);
-            if (name === internalsFor(this).name) return;
-            const store = __idbStoreForHandle(this.objectStore);
+                throw idbException("InvalidStateError", "Renaming an index requires a versionchange transaction.");
+            idbRequireActive(transaction);
+            const index = indexRecord.call(this);
+            if (name === record.name) return;
+            const store = idbStoreForHandle(record.objectStore);
             if (store.indexes.some((item) => item.name === name))
-                throw __idbException("ConstraintError", "An index already has that name.");
-            index.name = name; internalsFor(this).name = name;
+                throw idbException("ConstraintError", "An index already has that name.");
+            index.name = name; record.name = name;
         }
         get keyPath() {
+            const record = idbIndexHandleRecord(this);
             const path = indexRecord.call(this).keyPath;
-            if (!Array.isArray(path)) return path;
-            if (internalsFor(this).keyPathValue === undefined) internalsFor(this).keyPathValue = path.slice();
-            return internalsFor(this).keyPathValue;
+            if (!isArray(path)) return path;
+            if (record.keyPathValue === undefined) record.keyPathValue = path.slice();
+            return record.keyPathValue;
         }
-        get multiEntry() { return indexRecord.call(this).multiEntry; }
-        get unique() { return indexRecord.call(this).unique; }
-        get(query) { return indexFirst.call(this, query, false); }
-        getKey(query) { return indexFirst.call(this, query, true); }
-        getAll(query, count) { return indexAll.call(this, query, count, false, arguments.length > 0); }
-        getAllKeys(query, count) { return indexAll.call(this, query, count, true, arguments.length > 0); }
+        get multiEntry() { idbIndexHandleRecord(this); return indexRecord.call(this).multiEntry; }
+        get unique() { idbIndexHandleRecord(this); return indexRecord.call(this).unique; }
+        get(query) {
+            idbIndexHandleRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBIndex.get requires a query.");
+            return indexFirst.call(this, query, false);
+        }
+        getKey(query) {
+            idbIndexHandleRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBIndex.getKey requires a query.");
+            return indexFirst.call(this, query, true);
+        }
+        getAll(query, count) { idbIndexHandleRecord(this); return indexAll.call(this, query, count, false, arguments.length > 0); }
+        getAllKeys(query, count) { idbIndexHandleRecord(this); return indexAll.call(this, query, count, true, arguments.length > 0); }
         count(query) {
-            __idbRequireActive(this.objectStore.transaction);
-            const range = __idbRange(arguments.length ? query : null, true);
-            return __idbQueueRequest(this, () => __idbIndexRecordList(this, range, "next").length);
+            idbIndexHandleRecord(this);
+            idbRequireActive(this.objectStore.transaction);
+            const range = idbRange(arguments.length ? query : null, true);
+            return idbQueueRequest(this, () => idbIndexRecordList(this, range, "next").length);
         }
-        openCursor(query, direction) { return indexOpenCursor.call(this, query, direction, false, arguments.length > 0); }
-        openKeyCursor(query, direction) { return indexOpenCursor.call(this, query, direction, true, arguments.length > 0); }
-        get [Symbol.toStringTag]() { return "IDBIndex"; }
+        openCursor(query, direction) { idbIndexHandleRecord(this); return indexOpenCursor.call(this, query, direction, false, arguments.length > 0); }
+        openKeyCursor(query, direction) { idbIndexHandleRecord(this); return indexOpenCursor.call(this, query, direction, true, arguments.length > 0); }
+    }
+    function idbIndexHandleRecord(handle) {
+        const record = (typeof handle === "object" && handle !== null) ? apply(weakGet, internalSlots, [handle]) : undefined;
+        if (!record || !record.index) throw new TypeError("Illegal IDBIndex invocation");
+        return record;
     }
 
     function cursorIterate(skip, target) {
-        internalsFor(this).records = __idbSourceRecordList(this.source, internalsFor(this).range, this.direction);
-        let next = internalsFor(this).position + (skip || 1);
+        const record = internalsFor(this);
+        record.records = idbSourceRecordList(record.source, record.range, record.direction);
+        let next = record.position + (skip || 1);
         if (target) {
-            while (next < internalsFor(this).records.length &&
-                (this.direction.startsWith("prev")
-                    ? __idbCompare(internalsFor(this).records[next].key, target) > 0
-                    : __idbCompare(internalsFor(this).records[next].key, target) < 0)) next++;
+            while (next < record.records.length &&
+                (record.direction.startsWith("prev")
+                    ? idbCompare(record.records[next].key, target) > 0
+                    : idbCompare(record.records[next].key, target) < 0)) next++;
         }
-        if (next >= internalsFor(this).records.length) {
-            internalsFor(this).gotValue = false; internalsFor(this).position = internalsFor(this).records.length;
-            internalsFor(this).key = internalsFor(this).primaryKey = internalsFor(this).value = undefined;
+        if (next >= record.records.length) {
+            record.gotValue = false; record.position = record.records.length;
+            record.key = record.primaryKey = record.value = undefined;
             return null;
         }
-        internalsFor(this).position = next;
-        const record = internalsFor(this).records[next];
-        internalsFor(this).key = __idbKeyValue(record.key);
-        internalsFor(this).primaryKey = __idbKeyValue(record.primaryKey || record.key);
-        internalsFor(this).value = messageDeserialize(record.value); internalsFor(this).gotValue = true;
+        record.position = next;
+        const item = record.records[next];
+        record.key = idbKeyValue(item.key);
+        record.primaryKey = idbKeyValue(item.primaryKey || item.key);
+        record.value = adapter.deserialize(item.value); record.gotValue = true;
         return this;
     }
     class IDBCursor {
         constructor(token, source, direction, range) {
-            if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            this.source = source; this.direction = direction; internalsFor(this).range = range;
-            internalsFor(this).transaction = source instanceof IDBIndex
-                ? source.objectStore.transaction : source.transaction;
-            internalsFor(this).request = null;
-            internalsFor(this).gotValue = false; internalsFor(this).position = -1; internalsFor(this).records = null;
-            internalsFor(this).key = undefined; internalsFor(this).primaryKey = undefined; internalsFor(this).value = undefined;
+            if (token !== idbToken) throw new TypeError("Illegal constructor");
+            const record = internalsFor(this);
+            record.cursor = true;
+            record.source = source; record.direction = direction; record.range = range;
+            record.transaction = internalsFor(source).index ? source.objectStore.transaction : source.transaction;
+            record.request = null;
+            record.gotValue = false; record.position = -1; record.records = null;
+            record.key = undefined; record.primaryKey = undefined; record.value = undefined;
         }
-        get request() { return internalsFor(this).request; }
+        get source() { return idbCursorRecord(this).source; }
+        get direction() { return idbCursorRecord(this).direction; }
+        get request() { return idbCursorRecord(this).request; }
         get key() {
-            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            return internalsFor(this).key;
+            const record = idbCursorRecord(this);
+            if (!record.gotValue) throw idbException("InvalidStateError", "The cursor has no current value.");
+            return record.key;
         }
         get primaryKey() {
-            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            return internalsFor(this).primaryKey;
+            const record = idbCursorRecord(this);
+            if (!record.gotValue) throw idbException("InvalidStateError", "The cursor has no current value.");
+            return record.primaryKey;
         }
         continue(key) {
-            __idbRequireActive(internalsFor(this).transaction);
-            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
+            const record = idbCursorRecord(this);
+            idbRequireActive(record.transaction);
+            if (!record.gotValue) throw idbException("InvalidStateError", "The cursor is already advancing.");
             let target = null;
-            if (arguments.length) {
-                target = __idbKey(key);
-                const compared = __idbCompare(target, __idbKey(internalsFor(this).key));
-                if ((this.direction.startsWith("next") && compared <= 0) ||
-                    (this.direction.startsWith("prev") && compared >= 0))
-                    throw __idbException("DataError", "The continuation key does not advance the cursor.");
+            if (arguments.length && key !== undefined) {
+                target = idbKey(key);
+                const compared = idbCompare(target, idbKey(record.key));
+                if ((record.direction.startsWith("next") && compared <= 0) ||
+                    (record.direction.startsWith("prev") && compared >= 0))
+                    throw idbException("DataError", "The continuation key does not advance the cursor.");
             }
-            internalsFor(this).gotValue = false;
-            return __idbQueueRequest(this, () => cursorIterate.call(this, 1, target), internalsFor(this).request), undefined;
+            record.gotValue = false;
+            idbQueueRequest(this, () => cursorIterate.call(this, 1, target), record.request);
         }
         advance(count) {
+            const record = idbCursorRecord(this);
             count = Number(count);
             if (!Number.isInteger(count) || count <= 0 || count > 4294967295) throw new TypeError("Cursor advance count must be a positive unsigned long.");
-            __idbRequireActive(internalsFor(this).transaction);
-            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor is already advancing.");
-            internalsFor(this).gotValue = false;
-            return __idbQueueRequest(this, () => cursorIterate.call(this, count), internalsFor(this).request), undefined;
+            idbRequireActive(record.transaction);
+            if (!record.gotValue) throw idbException("InvalidStateError", "The cursor is already advancing.");
+            record.gotValue = false;
+            idbQueueRequest(this, () => cursorIterate.call(this, count), record.request);
         }
         delete() {
-            __idbRequireActive(internalsFor(this).transaction);
-            if (internalsFor(this).transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            const key = __idbKey(internalsFor(this).primaryKey);
-            return __idbQueueRequest(this, () => {
-                const store = __idbStoreForHandle(this.source instanceof IDBIndex
-                    ? this.source.objectStore : this.source);
-                store.records = store.records.filter((record) => __idbCompare(record.key, key) !== 0);
+            const record = idbCursorRecord(this);
+            idbRequireActive(record.transaction);
+            if (record.transaction.mode === "readonly") throw idbException("ReadOnlyError", "The transaction is read-only.");
+            if (!record.gotValue) throw idbException("InvalidStateError", "The cursor has no current value.");
+            const key = idbKey(record.primaryKey);
+            return idbQueueRequest(this, () => {
+                const store = idbStoreForHandle(internalsFor(record.source).index
+                    ? record.source.objectStore : record.source);
+                store.records = store.records.filter((item) => idbCompare(item.key, key) !== 0);
                 return undefined;
             });
         }
+        // #dom-idbcursor-update: the request's source is the cursor.
         update(value) {
-            __idbRequireActive(internalsFor(this).transaction);
-            if (internalsFor(this).transaction.mode === "readonly") throw __idbException("ReadOnlyError", "The transaction is read-only.");
-            if (!internalsFor(this).gotValue || !(this instanceof IDBCursorWithValue))
-                throw __idbException("InvalidStateError", "The cursor cannot update a value.");
-            const store = this.source instanceof IDBIndex ? this.source.objectStore : this.source;
-            return store.put(value, internalsFor(this).primaryKey);
+            const record = idbCursorRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBCursor.update requires a value.");
+            idbRequireActive(record.transaction);
+            if (record.transaction.mode === "readonly") throw idbException("ReadOnlyError", "The transaction is read-only.");
+            if (!record.gotValue || !record.withValue)
+                throw idbException("InvalidStateError", "The cursor cannot update a value.");
+            const store = internalsFor(record.source).index ? record.source.objectStore : record.source;
+            const serialized = adapter.serialize(value);
+            const storeRecord = idbStoreForHandle(store), primaryKey = idbKey(record.primaryKey);
+            if (storeRecord.keyPath !== null) {
+                // In-line keys: the clone's key must equal the effective key.
+                let key = null;
+                try {
+                    const extracted = idbExtractPath(adapter.deserialize(serialized), storeRecord.keyPath);
+                    if (extracted !== undefined) key = idbKey(extracted);
+                } catch (_) { key = null; }
+                if (key === null || idbCompare(key, primaryKey) !== 0)
+                    throw idbException("DataError", "The value's key does not match the cursor's primary key.");
+                return idbQueueRequest(this, idbStoreRecordOperation(store, serialized, false, undefined, false));
+            }
+            return idbQueueRequest(this, idbStoreRecordOperation(store, serialized, true, record.primaryKey, false));
         }
-        get [Symbol.toStringTag]() { return "IDBCursor"; }
+    }
+    function idbCursorRecord(cursor) {
+        const record = (typeof cursor === "object" && cursor !== null) ? apply(weakGet, internalSlots, [cursor]) : undefined;
+        if (!record || !record.cursor) throw new TypeError("Illegal IDBCursor invocation");
+        return record;
     }
     class IDBCursorWithValue extends IDBCursor {
-        get value() {
-            if (!internalsFor(this).gotValue) throw __idbException("InvalidStateError", "The cursor has no current value.");
-            return internalsFor(this).value;
+        constructor(token, source, direction, range) {
+            super(token, source, direction, range);
+            internalsFor(this).withValue = true;
         }
-        get [Symbol.toStringTag]() { return "IDBCursorWithValue"; }
+        get value() {
+            const record = idbCursorRecord(this);
+            if (!record.withValue) throw new TypeError("Illegal IDBCursorWithValue invocation");
+            if (!record.gotValue) throw idbException("InvalidStateError", "The cursor has no current value.");
+            return record.value;
+        }
     }
 
     class IDBDatabase extends EventTarget {
-        constructor(token, state, version) {
+        constructor(token, requestId, name, data, version, previousVersion) {
             super();
-            if (token !== __idbToken) throw new TypeError("Illegal constructor");
-            internalsFor(this).db = state; internalsFor(this).version = version;
-            internalsFor(this).closePending = false; internalsFor(this).closed = false;
-            state.connections.add(this);
+            if (token !== idbToken) throw new TypeError("Illegal constructor");
+            const record = internalsFor(this);
+            record.connectionRecord = true;
+            record.name = name; record.version = version;
+            // The connection's object store set, and the database's before an
+            // upgrade (#abort-an-upgrade-transaction reverts to it).
+            record.schema = idbSchema(data);
+            record.previousVersion = previousVersion;
+            record.previousSchema = record.schema;
+            record.closePending = false; record.closed = false;
+            record.upgrade = null; record.transactions = [];
+            record.frame = adapter.frame();
+            record.id = coordinator("connect", [requestId]);
+            connectionsById.set(record.id, this);
         }
-        get name() { return internalsFor(this).db.name; }
-        get version() { return internalsFor(this).version; }
+        get name() { return idbConnectionRecord(this).name; }
+        get version() { return idbConnectionRecord(this).version; }
         get objectStoreNames() {
-            const data = internalsFor(internalsFor(this).db).upgrade && internalsFor(internalsFor(internalsFor(this).db).upgrade).connection === this
-                ? internalsFor(internalsFor(internalsFor(this).db).upgrade).data : internalsFor(this).db.data;
-            return __idbSortedNames(data.stores.map((store) => store.name));
+            const record = idbConnectionRecord(this);
+            const data = record.upgrade ? internalsFor(record.upgrade).data : record.schema;
+            return idbSortedNames(data.stores.map((store) => store.name));
         }
-        transaction(storeNames, mode, options) {
+        transaction(storeNames, mode = undefined, options = undefined) {
+            const record = idbConnectionRecord(this);
             if (arguments.length === 0) throw new TypeError("IDBDatabase.transaction requires store names.");
-            if (internalsFor(internalsFor(this).db).upgrade) throw __idbException("InvalidStateError", "A versionchange transaction is active.");
-            if (internalsFor(this).closePending || internalsFor(this).closed) throw __idbException("InvalidStateError", "The connection is closing.");
-            const scope = typeof storeNames === "string" ? [storeNames]
-                : Array.from(storeNames, __idbDOMString);
+            // Web IDL conversions in argument order: (DOMString or
+            // sequence<DOMString>), IDBTransactionMode, IDBTransactionOptions.
+            const scope = (typeof storeNames === "object" && storeNames !== null) || typeof storeNames === "function"
+                ? Array.from(storeNames, idbDOMString) : [idbDOMString(storeNames)];
+            mode = mode === undefined ? "readonly" : idbDOMString(mode);
+            if (mode !== "readonly" && mode !== "readwrite" && mode !== "versionchange")
+                throw new TypeError("Invalid transaction mode.");
+            if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function")
+                throw new TypeError("IDBTransactionOptions must be a dictionary");
+            const durabilityMember = options == null ? undefined : options.durability;
+            const durability = durabilityMember === undefined ? "default" : idbDOMString(durabilityMember);
+            if (durability !== "default" && durability !== "strict" && durability !== "relaxed")
+                throw new TypeError("Invalid transaction durability.");
+            // #dom-idbdatabase-transaction steps 1-6.
+            if (record.upgrade) throw idbException("InvalidStateError", "A versionchange transaction is active.");
+            if (record.closePending || record.closed) throw idbException("InvalidStateError", "The connection is closing.");
             const unique = Array.from(new Set(scope));
-            if (!unique.length) throw __idbException("InvalidAccessError", "A transaction scope cannot be empty.");
-            for (const name of unique) if (!__idbStore(internalsFor(this).db.data, name))
-                throw __idbException("NotFoundError", "An object store in the scope does not exist.");
-            mode = mode === undefined ? "readonly" : String(mode);
-            if (mode !== "readonly" && mode !== "readwrite") throw new TypeError("Invalid transaction mode.");
-            const durability = options && options.durability !== undefined ? String(options.durability) : "default";
-            if (!["default", "strict", "relaxed"].includes(durability)) throw new TypeError("Invalid transaction durability.");
-            const transaction = new IDBTransaction(__idbToken, this, unique, mode, durability);
-            // HTML invokes IndexedDB transaction cleanup after the current task.
+            for (const name of unique) if (!idbStore(record.schema, name))
+                throw idbException("NotFoundError", "An object store in the scope does not exist.");
+            if (!unique.length) throw idbException("InvalidAccessError", "A transaction scope cannot be empty.");
+            if (mode === "versionchange") throw new TypeError("A versionchange transaction cannot be created by transaction().");
+            // The coordinator records the creation order across every agent
+            // and queues a database task to start it when it may.
+            const id = coordinator("transaction", [record.id, unique, mode === "readwrite"]);
+            const transaction = new IDBTransaction(idbToken, this, unique, mode, durability, id);
+            // HTML runs IndexedDB transaction cleanup after the current task.
             // This queued database task is therefore behind all synchronous
             // requests made by the author in the creating task.
-            __queue_dom_task(() => {
-                if (internalsFor(transaction).state === "active") internalsFor(transaction).state = "inactive";
-                __idbMaybeStartTransactions(internalsFor(transaction).db);
-                __idbProcess(transaction);
+            queueDatabaseTask(() => {
+                const transactionRecord = internalsFor(transaction);
+                if (transactionRecord.state === "active") transactionRecord.state = "inactive";
+                idbProcess(transaction);
             });
             return transaction;
         }
         createObjectStore(name, options) {
-            const transaction = internalsFor(internalsFor(this).db).upgrade;
-            if (!transaction || internalsFor(transaction).connection !== this)
-                throw __idbException("InvalidStateError", "Object stores can only be created during an upgrade.");
-            __idbRequireActive(transaction); name = __idbDOMString(name); options = options || {};
+            const record = idbConnectionRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBDatabase.createObjectStore requires a name.");
+            const transaction = record.upgrade;
+            if (!transaction) throw idbException("InvalidStateError", "Object stores can only be created during an upgrade.");
+            idbRequireActive(transaction); name = idbDOMString(name); options = options || {};
             let keyPath = options.keyPath === undefined ? null : options.keyPath;
             if (keyPath !== null) {
-                if (!__idbKeyPathValid(keyPath)) throw __idbException("SyntaxError", "The object store key path is invalid.");
-                keyPath = Array.isArray(keyPath) ? keyPath.slice() : String(keyPath);
+                if (!idbKeyPathValid(keyPath)) throw idbException("SyntaxError", "The object store key path is invalid.");
+                keyPath = isArray(keyPath) ? keyPath.slice() : String(keyPath);
             }
-            if (__idbStore(internalsFor(transaction).data, name)) throw __idbException("ConstraintError", "The object store already exists.");
-            if (options.autoIncrement && (keyPath === "" || Array.isArray(keyPath)))
-                throw __idbException("InvalidAccessError", "This key path cannot use autoIncrement.");
-            internalsFor(transaction).data.stores.push({ name: name, keyPath: keyPath, autoIncrement: !!options.autoIncrement, nextKey: 1, indexes: [], records: [] });
-            if (!internalsFor(transaction).scope.includes(name)) internalsFor(transaction).scope.push(name);
+            const transactionRecord = internalsFor(transaction);
+            if (idbStore(transactionRecord.data, name)) throw idbException("ConstraintError", "The object store already exists.");
+            if (options.autoIncrement && (keyPath === "" || isArray(keyPath)))
+                throw idbException("InvalidAccessError", "This key path cannot use autoIncrement.");
+            transactionRecord.data.stores.push({ name: name, keyPath: keyPath, autoIncrement: !!options.autoIncrement, nextKey: 1, indexes: [], records: [] });
+            if (!transactionRecord.scope.includes(name)) transactionRecord.scope.push(name);
             return transaction.objectStore(name);
         }
         deleteObjectStore(name) {
-            const transaction = internalsFor(internalsFor(this).db).upgrade;
-            if (!transaction || internalsFor(transaction).connection !== this)
-                throw __idbException("InvalidStateError", "Object stores can only be deleted during an upgrade.");
-            __idbRequireActive(transaction); name = __idbDOMString(name);
-            const index = internalsFor(transaction).data.stores.findIndex((store) => store.name === name);
-            if (index < 0) throw __idbException("NotFoundError", "The object store does not exist.");
-            internalsFor(transaction).data.stores.splice(index, 1);
-            internalsFor(transaction).scope = internalsFor(transaction).scope.filter((item) => item !== name);
+            const record = idbConnectionRecord(this);
+            if (arguments.length < 1) throw new TypeError("IDBDatabase.deleteObjectStore requires a name.");
+            const transaction = record.upgrade;
+            if (!transaction) throw idbException("InvalidStateError", "Object stores can only be deleted during an upgrade.");
+            idbRequireActive(transaction); name = idbDOMString(name);
+            const transactionRecord = internalsFor(transaction);
+            const index = transactionRecord.data.stores.findIndex((store) => store.name === name);
+            if (index < 0) throw idbException("NotFoundError", "The object store does not exist.");
+            transactionRecord.data.stores.splice(index, 1);
+            transactionRecord.scope = transactionRecord.scope.filter((item) => item !== name);
         }
-        close() { internalsFor(this).closePending = true; __idbFinishConnectionClose(this); }
-        get [Symbol.toStringTag]() { return "IDBDatabase"; }
+        close() { idbConnectionRecord(this); idbCloseConnection(this); }
     }
-    installHandlerProps(IDBDatabase.prototype, ["abort", "close", "error", "versionchange"]);
+    function idbConnectionRecord(connection) {
+        const record = (typeof connection === "object" && connection !== null) ? apply(weakGet, internalSlots, [connection]) : undefined;
+        if (!record || !record.connectionRecord) throw new TypeError("Illegal IDBDatabase invocation");
+        return record;
+    }
+    adapter.handlers(IDBDatabase.prototype, ["abort", "close", "error", "versionchange"]);
 
-    function __idbOpenSuccess(request, connection) {
-        __queue_dom_task(() => {
-            internalsFor(request).result = connection; internalsFor(request).error = null; internalsFor(request).done = true;
-            __idbRequestEvent(request, "success", false, false);
-            __idbFinishConnectionRequest(request);
+    // The connection queue (#connection-queues) entry is processed: the next
+    // open or delete request for this storage key and name may run.
+    function idbFinishRequest(request) {
+        const record = internalsFor(request);
+        if (record.finished) return;
+        record.finished = true;
+        requestsById.delete(record.id);
+        coordinator("finish", [record.id]);
+    }
+    // #dom-idbfactory-open step 5.3, success: after any upgrade transaction,
+    // so that the connection gets a chance to register for versionchange
+    // before another upgrade proceeds.
+    function idbOpenSuccess(request, connection) {
+        queueDatabaseTask(() => {
+            const record = internalsFor(request);
+            record.result = connection; record.error = null; record.done = true;
+            idbRequestEvent(request, "success", false, false);
+            idbFinishRequest(request);
         });
     }
-    function __idbWaitForConnections(request, state, version, continuation) {
-        // Capture the standard's openConnections set. Connections that are
-        // already close-pending receive no versionchange event, but still block
-        // until their outstanding transactions finish and they truly close.
-        const open = Array.from(state.connections).filter((connection) => !internalsFor(connection).closed);
-        if (!open.length) { continuation(); return; }
-        for (const connection of open) {
-            if (internalsFor(connection).closePending) continue;
-            __queue_dom_task(() => {
-                if (!internalsFor(connection).closed && !internalsFor(connection).closePending)
-                    __idbVersionEvent(connection, "versionchange", state.data.version, version);
-            });
-        }
-        __queue_dom_task(() => {
-            const remaining = open.filter((connection) => !internalsFor(connection).closed);
-            if (remaining.length) __idbVersionEvent(request, "blocked", state.data.version, version);
-            if (!remaining.length) { continuation(); return; }
-            let waiting = true;
-            const resume = () => {
-                if (!waiting || open.some((connection) => !internalsFor(connection).closed)) return;
-                waiting = false;
-                state.connectionWaiters.delete(resume);
-                __queue_dom_task(continuation);
-            };
-            state.connectionWaiters.add(resume);
+    function idbOpenFailure(request, error) {
+        queueDatabaseTask(() => {
+            const record = internalsFor(request);
+            record.result = undefined; record.error = error; record.done = true;
+            idbRequestEvent(request, "error", true, true);
+            idbFinishRequest(request);
         });
+    }
+    // #opening steps 4-11, once every previous request in the connection
+    // queue has been processed.
+    function idbOpenRun(request, name, version) {
+        const record = internalsFor(request);
+        const data = idbLoadData(name);
+        const oldVersion = data ? data.version : 0;
+        const requested = version === undefined ? (oldVersion || 1) : version;
+        if (oldVersion > requested) {
+            idbOpenFailure(request, idbException("VersionError", "The requested version is lower than the database version."));
+            return;
+        }
+        const connection = new IDBDatabase(idbToken, record.id, name, data || idbDefaultData(), requested, oldVersion);
+        if (oldVersion === requested) { idbOpenSuccess(request, connection); return; }
+        // Steps 10.1-10.5: versionchange at every other open connection of
+        // the database in any agent, then blocked while any stays open; the
+        // coordinator queues "unblocked" once they have all closed.
+        record.unblocked = () => idbUpgrade(request, connection, name, oldVersion, requested);
+        coordinator("versionchange", [record.id, internalsFor(connection).id, oldVersion, requested]);
+    }
+    // #upgrade-a-database.
+    function idbUpgrade(request, connection, name, oldVersion, version) {
+        const record = internalsFor(request), connectionRecord = internalsFor(connection);
+        if (connectionRecord.closePending || connectionRecord.closed) {
+            // #opening step 10.7.
+            idbCloseConnection(connection);
+            idbOpenFailure(request, idbException("AbortError", "The connection was closed before its upgrade."));
+            return;
+        }
+        const data = idbLoadData(name) || idbDefaultData();
+        data.version = version;
+        const transaction = new IDBTransaction(idbToken, connection,
+            data.stores.map((store) => store.name), "versionchange", "default", 0, data, request);
+        connectionRecord.upgrade = transaction;
+        const transactionRecord = internalsFor(transaction);
+        transactionRecord.state = "inactive";
+        queueDatabaseTask(() => {
+            if (transactionRecord.state === "finished") return;
+            record.result = connection; record.transaction = transaction; record.done = true;
+            transactionRecord.state = "active";
+            const event = idbVersionEvent(request, "upgradeneeded", oldVersion, version);
+            if (transactionRecord.state === "active") {
+                transactionRecord.state = "inactive";
+                if (adapter.listenerThrew(event)) {
+                    idbAbort(transaction, idbException("AbortError", "An upgradeneeded listener threw an exception."));
+                    return;
+                }
+            }
+            idbProcess(transaction);
+        });
+    }
+    // #deleting-a-database steps 4-12 and #dom-idbfactory-deletedatabase.
+    function idbDeleteRun(request, name) {
+        const record = internalsFor(request);
+        const data = idbLoadData(name);
+        const deleted = (version) => queueDatabaseTask(() => {
+            record.result = undefined; record.error = null; record.done = true;
+            idbVersionEvent(request, "success", version, null);
+            idbFinishRequest(request);
+        });
+        if (data === null) { deleted(0); return; }
+        record.unblocked = () => {
+            __storage_remove(idbDataKind, name);
+            deleted(data.version);
+        };
+        coordinator("versionchange", [record.id, 0, data.version, null]);
+    }
+    function idbNewRequest(name) {
+        const request = new IDBOpenDBRequest(idbToken);
+        const record = internalsFor(request);
+        record.frame = adapter.frame();
+        record.id = coordinator("request", [storageKey, name]);
+        requestsById.set(record.id, request);
+        return request;
     }
     class IDBFactory {
-        constructor(token) { if (token !== __idbToken) throw new TypeError("Illegal constructor"); }
-        open(name, version) {
+        constructor(token) { if (token !== idbToken) throw new TypeError("Illegal constructor"); }
+        open(name, version = undefined) {
             if (arguments.length === 0) throw new TypeError("IDBFactory.open requires a database name.");
-            name = __idbDOMString(name);
+            name = idbDOMString(name);
             if (version !== undefined) {
                 // Web IDL #abstract-opdef-converttoint: [EnforceRange]
                 // unsigned long long uses ToNumber, then truncation, then
@@ -41413,91 +41884,64 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (!Number.isFinite(version) || version <= 0 || version > Number.MAX_SAFE_INTEGER)
                     throw new TypeError("The database version must be a positive unsigned long long.");
             }
-            __idbCheckStorageKey();
-            const request = new IDBOpenDBRequest(__idbToken);
-            __idbEnqueueConnectionRequest(name, (finish) => {
-                __idbConnectionFinishes.set(request, finish);
-                const state = __idbDatabaseState(name, true);
-                const requested = version === undefined ? (state.data.version || 1) : version;
-                if (state.data.version > requested) {
-                    internalsFor(request).done = true; internalsFor(request).error = __idbException("VersionError", "The requested version is lower than the database version.");
-                    __idbRequestEvent(request, "error", true, true);
-                    __idbFinishConnectionRequest(request);
-                    return;
-                }
-                const openConnection = () => {
-                    const connection = new IDBDatabase(__idbToken, state, requested);
-                    if (state.data.version === requested) { __idbOpenSuccess(request, connection); return; }
-                    const oldVersion = state.data.version;
-                    const data = __idbCloneData(state.data); data.version = requested;
-                    const transaction = new IDBTransaction(__idbToken, connection,
-                        data.stores.map((store) => store.name), "versionchange", "default", data, request);
-                    internalsFor(state).upgrade = transaction;
-                    internalsFor(request).result = connection; internalsFor(request).transaction = transaction; internalsFor(request).done = true;
-                    internalsFor(transaction).state = "active";
-                    __idbVersionEvent(request, "upgradeneeded", oldVersion, requested);
-                    if (internalsFor(transaction).state === "active") internalsFor(transaction).state = "inactive";
-                    __idbProcess(transaction);
-                };
-                if (state.data.version < requested)
-                    __idbWaitForConnections(request, state, requested, openConnection);
-                else openConnection();
-            });
+            idbCheckStorageKey();
+            const request = idbNewRequest(name);
+            internalsFor(request).run = () => idbOpenRun(request, name, version);
             return request;
         }
         deleteDatabase(name) {
             if (arguments.length === 0) throw new TypeError("IDBFactory.deleteDatabase requires a database name.");
-            name = __idbDOMString(name);
-            __idbCheckStorageKey();
-            const request = new IDBOpenDBRequest(__idbToken);
-            __idbEnqueueConnectionRequest(name, (finish) => {
-                __idbConnectionFinishes.set(request, finish);
-                const state = __idbDatabaseState(name, false);
-                const oldVersion = state ? state.data.version : 0;
-                const remove = () => {
-                    __storage_remove(__idbDataKind, name); __idbCatalog.delete(name);
-                    internalsFor(request).done = true; internalsFor(request).result = undefined; internalsFor(request).error = null;
-                    __idbVersionEvent(request, "success", oldVersion, null);
-                    __idbFinishConnectionRequest(request);
-                };
-                if (state) __idbWaitForConnections(request, state, null, remove); else remove();
-            });
+            name = idbDOMString(name);
+            idbCheckStorageKey();
+            const request = idbNewRequest(name);
+            internalsFor(request).run = () => idbDeleteRun(request, name);
             return request;
         }
         databases() {
-            try { __idbCheckStorageKey(); } catch (error) { return Promise.reject(error); }
+            try { idbCheckStorageKey(); } catch (error) { return Promise.reject(error); }
             const result = [];
-            const count = __storage_len(__idbDataKind);
+            const count = __storage_len(idbDataKind);
             for (let index = 0; index < count; index++) {
-                const name = __storage_key(__idbDataKind, index);
+                const name = __storage_key(idbDataKind, index);
                 if (name === null) continue;
-                const data = __idbLoadData(name);
+                const data = idbLoadData(name);
                 if (data && data.version) result.push({ name: name, version: data.version });
-            }
-            for (const [name, state] of __idbCatalog) {
-                if (state.data.version && !result.some((entry) => entry.name === name))
-                    result.push({ name: name, version: state.data.version });
             }
             return Promise.resolve(result);
         }
         cmp(first, second) {
             if (arguments.length < 2) throw new TypeError("IDBFactory.cmp requires two keys.");
-            return __idbCompare(__idbKey(first), __idbKey(second));
+            return idbCompare(idbKey(first), idbKey(second));
         }
-        get [Symbol.toStringTag]() { return "IDBFactory"; }
     }
 
-    g.IDBRequest = IDBRequest; g.IDBOpenDBRequest = IDBOpenDBRequest;
-    g.IDBVersionChangeEvent = IDBVersionChangeEvent; g.IDBFactory = IDBFactory;
-    g.IDBDatabase = IDBDatabase; g.IDBTransaction = IDBTransaction;
-    g.IDBObjectStore = IDBObjectStore; g.IDBIndex = IDBIndex;
-    g.IDBKeyRange = IDBKeyRange; g.IDBCursor = IDBCursor;
-    g.IDBCursorWithValue = IDBCursorWithValue;
-    Object.defineProperty(g, "indexedDB", {
+    const interfaces = [["IDBRequest", IDBRequest], ["IDBOpenDBRequest", IDBOpenDBRequest],
+        ["IDBVersionChangeEvent", IDBVersionChangeEvent], ["IDBFactory", IDBFactory],
+        ["IDBDatabase", IDBDatabase], ["IDBTransaction", IDBTransaction],
+        ["IDBObjectStore", IDBObjectStore], ["IDBIndex", IDBIndex], ["IDBKeyRange", IDBKeyRange],
+        ["IDBCursor", IDBCursor], ["IDBCursorWithValue", IDBCursorWithValue]];
+    for (const [name, C] of interfaces) {
+        // Web IDL: regular attributes and operations are enumerable.
+        for (const key of Reflect.ownKeys(C.prototype)) {
+            if (key === "constructor" || typeof key !== "string") continue;
+            const descriptor = getOwn(C.prototype, key);
+            if (!descriptor.enumerable) { descriptor.enumerable = true; define(C.prototype, key, descriptor); }
+        }
+        for (const key of Reflect.ownKeys(C)) {
+            if (key === "length" || key === "name" || key === "prototype" || typeof key !== "string") continue;
+            const descriptor = getOwn(C, key);
+            if (!descriptor.enumerable) { descriptor.enumerable = true; define(C, key, descriptor); }
+        }
+        define(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+        define(g, name, { value: C, writable: true, configurable: true });
+    }
+    const factory = new IDBFactory(idbToken);
+    define(g, "indexedDB", {
         configurable: true, enumerable: true,
-        value: new IDBFactory(__idbToken), writable: false,
+        get: getOwn({ get indexedDB() { return factory; } }, "indexedDB").get,
     });
-
+    })(globalThis);
+    /*__INDEXEDDB_END__*/
 
     // Window and Worker use the same HTML port/transfer implementation.
     g.__port_adapter = {
@@ -41522,7 +41966,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const token = {}, portsById = new Map();
         const transferBuffer = ArrayBuffer.prototype.transfer;
         const bufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
-        let encode, decode, bitmapCodec;
+        const promiseThen = Promise.prototype.then, objectCreate = Object.create;
+        let encode, decode, bitmapCodec, streamsAPI;
+        // Streams #transferrable-streams: the entangled port of a transferred
+        // stream is never exposed to author code. Its port message queue feeds
+        // the cross-realm transform's message/messageerror handlers directly.
+        const streamPortHandlers = new Map();
         function native(op, id, payload) { return parse(binding(op, id, payload)); }
         function state(value) {
             const slot = apply(weakGet, adapter.slots, [value]);
@@ -41585,19 +42034,144 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const transfer = options.transfer;
             return transfer === undefined ? [] : sequence(transfer);
         }
+        // Streams #transferrable-streams: the port behaviors the cross-realm
+        // transforms use. post is PackAndPostMessage (the message port post
+        // message steps with an empty transfer list, which can throw), listen
+        // installs the message/messageerror handlers, enable starts the port
+        // message queue and close disentangles the port.
+        const streamPortOps = {
+            post(port, type, value) {
+                const message = objectCreate(null);
+                message.type = type;
+                message.value = value;
+                const slot = requirePort(port);
+                const peer = slot.detached ? null : native("peer", slot.id);
+                const packet = serialize(message, undefined, port, peer);
+                if (!peer || packet.doomed) return;
+                native("send", peer, stringify(packet));
+            },
+            listen(port, message, messageerror) {
+                streamPortHandlers.set(requirePort(port).id, { message, messageerror });
+            },
+            enable(port) {
+                const slot = requirePort(port);
+                if (!slot.detached) native("start", slot.id);
+            },
+            close(port) {
+                const slot = requirePort(port);
+                if (slot.detached) return;
+                slot.detached = true;
+                streamPortHandlers.delete(slot.id);
+                portsById.delete(slot.id);
+                native("dispose", slot.id);
+            },
+        };
+        function markHandled(promise) { apply(promiseThen, promise, [undefined, function () {}]); }
+        // HTML #structuredserializewithtransfer for one entangled port of a new
+        // pair: StructuredSerializeWithTransfer(port2, « port2 »).
+        function transferNewPort(port) {
+            const slot = requirePort(port);
+            const key = native("transfer", slot.id);
+            if (!key) throw cloneError("MessagePort transfer allocation failed");
+            portsById.delete(slot.id);
+            slot.id = 0;
+            slot.detached = true;
+            return key;
+        }
+        // The [[Type]] of a transferable stream (HTML primary interface name).
+        function streamType(item) {
+            if (!streamsAPI) return null;
+            if (streamsAPI.isReadableStream(item)) return "ReadableStream";
+            if (streamsAPI.isWritableStream(item)) return "WritableStream";
+            if (streamsAPI.isTransformStream(item)) return "TransformStream";
+            return null;
+        }
+        function streamRecordOf(item, type) {
+            return type === "ReadableStream" ? streamsAPI.stream(item)
+                : type === "WritableStream" ? streamsAPI.writable(item) : streamsAPI.transform(item);
+        }
+        // Streams #rs-transfer, #ws-transfer and #ts-transfer: the transfer
+        // steps, given a stream whose [[Detached]] flag is still false.
+        function transferStream(item, type) {
+            if (type === "TransformStream") {
+                const transform = streamsAPI.transform(item);
+                const readable = transform.readable.object, writable = transform.writable.object;
+                if (streamsAPI.locked(readable)) throw cloneError("The TransformStream's readable side is locked");
+                if (streamsAPI.writableLocked(writable)) throw cloneError("The TransformStream's writable side is locked");
+                return { type, readable: transferStreamWithTransfer(readable, "ReadableStream"),
+                    writable: transferStreamWithTransfer(writable, "WritableStream") };
+            }
+            if (type === "ReadableStream" ? streamsAPI.locked(item) : streamsAPI.writableLocked(item))
+                throw cloneError("A locked " + type + " cannot be transferred");
+            const ids = native("create");
+            const port1 = new MessagePort(token, ids[0]), port2 = new MessagePort(token, ids[1]);
+            let promise;
+            if (type === "ReadableStream") {
+                const writable = streamsAPI.newWritableObject();
+                streamsAPI.setUpCrossRealmWritable(writable, port1, streamPortOps);
+                promise = streamsAPI.pipeTo(item, writable, false, false, false);
+            } else {
+                const readable = streamsAPI.newReadableObject();
+                streamsAPI.setUpCrossRealmReadable(readable, port1, streamPortOps);
+                promise = streamsAPI.pipeTo(readable, item, false, false, false);
+            }
+            markHandled(promise);
+            return { type, port: transferNewPort(port2) };
+        }
+        // StructuredSerializeWithTransfer(stream, « stream ») inside the
+        // TransformStream transfer steps: the [[Detached]] check, the transfer
+        // steps, then [[Detached]] set to true.
+        function transferStreamWithTransfer(item, type) {
+            const record = streamRecordOf(item, type);
+            if (record.detached) throw cloneError("The " + type + " is detached");
+            const holder = transferStream(item, type);
+            record.detached = true;
+            return holder;
+        }
+        // The transfer-receiving steps (#rs-transfer, #ws-transfer, #ts-transfer)
+        // in the current Realm, after StructuredDeserializeWithTransfer of the port.
+        function receiveStream(holder) {
+            if (!holder || typeof holder !== "object") throw cloneError("A stream transfer");
+            if (holder.type === "TransformStream") {
+                const readable = receiveStream(holder.readable), writable = receiveStream(holder.writable);
+                if (!streamsAPI.isReadableStream(readable) || !streamsAPI.isWritableStream(writable))
+                    throw cloneError("A TransformStream transfer");
+                const value = streamsAPI.newTransformObject();
+                streamsAPI.setUpTransferredTransform(value, readable, writable);
+                return value;
+            }
+            if (holder.type !== "ReadableStream" && holder.type !== "WritableStream")
+                throw cloneError("A stream transfer");
+            const id = native("receive", `${holder.port}`);
+            if (!id) throw cloneError("A transferred stream's MessagePort is no longer available");
+            const port = new MessagePort(token, id);
+            if (holder.type === "ReadableStream") {
+                const value = streamsAPI.newReadableObject();
+                streamsAPI.setUpCrossRealmReadable(value, port, streamPortOps);
+                return value;
+            }
+            const value = streamsAPI.newWritableObject();
+            streamsAPI.setUpCrossRealmWritable(value, port, streamPortOps);
+            return value;
+        }
         function serialize(value, transfer, sourcePort, targetPort) {
             const list = transfer === undefined ? [] : sequence(transfer);
             const seen = new Set(), records = [], indices = new Map(), bufferIndices = new Map(), bitmapIndices = new Map();
+            const streamIndices = new Map();
             for (const item of list) {
                 if (seen.has(item) || item === sourcePort) throw cloneError("Duplicate or source port in transfer list");
                 seen.add(item);
                 const slot = state(item), bitmap = bitmapCodec && bitmapCodec.state(item);
+                const type = slot || bitmap ? null : streamType(item);
                 if (bitmap) {
                     bitmapIndices.set(item, bitmapIndices.size);
                     records.push({ item, bitmap });
                 } else if (slot) {
                     indices.set(item, indices.size);
                     records.push({ item, slot });
+                } else if (type) {
+                    streamIndices.set(item, streamIndices.size);
+                    records.push({ item, stream: type });
                 } else {
                     try { apply(bufferByteLength, item, []); }
                     catch (_) { throw cloneError("Object is not transferable"); }
@@ -41607,10 +42181,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             // HTML #structuredserializewithtransfer: visit the graph before detaching
             // anything. Exceptions in author getters leave the transfer list untouched.
-            const wire = encode(value, false, indices, bufferIndices, bitmapIndices), ports = [], buffers = [], bitmaps = [];
+            const wire = encode(value, false, indices, bufferIndices, bitmapIndices, streamIndices), ports = [], buffers = [], bitmaps = [];
+            const streams = [];
             let doomed = false;
             for (const record of records) {
-                if (record.bitmap) {
+                if (record.stream) {
+                    streams.push(transferStreamWithTransfer(record.item, record.stream));
+                } else if (record.bitmap) {
                     bitmaps.push(encode(bitmapCodec.transfer(record.item)));
                 } else if (record.slot) {
                     const slot = record.slot;
@@ -41627,7 +42204,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     catch (_) { throw cloneError("ArrayBuffer cannot be transferred"); }
                 }
             }
-            return { wire, ports, buffers, bitmaps, doomed };
+            return { wire, ports, buffers, bitmaps, streams, doomed };
         }
         function deserialize(packet) {
             const ports = packet.ports.map(key => {
@@ -41637,7 +42214,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             });
             const buffers = (packet.buffers || []).map(wire => decode(wire));
             const bitmaps = (packet.bitmaps || []).map(wire => bitmapCodec.receive(decode(wire)));
-            return { data: decode(packet.wire, ports, buffers, bitmaps), ports };
+            // HTML #structureddeserializewithtransfer: every transferred value,
+            // a stream included, is created before the serialized graph.
+            const streams = (packet.streams || []).map(receiveStream);
+            return { data: decode(packet.wire, ports, buffers, bitmaps, streams), ports };
         }
         class MessagePort extends adapter.EventTarget {
             constructor(key, id) {
@@ -41773,6 +42353,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             state,
             setCodec(serialize, deserialize) { encode = serialize; decode = deserialize; },
             setBitmaps(api) { bitmapCodec = api; },
+            setStreams(api) { streamsAPI = api; },
             serialize, deserialize, optionsTransfer,
             hasTask() { return native("has"); },
             runTask() {
@@ -41791,9 +42372,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     adapter.deliver(port, "message", { data, origin: packet.origin });
                     return true;
                 }
+                // A transferred stream's port runs its cross-realm transform's
+                // handlers (Streams #set-up-cross-realm-transform-readable and
+                // -writable); no author listener can observe that port.
+                const streamHandlers = streamPortHandlers.get(task[0]);
                 let packet;
                 try { packet = deserialize(parse(task[1])); }
-                catch (_) { adapter.deliver(port, "messageerror", {}); return true; }
+                catch (_) {
+                    if (streamHandlers) streamHandlers.messageerror();
+                    else adapter.deliver(port, "messageerror", {});
+                    return true;
+                }
+                if (streamHandlers) {
+                    streamHandlers.message(packet.data);
+                    return true;
+                }
                 adapter.deliver(port, "message", { data: packet.data, origin: "", source: null, ports: Object.freeze(packet.ports) });
                 return true;
             }
@@ -41840,13 +42433,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     };
     // HTML leaves selection among runnable task sources implementation-defined,
     // while requiring the event loop to keep making progress. Rotate among the
-    // ten represented sources so a self-replenishing source cannot starve
-    // another one. FIFO ordering remains intact within each source.
+    // eleven represented sources so a self-replenishing source cannot starve
+    // another one. FIFO ordering remains intact within each source. Database
+    // tasks (Indexed Database #queue-a-database-task) that the host's database
+    // coordinator queued for this realm are the eleventh.
     let platformSourceCursor = 0;
     trust.hasPlatformTask = function () {
         if (networkTasks.length > 0 || domTasks.length > 0 || intersectionTasks.length > 0 || controlSelectionTasks.length > 0 ||
             trust.hasMessageTask() || idleTasks.length > 0 || bitmapTasks.length > 0 || remoteEventTasks.length > 0 ||
-            (trust.hasPerformanceTask && trust.hasPerformanceTask())) return true;
+            (trust.hasPerformanceTask && trust.hasPerformanceTask()) ||
+            (indexedDBTasks !== null && indexedDBTasks.has())) return true;
         for (const childTrust of childWindowTrusts) {
             if (childTrust && childTrust.hasPlatformTask()) return true;
         }
@@ -41854,7 +42450,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     };
     trust.runPlatformTask = function () {
         const children = Array.from(childWindowTrusts);
-        const sourceCount = 10 + children.length;
+        const sourceCount = 11 + children.length;
         for (let offset = 0; offset < sourceCount; offset++) {
             const source = (platformSourceCursor + offset) % sourceCount;
             let task = null;
@@ -41883,8 +42479,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 task = controlSelectionTasks.shift(); label = "user interaction task";
             } else if (source === 9 && remoteEventTasks.length) {
                 task = remoteEventTasks.shift(); label = "remote event task";
-            } else if (source >= 10) {
-                const childTrust = children[source - 10];
+            } else if (source === 10 && indexedDBTasks !== null && indexedDBTasks.has()) {
+                platformSourceCursor = (source + 1) % sourceCount;
+                try { indexedDBTasks.run(); }
+                catch (e) { trust.errors.push("database task: " + ((e && e.message) || e)); }
+                return true;
+            } else if (source >= 11) {
+                const childTrust = children[source - 11];
                 if (childTrust && childTrust.runPlatformTask()) {
                     platformSourceCursor = (source + 1) % sourceCount;
                     return true;
@@ -42792,6 +43393,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (platformSlots && (platformSlots.wasmTag !== undefined ||
                     platformSlots.wasmExn !== undefined))
                 throw dce("A WebAssembly.Tag or WebAssembly.Exception");
+            // Streams #rs-transfer, #ws-transfer and #ts-transfer: streams are
+            // transferable, not serializable. Outside the transfer list they,
+            // like their readers, writers, controllers and strategies, are
+            // platform objects that cannot be cloned.
+            if (platformSlots && (platformSlots.readableStream || platformSlots.writableStream ||
+                    platformSlots.transformStream || platformSlots.streamReader ||
+                    platformSlots.streamWriter || platformSlots.readableStreamController ||
+                    platformSlots.writableStreamController || platformSlots.transformStreamController ||
+                    platformSlots.byobRequest || platformSlots.byteLengthStrategy ||
+                    platformSlots.countStrategy || platformSlots.textDecoderStream ||
+                    platformSlots.textEncoderStream || platformSlots.compressionStream ||
+                    platformSlots.decompressionStream))
+                throw dce("A stream platform object");
             if (wasmClone) {
                 const module = wasmClone.serialize(v, forStorage);
                 if (module) return module;
@@ -42855,8 +43469,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (var i = 0; i < keys.length; i++) op.push([keys[i], enc(v[keys[i]], heap, seen, forStorage)]);
             return ["O", op];
         }
-        G.__sc_serialize = function (value, forStorage = false, ports, buffers, bitmaps) {
+        G.__sc_serialize = function (value, forStorage = false, ports, buffers, bitmaps, streams) {
             var heap = [], seen = new Map();
+            // Transferred streams (HTML #structuredserializewithtransfer memory).
+            if (streams && !forStorage) streams.forEach(function (index, stream) {
+                seen.set(stream, heap.length); heap.push(["STT", index]);
+            });
             if (ports && !forStorage) ports.forEach(function (index, port) {
                 seen.set(port, heap.length); heap.push(["PT", index]);
             });
@@ -42870,8 +43488,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return JSON.stringify([root, heap]);
         };
         // Pass 1: build leaves fully + empty containers (so refs/cycles resolve).
-        function shell(node, ports, buffers, bitmaps) {
+        function shell(node, ports, buffers, bitmaps, streams) {
             switch (node[0]) {
+                case "STT":
+                    if (!streams || node[1] >= streams.length) throw dce("A stream transfer");
+                    return streams[node[1]];
                 case "IBT":
                     if (!bitmaps || node[1] >= bitmaps.length) throw dce("An ImageBitmap transfer");
                     return bitmaps[node[1]];
@@ -42946,10 +43567,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return undefined;
         }
-        G.__sc_deserialize = function (str, ports, buffers, bitmaps) {
+        G.__sc_deserialize = function (str, ports, buffers, bitmaps, streams) {
             var parsed = JSON.parse(str), root = parsed[0], heap = parsed[1];
             var built = new Array(heap.length), i;
-            for (i = 0; i < heap.length; i++) built[i] = shell(heap[i], ports, buffers, bitmaps);
+            for (i = 0; i < heap.length; i++) built[i] = shell(heap[i], ports, buffers, bitmaps, streams);
             // Pass 2: typed arrays / DataView (their buffer is an AB leaf, now built).
             for (i = 0; i < heap.length; i++) {
                 var n = heap[i];
@@ -43168,6 +43789,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     messageSerialize = g.__sc_serialize;
     messageDeserialize = g.__sc_deserialize;
     portAPI.setCodec(messageSerialize, messageDeserialize);
+    portAPI.setStreams(g.__streams_api);
     // The structured-clone wire codec, for native diagnostics and tests only.
     trust.messageCodec = { serialize: messageSerialize, deserialize: messageDeserialize };
     // Notifications, Storage and Service Workers expose the same interfaces
@@ -44242,108 +44864,189 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     for (const key of ["width","height","data","colorSpace","pixelFormat"])
         canvasImageGetters[key] = Object.getOwnPropertyDescriptor(canvasImageConstructor.prototype,key).get;
 
-    // The page side of Web Workers. `new Worker(url)` spawns a real second engine
-    // on its own thread (`__worker_spawn`); messages cross as structured-clone
-    // wire strings. Worker→page events arrive via `trust.workerMessage/Error`
-    // (the actor dispatches them like a click). Mirrors the WebSocket class.
-    trust.workers = {};
-    const workerIds = privateSlots();
-    function workerFire(type, ev) { dispatch(this, ev, false); }
-    class Worker extends EventTarget {
-        constructor(url, options) {
-            super();
-            options = options || {};
-            const type = options.type === undefined ? "classic" : String(options.type);
-            if (type !== "classic" && type !== "module") throw new TypeError("Invalid Worker type");
-            if (options.credentials !== undefined && !["omit", "same-origin", "include"].includes(String(options.credentials))) {
-                throw new TypeError("Invalid Worker credentials mode");
+    // HTML #dedicated-workers-and-the-worker-interface: the Window's adapter
+    // for the shared Worker block below. Worker events are dispatched like
+    // any other platform event of this Window; an error event the Worker
+    // object leaves unhandled is reported for this Window with omitError.
+    g.__worker_adapter = {
+        control: trust, EventTarget, Event, MessageEvent, ErrorEvent,
+        fire(target, C, type, init) { return dispatch(target, createTrustedEvent(C, type, init), false); },
+        handlers(proto, types) { installHandlerProps(proto, types); },
+        // Encoding-parse the URL relative to this Window's settings (its API
+        // base URL and its Document's encoding).
+        // HTML #dom-worker: this's relevant settings object is the Window the
+        // constructor runs for (a same-Realm child navigable's Window
+        // included): its Document's base URL and character encoding.
+        parseURL(url) {
+            const parsed = __url_parse(url, baseHref(), documentQueryEncoding(g.document));
+            return parsed ? parsed[0] : null;
+        },
+        // The File API Blob URL Store of this realm: an active entry's bytes,
+        // so that a revoked URL fails closed.
+        blobSource(href) {
+            const entry = __resolveBlobURL(href);
+            return entry ? entry.bytes : null;
+        },
+        serialize(message, transfer) { return serializeMessage(message, transfer); },
+        deserialize(packet) { return deserializeMessage(packet); },
+        optionsTransfer(options) { return portAPI.optionsTransfer(options); },
+        reportUnhandled(info) {
+            // HTML #report-an-exception with omitError set to true.
+            let notHandled = true;
+            if (!inErrorReportingMode) {
+                inErrorReportingMode = true;
+                try {
+                    notHandled = dispatch(g, createTrustedEvent(ErrorEvent, "error", {cancelable: true,
+                        message: info.message, filename: info.filename, lineno: info.lineno, colno: info.colno,
+                        error: null}), false);
+                } catch (_) {
+                } finally {
+                    inErrorReportingMode = false;
+                }
             }
-            const name = options.name != null ? String(options.name) : "";
-            // HTML #dom-worker: encoding-parse the script URL relative to
-            // this's relevant settings object, the Window the constructor
-            // runs for (a same-Realm child navigable's Window included): its
-            // API base URL (its Document's base URL) and its Document's
-            // character encoding.
-            const parsed = __url_parse(domString(url), baseHref(), documentQueryEncoding(g.document));
-            if (!parsed) throw new DOMException("Invalid worker script URL", "SyntaxError");
-            const href = parsed[0];
-            // HTML's Worker constructor fetches Blob URLs from the File API
-            // Blob URL Store. The store is authoritative in this realm; pass
-            // an active entry's byte string to the Rust worker launcher rather
-            // than asking the HTTP client to dereference a `blob:` URL. This
-            // also makes a revoked URL fail closed because __resolveBlobURL()
-            // returns null after URL.revokeObjectURL().
-            let blobSource = null;
-            if (href.slice(0, 5) === "blob:") {
-                const entry = __resolveBlobURL(href);
-                if (entry) blobSource = entry.bytes;
+            if (notHandled) trust.errors.push("worker: " + info.message +
+                (info.filename ? " at " + info.filename + ":" + info.lineno + ":" + info.colno : ""));
+        },
+        failed(message) { trust.errors.push("worker: " + message); },
+        console(line) { if (trust.logs.length < 100) trust.logs.push("worker: " + line); },
+    };
+    /*__DEDICATED_WORKER_BEGIN__*/
+    // HTML #dedicated-workers-and-the-worker-interface (local whatwg/html@e5071a2):
+    // Worker is [Exposed=(Window,DedicatedWorker,SharedWorker)]. This block is
+    // shared by the Window and every worker global (`js::worker_prelude()`), so a
+    // worker can create nested dedicated workers it owns. `new Worker(url)` runs a
+    // new agent on its own thread (`__worker_spawn`); messages cross as
+    // structured-clone wire strings through the worker's outside port, and the
+    // host delivers the worker's replies, errors, console lines and exit to the
+    // owning realm's control object (workerMessage/Error/Console/Exited).
+    (function (g) {
+        "use strict";
+        const adapter = g.__worker_adapter;
+        delete g.__worker_adapter;
+        const control = adapter.control;
+        const apply = Reflect.apply, define = Object.defineProperty, freeze = Object.freeze;
+        const stringify = JSON.stringify, parse = JSON.parse, objectCreate = Object.create;
+        const wellFormed = String.prototype.toWellFormed, startsWith = String.prototype.startsWith;
+        const stringSlice = String.prototype.slice, split = String.prototype.split;
+        const slotGet = WeakMap.prototype.get, slotSet = WeakMap.prototype.set;
+        const slots = new WeakMap();
+        // The Worker objects whose outside ports this realm owns, by agent id.
+        const workers = control.workers = objectCreate(null);
+        function workerState(value) {
+            const state = (typeof value === "object" && value !== null) ? apply(slotGet, slots, [value]) : undefined;
+            if (!state) throw new TypeError("Illegal Worker invocation");
+            return state;
+        }
+        class Worker extends adapter.EventTarget {
+            constructor(scriptURL, options = undefined) {
+                if (arguments.length < 1) throw new TypeError("Worker requires a script URL");
+                // (TrustedScriptURL or USVString): without Trusted Types
+                // enforcement the compliant string is the USVString.
+                scriptURL = apply(wellFormed, `${scriptURL}`, []);
+                // WorkerOptions members in lexicographic order (Web IDL #es-dictionary).
+                if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function")
+                    throw new TypeError("WorkerOptions must be a dictionary");
+                let name = "", type = "classic";
+                if (options != null) {
+                    const credentials = options.credentials;
+                    if (credentials !== undefined) {
+                        const mode = `${credentials}`;
+                        if (mode !== "omit" && mode !== "same-origin" && mode !== "include")
+                            throw new TypeError("Invalid Worker credentials mode");
+                    }
+                    const workerName = options.name;
+                    if (workerName !== undefined) name = `${workerName}`;
+                    const workerType = options.type;
+                    if (workerType !== undefined) {
+                        type = `${workerType}`;
+                        if (type !== "classic" && type !== "module") throw new TypeError("Invalid Worker type");
+                    }
+                }
+                // Constructor steps 3-4: encoding-parse relative to outsideSettings.
+                const href = adapter.parseURL(scriptURL);
+                if (href === null) throw new g.DOMException("Invalid worker script URL", "SyntaxError");
+                super();
+                const state = { id: -1 };
+                apply(slotSet, slots, [this, state]);
+                const blobSource = apply(startsWith, href, ["blob:"]) ? adapter.blobSource(href) : null;
+                state.id = __worker_spawn(href, type, name, blobSource);
+                if (state.id > 0) workers[state.id] = this;
             }
-            workerIds.set(this, __worker_spawn(href, type, name, blobSource));
-            if (workerIds.get(this) > 0) trust.workers[workerIds.get(this)] = this;
-        }
-        postMessage(message, options) {
-            if (arguments.length === 0) throw new TypeError("Worker.postMessage requires a message");
-            const packet = serializeMessage(message, portAPI.optionsTransfer(options));
-            if (workerIds.get(this) > 0) __worker_post(workerIds.get(this), JSON.stringify(packet));
-        }
-        terminate() {
-            if (workerIds.get(this) > 0) {
-                __worker_terminate(workerIds.get(this));
-                delete trust.workers[workerIds.get(this)];
-                workerIds.set(this, -1);
+            postMessage(message, options = undefined) {
+                const state = workerState(this);
+                if (arguments.length === 0) throw new TypeError("Worker.postMessage requires a message");
+                // The outside port's message port post message steps.
+                const packet = adapter.serialize(message, adapter.optionsTransfer(options));
+                if (state.id > 0) __worker_post(state.id, stringify(packet));
+            }
+            terminate() {
+                const state = workerState(this);
+                if (state.id > 0) {
+                    __worker_terminate(state.id);
+                    delete workers[state.id];
+                    state.id = -1;
+                }
             }
         }
-    }
-    installHandlerProps(Worker.prototype, ["message", "messageerror", "error"]);
-    g.Worker = Worker;
-    trust.workerMessage = function (id, s) {
-        const w = trust.workers[id];
-        if (!w) return;
-        let packet;
-        try { packet = deserializeMessage(JSON.parse(s)); }
-        catch (e) { workerFire.call(w, "messageerror", createTrustedEvent(MessageEvent, "messageerror", { origin: "" })); return; }
-        workerFire.call(w, "message", createTrustedEvent(MessageEvent, "message", {
-            data: packet.data, origin: "", ports: Object.freeze(packet.ports)
-        }));
-    };
-    // HTML #report-an-exception, dedicated worker branch: a report the worker
-    // global did not handle fires a cancelable ErrorEvent (error null) at the
-    // Worker object; if that is not handled either, it is reported for this
-    // Window with omitError. #run-a-worker: a script that cannot be fetched or
-    // parsed fires a plain "error" event. Other records are host diagnostics.
-    trust.workerError = function (id, msg) {
-        const w = trust.workers[id];
-        if (!w) return;
-        msg = String(msg);
-        if (msg.startsWith("\u0001fail ")) {
-            workerFire.call(w, "error", createTrustedEvent(Event, "error", {}));
-            trust.errors.push("worker: " + msg.slice(6));
-            return;
-        }
-        let info = null;
-        if (msg.startsWith("\u0001error ")) {
-            try { info = JSON.parse(msg.slice(7)); } catch (_) { info = null; }
-        }
-        if (!info) info = {message: msg, filename: "", lineno: 0, colno: 0};
-        const event = createTrustedEvent(ErrorEvent, "error", {cancelable: true, message: info.message,
-            filename: info.filename, lineno: info.lineno, colno: info.colno, error: null});
-        if (workerFire.call(w, "error", event) !== false && !event.defaultPrevented)
-            reportException(null, {message: info.message, filename: info.filename, lineno: info.lineno, colno: info.colno}, true);
-    };
-    // A worker's developer-console lines (its console and unreported
-    // rejections) join this Window's console ring.
-    trust.workerConsole = function (id, lines) {
-        for (const line of String(lines).split("\u001e")) {
-            if (line && trust.logs.length < 100) trust.logs.push("worker: " + line);
-        }
-    };
-    trust.workerExited = function (id) {
+        for (const key of ["postMessage", "terminate"])
+            define(Worker.prototype, key, {enumerable: true});
+        // AbstractWorker's onerror and MessageEventTarget's onmessage/onmessageerror.
+        adapter.handlers(Worker.prototype, ["error", "message", "messageerror"]);
+        define(Worker.prototype, Symbol.toStringTag, {value: "Worker", configurable: true});
+        define(g, "Worker", {value: Worker, writable: true, configurable: true});
+        control.workerMessage = function (id, wire) {
+            const worker = workers[id];
+            if (!worker) return;
+            let packet;
+            try { packet = adapter.deserialize(parse(`${wire}`)); }
+            catch (_) {
+                adapter.fire(worker, adapter.MessageEvent, "messageerror", {origin: ""});
+                return;
+            }
+            adapter.fire(worker, adapter.MessageEvent, "message", {
+                data: packet.data, origin: "", ports: freeze(packet.ports),
+            });
+        };
+        // HTML #report-an-exception, dedicated worker branch: a report the
+        // worker global did not handle fires a cancelable ErrorEvent (error
+        // null) at the Worker object; if that is not handled either, it is
+        // reported for this global with omitError. #run-a-worker: a script that
+        // cannot be fetched or parsed fires a plain "error" event. Other
+        // records are host diagnostics.
+        control.workerError = function (id, message) {
+            const worker = workers[id];
+            if (!worker) return;
+            message = `${message}`;
+            if (apply(startsWith, message, ["\u0001fail "])) {
+                adapter.fire(worker, adapter.Event, "error", {});
+                adapter.failed(apply(stringSlice, message, [6]));
+                return;
+            }
+            let info = null;
+            if (apply(startsWith, message, ["\u0001error "])) {
+                try { info = parse(apply(stringSlice, message, [7])); } catch (_) { info = null; }
+            }
+            if (!info || typeof info !== "object") info = {message, filename: "", lineno: 0, colno: 0};
+            const notHandled = adapter.fire(worker, adapter.ErrorEvent, "error", {cancelable: true,
+                message: `${info.message}`, filename: `${info.filename}`, lineno: info.lineno >>> 0,
+                colno: info.colno >>> 0, error: null});
+            if (notHandled) adapter.reportUnhandled({message: `${info.message}`, filename: `${info.filename}`,
+                lineno: info.lineno >>> 0, colno: info.colno >>> 0});
+        };
+        // A worker's developer-console lines join this global's console.
+        control.workerConsole = function (id, lines) {
+            const list = apply(split, `${lines}`, ["\u001e"]);
+            for (let i = 0; i < list.length; i++) if (list[i]) adapter.console(list[i]);
+        };
         // HTML #worker-processing-model: once the agent and its queued replies
-        // have finished, the host must not retain its wrapper/listener closures.
-        const w = trust.workers[id];
-        if (w) workerIds.set(w, -1);
-        delete trust.workers[id];
-    };
+        // have finished, the realm must not retain its wrapper and listeners.
+        control.workerExited = function (id) {
+            const worker = workers[id];
+            if (worker) apply(slotGet, slots, [worker]).id = -1;
+            delete workers[id];
+        };
+    })(globalThis);
+    /*__DEDICATED_WORKER_END__*/
 
     // HTML #shared-workers-and-the-sharedworker-interface (local whatwg/html@e5071a2).
     // The shared worker manager is the page's native worker host: it matches

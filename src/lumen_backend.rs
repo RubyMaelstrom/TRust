@@ -29,6 +29,8 @@ mod geometry_host;
 mod image_bitmap_host;
 #[path = "image_host.rs"]
 mod image_host;
+#[path = "indexed_db_host.rs"]
+mod indexed_db_host;
 #[path = "live_range_host.rs"]
 mod live_range_host;
 #[path = "lumen_wasm.rs"]
@@ -453,7 +455,9 @@ struct LumenPageWorkers {
     handle: tokio::runtime::Handle,
     page: url::Url,
     tasks: Arc<crate::http::PageTaskScope>,
-    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    /// The owner's event loop: the page actor, or for a nested dedicated worker
+    /// (HTML #dedicated-workers-and-the-worker-interface) its owning worker's inbox.
+    events: LumenTaskSender,
     workers: HashMap<usize, LumenWorkerHandle>,
     next_id: usize,
     /// HTML #shared-workers-and-the-sharedworker-interface: this page's shared worker global
@@ -464,11 +468,15 @@ struct LumenPageWorkers {
 
 struct LumenWorkerSelf {
     id: usize,
-    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    events: LumenTaskSender,
     closed: bool,
     /// HTML #set-up-a-worker-environment-settings-object: origin is inherited
     /// from the creator, whereas the API base URL remains the script URL.
     origin: url::Url,
+    /// Secure Contexts #is-settings-object-contextually-secure: whether this
+    /// worker's settings object is a secure context, which a nested worker
+    /// inherits when its own script URL is potentially trustworthy.
+    secure_context: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -621,6 +629,8 @@ impl Drop for DomResourceLease {
 
 struct HostState {
     message_ports: message_port_host::Agent,
+    /// This agent towards its storage shed's Indexed Database coordinator.
+    indexed_db: indexed_db_host::Agent,
     dom: Rc<RefCell<Dom>>,
     dom_gc: DomGcRegistry,
     clock: Rc<RealmClock>,
@@ -764,6 +774,7 @@ impl HostState {
         };
         Self {
             message_ports: Default::default(),
+            indexed_db: Default::default(),
             dom,
             dom_gc: DomGcRegistry::default(),
             clock,
@@ -866,7 +877,7 @@ impl HostState {
             handle: handle.clone(),
             page: self.base.clone(),
             tasks: cache.task_scope(),
-            events: events.clone(),
+            events: LumenTaskSender::Page(events.clone()),
             workers: HashMap::new(),
             next_id: 1,
             shared: HashMap::new(),
@@ -1005,6 +1016,7 @@ impl RetainedMemory for HostState {
         // the root realm and its ShadowRealms.
         let HostState {
             message_ports,
+            indexed_db: _,
             dom,
             dom_gc,
             clock,
@@ -10544,6 +10556,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__clock_set", 1, host_clock_set),
     ("__storage_allowed", 1, host_storage_allowed),
     ("__storage_get", 2, host_storage_get),
+    ("__storage_cas", 4, host_storage_cas),
+    ("__indexed_db", 2, indexed_db_host::call),
     ("__storage_set", 3, host_storage_set),
     ("__storage_remove", 2, host_storage_remove),
     ("__storage_clear", 1, host_storage_clear),
@@ -13578,6 +13592,7 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         state.import_maps.remove(&context);
         state.window_realms.remove(&context);
         state.message_ports.release(Some(context));
+        state.indexed_db.release(Some(context));
         state.window_request_urls.remove(&context);
         state.window_cookie_contexts.remove(&context);
         state.forget_realm_origin(context);
@@ -14656,12 +14671,25 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
         .map(|_| host_latin1_bytes(ctx, args, 3));
     let context = ctx.host_job_context();
-    let owner_page = request_client_url(ctx);
+    // A nested worker's outside settings object is its owning worker's: the
+    // creator origin and secure-context state that worker inherited itself.
+    let nested_owner = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.worker_self.as_ref())
+        .map(|worker| (worker.origin.clone(), worker.secure_context));
+    let (owner_page, owner_secure) = match nested_owner {
+        Some((origin, secure)) => (origin, secure),
+        None => {
+            let page = request_client_url(ctx);
+            let secure = lumen_potentially_trustworthy(&page);
+            (page, secure)
+        }
+    };
     let cookie_context = request_cookie_context(ctx);
     let script_url = owner_page
         .join(&target)
         .map_err(|_| ctx.make_error("SyntaxError", "invalid worker script URL"))?;
-    let secure_context = lumen_potentially_trustworthy(&owner_page)
+    let secure_context = owner_secure
         && (script_url.scheme() == "blob" || lumen_potentially_trustworthy(&script_url));
     let Some(state) = ctx
         .host_mut::<HostState>()
@@ -14901,7 +14929,19 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__ws_close", 3, host_ws_close as NativeFn),
         ("__worker_self_post", 1, host_worker_self_post as NativeFn),
         ("__worker_self_close", 0, host_worker_self_close as NativeFn),
+        ("__worker_spawn", 4, host_worker_spawn as NativeFn),
+        ("__worker_post", 2, host_worker_post as NativeFn),
+        ("__worker_terminate", 1, host_worker_terminate as NativeFn),
         ("__storage_manager", 2, host_storage_manager as NativeFn),
+        // The origin's Indexed Database and Cache Storage bottles in the
+        // owner's storage shed (Storage #storage-shed), shared with Windows.
+        ("__storage_get", 2, host_storage_get as NativeFn),
+        ("__storage_set", 3, host_storage_set as NativeFn),
+        ("__storage_cas", 4, host_storage_cas as NativeFn),
+        ("__storage_remove", 2, host_storage_remove as NativeFn),
+        ("__storage_key", 2, host_storage_key as NativeFn),
+        ("__storage_len", 1, host_storage_len as NativeFn),
+        ("__indexed_db", 2, indexed_db_host::call as NativeFn),
         ("__blob_mirror", 3, host_blob_mirror as NativeFn),
         (
             "__crypto_sha256_digest",
@@ -15128,11 +15168,7 @@ fn fetch_lumen_worker_script(
     })
 }
 
-fn send_lumen_worker_error(
-    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
-    id: usize,
-    message: impl Into<String>,
-) {
+fn send_lumen_worker_error(events: &LumenTaskSender, id: usize, message: impl Into<String>) {
     let _ = events.send(LumenHostTask::Worker {
         id,
         event: crate::js::WorkerOut::Error(message.into()),
@@ -15181,7 +15217,7 @@ fn eval_lumen_worker_classic(
     engine: &mut lumen::Engine,
     source: &str,
     label: &str,
-    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    events: &LumenTaskSender,
     id: usize,
 ) -> bool {
     let origin = lumen::SourceOrigin::new(label);
@@ -15225,7 +15261,7 @@ fn eval_lumen_worker_module(
     engine: &mut lumen::Engine,
     script: &LumenWorkerScript,
     fetch: LumenWorkerModuleFetch,
-    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    events: &LumenTaskSender,
     id: usize,
 ) -> bool {
     let loader_page = fetch.page;
@@ -15306,7 +15342,7 @@ fn lumen_worker_internal_call(
 
 fn lumen_worker_report_buffered_errors(
     engine: &mut lumen::Engine,
-    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    events: &LumenTaskSender,
     id: usize,
 ) -> bool {
     // HTML #notify-about-rejected-promises after the task's microtask checkpoint.
@@ -15385,11 +15421,12 @@ fn run_lumen_worker(
     launch: LumenWorkerLaunch,
     handle: tokio::runtime::Handle,
     tasks: Arc<crate::http::PageTaskScope>,
-    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    events: LumenTaskSender,
     ctl_rx: std::sync::mpsc::Receiver<LumenWorkerCtl>,
     interrupt: Arc<lumen::RuntimeInterrupt>,
 ) {
     let _task_lifetime = LumenWorkerTaskLifetime(tasks.clone());
+    let nested_tasks = tasks.clone();
     let cache = Arc::new(crate::http::PageCache::with_task_scope(tasks));
     let clock = Rc::new(RealmClock::new());
     let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
@@ -15424,15 +15461,32 @@ fn run_lumen_worker(
         &cache,
         launch.task_sender.clone(),
     );
+    let worker_origin = if launch.script_url.scheme() == "data" {
+        launch.script_url.clone()
+    } else {
+        launch.owner_page.clone()
+    };
+    // HTML #dedicated-workers-and-the-worker-interface: Worker is exposed in
+    // DedicatedWorker and SharedWorker globals. A nested worker's outside
+    // settings are this worker's: its tasks go to this agent's inbox, its
+    // fetches use this worker's origin, and it lives in this worker's owner
+    // set, so ending this agent (dropping its handles) terminates it too
+    // (#the-worker's-lifetime: an orphan is no longer permissible).
+    state.workers = Some(LumenPageWorkers {
+        handle: handle.clone(),
+        page: worker_origin.clone(),
+        tasks: nested_tasks,
+        events: launch.task_sender.clone(),
+        workers: HashMap::new(),
+        next_id: 1,
+        shared: HashMap::new(),
+    });
     state.worker_self = Some(LumenWorkerSelf {
         id: launch.id,
         events: events.clone(),
         closed: false,
-        origin: if launch.script_url.scheme() == "data" {
-            launch.script_url.clone()
-        } else {
-            launch.owner_page.clone()
-        },
+        origin: worker_origin,
+        secure_context: launch.secure_context,
     });
 
     let mut engine = lumen::Engine::new_with_interrupt(interrupt);
@@ -15540,7 +15594,7 @@ fn run_lumen_worker(
     // errors are reported within the worker (and possibly a developer console), never to
     // the SharedWorker objects. Their channel is closed, so those reports are discarded.
     let events = if launch.shared {
-        tokio::sync::mpsc::unbounded_channel().0
+        LumenTaskSender::Worker(std::sync::Weak::new())
     } else {
         events
     };
@@ -20716,6 +20770,31 @@ fn host_storage_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     Ok(Value::Bool(true))
 }
 
+/// Compare-and-set of one temporary bottle entry (`expected` null: absent). The Indexed Database
+/// and Cache Storage platform blocks write each commit with it, so that an agent's read-modify-write
+/// of a serialized database or request response list is atomic against every other agent sharing
+/// the storage shed (IndexedDB #commit-transaction, Service Workers #batch-cache-operations-algorithm).
+fn host_storage_cas(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let key = host_arg_string(ctx, args, 1);
+    let expected = args
+        .get(2)
+        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .map(|_| host_arg_string(ctx, args, 2));
+    let value = host_arg_string(ctx, args, 3);
+    let (storage, bucket) = host_storage_bucket(ctx, args);
+    if bucket.starts_with("local:") {
+        // localStorage keeps its own quota and persistence path.
+        return Ok(Value::Bool(false));
+    }
+    let mut storage = storage.lock().unwrap();
+    let current = storage.get(&bucket).and_then(|entries| entries.get(&key));
+    if current != expected.as_ref() {
+        return Ok(Value::Bool(false));
+    }
+    storage.entry(bucket).or_default().insert(key, value);
+    Ok(Value::Bool(true))
+}
+
 fn host_storage_remove(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let key = host_arg_string(ctx, args, 1);
     let (storage, bucket) = host_storage_bucket(ctx, args);
@@ -25676,9 +25755,10 @@ mod tests {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         state.worker_self = Some(LumenWorkerSelf {
             id: 1,
-            events,
+            events: LumenTaskSender::Page(events),
             closed: false,
             origin: url::Url::parse(DEFAULT_URL).unwrap(),
+            secure_context: true,
         });
         let origin = clock.origin_ms;
         let mut engine = lumen::Engine::new();
@@ -29818,7 +29898,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 236, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 238, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -29829,7 +29909,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 236);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 238);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -36898,6 +36978,7 @@ mod tests {
         .unwrap();
         run_microtask_checkpoint(&mut worker);
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let events = LumenTaskSender::Page(events);
         assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
         assert_eq!(
             settle_fixture_events(&mut worker),
@@ -37046,6 +37127,324 @@ mod tests {
             receiver.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    /// [`settle_fixture`] that also runs a worker's port message tasks, which
+    /// its event loop selects separately from its platform tasks.
+    fn settle_fixture_with_ports(engine: &mut lumen::Engine, worker: bool) -> String {
+        for _ in 0..20_000 {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, "typeof globalThis.result") != "undefined" {
+                break;
+            }
+            if worker && string_value(engine, "String(__wkr.hasPortTask())") == "true" {
+                eval(engine, "__wkr.runPortTask()", "port task").unwrap();
+                continue;
+            }
+            let control = if worker { "__wkr" } else { "__trust" };
+            if string_value(engine, &format!("String({control}.hasPlatformTask())")) == "true" {
+                eval(
+                    engine,
+                    &format!("{control}.runPlatformTask()"),
+                    "platform task",
+                )
+                .unwrap();
+                continue;
+            }
+            let tick = if worker {
+                "__wkr.tick(1e12)"
+            } else {
+                "__trust.tick()"
+            };
+            if string_value(engine, &format!("String({tick})")) != "true" {
+                break;
+            }
+        }
+        run_microtask_checkpoint(engine);
+        string_value(engine, "String(globalThis.result)")
+    }
+
+    #[test]
+    fn transferable_streams_use_cross_realm_transforms_in_windows_and_workers() {
+        // Streams #transferrable-streams, #rs-transfer, #ws-transfer and
+        // #ts-transfer (local whatwg/streams@b9ba9f4) through HTML
+        // #structuredserializewithtransfer (local whatwg/html@e5071a2): the
+        // [[Detached]] and locked checks, piping into cross-realm transforms,
+        // chunk/close/error/cancel/abort propagation and DataCloneError for
+        // uncloneable chunks, by structuredClone() and a MessagePort.
+        let fixture = wrap_platform_fixture(include_str!("fixtures/transferable_streams.mjs"));
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut window = platform_engine();
+            window.set_tier(tier);
+            eval(&mut window, &fixture, "transferable streams").unwrap();
+            assert_eq!(
+                settle_fixture_with_ports(&mut window, false),
+                "ok",
+                "transferable streams (Window, {tier:?})"
+            );
+            let mut worker = worker_platform_engine();
+            worker.set_tier(tier);
+            eval(&mut worker, &fixture, "transferable streams").unwrap();
+            assert_eq!(
+                settle_fixture_with_ports(&mut worker, true),
+                "ok",
+                "transferable streams (DedicatedWorkerGlobalScope, {tier:?})"
+            );
+        }
+    }
+
+    /// Drive a Window realm that owns real worker agents: run its platform
+    /// tasks and the host tasks its workers send until `done` is true.
+    fn pump_page_with_workers(
+        runtime: &tokio::runtime::Runtime,
+        engine: &mut lumen::Engine,
+        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        done: &str,
+        log: &str,
+        timeout: Duration,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, done) == "true" {
+                return string_value(engine, log);
+            }
+            if Instant::now() >= deadline {
+                let log = string_value(engine, log);
+                let errors = string_value(engine, "__trust.takeErrors()");
+                let logs = string_value(engine, "__trust.takeLogs()");
+                panic!("workers stalled: {log}\nerrors: {errors}\nlogs: {logs}");
+            }
+            pump_page_task(runtime, engine, task_rx);
+        }
+    }
+
+    /// Keep a Window realm's event loop running for `duration`.
+    fn pump_page_for(
+        runtime: &tokio::runtime::Runtime,
+        engine: &mut lumen::Engine,
+        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+        duration: Duration,
+    ) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            run_microtask_checkpoint(engine);
+            pump_page_task(runtime, engine, task_rx);
+        }
+        run_microtask_checkpoint(engine);
+    }
+
+    fn pump_page_task(
+        runtime: &tokio::runtime::Runtime,
+        engine: &mut lumen::Engine,
+        task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+    ) {
+        // Like the resident actor, never let a busy platform task source
+        // starve the tasks worker agents send (HTML #event-loop-processing-model).
+        if let Ok(task) = task_rx.try_recv() {
+            dispatch_host_task(engine, task).unwrap();
+        } else if matches!(
+            engine_call_trust_method(engine, "hasPlatformTask", &[]),
+            Ok(Value::Bool(true))
+        ) {
+            engine_call_trust_method(engine, "runPlatformTask", &[])
+                .unwrap_or_else(|error| panic!("{}", describe_eval_error(engine, error, "task")));
+        } else if let Ok(Some(task)) = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(20), task_rx.recv()).await
+        }) {
+            dispatch_host_task(engine, task).unwrap();
+        }
+    }
+
+    #[test]
+    fn transferable_streams_cross_agents_between_windows_and_workers() {
+        // Streams #transferrable-streams between a Window and a dedicated
+        // worker agent: each side's stream is driven through its entangled
+        // port from the other agent, a transferred TransformStream makes a
+        // second hop back, and an errored stream's error arrives cloned.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let (runtime, mut engine, mut task_rx) = worker_test_environment();
+            engine.set_tier(tier);
+            eval(
+                &mut engine,
+                include_str!("fixtures/worker_transferable_streams.mjs"),
+                "worker transferable streams",
+            )
+            .unwrap();
+            let log = pump_page_with_workers(
+                &runtime,
+                &mut engine,
+                &mut task_rx,
+                "streamLog.some(entry => entry === 'done' || entry.startsWith('threw') || entry.startsWith('error'))",
+                "streamLog.join('|')",
+                Duration::from_secs(30),
+            );
+            assert_eq!(
+                log,
+                "locked:true,true,true,true|answer:one+two,true|\
+                 failing:RangeError:worker failure:true|transform:ROUND,TRIP|\
+                 sink:from-worker,bytes:7:8|done",
+                "{tier:?}"
+            );
+            eval(&mut engine, "streamWorker.terminate()", "cleanup").unwrap();
+        }
+    }
+
+    #[test]
+    fn dedicated_workers_own_nested_classic_and_module_workers() {
+        // HTML #dedicated-workers-and-the-worker-interface (local
+        // whatwg/html@e5071a2): Worker is exposed in DedicatedWorkerGlobalScope
+        // and SharedWorker is not; nested classic workers import scripts,
+        // nested module workers reject importScripts(), and an unhandled nested
+        // error reaches the nested Worker object, the owning worker's global
+        // and finally the page's Worker object (#report-an-exception).
+        // #the-worker's-lifetime: when its owner ends, a nested worker is no
+        // longer permissible and stops running.
+        for tier in [Tier::Interp, Tier::Jit] {
+            let (runtime, mut engine, mut task_rx) = worker_test_environment();
+            engine.set_tier(tier);
+            eval(
+                &mut engine,
+                include_str!("fixtures/nested_workers.mjs"),
+                "nested workers",
+            )
+            .unwrap();
+            let log = pump_page_with_workers(
+                &runtime,
+                &mut engine,
+                &mut task_rx,
+                "nestedLog.length >= 5 && nestedTicks >= 3",
+                "nestedLog.join('|')",
+                Duration::from_secs(30),
+            );
+            let mut entries: Vec<_> = log.split('|').collect();
+            entries.sort_unstable();
+            assert_eq!(
+                entries,
+                [
+                    "classic:ping,42,true,inner,function,blob:,https://example.com",
+                    "module:ping:TypeError:function",
+                    "nested-error:true:true:true:true:true",
+                    "outer-error:true",
+                    "ready",
+                ],
+                "{tier:?}"
+            );
+            eval(&mut engine, "nestedOuter.terminate()", "terminate owner").unwrap();
+            pump_page_for(
+                &runtime,
+                &mut engine,
+                &mut task_rx,
+                Duration::from_millis(300),
+            );
+            let settled = string_value(&mut engine, "String(nestedTicks)");
+            pump_page_for(
+                &runtime,
+                &mut engine,
+                &mut task_rx,
+                Duration::from_millis(400),
+            );
+            assert_eq!(
+                string_value(&mut engine, "String(nestedTicks)"),
+                settled,
+                "a nested worker outlived its terminated owner ({tier:?})"
+            );
+            eval(&mut engine, "nestedTickChannel.close()", "cleanup").unwrap();
+        }
+    }
+
+    #[test]
+    fn indexed_db_follows_the_standard_in_windows_and_workers() {
+        // Indexed Database 3 (local w3c/IndexedDB@f704918) is [Exposed=(Window,Worker)]:
+        // #factory-interface, #request-construct (request -> transaction ->
+        // connection event paths with capture and bubbling), #fire-an-error-event
+        // (listener exceptions abort), #transaction-scheduling, #dom-idbcursor-update,
+        // #opening (versionchange and blocked) and #deleting-a-database, with
+        // IDBVersionChangeEvent, IDBKeyRange and DOMStringList attributes.
+        let fixture = wrap_platform_fixture(include_str!("fixtures/indexed_db_realms.mjs"));
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut window = platform_engine();
+            window.set_tier(tier);
+            eval(&mut window, &fixture, "IndexedDB").unwrap();
+            assert_eq!(
+                settle_fixture(&mut window, false),
+                "ok",
+                "IndexedDB (Window, {tier:?})"
+            );
+            let mut worker = worker_platform_engine();
+            worker.set_tier(tier);
+            eval(&mut worker, &fixture, "IndexedDB").unwrap();
+            assert_eq!(
+                settle_fixture(&mut worker, true),
+                "ok",
+                "IndexedDB (DedicatedWorkerGlobalScope, {tier:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_db_databases_are_shared_by_window_and_worker_agents() {
+        // Storage #storage-keys and Indexed Database 3: one origin's databases
+        // in a Window and a dedicated worker agent. versionchange and blocked
+        // cross agents (#opening steps 10.1-10.5, #deleting-a-database), the
+        // worker's transaction waits for the Window's earlier overlapping one
+        // and sees its writes (#transaction-scheduling), disjoint read/write
+        // transactions of both agents commit without losing records, and a
+        // terminated worker's connections close (#database-connection).
+        for tier in [Tier::Interp, Tier::Jit] {
+            let (runtime, mut engine, mut task_rx) = worker_test_environment();
+            engine.set_tier(tier);
+            eval(
+                &mut engine,
+                include_str!("fixtures/worker_indexed_db.mjs"),
+                "cross-agent IndexedDB",
+            )
+            .unwrap();
+            let log = pump_page_with_workers(
+                &runtime,
+                &mut engine,
+                &mut task_rx,
+                "idbDone",
+                "idbLog.join('|')",
+                Duration::from_secs(30),
+            );
+            assert_eq!(
+                log,
+                "page-versionchange:1>2|page-stubborn-versionchange:1>2|worker-blocked:1>2|\
+                 worker-upgraded:2:items+worker:v1|page-reopened:2:items+worker|page-complete|\
+                 worker-counter-matches:true|counts:22:21|worker-versionchange:2>null|deleted:2:null|\
+                 worker-holding:1|page-blocked:1>2|page-upgrade:1>2|page-final:2",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_storage_is_shared_by_window_and_worker_agents() {
+        // Service Workers §5 (local w3c/ServiceWorker@92aba3b): Cache and
+        // CacheStorage are [SecureContext, Exposed=(Window,Worker)] over the
+        // origin's one name to cache map; concurrent Batch Cache Operations
+        // from two agents keep every entry (#batch-cache-operations-algorithm).
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        eval(
+            &mut engine,
+            include_str!("fixtures/worker_cache_storage.mjs"),
+            "cross-agent Cache Storage",
+        )
+        .unwrap();
+        let log = pump_page_with_workers(
+            &runtime,
+            &mut engine,
+            &mut task_rx,
+            "cacheDone",
+            "cacheLog.join('|')",
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            log,
+            "worker-read:page-body:true:[object CacheStorage]+[object Cache]|keys:42|\
+             page-read:worker-body|names:shared|worker-deleted:true|has-after:false|retained:42"
+        );
     }
 
     fn worker_test_environment() -> (
@@ -37779,9 +38178,10 @@ mod tests {
             let (events, _) = tokio::sync::mpsc::unbounded_channel();
             state.worker_self = Some(LumenWorkerSelf {
                 id: 1,
-                events,
+                events: LumenTaskSender::Page(events),
                 closed: false,
                 origin: script.clone(),
+                secure_context: true,
             });
             state.enable_websockets(
                 page.clone(),
@@ -41148,9 +41548,10 @@ mod tests {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         state.worker_self = Some(LumenWorkerSelf {
             id: 1,
-            events,
+            events: LumenTaskSender::Page(events),
             closed: false,
             origin: url::Url::parse(DEFAULT_URL).unwrap(),
+            secure_context: secure,
         });
         let origin = clock.origin_ms;
         let mut engine = lumen::Engine::new();
@@ -43027,9 +43428,16 @@ mod tests {
         }
         run_microtask_checkpoint(&mut engine);
 
+        // `blocked` is queued once every versionchange event was fired while
+        // the close-pending connection still has `hold` live; it precedes the
+        // upgrade, which waits for `hold` to complete and the connection to
+        // close. The standard leaves the relative order of `hold`'s complete
+        // event and `blocked` open (both are database tasks queued from
+        // parallel steps); one database task FIFO per realm runs `hold`'s
+        // already queued commit first.
         assert_eq!(
             string_value(&mut engine, "indexedDbConnectionQueueResult"),
-            "first-success:1|versionchange:1:2:true|blocked:1:2:true|hold-complete|upgrade:1:2|second-success:2|delete:2:null:true"
+            "first-success:1|versionchange:1:2:true|hold-complete|blocked:1:2:true|upgrade:1:2|second-success:2|delete:2:null:true"
         );
         assert_eq!(string_value(&mut engine, "__trust.takeErrors()"), "");
     }

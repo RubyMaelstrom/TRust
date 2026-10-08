@@ -19,6 +19,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Tasks queued by the shared platform features (permissions, storage,
     // notifications): one FIFO selected by the worker event loop.
     const platformTasks = [];
+    let indexedDBTasks = null, databaseTurn = false;
     var cfg = g.__worker_cfg || { id: 0, name: "", type: "classic", url: "about:blank", language: "en-US", languages: ["en-US", "en"], hwc: 8 };
     function errStr(where, e) {
         try { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
@@ -85,9 +86,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }));
         },
         installPorts: function (api) { portAPI = api; },
-        hasPlatformTask: function () { return platformTasks.length > 0; },
+        // The shared platform features' FIFO and, alternating with it, the
+        // database tasks the host's Indexed Database coordinator queued here.
+        hasPlatformTask: function () {
+            return platformTasks.length > 0 || (indexedDBTasks !== null && indexedDBTasks.has());
+        },
         runPlatformTask: function () {
-            if (!platformTasks.length) return false;
+            databaseTurn = !databaseTurn;
+            if (databaseTurn && indexedDBTasks !== null && indexedDBTasks.has()) {
+                try { indexedDBTasks.run(); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
+                return true;
+            }
+            if (!platformTasks.length) {
+                if (indexedDBTasks === null || !indexedDBTasks.has()) return false;
+                try { indexedDBTasks.run(); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
+                return true;
+            }
             try { platformTasks.shift()(); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
             return true;
         },
@@ -211,31 +225,62 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     };
     // The platform's listener operations, captured before author code runs.
     const scopeAddListener = g.addEventListener, scopeRemoveListener = g.removeEventListener;
+    // DOM #concept-event-dispatch with EventTarget's "get the parent": worker
+    // targets have no parent, except that Indexed Database defines request ->
+    // transaction -> connection (IndexedDB 3 §2.7.1 and §2.8). Kept internal so
+    // author properties cannot rewrite an event path.
+    const scopeEventParents = new WeakMap();
+    // DOM's legacy listener-exception output, used only by Indexed Database.
+    const listenerExceptionEvents = new WeakSet();
+    // #concept-event-listener-invoke for one path entry and phase: 0 runs
+    // capture listeners, 1 the others (at target both, in that order).
+    function invokeScopeListeners(state, ev, current, capture) {
+        // Clone separately for each invocation, as DOM requires. A listener
+        // added during capture may run during the next phase.
+        var snap = lsFor(state.type, current).slice();
+        for (var i = 0; i < snap.length; i++) {
+            var entry = snap[i];
+            if (entry.removed || entry.capture !== capture) continue;
+            if (entry.once) removeListener.call(current, state.type, entry.fn, {capture:entry.capture});
+            state.passive = entry.passive;
+            try { (typeof entry.fn === "function") ? entry.fn.call(current, ev) : entry.fn.handleEvent(ev); }
+            // DOM #concept-event-listener-inner-invoke reports the exception.
+            catch (e) { listenerExceptionEvents.add(ev); reportException(e, state.type + " handler"); }
+            finally { state.passive = false; }
+            if (state.immediate) break;
+        }
+    }
     function dispatchScopeEvent(ev, preserveTrusted, target) {
         target = target || g;
-        var state = scopeEventState(ev), l = lsFor(state.type, target);
+        var state = scopeEventState(ev);
+        lsFor(state.type, target);
         if (state.dispatching) throw new g.DOMException('Event is already being dispatched','InvalidStateError');
         if (!preserveTrusted) state.isTrusted = false;
-        state.dispatching = true; state.target = target; state.currentTarget = target; state.eventPhase = 2;
+        listenerExceptionEvents.delete(ev);
+        var path = [target], parent = scopeEventParents.get(target);
+        while (parent) { path.push(parent); parent = scopeEventParents.get(parent); }
+        state.dispatching = true; state.target = target; state.path = path;
         try {
-            for (var phase = 0; phase < 2 && !state.stopped; phase++) {
-                // Clone separately for each invocation, as DOM requires. A
-                // listener added during capture may run during the next phase.
-                var snap = l.slice();
-                for (var i = 0; i < snap.length; i++) {
-                    var entry = snap[i];
-                    if (entry.removed || entry.capture !== (phase === 0)) continue;
-                    if (entry.once) removeListener.call(target, state.type, entry.fn, {capture:entry.capture});
-                    state.passive = entry.passive;
-                    try { (typeof entry.fn === "function") ? entry.fn.call(target, ev) : entry.fn.handleEvent(ev); }
-                    // DOM #concept-event-listener-inner-invoke reports the exception.
-                    catch (e) { reportException(e, state.type + " handler"); }
-                    finally { state.passive = false; }
-                    if (state.immediate) break;
+            // Capturing: from the root down to the target's parent.
+            state.eventPhase = 1;
+            for (var c = path.length - 1; c >= 1 && !state.stopped; c--) {
+                state.currentTarget = path[c];
+                invokeScopeListeners(state, ev, path[c], true);
+            }
+            // At target: capture listeners, then the others.
+            state.eventPhase = 2; state.currentTarget = target;
+            for (var phase = 0; phase < 2 && !state.stopped; phase++)
+                invokeScopeListeners(state, ev, target, phase === 0);
+            // Bubbling: up the path for a bubbling event.
+            if (state.bubbles) {
+                state.eventPhase = 3;
+                for (var b = 1; b < path.length && !state.stopped; b++) {
+                    state.currentTarget = path[b];
+                    invokeScopeListeners(state, ev, path[b], false);
                 }
             }
         } finally {
-            state.currentTarget = null; state.eventPhase = 0;
+            state.currentTarget = null; state.eventPhase = 0; state.path = null;
             state.dispatching = false; state.stopped = false; state.immediate = false;
         }
         return !state.defaultPrevented;
@@ -274,7 +319,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         preventDefault() { const state=scopeEventState(this); if(state.cancelable && !state.passive)state.defaultPrevented=true; },
         stopPropagation() { scopeEventState(this).stopped=true; },
         stopImmediatePropagation() { const state=scopeEventState(this); state.stopped=true;state.immediate=true; },
-        composedPath() { const state=scopeEventState(this); return state.dispatching ? [state.target] : []; },
+        composedPath() { const state=scopeEventState(this); return state.dispatching && state.path ? state.path.slice() : []; },
         initEvent(type, bubbles=false, cancelable=false) {
             const state=scopeEventState(this);
             if(!arguments.length)throw new TypeError('Missing event type');
@@ -368,7 +413,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // forwards the record); a shared worker keeps it (#run-a-worker).
     var errorReportingMode = false;
     function reportException(exception, label) {
-        var info = htmlEventsAPI.errorInformation(exception);
+        reportErrorInformation(htmlEventsAPI.errorInformation(exception), label, exception);
+    }
+    // #report-an-exception from its extracted information. A nested worker's
+    // unhandled report arrives with omitError set: info.error is null.
+    function reportErrorInformation(info, label, exception) {
         var notHandled = true;
         if (!errorReportingMode) {
             errorReportingMode = true;
@@ -400,6 +449,42 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // DOMException is the shared Web IDL interface (worker_prelude() runs its block first).
 
     const addListener = g.addEventListener, removeListener = g.removeEventListener;
+    // HTML #event-handler-idl-attributes on platform objects of this worker
+    // (Worker, IndexedDB requests, transactions and connections): an
+    // activated handler appends one listener that keeps its place, and a
+    // false return value cancels the event (#the-event-handler-processing-algorithm).
+    const targetHandlerSlots = new WeakMap();
+    function installTargetHandlers(proto, types) {
+        types.forEach(function (type) {
+            var name = "on" + type;
+            var accessors = {
+                get [name]() {
+                    var handlers = targetHandlerSlots.get(this), handler = handlers && handlers.get(type);
+                    return handler ? handler.value : null;
+                },
+                set [name](value) {
+                    if (!targetListeners.get(this)) throw new TypeError("Illegal EventTarget invocation");
+                    var handlers = targetHandlerSlots.get(this);
+                    if (!handlers) { handlers = new Map(); targetHandlerSlots.set(this, handlers); }
+                    value = (typeof value === "object" && value !== null) || typeof value === "function" ? value : null;
+                    var handler = handlers.get(type), target = this;
+                    if (value === null) {
+                        if (handler) { removeListener.call(target, type, handler.listener); handlers.delete(type); }
+                    } else if (handler) handler.value = value;
+                    else {
+                        handler = { value: value, listener: function (event) {
+                            var callback = handler.value;
+                            if (typeof callback === "function" && callback.call(target, event) === false) event.preventDefault();
+                        } };
+                        handlers.set(type, handler);
+                        addListener.call(target, type, handler.listener);
+                    }
+                }
+            };
+            var descriptor = Object.getOwnPropertyDescriptor(accessors, name);
+            Object.defineProperty(proto, name, { get: descriptor.get, set: descriptor.set, enumerable: true, configurable: true });
+        });
+    }
     g.EventTarget = class EventTarget {
         constructor() { targetListeners.set(this,new Map()); }
         addEventListener(type, callback, options) { addListener.call(this, type, callback, options); }
@@ -440,6 +525,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // #eligible-for-messaging: a WorkerGlobalScope whose closing flag is false.
         eligible() { return !workerClosing; },
         deliver(target, type, init) { dispatchScopeEvent(trustedScopeEvent(MessageEvent, type, init), true, target); }
+    };
+
+    // The shared Worker block's view of this worker (HTML: Worker is
+    // [Exposed=(Window,DedicatedWorker,SharedWorker)]): nested dedicated
+    // workers are owned by this global; their events are tasks of this loop.
+    g.__worker_adapter = {
+        control: WK, EventTarget: g.EventTarget, Event, MessageEvent, ErrorEvent,
+        fire(target, C, type, init) { return dispatchScopeEvent(trustedScopeEvent(C, type, init), true, target); },
+        handlers(proto, types) { installTargetHandlers(proto, types); },
+        parseURL(url) { var parsed = __url_parse(url, lp[0]); return parsed ? parsed[0] : null; },
+        blobSource(href) { var entry = __resolveBlobURL(href); return entry ? entry.bytes : null; },
+        serialize(message, transfer) { return portAPI.serialize(message, transfer); },
+        deserialize(packet) { return portAPI.deserialize(packet); },
+        optionsTransfer(options) { return portAPI.optionsTransfer(options); },
+        // #report-an-exception for this global with omitError set.
+        reportUnhandled(info) {
+            reportErrorInformation({message: info.message, filename: info.filename, lineno: info.lineno,
+                colno: info.colno, error: null});
+        },
+        failed(message) { if (WK.consoleLines.length < 100) WK.consoleLines.push("worker: " + message); },
+        console(line) { if (WK.consoleLines.length < 100) WK.consoleLines.push("worker: " + line); },
     };
 
     // --- self / postMessage / close / on* (DedicatedWorkerGlobalScope) ---
@@ -580,6 +686,27 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     Object.defineProperty(WorkerLocation.prototype, Symbol.toStringTag, {value: "WorkerLocation", configurable: true});
     Object.defineProperty(g, "WorkerLocation", {value: WorkerLocation, writable: true, configurable: true});
     Object.defineProperty(g, "location", {get: {location() { return workerLocation; }}.location, enumerable: true, configurable: true});
+    // The shared Indexed Database and Cache Storage blocks' view of this
+    // worker: its storage key (the origin, opaque for a data: URL), its events
+    // with IndexedDB's event parents and its storage codec; its database
+    // tasks alternate with the platform task queue. The databases and caches are the origin's, shared with Windows.
+    g.__indexeddb_adapter = {
+        origin: lp[8] || "null", EventTarget: g.EventTarget, Event,
+        setParent(target, parent) { scopeEventParents.set(target, parent); },
+        fire(target, C, type, init) {
+            var event = trustedScopeEvent(C, type, init);
+            dispatchScopeEvent(event, true, target);
+            return event;
+        },
+        listenerThrew(event) { return listenerExceptionEvents.has(event); },
+        handlers(proto, types) { installTargetHandlers(proto, types); },
+        frame() { return null; },
+        runIn(frame, fn) { fn(); },
+        serialize(value) { return WK.messageCodec.serialize(value, true); },
+        deserialize(wire) { return WK.messageCodec.deserialize(wire); },
+        register(api) { indexedDBTasks = api; },
+    };
+    g.__cache_storage_adapter = { origin: lp[8] || "null", secure: !!cfg.secureContext };
     // Secure Contexts §1.3: a dedicated worker inherits the owner's secure
     // context when its script URL is potentially trustworthy. Rust computes
     // that relationship, including Blob URL inheritance, at construction.

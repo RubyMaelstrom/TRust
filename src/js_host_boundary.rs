@@ -175,6 +175,8 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__clock_set", 1),
     ("__storage_allowed", 1),
     ("__storage_get", 2),
+    ("__storage_cas", 4),
+    ("__indexed_db", 2),
     ("__storage_set", 3),
     ("__storage_remove", 2),
     ("__storage_clear", 1),

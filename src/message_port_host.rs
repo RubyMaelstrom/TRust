@@ -21,7 +21,7 @@ pub(super) enum Wake {
 }
 
 impl Wake {
-    fn notify(&self) {
+    pub(super) fn notify(&self) {
         match self {
             Self::None => {}
             Self::Page(sender) => {
@@ -327,6 +327,25 @@ impl Registry {
                         let peer = port.peer.take();
                         if let Some(peer) = peer.and_then(|peer| self.ports.get_mut(&peer)) {
                             peer.peer = None;
+                        }
+                        Ok(json!(true))
+                    }
+                    // Streams #transferrable-streams: a cross-realm transform
+                    // disentangles its internal port once it is done. No author
+                    // object can reach that port again, so its endpoint and any
+                    // messages still queued for it are released at once instead
+                    // of when the agent ends.
+                    "dispose" => {
+                        if let Some(port) = self.ports.remove(&id) {
+                            self.queued_bytes -= port
+                                .messages
+                                .iter()
+                                .map(|(_, message)| message.len())
+                                .sum::<usize>();
+                            if let Some(peer) = port.peer.and_then(|peer| self.ports.get_mut(&peer))
+                            {
+                                peer.peer = None;
+                            }
                         }
                         Ok(json!(true))
                     }

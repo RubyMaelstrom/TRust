@@ -347,6 +347,30 @@ current behavior and limits; consult the governing standards before changing it.
   event task source (the worker's platform task queue); an event stream's
   unfinished line plus data buffer is capped at 8 Mi code units, beyond
   which the connection fails. data: and same-origin blob: URLs work.
+- `Worker` is the shared `/*__DEDICATED_WORKER_BEGIN__*/` block, exposed in
+  Windows and in dedicated and shared worker globals (`SharedWorker` stays
+  Window-only, as HTML exposes it). A nested worker's tasks reach its owning
+  worker's inbox, it inherits that worker's origin and secure context, and it
+  ends when its owner ends (the owner's handles drop). Worker blob: URL stores
+  are per realm, so a nested worker or `importScripts()` needs a blob: URL
+  created in its own realm.
+- IndexedDB and Cache Storage are shared blocks (`/*__INDEXEDDB_BEGIN__*/`,
+  `/*__CACHE_STORAGE_BEGIN__*/`) in Windows and workers over the storage shed's
+  per-origin bottles, so every agent of an origin sees the same databases and
+  caches. Commits use `__storage_cas` compare-and-set retries (a read/write
+  transaction replaces only its scope's object stores). `indexed_db_host.rs` is
+  the shed's coordinator for connection queues, connections, the
+  versionchange/blocked handshake and cross-agent transaction scheduling; it
+  queues database tasks into each realm's inbox (woken like port messages) and
+  releases a realm's or agent's connections, transactions and requests when it
+  ends. Each realm runs its database tasks in one FIFO. Microtasks do not run
+  between IDB event listeners, so a promise continuation after an IDB request
+  finds its transaction inactive.
+- ReadableStream, WritableStream and TransformStream are transferable through
+  `postMessage`, MessagePorts and `structuredClone` (Streams
+  #transferrable-streams): the PORTS block runs the transfer and
+  transfer-receiving steps over an internal entangled port whose endpoint is
+  disposed when the cross-realm transform disentangles it.
 - `--renderer=auto` selects Hybrid only after surface, adapter, device, and
   capability initialization succeed; recoverable later failures fall back to
   Vello CPU. `--renderer=cpu` forces the reference renderer, while

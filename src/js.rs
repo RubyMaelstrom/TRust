@@ -971,6 +971,11 @@ pub(crate) fn worker_prelude() -> &'static str {
             let xhr = platform_block("/*__XHR_BEGIN__*/", "/*__XHR_END__*/");
             let websocket = platform_block("/*__WEBSOCKET_BEGIN__*/", "/*__WEBSOCKET_END__*/");
             let eventsource = platform_block("/*__EVENTSOURCE_BEGIN__*/", "/*__EVENTSOURCE_END__*/");
+            let dedicated_worker =
+                platform_block("/*__DEDICATED_WORKER_BEGIN__*/", "/*__DEDICATED_WORKER_END__*/");
+            let cache_storage =
+                platform_block("/*__CACHE_STORAGE_BEGIN__*/", "/*__CACHE_STORAGE_END__*/");
+            let indexed_db = platform_block("/*__INDEXEDDB_BEGIN__*/", "/*__INDEXEDDB_END__*/");
             let rejection = platform_block("/*__REJECTION_BEGIN__*/", "/*__REJECTION_END__*/");
             let wasm = platform_block("/*__WASM_BEGIN__*/", "/*__WASM_END__*/");
             let urlpattern = platform_block("/*__URLPATTERN_BEGIN__*/", "/*__URLPATTERN_END__*/");
@@ -1002,8 +1007,9 @@ pub(crate) fn worker_prelude() -> &'static str {
                     1,
                 );
             format!(
-                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{fetch}\n{xhr}\n{websocket}\n{eventsource}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
+                 __port_api.setStreams(__streams_api);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\
                  delete globalThis.__bitmap_api; delete globalThis.__sc_bitmap_codec;\n\
                  __sc_crypto_codec(__crypto_key_api);\n\
