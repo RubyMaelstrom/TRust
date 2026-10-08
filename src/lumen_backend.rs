@@ -22569,6 +22569,68 @@ mod tests {
         );
     }
 
+    /// HTML #concept-upgrade-an-element enqueues the element's
+    /// attributeChangedCallback reactions (attribute-list order, values and
+    /// namespaces from before construction) and its connectedCallback (when
+    /// connected before construction) ahead of the constructor. While the
+    /// constructor runs the element is not yet custom, so what it does to the
+    /// element enqueues nothing, and a constructor that throws leaves the
+    /// element failed without reactions.
+    #[test]
+    fn upgrade_reactions_come_from_the_element_before_construction() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const log = [];
+            const a = document.createElement('x-a');
+            a.setAttribute('class', 'c'); a.setAttribute('id', 'i');
+            body.appendChild(a);
+            customElements.define('x-a', class extends HTMLElement {
+                static get observedAttributes() { return ['id', 'class', 'title']; }
+                constructor() {
+                    super();
+                    this.title = 't'; this.setAttribute('id', 'changed');
+                    log.push('ctor:' + this.getAttribute('id'));
+                    this.remove();
+                }
+                attributeChangedCallback(n, o, v, ns) { log.push(n + '=' + v + ':' + o + ':' + ns); }
+                connectedCallback() { log.push('connected:' + this.isConnected); }
+                disconnectedCallback() { log.push('disconnected'); }
+            });
+            body.appendChild(a);
+            log.push('|');
+            const b = document.createElement('x-b');
+            customElements.define('x-b', class extends HTMLElement {
+                constructor() { super(); body.appendChild(this); log.push('ctor-b'); }
+                connectedCallback() { log.push('connected-b'); }
+                disconnectedCallback() { log.push('disconnected-b'); }
+            });
+            customElements.upgrade(b);
+            log.push('|');
+            b.remove();
+            log.push('|');
+            const c = document.createElement('x-c');
+            c.id = 'x'; body.appendChild(c);
+            customElements.define('x-c', class extends HTMLElement {
+                static get observedAttributes() { return ['id']; }
+                constructor() { super(); log.push('ctor-c'); throw new Error('failed'); }
+                attributeChangedCallback() { log.push('attr-c'); }
+                connectedCallback() { log.push('connected-c'); }
+                disconnectedCallback() { log.push('disconnected-c'); }
+            });
+            c.id = 'y'; c.remove(); body.appendChild(c); customElements.upgrade(c);
+            return log.join(',');
+        })()"#
+            ),
+            "ctor:changed,class=c:null:null,id=i:null:null,connected:false,connected:true,|,\
+             ctor-b,|,disconnected-b,|,ctor-c"
+        );
+    }
+
     /// HTML runs a script element's post-connection steps when an insertion
     /// connects it, whether it is the inserted node or a descendant (shadow
     /// trees included), in tree order. "Already started" scripts never run:
