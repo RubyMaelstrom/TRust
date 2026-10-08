@@ -22365,6 +22365,110 @@ mod tests {
         );
     }
 
+    /// DOM #concept-node-insert enqueues custom element reactions while it
+    /// inserts a fragment's children and queues one mutation record for them;
+    /// HTML #cereactions runs the reactions when the method returns. So every
+    /// fragment node is in place when connectedCallback runs, and mutations
+    /// the callback makes are observed as their own records (Polymer's
+    /// dom-repeat and dom-if stamp from such callbacks; YouTube's guide).
+    #[test]
+    fn fragment_insertion_runs_custom_element_reactions_after_its_record() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                globalThis.ceLog = [];
+                const log = ceLog;
+                customElements.define('x-stamp', class extends HTMLElement {
+                    connectedCallback() {
+                        log.push('connected:next=' + (this.nextSibling ? this.nextSibling.localName : '-'));
+                        this.appendChild(document.createElement('span'));
+                    }
+                    disconnectedCallback() {
+                        log.push('disconnected:parent=' + (this.parentNode ? 'yes' : 'no'));
+                        target.setAttribute('data-gone', '1');
+                    }
+                });
+                const target = document.createElement('div'); body.appendChild(target);
+                new MutationObserver(records => {
+                    for (const r of records) log.push('mo:' + r.type + ':' + r.target.localName + ':'
+                        + (r.type === 'childList' ? r.addedNodes.length + '/' + r.removedNodes.length : r.attributeName));
+                }).observe(target, { childList: true, subtree: true, attributes: true });
+                globalThis.ceSteps = [
+                    () => { const f = document.createDocumentFragment();
+                        f.append(document.createElement('x-stamp'), document.createElement('i'));
+                        target.appendChild(f); log.push('returned'); },
+                    () => { const f = document.createDocumentFragment();
+                        f.append(document.createElement('x-stamp'), document.createElement('b'));
+                        target.insertBefore(f, target.firstChild); },
+                    () => { target.replaceChildren(document.createElement('u')); },
+                ];
+            "#,
+            "custom element fragment setup",
+        )
+        .unwrap();
+        for step in 0..3 {
+            eval(
+                &mut engine,
+                &format!("ceSteps[{step}](); ceLog.push('|');"),
+                "step",
+            )
+            .unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "ceLog.join(',')"),
+            "connected:next=i,returned,|,mo:childList:div:2/0,mo:childList:x-stamp:1/0,\
+             connected:next=b,|,mo:childList:div:2/0,mo:childList:x-stamp:1/0,\
+             disconnected:parent=no,disconnected:parent=no,|,mo:childList:div:1/4,\
+             mo:attributes:div:data-gone,mo:attributes:div:data-gone"
+        );
+    }
+
+    /// A fragment insertion skips only its own per-node records (DOM
+    /// #concept-node-insert suppressObservers), never records that author code
+    /// queues while it runs: an about:blank iframe's load event fires during
+    /// the iframe's post-connection steps, and Polymer's and YouTube's
+    /// microtask schedulers change an observed Text node there. Dropping that
+    /// characterData record stalled their queues (YouTube's guide stopped
+    /// after two sections).
+    #[test]
+    fn records_queued_during_a_fragment_insertion_are_delivered() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                globalThis.frameLog = [];
+                const tick = document.createTextNode('0'); body.appendChild(tick);
+                new MutationObserver(records => frameLog.push('characterData:' + records.length))
+                    .observe(tick, { characterData: true });
+                const target = document.createElement('div'); body.appendChild(target);
+                new MutationObserver(records => frameLog.push('childList:' + records.map(r => r.addedNodes.length).join('+')))
+                    .observe(target, { childList: true });
+                const frame = document.createElement('iframe');
+                frame.onload = () => {
+                    frameLog.push('load:siblings=' + target.childNodes.length);
+                    tick.data = String(Number(tick.data) + 1);
+                };
+                const fragment = document.createDocumentFragment();
+                fragment.append(frame, document.createElement('b'));
+                target.appendChild(fragment);
+                frameLog.push('returned');
+            "#,
+            "fragment iframe setup",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "frameLog.join(',')"),
+            "load:siblings=2,returned,childList:2,characterData:1"
+        );
+    }
+
     /// HTML's iframe insertion and removing steps run whenever a navigable
     /// container is in the inserted or removed subtree, at any depth and on
     /// every path; the frame-free fast path never skips them.

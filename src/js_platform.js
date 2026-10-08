@@ -1475,17 +1475,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // DOM #concept-node-insert runs post-connection steps (preparing scripts)
     // only after every node of a DocumentFragment is inserted, so a script
     // that mutates the tree cannot interrupt that insertion.
-    let deferredScriptRuns = null;
+    // Custom element reactions enqueued meanwhile (connectedCallback and
+    // upgrades from DOM #concept-node-insert step 7.7, disconnectedCallback
+    // from #concept-node-remove) run after the operation queued its mutation
+    // record and ran those post-connection steps, as HTML #cereactions pops
+    // the element queue when the method returns, so every node is in place
+    // and their mutations are recorded after the operation's own record.
+    let deferredScriptRuns = null, deferredCeReactions = null;
     function deferScriptRuns() {
         if (deferredScriptRuns !== null) return false;
         deferredScriptRuns = [];
+        deferredCeReactions = [];
         return true;
     }
     function takeDeferredScriptRuns(owner) {
-        if (!owner) return [];
-        const nodes = deferredScriptRuns;
-        deferredScriptRuns = null;
-        return nodes;
+        if (!owner) return null;
+        const taken = { scripts: deferredScriptRuns, reactions: deferredCeReactions };
+        deferredScriptRuns = deferredCeReactions = null;
+        return taken;
+    }
+    function finishDeferredInsertion(taken) {
+        if (!taken) return;
+        // Post-connection steps in insertion order: scripts, and iframes.
+        for (const step of taken.scripts) {
+            if (typeof step === "function") step();
+            else maybeRunScript(step);
+        }
+        for (const reaction of taken.reactions) reaction();
     }
     function maybeRunScript(node) {
         if (deferredScriptRuns !== null) {
@@ -5854,7 +5870,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // runs: only internal bookkeeping precedes the last of them.
     const INSERT_RANGES = 1, INSERT_LISTENERS = 2, INSERT_SLOTS = 4,
         INSERT_SCRIPT = 8, INSERT_LINK = 16, INSERT_BASE = 32;
-    function insertedNodeSteps(parent, node, oldParent, oldIndex) {
+    function insertedNodeSteps(parent, node, oldParent, oldIndex, silent = false) {
         const id = nodeIds.get(node);
         const effects = __dom_insertion_effects(id, nodeIds.get(parent));
         if (effects & INSERT_RANGES) {
@@ -5863,13 +5879,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         if (effects & INSERT_LISTENERS) syncWrapperSubtreeRetention(id);
         if (effects & INSERT_SLOTS) slotQueueCheck(parent);
-        moChildInsert(parent, node);
-        if (CE.defs.size) ceScan(node);
+        if (!silent) moChildInsert(parent, node);
+        if (CE.defs.size) {
+            if (deferredCeReactions !== null) deferredCeReactions.push(() => ceScan(node));
+            else ceScan(node);
+        }
         // HTML's script, link and base insertion steps.
         if (deferredScriptRuns !== null || (effects & INSERT_SCRIPT)) maybeRunScript(node);
         if (effects & INSERT_LINK) maybeLoadStylesheet(node);
         if (effects & INSERT_BASE) baseHrefCache = null;
-        maybeProcessInsertedFrames(node, parent);
+        // HTML's iframe post-connection steps can run author code (an
+        // about:blank load event); they follow the operation's record too.
+        if (deferredScriptRuns !== null) deferredScriptRuns.push(() => maybeProcessInsertedFrames(node, parent));
+        else maybeProcessInsertedFrames(node, parent);
+    }
+    // DOM #concept-node-insert for one validated non-fragment node, before
+    // `ref` (null appends). `silent` is the algorithm's suppressObservers
+    // flag: a DocumentFragment or replace-all operation queues one record for
+    // all its nodes itself, so this node's own removal and insertion records
+    // are skipped. Records anything else queues meanwhile are kept.
+    function insertOneNode(parent, node, ref, silent) {
+        const oldParent = rangeParent(node), oldIndex = oldParent ? adoptedRangeIndex(node) : 0;
+        if (oldParent && MO.length) moAdoptRemove(parent, node, ref, oldParent, silent);
+        preInsertResult(ref === null
+            ? __dom_append(nodeIds.get(parent), nodeIds.get(node))
+            : __dom_insert_before(nodeIds.get(parent), nodeIds.get(node), nodeIds.get(ref), 0), false);
+        insertedNodeSteps(parent, node, oldParent, oldIndex, silent);
     }
     // The index a node had before being adopted into a new parent, needed
     // only to adjust live Ranges (DOM #concept-node-remove steps 4–7). Without
@@ -5883,11 +5918,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // navigable container in the subtree, whose destruction can run author
     // code, each later step asks again as before.
     const REMOVE_FRAMES = 1, REMOVE_LISTENERS = 2, REMOVE_SLOTS = 4;
-    function removeChildSteps(parent, c) {
+    function removeChildSteps(parent, c, silent = false) {
         rangesRemove(c, parent, c);
         if (internalsOf(c).trustLN === "base") baseHrefCache = null;
-        moChildRemove(parent, c);
-        if (CE.defs.size) ceDisconnect(c);
+        // DOM #concept-node-remove: suppressObservers skips only the record;
+        // subtree observers still gain transient registrations.
+        if (!silent) moChildRemove(parent, c);
+        else if (MO.length) moRetainTransient(parent, c);
+        if (CE.defs.size) {
+            if (deferredCeReactions !== null) deferredCeReactions.push(() => ceDisconnect(c));
+            else ceDisconnect(c);
+        }
         const id = nodeIds.get(c);
         __dom_detach(id);
         const effects = __dom_removal_effects(id, nodeIds.get(parent));
@@ -6077,20 +6118,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const nodes = Array.from(c.childNodes);
                 if (!nodes.length) return c;
                 const previous = this.lastChild, owner = deferScriptRuns();
-                let scripts;
-                moSuppressed++;
-                try { for (const k of nodes) this.appendChild(k); }
-                finally { moSuppressed--; scripts = takeDeferredScriptRuns(owner); }
+                let deferred;
+                try { for (const k of nodes) insertOneNode(this, k, null, true); }
+                finally { deferred = takeDeferredScriptRuns(owner); }
                 moFragmentInsert(this, c, nodes, previous, null);
-                for (const script of scripts) maybeRunScript(script);
+                finishDeferredInsertion(deferred);
                 return c;
             }
             // DOM #concept-node-ensure-pre-insertion-validity: the syscall
             // refuses (unmutated) an insertion that is not valid.
-            const oldParent = rangeParent(c), oldIndex = oldParent ? adoptedRangeIndex(c) : 0;
-            if (oldParent && MO.length) moAdoptRemove(this, c, null, oldParent);
-            preInsertResult(__dom_append(nodeIds.get(this), nodeIds.get(c)), false);
-            insertedNodeSteps(this, c, oldParent, oldIndex);
+            insertOneNode(this, c, null, false);
             return c;
         }
         insertBefore(c, ref) {
@@ -6103,12 +6140,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const nodes = Array.from(c.childNodes);
                 if (!nodes.length) return c;
                 const previous = ref ? ref.previousSibling : this.lastChild, owner = deferScriptRuns();
-                let scripts;
-                moSuppressed++;
-                try { for (const k of nodes) this.insertBefore(k, ref); }
-                finally { moSuppressed--; scripts = takeDeferredScriptRuns(owner); }
+                let deferred;
+                try { for (const k of nodes) insertOneNode(this, k, ref, true); }
+                finally { deferred = takeDeferredScriptRuns(owner); }
                 moFragmentInsert(this, c, nodes, previous, ref);
-                for (const script of scripts) maybeRunScript(script);
+                finishDeferredInsertion(deferred);
                 return c;
             }
             // DOM #concept-node-pre-insert steps 1–3: validate, then insert a
@@ -6117,10 +6153,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), nodeIds.get(ref), 2), false);
                 ref = c.nextSibling;
             }
-            const oldParent = rangeParent(c), oldIndex = oldParent ? adoptedRangeIndex(c) : 0;
-            if (oldParent && MO.length) moAdoptRemove(this, c, ref, oldParent);
-            preInsertResult(__dom_insert_before(nodeIds.get(this), nodeIds.get(c), ref ? nodeIds.get(ref) : null, 0), false);
-            insertedNodeSteps(this, c, oldParent, oldIndex);
+            insertOneNode(this, c, ref, false);
             return c;
         }
         removeChild(c) {
@@ -6236,18 +6269,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (oldParent && !removed.includes(node) && MO.length) moChildRemove(oldParent, node);
             const owner = deferScriptRuns();
             let scripts;
-            moSuppressed++;
             try {
-                for (const child of removed) this.removeChild(child);
-                if (added.length) this.appendChild(node);
-            } finally { moSuppressed--; scripts = takeDeferredScriptRuns(owner); }
+                // #concept-node-replace-all removes and inserts with
+                // suppressObservers set; its own record follows.
+                for (const child of removed) removeChildSteps(this, child, true);
+                for (const child of added) insertOneNode(this, child, null, true);
+            } finally { scripts = takeDeferredScriptRuns(owner); }
             if (MO.length && moHasChildList) {
                 if (fragment && added.length) moNotify({ type: "childList", target: node,
                     removedNodes: added, previousSibling: null, nextSibling: null });
                 if (added.length || removed.length) moNotify({ type: "childList", target: this,
                     addedNodes: added, removedNodes: removed, previousSibling: null, nextSibling: null });
             } else if (added.length || removed.length) moEnqueue();
-            for (const script of scripts) maybeRunScript(script);
+            finishDeferredInsertion(scripts);
         }
         cloneNode(deep) {
             const attr = internalsOf(this).attrNode;
@@ -15064,10 +15098,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // DOM #concept-node-insert adopts the node, which removes it from its old
     // parent with that parent's own mutation record, once the insertion is
     // known to be valid.
-    function moAdoptRemove(parent, node, child, oldParent) {
+    function moAdoptRemove(parent, node, child, oldParent, silent = false) {
         preInsertResult(__dom_insert_before(nodeIds.get(parent), nodeIds.get(node),
             child ? nodeIds.get(child) : null, 2), false);
-        moChildRemove(oldParent, node);
+        if (!silent) moChildRemove(oldParent, node);
+        else moRetainTransient(oldParent, node);
     }
     // A native insertion's validity result (see __dom_insert_before).
     function preInsertResult(result, replacing) {
@@ -18735,7 +18770,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     let moHasChildList = false;
     // DOM's "suppress observers flag": a compound mutation (replacing a child
     // with a DocumentFragment) queues its own records instead of one per step.
-    let moSuppressed = 0;
     let moHasAttributes = false;
     let moHasCharacterData = false;
     let moQueued = false;        // a delivery microtask is already scheduled
@@ -18810,7 +18844,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // "childList" | "attributes" | "characterData"; oldValue is nulled per
     // observer unless one of its matching registrations asked for it (spec).
     function moNotify(rec) {
-        if (moSuppressed) return;
         // DOM #queue-a-mutation-record visits inclusive ancestors, then each
         // node's registrations. Creation order of observers is not delivery
         // order. Snapshot IDs without materializing ancestor wrappers.
@@ -18900,12 +18933,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const nodes = Array.from(fragment.childNodes);
         const previous = old.previousSibling, reference = old.nextSibling, owner = deferScriptRuns();
         let scripts;
-        moSuppressed++;
         try {
-            parent.removeChild(old);
-            for (const node of nodes) parent.insertBefore(node, reference);
+            // #concept-node-replace removes and inserts with suppressObservers
+            // set; its own record follows.
+            removeChildSteps(parent, old, true);
+            for (const node of nodes) insertOneNode(parent, node, reference, true);
         } finally {
-            moSuppressed--;
             scripts = takeDeferredScriptRuns(owner);
         }
         if (MO.length && moHasChildList) {
@@ -18914,7 +18947,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             moNotify({ type: "childList", target: parent, addedNodes: nodes, removedNodes: [old],
                 previousSibling: previous, nextSibling: reference });
         } else moEnqueue();
-        for (const script of scripts) maybeRunScript(script);
+        finishDeferredInsertion(scripts);
         return old;
     }
     function moChildInsert(parent, node) {        // call AFTER the insert
