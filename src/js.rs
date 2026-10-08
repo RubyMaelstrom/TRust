@@ -962,6 +962,9 @@ pub(crate) fn worker_prelude() -> &'static str {
             let codec = platform_block("/*__SC_CODEC_BEGIN__*/", "/*__SC_CODEC_END__*/");
             let features = platform_block("/*__FEATURES_BEGIN__*/", "/*__FEATURES_END__*/");
             let bitmap = platform_block("/*__IMAGE_BITMAP_BEGIN__*/", "/*__IMAGE_BITMAP_END__*/");
+            // HTML OffscreenCanvas, its 2D and bitmaprenderer contexts and
+            // WebGL are [Exposed=(Window,Worker)].
+            let canvas = platform_block("/*__CANVAS_BEGIN__*/", "/*__CANVAS_END__*/");
             let crypto = platform_block("/*__CRYPTO_BEGIN__*/", "/*__CRYPTO_END__*/");
             let domexception = platform_block("/*__DOMEXCEPTION_BEGIN__*/", "/*__DOMEXCEPTION_END__*/");
             let abort = platform_block("/*__ABORT_BEGIN__*/", "/*__ABORT_END__*/");
@@ -1007,11 +1010,13 @@ pub(crate) fn worker_prelude() -> &'static str {
                     1,
                 );
             format!(
-                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
                  __port_api.setStreams(__streams_api);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\
                  delete globalThis.__bitmap_api; delete globalThis.__sc_bitmap_codec;\n\
+                 __port_api.setCanvases(__canvas_api.offscreenCodec); __sc_canvas_codec(__canvas_api.offscreenCodec);\n\
+                 delete globalThis.__canvas_api; delete globalThis.__sc_canvas_codec;\n\
                  __sc_crypto_codec(__crypto_key_api);\n\
                  __html_events_ports(__port_api.state); delete globalThis.__html_events_ports;\n\
                  delete globalThis.__crypto_key_api; delete globalThis.__sc_crypto_codec;\n\
@@ -1019,7 +1024,8 @@ pub(crate) fn worker_prelude() -> &'static str {
                  \x20   control.installPorts(__port_api);\n\
                  \x20   control.messageCodec = {{ serialize: __sc_serialize, deserialize: __sc_deserialize }};\n\
                  }})(Reflect.apply(WeakMap.prototype.get, __platform_slots(\"controls\", new WeakMap()), [globalThis]));\n\
-                 delete globalThis.__port_api;\n{performance}\n{class_strings}"
+                 delete globalThis.__port_api;\n{performance}\n{class_strings}",
+                WEBGL = include_str!("js_webgl.js"),
             )
         })
         .as_str()

@@ -16,7 +16,8 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     const typedLength = descriptor(typedProto,"byteLength").get;
     const typedTag = descriptor(typedProto,Symbol.toStringTag).get;
     const bufferResizable = descriptor(ArrayBuffer.prototype,"resizable").get;
-    const sharedGrowable = descriptor(SharedArrayBuffer.prototype,"growable").get;
+    // A worker that is not cross-origin isolated has no SharedArrayBuffer.
+    const sharedGrowable = typeof SharedArrayBuffer === "function" ? descriptor(SharedArrayBuffer.prototype,"growable").get : null;
     const copyBytes = U8.prototype.set;
     const objectFinalizer = new FinalizationRegistry(record => {
         const owner=record.owner.deref(),s=owner&&slot(owner);
@@ -82,7 +83,7 @@ globalThis.__trust_install_webgl = function(g, adapter) {
     }
     function resizableBuffer(buffer) {
         try {return apply(bufferResizable,buffer,[]);}
-        catch {return apply(sharedGrowable,buffer,[]);}
+        catch {if(!sharedGrowable)throw new TypeError("Expected an ArrayBuffer");return apply(sharedGrowable,buffer,[]);}
     }
     function numericSequence(data,integer) {
         // Web IDL #create-sequence-from-iterable uses the iterator protocol,

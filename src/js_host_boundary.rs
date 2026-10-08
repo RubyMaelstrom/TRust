@@ -36,6 +36,7 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__live_range_snapshot", 0),
     ("__pointer_event_slots", 1),
     ("__canvas_2d", 4),
+    ("__offscreen_canvas", 5),
     ("__webgl", 4),
     ("__dom_create_element", 2),
     ("__dom_create_element_ns", 4),

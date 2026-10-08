@@ -481,6 +481,21 @@ impl Context {
         }
         Reply::Null
     }
+    /// HTML #dom-offscreencanvas-transfertoimagebitmap: the drawing buffer's
+    /// contents went to an ImageBitmap; continue with a cleared buffer,
+    /// whatever preserveDrawingBuffer says.
+    pub fn clear_drawing_buffer(&mut self) {
+        if self.lost || self.driver.make_current().is_err() {
+            return;
+        }
+        unsafe {
+            let g = &self.driver.gl;
+            g.bind_framebuffer(gl::FRAMEBUFFER, Some(self.default_fb));
+            self.clear_default();
+            g.bind_framebuffer(gl::FRAMEBUFFER, Some(self.bound_framebuffer()));
+        }
+    }
+
     pub fn lose(&mut self) {
         if !self.lost {
             self.lost = true;

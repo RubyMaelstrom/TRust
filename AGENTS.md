@@ -418,6 +418,31 @@ current behavior and limits; consult the governing standards before changing it.
   `getContext("webgl")` return `null`. WebGL 2 and multisample antialiasing are
   unimplemented. Estimated buffer/image storage has a shared 256 MiB page budget
   and at most 16 contexts; driver overhead and CPU copies are additional.
+  OffscreenCanvas WebGL contexts work in Windows and workers (EGL bindings are
+  per thread); the budget and context limit are per agent.
+- Canvas elements and `OffscreenCanvas` (Window and every worker) share one 2D
+  implementation (`src/canvas*.rs`, the prelude's `CANVAS` block, which the
+  worker prelude reuses); contexts are "2d", "bitmaprenderer" and "webgl"
+  ("webgl2"/"webgpu" give `null`). An OffscreenCanvas's native bitmap belongs to
+  its agent and is freed with the object; a transfer moves only its data holder
+  (dimensions, inherited language/direction, weak placeholder link) through a
+  bounded single-use key registry. `transferControlToOffscreen()` placeholders
+  present the newest frame from a single-slot mailbox, pushed at the owning
+  agent's rendering update: the page in `extract_live`, a worker after each task
+  and at its `requestAnimationFrame` opportunities (dedicated workers only).
+  Unallocatable 2D backing storage is a lost context: the context lost steps
+  fire `contextlost`/`contextrestored` at the next rendering update.
+- Canvas text honors letterSpacing/wordSpacing (resolved when text is prepared),
+  fontKerning, fontStretch, fontVariantCaps (small capitals synthesized at 0.7em
+  when the font lacks the feature), textRendering (`optimizeSpeed` drops kerning
+  and optional ligatures), lang and the element's HTML directionality. The `font`
+  setter sets its stretch/caps longhands and resets kerning, as the CSS shorthand
+  does. TextMetrics baselines come from the font's BASE table when present.
+- Canvas `filter` evaluates CSS filter functions natively by pulling exactly the
+  region of the infinite source each step reads (blur σ is capped at 256, like
+  shadows' limit). Same-document `url()` SVG filters run through resvg with the
+  canvas as reference box; external documents are never loaded, so they draw
+  unfiltered, and ids containing spaces, quotes or parentheses cannot be named.
 - Capability APIs report only what TRust provides. There is no permission
   prompt: "notifications" and "persistent-storage" start as "prompt"
   (`Notification.permission` "default"), a request records "denied" in the

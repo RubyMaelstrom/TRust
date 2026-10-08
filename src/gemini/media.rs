@@ -165,11 +165,10 @@ fn decode_utf32(bytes: &[u8], big_endian: Option<bool>, loading: bool) -> String
         (None, [0, 0, 0xfe, 0xff, rest @ ..]) => (true, rest),
         (None, _) => (true, bytes),
     };
-    let whole = bytes.len() - bytes.len() % 4;
-    let mut text: String = bytes[..whole]
-        .chunks_exact(4)
-        .map(|unit| {
-            let unit = [unit[0], unit[1], unit[2], unit[3]];
+    let (units, partial) = bytes.as_chunks::<4>();
+    let mut text: String = units
+        .iter()
+        .map(|&unit| {
             let scalar = if big_endian {
                 u32::from_be_bytes(unit)
             } else {
@@ -178,7 +177,7 @@ fn decode_utf32(bytes: &[u8], big_endian: Option<bool>, loading: bool) -> String
             char::from_u32(scalar).unwrap_or('\u{fffd}')
         })
         .collect();
-    if whole < bytes.len() && !loading {
+    if !partial.is_empty() && !loading {
         text.push('\u{fffd}');
     }
     text

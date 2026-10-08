@@ -428,6 +428,8 @@ pub(crate) struct State {
     /// ImageSmoothingQuality: 0 low, 1 medium, 2 high.
     pub smoothing_quality: u8,
     pub clip: Option<Arc<sk::Mask>>,
+    /// HTML #concept-canvas-current-filter; None is "none".
+    pub filter: Option<Arc<crate::canvas_filter::Filter>>,
 }
 
 impl State {
@@ -471,8 +473,25 @@ impl Default for State {
             smoothing: true,
             smoothing_quality: 0,
             clip: None,
+            filter: None,
         }
     }
+}
+
+/// How a canvas element's natural dimensions are determined (HTML
+/// #the-canvas-element, #concept-canvas-context-mode).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Sizing {
+    /// None, 2d, webgl: the width and height content attributes.
+    #[default]
+    Attributes,
+    /// placeholder: the bitmap last committed by its OffscreenCanvas.
+    Placeholder,
+    /// bitmaprenderer, bitmap mode blank: a transparent bitmap that follows
+    /// the content attributes.
+    Blank,
+    /// bitmaprenderer, bitmap mode valid: the transferred ImageBitmap's data.
+    Valid,
 }
 
 pub(crate) struct Canvas {
@@ -481,6 +500,15 @@ pub(crate) struct Canvas {
     pub alpha: bool,
     pub origin_clean: bool,
     pub webgl: bool,
+    pub sizing: Sizing,
+    /// HTML #offscreencanvas-placeholder: the committed-frame mailbox of the
+    /// OffscreenCanvas this element is a placeholder for.
+    pub placeholder: Option<Arc<crate::canvas_offscreen::Placeholder>>,
+    /// The context lost steps have fired `contextlost` for the current loss.
+    pub lost_notified: bool,
+    /// The current filter with its references resolved for the drawing
+    /// operation in progress (HTML #drawing-model step 4); set by the host.
+    pub filter_chain: Option<Vec<crate::canvas_filter::Resolved>>,
     /// Captured at Realm bootstrap, independent of author-controlled <base>.
     pub document_origin: String,
     pub state: State,
@@ -504,6 +532,10 @@ impl Canvas {
             alpha,
             origin_clean: true,
             webgl: false,
+            sizing: Sizing::Attributes,
+            placeholder: None,
+            lost_notified: false,
+            filter_chain: None,
             document_origin: String::new(),
             state: State::default(),
             stack: Vec::new(),
@@ -546,7 +578,55 @@ impl Canvas {
                 bitmap.fill(sk::Color::BLACK);
             }
         }
+        // New backing storage ends an earlier loss.
+        self.lost_notified = false;
         Some(())
+    }
+
+    /// Install `pixels` (premultiplied) as the bitmap: a committed placeholder
+    /// frame or a bitmaprenderer's transferred ImageBitmap. With alpha off the
+    /// bitmap is presented composited onto opaque black.
+    pub(crate) fn adopt(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: Option<sk::Pixmap>,
+        origin_clean: bool,
+    ) {
+        self.width = width;
+        self.height = height;
+        self.bitmap = pixels.filter(|p| p.width() == width && p.height() == height);
+        if self.bitmap.is_none()
+            && width != 0
+            && height != 0
+            && (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(4))
+                .is_some_and(|bytes| bytes <= MAX_BITMAP_BYTES)
+        {
+            self.bitmap = sk::Pixmap::new(width, height);
+        }
+        self.webgl_front = None;
+        self.origin_clean = origin_clean;
+        self.changed();
+    }
+
+    /// HTML #dom-offscreencanvas-transfertoimagebitmap: hand over the bitmap
+    /// and continue with a new one of the same dimensions, transparent black
+    /// or (alpha off) opaque black. The drawing state is unaffected.
+    pub(crate) fn take_bitmap(&mut self) -> Option<(sk::Pixmap, bool)> {
+        let bitmap = self.bitmap.take()?;
+        let clean = self.origin_clean;
+        self.bitmap = sk::Pixmap::new(self.width, self.height);
+        if !self.alpha
+            && let Some(bitmap) = self.bitmap.as_mut()
+        {
+            bitmap.fill(sk::Color::BLACK);
+        }
+        self.origin_clean = true;
+        self.webgl_front = None;
+        self.changed();
+        Some((bitmap, clean))
     }
 
     pub fn lost(&self) -> bool {
@@ -579,14 +659,29 @@ impl Canvas {
             + self.state.clip.as_ref().map_or(0, |m| m.data().len())
             + self.document_origin.capacity()
             + gradient_bytes
+            + self
+                .placeholder
+                .as_ref()
+                .map_or(0, |placeholder| placeholder.pending_bytes())
             + std::iter::once(&self.state)
                 .chain(self.stack.iter())
-                .map(|state| state.text.retained_bytes() + state.shadow.serialized.capacity())
+                .map(|state| {
+                    state.text.retained_bytes()
+                        + state.shadow.serialized.capacity()
+                        + state
+                            .filter
+                            .as_ref()
+                            .map_or(0, |filter| filter.text.capacity())
+                })
                 .sum::<usize>()
     }
 
     pub fn save(&mut self) {
         self.stack.push(self.state.clone());
+    }
+    /// Empty the drawing state stack (resetting the rendering context).
+    pub fn restore_all(&mut self) {
+        self.stack.clear();
     }
     pub fn restore(&mut self) {
         if let Some(state) = self.stack.pop() {
@@ -905,6 +1000,18 @@ impl Canvas {
         let Some(bitmap) = self.bitmap.as_mut() else {
             return;
         };
+        if let Some(chain) = self.filter_chain.as_deref() {
+            let bounds = Self::text_bounds(&self.state, text, n, stroke);
+            if bounds.is_none() {
+                return;
+            }
+            let state = &self.state;
+            crate::canvas_filter::draw(bitmap, state, chain, bounds, &mut |layer, shift| {
+                Self::text_source(layer, state, text, n, stroke, shift);
+            });
+            self.changed();
+            return;
+        }
         crate::canvas_shadow::paint(bitmap, &self.state, |layer, shift| {
             Self::text_source(layer, &self.state, text, n, stroke, shift);
         });
@@ -947,6 +1054,23 @@ impl Canvas {
         (ctm, transform)
     }
 
+    /// The device-space bounds of the text's ink, antialiasing included.
+    fn text_bounds(
+        state: &State,
+        text: &crate::canvas_text::PreparedText,
+        n: &[f64],
+        stroke: bool,
+    ) -> Option<Rect> {
+        let (_, transform) = Self::text_transforms(state, text, n, Affine::IDENTITY);
+        let mut rect = transform.transform_rect_bbox(text.ink_bounds()?);
+        if stroke {
+            let (x, y) = stroke_reach(state);
+            rect = rect.inflate(x, y);
+        }
+        // Antialiased coverage reaches past the geometric edge.
+        Some(rect.inflate(2., 2.))
+    }
+
     /// The canvas pixels the text's ink can cover, as (left, top, width,
     /// height), or None when it covers none.
     fn text_region(
@@ -957,25 +1081,7 @@ impl Canvas {
         width: u32,
         height: u32,
     ) -> Option<(u32, u32, u32, u32)> {
-        let (ctm, transform) = Self::text_transforms(state, text, n, Affine::IDENTITY);
-        let mut rect = transform.transform_rect_bbox(text.ink_bounds()?);
-        if stroke {
-            // The pen is applied under the current transform. Miter joins
-            // reach miterLimit half-widths from the outline; square caps reach
-            // a diagonal half-width.
-            let pen = &state.stroke;
-            let reach = f64::from(pen.width)
-                * 0.5
-                * if matches!(pen.line_join, sk::LineJoin::Miter | sk::LineJoin::MiterClip) {
-                    f64::from(pen.miter_limit).max(std::f64::consts::SQRT_2)
-                } else {
-                    std::f64::consts::SQRT_2
-                };
-            let [a, b, c, d, _, _] = ctm.as_coeffs();
-            rect = rect.inflate(reach * a.hypot(c), reach * b.hypot(d));
-        }
-        // Antialiased coverage reaches past the geometric edge.
-        let rect = rect.inflate(2., 2.);
+        let rect = Self::text_bounds(state, text, n, stroke)?;
         let left = rect.x0.floor().max(0.);
         let top = rect.y0.floor().max(0.);
         let right = rect.x1.ceil().min(f64::from(width));
@@ -1115,6 +1221,7 @@ impl Canvas {
     }
 
     fn paint(&mut self, path: BezPath, stroke: bool, evenodd: bool, clear: bool) {
+        let device_bounds = path.bounding_box();
         let pattern = if clear {
             None
         } else {
@@ -1209,12 +1316,15 @@ impl Canvas {
         let Some(path) = sk_path(&path) else {
             return;
         };
-        if !clear && self.state.shadow.drawn() {
+        if !clear && (self.state.shadow.drawn() || self.filter_chain.is_some()) {
             let mut source_paint = paint.clone();
             source_paint.blend_mode = sk::BlendMode::SourceOver;
-            crate::canvas_shadow::paint(bitmap, &self.state, |layer, shift| {
+            let state = &self.state;
+            // HTML #drawing-model step 1: render the shape onto a layer, A,
+            // mapped through `shift` (a shadow's or filter region's offset).
+            let mut render = |layer: &mut sk::Pixmap, shift: Affine| {
                 let matrix = if stroke {
-                    shift * self.state.transform
+                    shift * state.transform
                 } else {
                     shift
                 };
@@ -1229,7 +1339,7 @@ impl Canvas {
                     layer.stroke_path(
                         &path,
                         &source_paint,
-                        &self.state.stroke,
+                        &state.stroke,
                         sk_transform(matrix),
                         shifted.as_ref(),
                     );
@@ -1242,7 +1352,20 @@ impl Canvas {
                         shifted.as_ref(),
                     );
                 }
-            });
+            };
+            if let Some(chain) = self.filter_chain.as_deref() {
+                let bounds = if stroke {
+                    let (x, y) = stroke_reach(state);
+                    device_bounds.inflate(x, y)
+                } else {
+                    device_bounds
+                }
+                .inflate(1., 1.);
+                crate::canvas_filter::draw(bitmap, state, chain, Some(bounds), &mut render);
+                self.changed();
+                return;
+            }
+            crate::canvas_shadow::paint(bitmap, state, &mut render);
         }
         // Operators that discard the destination outside the source must see a
         // full transparent source bitmap, not just the shape's covered pixels.
@@ -1613,6 +1736,24 @@ impl Canvas {
             blend_mode: blend(&self.state.composite).unwrap_or_default(),
             ..Default::default()
         };
+        if let Some(chain) = self.filter_chain.as_deref() {
+            let mut source_paint = paint.clone();
+            source_paint.blend_mode = sk::BlendMode::SourceOver;
+            let bounds = transform
+                .transform_rect_bbox(Rect::new(x0, y0, x1, y1))
+                .inflate(1., 1.);
+            crate::canvas_filter::draw(
+                bitmap,
+                &self.state,
+                chain,
+                Some(bounds),
+                &mut |layer, shift| {
+                    layer.fill_rect(rect, &source_paint, sk_transform(shift * transform), None);
+                },
+            );
+            self.changed();
+            return;
+        }
         if self.state.shadow.drawn() {
             let mut source_paint = paint.clone();
             source_paint.blend_mode = sk::BlendMode::SourceOver;
@@ -1763,6 +1904,23 @@ pub(crate) fn convert(mut rgb: [f32; 3], source: u8, destination: u8) -> [f32; 3
         });
     }
     rgb
+}
+
+/// How far a stroke reaches past its path in device space, along x and y.
+/// The pen is applied under the current transform. Miter joins reach
+/// miterLimit half-widths from the outline; square caps reach a diagonal
+/// half-width.
+fn stroke_reach(state: &State) -> (f64, f64) {
+    let pen = &state.stroke;
+    let reach = f64::from(pen.width)
+        * 0.5
+        * if matches!(pen.line_join, sk::LineJoin::Miter | sk::LineJoin::MiterClip) {
+            f64::from(pen.miter_limit).max(std::f64::consts::SQRT_2)
+        } else {
+            std::f64::consts::SQRT_2
+        };
+    let [a, b, c, d, _, _] = state.transform.as_coeffs();
+    (reach * a.hypot(c), reach * b.hypot(d))
 }
 
 fn sk_transform(matrix: Affine) -> sk::Transform {
@@ -2035,7 +2193,10 @@ mod tests {
                     .unwrap()
                     .fill(sk::Color::from_rgba8(200, 180, 40, 160));
             }
-            let text = bounded.state.text.prepare(case.text, false, None);
+            let text = bounded
+                .state
+                .text
+                .prepare(case.text, &crate::canvas_text::TextEnvironment::default());
             bounded.draw_text(&text, case.n, case.stroke.is_some());
             draw_text_full_layer(&mut full, &text, case.n, case.stroke.is_some());
             let (bounded, full) = (bounded.bitmap.unwrap(), full.bitmap.unwrap());

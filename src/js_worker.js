@@ -516,7 +516,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         fire(target, type) { dispatchScopeEvent(trustedScopeEvent(Event, type, {}), true, target); },
         report(error) { WK.errors.push(errStr("abort algorithm", error)); },
     };
-    g.__bitmap_adapter = { queue(fn) { bitmapTasks.push(fn); }, source() { return undefined; } };
+    // createImageBitmap() sources of a worker: the canvas block below
+    // recognizes OffscreenCanvas; there are no element sources.
+    let canvasBitmapSource = null;
+    g.__bitmap_adapter = {
+        queue(fn) { bitmapTasks.push(fn); },
+        source(image, snapshot) { return canvasBitmapSource ? canvasBitmapSource(image, snapshot) : undefined; }
+    };
+    // The shared canvas block's view of this worker: OffscreenCanvas events,
+    // its blob serialization tasks and, in a dedicated worker, the
+    // AnimationFrameProvider whose rendering updates the Rust loop drives.
+    g.__canvas_adapter = {
+        EventTarget: g.EventTarget, control: WK, shared: !!cfg.shared,
+        add(target, type, callback) { addListener.call(target, type, callback); },
+        remove(target, type, callback) { removeListener.call(target, type, callback); },
+        fire(target, type, cancelable, C, init) {
+            const event = trustedScopeEvent(C || Event, type, {...init, cancelable: !!cancelable});
+            dispatchScopeEvent(event, true, target);
+            return !event.defaultPrevented;
+        },
+        queue(fn) { bitmapTasks.push(fn); },
+        report(error) { reportException(error); },
+        origin() { return lp[8] || "null"; },
+        now() { return perfFloor(perfClock() * 10) / 10 - perfOrigin; },
+        loopTime() { return currentTime(); },
+        setBitmapSource(fn) { canvasBitmapSource = fn; }
+    };
     g.__port_adapter = {
         slots: new WeakMap(), EventTarget: g.EventTarget,
         add(target, type, callback) { addListener.call(target, type, callback); },

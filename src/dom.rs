@@ -4781,9 +4781,21 @@ impl Dom {
     }
 
     /// HTML canvas natural dimensions, independent of its CSS used dimensions.
+    /// A placeholder (HTML #offscreencanvas-placeholder) shows the bitmap its
+    /// OffscreenCanvas last committed; a bitmaprenderer in bitmap mode valid
+    /// shows its ImageBitmap. Both have that bitmap's dimensions.
     pub(crate) fn canvas_size(&self, id: NodeId) -> Option<(u32, u32)> {
         if self.tag_name(id) != Some("canvas") {
             return None;
+        }
+        if let Ok(canvases) = self.canvases.try_borrow()
+            && let Some(canvas) = canvases.get(&id)
+            && matches!(
+                canvas.sizing,
+                crate::canvas::Sizing::Placeholder | crate::canvas::Sizing::Valid
+            )
+        {
+            return Some((canvas.width, canvas.height));
         }
         let dimension = |name, default| {
             let value = self
@@ -4797,14 +4809,85 @@ impl Dom {
         Some((dimension("width", 300), dimension("height", 150)))
     }
 
+    /// HTML #the-canvas-element: dimension attribute changes act on the
+    /// context mode; a placeholder and a valid bitmaprenderer do nothing.
     fn reset_canvas(&mut self, id: NodeId) {
         if let Some((width, height)) = self.canvas_size(id)
             && let Some(canvas) = self.canvases.get_mut().get_mut(&id)
+            && matches!(
+                canvas.sizing,
+                crate::canvas::Sizing::Attributes | crate::canvas::Sizing::Blank
+            )
         {
             // An allocation failure loses backing storage, never preserves a
             // stale bitmap under new dimensions.
             let _ = canvas.resize(width, height);
         }
+    }
+
+    /// HTML #the-directionality of `id`: true for 'rtl'.
+    pub(crate) fn html_directionality_rtl(&self, id: NodeId) -> bool {
+        self.style_view().direction_rtl(id)
+    }
+
+    /// HTML #dom-context-2d-filter: the SVG markup that defines the `filter`
+    /// element `fragment` names in `context`'s node document, for a canvas
+    /// filter `url()` reference. The element's outermost `svg` ancestor is
+    /// serialized, so the filter's own references (templates, feImage) stay
+    /// resolvable. None when no such element exists, which makes the whole
+    /// filter chain ignored (Filter Effects 1 #FilterProperty), or when its
+    /// id cannot be named in a `url()`.
+    pub(crate) fn canvas_svg_filter(&self, context: NodeId, fragment: &str) -> Option<String> {
+        const SVG: &str = "http://www.w3.org/2000/svg";
+        if fragment.is_empty()
+            || fragment.chars().any(|c| {
+                c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | '\\' | '<' | '&')
+            })
+        {
+            return None;
+        }
+        let document = if matches!(self.nodes[context].data, NodeData::Document) {
+            context
+        } else {
+            self.owner_document(context).unwrap_or(DOCUMENT)
+        };
+        let target = self
+            .descendants(document)
+            .into_iter()
+            .find(|&node| self.attr(node, "id") == Some(fragment))?;
+        if self.tag_name(target) != Some("filter") || self.namespace_uri(target) != Some(SVG) {
+            return None;
+        }
+        let mut root = target;
+        let mut current = self.nodes[target].parent;
+        while let Some(node) = current {
+            if self.namespace_uri(node) != Some(SVG) {
+                break;
+            }
+            if self.tag_name(node) == Some("svg") {
+                root = node;
+            }
+            current = self.nodes[node].parent;
+        }
+        let mut images = SvgImageRefs {
+            page: None,
+            urls: Vec::new(),
+        };
+        let mut svg = self.serialize_svg_for_image_with(root, &mut images);
+        if root == target {
+            svg = format!(r#"<svg xmlns="{SVG}">{svg}</svg>"#);
+        }
+        if !svg.contains("xmlns=") {
+            svg = svg.replacen("<svg", &format!(r#"<svg xmlns="{SVG}""#), 1);
+        }
+        if svg.contains("xlink:") && !svg.contains("xmlns:xlink") {
+            svg = svg.replacen(
+                "<svg",
+                r#"<svg xmlns:xlink="http://www.w3.org/1999/xlink""#,
+                1,
+            );
+        }
+        Some(self.resolve_svg_current_color(root, svg))
     }
 
     pub(crate) fn canvas_changed(&mut self, id: NodeId) {

@@ -918,6 +918,58 @@ struct ShapeKey {
     text: String,
     style: TextStyleKey,
     quantize: bool,
+    typography: Option<TypographyKey>,
+}
+
+/// Typographic settings Canvas text preparation adds to a [`TextStyle`]
+/// (HTML #text-preparation-algorithm: 'font-stretch', 'font-kerning',
+/// 'font-variant-caps' and SVG 'text-rendering' of the hypothetical inline
+/// box). Layout text never uses them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CanvasTypography {
+    /// CSS Fonts 4 #font-stretch-prop as a ratio of the normal width.
+    pub width: f32,
+    /// OpenType features to enable (1) or disable (0).
+    pub features: Vec<([u8; 4], u16)>,
+    /// Byte ranges shaped at another font size: synthesized small capitals
+    /// (CSS Fonts 4 #font-variant-caps-prop).
+    pub sized: Vec<(Range<usize>, f32)>,
+    /// Leading bytes (a directional mark) that take no letter spacing.
+    pub unspaced_prefix: usize,
+}
+
+impl Default for CanvasTypography {
+    fn default() -> Self {
+        Self {
+            width: 1.,
+            features: Vec::new(),
+            sized: Vec::new(),
+            unspaced_prefix: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TypographyKey {
+    width: u32,
+    features: Vec<([u8; 4], u16)>,
+    sized: Vec<(usize, usize, u32)>,
+    unspaced_prefix: usize,
+}
+
+impl From<&CanvasTypography> for TypographyKey {
+    fn from(typography: &CanvasTypography) -> Self {
+        Self {
+            width: typography.width.to_bits(),
+            features: typography.features.clone(),
+            sized: typography
+                .sized
+                .iter()
+                .map(|(range, size)| (range.start, range.end, size.to_bits()))
+                .collect(),
+            unspaced_prefix: typography.unspaced_prefix,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1003,16 +1055,27 @@ impl TextSystem {
         style: &TextStyle,
         quantize: bool,
     ) -> ShapedText {
+        self.shape_with_typography(text, style, quantize, None)
+    }
+
+    fn shape_with_typography(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        quantize: bool,
+        typography: Option<&CanvasTypography>,
+    ) -> ShapedText {
         self.select_fonts(style.font_set.as_ref());
         let key = ShapeKey {
             text: text.to_string(),
             style: style.into(),
             quantize,
+            typography: typography.map(Into::into),
         };
         if let Some(hit) = self.shape_cache.get(&key) {
             return hit.shaped.clone();
         }
-        let shaped = self.shape_uncached(text, style, quantize);
+        let shaped = self.shape_uncached(text, style, quantize, typography);
         let bytes = shape_cost(&key, &shaped);
         if bytes <= MAX_SHAPE_CACHE_BYTES / 4 {
             self.shape_cache_bytes = self.shape_cache_bytes.saturating_add(bytes);
@@ -1038,11 +1101,20 @@ impl TextSystem {
         shaped
     }
 
-    fn shape_uncached(&mut self, text: &str, style: &TextStyle, quantize: bool) -> ShapedText {
+    fn shape_uncached(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        quantize: bool,
+        typography: Option<&CanvasTypography>,
+    ) -> ShapedText {
         if text.is_empty() || style.size <= 0.0 {
             return zero_size_shape(text, style);
         }
-        let mut layout = self.styled_layout(text, style, quantize, None);
+        let mut layout = match typography {
+            Some(typography) => self.typographic_layout(text, style, quantize, typography),
+            None => self.styled_layout(text, style, quantize, None),
+        };
         layout.break_all_lines(None);
         let mut retained = retain_first_line(text, &layout);
         retained.underline = style.underline;
@@ -1066,6 +1138,44 @@ impl TextSystem {
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, quantize);
         configure_layout(&mut builder, style, breaks);
+        push_emoji_presentation(&mut builder, emoji);
+        builder.build(text)
+    }
+
+    fn typographic_layout(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        quantize: bool,
+        typography: &CanvasTypography,
+    ) -> Layout<()> {
+        let emoji = self.emoji_presentation(text, style);
+        let mut builder = self
+            .layouts
+            .ranged_builder(&mut self.fonts, text, 1.0, quantize);
+        configure_layout(&mut builder, style, None);
+        builder.push_default(StyleProperty::FontWidth(parley::FontWidth::from_ratio(
+            typography.width,
+        )));
+        let features: Vec<parley::FontFeature> = typography
+            .features
+            .iter()
+            .map(|(tag, value)| parley::FontFeature::new(parley::setting::Tag::new(tag), *value))
+            .collect();
+        builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::List(
+            Cow::Owned(features),
+        )));
+        for (range, size) in &typography.sized {
+            if range.start < range.end && range.end <= text.len() {
+                builder.push(StyleProperty::FontSize(size.max(0.01)), range.clone());
+            }
+        }
+        if typography.unspaced_prefix > 0 && typography.unspaced_prefix <= text.len() {
+            builder.push(
+                StyleProperty::LetterSpacing(0.),
+                0..typography.unspaced_prefix,
+            );
+        }
         push_emoji_presentation(&mut builder, emoji);
         builder.build(text)
     }
@@ -1589,6 +1699,17 @@ pub(crate) fn colored_lines(
 /// existing quantization choice or aliasing its entries.
 pub(crate) fn shape_canvas(text: &str, style: &TextStyle) -> ShapedText {
     TEXT.with_borrow_mut(|system| system.shape_with_quantization(text, style, false))
+}
+
+/// [`shape_canvas`] with Canvas text preparation's typographic settings.
+pub(crate) fn shape_canvas_with(
+    text: &str,
+    style: &TextStyle,
+    typography: &CanvasTypography,
+) -> ShapedText {
+    TEXT.with_borrow_mut(|system| {
+        system.shape_with_typography(text, style, false, Some(typography))
+    })
 }
 
 /// CSS `ch` basis: advance measure of U+0030 ZERO in the element's font.

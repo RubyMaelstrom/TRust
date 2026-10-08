@@ -29,6 +29,7 @@ impl Key {
                 text: text.into(),
                 style: style.into(),
                 quantize: true,
+                typography: None,
             },
             breaks,
             operation,

@@ -7,41 +7,127 @@ use crate::webgl::{Attributes, Context, Reply};
 mod fast;
 pub(super) use fast::Cache as FastCache;
 
+/// WebGL contexts of OffscreenCanvases are keyed above every DOM node id;
+/// their canvas is the OffscreenCanvas's native bitmap, not a DOM entry.
+const OFFSCREEN_KEYS: usize = 1 << 40;
+
+pub(super) fn offscreen_key(id: u32) -> usize {
+    OFFSCREEN_KEYS + id as usize
+}
+
+fn offscreen_id(key: usize) -> Option<u32> {
+    key.checked_sub(OFFSCREEN_KEYS)
+        .and_then(|id| u32::try_from(id).ok())
+}
+
+/// Whether a binding's canvas argument names an OffscreenCanvas context.
+pub(super) fn is_offscreen_argument(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_num_opt)
+        .is_some_and(|key| key.is_finite() && key >= OFFSCREEN_KEYS as f64)
+}
+
+/// Run `f` with the canvas a WebGL context draws into: the element's DOM
+/// canvas, or the OffscreenCanvas's bitmap.
+fn with_canvas<R>(
+    state: &HostState,
+    key: usize,
+    f: impl FnOnce(&mut crate::canvas::Canvas) -> R,
+) -> Option<R> {
+    if let Some(id) = offscreen_id(key) {
+        let offscreen = state.offscreen_canvases.get(&id)?.clone();
+        let mut offscreen = offscreen.borrow_mut();
+        if offscreen.mode != crate::canvas_offscreen::Mode::WebGl {
+            return None;
+        }
+        f(offscreen.canvas.as_mut()?).into()
+    } else {
+        let dom = state.dom.borrow();
+        let mut canvases = dom.canvases.borrow_mut();
+        canvases.get_mut(&key).map(f)
+    }
+}
+
 pub(super) fn publish(ctx: &mut Ctx, present: bool, only: Option<usize>) {
     let Some(state) = ctx.host_mut::<HostState>() else {
         return;
     };
-    let dom = state.dom.borrow();
-    let mut canvases = dom.canvases.borrow_mut();
     let mut allocated = state
         .webgl
         .values()
         .map(Context::allocated_bytes)
         .sum::<usize>();
-    for (id, context) in &mut state.webgl {
-        if only.is_some_and(|only| *id != only) {
+    let keys: Vec<usize> = state.webgl.keys().copied().collect();
+    for id in keys {
+        if only.is_some_and(|only| id != only) {
             continue;
         }
-        allocated -= context.allocated_bytes();
-        context.budget = crate::webgl::PAGE_BUDGET.saturating_sub(allocated);
-        let Some(canvas) = canvases.get_mut(id) else {
-            allocated += context.allocated_bytes();
+        // Only an OffscreenCanvas with a placeholder presents its frames
+        // (and then clears an unpreserved drawing buffer); others are read
+        // back when consumed.
+        if present
+            && let Some(offscreen) = offscreen_id(id)
+            && state
+                .offscreen_canvases
+                .get(&offscreen)
+                .is_none_or(|canvas| canvas.borrow().placeholder.is_none())
+        {
+            continue;
+        }
+        let Some(mut context) = state.webgl.remove(&id) else {
             continue;
         };
-        if context.generation != canvas.generation {
-            if context.resize(canvas.width, canvas.height).is_err() {
-                context.lose();
+        allocated -= context.allocated_bytes();
+        context.budget = crate::webgl::PAGE_BUDGET.saturating_sub(allocated);
+        let published = with_canvas(state, id, |canvas| {
+            if context.generation != canvas.generation {
+                if context.resize(canvas.width, canvas.height).is_err() {
+                    context.lose();
+                }
+                context.generation = canvas.generation;
             }
-            context.generation = canvas.generation;
+            if (!present || context.dirty)
+                && let Some((pixels, opaque)) = context.snapshot(present)
+                && canvas.width > 0
+                && canvas.height > 0
+            {
+                canvas.publish_webgl(context.width, context.height, pixels, opaque, present);
+                return true;
+            }
+            false
+        });
+        // A presented OffscreenCanvas frame is pushed to its placeholder.
+        if published == Some(true)
+            && present
+            && let Some(offscreen) = offscreen_id(id)
+            && let Some(offscreen) = state.offscreen_canvases.get(&offscreen)
+        {
+            offscreen.borrow_mut().dirty = true;
         }
         allocated += context.allocated_bytes();
-        if (!present || context.dirty)
-            && let Some((pixels, opaque)) = context.snapshot(present)
-            && canvas.width > 0
-            && canvas.height > 0
-        {
-            canvas.publish_webgl(context.width, context.height, pixels, opaque, present);
-        }
+        state.webgl.insert(id, context);
+    }
+}
+
+/// Read an OffscreenCanvas's WebGL drawing buffer back into its bitmap
+/// before the bitmap is consumed.
+pub(super) fn publish_offscreen(ctx: &mut Ctx, id: u32) {
+    let key = offscreen_key(id);
+    if ctx
+        .host_mut::<HostState>()
+        .is_some_and(|state| state.webgl.contains_key(&key))
+    {
+        publish(ctx, false, Some(key));
+    }
+}
+
+/// HTML #dom-offscreencanvas-transfertoimagebitmap step 4 for WebGL.
+pub(super) fn clear_offscreen(ctx: &mut Ctx, id: u32) {
+    if let Some(context) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.webgl.get_mut(&offscreen_key(id)))
+    {
+        context.clear_drawing_buffer();
     }
 }
 
@@ -139,8 +225,12 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         return Err(ctx.make_error("TypeError", "Expected an attached BufferSource"));
     }
     let dom = host_dom(ctx);
-    let id = host_arg_node(&dom.borrow(), args, 0)
-        .ok_or_else(|| ctx.make_error("TypeError", "Invalid WebGL canvas"))?;
+    let id = if is_offscreen_argument(args.first()) {
+        args[0].as_num_opt().unwrap_or(0.) as usize
+    } else {
+        host_arg_node(&dom.borrow(), args, 0)
+            .ok_or_else(|| ctx.make_error("TypeError", "Invalid WebGL canvas"))?
+    };
     if op == "dispose" || op == "init" {
         ctx.host_mut::<HostState>()
             .unwrap()
@@ -148,11 +238,19 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             .forget_contexts();
     }
     if op == "dispose" {
-        ctx.host_mut::<HostState>().unwrap().webgl.remove(&id);
-        if let Some(canvas) = dom.borrow().canvases.borrow_mut().get_mut(&id) {
-            canvas.publish_webgl(0, 0, vec![], true, true);
+        let state = ctx.host_mut::<HostState>().unwrap();
+        state.webgl.remove(&id);
+        if offscreen_id(id).is_none() {
+            with_canvas(state, id, |canvas| {
+                canvas.publish_webgl(0, 0, vec![], true, true)
+            });
         }
         return Ok(Value::Undefined);
+    }
+    if op == "init"
+        && let Some(offscreen) = offscreen_id(id)
+    {
+        return init_offscreen(ctx, id, offscreen, &n, text);
     }
     if op == "init" {
         let (width, height) = dom
@@ -170,15 +268,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         if ctx.host_mut::<HostState>().unwrap().webgl.len() >= 16 {
             return Ok(Value::Bool(false));
         }
-        let b = |i: usize, default: bool| n.get(i).map_or(default, |x| *x != 0.);
-        let attrs = Attributes {
-            alpha: b(0, true),
-            depth: b(1, true),
-            stencil: b(2, false),
-            premultiplied: b(3, true),
-            preserve: b(4, false),
-            fail_caveat: b(5, false),
-        };
+        let attrs = attributes(&n);
         let Some(mut canvas) = crate::canvas::Canvas::new(width, height, attrs.alpha) else {
             return Ok(Value::Bool(false));
         };
@@ -219,6 +309,78 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     value(ctx, reply)
 }
 
+fn attributes(n: &[f64]) -> Attributes {
+    let b = |i: usize, default: bool| n.get(i).map_or(default, |x| *x != 0.);
+    Attributes {
+        alpha: b(0, true),
+        depth: b(1, true),
+        stencil: b(2, false),
+        premultiplied: b(3, true),
+        preserve: b(4, false),
+        fail_caveat: b(5, false),
+    }
+}
+
+/// WebGL 1.0 §2.1 context creation for an OffscreenCanvas (HTML
+/// #dom-offscreencanvas-getcontext "webgl"): the drawing buffer takes the
+/// OffscreenCanvas's dimensions; its frames become the canvas's bitmap.
+fn init_offscreen(
+    ctx: &mut Ctx,
+    key: usize,
+    id: u32,
+    n: &[f64],
+    text: String,
+) -> Result<Value, Value> {
+    let state = ctx.host_mut::<HostState>().unwrap();
+    let Some(offscreen) = state.offscreen_canvases.get(&id).cloned() else {
+        return Err(ctx.make_error("TypeError", "Invalid WebGL canvas"));
+    };
+    let mut offscreen = offscreen.borrow_mut();
+    match offscreen.mode {
+        crate::canvas_offscreen::Mode::WebGl if state.webgl.contains_key(&key) => {
+            return Ok(Value::Bool(true));
+        }
+        crate::canvas_offscreen::Mode::None | crate::canvas_offscreen::Mode::WebGl => {}
+        _ => return Ok(Value::Bool(false)),
+    }
+    if state.webgl.len() >= 16 {
+        return Ok(Value::Bool(false));
+    }
+    let attrs = attributes(n);
+    let (width, height) = offscreen.bitmap_size();
+    let Some(mut canvas) = crate::canvas::Canvas::new(width, height, attrs.alpha) else {
+        return Ok(Value::Bool(false));
+    };
+    let used = state
+        .webgl
+        .values()
+        .map(Context::allocated_bytes)
+        .sum::<usize>();
+    match Context::new(
+        width,
+        height,
+        attrs,
+        canvas.generation,
+        crate::webgl::PAGE_BUDGET.saturating_sub(used),
+    ) {
+        Ok(context) => {
+            canvas.webgl = true;
+            canvas.document_origin = text;
+            offscreen.canvas = Some(canvas);
+            offscreen.mode = crate::canvas_offscreen::Mode::WebGl;
+            offscreen.dirty = true;
+            state.webgl.insert(key, context);
+            Ok(Value::Bool(true))
+        }
+        Err(error) => {
+            if std::env::var_os("TRUST_WEBGL_TRACE").is_some() {
+                eprintln!("WebGL context: {error}");
+            }
+            Ok(Value::Bool(false))
+        }
+    }
+}
+
 fn execute(
     ctx: &mut Ctx,
     id: usize,
@@ -227,6 +389,9 @@ fn execute(
     bytes: Option<&[u8]>,
     text: &str,
 ) -> Reply {
+    if offscreen_id(id).is_some() {
+        return execute_offscreen(ctx, id, op, n, bytes, text);
+    }
     let dom = host_dom(ctx);
     let state = ctx.host_mut::<HostState>().unwrap();
     // The page budget is shared; a lone context has it all.
@@ -275,6 +440,63 @@ fn execute(
     // and attribute-driven resizing have already requested their own repaint.
     if !was_dirty && context.dirty {
         dom.borrow_mut().canvas_changed(id);
+    }
+    result
+}
+
+fn execute_offscreen(
+    ctx: &mut Ctx,
+    key: usize,
+    op: &str,
+    n: &[f64],
+    bytes: Option<&[u8]>,
+    text: &str,
+) -> Reply {
+    let state = ctx.host_mut::<HostState>().unwrap();
+    let other = state
+        .webgl
+        .iter()
+        .filter(|(other, _)| **other != key)
+        .map(|(_, c)| c.allocated_bytes())
+        .sum::<usize>();
+    let Some(mut context) = state.webgl.remove(&key) else {
+        return Reply::Null;
+    };
+    context.budget = crate::webgl::PAGE_BUDGET.saturating_sub(other);
+    with_canvas(state, key, |canvas| {
+        if canvas.generation != context.generation {
+            if context.resize(canvas.width, canvas.height).is_err() {
+                context.lose();
+            }
+            context.generation = canvas.generation;
+        }
+    });
+    let was_dirty = context.dirty;
+    let result = match op {
+        "width" => Reply::Number(context.width as f64),
+        "height" => Reply::Number(context.height as f64),
+        "attributes" => Reply::Array(
+            [
+                context.attrs.alpha,
+                context.attrs.depth,
+                context.attrs.stencil,
+                false,
+                context.attrs.premultiplied,
+                context.attrs.preserve,
+            ]
+            .into_iter()
+            .map(Reply::Bool)
+            .collect(),
+        ),
+        _ => context.execute(op, n, bytes, text),
+    };
+    let drew = !was_dirty && context.dirty;
+    state.webgl.insert(key, context);
+    if drew
+        && let Some(id) = offscreen_id(key)
+        && let Some(offscreen) = state.offscreen_canvases.get(&id)
+    {
+        offscreen.borrow_mut().dirty = true;
     }
     result
 }

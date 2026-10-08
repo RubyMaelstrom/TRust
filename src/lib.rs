@@ -27,6 +27,8 @@ pub mod accessibility;
 pub mod av1;
 pub mod bookmarks;
 mod canvas;
+mod canvas_filter;
+mod canvas_offscreen;
 mod canvas_shadow;
 mod canvas_text;
 pub mod command;

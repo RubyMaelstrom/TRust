@@ -177,6 +177,11 @@ impl LumenResourceKind {
 #[allow(dead_code)] // Some task variants are exercised only by particular web-platform features.
 enum LumenHostTask {
     PortReady,
+    /// HTML #offscreencanvas-placeholder: an OffscreenCanvas committed a
+    /// frame for the placeholder canvas element `node`.
+    CanvasFrame {
+        node: usize,
+    },
     /// A network `@font-face` source the page's font sets awaited (`None`
     /// when it could not be fetched).
     FontDone {
@@ -731,6 +736,11 @@ struct HostState {
     /// pattern hold their own reference. The CanvasPattern's finalizer frees it.
     canvas_patterns: HashMap<u32, Arc<crate::canvas::Pattern>>,
     next_canvas_pattern: u32,
+    /// HTML #the-offscreencanvas-interface: this agent's OffscreenCanvas
+    /// bitmaps and context state by id; the OffscreenCanvas's finalizer
+    /// frees its entry, a transfer moves it to the receiving agent.
+    offscreen_canvases: HashMap<u32, Rc<RefCell<crate::canvas_offscreen::Offscreen>>>,
+    next_offscreen_canvas: u32,
     pointer_event_slots: Option<Value>,
     image_element_slots: Option<Value>,
     window_message_slots: Option<Value>,
@@ -843,6 +853,8 @@ impl HostState {
             compression: Default::default(),
             canvas_patterns: HashMap::new(),
             next_canvas_pattern: 0,
+            offscreen_canvases: HashMap::new(),
+            next_offscreen_canvas: 0,
             pointer_event_slots: None,
             image_element_slots: None,
             window_message_slots: None,
@@ -1085,6 +1097,8 @@ impl RetainedMemory for HostState {
             compression,
             canvas_patterns,
             next_canvas_pattern: _,
+            offscreen_canvases,
+            next_offscreen_canvas: _,
             pointer_event_slots,
             image_element_slots,
             window_message_slots,
@@ -1563,6 +1577,12 @@ impl RetainedMemory for HostState {
                 Arc::as_ptr(pattern) as usize,
                 pattern.retained_bytes(),
             ));
+        }
+        for canvas in offscreen_canvases.values() {
+            let bytes = canvas
+                .try_borrow()
+                .map_or(0, |canvas| canvas.retained_bytes());
+            report_rc_payload(visitor, "trust.offscreen-canvas", canvas, bytes);
         }
         if let Some(value) = element_slots {
             visitor.value(value);
@@ -4578,6 +4598,9 @@ mod desktop {
 
     fn extract_live(page: &mut LumenPage) -> (String, crate::http::RenderedPage, bool) {
         webgl_host::publish(page.engine.ctx(), true, None);
+        // HTML #offscreencanvas-placeholder: this Window agent's rendering
+        // update pushes its OffscreenCanvases' bitmaps and presents frames.
+        canvas_host::push_placeholders(page.engine.ctx());
         prime_page_svg_sprites(page);
         let clickable_listeners = listener_ids(page, "clickables");
         let hover_listeners = listener_ids(page, "hoverables");
@@ -10393,6 +10416,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__live_range_snapshot", 0, host_live_range_snapshot),
     ("__pointer_event_slots", 1, host_pointer_event_slots),
     ("__canvas_2d", 4, guarded_canvas_2d),
+    ("__offscreen_canvas", 5, canvas_host::offscreen_call),
     ("__webgl", 4, guarded_webgl),
     ("__dom_create_element", 2, guarded_create_element),
     ("__dom_create_element_ns", 4, guarded_create_element_ns),
@@ -11316,6 +11340,10 @@ fn guarded_canvas_2d(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value
 }
 
 fn guarded_webgl(ctx: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    // An OffscreenCanvas's context belongs to no Document.
+    if webgl_host::is_offscreen_argument(args.first()) {
+        return webgl_host::call(ctx, this, args);
+    }
     guarded_canvas_operation(ctx, this, args, "webgl_host::call", webgl_host::call)
 }
 
@@ -14908,6 +14936,9 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
     engine.define_global("__image_data_slots", 1, host_image_data_slots);
     engine.define_global("__image_binding", 2, image_host::call);
     engine.define_global("__image_bitmap_binding", 3, image_bitmap_host::call);
+    // HTML OffscreenCanvas and WebGL are [Exposed=(Window,Worker)].
+    engine.define_global("__offscreen_canvas", 5, canvas_host::offscreen_call);
+    engine.define_global("__webgl", 4, webgl_host::call);
     engine.define_global("__wasm_module_binding", 1, host_wasm_module_binding);
     engine.define_global("__permissions_binding", 2, host_permissions_binding);
     engine.define_global("__navigator_binding", 1, host_navigator_binding);
@@ -15407,6 +15438,53 @@ fn lumen_worker_deadline(engine: &mut lumen::Engine) -> Option<f64> {
     }
 }
 
+/// HTML #event-loop-processing-model (worker event loop): the next rendering
+/// opportunity of a DedicatedWorkerGlobalScope with animation frame
+/// callbacks (HTML #animationframeprovider).
+fn lumen_worker_frame_deadline(engine: &mut lumen::Engine) -> Option<f64> {
+    match lumen_worker_internal_call(engine, "animationFrameDeadline", &[]) {
+        Ok(Value::Num(deadline)) if deadline.is_finite() => Some(deadline),
+        _ => None,
+    }
+}
+
+/// "Update the rendering of that dedicated worker": run the context lost
+/// steps of its 2D OffscreenCanvas contexts, then present WebGL frames and
+/// push changed bitmaps to their placeholder canvas elements. Returns false
+/// when the worker was interrupted.
+fn lumen_worker_update_rendering(engine: &mut lumen::Engine) -> bool {
+    let lost = engine.ctx().host_mut::<HostState>().is_some_and(|state| {
+        state.offscreen_canvases.values().any(|canvas| {
+            let canvas = canvas.borrow();
+            canvas.mode == crate::canvas_offscreen::Mode::TwoD
+                && canvas
+                    .canvas
+                    .as_ref()
+                    .is_some_and(|canvas| canvas.lost() && !canvas.lost_notified)
+        })
+    });
+    if lost {
+        if let Err(EvalError::Interrupted(_)) =
+            lumen_worker_internal_call(engine, "runCanvasContextLost", &[])
+        {
+            return false;
+        }
+        if engine.run_microtasks_interruptible().is_err() {
+            return false;
+        }
+    }
+    if canvas_host::placeholders_dirty(engine.ctx())
+        || engine
+            .ctx()
+            .host_mut::<HostState>()
+            .is_some_and(|state| !state.webgl.is_empty())
+    {
+        webgl_host::publish(engine.ctx(), true, None);
+        canvas_host::push_placeholders(engine.ctx());
+    }
+    true
+}
+
 fn lumen_worker_now(engine: &mut lumen::Engine) -> f64 {
     match lumen_worker_internal_call(engine, "now", &[]) {
         Ok(Value::Num(now)) if now.is_finite() => now,
@@ -15605,6 +15683,7 @@ fn run_lumen_worker(
         Bitmap,
         Performance,
         Platform,
+        Frame,
     }
     let wall_origin = Instant::now();
     let virtual_origin = lumen_worker_now(&mut engine);
@@ -15613,6 +15692,7 @@ fn run_lumen_worker(
     loop {
         let now = virtual_origin + wall_origin.elapsed().as_secs_f64() * 1000.0;
         let deadline = lumen_worker_deadline(&mut engine);
+        let frame = lumen_worker_frame_deadline(&mut engine);
         if queued_command.is_none() {
             queued_command = match ctl_rx.try_recv() {
                 Ok(command) => Some(command),
@@ -15639,8 +15719,8 @@ fn run_lumen_worker(
         // Distinct task sources all make progress. A busy implicit worker port
         // must not starve transferred channels or an already-due timer.
         let mut task = None;
-        for offset in 0..6 {
-            let source = (source_cursor + offset) % 6;
+        for offset in 0..7 {
+            let source = (source_cursor + offset) % 7;
             task = match source {
                 0 => queued_command.take().map(WorkerTask::Command),
                 1 if deadline.is_some_and(|deadline| deadline <= now) => Some(WorkerTask::Timer),
@@ -15648,24 +15728,34 @@ fn run_lumen_worker(
                 3 if bitmap_ready => Some(WorkerTask::Bitmap),
                 4 if performance_ready => Some(WorkerTask::Performance),
                 5 if platform_ready => Some(WorkerTask::Platform),
+                6 if frame.is_some_and(|frame| frame <= now) => Some(WorkerTask::Frame),
                 _ => None,
             };
             if task.is_some() {
-                source_cursor = (source + 1) % 6;
+                source_cursor = (source + 1) % 7;
                 break;
             }
         }
         let task = match task {
             Some(task) => task,
             None => {
-                if deadline.is_none() {
+                let wake = match (deadline, frame) {
+                    (Some(deadline), Some(frame)) => Some(deadline.min(frame)),
+                    (deadline, frame) => deadline.or(frame),
+                };
+                if wake.is_none() {
                     engine.collect_garbage_at_idle();
                 }
-                match deadline {
-                    Some(deadline) => match ctl_rx
-                        .recv_timeout(Duration::from_secs_f64((deadline - now).max(0.0) / 1000.0))
+                match wake {
+                    Some(wake) => match ctl_rx
+                        .recv_timeout(Duration::from_secs_f64((wake - now).max(0.0) / 1000.0))
                     {
                         Ok(command) => WorkerTask::Command(command),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            if frame.is_some_and(|frame| frame <= wake) =>
+                        {
+                            WorkerTask::Frame
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WorkerTask::Timer,
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     },
@@ -15704,6 +15794,9 @@ fn run_lumen_worker(
             WorkerTask::Timer => {
                 lumen_worker_internal_call(&mut engine, "tick", &[Value::Num(now)])
             }
+            WorkerTask::Frame => {
+                lumen_worker_internal_call(&mut engine, "runAnimationFrames", &[Value::Num(now)])
+            }
         };
         match task_result {
             Ok(_) => {}
@@ -15717,6 +15810,7 @@ fn run_lumen_worker(
         if engine.run_microtasks_interruptible().is_err()
             || !lumen_worker_report_buffered_errors(&mut engine, &events, launch.id)
             || lumen_worker_closed(&mut engine)
+            || !lumen_worker_update_rendering(&mut engine)
         {
             break;
         }
@@ -16614,6 +16708,15 @@ fn settle_network_task(
 fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
     match task {
         LumenHostTask::PortReady => {}
+        LumenHostTask::CanvasFrame { node } => {
+            let dom = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .expect("HostState installed before host tasks")
+                .dom
+                .clone();
+            canvas_host::present_frames(&mut dom.borrow_mut(), Some(node));
+        }
         LumenHostTask::FontDone { url, bytes } => {
             let dom = engine
                 .ctx()
@@ -29898,7 +30001,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 238, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 239, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -29909,7 +30012,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 238);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 239);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -31920,6 +32023,615 @@ mod tests {
             catch(e) { rejected = e.name === 'TypeError'; }
             if (!rejected) throw Error('forged metric accepted');
         "#, "cross-Realm canvas metrics").unwrap();
+    }
+
+    /// Run queued tasks of a Window (`__trust`) or a worker harness
+    /// (`__wkr`) until `done` evaluates true.
+    fn run_canvas_tasks(engine: &mut lumen::Engine, worker: bool, done: &str) {
+        for _ in 0..256 {
+            run_microtask_checkpoint(engine);
+            if string_value(engine, &format!("String({done})")) == "true" {
+                return;
+            }
+            let task = if worker {
+                "if (__wkr.hasBitmapTask()) __wkr.runBitmapTask(); else if (__wkr.hasPortTask()) __wkr.runPortTask();"
+            } else {
+                "if (__trust.hasPlatformTask()) __trust.runPlatformTask(); else if (__trust.hasMessageTask()) __trust.runMessageTask();"
+            };
+            eval(engine, task, "canvas task").unwrap();
+        }
+    }
+
+    #[test]
+    fn offscreen_canvas_contexts_transfers_and_blobs_in_windows_and_workers() {
+        // HTML #the-offscreencanvas-interface: the constructor, dimensions,
+        // the context mode table, transferToImageBitmap(), convertToBlob(),
+        // bitmaprenderer, image sources and transfer, in both global kinds.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            for worker in [false, true] {
+                let mut engine = if worker {
+                    worker_platform_engine()
+                } else {
+                    platform_engine()
+                };
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(
+                    string_value(&mut engine, include_str!("fixtures/offscreen_canvas.mjs")),
+                    "offscreen-pending"
+                );
+                run_canvas_tasks(&mut engine, worker, "offscreenResult !== 'pending'");
+                assert_eq!(
+                    string_value(&mut engine, "offscreenResult"),
+                    "ok",
+                    "{tier:?} worker={worker}"
+                );
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        "[typeof __offscreen_canvas, typeof __canvas_api, typeof __canvas_adapter, typeof __sc_canvas_codec, typeof __trust_install_webgl].join()"
+                    ),
+                    "undefined,undefined,undefined,undefined,undefined"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn window_post_message_transfers_offscreen_canvases_and_bitmaps() {
+        // HTML #window-post-message-steps with a transfer list: the receiving
+        // Window gets its own OffscreenCanvas and ImageBitmap objects.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            globalThis.foreignWindow = frame.contentWindow;
+            globalThis.transferred = null;
+            foreignWindow.addEventListener('message', event => { transferred = event.data; });
+            globalThis.sentCanvas = new OffscreenCanvas(3, 2);
+            const pixels = new OffscreenCanvas(1, 1);
+            pixels.getContext('2d').fillRect(0, 0, 1, 1);
+            globalThis.sentBitmap = pixels.transferToImageBitmap();
+            foreignWindow.postMessage({canvas: sentCanvas, bitmap: sentBitmap}, '*', [sentCanvas, sentBitmap]);
+            "#,
+            "window postMessage transfer",
+        )
+        .unwrap();
+        run_canvas_tasks(&mut engine, false, "transferred !== null");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "[transferred.canvas instanceof foreignWindow.OffscreenCanvas, transferred.canvas.width, sentCanvas.width, transferred.bitmap instanceof foreignWindow.ImageBitmap, transferred.bitmap.width, sentBitmap.width].join()"
+            ),
+            "true,3,0,true,1,0"
+        );
+    }
+
+    #[test]
+    fn window_post_message_transfers_streams_beside_canvases() {
+        // HTML #window-post-message-steps runs StructuredSerializeWithTransfer:
+        // a transferred ReadableStream reaches the other Window as its own
+        // stream (Streams #rs-transfer) in the same message as an
+        // OffscreenCanvas, and still carries its chunks.
+        let fixture = wrap_platform_fixture(
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            const other = frame.contentWindow;
+            const received = new Promise(resolve => other.addEventListener('message', event => resolve(event.data)));
+            const canvas = new OffscreenCanvas(3, 2);
+            const stream = new ReadableStream({ start(c) { c.enqueue('chunk'); c.close(); } });
+            other.postMessage({ stream, canvas }, '*', [stream, canvas]);
+            check(stream.locked, 'the transferred original is locked by its pipe');
+            const data = await received;
+            check(data.stream instanceof other.ReadableStream, 'the stream belongs to the receiving Window');
+            check(data.canvas instanceof other.OffscreenCanvas && data.canvas.width === 3, 'the canvas arrives too');
+            const { value } = await data.stream.getReader().read();
+            check(value === 'chunk', 'the transferred stream carries its chunk: ' + value);
+            "#,
+        );
+        let mut window = platform_engine();
+        eval(&mut window, &fixture, "window stream transfer").unwrap();
+        assert_eq!(settle_fixture_with_ports(&mut window, false), "ok");
+    }
+
+    #[test]
+    fn offscreen_canvas_contexts_are_freed_with_their_objects() {
+        // An OffscreenCanvas's native bitmap lives exactly as long as it.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            "{ const c = new OffscreenCanvas(64, 64); c.getContext('2d').fillRect(0, 0, 64, 64); }",
+            "temporary OffscreenCanvas",
+        )
+        .unwrap();
+        let live = |engine: &mut lumen::Engine| {
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .offscreen_canvases
+                .len()
+        };
+        assert_eq!(live(&mut engine), 1);
+        for _ in 0..4 {
+            engine.collect_garbage_at_idle();
+            run_microtask_checkpoint(&mut engine);
+            drain_platform_tasks(&mut engine, "__trust");
+        }
+        assert_eq!(live(&mut engine), 0);
+    }
+
+    #[test]
+    fn canvas_text_drawing_styles_follow_the_text_preparation_algorithm() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_text_styles.mjs"),
+                "canvas text drawing styles",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "canvas-text-styles-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn offscreen_canvas_text_inherits_language_and_direction() {
+        // HTML #dom-offscreencanvas: a Window's OffscreenCanvas inherits its
+        // document element's directionality; a worker's is "ltr".
+        let mut engine = platform_engine();
+        let result = eval_value(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'); html.setAttribute('dir', 'rtl');
+            html.setAttribute('lang', 'ar'); document.appendChild(html);
+            const rtl = new OffscreenCanvas(10, 10).getContext('2d');
+            html.setAttribute('dir', 'ltr');
+            const ltr = new OffscreenCanvas(10, 10).getContext('2d');
+            for (const c of [rtl, ltr]) { c.font = '20px sans-serif'; c.textAlign = 'start'; }
+            const a = rtl.measureText('Hi'), b = ltr.measureText('Hi');
+            String(Math.abs(a.actualBoundingBoxLeft - b.actualBoundingBoxLeft - b.width) < 0.01)
+            "#,
+            "OffscreenCanvas inherited direction",
+        )
+        .unwrap();
+        assert_eq!(value_string(&mut engine, &result), "true");
+        let mut worker = worker_platform_engine();
+        let result = eval_value(
+            &mut worker,
+            r#"
+            const c = new OffscreenCanvas(10, 10).getContext('2d');
+            c.font = '20px sans-serif'; c.textAlign = 'start';
+            const inherited = c.measureText('Hi'); c.direction = 'ltr';
+            String(inherited.actualBoundingBoxLeft === c.measureText('Hi').actualBoundingBoxLeft)
+            "#,
+            "worker OffscreenCanvas direction",
+        )
+        .unwrap();
+        assert_eq!(value_string(&mut worker, &result), "true");
+    }
+
+    #[test]
+    fn canvas_filters_follow_the_drawing_model() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                include_str!("fixtures/canvas_filters.mjs"),
+                "canvas filters",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "canvas-filters-ok",
+                "{tier:?}"
+            );
+        }
+        // A worker has no document: a url() reference cannot resolve, so the
+        // whole chain is ignored.
+        let mut worker = worker_platform_engine();
+        let result = eval_value(
+            &mut worker,
+            r#"
+            const c = new OffscreenCanvas(4, 4).getContext('2d');
+            c.filter = 'invert(1) url(#f)'; c.fillStyle = 'red'; c.fillRect(0, 0, 4, 4);
+            const plain = Array.from(c.getImageData(1, 1, 1, 1).data).join();
+            c.filter = 'invert(1)'; c.fillRect(0, 0, 4, 4);
+            plain + '|' + Array.from(c.getImageData(1, 1, 1, 1).data).join()
+            "#,
+            "worker canvas filter",
+        )
+        .unwrap();
+        assert_eq!(
+            value_string(&mut worker, &result),
+            "255,0,0,255|0,255,255,255"
+        );
+    }
+
+    #[test]
+    fn canvas_placeholders_present_offscreen_commits_and_bitmap_renderers() {
+        // HTML #dom-canvas-transfercontroltooffscreen and
+        // #offscreencanvas-placeholder: the element shows what its
+        // OffscreenCanvas pushed at the rendering update; it has no context
+        // and its dimensions cannot change.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let value = eval_value(
+                &mut engine,
+                r#"
+                (function () {
+                    function check(ok, message) { if (!ok) throw Error(message); }
+                    function throws(fn, name) {
+                        try { fn(); } catch (error) { check(error.name === name, name + ': ' + error); return; }
+                        throw Error('missing ' + name);
+                    }
+                    const html = document.createElement('html'), body = document.createElement('body');
+                    document.appendChild(html); html.appendChild(body);
+                    const placeholder = document.createElement('canvas');
+                    placeholder.width = 6; placeholder.height = 4; body.appendChild(placeholder);
+                    const offscreen = placeholder.transferControlToOffscreen();
+                    check(offscreen instanceof OffscreenCanvas && offscreen.width === 6 && offscreen.height === 4, 'dimensions');
+                    throws(() => placeholder.transferControlToOffscreen(), 'InvalidStateError');
+                    throws(() => placeholder.getContext('2d'), 'InvalidStateError');
+                    throws(() => placeholder.getContext('bogus'), 'InvalidStateError');
+                    throws(() => { placeholder.width = 10; }, 'InvalidStateError');
+                    check(placeholder.width === 6, 'reflects its attribute');
+                    const context = offscreen.getContext('2d');
+                    context.fillStyle = 'lime'; context.fillRect(0, 0, 6, 4);
+                    globalThis.placeholderCanvas = placeholder; globalThis.offscreenPlaceholder = offscreen;
+                    // A context already in use cannot be transferred.
+                    const used = document.createElement('canvas'); used.getContext('2d');
+                    throws(() => used.transferControlToOffscreen(), 'InvalidStateError');
+                    // bitmaprenderer on an element.
+                    const shown = document.createElement('canvas'); shown.width = 3; shown.height = 3;
+                    const renderer = shown.getContext('bitmaprenderer');
+                    check(renderer instanceof ImageBitmapRenderingContext && renderer.canvas === shown, 'bitmaprenderer');
+                    check(shown.getContext('bitmaprenderer') === renderer && shown.getContext('2d') === null, 'mode');
+                    globalThis.bitmapCanvas = shown; globalThis.bitmapRenderer = renderer;
+                    return 'placeholder-ok';
+                })()
+                "#,
+                "placeholder canvas",
+            )
+            .unwrap();
+            assert_eq!(
+                value_string(&mut engine, &value),
+                "placeholder-ok",
+                "{tier:?}"
+            );
+            // Before the rendering update the placeholder shows its blank bitmap.
+            let probe = "(() => { const c = document.createElement('canvas'); c.width = 6; c.height = 4; const x = c.getContext('2d'); x.drawImage(placeholderCanvas, 0, 0); return Array.from(x.getImageData(2, 2, 1, 1).data).join(); })()";
+            assert_eq!(string_value(&mut engine, probe), "0,0,0,0");
+            canvas_host::push_placeholders(engine.ctx());
+            assert_eq!(string_value(&mut engine, probe), "0,255,0,255", "{tier:?}");
+            // A resize commits new natural dimensions at the next update.
+            eval(
+                &mut engine,
+                "offscreenPlaceholder.width = 9; offscreenPlaceholder.getContext('2d').fillRect(0, 0, 9, 4)",
+                "resize the OffscreenCanvas",
+            )
+            .unwrap();
+            canvas_host::push_placeholders(engine.ctx());
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "(() => { const c = document.createElement('canvas'); c.width = 20; c.height = 4; const x = c.getContext('2d'); x.drawImage(placeholderCanvas, 0, 0); return [placeholderCanvas.width, Array.from(x.getImageData(8, 1, 1, 1).data).join()].join('|'); })()"
+                ),
+                "6|0,0,0,255"
+            );
+            assert_eq!(
+                string_value(&mut engine, "placeholderCanvas.toDataURL().length > 30"),
+                "true"
+            );
+            // bitmaprenderer: the element's bitmap is the ImageBitmap's.
+            let value = eval_value(
+                &mut engine,
+                r#"
+                (async () => {
+                    const data = new ImageData(new Uint8ClampedArray([255,0,0,255, 0,0,255,255]), 2, 1);
+                    const bitmap = await createImageBitmap(data);
+                    bitmapRenderer.transferFromImageBitmap(bitmap);
+                    const c = document.createElement('canvas'); c.width = 3; c.height = 3;
+                    const x = c.getContext('2d'); x.drawImage(bitmapCanvas, 0, 0);
+                    globalThis.bitmapRendered = [bitmap.width, Array.from(x.getImageData(1, 0, 1, 1).data).join(),
+                        bitmapCanvas.width, bitmapCanvas.toDataURL().length > 30].join('|');
+                    bitmapRenderer.transferFromImageBitmap(null);
+                    x.clearRect(0, 0, 3, 3); x.drawImage(bitmapCanvas, 0, 0);
+                    globalThis.bitmapRendered += '|' + x.getImageData(1, 0, 1, 1).data[3];
+                })(); 'pending'
+                "#,
+                "bitmaprenderer element",
+            )
+            .unwrap();
+            assert_eq!(value_string(&mut engine, &value), "pending");
+            run_canvas_tasks(&mut engine, false, "typeof bitmapRendered === 'string'");
+            assert_eq!(
+                string_value(&mut engine, "bitmapRendered"),
+                "0|0,0,255,255|3|true|0",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_context_lost_steps_fire_lost_and_restored_events() {
+        // HTML #update-the-rendering, context lost steps: a 2D context whose
+        // backing storage cannot exist is lost; contextlost is cancelable,
+        // and an uncanceled loss attempts restoration.
+        for worker in [false, true] {
+            let mut engine = if worker {
+                worker_platform_engine()
+            } else {
+                platform_engine()
+            };
+            eval(
+                &mut engine,
+                r#"
+                globalThis.lostLog = [];
+                globalThis.lostCanvas = new OffscreenCanvas(100000, 100000);
+                globalThis.lostContext = lostCanvas.getContext('2d');
+                lostLog.push('before:' + lostContext.isContextLost());
+                lostCanvas.oncontextlost = event => {
+                    lostLog.push('lost:' + event.cancelable + ':' + event.isTrusted + ':' + lostContext.isContextLost());
+                    lostCanvas.width = 4; lostCanvas.height = 4;
+                };
+                lostCanvas.addEventListener('contextrestored', () => lostLog.push('restored:' + lostContext.isContextLost()));
+                "#,
+                "lost OffscreenCanvas context",
+            )
+            .unwrap();
+            if worker {
+                eval(
+                    &mut engine,
+                    "__wkr.runCanvasContextLost()",
+                    "worker rendering update",
+                )
+                .unwrap();
+            } else {
+                eval(
+                    &mut engine,
+                    "__trust.runRenderingFrame(performance.now())",
+                    "rendering update",
+                )
+                .unwrap();
+            }
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "lostLog.join('|')"),
+                "before:false|lost:true:true:true|restored:false",
+                "worker={worker}"
+            );
+            // A canceled loss stays lost.
+            eval(
+                &mut engine,
+                r#"
+                globalThis.keptLost = new OffscreenCanvas(100000, 100000);
+                globalThis.keptContext = keptLost.getContext('2d');
+                keptLost.addEventListener('contextlost', event => event.preventDefault());
+                keptLost.addEventListener('contextrestored', () => lostLog.push('unexpected'));
+                "#,
+                "canceled loss",
+            )
+            .unwrap();
+            if worker {
+                eval(
+                    &mut engine,
+                    "__wkr.runCanvasContextLost()",
+                    "worker rendering update",
+                )
+                .unwrap();
+            } else {
+                eval(
+                    &mut engine,
+                    "__trust.runRenderingFrame(performance.now())",
+                    "rendering update",
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "keptContext.isContextLost() + '|' + lostLog.length"
+                ),
+                "true|3"
+            );
+        }
+        // A canvas element's 2D context fires at the element.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'); document.appendChild(html);
+            globalThis.elementLost = [];
+            const canvas = document.createElement('canvas'); html.appendChild(canvas);
+            canvas.width = 100000; canvas.height = 100000;
+            const context = canvas.getContext('2d');
+            canvas.addEventListener('contextlost', event => { elementLost.push('lost'); canvas.width = 2; canvas.height = 2; });
+            canvas.addEventListener('contextrestored', () => elementLost.push('restored:' + context.isContextLost()));
+            "#,
+            "lost element context",
+        )
+        .unwrap();
+        eval(
+            &mut engine,
+            "__trust.runRenderingFrame(performance.now())",
+            "rendering update",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "elementLost.join('|')"),
+            "lost|restored:false"
+        );
+    }
+
+    #[test]
+    fn dedicated_workers_provide_animation_frames() {
+        // HTML #animationframeprovider: a DedicatedWorkerGlobalScope runs its
+        // callbacks at its rendering opportunities, in handle order, each
+        // removed before it is invoked.
+        let mut worker = worker_platform_engine();
+        eval(
+            &mut worker,
+            r#"
+            globalThis.frames = [];
+            const first = requestAnimationFrame(t => frames.push('a:' + (typeof t)));
+            const second = requestAnimationFrame(() => { frames.push('b'); requestAnimationFrame(() => frames.push('next')); });
+            const third = requestAnimationFrame(() => frames.push('c'));
+            cancelAnimationFrame(third);
+            globalThis.handles = [first, second, third].join();
+            "#,
+            "worker rAF",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut worker, "handles"), "1,2,3");
+        assert_eq!(
+            string_value(&mut worker, "typeof __wkr.animationFrameDeadline()"),
+            "number"
+        );
+        eval(&mut worker, "__wkr.runAnimationFrames(0)", "frame").unwrap();
+        assert_eq!(string_value(&mut worker, "frames.join()"), "a:number,b");
+        eval(&mut worker, "__wkr.runAnimationFrames(0)", "frame").unwrap();
+        assert_eq!(
+            string_value(&mut worker, "frames.join()"),
+            "a:number,b,next"
+        );
+        assert_eq!(
+            string_value(&mut worker, "String(__wkr.animationFrameDeadline())"),
+            "null"
+        );
+        assert_eq!(
+            string_value(
+                &mut worker,
+                "(() => { try { requestAnimationFrame(5); } catch (e) { return e.name; } })()"
+            ),
+            "TypeError"
+        );
+    }
+
+    #[test]
+    fn worker_offscreen_canvases_commit_frames_to_their_placeholders() {
+        // HTML #offscreencanvas-placeholder: a Window transfers control of a
+        // canvas element to a dedicated worker; the worker draws in an
+        // animation frame and its rendering update pushes the bitmap, which
+        // the element presents.
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            globalThis.placeholder = document.createElement('canvas');
+            placeholder.width = 8; placeholder.height = 6; body.appendChild(placeholder);
+            const offscreen = placeholder.transferControlToOffscreen();
+            globalThis.workerLog = [];
+            globalThis.drawer = new Worker(URL.createObjectURL(new Blob([`
+                onmessage = event => {
+                    const canvas = event.data.canvas;
+                    const context = canvas.getContext('2d');
+                    requestAnimationFrame(time => {
+                        context.fillStyle = 'rgb(0, 0, 255)'; context.fillRect(0, 0, 8, 6);
+                        postMessage('drawn:' + canvas.width + 'x' + canvas.height + ':' + (typeof time));
+                    });
+                };
+            `], {type: 'text/javascript'})));
+            drawer.onmessage = event => workerLog.push(event.data);
+            drawer.onerror = event => workerLog.push('error:' + event.message);
+            drawer.postMessage({canvas: offscreen}, [offscreen]);
+            workerLog.push('sent:' + offscreen.width);
+            "#,
+            "worker placeholder",
+        )
+        .unwrap();
+        let probe = "(() => { const c = document.createElement('canvas'); c.width = 8; c.height = 6; const x = c.getContext('2d'); x.drawImage(placeholder, 0, 0); return Array.from(x.getImageData(4, 3, 1, 1).data).join(); })()";
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let log = string_value(&mut engine, "workerLog.join('|')");
+            assert!(!log.contains("error"), "{log}");
+            if log.contains("drawn") && string_value(&mut engine, probe) == "0,0,255,255" {
+                assert_eq!(log, "sent:0|drawn:8x6:number");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no frame: {log}");
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        task_rx.recv(),
+                    )
+                    .await
+                })
+                .unwrap_or_else(|_| panic!("worker timeout: {log}"))
+                .unwrap();
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        eval(&mut engine, "drawer.terminate()", "Worker cleanup").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an installed EGL/GLES driver"]
+    fn webgl_offscreen_canvases_draw_in_windows_and_workers() {
+        // HTML #dom-offscreencanvas-getcontext "webgl" and
+        // #dom-offscreencanvas-transfertoimagebitmap step 4: the drawing
+        // buffer moves to the ImageBitmap and is cleared, preserved or not.
+        for tier in [Tier::Interp, Tier::Jit] {
+            for worker in [false, true] {
+                let mut engine = if worker {
+                    worker_platform_engine()
+                } else {
+                    platform_engine()
+                };
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                let value = eval_value(
+                    &mut engine,
+                    r#"
+                    (() => {
+                        const canvas = new OffscreenCanvas(4, 4);
+                        const gl = canvas.getContext('webgl', {preserveDrawingBuffer: true});
+                        if (!gl) return 'no-context';
+                        gl.clearColor(0, 1, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+                        const pixel = new Uint8Array(4);
+                        gl.readPixels(1, 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+                        const copy = new OffscreenCanvas(4, 4).getContext('2d');
+                        copy.drawImage(canvas, 0, 0);
+                        const drawn = Array.from(copy.getImageData(2, 2, 1, 1).data).join();
+                        const bitmap = canvas.transferToImageBitmap();
+                        const cleared = new Uint8Array(4);
+                        gl.readPixels(1, 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, cleared);
+                        copy.clearRect(0, 0, 4, 4); copy.drawImage(bitmap, 0, 0);
+                        canvas.width = 8;
+                        return [pixel.join(), drawn, gl.canvas === canvas, canvas.getContext('webgl') === gl,
+                            canvas.getContext('2d') === null, bitmap.width,
+                            Array.from(copy.getImageData(2, 2, 1, 1).data).join(), cleared.join(),
+                            gl.drawingBufferWidth].join('|');
+                    })()
+                    "#,
+                    "OffscreenCanvas WebGL",
+                )
+                .unwrap();
+                assert_eq!(
+                    value_string(&mut engine, &value),
+                    "0,255,0,255|0,255,0,255|true|true|true|4|0,255,0,255|0,0,0,0|8",
+                    "{tier:?} worker={worker}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -37331,13 +38043,29 @@ mod tests {
                 "{tier:?}"
             );
             eval(&mut engine, "nestedOuter.terminate()", "terminate owner").unwrap();
-            pump_page_for(
-                &runtime,
-                &mut engine,
-                &mut task_rx,
-                Duration::from_millis(300),
-            );
-            let settled = string_value(&mut engine, "String(nestedTicks)");
+            // Termination crosses two agent threads, which a loaded machine
+            // may take a while to schedule. The nested worker ticks every
+            // 5 ms, so a quiet 300 ms window means it has stopped; it must
+            // reach one well within the deadline and then stay quiet.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut settled = string_value(&mut engine, "String(nestedTicks)");
+            loop {
+                pump_page_for(
+                    &runtime,
+                    &mut engine,
+                    &mut task_rx,
+                    Duration::from_millis(300),
+                );
+                let ticks = string_value(&mut engine, "String(nestedTicks)");
+                if ticks == settled {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "a nested worker outlived its terminated owner ({tier:?})"
+                );
+                settled = ticks;
+            }
             pump_page_for(
                 &runtime,
                 &mut engine,
