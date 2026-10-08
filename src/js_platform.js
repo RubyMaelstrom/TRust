@@ -1472,6 +1472,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // HTML's already-started state belongs to the script object, not a global
     // forever-growing ID census. The native graph preserves a live wrapper.
     const SCRIPTS_STARTED = new WeakSet();
+    // The element's "already started" flag, also kept on the arena node so
+    // it outlives this wrapper and is seen when an ancestor is inserted.
+    function markScriptStarted(script) {
+        SCRIPTS_STARTED.add(script);
+        __dom_script_started(nodeIds.get(script));
+    }
     // DOM #concept-node-insert runs post-connection steps (preparing scripts)
     // only after every node of a DocumentFragment is inserted, so a script
     // that mutates the tree cannot interrupt that insertion.
@@ -1516,12 +1522,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // §"prepare the script element"). Letting it run loads the legacy
         // polyfill bundle a real browser never executes.
         if (ty!=="module"&&ty!=="importmap"&&node.hasAttribute("nomodule")) return;
-        // Only a script connected to the document runs (not one built up inside
-        // a detached fragment, which executes when ITS root is later inserted).
-        let n = node, connected = false;
-        while (n) { if (n.nodeType === 9) { connected = true; break; } n = n.parentNode; }
-        if (!connected) return;
-        SCRIPTS_STARTED.add(node);
+        // Only a connected script runs (one inside a shadow tree too); one in
+        // a detached subtree runs when that subtree's root is inserted.
+        if (!node.isConnected) return;
+        markScriptStarted(node);
         __dom_run_injected_script(nodeIds.get(node));
     }
     // A `<link rel=stylesheet href>` inserted into the live document is fetched
@@ -4602,7 +4606,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     trust.prepareParserScript = function (id) {
         const node = wrap(id);
         if (!node || !node.isConnected || SCRIPTS_STARTED.has(node)) return false;
-        SCRIPTS_STARTED.add(node);
+        markScriptStarted(node);
         return true;
     };
     // Fire a load/error event on an injected resource. GlobalEventHandlers
@@ -5884,14 +5888,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (deferredCeReactions !== null) deferredCeReactions.push(() => ceScan(node));
             else ceScan(node);
         }
-        // HTML's script, link and base insertion steps.
-        if (deferredScriptRuns !== null || (effects & INSERT_SCRIPT)) maybeRunScript(node);
-        if (effects & INSERT_LINK) maybeLoadStylesheet(node);
-        if (effects & INSERT_BASE) baseHrefCache = null;
+        // HTML's script, link and base post-connection steps, for each such
+        // element the insertion connected (the node or its descendants).
+        if (effects & (INSERT_SCRIPT | INSERT_LINK | INSERT_BASE)) insertionResourceSteps(node);
         // HTML's iframe post-connection steps can run author code (an
         // about:blank load event); they follow the operation's record too.
         if (deferredScriptRuns !== null) deferredScriptRuns.push(() => maybeProcessInsertedFrames(node, parent));
         else maybeProcessInsertedFrames(node, parent);
+    }
+    // The script, link and base elements an insertion connected, from the
+    // host in shadow-including tree order; already-started scripts excluded.
+    function insertionResourceSteps(node) {
+        const ids = __dom_insertion_resources(nodeIds.get(node));
+        for (let i = 0; i < ids.length; i++) {
+            const element = wrap(ids[i]);
+            const name = nodeLocalName(element);
+            if (name === "script") maybeRunScript(element);
+            else if (name === "link") maybeLoadStylesheet(element);
+            else baseHrefCache = null;
+        }
     }
     // DOM #concept-node-insert for one validated non-fragment node, before
     // `ref` (null appends). `silent` is the algorithm's suppressObservers
@@ -6220,9 +6235,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             else moEnqueue();
             // Reactions in enqueue order once the replacement is complete.
             if (CE.defs.size) { ceDisconnect(old); ceScan(n); }
-            maybeRunScript(n);
-            maybeLoadStylesheet(n);
-            if (internalsFor(n).trustLN === "base" || internalsFor(old).trustLN === "base") baseHrefCache = null;
+            insertionResourceSteps(n);
+            if (internalsFor(old).trustLN === "base") baseHrefCache = null;
             maybeProcessInsertedFrames(n, this);
             return old;
         }
@@ -13573,7 +13587,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 finishLoad();
             }
             function startResource(script, settled) {
-                SCRIPTS_STARTED.add(script);
+                markScriptStarted(script);
                 pendingResources++;
                 waitForFrameResource(script, function () {
                     __dom_run_injected_script(nodeIds.get(script));
@@ -13585,7 +13599,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 });
             }
             function runInline(script) {
-                SCRIPTS_STARTED.add(script);
+                markScriptStarted(script);
                 try {
                     // ScriptEvaluation retains the Realm's global lexical
                     // environment across sibling classic script elements.

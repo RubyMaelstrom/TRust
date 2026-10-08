@@ -9585,6 +9585,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__http_navigate_async", 4, host_http_navigate_async),
     ("__http_fetch_async", 5, host_http_fetch_async),
     ("__dom_run_injected_script", 1, guarded_run_injected_script),
+    ("__dom_script_started", 1, guarded_script_started),
+    ("__dom_insertion_resources", 1, guarded_insertion_resources),
     ("__dom_run_classic_script", 3, guarded_run_classic_script),
     (
         "__dom_fetch_classic_script",
@@ -10303,6 +10305,8 @@ node_access_guards! {
     guarded_load_frame = host_load_frame, [0], Invalidate;
     guarded_create_window_realm = host_create_window_realm, [1], Invalidate;
     guarded_run_injected_script = host_run_injected_script, [0], Invalidate;
+    guarded_script_started = host_script_started, [0], Invalidate;
+    guarded_insertion_resources = host_insertion_resources, [0], Invalidate;
     guarded_run_classic_script = host_run_classic_script, [0], Invalidate;
     guarded_fetch_classic_script = host_fetch_classic_script, [0], Invalidate;
     guarded_load_injected_stylesheet = host_load_injected_stylesheet, [0], Invalidate;
@@ -12957,6 +12961,29 @@ fn host_run_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
     let name = host_arg_string(ctx, args, 2);
     host_eval_inline_classic(ctx, node_id, &name, source);
     Ok(Value::Undefined)
+}
+
+/// `__dom_script_started(script)`: set the element's "already started" flag
+/// (HTML #already-started) when the prelude prepares it to run.
+fn host_script_started(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    if let Some(id) = host_arg_node(&dom, args, 0) {
+        dom.mark_script_started(id);
+    }
+    Ok(Value::Undefined)
+}
+
+/// `__dom_insertion_resources(node)`: see [`Dom::connected_insertion_resources`].
+fn host_insertion_resources(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let ids = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)
+            .map(|root| dom.connected_insertion_resources(root))
+            .unwrap_or_default()
+    };
+    Ok(host_ids_array(ctx, ids))
 }
 
 /// HTML §4.12.1.1 post-connection and prepare-the-script-element steps for scripts inserted
@@ -16594,13 +16621,18 @@ fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     if dom.may_affect_slot_assignment(parent) {
         effects |= 4;
     }
-    if matches!(dom.node(node).data, NodeData::Element { .. }) {
-        effects |= match dom.tag_name(node) {
-            Some("script") => 8,
-            Some("link") => 16,
-            Some("base") => 32,
-            _ => 0,
-        };
+    // HTML's post-connection steps for script, link and base elements among
+    // the inserted node's shadow-including inclusive descendants, once that
+    // node is connected in a document with scripting (see
+    // `Dom::connected_insertion_resources`).
+    if dom.is_dom_connected(parent) && dom.scripting_enabled_for(parent) {
+        for id in dom.connected_insertion_resources(node) {
+            effects |= match dom.tag_name(id) {
+                Some("script") => 8,
+                Some("link") => 16,
+                _ => 32,
+            };
+        }
     }
     Ok(Value::Num(effects as f64))
 }
@@ -22537,6 +22569,50 @@ mod tests {
         );
     }
 
+    /// HTML runs a script element's post-connection steps when an insertion
+    /// connects it, whether it is the inserted node or a descendant (shadow
+    /// trees included), in tree order. "Already started" scripts never run:
+    /// those the fragment parser created (Inert scripting mode), those that
+    /// already ran, and their clones (#already-started cloning steps).
+    #[test]
+    fn inserting_a_subtree_runs_its_scripts_once() {
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            globalThis.ran = [];
+            const script = text => { const s = document.createElement('script'); s.textContent = 'ran.push(' + JSON.stringify(text) + ')'; return s; };
+            const box = document.createElement('div');
+            const inner = document.createElement('p');
+            inner.append(script('nested-1'));
+            box.append(inner, script('nested-2'));
+            body.appendChild(box);
+            ran.push('|');
+            const parsed = document.createElement('div');
+            parsed.innerHTML = '<script>ran.push("innerHTML")<\/script>';
+            body.appendChild(parsed);
+            body.appendChild(parsed.firstChild);
+            ran.push('|');
+            const host = document.createElement('div');
+            host.attachShadow({ mode: 'open' }).appendChild(script('shadow'));
+            body.appendChild(host);
+            ran.push('|');
+            const holder = document.createElement('section'); body.appendChild(holder);
+            holder.appendChild(box);
+            ran.push('|');
+            body.appendChild(box.lastChild.cloneNode(true));
+            const fresh = script('clone-of-fresh');
+            body.appendChild(fresh.cloneNode(true));
+            return ran.join(',');
+        })()"#
+            ),
+            "nested-1,nested-2,|,|,shadow,|,|,clone-of-fresh"
+        );
+    }
+
     /// HTML's iframe insertion and removing steps run whenever a navigable
     /// container is in the inserted or removed subtree, at any depth and on
     /// every path; the frame-free fast path never skips them.
@@ -24175,7 +24251,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 212, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 214, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -24186,7 +24262,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 212);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 214);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

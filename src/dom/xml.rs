@@ -103,12 +103,25 @@ impl Dom {
     ) -> Option<Vec<NodeId>> {
         let (parsed, root) = self.xml_fragment_document(context, markup)?;
         let children: Vec<NodeId> = parsed.child_iter(root).collect();
-        Some(
-            children
-                .into_iter()
-                .map(|child| self.transplant(&parsed, child))
-                .collect(),
-        )
+        let copies: Vec<NodeId> = children
+            .into_iter()
+            .map(|child| self.transplant(&parsed, child))
+            .collect();
+        // HTML #parsing-xhtml-documents: a script element the XML parser
+        // creates for the XML fragment parsing algorithm is already started.
+        for &copy in &copies {
+            let mut scripts = Vec::new();
+            self.visit_shadow_including_subtree(copy, |id| {
+                if self.tag_name(id) == Some("script") {
+                    scripts.push(id);
+                }
+                true
+            });
+            for script in scripts {
+                self.mark_script_started(script);
+            }
+        }
+        Some(copies)
     }
 
     /// Whether `parse_xml_fragment` would succeed, without creating nodes.
