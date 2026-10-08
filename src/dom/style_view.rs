@@ -119,6 +119,17 @@ impl<'a> NodesRef<'a> {
         }
     }
 
+    /// DOM #concept-slotable: Element and Text nodes (CDATASection included).
+    #[inline]
+    pub(super) fn is_slottable(self, id: NodeId) -> bool {
+        self.0.get(id).is_some_and(|node| {
+            matches!(
+                node.data,
+                NodeData::Element { .. } | NodeData::Text(_) | NodeData::CData(_)
+            )
+        })
+    }
+
     /// The character data of a Text node.
     #[inline]
     pub(super) fn text(self, id: NodeId) -> Option<&'a str> {
@@ -191,6 +202,7 @@ pub(super) struct ViewState<'a> {
     pub(super) render_live: bool,
     pub(super) document_modes: &'a FxHashMap<NodeId, QuirksMode>,
     pub(super) cssom_inline: &'a FxHashMap<NodeId, cssom::Declarations>,
+    pub(super) manual_slots: &'a slotting::ManualSlots,
 }
 
 const _: () = {
@@ -229,6 +241,7 @@ impl Dom {
                 render_live: self.render_live,
                 document_modes: &self.document_modes,
                 cssom_inline: &self.cssom_inline,
+                manual_slots: &self.manual_slots,
             },
         }
     }

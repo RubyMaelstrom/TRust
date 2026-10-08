@@ -29,6 +29,7 @@ mod computed_cache;
 mod container_queries;
 mod counter_styles;
 pub(crate) mod cssom;
+pub(crate) mod custom_registry;
 mod focus;
 mod gc;
 mod generated;
@@ -57,9 +58,11 @@ pub(crate) fn css_transform_list_matrix(text: &str) -> Option<([f64; 16], bool)>
     properties::transform_list_matrix(text)
 }
 mod animations;
+mod move_node;
 mod rule_index;
 pub(crate) mod shadow;
 mod sheet_cache;
+mod slotting;
 mod svg_dependencies;
 pub(crate) mod svg_geometry;
 mod transitions;
@@ -603,6 +606,12 @@ pub struct Dom {
     /// and the reverse: shadow root fragment → host element.
     shadow_hosts: FxHashMap<NodeId, NodeId>,
     shadow_data: FxHashMap<NodeId, shadow::ShadowRootData>,
+    /// HTML #manually-assigned-nodes and DOM's manual slot assignment.
+    manual_slots: slotting::ManualSlots,
+    /// DOM #signal-slot-list and each slot's last signalled assignment.
+    slot_signals: slotting::SlotSignals,
+    /// Custom element registry associations (see `custom_registry`).
+    ce_registries: custom_registry::State,
     /// Set by every tree/attribute mutation; the living page takes it
     /// to decide whether a dispatch warrants re-extraction at all.
     dirty: bool,
@@ -1088,6 +1097,9 @@ impl Dom {
             shadow_roots,
             shadow_hosts,
             shadow_data,
+            manual_slots: _,
+            slot_signals: _,
+            ce_registries,
             dirty,
             epoch,
             window_names_epoch,
@@ -1298,6 +1310,8 @@ impl Dom {
         );
         fixed_map!(shadow_hosts, (NodeId, NodeId));
         fixed_map!(shadow_data, (NodeId, shadow::ShadowRootData));
+        bytes = bytes.saturating_add(self.slotting_retained_bytes());
+        bytes = bytes.saturating_add(ce_registries.retained_bytes());
         fixed_map!(geometry_dirty_nodes, (NodeId, DirtyKind));
         fixed_map!(adopted_styles, (NodeId, String));
         for text in adopted_styles.values() {
@@ -1622,6 +1636,9 @@ impl Dom {
             shadow_roots: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
             shadow_data: FxHashMap::default(),
+            manual_slots: slotting::ManualSlots::default(),
+            slot_signals: slotting::SlotSignals::default(),
+            ce_registries: custom_registry::State::default(),
             dirty: false,
             epoch: 0,
             window_names_epoch: 0,
@@ -2254,10 +2271,11 @@ impl Dom {
         false
     }
 
-    /// DOM Standard §4.2.2.3 "finding a slot": return the first slot in
-    /// the light parent's shadow tree whose name matches this slottable.  The
-    /// event dispatcher uses this as Node's `get the parent` algorithm; the
-    /// public `assignedSlot` IDL getter additionally hides closed-tree slots.
+    /// DOM #find-a-slot: the first slot in the light parent's shadow tree
+    /// whose name matches this slottable, or with manual slot assignment the
+    /// slot whose manually assigned nodes contain it. The event dispatcher
+    /// uses this as Node's `get the parent` algorithm; the public
+    /// `assignedSlot` IDL getter additionally hides closed-tree slots.
     pub fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
         self.style_view().assigned_slot(id)
     }
@@ -3446,7 +3464,7 @@ impl Dom {
         let tag = tag.to_ascii_lowercase();
         // Script-created templates need their content fragment exactly
         // like parser-created ones (Lit renders through them).
-        let template_contents = (tag == "template").then(|| self.new_node(NodeData::Fragment));
+        let template_contents = (tag == "template").then(|| self.new_template_contents());
         let name = QualName::new(None, ns!(html), tag.into());
         self.new_node(NodeData::Element {
             name,
@@ -3468,7 +3486,7 @@ impl Dom {
     ) -> NodeId {
         let namespace = Namespace::from(namespace);
         let template_contents = (namespace == ns!(html) && local_name == "template")
-            .then(|| self.new_node(NodeData::Fragment));
+            .then(|| self.new_template_contents());
         let name = QualName::new(prefix.map(Prefix::from), namespace, local_name.into());
         self.new_node(NodeData::Element {
             name,
@@ -3479,6 +3497,14 @@ impl Dom {
 
     pub fn create_text(&mut self, text: &str) -> NodeId {
         self.new_node(NodeData::Text(text.to_string()))
+    }
+
+    /// A template element's contents (HTML #template-contents): a
+    /// DocumentFragment of the inert template contents owner document.
+    fn new_template_contents(&mut self) -> NodeId {
+        let contents = self.new_node(NodeData::Fragment);
+        self.note_template_contents(contents);
+        contents
     }
 
     pub fn create_fragment(&mut self) -> NodeId {
@@ -3668,6 +3694,7 @@ impl Dom {
 
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
         let owner_document = self.nodes[parent].owner_document;
+        let registry_context = self.registry_context_before_insertion(child);
         self.detach(child);
         self.note_tree_style_mutation(Some(parent), child);
         let old_last = self.nodes[parent].last_child;
@@ -3680,6 +3707,7 @@ impl Dom {
         }
         self.nodes[parent].last_child = Some(child);
         self.set_owner_document_subtree(child, owner_document);
+        self.registries_after_insertion(child, registry_context);
         self.invalidate_style_subtree(child, true);
         self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
@@ -3881,6 +3909,7 @@ impl Dom {
         let owner_document = self.nodes[parent].owner_document;
         let mut previous = None;
         for child in new_children {
+            let registry_context = self.registry_context_before_insertion(child);
             debug_assert!(self.nodes[child].parent.is_none());
             debug_assert!(self.nodes[child].prev_sibling.is_none());
             debug_assert!(self.nodes[child].next_sibling.is_none());
@@ -3892,6 +3921,7 @@ impl Dom {
                 self.nodes[parent].first_child = Some(child);
             }
             self.set_owner_document_subtree(child, owner_document);
+            self.registries_after_insertion(child, registry_context);
             self.invalidate_style_subtree(child, true);
             previous = Some(child);
         }
@@ -3943,6 +3973,7 @@ impl Dom {
             reference
         };
         let owner_document = self.nodes[parent].owner_document;
+        let registry_context = self.registry_context_before_insertion(child);
         self.detach(child);
         self.note_tree_style_mutation(Some(parent), child);
         let prev = self.nodes[reference].prev_sibling;
@@ -3955,6 +3986,7 @@ impl Dom {
             None => self.nodes[parent].first_child = Some(child),
         }
         self.set_owner_document_subtree(child, owner_document);
+        self.registries_after_insertion(child, registry_context);
         self.invalidate_style_subtree(child, true);
         self.touch_content(Some(parent), &[child]);
         self.child_collection_changed(parent, child, true);
@@ -3978,8 +4010,12 @@ impl Dom {
             return Err(AdoptError::ShadowRoot);
         }
         let old_document = self.nodes[id].owner_document;
+        let registry_context = self.registry_context_before_insertion(id);
         self.detach(id);
         self.set_owner_document_subtree(id, document);
+        // An adopted copy of template contents leaves their inert document.
+        self.leave_inert_document(id);
+        self.registries_after_insertion(id, registry_context);
         if old_document != document {
             // DOM #concept-node-adopt changes the node document even for an
             // already detached tree, including its shadow descendants. There
@@ -8954,52 +8990,20 @@ impl Dom {
         stack[start..].reverse();
     }
 
-    /// The light-DOM nodes assigned to a `<slot>`, DOM #find-slotables: in a
-    /// shadow root with named slot assignment, each slottable child of the
-    /// host (an element or text node) whose slot name (its `slot` attribute,
-    /// else "") equals the slot's name (its `name` attribute, else "") — but
-    /// only for the first slot in tree order with that name (#find-a-slot),
-    /// so a later slot with the same name receives nothing. Empty when the
-    /// slot is not inside a shadow tree or nothing is assigned; the caller
-    /// then falls back to the slot's own children (its fallback content).
-    /// This projects a web component's light children into its shadow
-    /// `<slot>`s so the flat (rendered) tree is complete.
+    /// The slottables assigned to a `<slot>`, DOM #find-slotables: in a shadow
+    /// root with named slot assignment, each slottable child of the host (an
+    /// element or text node) whose slot name (its `slot` attribute, else "")
+    /// equals the slot's name (its `name` attribute, else "") — but only for
+    /// the first slot in tree order with that name (#find-a-slot), so a later
+    /// slot with the same name receives nothing; with manual slot assignment,
+    /// the slot's manually assigned nodes that are children of the host
+    /// (HTML #dom-slot-assign). Empty when the slot is not inside a shadow
+    /// tree or nothing is assigned; the caller then falls back to the slot's
+    /// own children (its fallback content). This projects a web component's
+    /// light children into its shadow `<slot>`s so the flat (rendered) tree
+    /// is complete.
     pub fn slot_assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
-        let mut cur = self.nodes[slot].parent;
-        let (shadow, host) = loop {
-            match cur {
-                Some(p) => {
-                    if let Some(&h) = self.shadow_hosts.get(&p) {
-                        if self
-                            .shadow_data
-                            .get(&p)
-                            .is_some_and(|data| data.manual_slot_assignment)
-                        {
-                            return Vec::new();
-                        }
-                        break (p, h);
-                    }
-                    cur = self.nodes[p].parent;
-                }
-                None => return Vec::new(),
-            }
-        };
-        let name = self.attr(slot, "name").unwrap_or("");
-        let first = self.descendants(shadow).find(|&candidate| {
-            self.tag_name(candidate) == Some("slot")
-                && self.attr(candidate, "name").unwrap_or("") == name
-        });
-        if first != Some(slot) {
-            return Vec::new();
-        }
-        self.child_iter(host)
-            .filter(|&child| {
-                matches!(
-                    self.nodes[child].data,
-                    NodeData::Element { .. } | NodeData::Text(_) | NodeData::CData(_)
-                ) && self.attr(child, "slot").unwrap_or("") == name
-            })
-            .collect()
+        self.style_view().find_slottables(slot)
     }
 
     /// Return the flattened slottables represented by `slot`. HTML's
@@ -9379,6 +9383,7 @@ impl Dom {
         content_type: &str,
     ) {
         let document = self.parse_xml_document_into(source, content_type);
+        self.set_window_document_registry(document);
         for c in self.children(frame) {
             if matches!(self.nodes[c].data, NodeData::Document) {
                 self.detach(c);
@@ -9417,6 +9422,9 @@ impl Dom {
             }
         }
         let document = self.create_document(doc.document_content_type(DOCUMENT));
+        // A navigable's active Document is its Window's associated Document,
+        // created with the Window's custom element registry.
+        self.set_window_document_registry(document);
         // The parsed Document's children in order: its doctype and the
         // comments and processing instructions around the root element are
         // part of the frame's document (DOM #concept-document, HTML
@@ -9429,6 +9437,7 @@ impl Dom {
                 new_html = Some(copy);
             }
         }
+        self.settle_parsed_slot_assignments(false);
         let new_html = new_html?;
         self.append(frame, document);
         self.document_modes
@@ -9653,12 +9662,51 @@ impl Dom {
     /// template always owns a fresh content fragment, populated when
     /// deep (webcomponents-loader probes exactly this).
     pub fn clone_subtree(&mut self, id: NodeId, deep: bool) -> NodeId {
-        self.clone_subtree_with(id, deep, false)
+        self.clone_node(id, deep, None, custom_registry::CeRegistry::Null)
+    }
+
+    /// DOM #concept-node-clone with a `document` other than the node's node
+    /// document and a fallback registry (`Document.importNode()`).
+    pub(crate) fn clone_subtree_into(
+        &mut self,
+        id: NodeId,
+        deep: bool,
+        document: NodeId,
+        fallback: custom_registry::CeRegistry,
+    ) -> NodeId {
+        self.clone_node(id, deep, Some(document), fallback)
+    }
+
+    fn clone_node(
+        &mut self,
+        id: NodeId,
+        deep: bool,
+        document: Option<NodeId>,
+        fallback: custom_registry::CeRegistry,
+    ) -> NodeId {
+        // importNode() clones into its Document, which also takes a copy of
+        // template contents out of their inert document.
+        let document = document.filter(|&document| {
+            matches!(self.nodes[document].data, NodeData::Document)
+                && !matches!(self.nodes[id].data, NodeData::Document)
+        });
+        let (registries, inert_copy) = self.clone_registries(id, document, fallback);
+        let copy = self.clone_subtree_with(id, deep, false, document, registries);
+        self.note_clone_root(copy, inert_copy);
+        copy
     }
 
     /// `inert`: the copy lands in template contents, whose node document is
     /// never fully active (HTML #template-contents), so its images never load.
-    fn clone_subtree_with(&mut self, id: NodeId, deep: bool, inert: bool) -> NodeId {
+    /// `document` replaces the source's node document for the copies.
+    fn clone_subtree_with(
+        &mut self,
+        id: NodeId,
+        deep: bool,
+        inert: bool,
+        document: Option<NodeId>,
+        registries: custom_registry::CloneRegistries,
+    ) -> NodeId {
         let data = match &self.nodes[id].data {
             NodeData::Document => NodeData::Document,
             NodeData::Fragment => NodeData::Fragment,
@@ -9683,6 +9731,7 @@ impl Dom {
             } => Some(*c),
             _ => None,
         };
+        let is_element = matches!(data, NodeData::Element { .. });
         let copy = self.new_node(data);
         if !inert {
             self.note_created_image(copy);
@@ -9695,8 +9744,12 @@ impl Dom {
             // DOM #concept-node-clone: a document copy keeps its encoding.
             let encoding = self.document_encoding(id);
             self.set_document_encoding(copy, encoding);
+            self.clone_document_registry(id, copy);
         } else {
-            self.nodes[copy].owner_document = self.nodes[id].owner_document;
+            self.nodes[copy].owner_document = document.unwrap_or(self.nodes[id].owner_document);
+        }
+        if is_element {
+            self.clone_element_registry(id, copy, registries);
         }
         if let Some(value) = self.input_values.get(&id).cloned() {
             self.input_values.insert(copy, value);
@@ -9716,16 +9769,24 @@ impl Dom {
             self.started_scripts.insert(copy);
         }
         if let Some(sc) = src_content {
-            let frag = self.new_node(NodeData::Fragment);
+            let frag = self.new_template_contents();
             if let NodeData::Element {
                 template_contents, ..
             } = &mut self.nodes[copy].data
             {
                 *template_contents = Some(frag);
             }
+            self.nodes[frag].owner_document = self.nodes[copy].owner_document;
             if deep {
+                // HTML template cloning steps clone the contents into the
+                // copy's (inert) template contents, without a fallback.
+                let inert_registries = custom_registry::CloneRegistries {
+                    source_default: custom_registry::CeRegistry::Null,
+                    document: custom_registry::CeRegistry::Null,
+                    fallback: custom_registry::CeRegistry::Null,
+                };
                 for c in self.children(sc) {
-                    let cc = self.clone_subtree_with(c, true, true);
+                    let cc = self.clone_subtree_with(c, true, true, document, inert_registries);
                     self.append(frag, cc);
                 }
             }
@@ -9736,22 +9797,30 @@ impl Dom {
                 if matches!(self.nodes[c].data, NodeData::Document) {
                     continue;
                 }
-                let cc = self.clone_subtree_with(c, true, inert);
+                let cc = self.clone_subtree_with(c, true, inert, document, registries);
                 self.append(copy, cc);
             }
         }
         // DOM #concept-node-clone copies a clonable shadow tree even for a
-        // shallow host clone; its shadow children are always copied deeply.
+        // shallow host clone; its shadow children are always copied deeply,
+        // without the fallback registry.
         if let Some(root) = self.shadow_root(id)
             && let Some(data) = self.shadow_data.get(&root).copied()
             && data.clonable
         {
             let copy_root = self.attach_shadow(copy);
             self.shadow_data.insert(copy_root, data);
+            self.clone_shadow_registry(root, copy_root, registries);
+            let shadow_registries = custom_registry::CloneRegistries {
+                fallback: custom_registry::CeRegistry::Null,
+                ..registries
+            };
             for child in self.children(root) {
-                let cc = self.clone_subtree_with(child, true, inert);
+                let cc = self.clone_subtree_with(child, true, inert, document, shadow_registries);
                 self.append(copy_root, cc);
             }
+            // Appending the shadow children assigns the copy's slots.
+            self.note_parsed_shadow_root(copy_root);
         }
         copy
     }
@@ -9820,13 +9889,9 @@ impl Dom {
         }
     }
 
-    /// HTML #fragment-parsing-algorithm-steps for markup inserted relative to
-    /// `target`, whose node document chooses the parser: the XML fragment
-    /// parsing algorithm in an XML document, otherwise the HTML one. The
-    /// context is `context` (an element), or a new body element when None.
-    /// A ShadowRoot or template-contents target parses in its host's context.
-    /// `None` reports an XML well-formedness error (a SyntaxError); with
-    /// `check_only` no nodes are created.
+    /// [`Self::fragment_parse_from`] with `target` as the algorithm's target
+    /// and without declarative shadow roots.
+    #[cfg(test)]
     pub(crate) fn fragment_parse(
         &mut self,
         target: NodeId,
@@ -9834,14 +9899,39 @@ impl Dom {
         markup: &str,
         check_only: bool,
     ) -> Option<Vec<NodeId>> {
-        self.fragment_parse_with_shadow_roots(target, context, markup, check_only, false)
+        self.fragment_parse_from(target, target, context, markup, check_only, false)
     }
 
-    /// The HTML fragment parsing algorithm with allowDeclarativeShadowRoots
-    /// (HTML #unsafely-set-html for setHTMLUnsafe()).
-    pub(crate) fn fragment_parse_with_shadow_roots(
+    /// The fragment parsing algorithm steps for markup inserted beside or
+    /// into `target` (HTML #dom-element-insertadjacenthtml and the outerHTML
+    /// setter), whose target is the context element, or a new body element
+    /// of the node document when the context is not an element.
+    pub(crate) fn fragment_parse_adjacent(
         &mut self,
         target: NodeId,
+        context: Option<NodeId>,
+        markup: &str,
+        check_only: bool,
+    ) -> Option<Vec<NodeId>> {
+        let registry_source =
+            context.unwrap_or_else(|| self.owner_document(target).unwrap_or(target));
+        self.fragment_parse_from(target, registry_source, context, markup, check_only, false)
+    }
+
+    /// HTML #fragment-parsing-algorithm-steps for markup inserted relative to
+    /// `target`, whose node document chooses the parser: the XML fragment
+    /// parsing algorithm in an XML document, otherwise the HTML one. The
+    /// context is `context` (an element), or a new body element when None.
+    /// A ShadowRoot or template-contents target parses in its host's context.
+    /// `None` reports an XML well-formedness error (a SyntaxError); with
+    /// `check_only` no nodes are created. `registry_source` is the
+    /// algorithm's target, whose custom element registry the parsed elements
+    /// receive; `declarative_shadow_roots` is allowDeclarativeShadowRoots
+    /// (HTML #unsafely-set-html for setHTMLUnsafe()).
+    pub(crate) fn fragment_parse_from(
+        &mut self,
+        target: NodeId,
+        registry_source: NodeId,
         context: Option<NodeId>,
         markup: &str,
         check_only: bool,
@@ -9859,13 +9949,36 @@ impl Dom {
                     .xml_fragment_well_formed(context, markup)
                     .then(Vec::new);
             }
-            return self.parse_xml_fragment(context, markup);
+            let nodes = self.parse_xml_fragment(context, markup)?;
+            self.settle_parsed_fragment(registry_source, document, &nodes);
+            return Some(nodes);
         }
         if check_only {
             return Some(Vec::new());
         }
         let scripting = self.scripting_enabled_for(target);
-        Some(self.parse_html_fragment_with(context, markup, scripting, declarative_shadow_roots))
+        let nodes =
+            self.parse_html_fragment_with(context, markup, scripting, declarative_shadow_roots);
+        self.settle_parsed_fragment(registry_source, document, &nodes);
+        self.settle_parsed_slot_assignments(true);
+        Some(nodes)
+    }
+
+    /// HTML #html-fragment-parsing-algorithm creates the fragment's nodes in
+    /// the target's node document, each element with the registry looked up
+    /// for its intended parent (see `apply_parsed_registry`).
+    fn settle_parsed_fragment(
+        &mut self,
+        registry_source: NodeId,
+        document: NodeId,
+        nodes: &[NodeId],
+    ) {
+        for &node in nodes {
+            if self.nodes[node].owner_document != document {
+                self.set_owner_document_subtree(node, document);
+            }
+        }
+        self.apply_parsed_registry(registry_source, nodes);
     }
 
     fn parse_fragment_with(
@@ -9941,6 +10054,9 @@ impl Dom {
             let cc = self.transplant(&src, c);
             self.append(doc, cc);
         }
+        // The parser's insertions signal the slot changes of the declarative
+        // shadow trees it built (DOM #concept-node-insert step 7.4).
+        self.settle_parsed_slot_assignments(true);
         doc
     }
 
@@ -9979,11 +10095,16 @@ impl Dom {
         if other.started_scripts.contains(&id) {
             self.started_scripts.insert(copy);
         }
+        // A parsed element's registry comes from its intended parent; only
+        // those differing from the parse's Document were recorded.
+        if let Some(registry) = other.recorded_element_registry(id) {
+            self.record_element_registry(copy, registry);
+        }
         if !inert {
             self.note_created_image(copy);
         }
         if let Some(sc) = src_content {
-            let frag = self.new_node(NodeData::Fragment);
+            let frag = self.new_template_contents();
             if let NodeData::Element {
                 template_contents, ..
             } = &mut self.nodes[copy].data
@@ -10003,7 +10124,10 @@ impl Dom {
         // preserve every parsed shadow tree regardless of its clonable flag.
         if let Some(root) = other.shadow_root(id) {
             let copy_root = self.attach_shadow(copy);
-            self.shadow_data.insert(copy_root, other.shadow_data[&root]);
+            let data = other.shadow_data[&root];
+            self.shadow_data.insert(copy_root, data);
+            self.note_copied_shadow_data(&data);
+            self.note_parsed_shadow_root(copy_root);
             for child in other.child_iter(root) {
                 let cc = self.transplant_with(other, child, inert);
                 self.append_fresh(copy_root, cc);
@@ -10229,6 +10353,9 @@ impl Dom {
         }
         if data.clonable {
             out.push_str(" shadowrootclonable=\"\"");
+        }
+        if self.serialize_registry_attribute(root) {
+            out.push_str(" shadowrootcustomelementregistry=\"\"");
         }
         out.push('>');
         for c in self.child_iter(root) {
@@ -12126,25 +12253,7 @@ impl<'a> StyleView<'a> {
 
     /// See `Dom::assigned_slot`.
     pub(super) fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
-        let host = self.nodes.parent_of(id)?;
-        let shadow = self.shadow_root(host)?;
-        if self
-            .state
-            .shadow_data
-            .get(&shadow)
-            .is_some_and(|data| data.manual_slot_assignment)
-        {
-            return None;
-        }
-        // Only elements and text nodes are slottables; names compare exactly.
-        if !self.nodes.is_element(id) && self.nodes.text(id).is_none() {
-            return None;
-        }
-        let wanted = self.attr(id, "slot").unwrap_or("");
-        self.descendants(shadow).find(|&candidate| {
-            self.tag_name(candidate) == Some("slot")
-                && self.attr(candidate, "name").unwrap_or("") == wanted
-        })
+        self.find_a_slot(id)
     }
 
     /// See `Dom::frame_body`.
@@ -21865,6 +21974,12 @@ impl TreeSink for Sink {
         if dom.nodes.len() > 1 {
             dom.touch();
         }
+        // The content of a declarative shadow root with a null registry was
+        // created with that registry; the parsed shadow trees' slots already
+        // have their slottables.
+        let roots = dom.parsed_shadow_roots().to_vec();
+        dom.settle_parsed_registries(&roots);
+        dom.settle_parsed_slot_assignments(false);
         // Parser handles do not escape this completed parse. Connected trees are native roots;
         // binding-created nodes acquire their own short-lived leases when allocated later.
         dom.clear_gc_allocation_leases();
@@ -21886,7 +22001,7 @@ impl TreeSink for Sink {
 
     fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> NodeId {
         let mut dom = self.dom.borrow_mut();
-        let contents = flags.template.then(|| dom.new_node(NodeData::Fragment));
+        let contents = flags.template.then(|| dom.new_template_contents());
         dom.new_node(NodeData::Element {
             name,
             attrs,

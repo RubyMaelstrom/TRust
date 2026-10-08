@@ -11,6 +11,11 @@ pub(crate) struct ShadowRootData {
     pub serializable: bool,
     pub clonable: bool,
     pub manual_slot_assignment: bool,
+    /// DOM's ShadowRoot custom element registry, when it differs from the
+    /// node document's (see `custom_registry`).
+    pub registry: Option<super::custom_registry::CeRegistry>,
+    /// DOM's ShadowRoot "keep custom element registry null".
+    pub keep_registry_null: bool,
 }
 
 impl Dom {
@@ -129,6 +134,12 @@ impl Dom {
         if !mode.eq_ignore_ascii_case("open") && !mode.eq_ignore_ascii_case("closed") {
             return false;
         }
+        // HTML #parsing-main-inhead: a `shadowrootcustomelementregistry`
+        // attribute gives the shadow root a null registry it keeps when
+        // adopted; otherwise it has the host's node document's registry.
+        let keep_registry_null = self
+            .attr(template, "shadowrootcustomelementregistry")
+            .is_some();
         let data = ShadowRootData {
             closed: mode.eq_ignore_ascii_case("closed"),
             declarative: true,
@@ -138,17 +149,25 @@ impl Dom {
             manual_slot_assignment: self
                 .attr(template, "shadowrootslotassignment")
                 .is_some_and(|value| value.eq_ignore_ascii_case("manual")),
+            ..Default::default()
         };
         let root = self.attach_shadow(host);
         self.shadow_data.insert(root, data);
+        if keep_registry_null {
+            self.set_shadow_registry(root, super::custom_registry::CeRegistry::Null, true);
+        }
+        self.note_parsed_shadow_root(root);
         // The tree builder keeps the template on its stack but does not insert
         // it in the light tree. Redirect subsequent parser insertions directly
         // into the shadow root, including nested declarations and raw text.
         if let NodeData::Element {
             template_contents, ..
         } = &mut self.nodes[template].data
+            && let Some(old) = template_contents.replace(root)
         {
-            *template_contents = Some(root);
+            // The template's own (now unreachable) contents fragment is no
+            // longer a template contents root.
+            self.ce_registries.inert_roots_remove(old);
         }
         true
     }

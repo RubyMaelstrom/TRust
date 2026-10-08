@@ -7209,17 +7209,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // `class X extends HTMLElement { constructor(){ super(); ... } }`
     // initializes the EXISTING wrapper.
     function createCustomElementState() {
-        return { defs: new Map(), tags: new Map(), definitions: new Map(), waiting: new Map(), upgrading: null,
-            running: false };
+        return { defs: new Map(), tags: new Map(), definitions: new Map(), waiting: new Map(), running: false };
     }
     function customElementStateForWindow(windowState) {
         return windowState.customElementState ||
             (windowState.customElementState = createCustomElementState());
     }
-    // HTML §4.13.4 associates the global custom-element registry with the
-    // Window's Document. `enterFrame` switches this reference alongside the
-    // active Document, avoiding a proxy/map lookup on every DOM mutation.
-    let CE = customElementStateForWindow(topWindowState);
+    // Whether any custom element registry of this Realm has a definition:
+    // until then no element can be upgraded or have reactions.
+    let ceDefined = false;
     // EventTarget is the root of the node + window hierarchy (Node and Window
     // both extend it), so the spec's listener methods live here ONCE and
     // everything inherits them. It must be declared before Node/Window (class
@@ -7297,9 +7295,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         if (effects & INSERT_LISTENERS) syncWrapperSubtreeRetention(id);
         if (effects & INSERT_FORM_STATE) formStateSubtreeChanged(node, true);
-        if (effects & INSERT_SLOTS) slotQueueCheck(parent);
+        if (effects & INSERT_SLOTS) slotQueueCheck(parent, true);
         if (!silent) moChildInsert(parent, node);
-        if (CE.defs.size) {
+        if (ceDefined) {
             if (deferredCeReactions !== null) deferredCeReactions.push(() => ceScan(node));
             else ceScan(node);
         }
@@ -7366,20 +7364,88 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (effects & REMOVE_FRAMES) {
             destroyFrameNavigablesIn(c);
             syncWrapperSubtreeRetention(id);
-            slotQueueCheck(parent);
+            slotQueueCheck(parent, true);
+            slotCheckId(id);
         } else {
             if (effects & REMOVE_LISTENERS) syncWrapperSubtreeRetention(id);
-            if (effects & REMOVE_SLOTS) slotQueueCheck(parent);
+            if (effects & REMOVE_SLOTS) { slotQueueCheck(parent, true); slotCheckId(id); }
         }
         if (effects & REMOVE_FORM_STATE) formStateSubtreeChanged(c, false);
         // HTML #cereactions: disconnectedCallback runs once the removal is
         // complete (after an enclosing operation's, when one is deferring).
-        if (CE.defs.size) {
+        if (ceDefined) {
             if (deferredCeReactions !== null) deferredCeReactions.push(() => ceDisconnect(c));
             else ceDisconnect(c);
         }
         if (faceElements.size) faceIdTreeChanged();
         return c;
+    }
+    // DOM #dom-parentnode-movebefore and #concept-node-move. A move is not a
+    // removal followed by an insertion: no removing or insertion steps run,
+    // so focus, form-control state, a child navigable and an already started
+    // script survive. The arena validates (steps 1–6) and relocates the node
+    // (steps 7–20); the observable steps around it follow the algorithm's
+    // order: the live range and NodeIterator pre-remove steps, slot
+    // assignment, the HTML moving steps, two mutation records, and then the
+    // custom element reactions ([CEReactions]).
+    function moveBeforeSteps(parent, node, child, argumentCount) {
+        if (argumentCount < 2) throw new TypeError("Failed to execute 'moveBefore': 2 arguments required.");
+        const parentId = nodeIds.get(parent);
+        if (parentId === undefined) throw new TypeError("Illegal invocation");
+        nodeArgument(node, "moveBefore", 1);
+        // `Node? child`: undefined converts to null.
+        if (child === undefined) child = null;
+        if (child !== null) nodeArgument(child, "moveBefore", 2);
+        const nodeId = nodeIds.get(node);
+        // An Attr is its own shadow-including root (step 1).
+        if (nodeId === undefined)
+            throw new DOMException("The node cannot be moved to this position.", "HierarchyRequestError");
+        // moveBefore() steps 1–2: the reference child.
+        let reference = child;
+        if (reference !== null && nodeIds.get(reference) === nodeId) reference = wrap(__dom_next(nodeId));
+        const referenceId = reference === null ? null : nodeIds.get(reference);
+        const foreign = reference !== null && referenceId === undefined;
+        preInsertResult(__dom_move_before(parentId, nodeId, foreign ? null : referenceId, foreign, true), false);
+        // Steps 7–12, at the node's old position.
+        const oldParent = rangeParent(node);
+        const oldIndex = liveRangesExist() ? rangeIndex(node) : 0;
+        if (liveNodeIterators.size) nodeIteratorsPreRemove(node);
+        const recording = MO.length && moHasChildList;
+        const oldPrevious = recording ? wrap(__dom_prev(nodeId)) : null;
+        const oldNext = recording ? wrap(__dom_next(nodeId)) : null;
+        // HTML #the-input-element: a checked radio button whose form owner
+        // changes unchecks the other buttons of its radio button group.
+        const controls = __dom_input(nodeId, "subtree-controls", null);
+        let radios = null;
+        if (controls) {
+            for (let i = 0; i + 2 < controls.length; i += 3)
+                if (controls[i] === 1) (radios || (radios = [])).push([controls[i + 1], __dom_form_owner(controls[i + 1])]);
+        }
+        preInsertResult(__dom_move_before(parentId, nodeId, referenceId, false, false), false);
+        rangesRemove(node, oldParent, oldIndex);
+        rangesInsert(parent, node);
+        // Steps 14–16 and 20: slot assignment of both trees, including a
+        // slot's fallback content.
+        slotQueueCheck(oldParent, true);
+        slotQueueCheck(parent, true);
+        // Step 21: the HTML moving steps. An option updates its nearest
+        // ancestor select; a moved base element changes the base URL.
+        if (controls) {
+            formStateSubtreeChanged(node, false);
+            if (radios) for (const [id, owner] of radios) if (__dom_form_owner(id) !== owner) uncheckRadioGroup(wrap(id));
+        }
+        baseHrefCache = null;
+        // Steps 22–23.
+        if (recording) {
+            moNotify({ type: "childList", target: oldParent, removedNodes: [node],
+                previousSibling: oldPrevious, nextSibling: oldNext });
+            moNotify({ type: "childList", target: parent, addedNodes: [node],
+                previousSibling: wrap(__dom_prev(nodeId)), nextSibling: reference });
+        } else moEnqueue();
+        // Step 21.3's connectedMoveCallback reactions, and form-associated
+        // custom elements' moving steps.
+        if (ceDefined) ceMoved(node, !!__dom_is_connected(parentId));
+        if (faceElements.size) faceIdTreeChanged();
     }
     const objectIsPrototypeOf = Object.prototype.isPrototypeOf;
     // The interface names of the HTML element interface prototype objects,
@@ -7397,20 +7463,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // returned; otherwise `self` becomes a new element that is already
     // custom, and null is returned.
     function htmlElementConstructorSteps(newTarget, prototype, self) {
-        const definition = CE.definitions.get(newTarget);
+        // Steps 2–5: the registry is the constructor's active registry, else
+        // the current global object's associated Document's.
+        const documentDefault = documentRegistry(g.document);
+        const registry = activeConstructorRegistries.has(newTarget)
+            ? activeConstructorRegistries.get(newTarget) : documentDefault;
+        const definition = registry ? internalsOf(registry).state.definitions.get(newTarget) : undefined;
         if (!definition) throw new TypeError("Illegal constructor");
         const base = elementInterfaceOfPrototype(prototype);
         if (definition.name === definition.localName ? base !== "HTMLElement"
             : base !== htmlInterfaceName(definition.localName))
             throw new TypeError("Illegal constructor");
-        const upgrading = CE.upgrading;
-        if (upgrading !== null && upgrading.definition === definition) {
-            // The construction stack's entry is replaced by the already
-            // constructed marker.
-            CE.upgrading = null;
-            Object.setPrototypeOf(upgrading.element, prototype);
-            return upgrading.element;
+        const stack = definition.constructionStack;
+        if (stack.length) {
+            // Steps 12–15: the construction stack's last entry, replaced by
+            // the already constructed marker.
+            const element = stack[stack.length - 1];
+            if (element === ALREADY_CONSTRUCTED)
+                throw new TypeError("The custom element has already been constructed");
+            Object.setPrototypeOf(element, prototype);
+            stack[stack.length - 1] = ALREADY_CONSTRUCTED;
+            return element;
         }
+        // Step 9: a new element of the current global's associated Document,
+        // already custom, with `registry`.
         const id = __dom_create_element(definition.localName, nodeIds.get(g.document));
         nodeIds.set(self, id);
         seedElementName(self, definition.localName, HTML_NS, null);
@@ -7419,6 +7495,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         slots.ceDefinition = definition;
         slots.ceUpgraded = true;
         rememberWrapper(id, self);
+        setCreatedElementRegistry(self, registry, registry === documentDefault);
         if (definition.name !== definition.localName) setElementIsValue(self, definition.name);
         setCustomElementDefined(self, true);
         return null;
@@ -7440,8 +7517,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         else if (removedRoots.length || __dom_children(id).length) moEnqueue();
         syncKnownWrapperRetention(removedWrapperIds, false);
         baseHrefCache = null;
-        if (CE.defs.size) { for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]); ceScan(target); }
-        slotQueueCheck(target);
+        if (ceDefined) { for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]); ceScan(target); }
+        if (__dom_slot_scope(id)) {
+            slotCheckId(id, true);
+            for (let i = 0; i < removedRoots.length; i++) slotCheckId(removedRoots[i]);
+        }
+        // Declarative shadow trees parsed by setHTMLUnsafe() assigned slots.
+        if (declarative) slotNoteNativeSignals();
         if (target.nodeType === 1) formStateContentReplaced(target);
         // HTML §4.8.6: innerHTML insertion still processes iframe
         // attributes and starts each newly inserted nested navigable.
@@ -7545,9 +7627,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     for (let i = 0; i < removedRoots.length; i++)
                         syncWrapperSubtreeRetention(removedRoots[i]);
                 }
-                slotQueueCheck(this);
+                if (__dom_slot_scope(id)) {
+                    slotCheckId(id, true);
+                    for (let i = 0; i < removedRoots.length; i++) slotCheckId(removedRoots[i]);
+                }
                 // DOM #string-replace-all removes each child (#concept-node-remove).
-                if (CE.defs.size) for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]);
+                if (ceDefined) for (let i = 0; i < removedRoots.length; i++) ceDisconnect(removedRoots[i]);
                 return;
             }
             if (t === 3 || t === 4 || t === 7 || t === 8) { const old = __dom_text(nodeIds.get(this)); __dom_set_text(nodeIds.get(this), v); moCharData(this, old); return; }
@@ -7560,8 +7645,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             for (let i = 0; i < removed.length; i++)
                 syncWrapperSubtreeRetention(nodeIds.get(removed[i]));
             moChildBulk(this, removed, Array.from(this.childNodes));
-            slotQueueCheck(this);
-            if (CE.defs.size) for (let i = 0; i < removed.length; i++) ceDisconnect(removed[i]);
+            if (__dom_slot_scope(nodeIds.get(this))) {
+                slotQueueCheck(this, true);
+                for (let i = 0; i < removed.length; i++) slotQueueCheck(removed[i]);
+            }
+            if (ceDefined) for (let i = 0; i < removed.length; i++) ceDisconnect(removed[i]);
         }
         get nodeValue() {
             const t = this.nodeType;
@@ -7714,12 +7802,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             __dom_detach(nodeIds.get(old));
             destroyFrameNavigablesIn(old);
             syncWrapperSubtreeRetention(nodeIds.get(old));
-            slotQueueCheck(this);
+            slotQueueCheck(this, true);
+            slotQueueCheck(old);
             if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
             else moEnqueue();
             // Reactions in enqueue order once the replacement is complete.
-            if (CE.defs.size) { ceDisconnect(old); ceScan(n); }
+            if (ceDefined) { ceDisconnect(old); ceScan(n); }
             insertionResourceSteps(n);
             if (internalsFor(old).trustLN === "base") baseHrefCache = null;
             maybeProcessInsertedFrames(n, this);
@@ -7795,9 +7884,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // parser-inserted one, so its force-async flag starts true.
             if (clone instanceof HTMLScriptElement) internalsFor(clone).trustForceAsync = true;
             // DOM #concept-node-clone creates each element with the
-            // synchronous custom elements flag unset: a defined one is
-            // upgraded (at the [CEReactions] checkpoint), connected or not.
-            if (CE.defs.size) ceScan(clone, true);
+            // synchronous custom elements flag unset and the source's
+            // registry: one defined there is upgraded (at the [CEReactions]
+            // checkpoint), connected or not.
+            if (ceDefined) ceScan(clone, true);
+            slotNoteNativeSignals();
             return clone;
         }
         contains(o) { while (o) { if (o === this) return true; o = o.parentNode; } return false; }
@@ -8987,22 +9078,41 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // element has no `content` property, so a framework's `.content = …`
         // property binding (lit's PropertyPart) now sets a plain expando here.
         attachShadow(init) {
-            if (!init || (typeof init !== "object" && typeof init !== "function"))
-                throw new TypeError("ShadowRootInit is required");
-            const mode = domString(init.mode);
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'attachShadow': 1 argument required");
+            // Web IDL ShadowRootInit: members convert in lexicographic order;
+            // `mode` is required. customElementRegistry accepts undefined (not
+            // present) and null (DOM #dom-element-attachshadow note).
+            if (init !== null && init !== undefined && typeof init !== "object" && typeof init !== "function")
+                throw new TypeError("ShadowRootInit must be a dictionary");
+            const member = name => init === null || init === undefined ? undefined : init[name];
+            const clonable = !!member("clonable");
+            const registryValue = member("customElementRegistry");
+            const registryGiven = registryValue !== undefined;
+            const givenRegistry = registryValue === undefined || registryValue === null
+                ? null : customElementRegistryArgument(registryValue);
+            const delegatesFocus = !!member("delegatesFocus");
+            const modeValue = member("mode");
+            if (modeValue === undefined) throw new TypeError("ShadowRootInit's mode is required");
+            const mode = domString(modeValue);
             if (mode !== "open" && mode !== "closed") throw new TypeError("Invalid shadow root mode");
-            const delegatesFocus = !!init.delegatesFocus;
-            const serializable = !!init.serializable;
-            const clonable = !!init.clonable;
-            const slotAssignment = init.slotAssignment === undefined ? "named" : domString(init.slotAssignment);
+            const serializable = !!member("serializable");
+            const slotValue = member("slotAssignment");
+            const slotAssignment = slotValue === undefined ? "named" : domString(slotValue);
             if (slotAssignment !== "named" && slotAssignment !== "manual")
                 throw new TypeError("Invalid slot assignment");
+            // DOM #dom-element-attachshadow steps 1–3: the node document's
+            // registry unless one is given, which must be scoped or that
+            // document's.
+            const nodeDocument = nodeDocumentForRegistry(this);
+            const registry = registryGiven ? givenRegistry : documentRegistry(nodeDocument);
+            if (registry !== null && !internalsOf(registry).scoped && registry !== documentRegistry(nodeDocument))
+                throw new DOMException("The custom element registry belongs to another document", "NotSupportedError");
             // DOM #concept-attach-a-shadow-root step 3: a custom element
             // definition can disable shadow roots.
             const localName = htmlElementName(this);
             const isValue = localName ? elementIsValue(this) : null;
             if (localName && (isValidCustomElementName(localName) || isValue !== null)) {
-                const definition = lookupCustomElementDefinition(CE, HTML_NS, localName, isValue);
+                const definition = lookupRegistryDefinition(elementRegistry(this), HTML_NS, localName, isValue);
                 if (definition && definition.disableShadow)
                     throw new DOMException("Shadow roots are disabled for this custom element", "NotSupportedError");
             }
@@ -9010,7 +9120,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const removed = previous ? Array.from(previous.childNodes) : [];
             const removedIds = previous ? snapshotRemovedWrapperSubtrees(previous, removed.map(n => nodeIds.get(n))) : [];
             const id = __dom_attach_shadow(nodeIds.get(this), mode === "closed", delegatesFocus,
-                serializable, clonable, slotAssignment === "manual");
+                serializable, clonable, slotAssignment === "manual", registryGiven ? registryCode(registry) : undefined);
             if (id === null) throw new DOMException("Cannot attach a shadow root", "NotSupportedError");
             const sr = wrap(id);
             // A new shadow root is available to element internals when its
@@ -9026,7 +9136,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 // tree order. Record the same sibling boundaries as those
                 // sequential removals, after native validation succeeds.
                 for (let i = 0; i < removed.length; i++) {
-                    if (CE.defs.size) ceDisconnect(removed[i]);
+                    if (ceDefined) ceDisconnect(removed[i]);
                     destroyFrameNavigablesIn(removed[i]);
                     if (MO.length) moRetainTransient(sr, removed[i]);
                     if (MO.length && moHasChildList) moNotify({
@@ -9035,13 +9145,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     });
                     else moEnqueue();
                 }
-                slotQueueCheck(sr);
+                slotQueueCheck(sr, true);
+                for (let i = 0; i < removed.length; i++) slotQueueCheck(removed[i]);
             }
             return sr;
         }
         get shadowRoot() {
             const root = internalsOf(this).sr || wrap(__dom_shadow_root(nodeIds.get(this)));
             return root && internalsFor(root).mode === "open" ? root : null;
+        }
+        // DOM #dom-element-customelementregistry.
+        get customElementRegistry() {
+            if (nodeIds.get(this) === undefined) throw new TypeError("Illegal invocation");
+            return elementRegistry(this);
         }
         get outerHTML() { return fragmentMarkup(__dom_outer_html(nodeIds.get(this))); }
         // HTML #dom-element-outerhtml setter steps: fragment-parse in the
@@ -9075,11 +9191,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             __dom_detach(nodeIds.get(this));
             destroyFrameNavigablesIn(this);
             syncWrapperSubtreeRetention(nodeIds.get(this));
-            slotQueueCheck(parent);
+            slotQueueCheck(parent, true);
+            slotQueueCheck(this);
             if (MO.length && moHasChildList) moNotify({ type: "childList", target: parent, addedNodes: added,
                 removedNodes: [this], previousSibling: prev, nextSibling: next });
             else moEnqueue();
-            if (CE.defs.size) { ceDisconnect(this); ceScan(parent); }
+            if (ceDefined) { ceDisconnect(this); ceScan(parent); }
             queueFrameNavigationsIn(parent);
         }
         get innerText() { return this.textContent; }
@@ -9100,16 +9217,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!MO.length || !container) {
                 __dom_insert_adjacent(nodeIds.get(this), p, String(h));
                 baseHrefCache = null;
-                if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
+                slotQueueCheck(container, true);
+                if (ceDefined) { const par = this.parentNode; ceScan(par || this); }
                 queueFrameNavigationsIn(container || this);
                 return;
             }
             const before = new Set(Array.from(container.childNodes).map((k) => nodeIds.get(k)));
             __dom_insert_adjacent(nodeIds.get(this), p, String(h));
             baseHrefCache = null;
+            slotQueueCheck(container, true);
             const added = Array.from(container.childNodes).filter((k) => !before.has(nodeIds.get(k)));
             moChildBulk(container, [], added);
-            if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
+            if (ceDefined) { const par = this.parentNode; ceScan(par || this); }
             queueFrameNavigationsIn(container);
         }
         insertAdjacentElement(p, el) {
@@ -12406,7 +12525,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         assignedElements(options) {
             return this.assignedNodes(options).filter((node) => node.nodeType === 1);
         }
+        // HTML #dom-slot-assign: `(Element or Text)... nodes` become this
+        // slot's manually assigned nodes. Every argument converts before any
+        // step runs; a node listed twice keeps its first position.
+        assign(...nodes) {
+            const slot = nodeIds.get(this);
+            if (slot === undefined || htmlElementName(this) !== "slot") throw new TypeError("Illegal invocation");
+            const ids = [], seen = new Set();
+            for (let i = 0; i < nodes.length; i++) {
+                const node = nodes[i];
+                const id = node !== null && typeof node === "object" ? nodeIds.get(node) : undefined;
+                const type = id === undefined ? 0 : __dom_node_type(id);
+                // Text includes CDATASection.
+                if (type !== 1 && type !== 3 && type !== 4)
+                    throw new TypeError("Failed to execute 'assign' on 'HTMLSlotElement': parameter " + (i + 1) +
+                        " is not of type 'Element' or 'Text'.");
+                if (!seen.has(id)) { seen.add(id); ids.push(id); }
+            }
+            if (__dom_slot_assign(slot, ids)) slotSignalled();
+        }
     }
+    // Web IDL #es-operations: interface operations are enumerable.
+    enumerableMembers(HTMLSlotElement);
     // HTML §the-script-element. Keep this interface complete rather than
     // scattering script behavior across generic Element reflectors. The
     // force-async state is an internal flag: parser-created scripts begin
@@ -14363,6 +14503,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get domain() { return internalsFor(this).domain !== undefined ? internalsFor(this).domain : g.location.hostname; }
         set domain(v) { internalsFor(this).domain = String(v); }
         get defaultView() { return nodeIds.get(this) === 0 ? g : null; }
+        // DOM #dom-documentorshadowroot-customelementregistry.
+        get customElementRegistry() {
+            if (nodeIds.get(this) === undefined) throw new TypeError("Illegal invocation");
+            return documentRegistry(this);
+        }
         // HTML Document creation: snapshot the final request referrer, or the
         // empty default for a Document without navigation request metadata.
         get referrer() { return documentReferrers.get(this) || ""; }
@@ -14438,20 +14583,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         createElement(t, options = undefined) {
             if (arguments.length < 1) throw new TypeError("Failed to execute 'createElement': 1 argument required");
             t = domString(t);
-            const is = elementCreationIsValue(options);
+            const converted = convertElementCreationOptions(options);
             // The contentType getter caches this Document's fixed content type.
             const knownContentType = internalsOf(this).trustContentType;
             const contentType = knownContentType !== undefined ? knownContentType : this.contentType;
             const isHTML = contentType === "text/html";
             const localName = createdElementLocalName(t, isHTML);
             const namespace = isHTML || contentType === "application/xhtml+xml" ? HTML_NS : null;
+            // DOM #dom-document-createelement step 4.
+            const [registry, is, documentDefault] = flattenElementCreationOptions(converted, this);
             const el = newElementWrapper(__dom_create_element_ns(namespace || "", "", localName, nodeIds.get(this)), localName, namespace, null);
+            setCreatedElementRegistry(el, registry, documentDefault);
             // HTML's script-element creation steps give dynamically created
             // scripts a true force-async flag. Setting async (as an IDL or
             // content attribute) clears it; parser-created wrappers never get
             // this marker and therefore default to false.
             if (localName === "script") internalsFor(el).trustForceAsync = true;
-            createdElementCustomSteps(el, namespace, localName, is);
+            createdElementCustomSteps(el, namespace, localName, is, registry);
             return el;
         }
         get adoptedStyleSheets() { return adoptedArray(this); }
@@ -14460,15 +14608,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (arguments.length < 2) throw new TypeError("Failed to execute 'createElementNS': 2 arguments required");
             namespace = namespace === null || namespace === undefined ? null : domString(namespace);
             qualifiedName = domString(qualifiedName);
-            const is = elementCreationIsValue(options);
+            const converted = convertElementCreationOptions(options);
             const extracted = validateAndExtractElementName(namespace, qualifiedName);
             const localName = extracted[2];
+            // DOM #internal-createelementns-steps step 2.
+            const [registry, is, documentDefault] = flattenElementCreationOptions(converted, this);
             const el = newElementWrapper(
                 __dom_create_element_ns(extracted[0] || "", extracted[1] || "", localName, nodeIds.get(this)),
                 localName, extracted[0], extracted[1]
             );
+            setCreatedElementRegistry(el, registry, documentDefault);
             if (extracted[0] === HTML_NS && localName === "script") internalsFor(el).trustForceAsync = true;
-            createdElementCustomSteps(el, extracted[0], localName, is);
+            createdElementCustomSteps(el, extracted[0], localName, is, registry);
             return el;
         }
         // DOM #dom-document-createtextnode / #dom-document-createcomment:
@@ -14528,27 +14679,40 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // object properties to the detached custom elements, then inserts the
         // fragment; postponing upgrade until insertion lets those own properties
         // shadow the component's reactive prototype setters forever.
-        importNode(n, options) {
-            if (!n || typeof nodeIds.get(n) !== "number")
-                throw new TypeError("Failed to execute 'importNode': parameter 1 is not of type 'Node'");
-            if (n.nodeType === 9 || n instanceof ShadowRoot)
+        importNode(n, options = false) {
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'importNode': 1 argument required");
+            nodeArgument(n, "importNode", 1);
+            // Web IDL: `(boolean or ImportNodeOptions) options = false`; null
+            // and objects are the dictionary (members in lexicographic order),
+            // anything else a boolean.
+            let subtree, registry = null;
+            if (options === null || typeof options === "object" || typeof options === "function") {
+                const value = options === null ? undefined : options.customElementRegistry;
+                if (value !== undefined) registry = customElementRegistryArgument(value);
+                const selfOnly = options === null ? undefined : options.selfOnly;
+                subtree = !(selfOnly === undefined ? false : !!selfOnly);
+            } else subtree = !!options;
+            const attr = internalsOf(n).attrNode;
+            // Step 1.
+            const type = attr ? 2 : __dom_node_type(nodeIds.get(n));
+            if (type === 9 || (type === 11 && __dom_shadow_info(nodeIds.get(n)) !== null))
                 throw new DOMException("Documents and shadow roots cannot be imported", "NotSupportedError");
-            let subtree = false;
-            if (typeof options === "boolean") subtree = options;
-            else if (options && typeof options === "object") {
-                subtree = !options.selfOnly;
-                const registry = options.customElementRegistry;
-                if (registry !== undefined && registry !== null &&
-                    registry !== currentCustomElementRegistry())
-                    throw new DOMException("Unsupported custom element registry", "NotSupportedError");
-            }
-            const clone = n.cloneNode(subtree);
-            if (__dom_owner_document(nodeIds.get(clone)) !== nodeIds.get(this)) this.adoptNode(clone);
-            // `cloneNode` has completed the whole subtree now, matching the
+            // Step 5.3.
+            if (registry !== null && !internalsOf(registry).scoped && registry !== documentRegistry(this))
+                throw new DOMException("The custom element registry belongs to another document", "NotSupportedError");
+            // Step 6: the fallback registry is this Document's.
+            if (registry === null) registry = documentRegistry(this);
+            if (attr) return createAttrNode(this, null, attr.namespace, attr.prefix, attr.localName, attrValue(attr));
+            // Step 7: clone into this Document. Cloning creates fresh script
+            // elements, whose force-async flag starts true.
+            const clone = wrap(__dom_clone(nodeIds.get(n), subtree, nodeIds.get(this), registryCode(registry)));
+            if (clone instanceof HTMLScriptElement) internalsFor(clone).trustForceAsync = true;
+            // The clone has completed the whole subtree now, matching the
             // clone algorithm's reaction boundary: constructors run in tree
             // order, against the complete clone, but connectedCallback waits
             // until the still-detached result is inserted.
-            if (CE.defs.size) ceScan(clone, true);
+            if (ceDefined) ceScan(clone, true);
+            slotNoteNativeSignals();
             return clone;
         }
         // DOM Standard ParentNode methods. Document used to inherit these
@@ -14699,7 +14863,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // top Document: detached nodes and their shadow roots already belong to this realm.
         createElement(t) { return Document.prototype.createElement.apply(this, arguments); }
         createElementNS(namespace, qualifiedName) {
-            return Document.prototype.createElementNS.call(this, namespace, qualifiedName);
+            return Document.prototype.createElementNS.apply(this, arguments);
         }
         createTextNode(s) { return Document.prototype.createTextNode.apply(this, arguments); }
         createComment(s) { return Document.prototype.createComment.apply(this, arguments); }
@@ -15309,7 +15473,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const token = {
             state: captureFrameState(),
             active: trust.__activeFrame || null,
-            customElementState: CE,
             switchedWindow: trust.__activeFrame !== frame,
         };
         saveAnimationFrameMethods(token.active);
@@ -15320,7 +15483,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             restoreFrameState(topFrameState);
             restoreAnimationFrameMethods(null);
             trust.__activeFrame = null;
-            CE = customElementStateForWindow(topWindowState);
             restoreScopedWindowGlobals(topWindowState);
             __dom_set_job_context(topWindowState.hostSettingsContext);
             return token;
@@ -15357,7 +15519,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         baseHrefCache = null;
         trust.__activeFrame = frame;
         const windowState = windowStateForFrame(frame);
-        CE = customElementStateForWindow(windowState);
         restoreScopedWindowGlobals(windowState);
         __dom_set_job_context(windowState.hostSettingsContext);
         return token;
@@ -15368,7 +15529,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (token.switchedWindow) saveScopedWindowGlobals(activeWindowState());
         restoreFrameState(token.state);
         trust.__activeFrame = token.active;
-        CE = token.customElementState;
         if (token.switchedWindow) restoreScopedWindowGlobals(activeWindowState());
         restoreAnimationFrameMethods(token.active);
         __dom_set_job_context(activeWindowState().hostSettingsContext);
@@ -15975,6 +16135,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get serializable() { return !!internalsFor(this).serializable; }
         get clonable() { return !!internalsFor(this).clonable; }
         get slotAssignment() { return internalsFor(this).slotAssignment || "named"; }
+        // DOM #dom-documentorshadowroot-customelementregistry.
+        get customElementRegistry() {
+            const id = nodeIds.get(this);
+            if (id === undefined) throw new TypeError("Illegal invocation");
+            return registryFromCode(__dom_custom_registry("shadow", id, null), nodeDocumentForRegistry(this));
+        }
         get activeElement() { return activeElementFor(this); }
         get innerHTML() { return fragmentMarkup(__dom_inner_html(nodeIds.get(this))); }
         set innerHTML(v) {
@@ -16015,43 +16181,39 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return result;
     }
 
-    let slotCheckQueued = false;
-    const slotCheckRoots = [];
-    function slotAffectedRoot(node) {
-        if (!node) return null;
-        if (node instanceof ShadowRoot) return node;
-        const root = rootOfNode(node);
-        if (root instanceof ShadowRoot) return root;
-        // A light-tree mutation affects the shadow root attached to its host.
-        return internalsOf(node).sr || null;
-    }
-    function slotQueueCheck(node) {
-        // Only a shadow root, a node in a shadow tree, or a shadow host can
-        // change slot assignment; the arena answers that without walking to
-        // the root through wrappers.
+    // DOM #assign-slotables-for-a-tree and #signal-a-slot-change. The arena
+    // evaluates slot assignment from the tree; after a mutation at `node` it
+    // runs the affected trees' slot assignment steps and adds each slot whose
+    // assigned nodes changed to the signal slots. Those wait for the mutation
+    // observer microtask, which fires their slotchange events after the
+    // observer callbacks (DOM #notify-mutation-observers). `childrenChanged`:
+    // `node` is the parent whose children changed (insert step 7.5, remove
+    // step 9: a slot's fallback content). A removed subtree's root passes no
+    // flag: its slots lose their slottables.
+    function slotQueueCheck(node, childrenChanged = false) {
         const id = node ? nodeIds.get(node) : undefined;
-        if (id !== undefined && !__dom_slot_scope(id)) return;
-        const root = slotAffectedRoot(node);
-        if (!root) return;
-        if (!slotCheckRoots.includes(root)) slotCheckRoots.push(root);
-        if (slotCheckQueued) return;
-        slotCheckQueued = true;
-        Promise.resolve().then(slotFlushChecks);
+        if (id !== undefined) slotCheckId(id, childrenChanged);
     }
-    function slotFlushChecks() {
-        slotCheckQueued = false;
-        const roots = slotCheckRoots.splice(0);
-        const changed = [];
-        for (const root of roots) {
-            for (const slot of root.querySelectorAll("slot")) {
-                const signature = __dom_slot_assigned(nodeIds.get(slot)).join(",");
-                const previous = internalsFor(slot).trustSlotSignature === undefined ? "" : internalsFor(slot).trustSlotSignature;
-                internalsFor(slot).trustSlotSignature = signature;
-                if (signature !== previous) changed.push(slot);
-            }
+    function slotCheckId(id, childrenChanged = false) {
+        if (__dom_slot_check(id, childrenChanged)) moEnqueue();
+    }
+    function slotSignalled() { moEnqueue(); }
+    // Native steps that may have signalled (parsing declarative shadow
+    // trees, cloning a clonable one) without a per-mutation check.
+    function slotNoteNativeSignals() {
+        if (__dom_slot_signals(false)) moEnqueue();
+    }
+    function takeSlotSignals() {
+        return __dom_slot_signals(false) ? __dom_slot_signals(true) : null;
+    }
+    // DOM #notify-mutation-observers step 7: fire slotchange (bubbles, not
+    // composed) at each slot of the signal set.
+    function fireSlotChanges(signalSet) {
+        if (!signalSet) return;
+        for (let i = 0; i < signalSet.length; i++) {
+            const slot = wrap(signalSet[i]);
+            if (slot) dispatch(slot, createTrustedEvent(Event, "slotchange", { bubbles: true }), false);
         }
-        // `slotchange` bubbles but is not composed (DOM §4.2.2.4).
-        for (const slot of changed) slot.dispatchEvent(new Event("slotchange", { bubbles: true }));
     }
 
     // --- the custom elements registry ---
@@ -16059,7 +16221,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // keeps its custom element definitions (#custom-element-definition) by
     // constructor; `defs` maps names to constructors and `tags` the reverse.
     // A definition records the lifecycle callbacks and static members that
-    // define() read once (#dom-customelementregistry-define).
+    // define() read once (#dom-customelementregistry-define), and its
+    // construction stack (#concept-custom-element-definition-construction-stack).
     const CE_LIFECYCLE_CALLBACKS = ["connectedCallback", "disconnectedCallback", "connectedMoveCallback",
         "adoptedCallback", "attributeChangedCallback"];
     const CE_FORM_CALLBACKS = ["formAssociatedCallback", "formResetCallback", "formDisabledCallback",
@@ -16067,11 +16230,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // The local names of form-associated autonomous custom elements defined
     // in any registry: the candidates of a form's listed elements.
     const formAssociatedNames = new Set();
+    // HTML #concept-already-constructed-marker.
+    const ALREADY_CONSTRUCTED = {};
+    // HTML #active-custom-element-constructor-map: constructor → registry.
+    const activeConstructorRegistries = new Map();
     function definitionForName(state, name) {
         const ctor = state && state.defs.get(name);
         return ctor ? state.definitions.get(ctor) || null : null;
     }
-    // HTML #look-up-a-custom-element-definition.
+    // HTML #look-up-a-custom-element-definition, given a registry's state.
     function lookupCustomElementDefinition(state, namespace, localName, is) {
         if (!state || namespace !== HTML_NS) return null;
         const autonomous = definitionForName(state, localName);
@@ -16081,6 +16248,82 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (builtIn && builtIn.localName === localName) return builtIn;
         }
         return null;
+    }
+    // HTML #look-up-a-custom-element-definition given a registry object
+    // (null finds nothing).
+    function lookupRegistryDefinition(registry, namespace, localName, is) {
+        return registry ? lookupCustomElementDefinition(internalsOf(registry).state, namespace, localName, is) : null;
+    }
+    // Custom element registry associations live in the arena
+    // (dom::custom_registry): parser-created elements have no wrapper until
+    // script reaches them. Across the boundary a registry is null, 0 for the
+    // node document's global registry, or the number of a scoped registry.
+    // Scoped registries stay in this map while a node may refer to them;
+    // `registryCode` assigns numbers lazily, and the map sheds registries no
+    // node uses any more once it has grown (a registry keeps its number and
+    // re-enters the map when associated again).
+    const scopedRegistries = new Map();
+    let nextScopedRegistry = 1, scopedRegistryPruneAt = 64;
+    function registryCode(registry) {
+        if (registry === null || registry === undefined) return null;
+        const slots = internalsOf(registry);
+        if (!slots.scoped) return 0;
+        if (!slots.registryNumber) slots.registryNumber = nextScopedRegistry++;
+        if (scopedRegistries.get(slots.registryNumber) !== registry) {
+            if (scopedRegistries.size >= scopedRegistryPruneAt) {
+                const live = new Set(__dom_custom_registry("live", null, null));
+                for (const number of Array.from(scopedRegistries.keys()))
+                    if (!live.has(number)) scopedRegistries.delete(number);
+                scopedRegistryPruneAt = Math.max(64, scopedRegistries.size * 2);
+            }
+            scopedRegistries.set(slots.registryNumber, registry);
+        }
+        return slots.registryNumber;
+    }
+    // The node document of `node`, as the arena records it.
+    function nodeDocumentForRegistry(node) {
+        const id = nodeIds.get(node);
+        if (id === undefined) return null;
+        return __dom_node_type(id) === 9 ? node : wrap(__dom_owner_document(id));
+    }
+    function registryFromCode(code, document) {
+        if (code === null || code === undefined) return null;
+        if (code === 0) return documentGlobalRegistry(document);
+        return scopedRegistries.get(code) || null;
+    }
+    // HTML #dom-window-customelements: a Window's associated Document has
+    // the Window's registry (a Document without a browsing context has none).
+    function documentGlobalRegistry(document) {
+        if (!document) return null;
+        const frame = internalsOf(document).frame;
+        if (frame) return customElementRegistryForWindow(windowStateForFrame(frame), frame === realmRootFrame ? null : frame);
+        if (!realmRootFrame && nodeIds.get(document) === 0) return customElementRegistryForWindow(topWindowState, null);
+        return null;
+    }
+    // DOM's Document custom element registry.
+    function documentRegistry(document) {
+        if (!document) return null;
+        if (internalsOf(document).frame || (!realmRootFrame && nodeIds.get(document) === 0))
+            return documentGlobalRegistry(document);
+        return registryFromCode(__dom_custom_registry("document", nodeIds.get(document), null), document);
+    }
+    // DOM #element-custom-element-registry.
+    function elementRegistry(element) {
+        return registryFromCode(__dom_custom_registry("element", nodeIds.get(element), null),
+            nodeDocumentForRegistry(element));
+    }
+    // A CustomElementRegistry argument (Web IDL #es-interface).
+    function customElementRegistryArgument(value) {
+        if (value !== null && typeof value === "object" && internalsOf(value).state) return value;
+        throw new TypeError("The value is not of type 'CustomElementRegistry'.");
+    }
+    // A scoped registry's scoped document set: the Documents of the elements
+    // that became connected (or were initialized) with it. It holds node ids,
+    // which are never reused, so a registry does not keep a Document alive.
+    function noteScopedDocument(registry, document) {
+        const set = internalsOf(registry).scopedDocuments;
+        const id = document ? nodeIds.get(document) : undefined;
+        if (set && id !== undefined) set.add(id);
     }
     // DOM #concept-element-is-value: the value an element was created with
     // (createElement's options), or the `is` attribute the parser created
@@ -16092,30 +16335,65 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const given = __dom_input(elementIdentity(el), "is-value-get", null);
         return given !== null && given !== undefined ? given : messageApply(elementGetAttribute, el, ["is"]);
     }
-    function elementDefinitionLookup(el) {
+    // HTML #concept-try-upgrade's lookup: the element's own registry.
+    function elementDefinitionLookup(el, registry = elementRegistry(el)) {
         const localName = htmlElementName(el);
-        return localName ? lookupCustomElementDefinition(CE, HTML_NS, localName, elementIsValue(el)) : null;
+        return localName ? lookupRegistryDefinition(registry, HTML_NS, localName, elementIsValue(el)) : null;
     }
-    // DOM #dom-document-createelement: `(DOMString or ElementCreationOptions)
-    // options`; a dictionary's `is` member is the new element's is value.
-    function elementCreationIsValue(options) {
-        if (options === null || typeof options !== "object" && typeof options !== "function") {
-            if (options !== undefined && options !== null) domString(options);
+    // Web IDL conversion of createElement()'s `(DOMString or
+    // ElementCreationOptions) options`: null, undefined and objects are the
+    // dictionary, whose members convert in lexicographic order.
+    function convertElementCreationOptions(options) {
+        if (options !== null && typeof options !== "object" && typeof options !== "function") {
+            if (options !== undefined) domString(options);
             return null;
         }
-        const is = options.is;
-        return is === undefined ? null : idlDOMString(is);
+        const dictionary = { hasRegistry: false, registry: null, is: undefined };
+        if (options !== null && options !== undefined) {
+            const value = options.customElementRegistry;
+            if (value !== undefined) {
+                dictionary.hasRegistry = true;
+                dictionary.registry = value === null ? null : customElementRegistryArgument(value);
+            }
+            const isValue = options.is;
+            if (isValue !== undefined) dictionary.is = idlDOMString(isValue);
+        }
+        return dictionary;
+    }
+    // DOM #flatten-element-creation-options: the registry and is value, and
+    // whether the registry is the document's (the arena's default for a new
+    // element of that document).
+    function flattenElementCreationOptions(options, document) {
+        const documentDefault = documentRegistry(document);
+        let registry = documentDefault, is = null;
+        if (options !== null) {
+            if (options.is !== undefined) is = options.is;
+            if (options.hasRegistry) {
+                if (is !== null)
+                    throw new DOMException("An element cannot have both a custom element registry and an is value", "NotSupportedError");
+                registry = options.registry;
+            }
+            if (registry !== null && !internalsOf(registry).scoped && registry !== documentDefault)
+                throw new DOMException("The custom element registry belongs to another document", "NotSupportedError");
+        }
+        return [registry, is, registry === documentDefault];
+    }
+    // DOM #concept-create-element's registry for a newly created element,
+    // which the arena defaults to its node document's.
+    function setCreatedElementRegistry(el, registry, isDocumentDefault) {
+        if (!isDocumentDefault)
+            __dom_custom_registry("set-element", elementIdentity(el), registryCode(registry));
     }
     // DOM #concept-create-element with the synchronous custom elements flag
     // set, for an element the wrapper already exists for: an HTML element
-    // keeps its is value, and a defined one is upgraded right away (an
-    // exception is reported, leaving the element failed).
-    function createdElementCustomSteps(el, namespace, localName, is) {
+    // keeps its is value, and one defined in `registry` is upgraded right
+    // away (an exception is reported, leaving the element failed).
+    function createdElementCustomSteps(el, namespace, localName, is, registry) {
         if (namespace !== HTML_NS) return;
-        const definition = lookupCustomElementDefinition(CE, HTML_NS, localName, is);
+        const definition = lookupRegistryDefinition(registry, HTML_NS, localName, is);
         if (is !== null && !(definition && definition.name === definition.localName))
             setElementIsValue(el, is);
-        if (definition) upgradeElement(el, definition);
+        if (definition) upgradeElement(el, definition, registry);
         else if (is !== null) setCustomElementDefined(el, false);
     }
     // HTML #enqueue-a-custom-element-callback-reaction, run synchronously:
@@ -16128,6 +16406,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (callbackName === "attributeChangedCallback" && !definition.observedAttributes.has(args[0])) return;
         try { messageApply(callback, el, args); }
         catch (e) { reportException(e, callbackName); }
+    }
+    // HTML #enqueue-a-custom-element-callback-reaction for
+    // "connectedMoveCallback": without one, a moved custom element gets its
+    // disconnectedCallback and then its connectedCallback, as one reaction.
+    function ceMoveReaction(el) {
+        const definition = internalsOf(el).ceDefinition;
+        if (!definition) return;
+        const callbacks = definition.callbacks;
+        if (callbacks.connectedMoveCallback) {
+            ceInvoke(el, "connectedMoveCallback", []);
+            return;
+        }
+        const disconnected = callbacks.disconnectedCallback, connected = callbacks.connectedCallback;
+        if (!disconnected && !connected) return;
+        try {
+            if (disconnected) messageApply(disconnected, el, []);
+            if (connected) messageApply(connected, el, []);
+        } catch (e) { reportException(e, "connectedMoveCallback"); }
     }
     function setCustomElementDefined(el, defined) {
         const id = elementIdentity(el);
@@ -16151,8 +16447,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // connectedCallback reactions are enqueued first, from the attributes
     // and connectedness it had before construction, and run once the
     // constructor succeeds; one that throws leaves the element failed and
-    // empties those reactions.
-    function upgradeElement(el, definition) {
+    // empties those reactions. The element's registry is the constructor's
+    // active registry while it runs (steps 8–9 and the cleanup steps).
+    function upgradeElement(el, definition, registry = elementRegistry(el)) {
         const internals = internalsFor(el);
         if (internals.ceUpgraded || internals.ceFailed) return;
         internals.ceDefinition = definition;
@@ -16170,15 +16467,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         const connected = el.isConnected;
         let failure = null;
+        definition.constructionStack.push(el);
+        const hadPrevious = activeConstructorRegistries.has(ctor);
+        const previous = activeConstructorRegistries.get(ctor);
+        activeConstructorRegistries.set(ctor, registry);
         try {
             if (definition.disableShadow && __dom_shadow_root(elementIdentity(el)) !== null)
                 throw new DOMException("Shadow roots are disabled for this custom element", "NotSupportedError");
             internals.ceConstructing = true;
-            CE.upgrading = {element: el, definition};
             const result = Reflect.construct(ctor, []);
             if (result !== el) throw new TypeError("The custom element constructor did not produce the upgraded element");
         } catch (e) { failure = { error: e }; }
-        finally { CE.upgrading = null; internals.ceConstructing = false; }
+        finally {
+            if (hadPrevious && previous !== null) activeConstructorRegistries.set(ctor, previous);
+            else activeConstructorRegistries.delete(ctor);
+            definition.constructionStack.pop();
+            internals.ceConstructing = false;
+        }
         if (failure) {
             internals.ceDefinition = null;
             reportException(failure.error, "custom element ctor");
@@ -16207,64 +16512,99 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // DOM #concept-node-insert step 7.7 for the custom element candidates of
     // an inserted subtree: a connected custom element gets its connected
-    // reaction, any other connected candidate tries to upgrade. The clone
-    // and upgrade() paths upgrade disconnected candidates as well
-    // (DOM #concept-node-clone, HTML #dom-customelementregistry-upgrade).
+    // reaction, any other connected candidate with a registry tries to
+    // upgrade in it, and a scoped registry records the candidate's Document.
+    // The clone path upgrades disconnected candidates as well
+    // (DOM #concept-node-clone creates elements with their registry).
     function ceScan(node, upgradeDisconnected = false) {
         if (!node || typeof node !== "object" || nodeIds.get(node) === undefined) return;
         // Rust returns just the custom-element candidates (valid custom
         // element names and `is` values) in the inserted subtree, shadow
-        // roots included and the root itself — so we wrap/visit only those,
-        // never the non-custom bulk of the subtree.
-        const ids = __dom_ce_candidates(nodeIds.get(node));
-        for (let i = 0; i < ids.length; i++) {
-            const el = wrap(ids[i]);
+        // roots included and the root itself, each with its registry — so we
+        // wrap/visit only those, never the non-custom bulk of the subtree.
+        const entries = __dom_ce_candidates(nodeIds.get(node), true);
+        if (!entries.length) return;
+        const document = nodeDocumentForRegistry(node);
+        for (let i = 0; i < entries.length; i += 2) {
+            const el = wrap(entries[i]);
             if (!internalsOf(el).ceUpgraded) {
-                if (!upgradeDisconnected && !el.isConnected) continue;
-                const definition = elementDefinitionLookup(el);
-                if (definition) upgradeElement(el, definition);
+                const connected = el.isConnected;
+                if (!upgradeDisconnected && !connected) continue;
+                const registry = registryFromCode(entries[i + 1], document);
+                if (!registry) continue;
+                if (connected && internalsOf(registry).scoped) noteScopedDocument(registry, document);
+                const definition = elementDefinitionLookup(el, registry);
+                if (definition) upgradeElement(el, definition, registry);
             } else faceTreeChanged(el);
             maybeConnect(el);
         }
     }
+    // HTML #dom-customelementregistry-upgrade: the shadow-including
+    // inclusive descendants of `root` whose registry is `registry` try to
+    // upgrade, connected or not.
+    function ceUpgradeIn(root, registry) {
+        const entries = __dom_ce_candidates(nodeIds.get(root), true);
+        if (!entries.length) return;
+        const document = nodeDocumentForRegistry(root);
+        for (let i = 0; i < entries.length; i += 2) {
+            if (registryFromCode(entries[i + 1], document) !== registry) continue;
+            const el = wrap(entries[i]);
+            if (internalsOf(el).ceUpgraded) continue;
+            const definition = elementDefinitionLookup(el, registry);
+            if (definition) upgradeElement(el, definition, registry);
+        }
+    }
     function ceAdopt(node, oldDocument, newDocument) {
-        if (!node || oldDocument === newDocument || !CE.defs.size) return;
+        if (!node || oldDocument === newDocument || !ceDefined) return;
         // `__dom_ce_candidates` follows the shadow-including tree and returns
         // only custom-element candidates, matching the adoption algorithm's
         // callback walk without wrapping every ordinary descendant.
-        const ids = __dom_ce_candidates(nodeIds.get(node));
+        const ids = __dom_ce_candidates(nodeIds.get(node), false);
         for (let i = 0; i < ids.length; i++) {
             const el = wrap(ids[i]);
             if (internalsOf(el).ceUpgraded) ceInvoke(el, "adoptedCallback", [oldDocument, newDocument]);
         }
     }
+    // DOM #concept-node-move step 21 for the shadow-including inclusive
+    // descendants of a moved node: the HTML moving steps of a form-associated
+    // custom element reset its form owner, and with a connected new parent a
+    // custom element gets its connectedMoveCallback reaction.
+    function ceMoved(node, connected) {
+        const ids = __dom_ce_candidates(nodeIds.get(node), false);
+        for (let i = 0; i < ids.length; i++) {
+            const el = cachedWrapper(ids[i]);
+            if (!el || !internalsOf(el).ceUpgraded) continue;
+            faceTreeChanged(el);
+            if (connected) ceMoveReaction(el);
+        }
+    }
     // HTML #upgrade-particular-elements-within-a-document, shadow-piercing:
     // an element rendered into a shadow root before its definition is
-    // upgraded too. The candidates — every composed-tree element with the
-    // definition's local name — come from one Rust walk; a customized
-    // built-in's must also carry its name as their is value.
-    function definitionCandidates(definition) {
-        const ids = __dom_upgrade_candidates(nodeIds.get(g.document), definition.localName);
+    // upgraded too. The candidates — every composed-tree element of
+    // `document` with the definition's local name and `registry` — come from
+    // one Rust walk; a customized built-in's must also carry its name as
+    // their is value.
+    function definitionCandidates(registry, document, definition) {
+        const ids = __dom_upgrade_candidates(nodeIds.get(document), definition.localName, registryCode(registry));
         const out = [];
         for (let i = 0; i < ids.length; i++) {
             const el = wrap(ids[i]);
             if (htmlElementName(el) !== definition.localName) continue;
             if (definition.name !== definition.localName && elementIsValue(el) !== definition.name) continue;
-            if (definition.name === definition.localName && elementDefinitionLookup(el) !== definition) continue;
             out.push(el);
         }
         return out;
     }
-    function ceUpgradeName(definition) {
-        for (const el of definitionCandidates(definition)) upgradeElement(el, definition);
+    function ceUpgradeName(registry, document, definition) {
+        for (const el of definitionCandidates(registry, document, definition)) upgradeElement(el, definition, registry);
     }
     // A definition can arrive while the parser/module task is still attaching
     // the document subtree.  The upgrade itself is synchronous, but the
     // connected reaction is delivered at the custom-element reactions
     // microtask checkpoint; retry the already-upgraded candidates there so a
     // transiently-disconnected instance is not left with an empty shadow root.
-    function ceConnectName(definition) {
-        for (const el of definitionCandidates(definition))
+    function ceConnectName(registry, document, definition) {
+        for (const el of definitionCandidates(registry, document, definition))
             if (internalsOf(el).ceUpgraded) maybeConnect(el);
     }
     // DOM #concept-node-remove: each custom element among the removed
@@ -16334,14 +16674,21 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!state) throw new TypeError("Illegal invocation");
         return state;
     }
+    // Internal construction of a Window's global registry; the public
+    // constructor creates a scoped one.
+    const REGISTRY_TOKEN = {};
     class CustomElementRegistry {
-        constructor(state, windowState, frame) {
-            // The public constructor creates an initially-empty scoped
-            // registry. Window-associated registries pass their state through
-            // the internal three-argument path below.
-            internalsFor(this).state = state || createCustomElementState();
-            internalsFor(this).windowState = windowState || null;
-            internalsFor(this).frame = frame || null;
+        // HTML #dom-customelementregistry: `new CustomElementRegistry()`
+        // sets "is scoped" to true. A Window's registry is created through
+        // the internal token path below and is not scoped.
+        constructor(token = undefined, state = undefined, windowState = undefined, frame = undefined) {
+            const internal = token === REGISTRY_TOKEN;
+            internalsFor(this).state = internal ? state : createCustomElementState();
+            internalsFor(this).windowState = internal ? windowState || null : null;
+            internalsFor(this).frame = internal ? frame || null : null;
+            internalsFor(this).scoped = !internal;
+            // HTML #customelementregistry-scoped-document-set.
+            internalsFor(this).scopedDocuments = internal ? null : new Set();
         }
         // HTML #dom-customelementregistry-define.
         define(name, ctor, options = undefined) {
@@ -16365,7 +16712,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new DOMException("This constructor is already defined", "NotSupportedError");
             let localName = name;
             if (extendsName !== null) {
-                if (!internalsOf(this).windowState)
+                if (internalsOf(this).scoped)
                     throw new DOMException("A scoped registry cannot define customized built-in elements", "NotSupportedError");
                 if (isValidCustomElementName(extendsName) || htmlInterfaceName(extendsName) === "HTMLUnknownElement")
                     throw new DOMException("Cannot extend '" + extendsName + "'", "NotSupportedError");
@@ -16407,16 +16754,29 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             const definition = {
                 name, localName, ctor, observedAttributes: new Set(observedAttributes), callbacks,
-                formAssociated, disableInternals, disableShadow,
+                formAssociated, disableInternals, disableShadow, constructionStack: [],
             };
             state.defs.set(name, ctor);
             state.tags.set(ctor, name);
             state.definitions.set(ctor, definition);
+            ceDefined = true;
             if (formAssociated && localName === name) formAssociatedNames.add(name);
-            registryWithAssociatedDocument.call(this, () => {
-                ceUpgradeName(definition);
-                Promise.resolve().then(() => ceConnectName(definition));
-            });
+            if (internalsOf(this).scoped) {
+                // Each Document of the scoped document set.
+                const documents = internalsOf(this).scopedDocuments;
+                for (const id of Array.from(documents)) {
+                    const document = wrap(id);
+                    if (!document) { documents.delete(id); continue; }
+                    ceUpgradeName(this, document, definition);
+                    Promise.resolve().then(() => ceConnectName(this, document, definition));
+                }
+            } else {
+                // This registry's relevant global object's associated Document.
+                registryWithAssociatedDocument.call(this, () => {
+                    ceUpgradeName(this, g.document, definition);
+                    Promise.resolve().then(() => ceConnectName(this, g.document, definition));
+                });
+            }
             const w = state.waiting.get(name);
             if (w) { state.waiting.delete(name); w.resolve(ctor); }
         }
@@ -16450,19 +16810,45 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return w.promise;
         }
         // HTML #dom-customelementregistry-upgrade: every shadow-including
-        // inclusive descendant tries to upgrade, connected or not.
+        // inclusive descendant with this registry tries to upgrade,
+        // connected or not.
         upgrade(root) {
-            const state = registryState(this);
+            registryState(this);
             if (arguments.length < 1) throw new TypeError("upgrade requires 1 argument");
-            if (!root || nodeIds.get(root) === undefined) throw new TypeError("The argument is not a Node");
-            const old = CE;
-            CE = state;
-            try { if (state.defs.size) ceScan(root, true); }
-            finally { CE = old; }
+            if (!root || typeof root !== "object" || (nodeIds.get(root) === undefined && !internalsOf(root).attrNode))
+                throw new TypeError("The argument is not a Node");
+            if (nodeIds.get(root) !== undefined && ceDefined) ceUpgradeIn(root, this);
+        }
+        // HTML #dom-customelementregistry-initialize.
+        initialize(root) {
+            registryState(this);
+            if (arguments.length < 1) throw new TypeError("initialize requires 1 argument");
+            const isAttr = root !== null && typeof root === "object" && nodeIds.get(root) === undefined &&
+                !!internalsOf(root).attrNode;
+            if (!root || typeof root !== "object" || (nodeIds.get(root) === undefined && !isAttr))
+                throw new TypeError("The argument is not a Node");
+            const scoped = !!internalsOf(this).scoped;
+            const document = isAttr ? attrState(root).document : nodeDocumentForRegistry(root);
+            // Step 1: a global registry initializes only nodes of its own
+            // Document, never a Document.
+            if (!scoped && ((!isAttr && __dom_node_type(nodeIds.get(root)) === 9) || documentRegistry(document) !== this))
+                throw new DOMException("The registry cannot initialize this node", "NotSupportedError");
+            // An Attr is neither a Document, a ShadowRoot nor an Element.
+            if (isAttr) return;
+            // Steps 2–4: the arena sets the null registries and returns the
+            // custom element candidates that now have this registry.
+            const candidates = __dom_custom_registry("initialize", nodeIds.get(root), registryCode(this));
+            if (scoped) noteScopedDocument(this, document);
+            for (let i = 0; i < candidates.length; i++) {
+                const el = wrap(candidates[i]);
+                if (internalsOf(el).ceUpgraded) continue;
+                const definition = elementDefinitionLookup(el, this);
+                if (definition) upgradeElement(el, definition, this);
+            }
         }
         get [Symbol.toStringTag]() { return "CustomElementRegistry"; }
     }
-    for (const name of ["define", "get", "getName", "whenDefined", "upgrade"])
+    for (const name of ["define", "get", "getName", "whenDefined", "upgrade", "initialize"])
         Object.defineProperty(CustomElementRegistry.prototype, name, {enumerable: true});
     // HTML #custom-elements-face and #the-elementinternals-interface: the
     // connected form-associated custom elements, whose form owner can change
@@ -16699,7 +17085,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (slots.isValue !== undefined && slots.isValue !== null)
             throw new DOMException("Customized built-in elements cannot attach internals", "NotSupportedError");
         const localName = htmlElementName(element);
-        const definition = localName ? lookupCustomElementDefinition(CE, HTML_NS, localName, null) : null;
+        const definition = localName ? lookupRegistryDefinition(elementRegistry(element), HTML_NS, localName, null) : null;
         if (!definition) throw new DOMException("The element is not a custom element", "NotSupportedError");
         if (definition.disableInternals)
             throw new DOMException("Internals are disabled for this custom element", "NotSupportedError");
@@ -16735,7 +17121,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function customElementRegistryForWindow(windowState, frame) {
         if (!windowState.customElementRegistry) {
             windowState.customElementRegistry = new CustomElementRegistry(
-                customElementStateForWindow(windowState), windowState, frame
+                REGISTRY_TOKEN, customElementStateForWindow(windowState), windowState, frame
             );
         }
         return windowState.customElementRegistry;
@@ -17720,6 +18106,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (const p of [Element.prototype, CharacterData.prototype]) move(p, CHILD_NODE);
         for (const n of [...PARENT_NODE, ...CHILD_NODE]) delete Node.prototype[n];
     }
+    // DOM #interface-parentnode: [CEReactions] undefined moveBefore(Node
+    // node, Node? child), an operation of each interface including ParentNode.
+    for (const proto of [Element.prototype, Document.prototype, DocumentFragment.prototype]) {
+        const { moveBefore } = { moveBefore(node, child) { moveBeforeSteps(this, node, child, arguments.length); } };
+        Object.defineProperty(proto, "moveBefore", { value: moveBefore, writable: true, enumerable: true, configurable: true });
+    }
+    // Web IDL #es-attributes: the customElementRegistry attributes of
+    // Element and DocumentOrShadowRoot are enumerable.
+    for (const proto of [Element.prototype, Document.prototype, ShadowRoot.prototype])
+        Object.defineProperty(proto, "customElementRegistry", { enumerable: true });
     // DOM §4.2.10.1: querySelectorAll returns a new STATIC NodeList with
     // supported indexed properties, item(), length, and iterable<Node>. The
     // backing IDs are immutable, while wrappers are materialized only when an
@@ -23110,6 +23506,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function moDeliver() {
         moQueued = false;
         if (moDisabled) return;
+        // DOM #notify-mutation-observers steps 4–5, before any callback.
+        const signalSet = takeSlotSignals();
         if (++moChain > MO_CHAIN_CAP) {
             moDisabled = true;
             for (const observer of moPending) internalsFor(observer).records = [];
@@ -23134,6 +23532,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             try { internalsFor(o).cb.call(o, recs, o); }
             catch (e) { reportException(e, "MutationObserver callback"); }
         }
+        fireSlotChanges(signalSet);
         // The chain has ended iff no callback re-queued during this turn; only
         // then is it safe to clear the loop counter.
         if (!moQueued) moChain = 0;
@@ -25259,6 +25658,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const id = __dom_parse_document(idlDOMString(html), "text/html", undefined, true);
             const document = rememberWrapper(id, new Document(id), false);
             documentURLs.set(document, "about:blank");
+            // The parser's insertions assigned the declarative shadow trees'
+            // slots (DOM #concept-node-insert step 7.4).
+            slotNoteNativeSignals();
             return document;
         } }.parseHTMLUnsafe});
     // Bootstrap the existing legacy Navigation/Resource Timing surface. The

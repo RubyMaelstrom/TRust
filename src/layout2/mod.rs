@@ -12426,6 +12426,58 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn manual_slot_assignment_composes_the_flat_tree() {
+        // HTML #dom-slot-assign and DOM #find-slotables: a slot in a shadow
+        // root with manual slot assignment renders the host children it was
+        // assigned, in assignment order; reassignment relays out the host.
+        let base = Url::parse("http://e.com/").unwrap();
+        let lay_dom = |dom: &Dom| {
+            lay_out_document(
+                dom,
+                &base,
+                TerminalViewport::new(80, 24, 8.0, 16.0),
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="h"><span id="a">ALPHA</span> <span id="b">BETA</span></div></body>"#,
+        );
+        let host = dom.get_by_id("h").unwrap();
+        let root = dom
+            .attach_shadow_with_options(
+                host,
+                crate::dom::shadow::ShadowRootData {
+                    manual_slot_assignment: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let slot = dom.create_element("slot");
+        dom.append(root, slot);
+        let out = lay_dom(&dom);
+        assert!(
+            absent(&out, "ALPHA") && absent(&out, "BETA"),
+            "nothing assigned"
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        dom.assign_slot_manually(slot, &[b, a]);
+        let out = lay_dom(&dom);
+        let text: String = out.rows.iter().map(row_text).collect();
+        let (beta, alpha) = (text.find("BETA"), text.find("ALPHA"));
+        assert!(
+            beta.is_some() && alpha.is_some() && beta < alpha,
+            "{text:?}"
+        );
+        dom.assign_slot_manually(slot, &[a]);
+        let out = lay_dom(&dom);
+        assert!(!absent(&out, "ALPHA") && absent(&out, "BETA"), "reassigned");
+    }
+
+    #[test]
     fn modal_auto_height_flex_chain_does_not_collapse_content() {
         let html = r#"<body style="margin:0"><div style="display:flex;align-items:center;justify-content:center;position:fixed;inset:0"><div style="display:flex;flex-direction:column;width:fit-content;max-width:calc(100% - 32px);max-height:calc(100% - 32px)"><div style="display:flex;flex-direction:column;align-items:center;height:100%;position:relative;box-sizing:border-box;max-height:inherit;min-height:inherit;overflow:auto"><div style="box-sizing:border-box;padding:16px;width:100%;display:flex;flex-direction:column;flex:1 1;overflow-y:auto;overflow-x:hidden"><div style="display:flex;flex-direction:column;min-height:0;flex-shrink:1;flex-grow:0;overflow:auto"><div style="display:block;padding:4px 0">Let us know your cookie preferences and why cookies are used.</div></div></div><div style="display:flex;flex-direction:column;width:100%;padding:16px;gap:8px"><button>Reject Optional Cookies</button><button>Accept All</button></div></div></div></div></body>"#;
         let out = lay(html, 40);

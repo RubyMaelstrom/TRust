@@ -92,6 +92,8 @@ impl Dom {
         for &(node, _, _) in &self.scroll_changes {
             visit(node);
         }
+        // DOM #signal-slot-list holds its slots until their slotchange event.
+        self.visit_slot_signal_roots(&mut visit);
     }
 
     pub(crate) fn visit_gc_pending_allocations(&self, mut visit: impl FnMut(NodeId)) {
@@ -216,6 +218,10 @@ impl Dom {
         if changed_popovers {
             self.popover_order.retain(|id| !dead.contains(id));
         }
+        // HTML #manually-assigned-nodes and DOM's manual slot assignment are
+        // weak relationships; a retired slot or slottable leaves them.
+        self.retain_slotting(&|id| !dead.contains(&id));
+        self.ce_registries.retain(&|id| !dead.contains(&id));
         self.dirty_nodes.retain(|(id, _)| !dead.contains(id));
         self.created_images.retain(|(id, _)| !dead.contains(id));
         // Scroll and transition events are roots, so a dead target here is a host-tracing bug.
@@ -367,6 +373,8 @@ impl Dom {
             started_scripts
         );
         self.popover_order.retain(|&id| valid(id));
+        slotting::retain(&mut self.manual_slots, &mut self.slot_signals, &valid);
+        self.ce_registries.retain(&valid);
         self.focused_areas
             .retain(|&doc, node| valid(doc) && valid(*node));
         self.dirty_nodes.retain(|(id, _)| valid(*id));
@@ -570,6 +578,49 @@ mod tests {
         let replacement = dom.create_element("aside");
         assert!(replacement > sibling);
         assert!(!dom.is_valid(child));
+    }
+
+    #[test]
+    fn native_gc_treats_manual_slot_assignment_as_weak_and_signals_as_roots() {
+        // HTML #manually-assigned-nodes and DOM's manual slot assignment may
+        // be weak (script cannot reach them); DOM #signal-slot-list holds its
+        // slots until slotchange is fired.
+        let mut dom = Dom::new();
+        let host = dom.create_element("div");
+        dom.append(DOCUMENT, host);
+        let root = dom
+            .attach_shadow_with_options(
+                host,
+                shadow::ShadowRootData {
+                    manual_slot_assignment: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let slot = dom.create_element("slot");
+        dom.append(root, slot);
+        let child = dom.create_element("b");
+        dom.append(host, child);
+        let detached = dom.create_element("i");
+        dom.assign_slot_manually(slot, &[child, detached]);
+        dom.take_signal_slots();
+        dom.clear_gc_allocation_leases();
+        let live = mark(&dom, &[]);
+        assert!(live.contains(&child) && !live.contains(&detached));
+        dom.sweep_gc_nodes(&|id| live.contains(&id));
+        assert_eq!(dom.slot_assigned_nodes(slot), vec![child]);
+        assert!(!dom.manual_slots.slot_of.contains_key(&detached));
+        // A removed slot waiting for slotchange is retained until then.
+        dom.detach(slot);
+        assert!(dom.slot_mutation_check(slot, false));
+        let live = mark(&dom, &[]);
+        assert!(live.contains(&slot));
+        dom.sweep_gc_nodes(&|id| live.contains(&id));
+        assert_eq!(dom.take_signal_slots(), vec![slot]);
+        let live = mark(&dom, &[]);
+        dom.sweep_gc_nodes(&|id| live.contains(&id));
+        assert!(!dom.is_valid(slot));
+        assert!(dom.manual_slots.assigned.is_empty() && dom.manual_slots.slot_of.is_empty());
     }
 
     #[test]

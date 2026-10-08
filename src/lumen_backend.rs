@@ -4,6 +4,7 @@
 //! Bindings are checked against the canonical registry so host names and JavaScript-visible
 //! function lengths cannot drift.
 
+use crate::dom::custom_registry::CeRegistry as CustomElementRegistryRef;
 use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
 use lumen::embed::{
@@ -9561,6 +9562,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_children", 1, host_children),
     ("__dom_slot_assigned", 1, guarded_slot_assigned),
     ("__dom_assigned_slot", 1, guarded_assigned_slot),
+    ("__dom_slot_assign", 2, guarded_slot_assign),
+    ("__dom_slot_check", 2, guarded_slot_check),
+    ("__dom_slot_signals", 1, host_slot_signals),
+    ("__dom_move_before", 5, guarded_move_before),
+    ("__dom_custom_registry", 3, guarded_custom_registry),
     ("__dom_next", 1, host_next),
     ("__dom_prev", 1, host_prev),
     ("__dom_node_type", 1, host_node_type),
@@ -9586,8 +9592,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_elements_by_class", 3, guarded_elements_by_class),
     ("__dom_matches", 2, guarded_matches),
     ("__dom_get_by_id", 1, guarded_get_by_id),
-    ("__dom_upgrade_candidates", 2, guarded_upgrade_candidates),
-    ("__dom_ce_candidates", 1, guarded_ce_candidates),
+    ("__dom_upgrade_candidates", 3, guarded_upgrade_candidates),
+    ("__dom_ce_candidates", 2, guarded_ce_candidates),
     ("__dom_listener_subtree", 1, host_listener_subtree),
     ("__dom_note_listener_node", 1, host_note_listener_node),
     ("__dom_rendering_frames", 1, host_rendering_frames),
@@ -9595,12 +9601,12 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_slot_scope", 1, host_slot_scope),
     ("__dom_insertion_effects", 2, host_insertion_effects),
     ("__dom_removal_effects", 2, host_removal_effects),
-    ("__dom_clone", 2, guarded_clone),
+    ("__dom_clone", 4, guarded_clone),
     ("__dom_doc_element", 0, guarded_doc_element),
     ("__html_all_collection", 5, host_html_all_collection),
     ("__url_parse", 2, host_url_parse),
     ("__url_set", 3, host_url_set),
-    ("__dom_attach_shadow", 6, guarded_attach_shadow),
+    ("__dom_attach_shadow", 7, guarded_attach_shadow),
     ("__dom_shadow_info", 1, host_shadow_info),
     ("__dom_shadow_root", 1, guarded_shadow_root),
     ("__dom_adopt_styles", 2, guarded_adopt_styles),
@@ -10289,7 +10295,7 @@ node_access_guards! {
     guarded_append = host_append, [0, 1], Invalidate;
     guarded_insert_before = host_insert_before, [0, 1, 2], Invalidate;
     guarded_adopt = host_adopt, [0, 1], Invalidate;
-    guarded_clone = host_clone, [0], Invalidate;
+    guarded_clone = host_clone, [0, 2], Invalidate;
     guarded_get_attr = host_get_attr, [0], Invalidate;
     guarded_set_attr = host_set_attr, [0], Invalidate;
     guarded_remove_attr = host_remove_attr, [0], Invalidate;
@@ -10325,6 +10331,10 @@ node_access_guards! {
     guarded_adopt_styles = host_adopt_styles, [0], Invalidate;
     guarded_slot_assigned = host_slot_assigned, [0], Invalidate;
     guarded_assigned_slot = host_assigned_slot, [0], Invalidate;
+    guarded_slot_assign = host_slot_assign, [0], Invalidate;
+    guarded_slot_check = host_slot_check, [0], Invalidate;
+    guarded_move_before = host_move_before, [0, 1, 2], Invalidate;
+    guarded_custom_registry = host_custom_registry, [1], Invalidate;
     guarded_form_owner = host_form_owner, [0], Invalidate;
     guarded_form_named_items = host_form_named_items, [0], Invalidate;
     guarded_window_named_items = host_window_named_items, [0], Invalidate;
@@ -16037,6 +16047,189 @@ fn host_assigned_slot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     ))
 }
 
+/// HTML #dom-slot-assign: `__dom_slot_assign(slot, nodes)` with the converted
+/// (Element or Text) arguments as distinct node ids. Returns whether a slot
+/// change was signalled, in which case the platform queues a mutation
+/// observer microtask (DOM #signal-a-slot-change).
+fn host_slot_assign(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let array = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let limit = ctx
+        .host_mut::<HostState>()
+        .expect("DOM host")
+        .dom
+        .borrow()
+        .node_count();
+    let Some(numbers) = ctx.copy_numeric_array(&array, limit) else {
+        return Err(ctx.make_error("TypeError", "Invalid slottable list"));
+    };
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let Some(slot) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(false));
+    };
+    let nodes: Vec<usize> = numbers
+        .into_iter()
+        .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+        .map(|number| number as usize)
+        .filter(|&node| dom.is_valid(node))
+        .collect();
+    Ok(Value::Bool(dom.assign_slot_manually(slot, &nodes)))
+}
+
+/// `__dom_slot_check(node, childrenChanged)`: the slot-assignment steps of a
+/// completed tree or attribute mutation at `node` (see
+/// `Dom::slot_mutation_check`). Returns whether a slot change was signalled.
+fn host_slot_check(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let children_changed = matches!(args.get(1), Some(Value::Bool(true)));
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let signalled = host_arg_node(&dom, args, 0)
+        .is_some_and(|node| dom.slot_mutation_check(node, children_changed));
+    Ok(Value::Bool(signalled))
+}
+
+/// `__dom_slot_signals(take)`: DOM #notify-mutation-observers steps 4–5 take
+/// the signal slots (an id array); without `take`, whether any are waiting.
+/// With several Window Realms, a Realm takes the slots of its own Documents
+/// (and of Documents no navigable owns): its mutation observer microtask
+/// fires their slotchange events with its own wrappers and listeners.
+fn host_slot_signals(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let take = matches!(args.first(), Some(Value::Bool(true)));
+    let caller = ctx.host_job_context();
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let handle = state.dom.clone();
+    let slots: Vec<usize> = {
+        let dom = handle.borrow();
+        let pending = dom.signal_slots();
+        if state.window_realms.is_empty() {
+            pending.to_vec()
+        } else {
+            pending
+                .iter()
+                .copied()
+                .filter(|&slot| {
+                    node_window_context(state, &dom, slot).is_none_or(|owner| owner == caller)
+                })
+                .collect()
+        }
+    };
+    if !take {
+        return Ok(Value::Bool(!slots.is_empty()));
+    }
+    handle.borrow_mut().remove_signal_slots(&slots);
+    Ok(host_ids_array(ctx, slots))
+}
+
+/// DOM #concept-node-move: `__dom_move_before(parent, node, child,
+/// foreignChild, checkOnly)` validates (steps 1–6) and, unless `checkOnly`,
+/// relocates the node. The result is `__dom_insert_before`'s: true, false for
+/// a HierarchyRequestError, -1 for a NotFoundError.
+fn host_move_before(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let foreign_child = matches!(args.get(3), Some(Value::Bool(true)));
+    let check_only = matches!(args.get(4), Some(Value::Bool(true)));
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let (Some(parent), Some(node)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
+    else {
+        return Ok(pre_insert_result(Err(
+            crate::dom::PreInsertError::HierarchyRequest,
+        )));
+    };
+    let child = host_arg_node(&dom, args, 2);
+    let foreign_child = foreign_child
+        || (child.is_none() && !matches!(args.get(2), None | Some(Value::Null | Value::Undefined)));
+    if let Err(error) = dom.ensure_move_validity(node, parent, child, foreign_child) {
+        return Ok(pre_insert_result(Err(error)));
+    }
+    if !check_only {
+        dom.move_before(node, parent, child)
+            .expect("validated move");
+    }
+    Ok(Value::Bool(true))
+}
+
+/// A custom element registry crossing the boundary: null, 0 for the node
+/// document's global registry, or a scoped registry's positive number.
+fn registry_value(registry: CustomElementRegistryRef) -> Value {
+    match registry {
+        CustomElementRegistryRef::Null => Value::Null,
+        CustomElementRegistryRef::Global => Value::Num(0.0),
+        CustomElementRegistryRef::Scoped(id) => Value::Num(id as f64),
+    }
+}
+
+/// The inverse of `registry_value`; None for any other value.
+fn registry_arg(value: Option<&Value>) -> Option<CustomElementRegistryRef> {
+    match value {
+        Some(Value::Null) => Some(CustomElementRegistryRef::Null),
+        Some(value) => {
+            let number = value.as_num_opt()?;
+            if number == 0.0 {
+                Some(CustomElementRegistryRef::Global)
+            } else if number.is_finite()
+                && number >= 1.0
+                && number.fract() == 0.0
+                && number <= u32::MAX as f64
+            {
+                Some(CustomElementRegistryRef::Scoped(number as u32))
+            } else {
+                None
+            }
+        }
+        None => None,
+    }
+}
+
+/// `__dom_custom_registry(op, node, value)`: the arena's custom element
+/// registry associations (see `dom::custom_registry`). `op` is "element",
+/// "shadow", "document" or "lookup" (a node's registry), "set-element",
+/// "initialize" (HTML #dom-customelementregistry-initialize steps 2–4,
+/// returning the candidates to try to upgrade) or "live" (the scoped
+/// registry numbers nodes still use).
+fn host_custom_registry(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    let dom = host_dom(ctx);
+    match op.as_str() {
+        "live" => {
+            let mut live: Vec<u32> = dom.borrow().live_scoped_registries().into_iter().collect();
+            live.sort_unstable();
+            Ok(ctx.make_array(live.into_iter().map(|id| Value::Num(id as f64)).collect()))
+        }
+        "initialize" => {
+            let candidates = {
+                let mut dom = dom.borrow_mut();
+                match (host_arg_node(&dom, args, 1), registry_arg(args.get(2))) {
+                    (Some(root), Some(registry)) => dom.initialize_registry(root, registry),
+                    _ => Vec::new(),
+                }
+            };
+            Ok(host_ids_array(ctx, candidates))
+        }
+        "set-element" => {
+            let mut dom = dom.borrow_mut();
+            if let (Some(element), Some(registry)) =
+                (host_arg_node(&dom, args, 1), registry_arg(args.get(2)))
+            {
+                dom.set_element_registry(element, registry);
+            }
+            Ok(Value::Undefined)
+        }
+        _ => {
+            let dom = dom.borrow();
+            let Some(node) = host_arg_node(&dom, args, 1) else {
+                return Ok(Value::Null);
+            };
+            let registry = match op.as_str() {
+                "element" => dom.element_registry(node),
+                "shadow" => dom.shadow_registry(node),
+                "document" => dom.document_registry(node),
+                _ => dom.lookup_registry(node),
+            };
+            Ok(registry_value(registry))
+        }
+    }
+}
+
 fn host_next(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -16617,9 +16810,21 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     let mut dom = dom.borrow_mut();
     if let Some(id) = host_arg_node(&dom, args, 0) {
         let target = dom.content_target(id);
-        let context = match args.get(3) {
-            None | Some(Value::Undefined) => Some(id),
-            Some(_) => host_arg_node(&dom, args, 3),
+        // The fragment parsing algorithm's target is the node itself, or, for
+        // Range.createContextualFragment(), the given context element (a new
+        // body element of the node document without one), whose custom
+        // element registry the parsed elements receive.
+        let (context, registry_source) = match args.get(3) {
+            None | Some(Value::Undefined) => (Some(id), id),
+            Some(_) => {
+                let context = host_arg_node(&dom, args, 3);
+                let source = context
+                    .filter(|&context| {
+                        matches!(dom.node(context).data, crate::dom::NodeData::Element { .. })
+                    })
+                    .unwrap_or_else(|| dom.owner_document(id).unwrap_or(id));
+                (context, source)
+            }
         };
         // HTML's innerHTML setter parses first, then DOM's replace-all
         // operation removes the old children and inserts the parsed fragment.
@@ -16627,7 +16832,7 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
         // declarative shadow roots (HTML #unsafely-set-html).
         let declarative = matches!(args.get(4), Some(Value::Bool(true)));
         let Some(nodes) =
-            dom.fragment_parse_with_shadow_roots(id, context, &html, check_only, declarative)
+            dom.fragment_parse_from(id, registry_source, context, &html, check_only, declarative)
         else {
             return Ok(Value::Bool(false));
         };
@@ -16681,7 +16886,7 @@ fn host_insert_adjacent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
                 && dom.tag_name(context) == Some("html")
                 && dom.namespace_uri(context) == Some("http://www.w3.org/1999/xhtml"))
     });
-    let Some(nodes) = dom.fragment_parse(id, context, &html, check_only) else {
+    let Some(nodes) = dom.fragment_parse_adjacent(id, context, &html, check_only) else {
         return Ok(Value::Bool(false));
     };
     if check_only {
@@ -16805,20 +17010,48 @@ fn host_get_by_id(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     })))
 }
 
+/// HTML #upgrade-particular-elements-within-a-document's candidates:
+/// `__dom_upgrade_candidates(document, localName, registry)`.
 fn host_upgrade_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let name = host_arg_string(ctx, args, 1).to_ascii_lowercase();
+    let registry = registry_arg(args.get(2)).unwrap_or(CustomElementRegistryRef::Global);
     let dom = host_dom(ctx);
     let ids = {
         let dom = dom.borrow();
         host_arg_node(&dom, args, 0)
-            .map(|root| dom.elements_by_tag_composed(root, &name))
+            .map(|root| dom.upgrade_candidates(root, &name, registry))
             .unwrap_or_default()
     };
     Ok(host_ids_array(ctx, ids))
 }
 
+/// `__dom_ce_candidates(root, withRegistries)`: the custom element
+/// candidates of `root`'s composed subtree; with `withRegistries`, each id is
+/// followed by its custom element registry (see `registry_value`).
 fn host_ce_candidates(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let with_registries = matches!(args.get(1), Some(Value::Bool(true)));
     let dom = host_dom(ctx);
+    if with_registries {
+        let pairs = {
+            let dom = dom.borrow();
+            host_arg_node(&dom, args, 0)
+                .map(|root| dom.custom_element_candidates_with_registries(root))
+                .unwrap_or_default()
+        };
+        let ids: Vec<usize> = pairs.iter().map(|&(id, _)| id).collect();
+        let mut values = Vec::with_capacity(pairs.len() * 2);
+        for (id, registry) in pairs {
+            values.push(Value::Num(id as f64));
+            values.push(registry_value(registry));
+        }
+        let array = ctx.make_array(values);
+        if let Some(state) = ctx.host_mut::<HostState>() {
+            state
+                .dom_gc
+                .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
+        }
+        return Ok(array);
+    }
     let ids = {
         let dom = dom.borrow();
         host_arg_node(&dom, args, 0)
@@ -16996,7 +17229,18 @@ fn host_clone(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     let deep = matches!(args.get(1), Some(Value::Bool(true)));
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    let id = host_arg_node(&dom, args, 0).map(|id| dom.clone_subtree(id, deep));
+    // `__dom_clone(node, deep, document, fallbackRegistry)`: importNode()
+    // clones into `document` with a fallback registry (DOM #concept-node-
+    // clone); cloneNode() passes neither.
+    let document = host_arg_node(&dom, args, 2);
+    let fallback = registry_arg(args.get(3)).unwrap_or(CustomElementRegistryRef::Null);
+    let id = host_arg_node(&dom, args, 0).map(|id| match document {
+        Some(document) => dom.clone_subtree_into(id, deep, document, fallback),
+        None => dom.clone_subtree(id, deep),
+    });
+    // A copied clonable shadow tree's slots receive the copied slottables
+    // (DOM #concept-node-insert step 7.4 for its children).
+    dom.settle_parsed_slot_assignments(true);
     Ok(host_id_value(id))
 }
 
@@ -17149,8 +17393,20 @@ fn host_attach_shadow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     };
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    let root =
-        host_arg_node(&dom, args, 0).and_then(|host| dom.attach_shadow_with_options(host, options));
+    let Some(host) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Null);
+    };
+    let reused = dom.shadow_root(host);
+    let root = dom.attach_shadow_with_options(host, options);
+    // DOM #concept-attach-a-shadow-root step 13: the new shadow root's
+    // registry; undefined is the host's node document's registry. A
+    // reclaimed declarative root keeps its registry.
+    if let Some(root) = root
+        && reused.is_none()
+        && let Some(registry) = registry_arg(args.get(6))
+    {
+        dom.set_shadow_registry(root, registry, false);
+    }
     Ok(host_id_value(root))
 }
 
@@ -23793,6 +24049,192 @@ mod tests {
         );
     }
 
+    /// HTML #dom-slot-assign with DOM's manual slot assignment, and DOM
+    /// #signal-a-slot-change: slotchange is fired after the mutation
+    /// observer callbacks of the same microtask, once per signalled slot.
+    #[test]
+    fn manual_slot_assignment_and_slotchange_follow_the_dom_algorithms() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/slot_assignment.mjs")),
+                "slot-assignment-ok",
+                "{tier:?}"
+            );
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/slot_change.mjs")),
+                "slot-change-queued",
+                "{tier:?}"
+            );
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "slotLog.join()"),
+                "mo,change:s1:true:false:true,|,change:s2:true:false:true,change:s1:true:false:true,\
+                 |,fallback,change:?:true:false:true,removed-s2",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// Named slotting signals slotchange from DOM's insert and remove steps
+    /// too, including a slot's fallback content and parser-created
+    /// declarative shadow trees (setHTMLUnsafe()).
+    #[test]
+    fn named_slot_changes_are_signalled_from_tree_mutations() {
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+            const log = [];
+            globalThis.namedSlotLog = log;
+            const host = document.createElement('div'); document.body.appendChild(host);
+            const root = host.attachShadow({ mode: 'open' });
+            root.innerHTML = '<slot id=d></slot><slot id=n name=n>fallback</slot>';
+            const d = root.getElementById('d'), n = root.getElementById('n');
+            root.addEventListener('slotchange', e => log.push(e.target.id));
+            const x = document.createElement('b');
+            host.appendChild(x);
+            x.slot = 'n';
+            x.slot = '';
+            n.firstChild.data = 'changed';
+            n.appendChild(document.createTextNode('more'));
+            const parsed = document.createElement('div'); document.body.appendChild(parsed);
+            parsed.setHTMLUnsafe('<p id=p><template shadowrootmode=open><slot></slot></template><i>x</i></p>');
+            parsed.firstChild.shadowRoot.addEventListener('slotchange', () => log.push('parsed'));
+            return 'queued';
+        })()"#
+            ),
+            "queued"
+        );
+        run_microtask_checkpoint(&mut engine);
+        // The default slot changed (x arrived, left for n and came back, a
+        // net change from nothing), the named slot's fallback changed by
+        // insertion (character data changes are not tree mutations), and
+        // the parsed tree's slot received its slottable.
+        assert_eq!(
+            string_value(&mut engine, "namedSlotLog.join()"),
+            "d,n,parsed"
+        );
+    }
+
+    /// DOM #dom-parentnode-movebefore and #concept-node-move.
+    #[test]
+    fn move_before_preserves_state_and_runs_the_move_steps() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/move_before.mjs")),
+                "move-before-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// A move runs no insertion or removing steps: a child navigable keeps
+    /// its Document and Window and an already started script does not run
+    /// again.
+    #[test]
+    fn move_before_keeps_child_navigables_and_scripts() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut engine = platform_engine();
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(() => {
+                document.appendChild(document.createElement('body'));
+                globalThis.moveFrameLog = [];
+                globalThis.moveScriptRuns = 0;
+                const left = document.createElement('section'), right = document.createElement('section');
+                document.body.append(left, right);
+                const frame = document.createElement('iframe');
+                frame.srcdoc = '<body><script>parent.moveFrameLog.push("run");<\/script>';
+                frame.onload = () => moveFrameLog.push('load');
+                left.appendChild(frame);
+                const script = document.createElement('script');
+                script.textContent = 'moveScriptRuns++';
+                left.appendChild(script);
+                return 'pending';
+                })()"#
+                    ),
+                    "pending"
+                );
+                let settle = |engine: &mut lumen::Engine| {
+                    run_microtask_checkpoint(engine);
+                    eval(
+                        engine,
+                        "while (__trust.hasPlatformTask()) __trust.runPlatformTask()",
+                        "frame tasks",
+                    )
+                    .unwrap();
+                    run_microtask_checkpoint(engine);
+                };
+                settle(&mut engine);
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        r#"(() => {
+                const frame = document.querySelector('iframe'), script = document.querySelector('script');
+                globalThis.movedWindow = frame.contentWindow;
+                const [left, right] = document.querySelectorAll('section');
+                right.moveBefore(frame, null);
+                right.moveBefore(script, null);
+                const shadow = document.createElement('div');
+                document.body.appendChild(shadow);
+                shadow.attachShadow({ mode: 'open' }).moveBefore(frame, null);
+                return moveFrameLog.join() + '|' + moveScriptRuns;
+                })()"#
+                    ),
+                    "run,load|1"
+                );
+                settle(&mut engine);
+                assert_eq!(
+                    string_value(
+                        &mut engine,
+                        "(() => { const moved = document.querySelector('div').shadowRoot.firstChild;
+                         return [moveFrameLog.join(), moveScriptRuns, moved.contentWindow === movedWindow,
+                          moved.contentDocument.body.childNodes.length].join('|'); })()"
+                    ),
+                    "run,load|1|true|1"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// HTML #custom-elements-api scoped registries and DOM's registry
+    /// associations of Documents, shadow roots and elements.
+    #[test]
+    fn scoped_custom_element_registries_follow_the_registry_algorithms() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/scoped_custom_registries.mjs")
+                ),
+                "scoped-registries-ok",
+                "{tier:?}"
+            );
+            run_microtask_checkpoint(&mut engine);
+            assert_eq!(
+                string_value(&mut engine, "scopedWhenDefined.join()"),
+                "ScopedWhen",
+                "{tier:?}"
+            );
+        }
+    }
+
     /// DOM #concept-node-remove enqueues disconnectedCallback for every custom
     /// element among the removed node's shadow-including inclusive
     /// descendants, and HTML #cereactions runs it once the removal is done:
@@ -25575,7 +26017,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 213, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 218, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -25586,7 +26028,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 213);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 218);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
