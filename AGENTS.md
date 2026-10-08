@@ -441,7 +441,30 @@ current behavior and limits; consult the governing standards before changing it.
   memory when the tree builder finds a later declaration. Only local files are
   autodetected, and only as UTF-8. That encoding is `document.characterSet` and
   the fallback for classic scripts and style sheets; module scripts are UTF-8.
-  Form submission and URL query strings still encode as UTF-8.
+  Form submission uses HTML's selected form encoding (`accept-charset`, else
+  the document's), with `&#N;` references for unencodable characters, and
+  URL query strings in hyperlinks, `location`, frame, image, media, script,
+  link and Worker URLs are encoding-parsed with the document's encoding
+  (`src/form_encoding.rs`). Fetch, XHR, `URL` and module requests stay UTF-8.
+- CSSOM keeps every `@import` as its own sheet (`ImportedSheet` records in
+  `src/dom/cssom.rs`) while the cascade still splices them in place; scripts
+  see nested `CSSStyleSheet`s with origin-clean checks, and imports added by
+  CSSOM are fetched once and restyle on arrival.
+- `document.evaluate()` and the DOM XPath interfaces run the XPath 1.0 engine
+  in `src/dom/xpath.rs` over the arena DOM. Namespace nodes are usable inside
+  expressions; returning one as a result throws `NotSupportedError`, since the
+  DOM Standard defines no node type for them.
+- `document.execCommand()` implements every command of the W3C execCommand
+  draft except `paste` (script may never read the clipboard, so it is
+  unsupported); `copy`/`cut` need transient activation and write text through
+  `PageEvt::ClipboardWrite`. Commands, native contenteditable edits and the
+  history share one per-Document undo stack built from mutation records
+  (`historyUndo`/`historyRedo`, Ctrl+Z/Ctrl+Y). The non-standard `heading`
+  command is not supported.
+- SVG elements reflect their attributes through the SVG 2 `SVGAnimated*`
+  interfaces; `animVal` always equals `baseVal`, because SMIL animation
+  elements (`animate`, `set`, `animateMotion`, `animateTransform`) are inert
+  and exposed only as `SVGElement`.
 
 ### Local files and persistent state
 

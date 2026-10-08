@@ -397,6 +397,18 @@ impl Dom {
         f64::from(self.font_px(id)).max(0.0)
     }
 
+    /// SVG 2 types.html#__svg__SVGLength__value: an element's SVG viewport
+    /// (the user space of its nearest `svg` ancestor, or the outermost
+    /// viewport for an outermost `svg` element) and its computed font size,
+    /// as `[width, height, font size]`.
+    pub(crate) fn svg_length_context(&self, id: NodeId, outer: (f64, f64)) -> [f64; 3] {
+        let (width, height) = match self.svg_nearest_viewport(id) {
+            Some(svg) => self.svg_user_space_size(svg, outer),
+            None => outer,
+        };
+        [width, height, self.svg_font_size(id)]
+    }
+
     /// Resolve an SVG `<length>` or `<percentage>` to user units (SVG 2
     /// coords.html#Units). Percentages refer to the nearest viewport's user
     /// space: its width, its height, or its normalized diagonal.

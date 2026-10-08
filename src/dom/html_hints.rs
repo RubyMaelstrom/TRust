@@ -522,7 +522,7 @@ fn nonzero_dimension_value(input: &str) -> Option<String> {
 /// HTML #rules-for-parsing-a-legacy-colour-value. In particular, this is not
 /// the CSS color grammar: arbitrary old attribute strings undergo the legacy
 /// component algorithm, while an empty string and `transparent` fail.
-fn legacy_color(input: &str) -> Option<String> {
+pub(super) fn legacy_color(input: &str) -> Option<String> {
     if input.is_empty() {
         return None;
     }
@@ -609,7 +609,7 @@ fn hex_digit(byte: u8) -> u8 {
 
 /// HTML #rules-for-parsing-a-legacy-font-size. Signed values are relative to
 /// 3, not the parent font's size. Trailing non-digits are ignored.
-fn legacy_font_size(input: &str) -> Option<&'static str> {
+pub(super) fn legacy_font_size(input: &str) -> Option<&'static str> {
     let input = input.trim_start_matches(ascii_whitespace);
     let (sign, digits) = match input.as_bytes().first()? {
         b'+' => (1, &input[1..]),

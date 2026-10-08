@@ -26,7 +26,7 @@
         SVGUseElement: 'SVGGraphicsElement', SVGImageElement: 'SVGGraphicsElement',
         SVGSwitchElement: 'SVGGraphicsElement', SVGForeignObjectElement: 'SVGGraphicsElement',
         SVGGradientElement: 'SVGElement', SVGLinearGradientElement: 'SVGGradientElement',
-        SVGRadialGradientElement: 'SVGGradientElement', SVGSymbolElement: 'SVGElement',
+        SVGRadialGradientElement: 'SVGGradientElement', SVGSymbolElement: 'SVGGraphicsElement',
         SVGMarkerElement: 'SVGElement', SVGClipPathElement: 'SVGElement', SVGStopElement: 'SVGElement',
     };
     for (const name of Object.keys(chain)) {
@@ -48,7 +48,7 @@
         tspan: 'SVGTSpanElement', textPath: 'SVGTextPathElement', svg: 'SVGSVGElement',
         g: 'SVGGElement', use: 'SVGUseElement', linearGradient: 'SVGLinearGradientElement',
         foreignObject: 'SVGForeignObjectElement', graphics: 'SVGElement', geometry: 'SVGElement',
-        gradient: 'SVGElement', feGaussianBlur: 'SVGElement',
+        gradient: 'SVGElement', feGaussianBlur: 'SVGFEGaussianBlurElement', RECT: 'SVGElement',
     };
     for (const name of Object.keys(created)) {
         const element = document.createElementNS(SVG, name);

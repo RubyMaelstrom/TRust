@@ -404,6 +404,9 @@ pub struct Form {
     pub fields: Vec<Field>,
     /// Original `<form>` DOM node id inside the living page actor.
     pub live_node: Option<usize>,
+    /// HTML #picking-an-encoding-for-the-form: the output encoding its
+    /// submission uses (accept-charset, else the document's encoding).
+    pub encoding: &'static encoding_rs::Encoding,
 }
 
 /// One entry of a static form's entry list (HTML #constructing-the-form-data-set).
@@ -411,14 +414,6 @@ enum EntryValue<'a> {
     Text(&'a str),
     /// A selected file, or `None` for the empty File an empty control submits.
     File(Option<&'a crate::file_select::SelectedFile>),
-}
-
-/// HTML: replace each CR not followed by LF, and each LF not preceded by CR,
-/// with CRLF.
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\n', "\r\n")
 }
 
 impl Form {
@@ -465,22 +460,33 @@ impl Form {
         entries
     }
 
-    /// Serialize the successful fields urlencoded (a file entry becomes its
-    /// name, HTML #convert-to-a-list-of-name-value-pairs). `submitter` is the
-    /// index of the submit control that fired; `None` is the HTML
-    /// `requestSubmit()` no-argument case, where no submit button contributes
-    /// a name/value pair.
+    /// Serialize the successful fields urlencoded in the form's encoding (URL
+    /// #concept-urlencoded-serializer). Names and values first normalize
+    /// newlines to CRLF and a file entry becomes its name (HTML
+    /// #convert-to-a-list-of-name-value-pairs). `submitter` is the index of
+    /// the submit control that fired; `None` is the HTML `requestSubmit()`
+    /// no-argument case, where no submit button contributes a name/value pair.
     pub fn encode(&self, submitter: Option<usize>) -> String {
-        let mut out = url::form_urlencoded::Serializer::new(String::new());
-        for (name, value) in self.entry_list(submitter) {
-            match value {
-                EntryValue::Text(text) => out.append_pair(name, text),
-                EntryValue::File(file) => {
-                    out.append_pair(name, file.map_or("", |file| file.name.as_str()))
-                }
-            };
-        }
-        out.finish()
+        let normalized: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = self
+            .entry_list(submitter)
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    EntryValue::Text(text) => text,
+                    EntryValue::File(file) => file.map_or("", |file| file.name.as_str()),
+                };
+                (
+                    crate::form_encoding::normalize_newlines(name),
+                    crate::form_encoding::normalize_newlines(value),
+                )
+            })
+            .collect();
+        crate::form_encoding::urlencoded_serialize(
+            normalized
+                .iter()
+                .map(|(name, value)| (name.as_ref(), value.as_ref())),
+            self.encoding,
+        )
     }
 
     /// HTML #submit-body: the entity body of a POST submission and its MIME
@@ -492,6 +498,8 @@ impl Form {
     pub fn entity_body(&self, submitter: Option<usize>) -> Result<(String, Vec<u8>), String> {
         match self.enctype.as_str() {
             "multipart/form-data" => self.multipart_body(submitter),
+            // HTML #text/plain-encoding-algorithm, encoded in the form's
+            // encoding (numeric character references for the unencodable).
             "text/plain" => {
                 let mut body = String::new();
                 for (name, value) in self.entry_list(submitter) {
@@ -499,12 +507,13 @@ impl Form {
                         EntryValue::Text(text) => text,
                         EntryValue::File(file) => file.map_or("", |file| file.name.as_str()),
                     };
-                    body.push_str(&normalize_newlines(name));
+                    body.push_str(&crate::form_encoding::normalize_newlines(name));
                     body.push('=');
-                    body.push_str(&normalize_newlines(value));
+                    body.push_str(&crate::form_encoding::normalize_newlines(value));
                     body.push_str("\r\n");
                 }
-                Ok((String::from("text/plain"), body.into_bytes()))
+                let body = crate::form_encoding::encode_html(&body, self.encoding).into_owned();
+                Ok((String::from("text/plain"), body))
             }
             _ => Ok((
                 String::from(crate::js::FORM_URLENCODED),
@@ -529,16 +538,21 @@ impl Form {
                 .replace('"', "%22")
         };
         let mut body = Vec::new();
+        // HTML #multipart/form-data-encoding-algorithm: names, string values
+        // and filenames are encoded in the form's encoding.
+        let encoded =
+            |text: &str| crate::form_encoding::encode_html(text, self.encoding).into_owned();
         for (name, value) in self.entry_list(submitter) {
-            let name = escape(&normalize_newlines(name));
+            let name = escape(&crate::form_encoding::normalize_newlines(name));
             body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
             match value {
                 EntryValue::Text(text) => {
-                    body.extend_from_slice(
-                        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n")
-                            .as_bytes(),
-                    );
-                    body.extend_from_slice(normalize_newlines(text).as_bytes());
+                    body.extend_from_slice(b"Content-Disposition: form-data; name=\"");
+                    body.extend_from_slice(&encoded(&name));
+                    body.extend_from_slice(b"\"\r\n\r\n");
+                    body.extend_from_slice(&encoded(&crate::form_encoding::normalize_newlines(
+                        text,
+                    )));
                 }
                 EntryValue::File(file) => {
                     let (filename, mime) =
@@ -548,13 +562,12 @@ impl Form {
                     } else {
                         mime
                     };
+                    body.extend_from_slice(b"Content-Disposition: form-data; name=\"");
+                    body.extend_from_slice(&encoded(&name));
+                    body.extend_from_slice(b"\"; filename=\"");
+                    body.extend_from_slice(&encoded(&escape(filename)));
                     body.extend_from_slice(
-                        format!(
-                            "Content-Disposition: form-data; name=\"{name}\"; filename=\"{}\"\r\n\
-                             Content-Type: {mime}\r\n\r\n",
-                            escape(filename)
-                        )
-                        .as_bytes(),
+                        format!("\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes(),
                     );
                     if let Some(file) = file {
                         let bytes = file.read().map_err(|error| error.message().to_string())?;
@@ -997,6 +1010,7 @@ mod tests {
                 field("alt", "Other", FieldKind::Submit),
             ],
             live_node: None,
+            encoding: encoding_rs::UTF_8,
         };
         // Unchecked boxes stay home; only the pressed submit is sent;
         // spaces and ampersands urlencode.
@@ -1048,6 +1062,7 @@ mod tests {
                 field("go", "Send", FieldKind::Submit),
             ],
             live_node: None,
+            encoding: encoding_rs::UTF_8,
         };
         let (content_type, body) = form.entity_body(Some(3)).unwrap();
         let boundary = content_type
@@ -1073,13 +1088,43 @@ mod tests {
                 b"no\r\nte=x\r\ny\r\nup=a\"b.txt\r\nnone=\r\n".to_vec()
             )
         );
-        assert_eq!(form.encode(None), "no%0Ate=x%0Ay&up=a%22b.txt&none=");
+        assert_eq!(form.encode(None), "no%0D%0Ate=x%0D%0Ay&up=a%22b.txt&none=");
         std::fs::write(&path, b"changed contents").unwrap();
         form.enctype = String::from("multipart/form-data");
         assert!(
             form.entity_body(None)
                 .unwrap_err()
                 .contains("changed after it was selected")
+        );
+    }
+
+    #[test]
+    fn encodes_form_submissions_in_the_form_encoding() {
+        // HTML #picking-an-encoding-for-the-form and URL
+        // #concept-urlencoded-serializer: legacy encodings, numeric character
+        // references for unencodable code points, CRLF-normalized newlines.
+        let form = Form {
+            method: FormMethod::Get,
+            action: url::Url::parse("https://example.com/q").unwrap(),
+            fields: vec![
+                field("q", "caf\u{e9} \u{3042}", FieldKind::Text),
+                field("t", "a\nb\rc", FieldKind::Textarea),
+            ],
+            live_node: None,
+            enctype: String::from(crate::js::FORM_URLENCODED),
+            encoding: encoding_rs::WINDOWS_1252,
+        };
+        assert_eq!(
+            form.encode(None),
+            "q=caf%E9+%26%2312354%3B&t=a%0D%0Ab%0D%0Ac"
+        );
+        let shift_jis = Form {
+            encoding: encoding_rs::SHIFT_JIS,
+            ..form
+        };
+        assert_eq!(
+            shift_jis.encode(None),
+            "q=caf%26%23233%3B+%82%A0&t=a%0D%0Ab%0D%0Ac"
         );
     }
 

@@ -179,6 +179,12 @@ enum LumenHostTask {
         url: String,
         bytes: Option<Vec<u8>>,
     },
+    /// Style sheets fetched for `@import` rules a sheet gained after the
+    /// document was fetched, with the sheets their own imports reached
+    /// (CSS Cascade 4 #fetch-an-import).
+    StyleImportsDone {
+        sheets: Vec<crate::http::PageSheet>,
+    },
     ParserResourceTiming(LumenResourceTiming),
     ImageDone {
         id: usize,
@@ -217,12 +223,14 @@ enum LumenHostTask {
         name: String,
         kind: LumenResourceKind,
         result: LumenResourceResult,
-        /// The decoded text, when decoding needs state from the moment the
-        /// element was prepared: a fetched style sheet with its imports
-        /// expanded and its URLs resolved against the response URL
-        /// (`http::fetched_stylesheet_text`), or a classic script decoded with
-        /// the fallback encoding of HTML #prepare-the-script-element.
+        /// The decoded text of a classic script, decoded with the fallback
+        /// encoding of HTML #prepare-the-script-element when the element was
+        /// prepared.
         text: Option<String>,
+        /// A fetched style sheet: its own text with its URLs resolved against
+        /// the response URL, and the sheets its imports fetched
+        /// (`http::fetched_stylesheet`).
+        sheet: Option<Box<crate::http::FetchedStyleSheet>>,
         timing: Option<LumenResourceTiming>,
         external: bool,
     },
@@ -3251,13 +3259,17 @@ mod desktop {
             dom.set_doc_url(url::Url::parse(&env.url).ok());
             dom.set_document_encoding(DOCUMENT, env.document_encoding);
             if !env.sheets.is_empty() {
-                let sheets: Vec<(String, String)> = env
+                let sheets: Vec<crate::http::PageSheet> = env
                     .sheets
                     .iter()
-                    .map(|(url, css)| (url.clone(), dom_text_in(css).into_owned()))
+                    .map(|sheet| crate::http::PageSheet {
+                        text: dom_text_in(&sheet.text).into_owned(),
+                        ..sheet.clone()
+                    })
                     .collect();
                 dom.attach_external_sheets(&sheets);
             }
+            dom.note_fetched_imports();
         }
         let scripts: Vec<_> = dom
             .borrow()
@@ -4442,6 +4454,7 @@ mod desktop {
         }
         let _ = trust_number(page, "updateIntersections");
         start_font_fetches(page);
+        start_style_import_fetches(page);
         start_document_image_fetches(page, &rendered.1);
         rendered
     }
@@ -4618,6 +4631,54 @@ mod desktop {
     /// sources this rendering's font sets awaited, from sheets the page added
     /// or child documents. Text renders in fallback fonts meanwhile; each
     /// completion is a task that rebuilds the font sets.
+    /// CSS Cascade 4 #fetch-an-import for the imports a style sheet gained
+    /// after its document was fetched (a script-inserted or changed
+    /// `<style>`, a CSSOM-inserted `@import`): each URL once, in no-cors
+    /// mode, in the owner node's document and with its encoding as the
+    /// environment encoding.
+    fn start_style_import_fetches(page: &mut LumenPage) {
+        let requests = page.dom.borrow().take_import_requests();
+        if requests.is_empty() {
+            return;
+        }
+        let Some((handle, cache, events)) =
+            page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+                let network = state.network.as_ref()?;
+                Some((
+                    network.handle.clone(),
+                    network.cache.clone(),
+                    state.task_events.clone()?,
+                ))
+            })
+        else {
+            return;
+        };
+        for (owner, url) in requests {
+            let Ok(url) = url::Url::parse(&url) else {
+                continue;
+            };
+            let (owner, encoding) = {
+                let dom = page.dom.borrow();
+                let owner = if dom.is_valid(owner) { owner } else { DOCUMENT };
+                (owner, dom.node_document_encoding(owner))
+            };
+            let client = element_request_client_url(page.engine.ctx(), owner);
+            if !matches!(url.scheme(), "http" | "https" | "file")
+                || !crate::http::subresource_allowed(&client, &url)
+            {
+                continue;
+            }
+            let events = events.clone();
+            cache.spawn(&handle, async move {
+                let sheets =
+                    crate::http::fetch_imported_sheet(url, client, Vec::new(), encoding).await;
+                if !sheets.is_empty() {
+                    let _ = events.send(LumenHostTask::StyleImportsDone { sheets });
+                }
+            });
+        }
+    }
+
     fn start_font_fetches(page: &mut LumenPage) {
         let urls = page.dom.borrow().take_font_requests();
         if urls.is_empty() {
@@ -10112,6 +10173,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__html_all_collection", 5, host_html_all_collection),
     ("__url_parse", 2, host_url_parse),
     ("__url_set", 3, host_url_set),
+    ("__form_encode", 3, host_form_encode),
+    ("__xpath", 4, host_xpath),
     ("__dom_attach_shadow", 7, guarded_attach_shadow),
     ("__dom_shadow_info", 1, host_shadow_info),
     ("__dom_shadow_root", 1, guarded_shadow_root),
@@ -13137,6 +13200,7 @@ fn send_resource_completion(
             kind,
             result,
             text,
+            sheet: None,
             timing: None,
             external,
         })
@@ -13338,6 +13402,7 @@ fn spawn_preload_fetch(
             kind: LumenResourceKind::Preload,
             result,
             text: None,
+            sheet: None,
             timing,
             external: true,
         });
@@ -13378,6 +13443,7 @@ fn spawn_resource_fetch(
     let shared = cache.consume_resource(&request.url, &client, destination, credentials);
     let trace_fetch = std::env::var_os("TRUST_TRACE_FETCH").is_some();
     let environment = dom_fallback_encoding(&host_dom(ctx).borrow(), node_id);
+    let cors_mode = credentials.is_some();
     cache.spawn(&handle, async move {
         let mut response_url = request.url.clone();
         let (result, timing) = match shared {
@@ -13434,7 +13500,7 @@ fn spawn_resource_fetch(
                 ),
             },
         };
-        let text = match &result {
+        let (text, sheet) = match &result {
             Some((status, content_type, body, headers))
                 if matches!(kind, LumenResourceKind::Stylesheet)
                     && crate::http::stylesheet_response_allowed(*status, content_type, headers) =>
@@ -13444,22 +13510,32 @@ fn spawn_resource_fetch(
                     body,
                     Some(environment),
                 );
-                Some(
-                    crate::http::fetched_stylesheet_text(css, response_url, client, encoding).await,
+                let sheet = crate::http::fetched_stylesheet(
+                    css,
+                    request.url.clone(),
+                    response_url,
+                    client,
+                    cors_mode,
+                    encoding,
                 )
+                .await;
+                (None, Some(Box::new(sheet)))
             }
             // The script's charset attribute and node document were read
             // when the element was prepared, as the fallback encoding is.
             Some((_, content_type, body, _))
                 if matches!(kind, LumenResourceKind::ClassicScript) =>
             {
-                Some(crate::document_encoding::decode_classic_script(
-                    content_type,
-                    body,
-                    environment,
-                ))
+                (
+                    Some(crate::document_encoding::decode_classic_script(
+                        content_type,
+                        body,
+                        environment,
+                    )),
+                    None,
+                )
             }
-            _ => None,
+            _ => (None, None),
         };
         if trace_fetch {
             match &result {
@@ -13478,6 +13554,7 @@ fn spawn_resource_fetch(
             kind,
             result,
             text,
+            sheet,
             timing,
             external: true,
         });
@@ -15443,6 +15520,8 @@ fn dom_fallback_encoding(dom: &Dom, node: usize) -> &'static encoding_rs::Encodi
         })
 }
 
+// The completed fetch's parts, as the resource task receives them.
+#[allow(clippy::too_many_arguments)]
 fn run_resource_task(
     engine: &mut lumen::Engine,
     node_id: usize,
@@ -15450,6 +15529,7 @@ fn run_resource_task(
     kind: LumenResourceKind,
     result: LumenResourceResult,
     text: Option<String>,
+    sheet: Option<Box<crate::http::FetchedStyleSheet>>,
     external: bool,
 ) -> Result<(), String> {
     match kind {
@@ -15512,16 +15592,25 @@ fn run_resource_task(
             {
                 // CSS Values 4 #relative-urls: a fetched sheet arrives with
                 // its URLs resolved against its own response URL. Only an
-                // undelivered (`data:`) sheet is decoded here.
-                let css = text.unwrap_or_else(|| {
-                    let environment = element_fallback_encoding(engine, node_id);
-                    crate::document_encoding::decode_stylesheet(
-                        &content_type,
-                        &body,
-                        Some(environment),
-                    )
-                    .0
-                });
+                // undelivered (`data:`) sheet is decoded here; Fetch's scheme
+                // fetch makes a data: response basic, so CORS-same-origin.
+                let sheet = sheet.map_or_else(
+                    || {
+                        let environment = element_fallback_encoding(engine, node_id);
+                        crate::http::FetchedStyleSheet {
+                            text: crate::document_encoding::decode_stylesheet(
+                                &content_type,
+                                &body,
+                                Some(environment),
+                            )
+                            .0,
+                            base: name.clone(),
+                            cors_same_origin: true,
+                            imports: Vec::new(),
+                        }
+                    },
+                    |sheet| *sheet,
+                );
                 let dom = engine
                     .ctx()
                     .host_mut::<HostState>()
@@ -15529,8 +15618,20 @@ fn run_resource_task(
                     .dom
                     .clone();
                 // Decoded CSS is Rust text; CSSOM strings are DOM engine text.
+                let to_engine = |sheet: crate::http::PageSheet| crate::http::PageSheet {
+                    text: dom_text_in(&sheet.text).into_owned(),
+                    ..sheet
+                };
+                let link = to_engine(crate::http::PageSheet {
+                    link_href: None,
+                    url: name.clone(),
+                    base: sheet.base,
+                    text: sheet.text,
+                    cors_same_origin: sheet.cors_same_origin,
+                });
+                let imports = sheet.imports.into_iter().map(to_engine).collect();
                 dom.borrow_mut()
-                    .attach_sheet_to_link(node_id, dom_text_in(&css).into_owned());
+                    .attach_sheet_to_link(node_id, link, imports);
                 fire_engine_script_event(engine, node_id, "load");
             }
             _ => fire_engine_script_event(engine, node_id, "error"),
@@ -15674,6 +15775,26 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .clone();
             dom.borrow_mut().install_downloaded_font(&url, bytes);
         }
+        LumenHostTask::StyleImportsDone { sheets } => {
+            let dom = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .expect("HostState installed before host tasks")
+                .dom
+                .clone();
+            // Decoded CSS is Rust text; CSSOM strings are DOM engine text.
+            let sheets = sheets
+                .into_iter()
+                .map(|sheet| crate::http::PageSheet {
+                    text: dom_text_in(&sheet.text).into_owned(),
+                    ..sheet
+                })
+                .collect();
+            dom.borrow_mut().attach_imported_sheets(sheets);
+            // CSSImportRule.styleSheet: the rules waiting for these sheets
+            // associate them and hand the cascade their rules.
+            let _ = host_call_trust(engine.ctx(), "styleImportsArrived", &[]);
+        }
         LumenHostTask::ParserResourceTiming(timing) => {
             record_resource_timing_ref(engine.ctx(), &timing);
         }
@@ -15782,6 +15903,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             kind,
             result,
             text,
+            sheet,
             timing,
             external,
         } => {
@@ -15803,7 +15925,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             // against the wrong Realm-local listener registry.
             if context == engine.ctx().host_job_context() {
                 record_resource_timing(engine.ctx(), timing);
-                run_resource_task(engine, node_id, name, kind, result, text, external)?;
+                run_resource_task(engine, node_id, name, kind, result, text, sheet, external)?;
             } else {
                 let realm = engine
                     .ctx()
@@ -15817,7 +15939,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 };
                 match engine.with_embed_realm(&realm, move |engine| {
                     record_resource_timing(engine.ctx(), timing);
-                    run_resource_task(engine, node_id, name, kind, result, text, external)
+                    run_resource_task(engine, node_id, name, kind, result, text, sheet, external)
                 }) {
                     Ok(result) => result?,
                     Err(error) => {
@@ -18071,6 +18193,45 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let op = host_arg_string(ctx, args, 0);
     let text = host_arg_string(ctx, args, 1);
     let extra = host_arg_string(ctx, args, 2);
+    // CSS Cascade 4 #fetch-an-import: the sheet an @import fetched for an
+    // absolute request URL, for CSSImportRule.styleSheet.
+    if op == "import-sheet" {
+        let source = host_dom(ctx).borrow().imported_sheet_source(&text);
+        return Ok(source.map_or_else(|| Value::from_engine_text("null"), Value::from_string));
+    }
+    // A CSSOM-inserted @import whose sheet no fetch obtained yet: `text` is
+    // the absolute URL and `extra` the owner node of the importing sheet.
+    if op == "import-request" {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let owner = extra
+            .parse::<usize>()
+            .ok()
+            .filter(|&id| dom.is_valid(id))
+            .unwrap_or(DOCUMENT);
+        dom.request_import(owner, &text);
+        return Ok(Value::from_engine_text("null"));
+    }
+    // execCommand #inline-formatting-commands: CSS Color 4 components of a
+    // `<color>` ([r, g, b, alpha] with alpha in 0..=255, or null), and
+    // HTML's <font> presentational hints for #specified-command-value.
+    if op == "color" {
+        let json = match crate::render::PaintColor::parse_css(&text) {
+            Some(crate::render::PaintColor::Rgba(r, g, b, a)) => format!("[{r},{g},{b},{a}]"),
+            _ => String::from("null"),
+        };
+        return Ok(Value::from_string(json));
+    }
+    if op == "legacy-color" || op == "legacy-font-size" {
+        let value = if op == "legacy-color" {
+            crate::dom::legacy_color_value(&text)
+        } else {
+            crate::dom::legacy_font_size_value(&text).map(str::to_owned)
+        };
+        return Ok(Value::from_string(
+            serde_json::to_string(&value).unwrap_or_else(|_| String::from("null")),
+        ));
+    }
     if op == "adopted-sheets" {
         if let (Ok(scope), Ok(sheets)) = (
             text.parse::<usize>(),
@@ -18202,6 +18363,9 @@ fn host_template_content(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 
 /// WHATWG URL §4.4 basic URL parser, delegated to the standards-oriented `url` crate. The tuple is
 /// the compact boundary representation consumed by the shared JavaScript `URL` wrapper.
+/// `__url_parse(url, base, encoding?)`: the URL parser, given an optional
+/// base and an optional query encoding (an encoding name, for HTML
+/// #encoding-parsing-a-url). Without an encoding the query is UTF-8.
 fn host_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let href = match args.first() {
         Some(value) => ctx.coerce_string(value)?.to_string(),
@@ -18211,14 +18375,180 @@ fn host_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
         None | Some(Value::Null | Value::Undefined) => None,
         Some(value) => Some(ctx.coerce_string(value)?.to_string()),
     };
+    let encoding = match args.get(2) {
+        None | Some(Value::Null | Value::Undefined) => encoding_rs::UTF_8,
+        Some(value) => crate::form_encoding::encoding_for_label(ctx.coerce_string(value)?.as_ref())
+            .unwrap_or(encoding_rs::UTF_8),
+    };
     let parsed = match base {
-        Some(base) => url::Url::parse(&base).and_then(|base| base.join(&href)),
-        None => url::Url::parse(&href),
+        Some(base) => url::Url::parse(&base).and_then(|base| {
+            crate::form_encoding::encoding_parse_url(&href, Some(&base), encoding)
+        }),
+        None => crate::form_encoding::encoding_parse_url(&href, None, encoding),
     };
     let Ok(url) = parsed else {
         return Ok(Value::Null);
     };
     Ok(host_url_parts(ctx, &url))
+}
+
+/// `__xpath(op, expression, namespaces, context)`: the XPath 1.0 engine
+/// (`dom::xpath`) behind the DOM Standard's XPathEvaluatorBase. Results are
+/// JSON:
+/// - "parse": `{"prefixes": [...]}` with the prefixes the namespace resolver
+///   must bind, or `{"error": [name, message]}`.
+/// - "evaluate" (or "evaluate-number", "-string", "-boolean", converting
+///   the result as XPath's function of that name): `namespaces` maps each
+///   prefix to its namespace and
+///   `context` is `[0, node]` or `[1, element, namespace, localName]` for an
+///   attribute; the result is `{"type": "number"|"string"|"boolean", "value"}`
+///   or `{"type": "nodes", "value": [...]}` whose items are `[0, node]`,
+///   `[1, element, namespace, localName]` or `[2, element, prefix]` for a
+///   namespace node, or `{"error": [name, message]}`.
+fn host_xpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use crate::dom::xpath::{XNode, XPathConversion, XPathError, XPathExpression, XValue};
+    let op = host_arg_string(ctx, args, 0);
+    let source = host_arg_string(ctx, args, 1);
+    let error = |error: XPathError| {
+        let (name, message) = match error {
+            XPathError::Syntax(message) => ("SyntaxError", message),
+            XPathError::Namespace(prefix) => {
+                ("NamespaceError", format!("unresolved prefix {prefix}"))
+            }
+            XPathError::Type(message) => ("TypeError", message),
+        };
+        serde_json::json!({ "error": [name, message] })
+    };
+    let result = match op.as_str() {
+        "parse" => match XPathExpression::parse(&source) {
+            Ok(expression) => serde_json::json!({ "prefixes": expression.prefixes() }),
+            Err(failure) => error(failure),
+        },
+        "evaluate" | "evaluate-number" | "evaluate-string" | "evaluate-boolean" => {
+            let convert = match op.as_str() {
+                "evaluate-number" => Some(XPathConversion::Number),
+                "evaluate-string" => Some(XPathConversion::String),
+                "evaluate-boolean" => Some(XPathConversion::Boolean),
+                _ => None,
+            };
+            let namespaces: std::collections::HashMap<String, String> =
+                serde_json::from_str(&host_arg_string(ctx, args, 2)).unwrap_or_default();
+            let context: Vec<serde_json::Value> =
+                serde_json::from_str(&host_arg_string(ctx, args, 3)).unwrap_or_default();
+            let dom = host_dom(ctx);
+            let dom = dom.borrow();
+            let id = |index: usize| {
+                context
+                    .get(index)
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|id| id as usize)
+                    .filter(|&id| dom.is_valid(id))
+            };
+            let text = |index: usize| {
+                context
+                    .get(index)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            };
+            let context_node = match context.first().and_then(serde_json::Value::as_u64) {
+                Some(0) => id(1).map(XNode::Node),
+                Some(1) => id(1).and_then(|element| {
+                    dom.xpath_attribute_index(element, text(2), text(3))
+                        .map(|index| XNode::Attribute(element, index))
+                }),
+                _ => None,
+            };
+            let evaluated = XPathExpression::parse(&source).and_then(|mut expression| {
+                expression.resolve(&|prefix| namespaces.get(prefix).cloned())?;
+                let node = context_node
+                    .ok_or_else(|| XPathError::Type("the context node is not in the DOM".into()))?;
+                dom.xpath_evaluate_as(&expression, node, convert)
+            });
+            match evaluated {
+                Ok(XValue::Number(number)) => {
+                    serde_json::json!({ "type": "number", "value": number_json(number) })
+                }
+                Ok(XValue::String(text)) => serde_json::json!({ "type": "string", "value": text }),
+                Ok(XValue::Boolean(value)) => {
+                    serde_json::json!({ "type": "boolean", "value": value })
+                }
+                Ok(XValue::NodeSet(nodes)) => {
+                    let items: Vec<serde_json::Value> = nodes
+                        .iter()
+                        .map(|node| match node {
+                            XNode::Node(id) => serde_json::json!([0, id]),
+                            XNode::Attribute(element, index) => {
+                                let (namespace, _, local) = dom
+                                    .xpath_attribute_name(*element, *index)
+                                    .unwrap_or_default();
+                                serde_json::json!([1, element, namespace, local])
+                            }
+                            XNode::Namespace(element, prefix) => {
+                                serde_json::json!([2, element, prefix])
+                            }
+                        })
+                        .collect();
+                    serde_json::json!({ "type": "nodes", "value": items })
+                }
+                Err(failure) => error(failure),
+            }
+        }
+        _ => serde_json::Value::Null,
+    };
+    Ok(Value::from_string(result.to_string()))
+}
+
+/// A number for JSON, whose numbers cannot be NaN or infinite: those travel
+/// as their XPath string forms.
+fn number_json(number: f64) -> serde_json::Value {
+    if number.is_finite() {
+        serde_json::json!(number)
+    } else {
+        serde_json::json!(crate::dom::xpath::number_to_string(number))
+    }
+}
+
+/// `__form_encode(mode, text, encoding)`, HTML form submission's encodings
+/// (`crate::form_encoding`):
+/// - "pick": `text` is the form's accept-charset attribute or null, and
+///   `encoding` the document's encoding name; returns the name of the form's
+///   encoding (HTML #picking-an-encoding-for-the-form).
+/// - "html": `text` encoded with the "html" error mode (Encoding #encode), as
+///   a binary string.
+/// - "urlencoded": URL #string-percent-encode-after-encoding with the
+///   `application/x-www-form-urlencoded` percent-encode set.
+fn host_form_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let mode = host_arg_string(ctx, args, 0);
+    let label = host_arg_string(ctx, args, 2);
+    let encoding = crate::form_encoding::encoding_for_label(&label).unwrap_or(encoding_rs::UTF_8);
+    match mode.as_str() {
+        "pick" => {
+            let accept = match args.get(1) {
+                None | Some(Value::Null | Value::Undefined) => None,
+                Some(_) => Some(host_arg_string(ctx, args, 1)),
+            };
+            let chosen =
+                crate::form_encoding::form_submission_encoding(accept.as_deref(), encoding);
+            Ok(Value::from_engine_text(chosen.name()))
+        }
+        "html" => {
+            let text = host_arg_usv(ctx, args, 1);
+            let bytes = crate::form_encoding::encode_html(&text, encoding);
+            Ok(Value::from_string(
+                bytes
+                    .iter()
+                    .map(|&byte| char::from(byte))
+                    .collect::<String>(),
+            ))
+        }
+        "urlencoded" => {
+            let text = host_arg_usv(ctx, args, 1);
+            Ok(Value::from_string(
+                crate::form_encoding::form_urlencode_after_encoding(encoding, &text),
+            ))
+        }
+        _ => Ok(Value::Null),
+    }
 }
 
 fn host_url_parts(ctx: &Ctx, url: &url::Url) -> Value {
@@ -27277,7 +27607,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 228, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 230, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -27288,7 +27618,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 228);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 230);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -28331,6 +28661,221 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn xpath_interfaces_evaluate_xpath_one() {
+        // DOM #xpath, DOM Level 3 XPath and XPath 1.0 through the DOM API.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/xpath_interfaces.mjs")),
+                "xpath-interfaces-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_command_edits_editing_hosts() {
+        // W3C Editing execCommand, Input Events 2 and Clipboard API and
+        // events #integration-with-rich-text-editing.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(&mut engine, include_str!("fixtures/exec_command.mjs")),
+                "exec-command-ok",
+                "{tier:?}"
+            );
+            let requests = std::mem::take(
+                &mut engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .unwrap()
+                    .clipboard_requests,
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>(),
+                ["foo", "foo"],
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_animated_values_reflect_their_attributes() {
+        // SVG 2 types.html#ReflectingDOM and the SVGAnimated* interfaces,
+        // Filter Effects 1 and CSS Masking 1 DOM interfaces.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/svg_animated_values.mjs")
+                ),
+                "svg-animated-values-ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_and_imported_sheets_are_css_style_sheets() {
+        // CSSOM #css-style-sheets and #the-cssimportrule-interface, CSS
+        // Cascade 4 #fetch-an-import and 5 #at-import: every fetched sheet
+        // keeps its own record; the cascade splices imported rules.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut dom = Dom::parse_document(
+                "<html><head>\
+                 <link rel=stylesheet title=Main href=/css/main.css>\
+                 <link rel=stylesheet href=https://cdn.example/x.css>\
+                 <style>@import url(inline.css) layer(base) supports(display: grid) screen;\
+                 @import url(skip.css) layer supports(display: no-such-display);\
+                 p { margin: 0 }</style>\
+                 <link rel=stylesheet href=/css/other.css>\
+                 </head><body><p id=target>x</p></body></html>",
+            );
+            dom.set_doc_url(url::Url::parse(DEFAULT_URL).ok());
+            let sheet =
+                |link: Option<&str>, url: &str, text: &str, cors: bool| crate::http::PageSheet {
+                    link_href: link.map(str::to_string),
+                    url: url.into(),
+                    base: url.into(),
+                    text: text.into(),
+                    cors_same_origin: cors,
+                };
+            dom.attach_external_sheets(&[
+                sheet(
+                    Some("/css/main.css"),
+                    "https://example.com/css/main.css",
+                    "@import 'theme.css' print; @import url(missing.css); .a { color: blue }",
+                    true,
+                ),
+                sheet(
+                    Some("https://cdn.example/x.css"),
+                    "https://cdn.example/x.css",
+                    ".b {}",
+                    false,
+                ),
+                sheet(
+                    Some("/css/other.css"),
+                    "https://example.com/css/other.css",
+                    "@import url(https://cdn.example/y.css);",
+                    true,
+                ),
+                sheet(
+                    None,
+                    "https://example.com/css/theme.css",
+                    "@import url(deep.css); .t { color: green }",
+                    true,
+                ),
+                sheet(
+                    None,
+                    "https://example.com/css/deep.css",
+                    ".d { margin: 0 }",
+                    true,
+                ),
+                sheet(
+                    None,
+                    "https://example.com/inline.css",
+                    "#target { color: red }",
+                    true,
+                ),
+                sheet(
+                    None,
+                    "https://example.com/skip.css",
+                    "#target { color: lime }",
+                    true,
+                ),
+                sheet(None, "https://cdn.example/y.css", ".y {}", false),
+            ]);
+            let dom = Rc::new(RefCell::new(dom));
+            let mut engine = configured_engine(
+                HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+                DEFAULT_URL,
+            );
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/cssom_imported_sheets.mjs")
+                ),
+                "cssom-imported-sheets-ok",
+                "{tier:?}"
+            );
+            // A CSSOM-inserted @import requests its sheet (CSS Cascade 4
+            // #fetch-an-import); its arrival associates the sheet with the
+            // rule and cascades it.
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "globalThis.late = document.styleSheets[2];\n\
+                     late.insertRule('@import url(late.css);', 0);\n\
+                     [late.cssRules[0].styleSheet, getComputedStyle(document.getElementById('target')).color].join()"
+                ),
+                ",rgb(0, 0, 0)",
+                "{tier:?}"
+            );
+            let requests = dom.borrow().take_import_requests();
+            assert!(
+                requests
+                    .iter()
+                    .any(|(_, url)| url == "https://example.com/late.css"),
+                "{requests:?}"
+            );
+            dom.borrow_mut()
+                .attach_imported_sheets(vec![crate::http::PageSheet {
+                    link_href: None,
+                    url: "https://example.com/late.css".into(),
+                    base: "https://example.com/late.css".into(),
+                    text: "#target { color: rgb(7, 8, 9) }".into(),
+                    cors_same_origin: true,
+                }]);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    "__trust.styleImportsArrived();\n\
+                     [late.cssRules[0].styleSheet.href, late.cssRules[0].styleSheet.parentStyleSheet === late,\n\
+                      getComputedStyle(document.getElementById('target')).color].join()"
+                ),
+                "https://example.com/late.css,true,rgb(7, 8, 9)",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forms_and_urls_use_the_document_encoding() {
+        // HTML #picking-an-encoding-for-the-form, #submit-body,
+        // #encoding-parsing-a-url and URL #concept-urlencoded-serializer in a
+        // windows-1252 Document.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let dom = Rc::new(RefCell::new(Dom::new()));
+            dom.borrow_mut()
+                .set_document_encoding(DOCUMENT, encoding_rs::WINDOWS_1252);
+            let mut engine =
+                configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    include_str!("fixtures/legacy_encoding_forms.mjs")
+                ),
+                "legacy-encoding-forms-ok",
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]

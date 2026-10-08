@@ -14,6 +14,36 @@ pub(crate) struct Sheet {
     pub disabled: bool,
 }
 
+/// A fetched `<link rel=stylesheet>` sheet (HTML #link-type-stylesheet,
+/// CSSOM #css-style-sheets).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LinkedSheet {
+    /// The sheet's own text: `url()` tokens absolute, `@import` rules kept.
+    pub text: String,
+    /// CSSOM #concept-css-style-sheet-location.
+    pub location: String,
+    /// The response URL, against which its `@import` URLs resolve.
+    pub base: String,
+    /// CSSOM #concept-css-style-sheet-origin-clean-flag.
+    pub origin_clean: bool,
+    /// The cascade's text: `text` with its imported sheets spliced in place
+    /// of their `@import` rules (CSS Cascade 5 #at-import).
+    pub cascade: String,
+}
+
+/// A style sheet an `@import` rule fetched (CSS Cascade 4
+/// #fetch-an-import), found by its absolute request URL.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ImportedSheet {
+    /// The sheet's own text: `url()` tokens absolute, `@import` rules kept.
+    pub text: String,
+    /// The response URL, against which its `@import` URLs resolve.
+    pub base: String,
+    /// The response was CORS-same-origin; the imported sheet's origin-clean
+    /// flag also requires its parent's.
+    pub cors_same_origin: bool,
+}
+
 impl Dom {
     /// CSSOM View #dom-element-clientwidth / #dom-element-clientheight.
     /// Each Document, including child navigables, has its own root and mode.
@@ -144,17 +174,28 @@ impl Dom {
     /// HTML #update-a-style-block: a style sheet exists for a connected
     /// style element (or stylesheet link), whose shadow-including root is any
     /// Document, a DOMParser document included (CSSOM #dom-document-stylesheets).
+    ///
+    /// The source is `[version, text, location, origin-clean, base]`: the
+    /// sheet's own text (its `@import` rules remain), its CSSOM location
+    /// (null when embedded), its origin-clean flag, and the URL its
+    /// `@import` URLs resolve against (HTML #update-a-style-block: the
+    /// document base URL; #link-type-stylesheet: the response URL).
     pub(crate) fn cssom_sheet_source(&self, id: NodeId) -> Option<String> {
         if !self.is_dom_connected(id) {
             return None;
         }
-        let text = match self.tag_name(id)? {
+        let version = self.cssom_sheet_versions.get(&id).copied().unwrap_or(0);
+        let source = match self.tag_name(id)? {
             "style"
                 if self
                     .attr(id, "type")
                     .is_none_or(|v| v.is_empty() || v.eq_ignore_ascii_case("text/css")) =>
             {
-                self.text_content(id)
+                let base = self
+                    .doc_url
+                    .as_ref()
+                    .map(|page| self.resource_base_url(id, page).to_string());
+                json!([version, self.text_content(id), null, true, base])
             }
             "link"
                 if self.attr(id, "rel").is_some_and(|v| {
@@ -162,17 +203,144 @@ impl Dom {
                         .any(|v| v.eq_ignore_ascii_case("stylesheet"))
                 }) =>
             {
-                self.external_sheets.get(&id)?.clone()
+                let sheet = self.external_sheets.get(&id)?;
+                json!([
+                    version,
+                    sheet.text,
+                    sheet.location,
+                    sheet.origin_clean,
+                    sheet.base
+                ])
             }
             _ => return None,
         };
-        Some(
-            json!([
-                self.cssom_sheet_versions.get(&id).copied().unwrap_or(0),
-                text
-            ])
-            .to_string(),
-        )
+        Some(source.to_string())
+    }
+
+    /// The imported sheet fetched for an absolute request URL, as
+    /// `[text, base, CORS-same-origin]` for the CSSOM (CSSImportRule's
+    /// associated style sheet), or `None` when no import fetched it.
+    pub(crate) fn imported_sheet_source(&self, url: &str) -> Option<String> {
+        let sheet = self.imported_sheets.get(url)?;
+        Some(json!([sheet.text, sheet.base, sheet.cors_same_origin]).to_string())
+    }
+
+    /// CSS Cascade 5 #at-import for the cascade: `css` with each valid
+    /// `@import` replaced by its fetched sheet (resolved against `base`)
+    /// under the import's conditions; `None` when it has no `@import`.
+    ///
+    /// An applicable import whose sheet no fetch obtained is requested for
+    /// `owner` (the sheet's owner node), once per URL
+    /// (`take_import_requests`): a sheet inserted or changed after the
+    /// document was fetched (CSS Cascade 4 #fetch-an-import).
+    pub(crate) fn splice_imported_sheets(
+        &self,
+        css: &str,
+        base: Option<&url::Url>,
+        own_url: Option<&str>,
+        owner: Option<NodeId>,
+    ) -> Option<String> {
+        if !contains_import(css) {
+            return None;
+        }
+        crate::http::splice_imports(css, base, own_url, &|url| {
+            let found = self
+                .imported_sheets
+                .get(url)
+                .map(|sheet| (sheet.text.as_str(), sheet.base.as_str()));
+            if found.is_none()
+                && let Some(owner) = owner
+            {
+                self.request_import(owner, url);
+            }
+            found
+        })
+    }
+
+    /// Request the sheet an applicable `@import` of `owner`'s sheet names,
+    /// unless it was requested (or obtained) before.
+    pub(crate) fn request_import(&self, owner: NodeId, url: &str) {
+        if self.imported_sheets.contains_key(url) {
+            return;
+        }
+        let mut requests = self.import_requests.borrow_mut();
+        if requests.1.insert(url.to_string()) {
+            requests.0.push((owner, url.to_string()));
+        }
+    }
+
+    /// The pending `@import` requests, each returned once.
+    pub(crate) fn take_import_requests(&self) -> Vec<(NodeId, String)> {
+        std::mem::take(&mut self.import_requests.borrow_mut().0)
+    }
+
+    /// Record the import URLs the document's own sheets already name as
+    /// requested: navigation fetched every import its sheets had (`PageSheet`
+    /// lists only the sheets that arrived), so only imports added later
+    /// need a fetch.
+    pub(crate) fn note_fetched_imports(&self) {
+        let mut sources: Vec<(String, Option<url::Url>)> = Vec::new();
+        for id in self.shadow_including_subtree(DOCUMENT) {
+            if self.tag_name(id) == Some("style") {
+                let base = self
+                    .doc_url
+                    .as_ref()
+                    .map(|page| self.resource_base_url(id, page));
+                sources.push((self.text_content(id), base));
+            }
+        }
+        for sheet in self.external_sheets.values() {
+            sources.push((sheet.text.clone(), url::Url::parse(&sheet.base).ok()));
+        }
+        for sheet in self.imported_sheets.values() {
+            sources.push((sheet.text.clone(), url::Url::parse(&sheet.base).ok()));
+        }
+        let mut requests = self.import_requests.borrow_mut();
+        for (text, base) in sources {
+            if !contains_import(&text) {
+                continue;
+            }
+            for url in crate::http::stylesheet_import_urls(&text, base.as_ref()) {
+                requests.1.insert(url);
+            }
+        }
+    }
+
+    /// Attach style sheets fetched for `@import` rules after the document
+    /// was (`take_import_requests`); every sheet that may import them is
+    /// restyled.
+    pub(crate) fn attach_imported_sheets(&mut self, sheets: Vec<crate::http::PageSheet>) {
+        if sheets.is_empty() {
+            return;
+        }
+        for sheet in sheets {
+            self.imported_sheets.insert(
+                sheet.url,
+                ImportedSheet {
+                    text: sheet.text,
+                    base: sheet.base,
+                    cors_same_origin: sheet.cors_same_origin,
+                },
+            );
+        }
+        // A link's cascade text spliced the imports present when it arrived.
+        let links: Vec<NodeId> = self.external_sheets.keys().copied().collect();
+        for id in links {
+            let Some(linked) = self.external_sheets.get(&id) else {
+                continue;
+            };
+            let base = url::Url::parse(&linked.base).ok();
+            if let Some(cascade) = self.splice_imported_sheets(
+                &linked.text,
+                base.as_ref(),
+                Some(&linked.location),
+                None,
+            ) && let Some(linked) = self.external_sheets.get_mut(&id)
+            {
+                linked.cascade = cascade;
+            }
+        }
+        self.touch_style();
     }
 
     pub(crate) fn set_cssom_sheet(
@@ -195,6 +363,13 @@ impl Dom {
             },
         );
     }
+}
+
+/// Whether a sheet's text names `@import` at all (ASCII case-insensitive).
+fn contains_import(css: &str) -> bool {
+    css.as_bytes()
+        .windows(7)
+        .any(|window| window.eq_ignore_ascii_case(b"@import"))
 }
 
 pub(super) fn valid_property_name(name: &str) -> bool {

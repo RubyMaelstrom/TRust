@@ -324,6 +324,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     Object.setPrototypeOf(DOMRect, DOMRectReadOnly);
     const snapshotRect = rectBindings[2], createDOMRect = rectBindings[3];
     const createDOMRectReadOnly = rectBindings[5];
+    // SVG 2 #InterfaceSVGAnimatedRect: update a reflecting SVGRect's values
+    // from its attribute without running its write steps.
+    const updateReflectedRect = rectBindings[6];
     Object.defineProperty(DOMRect, 'fromRect', {value: {
         fromRect(other = {}) { const r = rectInit(other); return createDOMRect(r[0], r[1], r[2], r[3]); }
     }.fromRect, writable:true, enumerable:true, configurable:true});
@@ -393,8 +396,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return state;
     }
     function initPoint(object, x, y, z, w, writable) {
-        geometrySlots(object, true).domPoint = { x, y, z, w, writable };
+        geometrySlots(object, true).domPoint = { x, y, z, w, writable, svg: null };
         return object;
+    }
+    // A DOMPoint's attribute getter and setter. An SVGPoint that reflects an
+    // item of a `points` attribute (SVG 2 shapes.html#InterfaceSVGPointList)
+    // first synchronizes with its list; a read-only one throws
+    // NoModificationAllowedError on writes; a write reserializes the list.
+    function pointWrite(object, key, value, read) {
+        const point = pointState(object, !read);
+        const svg = point.svg;
+        if (read) {
+            if (svg) svg.sync();
+            return point[key];
+        }
+        if (svg && svg.readOnly) throw geometryDOMException("The point is read-only", "NoModificationAllowedError");
+        point[key] = +value;
+        if (svg) svg.changed();
     }
     function pointInit(value) {
         // DOMPointInit members in lexicographic order, each defaulted.
@@ -435,14 +453,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const p = pointInit(other);
             return createPoint(p[0], p[1], p[2], p[3]);
         }
-        get x() { return pointState(this, false).x; }
-        set x(value) { const point = pointState(this, true); point.x = +value; }
-        get y() { return pointState(this, false).y; }
-        set y(value) { const point = pointState(this, true); point.y = +value; }
-        get z() { return pointState(this, false).z; }
-        set z(value) { const point = pointState(this, true); point.z = +value; }
-        get w() { return pointState(this, false).w; }
-        set w(value) { const point = pointState(this, true); point.w = +value; }
+        get x() { return pointWrite(this, "x", undefined, true); }
+        set x(value) { pointWrite(this, "x", value, false); }
+        get y() { return pointWrite(this, "y", undefined, true); }
+        set y(value) { pointWrite(this, "y", value, false); }
+        get z() { return pointWrite(this, "z", undefined, true); }
+        set z(value) { pointWrite(this, "z", value, false); }
+        get w() { return pointWrite(this, "w", undefined, true); }
+        set w(value) { pointWrite(this, "w", value, false); }
     }
     const pointReadOnlyPrototype = DOMPointReadOnly.prototype, pointPrototype = DOMPoint.prototype;
     Object.setPrototypeOf(DOMPoint, DOMPointReadOnly);
@@ -2051,6 +2069,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // blob:/data:/about: — ignores the base. Falls back to the raw string on a
     // parse miss (the Rust syscall then joins against the page URL as before).
     function resolveURL(u) { const p = __url_parse(u, baseHref()); return p ? p[0] : u; }
+    // HTML #document's-character-encoding: the name of a Document's encoding
+    // (UTF-8 for a value that is not a Document of this agent).
+    function documentQueryEncoding(document) {
+        const id = document && typeof document === "object" ? nodeIds.get(document) : undefined;
+        return id === undefined ? "UTF-8" : __dom_document_encoding(id);
+    }
+    // HTML #encoding-parsing-a-url relative to a Document, given a base URL
+    // string: the URL parser with the Document's character encoding as the
+    // query encoding (URL #concept-basic-url-parser). Returns the URL parts
+    // tuple, or null for failure.
+    function encodingParseURL(url, base, document) {
+        return __url_parse(url, base, documentQueryEncoding(document));
+    }
+    // HTML #encoding-parsing-a-url relative to a node's node document, whose
+    // document base URL is the base.
+    function encodingParseForNode(url, node) {
+        const document = node && (node.nodeType === 9 ? node : __dom_owner_document(node));
+        return __url_parse(url, nodeBaseHref(node), documentQueryEncoding(document));
+    }
 
     // --- events: listener registry + synchronous capture/target/bubble dispatch ---
     // Each list entry is { fn, capture, once, removed } (DOM §"event listener").
@@ -4766,7 +4803,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // The incumbent Window can already be the child when parent-side code
         // rereads contentDocument; it must not affect the embedding URL base.
         const capturedURL = navigationURL && (locationNavigation || navigationURL.source === src) ? navigationURL : null;
-        const parsed = capturedURL ? capturedURL.parsed : __url_parse(src, nodeBaseHref(frame));
+        const parsed = capturedURL ? capturedURL.parsed : encodingParseForNode(src, frame);
         if (!parsed) return;
         const url = parsed[0];
         if (!locationNavigation && internalsFor(frame).loadedSrc === url) return; // already processed this src
@@ -4929,7 +4966,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const previous = frameNavigationURLs.get(frame);
         if (locationRequest || !internalsFor(frame).trustNavigationQueued || !previous || previous.source !== source) {
             const parsed = locationRequest ? __url_parse(locationRequest[0], null) : frame.getAttribute("srcdoc") === null && source
-                ? __url_parse(source, nodeBaseHref(frame)) : null;
+                ? encodingParseForNode(source, frame) : null;
             if (parsed) {
                 const url = parsed[0], hash = url.indexOf("#");
                 const key = hash < 0 ? url : url.slice(0, hash);
@@ -6530,20 +6567,44 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
     // HTML #convert-to-a-list-of-name-value-pairs: a File value becomes its
-    // name.
+    // name, and newlines in names and values normalize to CRLF.
     function nameValuePairs(entries) {
         const pairs = [];
+        const crlf = (text) => text.replace(/\r\n|\r|\n/g, "\r\n");
         for (let i = 0; i < entries.length; i++) {
             const value = entries[i].value;
-            pairs.push([entries[i].name, typeof value === "string" ? value : value.name]);
+            pairs.push([crlf(entries[i].name), crlf(typeof value === "string" ? value : value.name)]);
         }
         return pairs;
     }
-    // URL #concept-urlencoded-serializer (UTF-8).
-    function urlencodedSerialize(pairs) {
-        const params = new URLSearchParams();
-        for (let i = 0; i < pairs.length; i++) params.append(pairs[i][0], pairs[i][1]);
-        return params.toString();
+    // HTML #picking-an-encoding-for-the-form: the first known label of the
+    // form's accept-charset attribute (UTF-8 when it names none), otherwise
+    // the document's character encoding; then its output encoding.
+    function formEncoding(form) {
+        return __form_encode("pick", messageApply(elementGetAttribute, form, ["accept-charset"]),
+            documentQueryEncoding(form.ownerDocument));
+    }
+    // URL #concept-urlencoded-serializer with an encoding: each name and
+    // value is percent-encoded after encoding, an unencodable code point as
+    // "%26%23N%3B" (URL #string-percent-encode-after-encoding).
+    function urlencodedSerialize(pairs, encoding = "UTF-8") {
+        if (encoding === "UTF-8") {
+            const params = new URLSearchParams();
+            for (let i = 0; i < pairs.length; i++) params.append(pairs[i][0], pairs[i][1]);
+            return params.toString();
+        }
+        let output = "";
+        for (let i = 0; i < pairs.length; i++) {
+            if (output !== "") output += "&";
+            output += __form_encode("urlencoded", pairs[i][0], encoding) + "=" +
+                __form_encode("urlencoded", pairs[i][1], encoding);
+        }
+        return output;
+    }
+    // Encoding #encode in the form's encoding, "html" error mode: a binary
+    // string of the encoded bytes.
+    function formEncodeBytes(text, encoding) {
+        return encoding === "UTF-8" ? utf8Binary(text) : __form_encode("html", text, encoding);
     }
     // HTML #text/plain-encoding-algorithm.
     function textPlainSerialize(pairs) {
@@ -6553,23 +6614,24 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // The submission a planned navigation carries to the frontends: the
     // action URL, the method, and for POST the entity body (as a byte
-    // string) with its MIME type.
-    function formSubmissionRecord(form, submitter, entries, method, action, enctype) {
+    // string) with its MIME type (HTML #submit-body, #submit-mutate-action).
+    function formSubmissionRecord(form, submitter, entries, method, action, enctype, encoding) {
         if (method === "post") {
             let body, type;
             if (enctype === "multipart/form-data") {
                 const formData = new g.FormData();
                 internalsFor(formData).entries = entries;
-                const wire = __formDataWire(formData, true);
+                const wire = __formDataWire(formData, encoding, true);
                 body = wire.wire; type = wire.type;
             } else if (enctype === "text/plain") {
-                body = utf8Binary(textPlainSerialize(nameValuePairs(entries))); type = "text/plain";
+                body = formEncodeBytes(textPlainSerialize(nameValuePairs(entries)), encoding); type = "text/plain";
             } else {
-                body = utf8Binary(urlencodedSerialize(nameValuePairs(entries))); type = enctype;
+                // The serializer's output is ASCII; UTF-8 encoding it is the identity.
+                body = urlencodedSerialize(nameValuePairs(entries), encoding); type = enctype;
             }
             return {action, method, enctype: type, body};
         }
-        return {action, method, enctype: "", body: urlencodedSerialize(nameValuePairs(entries))};
+        return {action, method, enctype: "", body: urlencodedSerialize(nameValuePairs(entries), encoding)};
     }
     // HTML #concept-form-submit. Returns true when the submission was taken
     // over by the page (prevented, invalid, a dialog, or planned here).
@@ -6595,7 +6657,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (!shouldContinue) return {handled: true, prevented: true};
             if (formCannotNavigate(form)) return {handled: true};
         }
-        const entries = constructEntryList(form, submitter === form ? null : submitter, "UTF-8");
+        const encoding = formEncoding(form);
+        const entries = constructEntryList(form, submitter === form ? null : submitter, encoding);
         if (entries === null || formCannotNavigate(form)) return {handled: true};
         const method = submissionMethod(form, submitter);
         if (method === "dialog") {
@@ -6616,10 +6679,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         let action = submissionAction(form, submitter);
         const document = (submitter || form).ownerDocument;
         if (action === "") action = document ? document.URL : g.location.href;
-        const parsed = __url_parse(action, document && document.baseURI ? document.baseURI : baseHref());
+        // HTML #form-submission-algorithm: encoding-parse the action relative
+        // to the submitter's node document.
+        const parsed = encodingParseURL(action, document && document.baseURI ? document.baseURI : baseHref(), document);
         if (!parsed) return {handled: true};
         const enctype = submissionEnctype(form, submitter);
-        const record = formSubmissionRecord(form, submitter, entries, method, parsed[0], enctype);
+        const record = formSubmissionRecord(form, submitter, entries, method, parsed[0], enctype, encoding);
         const scheme = parsed[0].slice(0, parsed[0].indexOf(":")).toLowerCase();
         if (scheme === "http" || scheme === "https") {
             slots.preparedSubmission = record;
@@ -6632,7 +6697,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         let url = parsed[0];
         if ((scheme === "data" && method === "get") || scheme === "mailto") {
             const base = url.replace(/[?#].*$/s, "");
-            let query = urlencodedSerialize(nameValuePairs(entries));
+            let query = urlencodedSerialize(nameValuePairs(entries), encoding);
             if (scheme === "mailto") {
                 if (method === "get") query = query.replace(/\+/g, "%20");
                 else {
@@ -6734,7 +6799,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function editableBlock(node) {
         if (node.nodeType !== 1) return false;
-        const display = g.getComputedStyle(node).display;
+        const display = ecResolved(node, "display");
         return /^(block|flow-root|list-item|flex|grid|table)/.test(display) ||
             (!display && /^(p|div|li|h[1-6]|blockquote|pre)$/.test(node.localName));
     }
@@ -6932,6 +6997,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         selection.collapse(caret,0);
     }
     function editableEdit(host, inputType, data, composing = false, replacement = null) {
+        // execCommand #the-inserttext-command: typed text takes the state and
+        // value overrides recorded before the edit.
+        const overrides = inputType === "insertText" && !composing ? ecRecordCurrentOverrides(host.ownerDocument) : [];
         let model = editableModel(host);
         let state = replacement || editableSelection(model);
         const current = g.getSelection();
@@ -6945,6 +7013,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Handlers can change text, structure, selection or editability. Derive
         // the default from the current live selection after dispatch.
         if (!host.isConnected || editingHostOf(host) !== host) return false;
+        const history = ecNativeEditBegin(host);
         model = editableModel(host); state = editableSelection(model);
         let start = state.start, end = state.end;
         if (start === end) {
@@ -6965,24 +7034,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const node = range.startContainer, offset = range.startOffset;
             if (node.nodeType === 3) {
                 node.insertData(offset,data); selection.collapse(node,offset+data.length);
+                ecApplyTypedOverrides(host.ownerDocument, overrides, node, offset, offset + data.length);
             } else {
                 const text = host.ownerDocument.createTextNode(data);
                 range.insertNode(text); selection.collapse(text,text.length);
+                ecApplyTypedOverrides(host.ownerDocument, overrides, text, 0, data.length);
             }
             changed = true;
         }
+        ecNativeEditEnd(history, inputType);
         if (changed) dispatch(host,createTrustedEvent(InputEvent,"input",init),false);
         return changed;
     }
     // Input Events 2 §6: key handlers precede beforeinput, a structural edit
     // at the live Selection, and input. Cancellation leaves the DOM intact.
     trust.editableKeyDefault = function (id, key, shift, ctrl, alt, meta) {
-        if (ctrl || alt || meta) return false;
+        if (alt || ((ctrl || meta) && Array.from(key).length !== 1)) return false;
         const target = id == null ? focusedArea : wrap(id);
         if (id == null && internalsOf(target).contentRealmWindow)
             return trustOf(internalsOf(target).contentRealmWindow).editableKeyDefault(null,key,shift,ctrl,alt,meta);
         const host = editingHostOf(target);
         if (!host || !host.isConnected) return false;
+        if (ctrl || meta) return ecHistoryShortcut(host, key, shift);
         const movement = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
         if (movement) { editableMove(g.getSelection(),host,movement,shift); return true; }
         let inputType, data = null;
@@ -9587,7 +9660,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             state.network = 2;
             queueMediaEvent(element, state, generation, "loadstart");
             if (src !== null) {
-                const url = src === "" ? null : __url_parse(src, nodeBaseHref(element));
+                const url = src === "" ? null : encodingParseForNode(src, element);
                 if (url) state.currentSrc = url[0];
                 // Dedicated media source failure steps. No decoder means no
                 // usable media resource; this is not a fabricated network error.
@@ -9640,7 +9713,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         pause() {}
         addTextTrack() { return { mode: "disabled", cues: null, activeCues: null, addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; }
         fastSeek(t) { internalsFor(this).ct = +t || 0; }
-        get src() { const r = this.getAttribute("src"); if (r === null) return ""; const u = __url_parse(r, baseHref()); return u ? u[0] : r; }
+        get src() { return reflectedURL(this, this.getAttribute("src")); }
         set src(v) { this.setAttribute("src", String(v)); }
         get currentSrc() { return mediaState(this).currentSrc; }
         get readyState() { return 0; }
@@ -12525,12 +12598,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     class HTMLScriptElement extends HTMLElement {
         get type() { return this.getAttribute("type") || ""; }
         set type(v) { this.setAttribute("type", String(v)); }
-        get src() {
-            const raw = this.getAttribute("src");
-            if (raw === null) return "";
-            const parsed = __url_parse(raw, baseHref());
-            return parsed ? parsed[0] : raw;
-        }
+        get src() { return reflectedURL(this, this.getAttribute("src")); }
         set src(v) { this.setAttribute("src", String(v)); }
         get noModule() { return this.hasAttribute("nomodule"); }
         set noModule(v) { if (v) this.setAttribute("nomodule", ""); else this.removeAttribute("nomodule"); }
@@ -13218,16 +13286,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // on child-list/connection changes, even when its source text is equal.
     function elementSheet(owner) {
         const raw=__css_sheet(nodeIds.get(owner), "");
+        const slots = internalsFor(owner);
         if (raw===null) {
-            if (internalsFor(owner).sheet) internalsFor(owner).sheet.ownerNode=null;
-            internalsFor(owner).sheet=null; return null;
+            detachStyleSheet(slots.sheet);
+            slots.sheet=null; return null;
         }
-        const [version,text]=JSON.parse(raw);
-        if (!internalsFor(owner).sheet || internalsFor(owner).sheetVersion!==version || internalsFor(owner).sheetText!==text) {
-            if (internalsFor(owner).sheet) internalsFor(owner).sheet.ownerNode=null;
-            internalsFor(owner).sheet=makeStyleSheet(text,owner); internalsFor(owner).sheetVersion=version; internalsFor(owner).sheetText=text;
+        const source=JSON.parse(raw);
+        const [version,text,location]=source;
+        if (!slots.sheet || slots.sheetVersion!==version || slots.sheetText!==text || slots.sheetLocation!==location) {
+            detachStyleSheet(slots.sheet);
+            slots.sheet=makeStyleSheet(owner, source); slots.sheetVersion=version; slots.sheetText=text; slots.sheetLocation=location;
         }
-        return internalsFor(owner).sheet;
+        return slots.sheet;
     }
     class HTMLStyleElement extends HTMLElement {
         get sheet() { return elementSheet(this); }
@@ -13607,21 +13677,35 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // not its spelling alone. Memoize the pair: HTML <a> is an
     // HTMLAnchorElement, SVG <a> an SVGAElement, and a null/custom-namespace <a>
     // remains the generic Element.
-    const SVG_IFACE_IRREGULAR = {
-        svg: "SVG", a: "A", g: "G", tspan: "TSpan", textpath: "TextPath",
-        clippath: "ClipPath", lineargradient: "LinearGradient",
-        radialgradient: "RadialGradient", foreignobject: "ForeignObject",
+    // The SVG element interfaces (SVG 2, Filter Effects 1, CSS Masking 1)
+    // by element local name, which is case-sensitive.
+    const SVG_ELEMENT_INTERFACES = {
+        a: "SVGAElement", circle: "SVGCircleElement", clipPath: "SVGClipPathElement", defs: "SVGDefsElement",
+        desc: "SVGDescElement", ellipse: "SVGEllipseElement", feBlend: "SVGFEBlendElement",
+        feColorMatrix: "SVGFEColorMatrixElement", feComponentTransfer: "SVGFEComponentTransferElement",
+        feComposite: "SVGFECompositeElement", feConvolveMatrix: "SVGFEConvolveMatrixElement",
+        feDiffuseLighting: "SVGFEDiffuseLightingElement", feDisplacementMap: "SVGFEDisplacementMapElement",
+        feDistantLight: "SVGFEDistantLightElement", feDropShadow: "SVGFEDropShadowElement",
+        feFlood: "SVGFEFloodElement", feFuncA: "SVGFEFuncAElement", feFuncB: "SVGFEFuncBElement",
+        feFuncG: "SVGFEFuncGElement", feFuncR: "SVGFEFuncRElement", feGaussianBlur: "SVGFEGaussianBlurElement",
+        feImage: "SVGFEImageElement", feMerge: "SVGFEMergeElement", feMergeNode: "SVGFEMergeNodeElement",
+        feMorphology: "SVGFEMorphologyElement", feOffset: "SVGFEOffsetElement", fePointLight: "SVGFEPointLightElement",
+        feSpecularLighting: "SVGFESpecularLightingElement", feSpotLight: "SVGFESpotLightElement",
+        feTile: "SVGFETileElement", feTurbulence: "SVGFETurbulenceElement", filter: "SVGFilterElement",
+        foreignObject: "SVGForeignObjectElement", g: "SVGGElement", image: "SVGImageElement", line: "SVGLineElement",
+        linearGradient: "SVGLinearGradientElement", marker: "SVGMarkerElement", mask: "SVGMaskElement",
+        metadata: "SVGMetadataElement", path: "SVGPathElement", pattern: "SVGPatternElement",
+        polygon: "SVGPolygonElement", polyline: "SVGPolylineElement", radialGradient: "SVGRadialGradientElement",
+        rect: "SVGRectElement", script: "SVGScriptElement", stop: "SVGStopElement", style: "SVGStyleElement",
+        svg: "SVGSVGElement", switch: "SVGSwitchElement", symbol: "SVGSymbolElement", text: "SVGTextElement",
+        textPath: "SVGTextPathElement", title: "SVGTitleElement", tspan: "SVGTSpanElement", use: "SVGUseElement",
+        view: "SVGViewElement",
     };
-    // Abstract SVG 2 interfaces (SVGGraphicsElement, SVGGeometryElement,
-    // SVGGradientElement) belong to no element of their own.
-    const SVG_IFACE_ABSTRACT = new Set(["graphics", "geometry", "gradient"]);
+    // SVG 2 types.html#InterfaceSVGElement: an element in the SVG namespace
+    // implements its element's interface, SVGElement for any other name.
     function svgInterfaceName(local) {
-        const value = String(local || "");
-        const lower = value.toLowerCase();
-        if (SVG_IFACE_ABSTRACT.has(lower)) return "SVGElement";
-        const suffix = SVG_IFACE_IRREGULAR[lower]
-            || (lower ? lower.charAt(0).toUpperCase() + lower.slice(1) : "");
-        const name = "SVG" + suffix + "Element";
+        const name = Object.prototype.hasOwnProperty.call(SVG_ELEMENT_INTERFACES, local)
+            ? SVG_ELEMENT_INTERFACES[local] : "SVGElement";
         return g[name] ? name : "SVGElement";
     }
     // Interface classes by namespace, then local name.
@@ -13670,14 +13754,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             get() {
                 const raw = this.getAttribute("href");
                 if (raw === null) return i === 1 ? ":" : "";
-                const u = __url_parse(raw, baseHref());
+                // HTML #concept-hyperlink-url-set: encoding-parse relative to
+                // the element's node document.
+                const document = this.ownerDocument;
+                const u = encodingParseURL(raw, document ? document.baseURI : baseHref(), document);
                 return u ? u[i] : (i === 1 ? ":" : "");
             } };
         if (!readOnly) {
             d.set = function (value) {
                 const raw = this.getAttribute("href");
                 if (raw === null) return;
-                const u = __url_parse(raw, baseHref());
+                const document = this.ownerDocument;
+                const u = encodingParseURL(raw, document ? document.baseURI : baseHref(), document);
                 if (!u) return;
                 const updated = __url_set(u[0], [
                     "", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin",
@@ -13696,7 +13784,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const raw = this.getAttribute("href");
         if (raw === null) return "";
         const document = this.ownerDocument;
-        const parsed = __url_parse(raw, document ? document.baseURI : baseHref());
+        const parsed = encodingParseURL(raw, document ? document.baseURI : baseHref(), document);
         return parsed ? parsed[0] : raw;
     }
     function installUrlParts(Cls) {
@@ -15074,7 +15162,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!node) return "";
         const raw = node.getAttribute("src") || node.getAttribute("href") || "";
         if (!String(raw).trim()) return "";
-        const p = __url_parse(raw, nodeBaseHref(node));
+        // HTML #encoding-parsing-a-url: element resource URLs (img, script,
+        // link, media, frame) parse relative to the node document with its
+        // character encoding.
+        const p = encodingParseForNode(raw, node);
         return p ? p[0] : raw;
     }
     trust.resourceBaseURL = function (nodeId) {return nodeBaseHref(wrap(nodeId));};
@@ -15111,7 +15202,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // resolves to the document's current base URL.
         if (raw === null) return null;
         const subject = frameOwnerForNode(anchor);
-        const parsed = __url_parse(String(raw), nodeBaseHref(anchor));
+        // HTML #following-hyperlinks-2: encoding-parse relative to the
+        // subject's node document.
+        const parsed = encodingParseForNode(String(raw), anchor);
         if (!parsed) return null;
         const url = String(parsed[0] || "");
         if (!url || /^javascript:/i.test(url)) return null;
@@ -17159,10 +17252,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function parseCss(text, quirks = false) {
         try { return JSON.parse(__css_parse(String(text || ""), !!quirks)); } catch (e) { return []; }
     }
-    // A sheet parses in its Document's mode: the owner node's, or a
-    // constructed sheet's constructor document.
+    // The Document a CSS style sheet belongs to: its owner node's node
+    // document, an imported sheet's top-level sheet's, or a constructed
+    // sheet's constructor document (CSSOM #concept-css-style-sheet-*).
+    function sheetDocument(sheet) {
+        for (let current = sheet, depth = 0; current && depth < 1024; current = internalsOf(current).parentSheet, depth++) {
+            const slots = internalsOf(current);
+            if (slots.ownerNode) return slots.ownerNode.ownerDocument;
+            if (slots.constructorDocumentObject) return slots.constructorDocumentObject;
+        }
+        return undefined;
+    }
+    // A sheet parses in its Document's mode.
     function sheetQuirks(sheet) {
-        const document = sheet?.ownerNode ? sheet.ownerNode.ownerDocument : (sheet ? internalsFor(sheet).constructorDocumentObject : undefined);
+        const document = sheet ? sheetDocument(sheet) : undefined;
         return !!document && __dom_document_quirks(nodeIds.get(document));
     }
     // Split stylesheet text into its top-level rules (string/comment/brace
@@ -17345,22 +17448,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         set selectorText(value) { value = domString(value); if (cssOp("selector",value,this.parentRule instanceof CSSStyleRule ? "nested" : "")) { internalsFor(this).selector = value; cssChanged(this); } }
     }
     cssSerializers.set(CSSStyleRule.prototype, function (internal = false) { return this.selectorText + " { " + declarationText(this.style, internal) + (internalsFor(this).children.length ? " " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") : "") + " }"; });
-    class CSSMediaRule extends CSSGroupingRule {
+    // CSS Conditional 3 #the-cssconditionrule-interface: a grouping rule
+    // whose readonly conditionText serializes its condition.
+    class CSSConditionRule extends CSSGroupingRule {
+        get conditionText() { return internalsFor(this).json.q || ""; }
+    }
+    // CSS Conditional 3 #the-cssmediarule-interface.
+    class CSSMediaRule extends CSSConditionRule {
         constructor(j) { super(j); internalsFor(this).media = mediaList(j.q, () => cssChanged(this)); }
         get type() { return 4; }
         get media() { return internalsFor(this).media; }
         set media(v) { internalsFor(this).media.mediaText = v; }
         get conditionText() { return this.media.mediaText; }
-        set conditionText(value) { this.media.mediaText = value; }
+        // #dom-cssmediarule-matches: whether the media query list matches
+        // the state of the rendered Document.
+        get matches() {
+            const text = this.media.mediaText;
+            return text === "" || !!g.matchMedia(text).matches;
+        }
     }
     cssSerializers.set(CSSMediaRule.prototype, function (internal = false) { return "@media " + this.conditionText + " { " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") + " }"; });
-    class CSSSupportsRule extends CSSGroupingRule {
+    // CSS Conditional 3 #the-csssupportsrule-interface.
+    class CSSSupportsRule extends CSSConditionRule {
         get type() { return 12; }
-        get conditionText() { return internalsFor(this).json.q || ""; }
-        set conditionText(value) { internalsFor(this).json.q = domString(value); cssChanged(this); }
+        // #dom-csssupportsrule-matches: the result of evaluating its condition.
+        get matches() { return !!cssOp("condition", this.conditionText); }
     }
-    class CSSContainerRule extends CSSGroupingRule {
-        get conditionText() { return internalsFor(this).json.q || ""; }
+    class CSSContainerRule extends CSSConditionRule {
         get containerName() { return this.conditionText.match(/^([^\s(]+)\s+/)?.[1] || ""; }
         get containerQuery() { return this.conditionText.slice(this.containerName.length).trim(); }
     }
@@ -17438,19 +17552,126 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     defineIndexedIteration(CSSKeyframesRule);
     cssSerializers.set(CSSKeyframesRule.prototype, function (internal = false) { return "@keyframes " + this.name + " { " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") + " }"; });
+    // CSS Syntax 3 #consume-string-token / #consume-url-token: the value of
+    // a string or url() token, escapes decoded.
+    function cssUnescape(text) {
+        return text.replace(/\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|(\r\n|[\s\S]))/g, (_, hex, ch) => {
+            if (hex === undefined) return ch === "\n" || ch === "\r\n" || ch === "\r" || ch === "\f" ? "" : ch;
+            const code = parseInt(hex, 16);
+            return code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) ? "\uFFFD" : String.fromCodePoint(code);
+        });
+    }
+    // CSS Cascade 5 #at-import: an @import prelude is a <url> or <string>,
+    // then `layer` or `layer(<layer-name>)`, then `supports(...)`, then a
+    // media query list.
+    function importPreludeParts(prelude) {
+        let rest = String(prelude || "").trim(), href = "";
+        const url = rest.match(/^url\(\s*(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|((?:[^)\s\\]|\\[\s\S])*))\s*\)/i)
+            || rest.match(/^(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)')/);
+        if (url) {
+            href = cssUnescape(url[1] ?? url[2] ?? url[3] ?? "");
+            rest = rest.slice(url[0].length).trim();
+        }
+        let layer = null, supports = null;
+        const named = rest.match(/^layer\(\s*([^)]*?)\s*\)/i);
+        if (named) { layer = named[1]; rest = rest.slice(named[0].length).trim(); }
+        else if (/^layer(?![\w\u0080-\uFFFF(-])/i.test(rest)) { layer = ""; rest = rest.slice(5).trim(); }
+        if (/^supports\(/i.test(rest)) {
+            let depth = 0, quote = null, end = -1;
+            for (let i = 8; i < rest.length; i++) {
+                const c = rest[i];
+                if (quote) { if (c === "\\") i++; else if (c === quote) quote = null; continue; }
+                if (c === '"' || c === "'") quote = c;
+                else if (c === "(") depth++;
+                else if (c === ")" && --depth === 0) { end = i; break; }
+            }
+            if (end > 0) { supports = rest.slice(9, end).trim(); rest = rest.slice(end + 1).trim(); }
+        }
+        return {href, layer, supports, media: rest};
+    }
+    // CSSOM #the-cssimportrule-interface. The rule's associated CSS style
+    // sheet is the sheet its @import fetched (CSS Cascade 4
+    // #fetch-an-import): found by the import's URL, resolved against the
+    // parent sheet's base URL, once the rule is in a sheet. A false
+    // supports() condition, a cycle or a failed fetch leaves it null.
     class CSSImportRule extends CSSRule {
         constructor(j) {
-            super(j); const m = (j.q || "").match(/^(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))\s*([\s\S]*)$/i);
-            internalsFor(this).href = m ? (m[1] || m[2]).replace(/^['"]|['"]$/g, "") : "";
-            internalsFor(this).media = mediaList(m?.[3] || "", () => cssChanged(this));
+            super(j);
+            const parts = importPreludeParts(j.q), slots = internalsFor(this);
+            slots.href = parts.href; slots.layer = parts.layer; slots.supports = parts.supports;
+            slots.media = mediaList(parts.media, () => cssChanged(this));
         }
         get type() { return 3; }
         get href() { return internalsFor(this).href; }
+        // The associated sheet's media is this same MediaList.
         get media() { return internalsFor(this).media; }
         set media(v) { internalsFor(this).media.mediaText = v; }
-        get styleSheet() { return null; }
+        get styleSheet() { return importRuleSheet(this); }
+        get layerName() { return internalsFor(this).layer; }
+        get supportsText() { return internalsFor(this).supports; }
     }
-    cssSerializers.set(CSSImportRule.prototype, function (internal = false) { return "@import url(" + JSON.stringify(this.href) + ")" + (this.media.mediaText ? " " + this.media.mediaText : "") + ";"; });
+    // CSSOM #serialize-a-css-rule: "@import", the serialized URL, then the
+    // layer, supports() and media conditions as the rule declares them.
+    // The cascade's (internal) serialization instead splices in the rules of
+    // the imported sheet under those conditions (CSS Cascade 5 #at-import),
+    // so CSSOM edits of an imported sheet reach the cascade.
+    cssSerializers.set(CSSImportRule.prototype, function (internal = false) {
+        const slots = internalsFor(this), media = slots.media.mediaText;
+        if (internal) {
+            const sheet = importRuleSheet(this);
+            let css = sheet && !internalsFor(sheet).disabled ? sheetText.call(sheet) : "";
+            if (slots.layer !== null) css = "@layer" + (slots.layer ? " " + slots.layer : "") + " { " + css + " }";
+            if (slots.supports !== null) css = "@supports (" + slots.supports + ") { " + css + " }";
+            if (media) css = "@media " + media + " { " + css + " }";
+            return css;
+        }
+        return "@import url(" + cssOp("string", slots.href) + ")" +
+            (slots.layer === null ? "" : slots.layer ? " layer(" + slots.layer + ")" : " layer") +
+            (slots.supports === null ? "" : " supports(" + slots.supports + ")") +
+            (media ? " " + media : "") + ";";
+    });
+    // CSSImportRules waiting for the sheet their @import fetches.
+    const pendingImportRules = new Set();
+    trust.styleImportsArrived = function () {
+        for (const rule of Array.from(pendingImportRules)) {
+            pendingImportRules.delete(rule);
+            if (internalsOf(rule).sheet) cssChanged(rule);
+        }
+    };
+    function importRuleSheet(rule) {
+        const slots = internalsFor(rule);
+        if (slots.styleSheet !== undefined) return slots.styleSheet;
+        const parent = slots.sheet;
+        if (!parent) return null;
+        let sheet = null;
+        const base = internalsOf(parent).importBase;
+        let url = null;
+        try { url = new URL(slots.href, base || undefined).href; } catch (_) {}
+        const cyclic = (target) => {
+            for (let current = parent; current; current = internalsOf(current).parentSheet)
+                if (internalsOf(current).location === target) return true;
+            return false;
+        };
+        if (url !== null && (slots.supports === null || cssOp("condition", slots.supports)) && !cyclic(url)) {
+            const record = cssOp("import-sheet", url);
+            // No fetch obtained this URL yet: nothing is associated until the
+            // fetch the import starts completes (styleImportsArrived).
+            if (!record) {
+                let root = parent;
+                while (internalsOf(root).parentSheet) root = internalsOf(root).parentSheet;
+                const owner = internalsOf(root).ownerNode;
+                if (owner && !pendingImportRules.has(rule)) {
+                    pendingImportRules.add(rule);
+                    cssOp("import-request", url, String(nodeIds.get(owner)));
+                }
+                return null;
+            }
+            sheet = makeImportedSheet(record, rule, parent, url);
+        }
+        // [SameObject]: the association is made once.
+        slots.styleSheet = sheet;
+        return sheet;
+    }
     class CSSNamespaceRule extends CSSRule {
         constructor(j) { super(j); const m = (j.q || "").match(/^(?:([^\s]+)\s+)?(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))$/i); internalsFor(this).prefix = m?.[1] || ""; internalsFor(this).namespace = (m?.[2] || m?.[3] || "").replace(/^['"]|['"]$/g, ""); }
         get type() { return 10; }
@@ -17500,11 +17721,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         Object.defineProperty(CSSRule, name, { value: number, enumerable: true });
         Object.defineProperty(CSSRule.prototype, name, { value: number, enumerable: true });
     }
+    // A sheet's CSS rules changed: an imported sheet's change reaches its
+    // parent through its owner rule; a top-level sheet hands the cascade its
+    // internal serialization (HTML #update-a-style-block keeps the DOM text).
     function sheetChanged() {
-        internalsFor(this).serializedText = undefined;
-        if (this.ownerNode) {
-            const owner=this.ownerNode;
-            if (owner.sheet===this) __css_sheet(nodeIds.get(owner), JSON.stringify([sheetText.call(this), this.media.mediaText, this.disabled]));
+        const slots = internalsFor(this);
+        slots.serializedText = undefined;
+        if (slots.ownerRule) cssChanged(slots.ownerRule);
+        else if (slots.ownerNode) {
+            const owner = slots.ownerNode;
+            if (internalsOf(owner).sheet === this)
+                __css_sheet(nodeIds.get(owner), JSON.stringify([sheetText.call(this), slots.media.mediaText, slots.disabled]));
         } else sheetSync(this);
     }
     function sheetText() {
@@ -17515,7 +17742,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             internalsFor(this).serializedText = internalsFor(this).children.map((r) => cssSerialize(r, true)).join("\n");
         return internalsFor(this).serializedText;
     }
-    function sheetAppliedText() { return this.disabled ? "" : this.media.mediaText ? "@media " + this.media.mediaText + " { " + sheetText.call(this) + " }" : sheetText.call(this); }
+    // An adopted sheet's text for the cascade: nothing while disabled, under
+    // its media list otherwise.
+    function sheetAppliedText() {
+        const slots = internalsFor(this), media = slots.media.mediaText;
+        return slots.disabled ? "" : media ? "@media " + media + " { " + sheetText.call(this) + " }" : sheetText.call(this);
+    }
     function sheetCheck() { if (!internalsFor(this).clean) throw new DOMException("Cross-origin stylesheet", "SecurityError"); }
     function sheetReplace(text) {
         for (const rule of internalsFor(this).children) attachCssRule(rule, null, null);
@@ -17523,47 +17755,114 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (const rule of internalsFor(this).children) attachCssRule(rule, null, this);
         cssChanged(this);
     }
-    class CSSStyleSheet {
+    // CSSOM #parse-a-css-stylesheet's rules, without the @import rules that
+    // follow another rule (CSS Cascade 5 #at-import: only @layer statements
+    // may precede an @import).
+    function sheetRules(text, quirks) {
+        const rules = buildRules(parseCss(text, quirks));
+        let body = false;
+        return rules.filter((rule) => {
+            if (rule.type === 3) return !body;
+            if (!(rule instanceof CSSLayerStatementRule)) body = true;
+            return true;
+        });
+    }
+    function requireStyleSheet(object) {
+        if (!internalsOf(object).isStyleSheet) throw new TypeError("Illegal invocation");
+    }
+    // The title of a sheet whose owner node supplies it (HTML: the element's
+    // title attribute while it is in a document tree, else empty).
+    function sheetTitle(sheet) {
+        const slots = internalsOf(sheet);
+        const owner = slots.ownerNode;
+        if (!owner || slots.ownerRule) return slots.title || "";
+        const root = Node.prototype.getRootNode.call(owner);
+        return root && root.nodeType === 9 ? owner.getAttribute("title") || "" : "";
+    }
+    const styleSheetToken = Object.freeze(Object.create(null));
+    // CSSOM #the-stylesheet-interface: an abstract base with no constructor.
+    class StyleSheet {
+        constructor(token) { if (token !== styleSheetToken) throw new TypeError("Illegal constructor"); }
+        get type() { requireStyleSheet(this); return "text/css"; }
+        // #dom-stylesheet-href: the location.
+        get href() { requireStyleSheet(this); const location = internalsOf(this).location; return location == null ? null : location; }
+        get ownerNode() { requireStyleSheet(this); return internalsOf(this).ownerNode || null; }
+        get parentStyleSheet() { requireStyleSheet(this); return internalsOf(this).parentSheet || null; }
+        // #dom-stylesheet-title: null when the title is the empty string.
+        get title() { requireStyleSheet(this); const title = sheetTitle(this); return title === "" ? null : title; }
+        get media() { requireStyleSheet(this); return internalsOf(this).media; }
+        set media(v) { requireStyleSheet(this); internalsOf(this).media.mediaText = v; }
+        get disabled() {
+            requireStyleSheet(this);
+            const slots = internalsFor(this), owner = slots.ownerNode;
+            if (owner && !slots.ownerRule) {
+                const attr = owner.hasAttribute("disabled");
+                if (attr !== slots.disabledAttr) { slots.disabledAttr = attr; slots.disabled = attr; }
+            }
+            return slots.disabled;
+        }
+        set disabled(v) { requireStyleSheet(this); internalsFor(this).disabled = !!v; cssChanged(this); }
+        get [Symbol.toStringTag]() { return "StyleSheet"; }
+    }
+    // CSSOM #css-style-sheets: the state every CSS style sheet starts with.
+    function initStyleSheet(sheet, state) {
+        const slots = internalsFor(sheet);
+        slots.isStyleSheet = true;
+        slots.children = []; slots.list = new CSSRuleList(slots.children);
+        slots.ownerNode = state.ownerNode || null;
+        slots.ownerRule = state.ownerRule || null;
+        slots.parentSheet = state.parentSheet || null;
+        slots.location = state.location == null ? null : state.location;
+        slots.importBase = state.importBase || null;
+        slots.title = "";
+        slots.constructed = !!state.constructed; slots.locked = false;
+        slots.clean = state.clean !== false;
+        slots.disabled = !!state.disabled;
+        slots.media = state.media || mediaList(String(state.mediaText || ""), () => cssChanged(sheet));
+        return slots;
+    }
+    // CSSOM #the-cssstylesheet-interface.
+    class CSSStyleSheet extends StyleSheet {
         constructor(options = {}) {
-            internalsFor(this).isStyleSheet = true;
-            internalsFor(this).children = []; internalsFor(this).list = new CSSRuleList(internalsFor(this).children);
-            internalsFor(this).constructorDocument = nodeIds.get(g.document);
+            super(styleSheetToken);
+            if (options === null || (typeof options !== "object" && typeof options !== "function")) options = {};
+            // #create-a-constructed-cssstylesheet: the location is the base
+            // URL of the current global object's associated Document.
+            const document = g.document;
+            const baseURL = document.baseURI;
+            let mediaText = options.media;
+            if (mediaText instanceof MediaList) mediaText = mediaText.mediaText;
+            const slots = initStyleSheet(this, {location: baseURL, constructed: true, clean: true,
+                disabled: !!options.disabled, mediaText: mediaText === undefined ? "" : domString(mediaText)});
+            slots.constructorDocument = nodeIds.get(document);
             // CSSOM's constructor document is an associated Document, not merely an arena
             // number. A surviving sheet keeps this Document across Window reuse/navigation.
-            internalsFor(this).constructorDocumentObject = g.document;
-            internalsFor(this).baseURL = g.document.baseURI;
+            slots.constructorDocumentObject = document;
+            slots.baseURL = baseURL;
+            slots.importBase = baseURL;
             if (options.baseURL != null) {
-                try { internalsFor(this).baseURL = new URL(domString(options.baseURL), internalsFor(this).baseURL).href; } catch (_) {}
+                try { slots.baseURL = new URL(domString(options.baseURL), slots.baseURL).href; } catch (_) {}
             }
-            this.ownerNode = null; internalsFor(this).constructed = true; internalsFor(this).locked = false; internalsFor(this).clean = true;
-            internalsFor(this).disabled = !!options.disabled; internalsFor(this).media = mediaList(String(options.media || ""), () => cssChanged(this));
         }
-        get type() { return "text/css"; }
-        get href() { return this.ownerNode?.localName === "link" ? this.ownerNode.href : null; }
-        get title() { return this.ownerNode ? this.ownerNode.getAttribute("title") || "" : null; }
-        get parentStyleSheet() { return null; }
-        get ownerRule() { return null; }
-        get media() { return internalsFor(this).media; }
-        set media(v) { internalsFor(this).media.mediaText = v; }
-        get disabled() {
-            if(this.ownerNode) {const attr=this.ownerNode.hasAttribute("disabled");if(attr!==internalsFor(this).disabledAttr){internalsFor(this).disabledAttr=attr;internalsFor(this).disabled=attr;}}
-            return internalsFor(this).disabled;
-        }
-        set disabled(v) { internalsFor(this).disabled = !!v; cssChanged(this); }
-        get cssRules() { sheetCheck.call(this); return internalsFor(this).list; }
+        // #dom-cssstylesheet-ownerrule.
+        get ownerRule() { requireStyleSheet(this); return internalsOf(this).ownerRule || null; }
+        get cssRules() { requireStyleSheet(this); sheetCheck.call(this); return internalsFor(this).list; }
         get rules() { return this.cssRules; }
         replace(text) {
+            requireStyleSheet(this);
             text = domString(text);
             if (!internalsFor(this).constructed || internalsFor(this).locked) return Promise.reject(new DOMException("Sheet cannot be replaced", "NotAllowedError"));
             internalsFor(this).locked = true;
             return Promise.resolve().then(() => { sheetReplace.call(this, text); internalsFor(this).locked = false; return this; });
         }
         replaceSync(text) {
+            requireStyleSheet(this);
             text = domString(text);
             if (!internalsFor(this).constructed || internalsFor(this).locked) throw new DOMException("Sheet cannot be replaced", "NotAllowedError");
             sheetReplace.call(this, text);
         }
         insertRule(text, index = 0) {
+            requireStyleSheet(this);
             sheetCheck.call(this); if (internalsFor(this).locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
             text = domString(text); index = Number(index) >>> 0;
             const rule = singleCssRule(text);
@@ -17571,6 +17870,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return insertCssRule(this, text, index);
         }
         deleteRule(index) {
+            requireStyleSheet(this);
             sheetCheck.call(this); if (internalsFor(this).locked) throw new DOMException("Sheet is being replaced", "NotAllowedError");
             if (!arguments.length) throw new TypeError("Rule index is required"); deleteCssRule(this, Number(index) >>> 0);
         }
@@ -17578,26 +17878,41 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         removeRule(index = 0) { this.deleteRule(index); }
         get [Symbol.toStringTag]() { return "CSSStyleSheet"; }
     }
-    function makeStyleSheet(text, owner) {
-        const sheet = new CSSStyleSheet({ media: owner?.getAttribute("media") || "", disabled: owner?.hasAttribute("disabled") || false });
-        sheet.ownerNode = owner || null; internalsFor(sheet).constructed = !owner;
-        internalsFor(sheet).disabledAttr=owner?.hasAttribute("disabled")||false;
-        if(owner) {
-            let mediaAttr=owner.getAttribute("media")||"";
-            internalsFor(internalsFor(sheet).media).read=()=>{const value=owner.getAttribute("media")||"";if(value!==mediaAttr){mediaAttr=value;mediaListSet(internalsFor(sheet).media, value);}};
-        }
-        internalsFor(sheet).children.push(...buildRules(parseCss(text, sheetQuirks(sheet))));
-        for (const rule of internalsFor(sheet).children) attachCssRule(rule, null, sheet);
-        if (owner?.localName === "link") {
-            try {
-                const origin = new URL(owner.href).origin;
-                // CSSOM origin-clean / HTML link processing: no-CORS file
-                // sheets can render, but their rules are not script-readable.
-                internalsFor(sheet).clean = origin !== "null" && origin === new URL(owner.ownerDocument.URL).origin;
-            }
-            catch (_) { internalsFor(sheet).clean = false; }
-        }
+    // HTML #update-a-style-block and #link-type-stylesheet "create a CSS
+    // style sheet": `source` is the host's [version, text, location,
+    // origin-clean, base] record. Media, title and disabled refer to the
+    // owner's attributes (CSSOM #concept-css-style-sheet-media/-title).
+    function makeStyleSheet(owner, source) {
+        const [, text, location, clean, base] = source;
+        const sheet = Object.create(CSSStyleSheet.prototype);
+        let mediaAttr = owner.getAttribute("media") || "";
+        const slots = initStyleSheet(sheet, {ownerNode: owner, location, clean: !!clean, importBase: base,
+            mediaText: mediaAttr, disabled: owner.hasAttribute("disabled")});
+        slots.disabledAttr = owner.hasAttribute("disabled");
+        internalsFor(slots.media).read = () => {
+            const value = owner.getAttribute("media") || "";
+            if (value !== mediaAttr) { mediaAttr = value; mediaListSet(slots.media, value); }
+        };
+        slots.children.push(...sheetRules(text, sheetQuirks(sheet)));
+        for (const rule of slots.children) attachCssRule(rule, null, sheet);
         return sheet;
+    }
+    // CSS Cascade 4 #fetch-an-import steps 4-7: the imported sheet, parsed
+    // from the fetched text, origin-clean only when its parent is and the
+    // response was CORS-same-origin; its media is its rule's media list.
+    function makeImportedSheet(record, rule, parent, url) {
+        const [text, base, corsSameOrigin] = record;
+        const sheet = Object.create(CSSStyleSheet.prototype);
+        const slots = initStyleSheet(sheet, {ownerRule: rule, parentSheet: parent, location: url, importBase: base,
+            clean: internalsOf(parent).clean && !!corsSameOrigin, media: internalsOf(rule).media});
+        slots.children.push(...sheetRules(text, sheetQuirks(parent)));
+        for (const r of slots.children) attachCssRule(r, null, sheet);
+        return sheet;
+    }
+    // An owner node no longer has this associated sheet (CSSOM
+    // #remove-a-css-style-sheet sets its owner node to null).
+    function detachStyleSheet(sheet) {
+        if (sheet) internalsFor(sheet).ownerNode = null;
     }
     g.MediaList = MediaList; g.CSSLayerStatementRule = CSSLayerStatementRule;
 
@@ -18736,13 +19051,219 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     g.NodeIterator = NodeIterator;
     g.DOMParser = DOMParser;
     g.XMLSerializer = XMLSerializer;
+    // ---- DOM #xpath: XPathEvaluatorBase, XPathExpression, XPathResult ----
+    // The interfaces of the DOM Standard's XPath section with the semantics
+    // of DOM Level 3 XPath (W3C Note 2004) and XPath 1.0, evaluated by the
+    // host's XPath engine over the arena DOM (src/dom/xpath.rs). Prefixes are
+    // resolved when the expression is created, as DOM L3 XPath's
+    // createExpression "with resolved namespaces" describes.
+    const XPATH_RESULT_TYPES = {ANY_TYPE: 0, NUMBER_TYPE: 1, STRING_TYPE: 2, BOOLEAN_TYPE: 3,
+        UNORDERED_NODE_ITERATOR_TYPE: 4, ORDERED_NODE_ITERATOR_TYPE: 5, UNORDERED_NODE_SNAPSHOT_TYPE: 6,
+        ORDERED_NODE_SNAPSHOT_TYPE: 7, ANY_UNORDERED_NODE_TYPE: 8, FIRST_ORDERED_NODE_TYPE: 9};
+    function xpathFailure(result) {
+        if (!result || !result.error) return;
+        const [name, message] = result.error;
+        if (name === "TypeError") throw new TypeError(message);
+        throw new DOMException(message, name);
+    }
+    // Web IDL #call-a-user-objects-operation for the XPathNSResolver callback
+    // interface: a callable resolver is called; otherwise its
+    // lookupNamespaceURI operation is.
+    function xpathLookupNamespace(resolver, prefix) {
+        let value;
+        if (typeof resolver === "function") value = messageApply(resolver, undefined, [prefix]);
+        else {
+            const lookup = resolver.lookupNamespaceURI;
+            if (typeof lookup !== "function") throw new TypeError("The resolver's lookupNamespaceURI is not callable");
+            value = messageApply(lookup, resolver, [prefix]);
+        }
+        return value === null || value === undefined ? null : domString(value);
+    }
+    // XPathEvaluatorBase createExpression steps: parse, then bind each prefix
+    // through the resolver (NamespaceError when one stays unbound).
+    function createXPathExpression(expression, resolver) {
+        expression = domString(expression);
+        if (resolver !== null && resolver !== undefined && typeof resolver !== "object" && typeof resolver !== "function")
+            throw new TypeError("The resolver is not an XPathNSResolver");
+        const parsed = JSON.parse(__xpath("parse", expression, "", ""));
+        xpathFailure(parsed);
+        const namespaces = Object.create(null);
+        for (const prefix of parsed.prefixes) {
+            const uri = resolver === null || resolver === undefined || prefix === "xml" ? null
+                : xpathLookupNamespace(resolver, prefix);
+            if (prefix === "xml") continue;
+            if (uri === null || uri === "")
+                throw new DOMException(`The prefix '${prefix}' has no namespace`, "NamespaceError");
+            namespaces[prefix] = uri;
+        }
+        const object = Object.create(XPathExpression.prototype);
+        internalsFor(object).xpathExpression = {expression, namespaces: JSON.stringify(namespaces)};
+        return object;
+    }
+    // DOM L3 XPath evaluate: the context node must be a Document, Element,
+    // Attr, Text, CDATASection, Comment or ProcessingInstruction.
+    function xpathContext(node) {
+        if (!(node instanceof Node)) throw new TypeError("The context node is not a Node");
+        const attr = internalsOf(node).attrNode;
+        if (attr) {
+            if (!attr.element) throw new DOMException("The attribute has no element", "NotSupportedError");
+            return [1, nodeIds.get(attr.element), attr.namespace === null ? "" : attr.namespace, attr.localName];
+        }
+        const type = messageApply(nodeNodeType, node, []);
+        if (![1, 3, 4, 7, 8, 9].includes(type))
+            throw new DOMException("The node cannot be an XPath context node", "NotSupportedError");
+        return [0, nodeIds.get(node)];
+    }
+    function xpathNode(item) {
+        if (item[0] === 0) return wrap(item[1]);
+        if (item[0] === 1) return attributeNodeByNamespace(wrap(item[1]), item[2] === "" ? null : item[2], item[3]);
+        // DOM L3 XPath §1.2.3 XPathNamespace has no interface in the DOM
+        // Standard, so a namespace node has no DOM representation.
+        throw new DOMException("A namespace node has no DOM representation", "NotSupportedError");
+    }
+    // XPathExpression evaluate steps: evaluate, then convert to the requested
+    // result type (DOM L3 XPath XPathResultType).
+    function evaluateXPathExpression(state, contextNode, type, result) {
+        type = type === undefined ? 0 : idlUnsignedShort(type);
+        if (result !== undefined && result !== null && !(result instanceof XPathResult))
+            throw new TypeError("The result is not an XPathResult");
+        const context = xpathContext(contextNode);
+        if (type > 9) throw new DOMException("Unknown XPath result type", "NotSupportedError");
+        // NUMBER_TYPE, STRING_TYPE and BOOLEAN_TYPE convert the result as
+        // XPath's number(), string() and boolean() functions do.
+        const conversion = type === 1 ? "evaluate-number" : type === 2 ? "evaluate-string"
+            : type === 3 ? "evaluate-boolean" : "evaluate";
+        const evaluated = JSON.parse(__xpath(conversion, state.expression, state.namespaces, JSON.stringify(context)));
+        xpathFailure(evaluated);
+        const isNodes = evaluated.type === "nodes";
+        // ANY_TYPE: the natural type, a node-set as UNORDERED_NODE_ITERATOR_TYPE.
+        const resultType = type !== 0 ? type : isNodes ? 4
+            : evaluated.type === "number" ? 1 : evaluated.type === "string" ? 2 : 3;
+        if (resultType >= 4 && !isNodes) throw new TypeError("The expression does not evaluate to a node-set");
+        const slots = {resultType, number: 0, string: "", boolean: false, nodes: [], index: 0, epoch: __dom_epoch()};
+        if (resultType === 1) slots.number = Number(evaluated.value);
+        else if (resultType === 2) slots.string = evaluated.value;
+        else if (resultType === 3) slots.boolean = evaluated.value;
+        else slots.nodes = evaluated.value.map(xpathNode);
+        const object = Object.create(XPathResult.prototype);
+        internalsFor(object).xpathResult = slots;
+        return object;
+    }
+    function xpathResultState(object) {
+        const state = internalsOf(object).xpathResult;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    const XPathResult = {XPathResult: class {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get resultType() { return xpathResultState(this).resultType; }
+        get numberValue() {
+            const state = xpathResultState(this);
+            if (state.resultType !== 1) throw new TypeError("The result is not a number");
+            return state.number;
+        }
+        get stringValue() {
+            const state = xpathResultState(this);
+            if (state.resultType !== 2) throw new TypeError("The result is not a string");
+            return state.string;
+        }
+        get booleanValue() {
+            const state = xpathResultState(this);
+            if (state.resultType !== 3) throw new TypeError("The result is not a boolean");
+            return state.boolean;
+        }
+        get singleNodeValue() {
+            const state = xpathResultState(this);
+            if (state.resultType !== 8 && state.resultType !== 9) throw new TypeError("The result is not a single node");
+            return state.nodes.length ? state.nodes[0] : null;
+        }
+        // DOM L3 XPath: an iterator becomes invalid when its document is
+        // modified after the result was returned.
+        get invalidIteratorState() {
+            const state = xpathResultState(this);
+            return (state.resultType === 4 || state.resultType === 5) && state.epoch !== __dom_epoch();
+        }
+        get snapshotLength() {
+            const state = xpathResultState(this);
+            if (state.resultType !== 6 && state.resultType !== 7) throw new TypeError("The result is not a snapshot");
+            return state.nodes.length;
+        }
+        iterateNext() {
+            const state = xpathResultState(this);
+            if (state.resultType !== 4 && state.resultType !== 5) throw new TypeError("The result is not an iterator");
+            if (state.epoch !== __dom_epoch())
+                throw new DOMException("The document has been mutated since the result was returned", "InvalidStateError");
+            return state.index < state.nodes.length ? state.nodes[state.index++] : null;
+        }
+        snapshotItem(index) {
+            const state = xpathResultState(this);
+            if (state.resultType !== 6 && state.resultType !== 7) throw new TypeError("The result is not a snapshot");
+            if (arguments.length < 1) throw new TypeError("snapshotItem requires 1 argument");
+            index = idlUnsignedLong(index);
+            return index < state.nodes.length ? state.nodes[index] : null;
+        }
+    }}.XPathResult;
+    for (const [name, value] of Object.entries(XPATH_RESULT_TYPES)) {
+        const d = {value, writable: false, enumerable: true, configurable: false};
+        Object.defineProperty(XPathResult, name, d);
+        Object.defineProperty(XPathResult.prototype, name, d);
+    }
+    const XPathExpression = {XPathExpression: class {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        evaluate(contextNode, type = 0, result = null) {
+            const state = internalsOf(this).xpathExpression;
+            if (!state) throw new TypeError("Illegal invocation");
+            if (arguments.length < 1) throw new TypeError("evaluate requires 1 argument");
+            return evaluateXPathExpression(state, contextNode, type, result);
+        }
+    }}.XPathExpression;
+    // DOM #mixin-xpathevaluatorbase, included by Document and XPathEvaluator.
+    const xpathEvaluatorBase = {
+        createExpression(expression, resolver = null) {
+            if (arguments.length < 1) throw new TypeError("createExpression requires 1 argument");
+            return createXPathExpression(expression, resolver);
+        },
+        // #dom-xpathevaluatorbase-creatensresolver: the node itself.
+        createNSResolver(nodeResolver) {
+            if (!(nodeResolver instanceof Node)) throw new TypeError("The argument is not a Node");
+            return nodeResolver;
+        },
+        evaluate(expression, contextNode, resolver = null, type = 0, result = null) {
+            if (arguments.length < 2) throw new TypeError("evaluate requires 2 arguments");
+            const compiled = createXPathExpression(expression, resolver);
+            return evaluateXPathExpression(internalsOf(compiled).xpathExpression, contextNode, type, result);
+        },
+    };
+    const XPathEvaluator = {XPathEvaluator: class {
+        constructor() { internalsFor(this).xpathEvaluator = true; }
+    }}.XPathEvaluator;
+    for (const target of [Document.prototype, XPathEvaluator.prototype]) {
+        for (const key of Object.keys(xpathEvaluatorBase)) {
+            const method = xpathEvaluatorBase[key];
+            Object.defineProperty(target, key, {value: {[key](...args) {
+                if (target === Document.prototype ? !(this instanceof Document) : !internalsOf(this).xpathEvaluator)
+                    throw new TypeError("Illegal invocation");
+                return Reflect.apply(method, this, args);
+            }}[key], writable: true, enumerable: true, configurable: true});
+        }
+    }
+    Object.defineProperty(Document.prototype.createExpression, "length", {value: 1});
+    Object.defineProperty(Document.prototype.createNSResolver, "length", {value: 1});
+    Object.defineProperty(Document.prototype.evaluate, "length", {value: 2});
+    Object.defineProperty(XPathEvaluator.prototype.createExpression, "length", {value: 1});
+    Object.defineProperty(XPathEvaluator.prototype.createNSResolver, "length", {value: 1});
+    Object.defineProperty(XPathEvaluator.prototype.evaluate, "length", {value: 2});
+    for (const [name, C] of [["XPathResult", XPathResult], ["XPathExpression", XPathExpression], ["XPathEvaluator", XPathEvaluator]]) {
+        Object.defineProperty(C.prototype, Symbol.toStringTag, {value: name, configurable: true});
+        Object.defineProperty(g, name, {value: C, writable: true, configurable: true});
+    }
     g.NodeFilter = {
         SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_COMMENT: 128,
         FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
     };
-    g.CSSStyleSheet = CSSStyleSheet;
+    g.StyleSheet = StyleSheet; g.CSSStyleSheet = CSSStyleSheet;
     g.CSSRule = CSSRule; g.CSSStyleRule = CSSStyleRule;
-    g.CSSGroupingRule = CSSGroupingRule; g.CSSMediaRule = CSSMediaRule;
+    g.CSSGroupingRule = CSSGroupingRule; g.CSSConditionRule = CSSConditionRule; g.CSSMediaRule = CSSMediaRule;
     g.CSSSupportsRule = CSSSupportsRule; g.CSSContainerRule = CSSContainerRule;
     g.CSSLayerBlockRule = CSSLayerBlockRule; g.CSSFontFaceRule = CSSFontFaceRule;
     g.CSSPageRule = CSSPageRule; g.CSSKeyframeRule = CSSKeyframeRule;
@@ -19095,7 +19616,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         ["HTMLTimeElement","dateTime",0,"s"], ["HTMLAnchorElement","hreflang",0,"s"],
         ["HTMLAreaElement","hreflang",0,"s"], ["HTMLAnchorElement","type",0,"s"],
         ["HTMLAreaElement","type",0,"s"], ["HTMLAnchorElement","target",0,"s"],
-        ["HTMLAreaElement","target",0,"s"], ["SVGAElement","target",0,"s"], ["HTMLModElement","cite",0,"url"],
+        ["HTMLAreaElement","target",0,"s"], ["HTMLModElement","cite",0,"url"],
         ["HTMLModElement","dateTime",0,"s"], ["HTMLSourceElement","src",0,"url"],
         ["HTMLSourceElement","type",0,"s"], ["HTMLSourceElement","srcset",0,"u"],
         ["HTMLSourceElement","sizes",0,"s"], ["HTMLSourceElement","media",0,"s"],
@@ -19355,7 +19876,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function reflectedURL(element, value) {
         if (value === null) return "";
         const document = element.ownerDocument;
-        const parsed = __url_parse(value, document ? document.baseURI : baseHref());
+        const parsed = encodingParseURL(value, document ? document.baseURI : baseHref(), document);
         return parsed ? parsed[0] : idlUSVString(value);
     }
     // HTML #explicitly-set-attr-element: Element? reflection.
@@ -19814,7 +20335,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // through `__svg_geometry` (src/dom/svg_geometry.rs).
     const SVG_GRAPHICS_ELEMENTS = new Set(["svg", "g", "defs", "a", "use", "image", "switch",
         "foreignObject", "rect", "circle", "ellipse", "line", "path", "polyline", "polygon",
-        "text", "tspan", "textPath"]);
+        "text", "tspan", "textPath", "symbol"]);
     const SVG_GEOMETRY_ELEMENTS = new Set(["rect", "circle", "ellipse", "line", "path",
         "polyline", "polygon"]);
     const SVG_TEXT_CONTENT_ELEMENTS = new Set(["text", "tspan", "textPath"]);
@@ -19822,7 +20343,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const SVG_GEOMETRY_BBOX = 0, SVG_GEOMETRY_CTM = 1, SVG_GEOMETRY_SCREEN_CTM = 2,
         SVG_GEOMETRY_TOTAL_LENGTH = 3, SVG_GEOMETRY_POINT_AT_LENGTH = 4,
         SVG_GEOMETRY_IN_FILL = 5, SVG_GEOMETRY_IN_STROKE = 6, SVG_GEOMETRY_CHARS = 7,
-        SVG_GEOMETRY_TEXT_LENGTH = 8, SVG_GEOMETRY_SUBSTRING_LENGTH = 9;
+        SVG_GEOMETRY_TEXT_LENGTH = 8, SVG_GEOMETRY_SUBSTRING_LENGTH = 9,
+        SVG_GEOMETRY_LENGTH_CONTEXT = 10;
     const svgGetAttribute = Element.prototype.getAttribute;
     const svgSetAttribute = Element.prototype.setAttribute;
     function svgInterface(name, Base) {
@@ -20033,7 +20555,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return state;
     }
     function svgTransformListItems(state) {
-        const source = Reflect.apply(svgGetAttribute, state.element, ["transform"]);
+        const source = Reflect.apply(svgGetAttribute, state.element, [state.attribute]);
         if (source !== state.source) {
             for (const item of state.items) svgTransformState(item).list = null;
             state.items = parseSVGTransformList(source).map(([type, numbers]) =>
@@ -20045,7 +20567,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function svgTransformListReserialize(state) {
         const text = state.items.map(svgSerializeTransform).join(" ");
         state.source = text;
-        Reflect.apply(svgSetAttribute, state.element, ["transform", text]);
+        Reflect.apply(svgSetAttribute, state.element, [state.attribute, text]);
     }
     function svgTransformListWritable(object) {
         const state = svgTransformListState(object);
@@ -20101,9 +20623,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
         return shareInternals(proxy, list);
     }
-    function createSVGTransformList(element, readOnly) {
+    // `attribute` is transform, gradientTransform or patternTransform.
+    function createSVGTransformList(element, readOnly, attribute = "transform") {
         const list = Object.create(SVGTransformList.prototype);
-        const state = internalsFor(list).svgTransformList = {element, readOnly, items: [], source: null};
+        const state = internalsFor(list).svgTransformList = {element, readOnly, attribute, items: [], source: null};
         return svgListProxy(list, () => svgTransformListItems(state));
     }
     svgMembers(SVGTransformList, {
@@ -20204,22 +20727,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get baseVal() { return svgAnimatedState(this, "svgAnimatedTransformList").baseVal; },
         get animVal() { return svgAnimatedState(this, "svgAnimatedTransformList").animVal; },
     });
-    // types.html#InterfaceSVGAnimatedNumber reflecting a <number> attribute
-    // (shapes.html#__svg__SVGGeometryElement__pathLength reflects pathLength).
-    const SVGAnimatedNumber = svgIllegalInterface("SVGAnimatedNumber");
-    function svgAnimatedNumberValue(state) {
-        const value = Reflect.apply(svgGetAttribute, state.element, [state.attribute]);
-        const number = value === null || !/^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/.test(value) ? NaN : +value;
-        return Number.isFinite(number) ? Math.fround(number) : state.initial;
-    }
-    svgMembers(SVGAnimatedNumber, {
-        get baseVal() { return svgAnimatedNumberValue(svgAnimatedState(this, "svgAnimatedNumber")); },
-        set baseVal(value) {
-            const state = svgAnimatedState(this, "svgAnimatedNumber");
-            Reflect.apply(svgSetAttribute, state.element, [state.attribute, `${svgFloat(value)}`]);
-        },
-        get animVal() { return svgAnimatedNumberValue(svgAnimatedState(this, "svgAnimatedNumber")); },
-    });
 
     // types.html#__svg__SVGElement__ownerSVGElement and #…__viewportElement:
     // the nearest ancestor svg element, null for the outermost one.
@@ -20300,13 +20807,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // types.html#__svg__SVGGeometryElement__pathLength ([SameObject]).
         get pathLength() {
             svgElementId(this, SVG_GEOMETRY_ELEMENTS);
-            const slots = internalsFor(this);
-            if (!slots.svgPathLength) {
-                const animated = Object.create(SVGAnimatedNumber.prototype);
-                internalsFor(animated).svgAnimatedNumber = {element: this, attribute: "pathLength", initial: 0};
-                slots.svgPathLength = animated;
-            }
-            return slots.svgPathLength;
+            return svgReflectedObject(this, "pathLength", "number", "pathLength", {initial: 0});
         },
         // types.html#__svg__SVGGeometryElement__isPointInFill
         isPointInFill(point = {}) {
@@ -20391,11 +20892,1171 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // `href.baseVal` vs `href` — a bare `SVGAElement` was a ReferenceError
     // that broke its link interception/preloading; libraries also
     // feature-detect these.
-    for (const __n of ["Desc", "Title", "Symbol", "Style", "Script", "Marker",
+    for (const __n of ["Desc", "Title", "Style", "Script", "Marker",
         "ClipPath", "Mask", "Pattern", "Stop", "Filter", "View"]) {
         const __cn = "SVG" + __n + "Element";
         if (!g[__cn]) svgInterface(__cn, SVGElement);
     }
+    // ---- SVG 2 DOM: basic data types and reflecting animated values ----
+    // SVG 2 types.html#ReflectingDOM and #DOMInterfaces (local svgwg master),
+    // Filter Effects 1 appendix "DOM interfaces" and CSS Masking 1
+    // #dom-interfaces. Every animated value's baseVal reflects its content
+    // attribute (the attribute's initial value when absent or invalid) and is
+    // live: objects re-read the attribute when it changes and reserialize it
+    // when modified. SVG 2 makes animVal an alias of the same non-animated
+    // value; its objects are read only. TRust implements no SMIL animation
+    // (animate, set, animateMotion and animateTransform are inert), so there
+    // is never an animated value that differs.
+    const SVG_WS = "[ \\t\\n\\f\\r]*";
+    const SVG_NUMBER_SOURCE = "[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[eE][+-]?\\d+)?";
+    const SVG_NUMBER_ONLY = new RegExp("^" + SVG_WS + "(" + SVG_NUMBER_SOURCE + ")" + SVG_WS + "$");
+    const SVG_DIMENSION = new RegExp("^" + SVG_WS + "(" + SVG_NUMBER_SOURCE + ")(%|[a-zA-Z]+)?" + SVG_WS + "$");
+    // A <number> as CSS syntax parses it, or null.
+    function svgParseNumber(text) {
+        const match = text === null || text === undefined ? null : SVG_NUMBER_ONLY.exec(`${text}`);
+        if (!match) return null;
+        const number = +match[1];
+        return Number.isFinite(number) ? number : null;
+    }
+    // Comma-or-whitespace separated <number>s (SVG 2 #DataTypeList), or null.
+    function svgParseNumberList(text) {
+        if (text === null || text === undefined) return null;
+        text = `${text}`;
+        const trimmed = text.replace(/^[ \t\n\f\r]+|[ \t\n\f\r]+$/g, "");
+        if (trimmed === "") return [];
+        const parts = trimmed.split(/[ \t\n\f\r]*,[ \t\n\f\r]*|[ \t\n\f\r]+/);
+        const numbers = [];
+        for (const part of parts) {
+            const number = svgParseNumber(part);
+            if (number === null) return null;
+            numbers.push(number);
+        }
+        return numbers;
+    }
+    // Web IDL #es-unsigned-short.
+    function svgUnsignedShort(value) {
+        const number = +value;
+        if (!Number.isFinite(number)) return 0;
+        const integer = Math.trunc(number) % 65536;
+        return integer < 0 ? integer + 65536 : integer;
+    }
+    // The shortest decimal string that reads back as the same float (the
+    // "implementation specific string" of SVG 2 #TermReserialize).
+    function svgNumberString(value) {
+        const number = Math.fround(value);
+        if (!Number.isFinite(number)) return String(number);
+        if (Object.is(number, -0)) return "0";
+        for (let digits = 1; digits <= 9; digits++) {
+            const candidate = Number(number.toPrecision(digits));
+            if (Math.fround(candidate) === number) return String(candidate);
+        }
+        return String(number);
+    }
+
+    // SVG 2 #InterfaceSVGLength unit types and CSS Values 4 units. Lengths
+    // with another unit are valid values of SVG_LENGTHTYPE_UNKNOWN.
+    const SVG_LENGTH_UNIT_TYPES = {"": 1, "%": 2, em: 3, ex: 4, px: 5, cm: 6, mm: 7, in: 8, pt: 9, pc: 10};
+    const SVG_LENGTH_UNIT_NAMES = ["", "", "%", "em", "ex", "px", "cm", "mm", "in", "pt", "pc"];
+    const SVG_OTHER_LENGTH_UNITS = {ch: "ch", rem: "rem", vw: "vw", vh: "vh", vmin: "vmin", vmax: "vmax", q: "Q"};
+    // A [ <number> | <length> | <percentage> ] value: {type, factor, unit}.
+    function svgParseLength(text) {
+        const match = text === null || text === undefined ? null : SVG_DIMENSION.exec(`${text}`);
+        if (!match) return null;
+        const factor = +match[1];
+        if (!Number.isFinite(factor)) return null;
+        const unit = match[2] === undefined ? "" : match[2].toLowerCase();
+        const type = SVG_LENGTH_UNIT_TYPES[unit];
+        if (type !== undefined) return {type, factor, unit: SVG_LENGTH_UNIT_NAMES[type]};
+        const other = SVG_OTHER_LENGTH_UNITS[unit];
+        return other === undefined ? null : {type: 0, factor, unit: other};
+    }
+    function svgLengthString(length) {
+        return svgNumberString(length.factor) + length.unit;
+    }
+    // The bases SVG 2 #__svg__SVGLength__value resolves relative units
+    // against: the associated element's SVG viewport (its nearest viewport's
+    // user space) and computed font size, or 100 and the initial font size
+    // (medium, 16px) without an associated element.
+    function svgLengthContext(element) {
+        if (!element) return {width: 100, height: 100, fontSize: 16, rootFontSize: 16};
+        const id = elementIdentity(element);
+        const context = id === undefined ? null : __svg_geometry(id, SVG_GEOMETRY_LENGTH_CONTEXT);
+        // CSS Values 4 #rem: the root element's font size.
+        const document = element.ownerDocument;
+        const root = document && document.documentElement ? elementIdentity(document.documentElement) : undefined;
+        const rootFontSize = root === undefined ? 16 : parseFloat(__dom_computed(root, "font-size")) || 16;
+        return context ? {width: context[0], height: context[1], fontSize: context[2], rootFontSize}
+            : {width: 0, height: 0, fontSize: 16, rootFontSize};
+    }
+    function svgPercentBasis(context, direction, detached) {
+        if (detached) return 100;
+        if (direction === "x") return context.width;
+        if (direction === "y") return context.height;
+        return Math.sqrt((context.width * context.width + context.height * context.height) / 2);
+    }
+    // A length's value in user units (px).
+    function svgLengthUserUnits(length, element, direction) {
+        const factor = length.factor;
+        switch (length.unit) {
+            case "": case "px": return factor;
+            case "cm": return factor * 96 / 2.54;
+            case "mm": return factor * 96 / 25.4;
+            case "Q": return factor * 96 / 101.6;
+            case "in": return factor * 96;
+            case "pt": return factor * 4 / 3;
+            case "pc": return factor * 16;
+        }
+        const context = svgLengthContext(element);
+        switch (length.unit) {
+            case "%": return factor / 100 * svgPercentBasis(context, direction, !element);
+            case "em": return factor * context.fontSize;
+            // CSS Values 4 #ex and #ch: 0.5em when the font metric is not measurable.
+            case "ex": case "ch": return factor * context.fontSize / 2;
+            case "rem": return factor * context.rootFontSize;
+            case "vw": return factor * g.innerWidth / 100;
+            case "vh": return factor * g.innerHeight / 100;
+            case "vmin": return factor * Math.min(g.innerWidth, g.innerHeight) / 100;
+            default: return factor * Math.max(g.innerWidth, g.innerHeight) / 100;
+        }
+    }
+    // A user-unit value converted to unit type `type`.
+    function svgLengthFromUserUnits(value, type, element, direction) {
+        const unit = SVG_LENGTH_UNIT_NAMES[type];
+        const per = svgLengthUserUnits({type, factor: 1, unit}, element, direction);
+        return {type, factor: per === 0 ? 0 : value / per, unit};
+    }
+
+    // SVG 2 #InterfaceSVGAngle: [ <number> | <angle> ].
+    const SVG_ANGLE_UNIT_TYPES = {"": 1, deg: 2, rad: 3, grad: 4};
+    const SVG_ANGLE_UNIT_NAMES = ["", "", "deg", "rad", "grad"];
+    function svgParseAngle(text) {
+        const match = text === null || text === undefined ? null : SVG_DIMENSION.exec(`${text}`);
+        if (!match || match[2] === "%") return null;
+        const factor = +match[1];
+        if (!Number.isFinite(factor)) return null;
+        const unit = match[2] === undefined ? "" : match[2].toLowerCase();
+        const type = SVG_ANGLE_UNIT_TYPES[unit];
+        if (type !== undefined) return {type, factor, unit: SVG_ANGLE_UNIT_NAMES[type]};
+        return unit === "turn" ? {type: 0, factor, unit} : null;
+    }
+    function svgAngleDegrees(angle) {
+        switch (angle.unit) {
+            case "rad": return angle.factor * 180 / Math.PI;
+            case "grad": return angle.factor * 0.9;
+            case "turn": return angle.factor * 360;
+            default: return angle.factor;
+        }
+    }
+
+    // An SVG DOM value object (SVGLength, SVGAngle, SVGNumber) is detached,
+    // reflects an animated attribute's base value (`reflect`), or reflects an
+    // item of a list (`list`). A reflecting object re-reads its attribute
+    // before each use, which is how it stays synchronized.
+    function svgValueState(object, slot) {
+        const state = internalsFor(object)[slot];
+        if (!state) throw new TypeError("Illegal invocation");
+        if (state.reflect) state.value = state.reflect.read();
+        else if (state.list) svgListSync(state.list);
+        return state;
+    }
+    function svgWritable(state) {
+        if (state.readOnly) throw new DOMException("The object is read-only", "NoModificationAllowedError");
+    }
+    function svgValueChanged(state) {
+        if (state.reflect) state.reflect.write(state.value);
+        else if (state.list) svgListReserialize(state.list);
+    }
+
+    const SVGLength = svgIllegalInterface("SVGLength");
+    svgConstants(SVGLength, {SVG_LENGTHTYPE_UNKNOWN: 0, SVG_LENGTHTYPE_NUMBER: 1, SVG_LENGTHTYPE_PERCENTAGE: 2,
+        SVG_LENGTHTYPE_EMS: 3, SVG_LENGTHTYPE_EXS: 4, SVG_LENGTHTYPE_PX: 5, SVG_LENGTHTYPE_CM: 6,
+        SVG_LENGTHTYPE_MM: 7, SVG_LENGTHTYPE_IN: 8, SVG_LENGTHTYPE_PT: 9, SVG_LENGTHTYPE_PC: 10});
+    function createSVGLengthObject(value, options = {}) {
+        const length = Object.create(SVGLength.prototype);
+        internalsFor(length).svgLength = {value, element: options.element || null,
+            direction: options.direction || "other", readOnly: !!options.readOnly,
+            reflect: options.reflect || null, list: options.list || null};
+        return length;
+    }
+    function svgLengthUnitArgument(unitType) {
+        const type = svgUnsignedShort(unitType);
+        if (type === 0 || type > 10) throw new DOMException("Unsupported length unit type", "NotSupportedError");
+        return type;
+    }
+    svgMembers(SVGLength, {
+        get unitType() { return svgValueState(this, "svgLength").value.type; },
+        get value() {
+            const state = svgValueState(this, "svgLength");
+            return Math.fround(svgLengthUserUnits(state.value, state.element, state.direction));
+        },
+        set value(value) {
+            const state = svgValueState(this, "svgLength");
+            svgWritable(state);
+            state.value = {type: 1, factor: svgFloat(value), unit: ""};
+            svgValueChanged(state);
+        },
+        get valueInSpecifiedUnits() { return Math.fround(svgValueState(this, "svgLength").value.factor); },
+        set valueInSpecifiedUnits(value) {
+            const state = svgValueState(this, "svgLength");
+            svgWritable(state);
+            state.value = {type: state.value.type, factor: svgFloat(value), unit: state.value.unit};
+            svgValueChanged(state);
+        },
+        get valueAsString() { return svgLengthString(svgValueState(this, "svgLength").value); },
+        set valueAsString(value) {
+            const state = svgValueState(this, "svgLength");
+            svgWritable(state);
+            const parsed = svgParseLength(domString(value));
+            if (!parsed) throw new DOMException("The value is not a length", "SyntaxError");
+            state.value = parsed;
+            svgValueChanged(state);
+        },
+        newValueSpecifiedUnits(unitType, valueInSpecifiedUnits) {
+            const state = svgValueState(this, "svgLength");
+            svgArguments(2, arguments.length, "newValueSpecifiedUnits");
+            svgWritable(state);
+            const type = svgLengthUnitArgument(unitType);
+            state.value = {type, factor: svgFloat(valueInSpecifiedUnits), unit: SVG_LENGTH_UNIT_NAMES[type]};
+            svgValueChanged(state);
+        },
+        convertToSpecifiedUnits(unitType) {
+            const state = svgValueState(this, "svgLength");
+            svgArguments(1, arguments.length, "convertToSpecifiedUnits");
+            svgWritable(state);
+            const type = svgLengthUnitArgument(unitType);
+            const absolute = svgLengthUserUnits(state.value, state.element, state.direction);
+            state.value = svgLengthFromUserUnits(absolute, type, state.element, state.direction);
+            svgValueChanged(state);
+        },
+    });
+
+    const SVGAngle = svgIllegalInterface("SVGAngle");
+    svgConstants(SVGAngle, {SVG_ANGLETYPE_UNKNOWN: 0, SVG_ANGLETYPE_UNSPECIFIED: 1, SVG_ANGLETYPE_DEG: 2,
+        SVG_ANGLETYPE_RAD: 3, SVG_ANGLETYPE_GRAD: 4});
+    function createSVGAngleObject(value, options = {}) {
+        const angle = Object.create(SVGAngle.prototype);
+        internalsFor(angle).svgAngle = {value, readOnly: !!options.readOnly, reflect: options.reflect || null, list: null};
+        return angle;
+    }
+    function svgAngleUnitArgument(unitType) {
+        const type = svgUnsignedShort(unitType);
+        if (type === 0 || type > 4) throw new DOMException("Unsupported angle unit type", "NotSupportedError");
+        return type;
+    }
+    svgMembers(SVGAngle, {
+        get unitType() { return svgValueState(this, "svgAngle").value.type; },
+        get value() { return Math.fround(svgAngleDegrees(svgValueState(this, "svgAngle").value)); },
+        set value(value) {
+            const state = svgValueState(this, "svgAngle");
+            svgWritable(state);
+            state.value = {type: 1, factor: svgFloat(value), unit: ""};
+            svgValueChanged(state);
+        },
+        get valueInSpecifiedUnits() { return Math.fround(svgValueState(this, "svgAngle").value.factor); },
+        set valueInSpecifiedUnits(value) {
+            const state = svgValueState(this, "svgAngle");
+            svgWritable(state);
+            state.value = {type: state.value.type, factor: svgFloat(value), unit: state.value.unit};
+            svgValueChanged(state);
+        },
+        get valueAsString() { const value = svgValueState(this, "svgAngle").value; return svgNumberString(value.factor) + value.unit; },
+        set valueAsString(value) {
+            const state = svgValueState(this, "svgAngle");
+            svgWritable(state);
+            const parsed = svgParseAngle(domString(value));
+            if (!parsed) throw new DOMException("The value is not an angle", "SyntaxError");
+            state.value = parsed;
+            svgValueChanged(state);
+        },
+        newValueSpecifiedUnits(unitType, valueInSpecifiedUnits) {
+            const state = svgValueState(this, "svgAngle");
+            svgArguments(2, arguments.length, "newValueSpecifiedUnits");
+            svgWritable(state);
+            const type = svgAngleUnitArgument(unitType);
+            state.value = {type, factor: svgFloat(valueInSpecifiedUnits), unit: SVG_ANGLE_UNIT_NAMES[type]};
+            svgValueChanged(state);
+        },
+        convertToSpecifiedUnits(unitType) {
+            const state = svgValueState(this, "svgAngle");
+            svgArguments(1, arguments.length, "convertToSpecifiedUnits");
+            svgWritable(state);
+            const type = svgAngleUnitArgument(unitType);
+            const degrees = svgAngleDegrees(state.value);
+            const per = svgAngleDegrees({factor: 1, unit: SVG_ANGLE_UNIT_NAMES[type]});
+            state.value = {type, factor: degrees / per, unit: SVG_ANGLE_UNIT_NAMES[type]};
+            svgValueChanged(state);
+        },
+    });
+
+    const SVGNumber = svgIllegalInterface("SVGNumber");
+    function createSVGNumberObject(value, options = {}) {
+        const number = Object.create(SVGNumber.prototype);
+        internalsFor(number).svgNumber = {value, readOnly: !!options.readOnly, reflect: null, list: options.list || null};
+        return number;
+    }
+    svgMembers(SVGNumber, {
+        get value() { return Math.fround(svgValueState(this, "svgNumber").value); },
+        set value(value) {
+            const state = svgValueState(this, "svgNumber");
+            svgWritable(state);
+            state.value = svgFloat(value);
+            svgValueChanged(state);
+        },
+    });
+
+    // SVG 2 #ListInterfaces for SVGNumberList, SVGLengthList, SVGPointList
+    // and SVGStringList. A list reflects its attribute's base value: it is
+    // synchronized (items reused, values updated) when the attribute changed,
+    // and reserializes the attribute after each modification.
+    function svgListState(object) {
+        const state = internalsFor(object).svgList;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function svgListSync(state) {
+        const source = Reflect.apply(svgGetAttribute, state.element, [state.attribute]);
+        if (source === state.source) return state.items;
+        state.source = source;
+        const values = state.kind.parse(source) || [];
+        if (state.kind.primitive) { state.items = values; return state.items; }
+        while (state.items.length > values.length) state.kind.detach(state.items.pop());
+        while (state.items.length < values.length) state.items.push(state.kind.create(state, values[state.items.length]));
+        for (let i = 0; i < values.length; i++) state.kind.assign(state.items[i], values[i]);
+        return state.items;
+    }
+    function svgListReserialize(state) {
+        const text = state.items.map((item) => state.kind.serialize(item)).join(state.kind.separator || " ");
+        state.source = text;
+        Reflect.apply(svgSetAttribute, state.element, [state.attribute, text]);
+    }
+    function svgListWritable(object) {
+        const state = svgListState(object);
+        if (state.readOnly) throw new DOMException("The list is read-only", "NoModificationAllowedError");
+        svgListSync(state);
+        return state;
+    }
+    function svgListIndex(state, index) {
+        index = svgUnsignedLong(index);
+        if (index >= state.items.length) throw new DOMException("Index out of range", "IndexSizeError");
+        return index;
+    }
+    // A new object item that is not detached is copied (SVG 2 #ListInterfaces
+    // initialize/insertItemBefore/replaceItem/appendItem); a detached one is
+    // attached to the list.
+    function svgListAdopt(state, item) {
+        if (state.kind.primitive) return domString(item);
+        const value = state.kind.valueOf(item);
+        if (state.kind.attached(item)) return state.kind.create(state, value);
+        state.kind.attach(state, item);
+        return item;
+    }
+    function createSVGList(C, kind, element, attribute, options = {}) {
+        const list = Object.create(C.prototype);
+        const state = internalsFor(list).svgList = {kind, element, attribute, readOnly: !!options.readOnly,
+            direction: options.direction || "other", items: [], source: undefined};
+        return svgListProxy(list, () => svgListSync(state));
+    }
+    function svgListMembers(C, type) {
+        svgMembers(C, {
+            get length() { return svgListSync(svgListState(this)).length; },
+            get numberOfItems() { return svgListSync(svgListState(this)).length; },
+            clear() {
+                const state = svgListWritable(this);
+                if (!state.kind.primitive) for (const item of state.items) state.kind.detach(item);
+                state.items = [];
+                svgListReserialize(state);
+            },
+            initialize(newItem) {
+                const state = svgListWritable(this);
+                svgArguments(1, arguments.length, "initialize");
+                state.kind.check(newItem, type);
+                if (!state.kind.primitive) for (const item of state.items) state.kind.detach(item);
+                state.items = [];
+                const item = svgListAdopt(state, newItem);
+                state.items.push(item);
+                svgListReserialize(state);
+                return item;
+            },
+            getItem(index) {
+                const state = svgListState(this);
+                svgArguments(1, arguments.length, "getItem");
+                svgListSync(state);
+                return state.items[svgListIndex(state, index)];
+            },
+            insertItemBefore(newItem, index) {
+                const state = svgListWritable(this);
+                svgArguments(2, arguments.length, "insertItemBefore");
+                state.kind.check(newItem, type);
+                const item = svgListAdopt(state, newItem);
+                state.items.splice(Math.min(svgUnsignedLong(index), state.items.length), 0, item);
+                svgListReserialize(state);
+                return item;
+            },
+            replaceItem(newItem, index) {
+                const state = svgListWritable(this);
+                svgArguments(2, arguments.length, "replaceItem");
+                state.kind.check(newItem, type);
+                const position = svgListIndex(state, index);
+                const item = svgListAdopt(state, newItem);
+                if (!state.kind.primitive) state.kind.detach(state.items[position]);
+                state.items[position] = item;
+                svgListReserialize(state);
+                return item;
+            },
+            removeItem(index) {
+                const state = svgListWritable(this);
+                svgArguments(1, arguments.length, "removeItem");
+                const [item] = state.items.splice(svgListIndex(state, index), 1);
+                if (!state.kind.primitive) state.kind.detach(item);
+                svgListReserialize(state);
+                return item;
+            },
+            appendItem(newItem) {
+                const state = svgListWritable(this);
+                svgArguments(1, arguments.length, "appendItem");
+                state.kind.check(newItem, type);
+                const item = svgListAdopt(state, newItem);
+                state.items.push(item);
+                svgListReserialize(state);
+                return item;
+            },
+        });
+        defineIndexedIteration(C);
+    }
+    function svgCheckItem(slot, name) {
+        return (item) => {
+            if (!internalsOf(item)[slot]) throw new TypeError(`The item is not an ${name}`);
+        };
+    }
+    // List element kinds: parse the attribute, create/assign/attach/detach
+    // items (SVG 2 #ListInterfaces "attached"/"detached"), serialize them.
+    const SVG_NUMBER_LIST_KIND = {
+        parse: svgParseNumberList,
+        check: svgCheckItem("svgNumber", "SVGNumber"),
+        create(list, value) { return createSVGNumberObject(value, {list, readOnly: list.readOnly}); },
+        assign(item, value) { internalsFor(item).svgNumber.value = value; },
+        valueOf(item) { return internalsOf(item).svgNumber.value; },
+        attached(item) { const state = internalsOf(item).svgNumber; return !!(state.list || state.reflect); },
+        attach(list, item) { const state = internalsFor(item).svgNumber; state.list = list; state.readOnly = list.readOnly; },
+        detach(item) { const state = internalsFor(item).svgNumber; state.list = null; state.readOnly = false; },
+        serialize(item) { return svgNumberString(internalsOf(item).svgNumber.value); },
+    };
+    const SVG_LENGTH_LIST_KIND = {
+        parse(text) {
+            if (text === null || text === undefined) return null;
+            const trimmed = `${text}`.replace(/^[ \t\n\f\r]+|[ \t\n\f\r]+$/g, "");
+            if (trimmed === "") return [];
+            const lengths = [];
+            for (const part of trimmed.split(/[ \t\n\f\r]*,[ \t\n\f\r]*|[ \t\n\f\r]+/)) {
+                const length = svgParseLength(part);
+                if (!length) return null;
+                lengths.push(length);
+            }
+            return lengths;
+        },
+        check: svgCheckItem("svgLength", "SVGLength"),
+        create(list, value) {
+            return createSVGLengthObject(value, {list, element: list.element, direction: list.direction, readOnly: list.readOnly});
+        },
+        assign(item, value) { internalsFor(item).svgLength.value = value; },
+        valueOf(item) { return internalsOf(item).svgLength.value; },
+        attached(item) { const state = internalsOf(item).svgLength; return !!(state.list || state.reflect); },
+        attach(list, item) {
+            const state = internalsFor(item).svgLength;
+            state.list = list; state.element = list.element; state.direction = list.direction; state.readOnly = list.readOnly;
+        },
+        detach(item) {
+            const state = internalsFor(item).svgLength;
+            state.list = null; state.element = null; state.direction = "other"; state.readOnly = false;
+        },
+        serialize(item) { return svgLengthString(internalsOf(item).svgLength.value); },
+    };
+    // shapes.html#InterfaceSVGPointList: SVGPoint (DOMPoint) items of a
+    // `points` attribute, pairs of coordinates.
+    function svgPointHook(list, point) {
+        geometrySlots(point, false).domPoint.svg = {
+            readOnly: list.readOnly,
+            sync() { svgListSync(list); },
+            changed() { svgListReserialize(list); },
+        };
+    }
+    const SVG_POINT_LIST_KIND = {
+        parse(text) {
+            const numbers = svgParseNumberList(text);
+            if (numbers === null) return null;
+            const points = [];
+            // shapes.html#PointsBNF: an odd coordinate count drops the last.
+            for (let i = 0; i + 1 < numbers.length; i += 2) points.push([numbers[i], numbers[i + 1]]);
+            return points;
+        },
+        check(item) {
+            const record = geometrySlots(item, false);
+            if (!record || !record.domPoint || !record.domPoint.writable) throw new TypeError("The item is not an SVGPoint");
+        },
+        create(list, value) {
+            const point = createPoint(value[0], value[1], 0, 1);
+            svgPointHook(list, point);
+            return point;
+        },
+        assign(item, value) { const point = geometrySlots(item, false).domPoint; point.x = value[0]; point.y = value[1]; },
+        valueOf(item) { const point = geometrySlots(item, false).domPoint; return [point.x, point.y]; },
+        attached(item) { return !!geometrySlots(item, false).domPoint.svg; },
+        attach(list, item) { svgPointHook(list, item); },
+        detach(item) { geometrySlots(item, false).domPoint.svg = null; },
+        serialize(item) {
+            const point = geometrySlots(item, false).domPoint;
+            return svgNumberString(point.x) + "," + svgNumberString(point.y);
+        },
+    };
+    const SVG_STRING_LIST_KIND = {
+        primitive: true,
+        // Conditional processing: requiredExtensions is a list of URLs
+        // separated by whitespace (struct.html#RequiredExtensionsAttribute).
+        parse(text) {
+            if (text === null || text === undefined) return [];
+            const trimmed = `${text}`.replace(/^[ \t\n\f\r]+|[ \t\n\f\r]+$/g, "");
+            return trimmed === "" ? [] : trimmed.split(/[ \t\n\f\r]+/);
+        },
+        check() {},
+        serialize(item) { return item; },
+    };
+    // systemLanguage is a comma-separated list of BCP 47 language tags
+    // (struct.html#SystemLanguageAttribute). The list joins its items with
+    // ", " so that its reserialization parses back to the same items.
+    const SVG_LANGUAGE_LIST_KIND = Object.assign({}, SVG_STRING_LIST_KIND, {
+        parse(text) {
+            if (text === null || text === undefined) return [];
+            return `${text}`.split(",").map((part) => part.replace(/^[ \t\n\f\r]+|[ \t\n\f\r]+$/g, ""))
+                .filter((part) => part !== "");
+        },
+        separator: ", ",
+    });
+    const SVGNumberList = svgIllegalInterface("SVGNumberList");
+    svgListMembers(SVGNumberList, "SVGNumber");
+    const SVGLengthList = svgIllegalInterface("SVGLengthList");
+    svgListMembers(SVGLengthList, "SVGLength");
+    const SVGPointList = svgIllegalInterface("SVGPointList");
+    svgListMembers(SVGPointList, "SVGPoint");
+    const SVGStringList = svgIllegalInterface("SVGStringList");
+    svgListMembers(SVGStringList, "DOMString");
+
+    // coords.html#InterfaceSVGPreserveAspectRatio.
+    const SVGPreserveAspectRatio = svgIllegalInterface("SVGPreserveAspectRatio");
+    const SVG_ALIGN_KEYWORDS = ["", "none", "xMinYMin", "xMidYMin", "xMaxYMin", "xMinYMid", "xMidYMid",
+        "xMaxYMid", "xMinYMax", "xMidYMax", "xMaxYMax"];
+    const SVG_MEET_KEYWORDS = ["", "meet", "slice"];
+    svgConstants(SVGPreserveAspectRatio, {SVG_PRESERVEASPECTRATIO_UNKNOWN: 0, SVG_PRESERVEASPECTRATIO_NONE: 1,
+        SVG_PRESERVEASPECTRATIO_XMINYMIN: 2, SVG_PRESERVEASPECTRATIO_XMIDYMIN: 3, SVG_PRESERVEASPECTRATIO_XMAXYMIN: 4,
+        SVG_PRESERVEASPECTRATIO_XMINYMID: 5, SVG_PRESERVEASPECTRATIO_XMIDYMID: 6, SVG_PRESERVEASPECTRATIO_XMAXYMID: 7,
+        SVG_PRESERVEASPECTRATIO_XMINYMAX: 8, SVG_PRESERVEASPECTRATIO_XMIDYMAX: 9, SVG_PRESERVEASPECTRATIO_XMAXYMAX: 10,
+        SVG_MEETORSLICE_UNKNOWN: 0, SVG_MEETORSLICE_MEET: 1, SVG_MEETORSLICE_SLICE: 2});
+    // coords.html#PreserveAspectRatioAttribute: <align> [meet | slice]?,
+    // initially xMidYMid meet.
+    function svgParsePreserveAspectRatio(text) {
+        const match = text === null || text === undefined ? null
+            : /^[ \t\n\f\r]*([A-Za-z]+)(?:[ \t\n\f\r]+([a-z]+))?[ \t\n\f\r]*$/.exec(`${text}`);
+        if (!match) return null;
+        const align = SVG_ALIGN_KEYWORDS.indexOf(match[1]);
+        const meet = match[2] === undefined ? 1 : SVG_MEET_KEYWORDS.indexOf(match[2]);
+        return align > 0 && meet > 0 ? [align, meet] : null;
+    }
+    function svgParState(object) {
+        const state = internalsFor(object).svgPreserveAspectRatio;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function svgParValue(state) {
+        return svgParsePreserveAspectRatio(Reflect.apply(svgGetAttribute, state.element, ["preserveAspectRatio"])) || [6, 1];
+    }
+    function svgParSet(object, index, value, keywords) {
+        const state = svgParState(object);
+        if (state.readOnly) throw new DOMException("The object is read-only", "NoModificationAllowedError");
+        value = svgUnsignedShort(value);
+        if (value === 0 || value >= keywords.length) throw new TypeError("Invalid preserveAspectRatio value");
+        const current = svgParValue(state);
+        current[index] = value;
+        Reflect.apply(svgSetAttribute, state.element, ["preserveAspectRatio",
+            SVG_ALIGN_KEYWORDS[current[0]] + " " + SVG_MEET_KEYWORDS[current[1]]]);
+    }
+    svgMembers(SVGPreserveAspectRatio, {
+        get align() { return svgParValue(svgParState(this))[0]; },
+        set align(value) { svgParSet(this, 0, value, SVG_ALIGN_KEYWORDS); },
+        get meetOrSlice() { return svgParValue(svgParState(this))[1]; },
+        set meetOrSlice(value) { svgParSet(this, 1, value, SVG_MEET_KEYWORDS); },
+    });
+
+    const SVGUnitTypes = svgIllegalInterface("SVGUnitTypes");
+    svgConstants(SVGUnitTypes, {SVG_UNIT_TYPE_UNKNOWN: 0, SVG_UNIT_TYPE_USERSPACEONUSE: 1,
+        SVG_UNIT_TYPE_OBJECTBOUNDINGBOX: 2});
+    const SVG_UNITS = {userSpaceOnUse: 1, objectBoundingBox: 2};
+
+    // The SVGAnimated* interfaces. Each has baseVal and animVal; their state
+    // names the element and the reflected attribute's definition.
+    function svgAnimated(name, members) {
+        const C = svgIllegalInterface(name);
+        svgMembers(C, members);
+        return C;
+    }
+    function svgAnimatedSlot(object) {
+        const state = internalsFor(object).svgAnimated;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state;
+    }
+    function svgAttr(state) {
+        return Reflect.apply(svgGetAttribute, state.element, [state.attribute]);
+    }
+    function svgSetAttr(state, value) {
+        Reflect.apply(svgSetAttribute, state.element, [state.attribute, value]);
+    }
+    function svgInitial(state) {
+        return typeof state.initial === "function" ? state.initial(state.element) : state.initial;
+    }
+    // The value of a <number> or <integer> attribute, or both values of a
+    // <number-optional-number> one whose implicit second value is its first
+    // (types.html#InterfaceSVGAnimatedNumber, #InterfaceSVGAnimatedInteger),
+    // the initial value when absent or invalid.
+    function svgPairValues(state) {
+        const text = svgAttr(state);
+        let values = null;
+        if (text !== null && state.percent) {
+            // pservers.html#StopElementOffsetAttribute: <number> | <percentage>.
+            const length = svgParseLength(text);
+            if (length && (length.unit === "" || length.unit === "%"))
+                values = [length.unit === "%" ? length.factor / 100 : length.factor];
+        } else if (text !== null) {
+            const numbers = svgParseNumberList(text);
+            if (numbers !== null && numbers.length >= 1 && numbers.length <= (state.pair === undefined ? 1 : 2) &&
+                (!state.integer || numbers.every(Number.isInteger))) values = numbers;
+        }
+        if (values === null) values = [svgInitial(state)];
+        if (values.length === 1) values.push(values[0]);
+        return values;
+    }
+    const SVGAnimatedNumber = svgAnimated("SVGAnimatedNumber", {
+        get baseVal() { const state = svgAnimatedSlot(this); return Math.fround(svgPairValues(state)[state.pair || 0]); },
+        set baseVal(value) {
+            const state = svgAnimatedSlot(this);
+            value = svgFloat(value);
+            if (state.pair === undefined) { svgSetAttr(state, svgNumberString(value)); return; }
+            const current = svgPairValues(state);
+            current[state.pair] = value;
+            svgSetAttr(state, svgNumberString(current[0]) + " " + svgNumberString(current[1]));
+        },
+        get animVal() { const state = svgAnimatedSlot(this); return Math.fround(svgPairValues(state)[state.pair || 0]); },
+    });
+    const SVGAnimatedInteger = svgAnimated("SVGAnimatedInteger", {
+        get baseVal() { const state = svgAnimatedSlot(this); return svgPairValues(state)[state.pair || 0]; },
+        set baseVal(value) {
+            const state = svgAnimatedSlot(this);
+            value = idlLong(value);
+            if (state.pair === undefined) { svgSetAttr(state, String(value)); return; }
+            const current = svgPairValues(state);
+            current[state.pair] = value;
+            svgSetAttr(state, current[0] + " " + current[1]);
+        },
+        get animVal() { const state = svgAnimatedSlot(this); return svgPairValues(state)[state.pair || 0]; },
+    });
+    function svgBooleanValue(state) {
+        const value = svgAttr(state);
+        return value === "true" ? true : value === "false" ? false : state.initial;
+    }
+    const SVGAnimatedBoolean = svgAnimated("SVGAnimatedBoolean", {
+        get baseVal() { return svgBooleanValue(svgAnimatedSlot(this)); },
+        set baseVal(value) { svgSetAttr(svgAnimatedSlot(this), value ? "true" : "false"); },
+        get animVal() { return svgBooleanValue(svgAnimatedSlot(this)); },
+    });
+    // types.html#InterfaceSVGAnimatedEnumeration: the numeric type value of
+    // the keyword (the initial value's when absent or invalid).
+    function svgEnumValue(state) {
+        if (state.orient) {
+            const value = svgAttr(state);
+            if (value === "auto") return 1;
+            if (value === "auto-start-reverse") return 3;
+            return 2;
+        }
+        const value = svgAttr(state);
+        const number = value === null ? undefined : state.keywords[value];
+        return number === undefined ? state.keywords[state.initial] : number;
+    }
+    const SVGAnimatedEnumeration = svgAnimated("SVGAnimatedEnumeration", {
+        get baseVal() { return svgEnumValue(svgAnimatedSlot(this)); },
+        set baseVal(value) {
+            const state = svgAnimatedSlot(this);
+            value = svgUnsignedShort(value);
+            if (state.orient) {
+                if (value === 1) svgSetAttr(state, "auto");
+                else if (value === 2) svgSetAttr(state, "0");
+                else if (value === 3) svgSetAttr(state, "auto-start-reverse");
+                else throw new TypeError("Invalid orient type");
+                return;
+            }
+            const keyword = Object.keys(state.keywords).find((key) => state.keywords[key] === value);
+            if (value === 0 || keyword === undefined) throw new TypeError("Invalid enumeration value");
+            svgSetAttr(state, keyword);
+        },
+        get animVal() { return svgEnumValue(svgAnimatedSlot(this)); },
+    });
+    // types.html#InterfaceSVGAnimatedString, optionally also reflecting the
+    // deprecated xlink:href; crossOrigin is limited to known values.
+    const XLINK_NS = "http://www.w3.org/1999/xlink";
+    function svgStringValue(state) {
+        const value = svgAttr(state);
+        if (state.known) {
+            // HTML #cors-settings-attribute: missing → null is not a string
+            // here; the invalid value default is anonymous.
+            if (value === null) return "";
+            const lower = asciiLower(value);
+            return lower === "use-credentials" ? "use-credentials" : "anonymous";
+        }
+        if (value === null && state.xlink) {
+            const deprecated = Element.prototype.getAttributeNS.call(state.element, XLINK_NS, "href");
+            if (deprecated !== null) return deprecated;
+        }
+        return value === null ? state.initial || "" : value;
+    }
+    const SVGAnimatedString = svgAnimated("SVGAnimatedString", {
+        get baseVal() { return svgStringValue(svgAnimatedSlot(this)); },
+        set baseVal(value) {
+            const state = svgAnimatedSlot(this);
+            value = domString(value);
+            if (state.xlink && svgAttr(state) === null &&
+                Element.prototype.hasAttributeNS.call(state.element, XLINK_NS, "href")) {
+                Element.prototype.setAttributeNS.call(state.element, XLINK_NS, "xlink:href", value);
+                return;
+            }
+            svgSetAttr(state, value);
+        },
+        get animVal() { return svgStringValue(svgAnimatedSlot(this)); },
+    });
+    // types.html#InterfaceSVGAnimatedLength: baseVal reflects the attribute;
+    // animVal is a distinct read-only SVGLength of the same value.
+    function svgLengthReflection(state) {
+        return {
+            read() {
+                return svgParseLength(svgAttr(state)) || svgParseLength(svgInitial(state));
+            },
+            write(value) { svgSetAttr(state, svgLengthString(value)); },
+        };
+    }
+    const SVGAnimatedLength = svgAnimated("SVGAnimatedLength", {
+        get baseVal() { return svgAnimatedObject(this, "baseVal"); },
+        get animVal() { return svgAnimatedObject(this, "animVal"); },
+    });
+    // painting.html#__svg__SVGMarkerElement__orientAngle: the <angle> of
+    // the orient attribute (0 for auto and auto-start-reverse).
+    function svgAngleReflection(state) {
+        return {
+            read() { return svgParseAngle(svgAttr(state)) || {type: 1, factor: 0, unit: ""}; },
+            write(value) { svgSetAttr(state, svgNumberString(value.factor) + value.unit); },
+        };
+    }
+    const SVGAnimatedAngle = svgAnimated("SVGAnimatedAngle", {
+        get baseVal() { return svgAnimatedObject(this, "baseVal"); },
+        get animVal() { return svgAnimatedObject(this, "animVal"); },
+    });
+    // types.html#InterfaceSVGAnimatedRect: viewBox's SVGRect (DOMRect)
+    // objects, updated from the attribute and reserializing it when written.
+    function svgParseViewBox(text) {
+        const numbers = svgParseNumberList(text);
+        return numbers && numbers.length === 4 && numbers[2] >= 0 && numbers[3] >= 0 ? numbers : null;
+    }
+    function svgRectSync(state) {
+        const values = svgParseViewBox(svgAttr(state)) || [0, 0, 0, 0];
+        for (const key of ["baseVal", "animVal"]) {
+            const rect = state.objects[key];
+            if (rect) updateReflectedRect(rect, values[0], values[1], values[2], values[3], true);
+        }
+    }
+    trust.svgRectWrite = function (rect, index, number) {
+        const reflection = internalsOf(rect).svgRectReflection;
+        if (!reflection) return;
+        if (reflection.readOnly) throw new DOMException("The rectangle is read-only", "NoModificationAllowedError");
+        const state = reflection.state;
+        const values = svgParseViewBox(svgAttr(state)) || [0, 0, 0, 0];
+        values[index] = number;
+        svgSetAttr(state, values.map(svgNumberString).join(" "));
+    };
+    const SVGAnimatedRect = svgAnimated("SVGAnimatedRect", {
+        get baseVal() { return svgAnimatedObject(this, "baseVal"); },
+        get animVal() { return svgAnimatedObject(this, "animVal"); },
+    });
+    const SVGAnimatedPreserveAspectRatio = svgAnimated("SVGAnimatedPreserveAspectRatio", {
+        get baseVal() { return svgAnimatedObject(this, "baseVal"); },
+        get animVal() { return svgAnimatedObject(this, "animVal"); },
+    });
+    const SVGAnimatedNumberList = svgAnimated("SVGAnimatedNumberList", {
+        get baseVal() { return svgAnimatedObject(this, "baseVal"); },
+        get animVal() { return svgAnimatedObject(this, "animVal"); },
+    });
+    const SVGAnimatedLengthList = svgAnimated("SVGAnimatedLengthList", {
+        get baseVal() { return svgAnimatedObject(this, "baseVal"); },
+        get animVal() { return svgAnimatedObject(this, "animVal"); },
+    });
+    // The [SameObject] baseVal/animVal value of an animated object, created
+    // on first access.
+    function svgAnimatedObject(animated, which) {
+        const state = svgAnimatedSlot(animated);
+        if (state.objects[which]) {
+            if (state.kind === "rect") svgRectSync(state);
+            return state.objects[which];
+        }
+        const readOnly = which === "animVal";
+        let object;
+        switch (state.kind) {
+            case "length":
+                object = createSVGLengthObject(null, {element: state.element, direction: state.direction,
+                    readOnly, reflect: svgLengthReflection(state)});
+                break;
+            case "angle":
+                object = createSVGAngleObject(null, {readOnly, reflect: svgAngleReflection(state)});
+                break;
+            case "rect":
+                object = createDOMRect(0, 0, 0, 0);
+                internalsFor(object).svgRectReflection = {state, readOnly};
+                break;
+            case "preserveAspectRatio":
+                object = Object.create(SVGPreserveAspectRatio.prototype);
+                internalsFor(object).svgPreserveAspectRatio = {element: state.element, readOnly};
+                break;
+            case "numberList":
+                object = createSVGList(SVGNumberList, SVG_NUMBER_LIST_KIND, state.element, state.attribute, {readOnly});
+                break;
+            case "lengthList":
+                object = createSVGList(SVGLengthList, SVG_LENGTH_LIST_KIND, state.element, state.attribute,
+                    {readOnly, direction: state.direction});
+                break;
+        }
+        state.objects[which] = object;
+        if (state.kind === "rect") svgRectSync(state);
+        return object;
+    }
+    // Keep reflecting SVGRects current when their attribute changes (SVG 2
+    // #InterfaceSVGAnimatedRect "whenever the reflected content attribute is
+    // added, removed, or changed").
+    function svgReflectedAttributeChanged(element, name, namespace) {
+        const reflections = internalsOf(element).svgReflections;
+        if (!reflections || namespace !== null || name !== "viewBox") return;
+        const animated = reflections.get("viewBox");
+        if (animated) svgRectSync(svgAnimatedSlot(animated));
+    }
+
+    // Interfaces not created above, each with its base interface.
+    for (const [name, base] of [["SVGMetadataElement", SVGElement], ["SVGSymbolElement", SVGGraphicsElement],
+        ["SVGComponentTransferFunctionElement", SVGElement], ["SVGFEBlendElement", SVGElement],
+        ["SVGFEColorMatrixElement", SVGElement], ["SVGFEComponentTransferElement", SVGElement],
+        ["SVGFECompositeElement", SVGElement], ["SVGFEConvolveMatrixElement", SVGElement],
+        ["SVGFEDiffuseLightingElement", SVGElement], ["SVGFEDisplacementMapElement", SVGElement],
+        ["SVGFEDistantLightElement", SVGElement], ["SVGFEDropShadowElement", SVGElement],
+        ["SVGFEFloodElement", SVGElement], ["SVGFEGaussianBlurElement", SVGElement],
+        ["SVGFEImageElement", SVGElement], ["SVGFEMergeElement", SVGElement], ["SVGFEMergeNodeElement", SVGElement],
+        ["SVGFEMorphologyElement", SVGElement], ["SVGFEOffsetElement", SVGElement],
+        ["SVGFEPointLightElement", SVGElement], ["SVGFESpecularLightingElement", SVGElement],
+        ["SVGFESpotLightElement", SVGElement], ["SVGFETileElement", SVGElement],
+        ["SVGFETurbulenceElement", SVGElement]]) {
+        if (!g[name]) svgInterface(name, base);
+    }
+    for (const name of ["R", "G", "B", "A"])
+        if (!g["SVGFEFunc" + name + "Element"]) svgInterface("SVGFEFunc" + name + "Element", g.SVGComponentTransferFunctionElement);
+    // The local names of the elements implementing interface C.
+    const svgInterfaceElementNames = new Map();
+    function svgNamesFor(C) {
+        let names = svgInterfaceElementNames.get(C);
+        if (!names) {
+            names = new Set(Object.keys(SVG_ELEMENT_INTERFACES).filter((local) => {
+                const own = g[SVG_ELEMENT_INTERFACES[local]];
+                return own === C || (own && own.prototype instanceof C);
+            }));
+            svgInterfaceElementNames.set(C, names);
+        }
+        return names;
+    }
+
+    // Reflection definitions: [IDL attribute, kind, content attribute, options].
+    const reflectLength = (idl, attribute, direction, initial) => [idl, "length", attribute, {direction, initial}];
+    const reflectNumber = (idl, attribute, initial, extra = {}) => [idl, "number", attribute, Object.assign({initial}, extra)];
+    const reflectEnum = (idl, attribute, keywords, initial) => [idl, "enumeration", attribute, {keywords, initial}];
+    const reflectString = (idl, attribute, extra = {}) => [idl, "string", attribute, extra];
+    const reflectUnits = (idl, attribute, initial) => reflectEnum(idl, attribute, SVG_UNITS, initial);
+    const FILTER_PRIMITIVE = [reflectLength("x", "x", "x", "0%"), reflectLength("y", "y", "y", "0%"), reflectLength("width", "width", "x", "100%"),
+        reflectLength("height", "height", "y", "100%"), reflectString("result", "result")];
+    const SVG_EDGE_MODES = {duplicate: 1, wrap: 2, none: 3};
+    const svgCoincidentInitial = (element, attribute) => {
+        const text = Reflect.apply(svgGetAttribute, element, [attribute]);
+        return svgParseLength(text) ? text : "50%";
+    };
+    // Filter Effects 1 #element-attrdef-feconvolvematrix-divisor: the sum of
+    // kernelMatrix, or 1 when that sum is 0.
+    const convolveDivisor = (element) => {
+        const kernel = svgParseNumberList(Reflect.apply(svgGetAttribute, element, ["kernelMatrix"])) || [];
+        const sum = kernel.reduce((total, value) => total + value, 0);
+        return sum === 0 ? 1 : sum;
+    };
+    const convolveOrder = (element) => {
+        const order = svgParseNumberList(Reflect.apply(svgGetAttribute, element, ["order"]));
+        const valid = order && order.length >= 1 && order.length <= 2 && order.every((n) => Number.isInteger(n) && n > 0);
+        return valid ? [order[0], order.length === 2 ? order[1] : order[0]] : [3, 3];
+    };
+    const SVG_REFLECTIONS = {
+        SVGElement: [reflectString("className", "class")],
+        SVGGraphicsElement: [["requiredExtensions", "stringList", "requiredExtensions", {}],
+            ["systemLanguage", "stringList", "systemLanguage", {language: true}]],
+        SVGSVGElement: [reflectLength("x", "x", "x", "0"), reflectLength("y", "y", "y", "0"), reflectLength("width", "width", "x", "100%"),
+            reflectLength("height", "height", "y", "100%")],
+        SVGRectElement: [reflectLength("x", "x", "x", "0"), reflectLength("y", "y", "y", "0"), reflectLength("width", "width", "x", "0"),
+            reflectLength("height", "height", "y", "0"), reflectLength("rx", "rx", "x", "0"), reflectLength("ry", "ry", "y", "0")],
+        SVGCircleElement: [reflectLength("cx", "cx", "x", "0"), reflectLength("cy", "cy", "y", "0"), reflectLength("r", "r", "other", "0")],
+        SVGEllipseElement: [reflectLength("cx", "cx", "x", "0"), reflectLength("cy", "cy", "y", "0"), reflectLength("rx", "rx", "x", "0"), reflectLength("ry", "ry", "y", "0")],
+        SVGLineElement: [reflectLength("x1", "x1", "x", "0"), reflectLength("y1", "y1", "y", "0"), reflectLength("x2", "x2", "x", "0"), reflectLength("y2", "y2", "y", "0")],
+        SVGPolylineElement: [["points", "points", "points", {}], ["animatedPoints", "points", "points", {readOnly: true}]],
+        SVGPolygonElement: [["points", "points", "points", {}], ["animatedPoints", "points", "points", {readOnly: true}]],
+        SVGImageElement: [reflectLength("x", "x", "x", "0"), reflectLength("y", "y", "y", "0"), reflectLength("width", "width", "x", "0"),
+            reflectLength("height", "height", "y", "0"), ["preserveAspectRatio", "preserveAspectRatio", "preserveAspectRatio", {}],
+            reflectString("href", "href", {xlink: true})],
+        SVGForeignObjectElement: [reflectLength("x", "x", "x", "0"), reflectLength("y", "y", "y", "0"), reflectLength("width", "width", "x", "0"),
+            reflectLength("height", "height", "y", "0")],
+        SVGUseElement: [reflectLength("x", "x", "x", "0"), reflectLength("y", "y", "y", "0"), reflectLength("width", "width", "x", "0"),
+            reflectLength("height", "height", "y", "0"), reflectString("href", "href", {xlink: true})],
+        SVGAElement: [reflectString("target", "target"), reflectString("href", "href", {xlink: true})],
+        SVGScriptElement: [reflectString("href", "href", {xlink: true})],
+        SVGSymbolElement: [["viewBox", "rect", "viewBox", {}], ["preserveAspectRatio", "preserveAspectRatio", "preserveAspectRatio", {}]],
+        SVGViewElement: [["viewBox", "rect", "viewBox", {}], ["preserveAspectRatio", "preserveAspectRatio", "preserveAspectRatio", {}]],
+        SVGMarkerElement: [reflectLength("refX", "refX", "x", "0"), reflectLength("refY", "refY", "y", "0"),
+            reflectEnum("markerUnits", "markerUnits", {userSpaceOnUse: 1, strokeWidth: 2}, "strokeWidth"),
+            reflectLength("markerWidth", "markerWidth", "x", "3"), reflectLength("markerHeight", "markerHeight", "y", "3"),
+            ["orientType", "enumeration", "orient", {orient: true}], ["orientAngle", "angle", "orient", {}],
+            ["viewBox", "rect", "viewBox", {}], ["preserveAspectRatio", "preserveAspectRatio", "preserveAspectRatio", {}]],
+        SVGGradientElement: [reflectUnits("gradientUnits", "gradientUnits", "objectBoundingBox"),
+            ["gradientTransform", "transformList", "gradientTransform", {}],
+            reflectEnum("spreadMethod", "spreadMethod", {pad: 1, reflect: 2, repeat: 3}, "pad"), reflectString("href", "href", {xlink: true})],
+        SVGLinearGradientElement: [reflectLength("x1", "x1", "x", "0%"), reflectLength("y1", "y1", "y", "0%"), reflectLength("x2", "x2", "x", "100%"),
+            reflectLength("y2", "y2", "y", "0%")],
+        SVGRadialGradientElement: [reflectLength("cx", "cx", "x", "50%"), reflectLength("cy", "cy", "y", "50%"), reflectLength("r", "r", "other", "50%"),
+            // pservers.html#RadialGradientElementFXAttribute: fx and fy
+            // default to cx and cy.
+            reflectLength("fx", "fx", "x", (element) => svgCoincidentInitial(element, "cx")),
+            reflectLength("fy", "fy", "y", (element) => svgCoincidentInitial(element, "cy")), reflectLength("fr", "fr", "other", "0%")],
+        SVGStopElement: [reflectNumber("offset", "offset", 0, {percent: true})],
+        SVGPatternElement: [reflectUnits("patternUnits", "patternUnits", "objectBoundingBox"),
+            reflectUnits("patternContentUnits", "patternContentUnits", "userSpaceOnUse"),
+            ["patternTransform", "transformList", "patternTransform", {}], reflectLength("x", "x", "x", "0"), reflectLength("y", "y", "y", "0"),
+            reflectLength("width", "width", "x", "0"), reflectLength("height", "height", "y", "0"), ["viewBox", "rect", "viewBox", {}],
+            ["preserveAspectRatio", "preserveAspectRatio", "preserveAspectRatio", {}], reflectString("href", "href", {xlink: true})],
+        SVGTextContentElement: [reflectLength("textLength", "textLength", "x", "0"),
+            reflectEnum("lengthAdjust", "lengthAdjust", {spacing: 1, spacingAndGlyphs: 2}, "spacing")],
+        SVGTextPositioningElement: [["x", "lengthList", "x", {direction: "x"}], ["y", "lengthList", "y", {direction: "y"}],
+            ["dx", "lengthList", "dx", {direction: "x"}], ["dy", "lengthList", "dy", {direction: "y"}],
+            ["rotate", "numberList", "rotate", {}]],
+        SVGTextPathElement: [reflectLength("startOffset", "startOffset", "x", "0"), reflectEnum("method", "method", {align: 1, stretch: 2}, "align"),
+            reflectEnum("spacing", "spacing", {auto: 1, exact: 2}, "exact"), reflectString("href", "href", {xlink: true})],
+        SVGClipPathElement: [reflectUnits("clipPathUnits", "clipPathUnits", "userSpaceOnUse"),
+            ["transform", "transformList", "transform", {}]],
+        SVGMaskElement: [reflectUnits("maskUnits", "maskUnits", "objectBoundingBox"),
+            reflectUnits("maskContentUnits", "maskContentUnits", "userSpaceOnUse"), reflectLength("x", "x", "x", "-10%"),
+            reflectLength("y", "y", "y", "-10%"), reflectLength("width", "width", "x", "120%"), reflectLength("height", "height", "y", "120%")],
+        SVGFilterElement: [reflectUnits("filterUnits", "filterUnits", "objectBoundingBox"),
+            reflectUnits("primitiveUnits", "primitiveUnits", "userSpaceOnUse"), reflectLength("x", "x", "x", "-10%"),
+            reflectLength("y", "y", "y", "-10%"), reflectLength("width", "width", "x", "120%"), reflectLength("height", "height", "y", "120%")],
+        SVGFEBlendElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"), reflectString("in2", "in2"),
+            reflectEnum("mode", "mode", {normal: 1, multiply: 2, screen: 3, darken: 4, lighten: 5, overlay: 6, "color-dodge": 7,
+                "color-burn": 8, "hard-light": 9, "soft-light": 10, difference: 11, exclusion: 12, hue: 13,
+                saturation: 14, color: 15, luminosity: 16}, "normal")],
+        SVGFEColorMatrixElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"),
+            reflectEnum("type", "type", {matrix: 1, saturate: 2, hueRotate: 3, luminanceToAlpha: 4}, "matrix"),
+            ["values", "numberList", "values", {}]],
+        SVGFEComponentTransferElement: [...FILTER_PRIMITIVE, reflectString("in1", "in")],
+        SVGComponentTransferFunctionElement: [reflectEnum("type", "type", {identity: 1, table: 2, discrete: 3, linear: 4, gamma: 5}, "identity"),
+            ["tableValues", "numberList", "tableValues", {}], reflectNumber("slope", "slope", 1), reflectNumber("intercept", "intercept", 0),
+            reflectNumber("amplitude", "amplitude", 1), reflectNumber("exponent", "exponent", 1), reflectNumber("offset", "offset", 0)],
+        SVGFECompositeElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"), reflectString("in2", "in2"),
+            reflectEnum("operator", "operator", {over: 1, in: 2, out: 3, atop: 4, xor: 5, arithmetic: 6}, "over"),
+            reflectNumber("k1", "k1", 0), reflectNumber("k2", "k2", 0), reflectNumber("k3", "k3", 0), reflectNumber("k4", "k4", 0)],
+        SVGFEConvolveMatrixElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"),
+            ["orderX", "integer", "order", {initial: 3, pair: 0}], ["orderY", "integer", "order", {initial: 3, pair: 1}],
+            ["kernelMatrix", "numberList", "kernelMatrix", {}], reflectNumber("divisor", "divisor", convolveDivisor), reflectNumber("bias", "bias", 0),
+            ["targetX", "integer", "targetX", {initial: (element) => Math.floor(convolveOrder(element)[0] / 2)}],
+            ["targetY", "integer", "targetY", {initial: (element) => Math.floor(convolveOrder(element)[1] / 2)}],
+            reflectEnum("edgeMode", "edgeMode", SVG_EDGE_MODES, "duplicate"),
+            reflectNumber("kernelUnitLengthX", "kernelUnitLength", 0, {pair: 0}), reflectNumber("kernelUnitLengthY", "kernelUnitLength", 0, {pair: 1}),
+            ["preserveAlpha", "boolean", "preserveAlpha", {initial: false}]],
+        SVGFEDiffuseLightingElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"), reflectNumber("surfaceScale", "surfaceScale", 1),
+            reflectNumber("diffuseConstant", "diffuseConstant", 1),
+            reflectNumber("kernelUnitLengthX", "kernelUnitLength", 0, {pair: 0}), reflectNumber("kernelUnitLengthY", "kernelUnitLength", 0, {pair: 1})],
+        SVGFEDistantLightElement: [reflectNumber("azimuth", "azimuth", 0), reflectNumber("elevation", "elevation", 0)],
+        SVGFEPointLightElement: [reflectNumber("x", "x", 0), reflectNumber("y", "y", 0), reflectNumber("z", "z", 0)],
+        SVGFESpotLightElement: [reflectNumber("x", "x", 0), reflectNumber("y", "y", 0), reflectNumber("z", "z", 0), reflectNumber("pointsAtX", "pointsAtX", 0),
+            reflectNumber("pointsAtY", "pointsAtY", 0), reflectNumber("pointsAtZ", "pointsAtZ", 0), reflectNumber("specularExponent", "specularExponent", 1),
+            reflectNumber("limitingConeAngle", "limitingConeAngle", 0)],
+        SVGFEDisplacementMapElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"), reflectString("in2", "in2"), reflectNumber("scale", "scale", 0),
+            reflectEnum("xChannelSelector", "xChannelSelector", {R: 1, G: 2, B: 3, A: 4}, "A"),
+            reflectEnum("yChannelSelector", "yChannelSelector", {R: 1, G: 2, B: 3, A: 4}, "A")],
+        SVGFEDropShadowElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"), reflectNumber("dx", "dx", 2), reflectNumber("dy", "dy", 2),
+            reflectNumber("stdDeviationX", "stdDeviation", 2, {pair: 0}), reflectNumber("stdDeviationY", "stdDeviation", 2, {pair: 1})],
+        SVGFEFloodElement: [...FILTER_PRIMITIVE],
+        SVGFEGaussianBlurElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"),
+            reflectNumber("stdDeviationX", "stdDeviation", 0, {pair: 0}), reflectNumber("stdDeviationY", "stdDeviation", 0, {pair: 1}),
+            reflectEnum("edgeMode", "edgeMode", SVG_EDGE_MODES, "none")],
+        SVGFEImageElement: [...FILTER_PRIMITIVE, ["preserveAspectRatio", "preserveAspectRatio", "preserveAspectRatio", {}],
+            reflectString("crossOrigin", "crossorigin", {known: true}), reflectString("href", "href", {xlink: true})],
+        SVGFEMergeElement: [...FILTER_PRIMITIVE],
+        SVGFEMergeNodeElement: [reflectString("in1", "in")],
+        SVGFEMorphologyElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"),
+            reflectEnum("operator", "operator", {erode: 1, dilate: 2}, "erode"),
+            reflectNumber("radiusX", "radius", 0, {pair: 0}), reflectNumber("radiusY", "radius", 0, {pair: 1})],
+        SVGFEOffsetElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"), reflectNumber("dx", "dx", 0), reflectNumber("dy", "dy", 0)],
+        SVGFESpecularLightingElement: [...FILTER_PRIMITIVE, reflectString("in1", "in"), reflectNumber("surfaceScale", "surfaceScale", 1),
+            reflectNumber("specularConstant", "specularConstant", 1), reflectNumber("specularExponent", "specularExponent", 1),
+            reflectNumber("kernelUnitLengthX", "kernelUnitLength", 0, {pair: 0}), reflectNumber("kernelUnitLengthY", "kernelUnitLength", 0, {pair: 1})],
+        SVGFETileElement: [...FILTER_PRIMITIVE, reflectString("in1", "in")],
+        SVGFETurbulenceElement: [...FILTER_PRIMITIVE, reflectNumber("baseFrequencyX", "baseFrequency", 0, {pair: 0}),
+            reflectNumber("baseFrequencyY", "baseFrequency", 0, {pair: 1}), ["numOctaves", "integer", "numOctaves", {initial: 1}],
+            reflectNumber("seed", "seed", 0), reflectEnum("stitchTiles", "stitchTiles", {stitch: 1, noStitch: 2}, "noStitch"),
+            reflectEnum("type", "type", {fractalNoise: 1, turbulence: 2}, "turbulence")],
+    };
+    // SVGSVGElement includes SVGFitToViewBox.
+    SVG_REFLECTIONS.SVGSVGElement.push(["viewBox", "rect", "viewBox", {}],
+        ["preserveAspectRatio", "preserveAspectRatio", "preserveAspectRatio", {}]);
+    const SVG_ANIMATED_INTERFACES = {length: SVGAnimatedLength, number: SVGAnimatedNumber, integer: SVGAnimatedInteger,
+        boolean: SVGAnimatedBoolean, enumeration: SVGAnimatedEnumeration, string: SVGAnimatedString,
+        angle: SVGAnimatedAngle, rect: SVGAnimatedRect, preserveAspectRatio: SVGAnimatedPreserveAspectRatio,
+        numberList: SVGAnimatedNumberList, lengthList: SVGAnimatedLengthList};
+    // The [SameObject] object an IDL attribute returns for an element.
+    function svgReflectedObject(element, idl, kind, attribute, options) {
+        const slots = internalsFor(element);
+        if (!slots.svgReflections) slots.svgReflections = new Map();
+        const cached = slots.svgReflections.get(idl);
+        if (cached) return cached;
+        let object;
+        if (kind === "points") {
+            object = createSVGList(SVGPointList, SVG_POINT_LIST_KIND, element, attribute, {readOnly: !!options.readOnly});
+        } else if (kind === "stringList") {
+            object = createSVGList(SVGStringList, options.language ? SVG_LANGUAGE_LIST_KIND : SVG_STRING_LIST_KIND,
+                element, attribute, {});
+        } else if (kind === "transformList") {
+            object = Object.create(SVGAnimatedTransformList.prototype);
+            internalsFor(object).svgAnimatedTransformList = {
+                baseVal: createSVGTransformList(element, false, attribute),
+                animVal: createSVGTransformList(element, true, attribute),
+            };
+        } else {
+            object = Object.create(SVG_ANIMATED_INTERFACES[kind].prototype);
+            internalsFor(object).svgAnimated = {element, attribute, kind, objects: {},
+                direction: options.direction || "other", keywords: options.keywords, initial: options.initial,
+                pair: options.pair, integer: kind === "integer", percent: !!options.percent,
+                orient: !!options.orient, xlink: !!options.xlink, known: !!options.known};
+        }
+        slots.svgReflections.set(idl, object);
+        return object;
+    }
+    for (const name of Object.keys(SVG_REFLECTIONS)) {
+        const C = g[name];
+        const members = {};
+        for (const [idl, kind, attribute, options] of SVG_REFLECTIONS[name]) {
+            Object.defineProperty(members, idl, {enumerable: true, configurable: true,
+                get: {[idl]() {
+                    if (C !== SVGElement) svgElementId(this, svgNamesFor(C));
+                    else {
+                        const id = elementIdentity(this);
+                        const element = id === undefined ? null : __dom_element_name(id);
+                        if (!element || element[1] !== SVG_NS) throw new TypeError("Illegal invocation");
+                    }
+                    return svgReflectedObject(this, idl, kind, attribute, options);
+                }}[idl]});
+        }
+        svgMembers(C, members);
+    }
+    // Interface constants.
+    svgConstants(g.SVGMarkerElement, {SVG_MARKERUNITS_UNKNOWN: 0, SVG_MARKERUNITS_USERSPACEONUSE: 1,
+        SVG_MARKERUNITS_STROKEWIDTH: 2, SVG_MARKER_ORIENT_UNKNOWN: 0, SVG_MARKER_ORIENT_AUTO: 1,
+        SVG_MARKER_ORIENT_ANGLE: 2, SVG_MARKER_ORIENT_AUTO_START_REVERSE: 3});
+    svgConstants(SVGGradientElement, {SVG_SPREADMETHOD_UNKNOWN: 0, SVG_SPREADMETHOD_PAD: 1,
+        SVG_SPREADMETHOD_REFLECT: 2, SVG_SPREADMETHOD_REPEAT: 3});
+    svgConstants(g.SVGTextPathElement, {TEXTPATH_METHODTYPE_UNKNOWN: 0, TEXTPATH_METHODTYPE_ALIGN: 1,
+        TEXTPATH_METHODTYPE_STRETCH: 2, TEXTPATH_SPACINGTYPE_UNKNOWN: 0, TEXTPATH_SPACINGTYPE_AUTO: 1,
+        TEXTPATH_SPACINGTYPE_EXACT: 2});
+    svgConstants(g.SVGFEBlendElement, {SVG_FEBLEND_MODE_UNKNOWN: 0, SVG_FEBLEND_MODE_NORMAL: 1,
+        SVG_FEBLEND_MODE_MULTIPLY: 2, SVG_FEBLEND_MODE_SCREEN: 3, SVG_FEBLEND_MODE_DARKEN: 4,
+        SVG_FEBLEND_MODE_LIGHTEN: 5, SVG_FEBLEND_MODE_OVERLAY: 6, SVG_FEBLEND_MODE_COLOR_DODGE: 7,
+        SVG_FEBLEND_MODE_COLOR_BURN: 8, SVG_FEBLEND_MODE_HARD_LIGHT: 9, SVG_FEBLEND_MODE_SOFT_LIGHT: 10,
+        SVG_FEBLEND_MODE_DIFFERENCE: 11, SVG_FEBLEND_MODE_EXCLUSION: 12, SVG_FEBLEND_MODE_HUE: 13,
+        SVG_FEBLEND_MODE_SATURATION: 14, SVG_FEBLEND_MODE_COLOR: 15, SVG_FEBLEND_MODE_LUMINOSITY: 16});
+    svgConstants(g.SVGFEColorMatrixElement, {SVG_FECOLORMATRIX_TYPE_UNKNOWN: 0, SVG_FECOLORMATRIX_TYPE_MATRIX: 1,
+        SVG_FECOLORMATRIX_TYPE_SATURATE: 2, SVG_FECOLORMATRIX_TYPE_HUEROTATE: 3,
+        SVG_FECOLORMATRIX_TYPE_LUMINANCETOALPHA: 4});
+    svgConstants(g.SVGComponentTransferFunctionElement, {SVG_FECOMPONENTTRANSFER_TYPE_UNKNOWN: 0,
+        SVG_FECOMPONENTTRANSFER_TYPE_IDENTITY: 1, SVG_FECOMPONENTTRANSFER_TYPE_TABLE: 2,
+        SVG_FECOMPONENTTRANSFER_TYPE_DISCRETE: 3, SVG_FECOMPONENTTRANSFER_TYPE_LINEAR: 4,
+        SVG_FECOMPONENTTRANSFER_TYPE_GAMMA: 5});
+    svgConstants(g.SVGFECompositeElement, {SVG_FECOMPOSITE_OPERATOR_UNKNOWN: 0, SVG_FECOMPOSITE_OPERATOR_OVER: 1,
+        SVG_FECOMPOSITE_OPERATOR_IN: 2, SVG_FECOMPOSITE_OPERATOR_OUT: 3, SVG_FECOMPOSITE_OPERATOR_ATOP: 4,
+        SVG_FECOMPOSITE_OPERATOR_XOR: 5, SVG_FECOMPOSITE_OPERATOR_ARITHMETIC: 6});
+    for (const name of ["SVGFEConvolveMatrixElement", "SVGFEGaussianBlurElement"])
+        svgConstants(g[name], {SVG_EDGEMODE_UNKNOWN: 0, SVG_EDGEMODE_DUPLICATE: 1, SVG_EDGEMODE_WRAP: 2, SVG_EDGEMODE_NONE: 3});
+    svgConstants(g.SVGFEDisplacementMapElement, {SVG_CHANNEL_UNKNOWN: 0, SVG_CHANNEL_R: 1, SVG_CHANNEL_G: 2,
+        SVG_CHANNEL_B: 3, SVG_CHANNEL_A: 4});
+    svgConstants(g.SVGFEMorphologyElement, {SVG_MORPHOLOGY_OPERATOR_UNKNOWN: 0, SVG_MORPHOLOGY_OPERATOR_ERODE: 1,
+        SVG_MORPHOLOGY_OPERATOR_DILATE: 2});
+    svgConstants(g.SVGFETurbulenceElement, {SVG_TURBULENCE_TYPE_UNKNOWN: 0, SVG_TURBULENCE_TYPE_FRACTALNOISE: 1,
+        SVG_TURBULENCE_TYPE_TURBULENCE: 2, SVG_STITCHTYPE_UNKNOWN: 0, SVG_STITCHTYPE_STITCH: 1,
+        SVG_STITCHTYPE_NOSTITCH: 2});
+    // Filter Effects 1 #dom-svgfegaussianblurelement-setstddeviation and
+    // #dom-svgfedropshadowelement-setstddeviation.
+    for (const name of ["SVGFEGaussianBlurElement", "SVGFEDropShadowElement"]) {
+        const C = g[name];
+        svgMembers(C, {
+            setStdDeviation(stdDeviationX, stdDeviationY) {
+                svgElementId(this, svgNamesFor(C));
+                svgArguments(2, arguments.length, "setStdDeviation");
+                const x = svgFloat(stdDeviationX), y = svgFloat(stdDeviationY);
+                Reflect.apply(svgSetAttribute, this, ["stdDeviation", svgNumberString(x) + " " + svgNumberString(y)]);
+            },
+        });
+    }
+    // painting.html#__svg__SVGMarkerElement__orient, #…setOrientToAuto and
+    // #…setOrientToAngle.
+    svgMembers(g.SVGMarkerElement, {
+        get orient() {
+            svgElementId(this, svgNamesFor(g.SVGMarkerElement));
+            const value = Reflect.apply(svgGetAttribute, this, ["orient"]);
+            return value === null ? "" : value;
+        },
+        set orient(value) {
+            svgElementId(this, svgNamesFor(g.SVGMarkerElement));
+            Reflect.apply(svgSetAttribute, this, ["orient", domString(value)]);
+        },
+        setOrientToAuto() {
+            svgElementId(this, svgNamesFor(g.SVGMarkerElement));
+            Reflect.apply(svgSetAttribute, this, ["orient", "auto"]);
+        },
+        setOrientToAngle(angle) {
+            svgElementId(this, svgNamesFor(g.SVGMarkerElement));
+            svgArguments(1, arguments.length, "setOrientToAngle");
+            const state = internalsOf(angle).svgAngle;
+            if (!state) throw new TypeError("The argument is not an SVGAngle");
+            const value = svgValueState(angle, "svgAngle").value;
+            Reflect.apply(svgSetAttribute, this, ["orient", svgNumberString(value.factor) + value.unit]);
+        },
+    });
+    // struct.html#__svg__SVGSVGElement__createSVGNumber, createSVGLength and
+    // createSVGAngle: new detached objects.
+    svgMembers(SVGSVGElement, {
+        createSVGNumber() { svgElementId(this, SVG_SVG_ELEMENTS); return createSVGNumberObject(0); },
+        createSVGLength() { svgElementId(this, SVG_SVG_ELEMENTS); return createSVGLengthObject({type: 1, factor: 0, unit: ""}); },
+        createSVGAngle() { svgElementId(this, SVG_SVG_ELEMENTS); return createSVGAngleObject({type: 1, factor: 0, unit: ""}); },
+    });
+    // styling.html#InterfaceSVGStyleElement includes LinkStyle: an SVG style
+    // element's sheet is created like an HTML one's (CSSOM #the-linkstyle-interface).
+    svgMembers(g.SVGStyleElement, {
+        get type() { svgElementId(this, svgNamesFor(g.SVGStyleElement)); return Reflect.apply(svgGetAttribute, this, ["type"]) ?? ""; },
+        set type(value) { svgElementId(this, svgNamesFor(g.SVGStyleElement)); Reflect.apply(svgSetAttribute, this, ["type", domString(value)]); },
+        get media() { svgElementId(this, svgNamesFor(g.SVGStyleElement)); return Reflect.apply(svgGetAttribute, this, ["media"]) ?? ""; },
+        set media(value) { svgElementId(this, svgNamesFor(g.SVGStyleElement)); Reflect.apply(svgSetAttribute, this, ["media", domString(value)]); },
+        get title() { svgElementId(this, svgNamesFor(g.SVGStyleElement)); return Reflect.apply(svgGetAttribute, this, ["title"]) ?? ""; },
+        set title(value) { svgElementId(this, svgNamesFor(g.SVGStyleElement)); Reflect.apply(svgSetAttribute, this, ["title", domString(value)]); },
+        get sheet() { svgElementId(this, svgNamesFor(g.SVGStyleElement)); return elementSheet(this); },
+        get disabled() { svgElementId(this, svgNamesFor(g.SVGStyleElement)); const sheet = elementSheet(this); return sheet ? sheet.disabled : false; },
+        set disabled(value) { svgElementId(this, svgNamesFor(g.SVGStyleElement)); const sheet = elementSheet(this); if (sheet) sheet.disabled = value; },
+    });
+
     // The WebGL 2 interface remains non-constructible; unsupported context kinds
     // return null so content can select the implemented WebGL 1 API.
     for (const __n of ["WebGL2RenderingContext"]) {
@@ -21575,7 +23236,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // encoding-parse relative to the ENTRY settings object's API base URL,
         // even when the Location belongs to another Window or about:blank.
         const settings = windowMessageSlots && windowMessageState(source);
-        const p = __url_parse(domString(u), settings ? settings.apiBaseURL() : baseHref());
+        const p = settings ? __url_parse(domString(u), settings.apiBaseURL(), settings.documentEncoding())
+            : encodingParseURL(domString(u), baseHref(), g.document);
         if (!p) throw new DOMException("Invalid navigation URL.", "SyntaxError");
         const old = locState.href;
         // Only the hash setter suppresses an unchanged fragment (HTML
@@ -22737,7 +24399,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const current = record.location;
             let parsed = __url_parse(current.href, null);
             if (u !== null && u !== "") {
-                parsed = __url_parse(u, record.baseURL());
+                // HTML #shared-history-push/replace-state-steps: encoding-parse
+                // relative to the History object's relevant settings object.
+                parsed = __url_parse(u, record.baseURL(), documentQueryEncoding(g.document));
                 const currentURL = __url_parse(current.href, null);
                 if (!parsed || !canRewriteHistoryURL(currentURL, parsed)) {
                     throw new DOMException(
@@ -23273,7 +24937,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // #dfn-selection: mutating the selection's range schedules
     // selectionchange).
     function rangeChanged(range) {
-        if (selectionRangeOwner(range)) queueSelectionChange();
+        const selection = selectionRangeOwner(range);
+        if (selection) {
+            queueSelectionChange();
+            ecSelectionChanged(selection);
+        }
     }
     // DOM #concept-range-bp-set ("set the start or end").
     function setRangeBoundary(range, node, offset, start) {
@@ -23708,6 +25376,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         state.direction = range ? direction : "directionless";
         if (range) selectionOwners.set(range, selection);
         queueSelectionChange();
+        ecSelectionChanged(selection);
     }
     function selectionAnchor(state) {
         const range = state.range;
@@ -24355,6 +26024,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // DOM #queue-an-attribute-mutation-record: the attribute's local name and namespace.
     function moAttr(target, name, oldValue, namespace = null) {
+        svgReflectedAttributeChanged(target, name, namespace);
         if (!MO.length || !moHasAttributes) { moEnqueue(); return; }
         moNotify({ type: "attributes", target, attributeName: name, attributeNamespace: namespace, oldValue });
     }
@@ -25559,6 +27229,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
         },
         apiBaseURL() { return documentBaseURL(realmRootFrame); },
+        // The associated Document's character encoding, the query encoding
+        // of HTML #encoding-parsing-a-url relative to this Window.
+        documentEncoding() { return documentQueryEncoding(g.document); },
         // The WindowProxy of a document-tree child navigable with this target
         // name, as this Window's named property getter would return it.
         namedChild(name) {
@@ -29843,16 +31516,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // `"`/CR/LF in names and filenames percent-escape (%22/%0D/%0A), newlines
     // in string values normalize to CRLF, File parts carry their content type.
     // Returns the latin1 wire body plus the content type with its boundary.
+    // HTML #multipart/form-data-encoding-algorithm given an encoding (UTF-8
+    // for Fetch's body extraction): names, string values and filenames are
+    // encoded with the "html" error mode (Encoding #encode), and the encoded
+    // name and filename bytes then escape LF, CR and '"'.
     // With `segments`, a selected file's bytes are not read here: the body is
     // a list of byte strings and [file id, start, end] ranges that the host
     // reads when it sends a form navigation (bounded by its body limit).
-    const __formDataWire = (fd, segments = false) => {
+    const __formDataWire = (fd, encoding = "UTF-8", segments = false) => {
         let boundary = "----TRustFormBoundary";
         for (let i = 0; i < 16; i++) boundary += "0123456789abcdef"[(Math.random() * 16) | 0];
-        // HTML #multipart/form-data-encoding-algorithm: names (and
-        // string values) normalize newlines to CRLF first.
-        const escape = (s) => String(s).replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
-        const escName = (s) => escape(String(s).replace(/\r\n|\r|\n/g, "\r\n"));
+        const encode = encoding === "UTF-8" ? utf8Binary : (s) => __form_encode("html", s, encoding);
+        const escape = (bytes) => bytes.replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
+        const crlf = (s) => String(s).replace(/\r\n|\r|\n/g, "\r\n");
         let out = "";
         const pieces = [];
         const es = internalsFor(fd).entries;
@@ -29860,8 +31536,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const e = es[i];
             out += "--" + boundary + "\r\n";
             if (e.value && Array.isArray(internalsFor(e.value).parts)) { // File
-                out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"; filename="' + escape(e.value.name == null ? "blob" : e.value.name) + '"') + "\r\n";
-                out += "Content-Type: " + (e.value.type || "application/octet-stream") + "\r\n\r\n";
+                out += 'Content-Disposition: form-data; name="' + escape(encode(crlf(e.name))) + '"; filename="' +
+                    escape(encode(String(e.value.name == null ? "blob" : e.value.name))) + '"' + "\r\n";
+                out += "Content-Type: " + utf8Binary(e.value.type || "application/octet-stream") + "\r\n\r\n";
                 if (!segments) out += __blobBytes(e.value);
                 else for (const part of blobLeafParts(e.value)) {
                     const host = part && typeof part === "object" ? internalsOf(part).hostFile : null;
@@ -29872,8 +31549,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 out += "\r\n";
             } else {
-                out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"') + "\r\n\r\n";
-                out += utf8Binary(String(e.value).replace(/\r\n|\r|\n/g, "\r\n")) + "\r\n";
+                out += 'Content-Disposition: form-data; name="' + escape(encode(crlf(e.name))) + '"' + "\r\n\r\n";
+                out += encode(crlf(e.value)) + "\r\n";
             }
         }
         out += "--" + boundary + "--\r\n";
@@ -34075,9 +35752,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 throw new TypeError("Invalid Worker credentials mode");
             }
             const name = options.name != null ? String(options.name) : "";
-            let href;
-            try { href = new g.URL(String(url), g.location.href).href; }
-            catch (e) { throw new DOMException("Invalid worker script URL", "SyntaxError"); }
+            // HTML #dom-worker: encoding-parse the script URL relative to the
+            // outside settings object (its API base URL and the Window's
+            // Document's encoding).
+            const parsed = __url_parse(domString(url), messageWindowState.apiBaseURL(), messageWindowState.documentEncoding());
+            if (!parsed) throw new DOMException("Invalid worker script URL", "SyntaxError");
+            const href = parsed[0];
             // HTML's Worker constructor fetches Blob URLs from the File API
             // Blob URL Store. The store is authoritative in this realm; pass
             // an active entry's byte string to the Rust worker launcher rather
@@ -34161,7 +35841,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     if (!sharedWorkerTypes.includes(type)) throw new TypeError("Invalid SharedWorker type");
                 }
             } else name = `${options}`;
-            const parsed = __url_parse(scriptURL, messageWindowState.apiBaseURL());
+            const parsed = __url_parse(scriptURL, messageWindowState.apiBaseURL(), messageWindowState.documentEncoding());
             if (!parsed) throw new DOMException("Invalid shared worker script URL", "SyntaxError");
             const href = parsed[0];
             super();
@@ -36102,6 +37782,3165 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return result;
         };
+    }
+    // --- Editing commands -------------------------------------------------
+    // W3C Editing "execCommand" (local w3c/editing 70be76a,
+    // docs/execCommand/index.html): Document.execCommand(), the
+    // queryCommand*() methods and every command that specification defines,
+    // with an undo/redo history shared by script commands and native editing
+    // (Input Events 2 historyUndo/historyRedo). Helpers carry an "ec" prefix
+    // and keep the specification's step order and names. Per
+    // #common-definitions, a DOM method or attribute the algorithms refer to
+    // keeps its specification-defined behavior even when a page replaces
+    // it, so the originals are captured here, after the platform installed
+    // them and before any author script runs.
+    const ecDescriptor = (proto, name) => Object.getOwnPropertyDescriptor(proto, name);
+    const ecAppendMethod = Node.prototype.appendChild, ecInsertBeforeMethod = Node.prototype.insertBefore;
+    const ecRemoveChildMethod = Node.prototype.removeChild, ecCloneMethod = Node.prototype.cloneNode;
+    const ecCreateElementMethod = Document.prototype.createElement;
+    const ecCreateTextMethod = Document.prototype.createTextNode;
+    const ecGetAttributeMethod = Element.prototype.getAttribute, ecSetAttributeMethod = Element.prototype.setAttribute;
+    const ecRemoveAttributeMethod = Element.prototype.removeAttribute, ecHasAttributeMethod = Element.prototype.hasAttribute;
+    const ecSetAttributeNSMethod = Element.prototype.setAttributeNS;
+    const ecAttributesGetter = ecDescriptor(Element.prototype, "attributes").get;
+    const ecStyleGetter = ecDescriptor(Element.prototype, "style").get;
+    const ecSplitTextMethod = Text.prototype.splitText;
+    const ecReplaceDataMethod = CharacterData.prototype.replaceData;
+    const ecDataGetter = ecDescriptor(CharacterData.prototype, "data").get;
+    const ecGetPropertyValueMethod = CSSStyleDeclaration.prototype.getPropertyValue;
+    const ecSetPropertyMethod = CSSStyleDeclaration.prototype.setProperty;
+    const ecRemovePropertyMethod = CSSStyleDeclaration.prototype.removeProperty;
+    const ecSelectionCollapseMethod = Selection.prototype.collapse, ecSelectionExtendMethod = Selection.prototype.extend;
+    const ecCollapseToEndMethod = Selection.prototype.collapseToEnd;
+    const ecRemoveAllRangesMethod = Selection.prototype.removeAllRanges;
+    const ecSelectAllChildrenMethod = Selection.prototype.selectAllChildren;
+    const ecSetBaseAndExtentMethod = Selection.prototype.setBaseAndExtent;
+    const ecSelectionToStringMethod = Selection.prototype.toString;
+    const ecRangeInsertNodeMethod = Range.prototype.insertNode;
+    const ecRangeExtractMethod = Range.prototype.extractContents;
+    const ecRangeDeleteMethod = Range.prototype.deleteContents;
+    const ecRangeFragmentMethod = Range.prototype.createContextualFragment;
+    const ecRangeCloneMethod = Range.prototype.cloneRange, ecAddRangeMethod = Selection.prototype.addRange;
+    const ecCall = (method, receiver, ...args) => messageApply(method, receiver, args);
+    const SVG_NAMESPACE = "http://www.w3.org/2000/svg", MATHML_NAMESPACE = "http://www.w3.org/1998/Math/MathML";
+
+    // Tree primitives over the platform's own relations.
+    function ecType(node) { return node ? __dom_node_type(nodeIds.get(node)) : 0; }
+    function ecIsElement(node) { return ecType(node) === 1; }
+    // DOM #text: Text and CDATASection nodes.
+    function ecIsText(node) { const type = ecType(node); return type === 3 || type === 4; }
+    function ecParent(node) { return node ? rangeParent(node) : null; }
+    function ecIndex(node) { return rangeIndex(node); }
+    function ecLength(node) { return rangeLength(node); }
+    function ecFirstChild(node) { return traversalFirstChild(node); }
+    function ecLastChild(node) { return traversalLastChild(node); }
+    function ecNextSibling(node) { return traversalNext(node); }
+    function ecPreviousSibling(node) { return traversalPrevious(node); }
+    function ecChildren(node) {
+        const children = [];
+        for (let child = ecFirstChild(node); child; child = ecNextSibling(child)) children.push(child);
+        return children;
+    }
+    function ecChildAt(node, index) {
+        if (index < 0) return null;
+        const ids = __dom_children(nodeIds.get(node));
+        return index < ids.length ? wrap(ids[index]) : null;
+    }
+    function ecHasChildren(node) { return !!ecFirstChild(node); }
+    function ecIsAncestor(ancestor, node) { return !rangeSame(ancestor, node) && rangeContains(ancestor, node); }
+    // DOM #concept-tree-order: -1 when `a` precedes `b`, 1 when it follows.
+    function ecTreeOrder(a, b) {
+        if (rangeSame(a, b)) return 0;
+        if (rangeContains(a, b)) return -1;
+        if (rangeContains(b, a)) return 1;
+        return rangeOrder(ecParent(a), ecIndex(a), ecParent(b), ecIndex(b)) || 0;
+    }
+    function ecIsInclusiveAncestor(ancestor, node) { return rangeContains(ancestor, node); }
+    // DOM #concept-tree-following / -preceding: the node after or before
+    // `node` in tree order.
+    function ecNextNode(node) {
+        const child = ecFirstChild(node);
+        if (child) return child;
+        for (let current = node; current; current = ecParent(current)) {
+            const next = ecNextSibling(current);
+            if (next) return next;
+        }
+        return null;
+    }
+    function ecNextNodeDescendants(node) {
+        for (let current = node; current; current = ecParent(current)) {
+            const next = ecNextSibling(current);
+            if (next) return next;
+        }
+        return null;
+    }
+    function ecPreviousNode(node) {
+        let previous = ecPreviousSibling(node);
+        if (!previous) return ecParent(node);
+        for (let last = ecLastChild(previous); last; last = ecLastChild(previous)) previous = last;
+        return previous;
+    }
+    function ecData(node) { return ecCall(ecDataGetter, node); }
+    function ecLocalName(node) { return ecIsElement(node) ? __dom_element_name(nodeIds.get(node))[0] : ""; }
+    function ecNamespace(node) { return ecIsElement(node) ? __dom_element_name(nodeIds.get(node))[1] : null; }
+    // execCommand #html-element, tested by local name.
+    function ecIsHTML(node, ...names) {
+        const name = ecIsElement(node) ? htmlElementName(node) : "";
+        return name !== "" && (!names.length || names.includes(name));
+    }
+    function ecAttribute(element, name) { return ecCall(ecGetAttributeMethod, element, name); }
+    function ecHasAttribute(element, name) { return ecCall(ecHasAttributeMethod, element, name); }
+    function ecSetAttribute(element, name, value) { ecCall(ecSetAttributeMethod, element, name, value); }
+    function ecRemoveAttribute(element, name) { ecCall(ecRemoveAttributeMethod, element, name); }
+    function ecAttributeList(element) {
+        const map = ecCall(ecAttributesGetter, element), list = [];
+        for (let i = 0; i < map.length; i++) list.push(map[i]);
+        return list;
+    }
+    function ecNodeDocument(node) { return ecType(node) === 9 ? node : node.ownerDocument; }
+    function ecCreate(document, name) { return ecCall(ecCreateElementMethod, document, name); }
+    function ecInsertBefore(parent, node, reference) { ecCall(ecInsertBeforeMethod, parent, node, reference); }
+    function ecAppend(parent, node) { ecCall(ecAppendMethod, parent, node); }
+    function ecRemove(node) {
+        const parent = ecParent(node);
+        if (parent) ecCall(ecRemoveChildMethod, parent, node);
+    }
+    function ecStyle(element) { return ecCall(ecStyleGetter, element); }
+    // The resolved value of a CSS property (CSSOM #resolved-value), the
+    // empty string for a node without one (not connected, not an Element).
+    function ecResolved(element, property) {
+        if (!ecIsElement(element)) return "";
+        const cache = ecFreshCache().resolved, key = nodeIds.get(element) + " " + property;
+        let value = cache.get(key);
+        if (value === undefined) {
+            value = __dom_computed(nodeIds.get(element), property);
+            cache.set(key, value = value == null ? "" : String(value));
+        }
+        return value;
+    }
+
+    // execCommand #prohibited-paragraph-child-name.
+    const EC_PROHIBITED_PARAGRAPH_CHILDREN = new Set(["address", "article", "aside", "blockquote", "caption",
+        "center", "col", "colgroup", "dd", "details", "dir", "div", "dl", "dt", "fieldset", "figcaption",
+        "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li",
+        "listing", "menu", "nav", "ol", "p", "plaintext", "pre", "section", "summary", "table", "tbody",
+        "td", "tfoot", "th", "thead", "tr", "ul", "xmp"]);
+    function ecIsProhibitedParagraphChild(node) {
+        return EC_PROHIBITED_PARAGRAPH_CHILDREN.has(ecIsElement(node) ? htmlElementName(node) : "");
+    }
+    // execCommand #block-node / #inline-node.
+    function ecIsBlockNode(node) {
+        const type = ecType(node);
+        if (type === 9 || type === 11) return true;
+        if (type !== 1) return false;
+        const display = ecResolved(node, "display");
+        return display !== "inline" && display !== "inline-block" && display !== "inline-table" && display !== "none";
+    }
+    function ecIsInlineNode(node) { return !!node && !ecIsBlockNode(node); }
+    // HTML #editing-host: an HTML element whose contenteditable attribute is
+    // in the true or plaintext-only state, or the HTML document element of a
+    // Document in design mode.
+    function ecContentEditableState(element) {
+        if (!ecIsHTML(element) || !ecHasAttribute(element, "contenteditable")) return "inherit";
+        const value = asciiLower(ecAttribute(element, "contenteditable"));
+        return value === "" || value === "true" ? "true" : value === "false" ? "false"
+            : value === "plaintext-only" ? "plaintext-only" : "inherit";
+    }
+    // Editability and resolved values are re-read after any DOM mutation
+    // (the arena's mutation epoch); between mutations they are cached.
+    const ecCache = {epoch: -1, editable: new Map(), host: new Map(), resolved: new Map()};
+    function ecFreshCache() {
+        const epoch = __dom_epoch();
+        if (ecCache.epoch !== epoch) {
+            ecCache.epoch = epoch;
+            ecCache.editable.clear();
+            ecCache.host.clear();
+            ecCache.resolved.clear();
+        }
+        return ecCache;
+    }
+    function ecIsEditingHost(node) {
+        if (!node) return false;
+        const cache = ecFreshCache().host, id = nodeIds.get(node);
+        let result = cache.get(id);
+        if (result === undefined) cache.set(id, result = ecComputeIsEditingHost(node));
+        return result;
+    }
+    function ecComputeIsEditingHost(node) {
+        if (!ecIsHTML(node)) return false;
+        const state = ecContentEditableState(node);
+        if (state === "true" || state === "plaintext-only") return true;
+        const parent = ecParent(node);
+        return ecType(parent) === 9 && designModeEnabled(parent);
+    }
+    // execCommand #editable.
+    function ecIsEditable(node) {
+        if (!node) return false;
+        const cache = ecFreshCache().editable, id = nodeIds.get(node);
+        let result = cache.get(id);
+        if (result === undefined) cache.set(id, result = ecComputeIsEditable(node));
+        return result;
+    }
+    function ecComputeIsEditable(node) {
+        if (ecIsEditingHost(node)) return false;
+        const type = ecType(node);
+        if (type === 1 && ecContentEditableState(node) === "false") return false;
+        const parent = ecParent(node);
+        if (!parent || !(ecIsEditingHost(parent) || ecIsEditable(parent))) return false;
+        if (type === 1) {
+            if (ecIsHTML(node)) return true;
+            const namespace = ecNamespace(node), name = ecLocalName(node);
+            return (namespace === SVG_NAMESPACE && name === "svg") || (namespace === MATHML_NAMESPACE && name === "math");
+        }
+        return ecIsHTML(parent);
+    }
+    // execCommand #editing-host-of.
+    function ecEditingHostOf(node) {
+        if (!node) return null;
+        if (ecIsEditingHost(node)) return node;
+        if (!ecIsEditable(node)) return null;
+        let ancestor = ecParent(node);
+        while (ancestor && !ecIsEditingHost(ancestor)) ancestor = ecParent(ancestor);
+        return ancestor;
+    }
+    // execCommand #in-the-same-editing-host.
+    function ecInSameEditingHost(a, b) {
+        const host = ecEditingHostOf(a);
+        return !!host && host === ecEditingHostOf(b);
+    }
+
+    // Line-break definitions. The specification describes collapsed and
+    // extraneous line breaks by their effect on layout (a br beginning an
+    // otherwise empty line box; a br whose removal changes nothing), noting
+    // that a DOM-based definition would be preferable. The same CSS line
+    // model is evaluated here over the box tree's inputs: a line box ends at
+    // a br or a block boundary, collapsible white space at a line's edges and
+    // display:none subtrees are empty, and atomic inlines and replaced
+    // elements are content. This keeps the answers independent of terminal
+    // or window geometry and never mutates the document to measure it.
+    const EC_REPLACED = new Set(["img", "input", "select", "textarea", "button", "video", "audio",
+        "canvas", "iframe", "embed", "object", "meter", "progress", "hr"]);
+    function ecDisplayNone(node) { return ecIsElement(node) && ecResolved(node, "display") === "none"; }
+    function ecHasDisplayNoneInclusiveAncestor(node) {
+        for (let current = node; current; current = ecParent(current))
+            if (ecDisplayNone(current)) return true;
+        return false;
+    }
+    // The innermost ancestor that contains the line boxes of `node`: a block
+    // node, or an inline-level box that establishes its own lines.
+    function ecLineContainer(node) {
+        let ancestor = ecParent(node);
+        while (ancestor && !ecIsBlockNode(ancestor) && !ecIsAtomicInline(ancestor)) ancestor = ecParent(ancestor);
+        return ancestor;
+    }
+    function ecIsAtomicInline(node) {
+        if (!ecIsElement(node)) return false;
+        const display = ecResolved(node, "display");
+        if (display === "inline-block" || display === "inline-table") return true;
+        if (ecNamespace(node) !== HTML_NS) return ecNamespace(node) === SVG_NAMESPACE && ecLocalName(node) === "svg";
+        return EC_REPLACED.has(htmlElementName(node));
+    }
+    // Whether white space in `text` collapses (CSS Text #white-space-phase-1).
+    function ecCollapsesSpaces(text) {
+        const parent = ecParent(text);
+        const space = ecIsElement(parent) ? ecResolved(parent, "white-space") : "normal";
+        return space === "" || space === "normal" || space === "nowrap" || space === "pre-line";
+    }
+    // The node after (or before) `node`'s subtree in tree order without
+    // leaving `container`; null at the container's edge.
+    function ecLineStep(node, container, forward) {
+        for (let current = node; current && !rangeSame(current, container); current = ecParent(current)) {
+            const sibling = forward ? ecNextSibling(current) : ecPreviousSibling(current);
+            if (sibling) return sibling;
+            const parent = ecParent(current);
+            if (!parent || rangeSame(parent, container)) return null;
+        }
+        return null;
+    }
+    // Whether anything renders on the same line between `node` and the line's
+    // end (forward) or start (backward): "content", or "break" for a br, a
+    // block boundary or the container's edge. Inline elements are entered;
+    // collapsible white space and display:none subtrees are skipped.
+    function ecScanLine(node, container, forward) {
+        let current = ecLineStep(node, container, forward);
+        while (current) {
+            if (ecIsElement(current)) {
+                if (ecDisplayNone(current)) { current = ecLineStep(current, container, forward); continue; }
+                if (ecIsBlockNode(current) || ecIsHTML(current, "br")) return "break";
+                if (ecIsAtomicInline(current)) return "content";
+                const inner = forward ? ecFirstChild(current) : ecLastChild(current);
+                current = inner || ecLineStep(current, container, forward);
+                continue;
+            }
+            if (ecIsText(current)) {
+                const data = ecData(current);
+                if (data !== "" && !(ecCollapsesSpaces(current) && /^[\t\n\r ]*$/.test(data))) return "content";
+                // pre-line keeps segment breaks (CSS Text #white-space-phase-1).
+                if (/\n/.test(data) && ecResolved(ecParent(current), "white-space") === "pre-line") return "break";
+            }
+            current = ecLineStep(current, container, forward);
+        }
+        return "break";
+    }
+    // execCommand #collapsed-line-break: a br that begins a line box with
+    // nothing else in it, i.e. nothing renders between it and the end of
+    // its line.
+    function ecIsCollapsedLineBreak(node) {
+        if (!ecIsHTML(node, "br") || !ecParent(node) || ecHasDisplayNoneInclusiveAncestor(node)) return false;
+        return ecScanLine(node, ecLineContainer(node), true) === "break";
+    }
+    // execCommand #extraneous-line-break: a br whose removal would not change
+    // layout. That is a br that begins an empty line (collapsed) and ends a
+    // line that has other content; a sole child of an li is excluded.
+    function ecIsExtraneousLineBreak(node) {
+        if (!ecIsHTML(node, "br")) return false;
+        const parent = ecParent(node);
+        if (ecIsHTML(parent, "li") && ecChildren(parent).length === 1) return false;
+        if (ecHasDisplayNoneInclusiveAncestor(node)) return true;
+        if (!ecIsCollapsedLineBreak(node)) return false;
+        return ecScanLine(node, ecLineContainer(node), false) === "content";
+    }
+    // execCommand #whitespace-node.
+    function ecIsWhitespaceNode(node) {
+        if (!ecIsText(node)) return false;
+        const data = ecData(node);
+        if (data === "") return true;
+        const parent = ecParent(node);
+        if (!ecIsElement(parent)) return false;
+        const space = ecResolved(parent, "white-space");
+        if (/^[\t\n\r ]+$/.test(data) && (space === "normal" || space === "nowrap")) return true;
+        return /^[\t\r ]+$/.test(data) && space === "pre-line";
+    }
+    // execCommand #collapsed-whitespace-node.
+    function ecIsCollapsedWhitespaceNode(node) {
+        if (!ecIsWhitespaceNode(node)) return false;
+        if (ecData(node) === "") return true;
+        let ancestor = ecParent(node);
+        if (!ancestor) return true;
+        if (ecHasDisplayNoneInclusiveAncestor(ancestor)) return true;
+        while (!ecIsBlockNode(ancestor) && ecParent(ancestor)) ancestor = ecParent(ancestor);
+        let reference = node;
+        while (ecIsAncestor(ancestor, reference)) {
+            reference = ecPreviousNode(reference);
+            if (!reference) break;
+            if (ecIsBlockNode(reference) || ecIsHTML(reference, "br")) return true;
+            if ((ecIsText(reference) && !ecIsWhitespaceNode(reference)) || ecIsHTML(reference, "img")) break;
+        }
+        reference = node;
+        while (reference && ecIsAncestor(ancestor, reference)) {
+            reference = ecNextNode(reference);
+            if (!reference) break;
+            if (ecIsBlockNode(reference) || ecIsHTML(reference, "br")) return true;
+            if ((ecIsText(reference) && !ecIsWhitespaceNode(reference)) || ecIsHTML(reference, "img")) break;
+        }
+        return false;
+    }
+    // execCommand #visible / #invisible.
+    function ecIsVisible(node) {
+        if (!node || ecHasDisplayNoneInclusiveAncestor(node)) return false;
+        return ecIsVisibleIgnoringDisplay(node);
+    }
+    function ecIsVisibleIgnoringDisplay(node) {
+        if (ecIsBlockNode(node)) return true;
+        if (ecIsText(node)) return !ecIsCollapsedWhitespaceNode(node);
+        if (ecIsHTML(node, "img")) return true;
+        if (ecIsHTML(node, "br")) return !ecIsExtraneousLineBreak(node);
+        for (let child = ecFirstChild(node); child; child = ecNextSibling(child))
+            if (!ecDisplayNone(child) && ecIsVisibleIgnoringDisplay(child)) return true;
+        return false;
+    }
+    function ecIsInvisible(node) { return !ecIsVisible(node); }
+    // execCommand #collapsed-block-prop.
+    function ecIsCollapsedBlockProp(node) {
+        if (ecIsCollapsedLineBreak(node) && !ecIsExtraneousLineBreak(node)) return true;
+        if (!ecIsElement(node) || !ecIsInlineNode(node)) return false;
+        let hasProp = false;
+        for (let child = ecFirstChild(node); child; child = ecNextSibling(child)) {
+            if (ecIsCollapsedBlockProp(child)) hasProp = true;
+            else if (!ecIsInvisible(child)) return false;
+        }
+        return hasProp;
+    }
+
+    // execCommand #preserving-ranges: move `node` to (`newParent`,
+    // `newIndex`), an index among newParent's current children, applying
+    // the specification's boundary point rules to every live range instead
+    // of the DOM's removal and insertion rules.
+    function ecMovePreservingRanges(node, newParent, newIndex) {
+        const children = __dom_children(nodeIds.get(newParent));
+        if (newIndex < 0 || newIndex > children.length) newIndex = children.length;
+        const oldParent = ecParent(node), oldIndex = oldParent ? ecIndex(node) : -1;
+        const ranges = snapshotLiveRanges() || [];
+        const points = [];
+        for (const range of ranges) {
+            const state = internalsOf(range).rangeBoundary;
+            if (!state) continue;
+            const adjust = (point) => {
+                if (rangeSame(point[0], newParent) && point[1] > newIndex) point[1]++;
+                if (oldParent && rangeSame(point[0], oldParent) && (point[1] === oldIndex || point[1] === oldIndex + 1)) {
+                    point[0] = newParent;
+                    point[1] += newIndex - oldIndex;
+                }
+                if (oldParent && rangeSame(point[0], oldParent) && point[1] > oldIndex + 1) point[1]--;
+                return point;
+            };
+            points.push([range, state, adjust([state.startNode, state.startOffset]), adjust([state.endNode, state.endOffset])]);
+        }
+        const reference = newIndex < children.length ? wrap(children[newIndex]) : null;
+        if (reference && rangeSame(reference, node)) {
+            // Already in place; the DOM is unchanged.
+        } else ecInsertBefore(newParent, node, reference);
+        for (const [range, state, start, end] of points) {
+            if (state.startNode === start[0] && state.startOffset === start[1] &&
+                state.endNode === end[0] && state.endOffset === end[1]) continue;
+            [state.startNode, state.startOffset] = start;
+            [state.endNode, state.endOffset] = end;
+            rangeChanged(range);
+        }
+    }
+    function ecInsertBeforePreservingRanges(node, reference) {
+        const parent = ecParent(reference);
+        ecMovePreservingRanges(node, parent, ecIndex(reference));
+    }
+    function ecInsertAfterPreservingRanges(node, reference) {
+        const parent = ecParent(reference);
+        ecMovePreservingRanges(node, parent, ecIndex(reference) + 1);
+    }
+    function ecAppendPreservingRanges(node, parent) { ecMovePreservingRanges(node, parent, -1); }
+    // execCommand #set-the-tag-name.
+    function ecSetTagName(element, newName) {
+        if (ecIsHTML(element, newName)) return element;
+        const parent = ecParent(element);
+        if (!parent) return element;
+        const replacement = ecCreate(ecNodeDocument(element), newName);
+        ecInsertBefore(parent, replacement, element);
+        ecCopyAttributes(element, replacement);
+        for (let child = ecFirstChild(element); child; child = ecFirstChild(element))
+            ecAppendPreservingRanges(child, replacement);
+        ecRemove(element);
+        return replacement;
+    }
+    function ecCopyAttributes(from, to) {
+        for (const attr of ecAttributeList(from))
+            ecCall(ecSetAttributeNSMethod, to, attr.namespaceURI, attr.name, attr.value);
+    }
+    // execCommand #remove-extraneous-line-breaks-before.
+    function ecRemoveExtraneousLineBreaksBefore(node) {
+        let ref = ecPreviousSibling(node);
+        if (!ref) return;
+        for (let last = ecLastChild(ref); last; last = ecLastChild(ref)) ref = last;
+        const parent = ecParent(node);
+        while (ref && ecIsInvisible(ref) && !ecIsExtraneousLineBreak(ref) && !rangeSame(ref, parent))
+            ref = ecPreviousNode(ref);
+        if (ref && ecIsEditable(ref) && ecIsExtraneousLineBreak(ref)) ecRemove(ref);
+    }
+    // execCommand #remove-extraneous-line-breaks-at-the-end-of.
+    function ecRemoveExtraneousLineBreaksAtTheEndOf(node) {
+        let ref = node;
+        for (let last = ecLastChild(ref); last; last = ecLastChild(ref)) ref = last;
+        while (ref && ecIsInvisible(ref) && !ecIsExtraneousLineBreak(ref) && !rangeSame(ref, node))
+            ref = ecPreviousNode(ref);
+        if (ref && ecIsEditable(ref) && ecIsExtraneousLineBreak(ref)) {
+            while (ecIsEditable(ecParent(ref)) && ecIsInvisible(ecParent(ref))) ref = ecParent(ref);
+            ecRemove(ref);
+        }
+    }
+    // execCommand #remove-extraneous-line-breaks-from.
+    function ecRemoveExtraneousLineBreaksFrom(node) {
+        ecRemoveExtraneousLineBreaksBefore(node);
+        ecRemoveExtraneousLineBreaksAtTheEndOf(node);
+    }
+    // execCommand #wrap.
+    function ecWrap(nodeList, siblingCriteria = () => false, newParentInstructions = () => null) {
+        nodeList = nodeList.slice();
+        if (!nodeList.length) return null;
+        if (nodeList.every((node) => ecIsInvisible(node) && !ecIsHTML(node, "br"))) return null;
+        if (!ecParent(nodeList[0])) return null;
+        const last = () => nodeList[nodeList.length - 1];
+        if (ecIsInlineNode(last()) && !ecIsHTML(last(), "br") && ecIsHTML(ecNextSibling(last()), "br"))
+            nodeList.push(ecNextSibling(last()));
+        while (ecPreviousSibling(nodeList[0]) && ecIsInvisible(ecPreviousSibling(nodeList[0])))
+            nodeList.unshift(ecPreviousSibling(nodeList[0]));
+        while (ecNextSibling(last()) && ecIsInvisible(ecNextSibling(last())))
+            nodeList.push(ecNextSibling(last()));
+        let newParent;
+        const previous = ecPreviousSibling(nodeList[0]), next = ecNextSibling(last());
+        if (previous && ecIsEditable(previous) && siblingCriteria(previous)) newParent = previous;
+        else if (next && ecIsEditable(next) && siblingCriteria(next)) newParent = next;
+        else newParent = newParentInstructions();
+        if (!newParent) return null;
+        if (!ecParent(newParent)) {
+            const parent = ecParent(nodeList[0]);
+            ecInsertBefore(parent, newParent, nodeList[0]);
+            // Step 10.2: boundary points just before the new parent follow
+            // the wrapped nodes inside it.
+            const index = ecIndex(newParent);
+            for (const range of snapshotLiveRanges() || []) {
+                const state = internalsOf(range).rangeBoundary;
+                if (!state) continue;
+                let changed = false;
+                if (rangeSame(state.startNode, parent) && state.startOffset === index) { state.startOffset++; changed = true; }
+                if (rangeSame(state.endNode, parent) && state.endOffset === index) { state.endOffset++; changed = true; }
+                if (changed) rangeChanged(range);
+            }
+        }
+        const originalParent = ecParent(nodeList[0]);
+        if (ecTreeOrder(newParent, nodeList[0]) < 0) {
+            if (!ecIsInlineNode(newParent) && ecIsInlineNode(ecLastVisibleChild(newParent)) &&
+                ecIsInlineNode(nodeList.find(ecIsVisible) || null) && !ecIsHTML(ecLastChild(newParent), "br"))
+                ecAppend(newParent, ecCreate(ecNodeDocument(newParent), "br"));
+            for (const node of nodeList) ecAppendPreservingRanges(node, newParent);
+        } else {
+            const lastVisible = nodeList.slice().reverse().find(ecIsVisible) || null;
+            if (!ecIsInlineNode(newParent) && ecIsInlineNode(ecFirstVisibleChild(newParent)) &&
+                ecIsInlineNode(lastVisible) && !ecIsHTML(last(), "br"))
+                ecInsertBefore(newParent, ecCreate(ecNodeDocument(newParent), "br"), ecFirstChild(newParent));
+            for (let i = nodeList.length - 1; i >= 0; i--) ecMovePreservingRanges(nodeList[i], newParent, 0);
+        }
+        if (originalParent && ecIsEditable(originalParent) && !ecHasChildren(originalParent)) ecRemove(originalParent);
+        const following = ecNextSibling(newParent);
+        if (following && ecIsEditable(following) && siblingCriteria(following)) {
+            if (!ecIsInlineNode(newParent) && ecIsInlineNode(ecLastChild(newParent)) &&
+                ecIsInlineNode(ecFirstChild(following)) && !ecIsHTML(ecLastChild(newParent), "br"))
+                ecAppend(newParent, ecCreate(ecNodeDocument(newParent), "br"));
+            for (let child = ecFirstChild(following); child; child = ecFirstChild(following))
+                ecAppendPreservingRanges(child, newParent);
+            ecRemove(following);
+        }
+        ecRemoveExtraneousLineBreaksFrom(newParent);
+        return newParent;
+    }
+    function ecLastVisibleChild(node) {
+        for (let child = ecLastChild(node); child; child = ecPreviousSibling(child))
+            if (ecIsVisible(child)) return child;
+        return null;
+    }
+    function ecFirstVisibleChild(node) {
+        for (let child = ecFirstChild(node); child; child = ecNextSibling(child))
+            if (ecIsVisible(child)) return child;
+        return null;
+    }
+    // execCommand #name-of-an-element-with-inline-contents.
+    const EC_INLINE_CONTENT_NAMES = new Set(["a", "abbr", "b", "bdi", "bdo", "cite", "code", "dfn", "em", "h1",
+        "h2", "h3", "h4", "h5", "h6", "i", "kbd", "mark", "p", "pre", "q", "rp", "rt", "ruby", "s", "samp",
+        "small", "span", "strong", "sub", "sup", "u", "var", "acronym", "listing", "strike", "xmp", "big",
+        "blink", "font", "marquee", "nobr", "tt"]);
+    const EC_HEADINGS = ["h1", "h2", "h3", "h4", "h5", "h6"];
+    // execCommand #allowed-child. `child` and `parent` are nodes or names.
+    function ecIsAllowedChild(child, parent) {
+        const parentName = typeof parent === "string" ? parent : htmlElementName(parent);
+        if (["colgroup", "table", "tbody", "tfoot", "thead", "tr"].includes(parentName) &&
+            ecIsText(child) && !/^[\t\n\f\r ]*$/.test(ecData(child))) return false;
+        if (["script", "style", "plaintext", "xmp"].includes(parentName) && !ecIsText(child)) return false;
+        if (typeof child !== "string") {
+            const type = ecType(child);
+            if (type === 9 || type === 11 || type === 10) return false;
+            if (!ecIsHTML(child)) return true;
+            child = htmlElementName(child);
+        }
+        if (typeof parent !== "string" && ecIsHTML(parent)) {
+            for (let ancestor = parent; ancestor; ancestor = ecParent(ancestor)) {
+                if (child === "a" && ecIsHTML(ancestor, "a")) return false;
+                if (EC_PROHIBITED_PARAGRAPH_CHILDREN.has(child) && ecIsElement(ancestor) &&
+                    EC_INLINE_CONTENT_NAMES.has(htmlElementName(ancestor))) return false;
+                if (EC_HEADINGS.includes(child) && ecIsHTML(ancestor, ...EC_HEADINGS)) return false;
+            }
+            parent = parentName;
+        }
+        if (typeof parent !== "string") return ecIsElement(parent) || ecType(parent) === 11;
+        const lists = {colgroup: ["col"], table: ["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"],
+            tbody: ["td", "th", "tr"], tfoot: ["td", "th", "tr"], thead: ["td", "th", "tr"], tr: ["td", "th"],
+            dl: ["dt", "dd"], dir: ["dir", "li", "ol", "ul"], ol: ["dir", "li", "ol", "ul"], ul: ["dir", "li", "ol", "ul"],
+            hgroup: EC_HEADINGS};
+        if (Object.prototype.hasOwnProperty.call(lists, parent)) return lists[parent].includes(child);
+        if (["body", "caption", "col", "colgroup", "frame", "frameset", "head", "html", "tbody", "td", "tfoot",
+            "th", "thead", "tr"].includes(child)) return false;
+        if ((child === "dd" || child === "dt") && parent !== "dl") return false;
+        if (child === "li" && parent !== "ol" && parent !== "ul") return false;
+        if (parent === "a" && child === "a") return false;
+        if ((parent === "dd" || parent === "dt") && (child === "dd" || child === "dt")) return false;
+        if (EC_HEADINGS.includes(parent) && EC_HEADINGS.includes(child)) return false;
+        if (parent === "li" && child === "li") return false;
+        if (parent === "nobr" && child === "nobr") return false;
+        if (EC_INLINE_CONTENT_NAMES.has(parent) && EC_PROHIBITED_PARAGRAPH_CHILDREN.has(child)) return false;
+        if ((parent === "td" || parent === "th") &&
+            ["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"].includes(child)) return false;
+        return true;
+    }
+
+    // --- Inline formatting (execCommand #inline-formatting-commands) -------
+    // CSS Color 4 values: [r, g, b, a] (a in 0..255), "currentcolor", or
+    // null for a string that is not a valid CSS color.
+    const ecColorCache = new Map();
+    function ecColor(value) {
+        value = String(value);
+        let result = ecColorCache.get(value);
+        if (result !== undefined) return result;
+        result = /^[\t\n\f\r ]*currentcolor[\t\n\f\r ]*$/i.test(value) ? "currentcolor" : cssOp("color", value);
+        if (ecColorCache.size >= 256) ecColorCache.clear();
+        ecColorCache.set(value, result);
+        return result;
+    }
+    function ecIsValidColor(value) { return ecColor(value) !== null; }
+    function ecIsFullyTransparent(value) {
+        const color = ecColor(value);
+        return Array.isArray(color) && color[3] === 0;
+    }
+    // HTML #rules-for-serializing-simple-colour-values.
+    function ecSimpleColor(color) {
+        return "#" + color.slice(0, 3).map((channel) => channel.toString(16).padStart(2, "0")).join("");
+    }
+    // The commands of #inline-formatting-commands: relevant CSS property,
+    // inline command activated values and equivalent values.
+    const EC_RELEVANT_PROPERTY = {backColor: "background-color", bold: "font-weight", fontName: "font-family",
+        fontSize: "font-size", foreColor: "color", hiliteColor: "background-color", italic: "font-style"};
+    const EC_ACTIVATED_VALUES = {bold: ["bold", "600", "700", "800", "900"], italic: ["italic", "oblique"],
+        strikethrough: ["line-through"], subscript: ["subscript"], superscript: ["superscript"], underline: ["underline"]};
+    const EC_STANDARD_INLINE_VALUE = new Set(["backColor", "fontName", "foreColor", "hiliteColor"]);
+    const EC_COLOR_COMMANDS = new Set(["backColor", "foreColor", "hiliteColor"]);
+    function ecRelevantProperty(command) { return EC_RELEVANT_PROPERTY[command] || null; }
+    // execCommand #equivalent-values.
+    function ecEquivalentValues(command, a, b) {
+        if (a === null || b === null) return a === null && b === null;
+        if (a === b) return true;
+        if (command === "bold")
+            return (a === "bold" && b === "700") || (a === "700" && b === "bold") ||
+                (a === "normal" && b === "400") || (a === "400" && b === "normal");
+        if (EC_COLOR_COMMANDS.has(command)) {
+            const x = ecColor(a), y = ecColor(b);
+            if (x === null || y === null) return x === null && y === null;
+            if (!Array.isArray(x) || !Array.isArray(y)) return x === y;
+            return x[0] === y[0] && x[1] === y[1] && x[2] === y[2] && x[3] === y[3];
+        }
+        return false;
+    }
+    // The resolved font-size of <font size=1..7> (HTML #fonts-and-colors,
+    // CSS Fonts 4 #absolute-size-mapping with TRust's 16px medium).
+    const EC_FONT_SIZE_KEYWORDS = ["x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"];
+    const EC_FONT_SIZE_PIXELS = [10, 13, 16, 18, 24, 32, 48];
+    // execCommand #loosely-equivalent-values.
+    function ecLooselyEquivalentValues(command, a, b) {
+        if (ecEquivalentValues(command, a, b)) return true;
+        if (command !== "fontSize" || typeof a !== "string" || typeof b !== "string") return false;
+        const matches = (keyword, resolved) => {
+            const index = EC_FONT_SIZE_KEYWORDS.indexOf(keyword);
+            return index >= 0 && /px$/.test(resolved) && parseFloat(resolved) === EC_FONT_SIZE_PIXELS[index];
+        };
+        return matches(a, b) || matches(b, a);
+    }
+    // The declarations a style attribute sets, in order, valid or not:
+    // [name, value] pairs from CSS Syntax #parse-a-list-of-declarations.
+    function ecStyleDeclarationNames(element) {
+        const text = ecAttribute(element, "style");
+        if (text === null) return [];
+        const names = [];
+        let depth = 0, quote = "", start = 0;
+        const flush = (end) => {
+            const declaration = text.slice(start, end);
+            const colon = declaration.indexOf(":");
+            if (colon > 0) {
+                const name = declaration.slice(0, colon).replace(/\/\*[\s\S]*?\*\//g, "").trim();
+                if (name) names.push(name.startsWith("--") ? name : asciiLower(name));
+            }
+        };
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            if (quote) {
+                if (ch === "\\") i++;
+                else if (ch === quote) quote = "";
+            } else if (ch === "\"" || ch === "'") quote = ch;
+            else if (ch === "/" && text[i + 1] === "*") {
+                const end = text.indexOf("*/", i + 2);
+                i = end < 0 ? text.length : end + 1;
+            } else if (ch === "(" || ch === "[" || ch === "{") depth++;
+            else if ((ch === ")" || ch === "]" || ch === "}") && depth) depth--;
+            else if (ch === ";" && !depth) { flush(i); start = i + 1; }
+        }
+        flush(text.length);
+        return names;
+    }
+    // The value an element's style attribute gives `property`, or "".
+    function ecInlineStyleValue(element, property) {
+        if (!ecHasAttribute(element, "style")) return "";
+        return String(ecCall(ecGetPropertyValueMethod, ecStyle(element), property));
+    }
+    function ecInlineTextDecoration(element) {
+        return ecInlineStyleValue(element, "text-decoration-line") || ecInlineStyleValue(element, "text-decoration");
+    }
+    function ecSetInlineStyle(element, property, value) {
+        ecCall(ecSetPropertyMethod, ecStyle(element), property, value);
+    }
+    // Unsetting the last property leaves no empty style attribute behind.
+    function ecUnsetInlineStyle(element, property) {
+        if (!ecHasAttribute(element, "style")) return;
+        ecCall(ecRemovePropertyMethod, ecStyle(element), property);
+        if (ecAttribute(element, "style") === "") ecRemoveAttribute(element, "style");
+    }
+    const EC_MODIFIABLE_NAMES = ["b", "em", "i", "s", "span", "strike", "strong", "sub", "sup", "u"];
+    // execCommand #modifiable-element.
+    function ecIsModifiableElement(node) {
+        if (!ecIsHTML(node)) return false;
+        const name = htmlElementName(node), attributes = ecAttributeList(node).map((attr) => attr.name);
+        if (EC_MODIFIABLE_NAMES.includes(name)) return attributes.every((attr) => attr === "style");
+        if (name === "font") return attributes.every((attr) => ["style", "color", "face", "size"].includes(attr));
+        if (name === "a") return attributes.every((attr) => attr === "style" || attr === "href");
+        return false;
+    }
+    // execCommand #simple-modifiable-element.
+    function ecIsSimpleModifiableElement(node) {
+        if (!ecIsHTML(node)) return false;
+        const name = htmlElementName(node);
+        if (!["a", "b", "em", "font", "i", "s", "span", "strike", "strong", "sub", "sup", "u"].includes(name)) return false;
+        const attributes = ecAttributeList(node);
+        if (!attributes.length) return true;
+        if (attributes.length > 1) return false;
+        const attr = attributes[0].name;
+        if (attr === "href") return name === "a";
+        if (attr === "color" || attr === "face" || attr === "size") return name === "font";
+        if (attr !== "style") return false;
+        const declarations = ecStyleDeclarationNames(node);
+        if (!declarations.length) return true;
+        if (declarations.length !== 1) return false;
+        const property = declarations[0];
+        if ((name === "b" || name === "strong") && property === "font-weight") return true;
+        if ((name === "i" || name === "em") && property === "font-style") return true;
+        if (["a", "font", "span"].includes(name) && property !== "text-decoration") return true;
+        if (["a", "font", "s", "span", "strike", "u"].includes(name) && property === "text-decoration") {
+            const value = asciiLower(ecInlineTextDecoration(node).trim());
+            return ["line-through", "underline", "overline", "none"].includes(value);
+        }
+        return false;
+    }
+    // execCommand #formattable-node.
+    function ecIsFormattableNode(node) {
+        return ecIsEditable(node) && ecIsVisible(node) && (ecIsText(node) || ecIsHTML(node, "img", "br"));
+    }
+    function ecCollapsed(range) { return rangeIsCollapsed(range); }
+    // The child indices on the paths from a range's start and end nodes to
+    // their root: node id -> index of the child containing the boundary.
+    function ecRangePaths(range) {
+        const start = new Map(), end = new Map();
+        let child = range.startNode;
+        for (let parent = ecParent(child); parent; child = parent, parent = ecParent(parent))
+            start.set(nodeIds.get(parent), ecIndex(child));
+        child = range.endNode;
+        for (let parent = ecParent(child); parent; child = parent, parent = ecParent(parent))
+            end.set(nodeIds.get(parent), ecIndex(child));
+        return {start, end};
+    }
+    // For a node on a range path (a boundary node or an ancestor of one):
+    // [lo, hi) bounds the indices of its children that DOM #contained
+    // admits, since a child at index i is contained exactly when (node, i)
+    // is not before the range's start and (node, i + 1) is not after its
+    // end. The children holding the boundaries are the only other children
+    // that can be partially contained. Tree-order comparisons per child
+    // would cost O(siblings) each.
+    function ecChildBounds(range, paths, node) {
+        const id = nodeIds.get(node);
+        const startChild = paths.start.get(id), endChild = paths.end.get(id);
+        const lo = rangeSame(node, range.startNode) ? range.startOffset : startChild !== undefined ? startChild + 1 : 0;
+        const hi = rangeSame(node, range.endNode) ? range.endOffset : endChild !== undefined ? endChild : ecLength(node);
+        return {lo, hi, startChild, endChild};
+    }
+    function ecPushSubtree(node, list) {
+        list.push(node);
+        for (let child = ecFirstChild(node); child; child = ecNextSibling(child)) ecPushSubtree(child, list);
+    }
+    // Visits the children of a range path node that are contained or on a
+    // range path, in tree order.
+    function ecRangePathChildren(range, paths, node, contained, onPath) {
+        const ids = __dom_children(nodeIds.get(node));
+        const {lo, hi, startChild, endChild} = ecChildBounds(range, paths, node);
+        let first = Math.min(lo, startChild === undefined ? Infinity : startChild, endChild === undefined ? Infinity : endChild);
+        let last = Math.max(hi - 1, startChild === undefined ? -1 : startChild, endChild === undefined ? -1 : endChild);
+        first = Math.max(first, 0);
+        last = Math.min(last, ids.length - 1);
+        for (let index = first; index <= last; index++) {
+            if (index >= lo && index + 1 <= hi) contained(wrap(ids[index]));
+            else if (index === startChild || index === endChild) onPath(wrap(ids[index]));
+        }
+    }
+    // DOM #contained: every node contained in `range`, in tree order.
+    function ecNodesContainedIn(range) {
+        const nodes = [];
+        if (ecCollapsed(range)) return nodes;
+        const paths = ecRangePaths(range);
+        const visit = (node) => ecRangePathChildren(range, paths, node, (child) => ecPushSubtree(child, nodes), visit);
+        visit(rangeCommonAncestor(range));
+        return nodes;
+    }
+    // execCommand #effectively-contained: every node effectively contained
+    // in `range`, in tree order. Such a node is contained, or is a node on a
+    // range path (never itself contained).
+    function ecEffectivelyContainedNodes(range) {
+        if (ecCollapsed(range)) return [];
+        const paths = ecRangePaths(range), memo = new Map(), nodes = [];
+        const startText = ecIsText(range.startNode), endText = ecIsText(range.endNode);
+        const effective = (node) => {
+            const id = nodeIds.get(node);
+            if (memo.has(id)) return memo.get(id);
+            let result = false;
+            if (rangeSame(node, range.startNode) && startText && ecLength(node) !== range.startOffset) result = true;
+            else if (rangeSame(node, range.endNode) && endText && range.endOffset !== 0) result = true;
+            else if (!ecIsText(node) && ecHasChildren(node)) {
+                // Every child must be contained, or on a path and itself
+                // effectively contained.
+                const count = ecLength(node);
+                const {lo, hi, startChild, endChild} = ecChildBounds(range, paths, node);
+                const outside = [];
+                if (lo >= hi) for (let index = 0; index < count && outside.length < 3; index++) outside.push(index);
+                else {
+                    for (let index = 0; index < lo && outside.length < 3; index++) outside.push(index);
+                    for (let index = hi; index < count && outside.length < 3; index++) outside.push(index);
+                }
+                result = outside.length < 3 && outside.every((index) => (index === startChild || index === endChild) &&
+                    effective(ecChildAt(node, index)));
+                result = result &&
+                    (!ecIsAncestor(node, range.startNode) || !startText || range.startOffset === 0) &&
+                    (!ecIsAncestor(node, range.endNode) || !endText || range.endOffset === ecLength(range.endNode));
+            }
+            memo.set(id, result);
+            return result;
+        };
+        const visit = (node) => {
+            if (effective(node)) nodes.push(node);
+            ecRangePathChildren(range, paths, node, (child) => ecPushSubtree(child, nodes), visit);
+        };
+        visit(rangeRoot(range.startNode));
+        return nodes;
+    }
+    // execCommand #effective-command-value.
+    function ecEffectiveCommandValue(node, command) {
+        if (!node) return null;
+        if (!ecIsElement(node) && !ecIsElement(ecParent(node))) return null;
+        if (!ecIsElement(node)) return ecEffectiveCommandValue(ecParent(node), command);
+        if (command === "createLink" || command === "unlink") {
+            while (node && !(ecIsHTML(node, "a") && ecHasAttribute(node, "href"))) node = ecParent(node);
+            return node ? ecAttribute(node, "href") : null;
+        }
+        if (command === "backColor" || command === "hiliteColor") {
+            while (ecIsFullyTransparent(ecResolved(node, "background-color")) && ecIsElement(ecParent(node)))
+                node = ecParent(node);
+            return ecResolved(node, "background-color");
+        }
+        if (command === "subscript" || command === "superscript") {
+            let subscript = false, superscript = false;
+            while (ecIsInlineNode(node)) {
+                if (ecIsHTML(node, "sub")) subscript = true;
+                else if (ecIsHTML(node, "sup")) superscript = true;
+                node = ecParent(node);
+            }
+            if (subscript && superscript) return "mixed";
+            return subscript ? "subscript" : superscript ? "superscript" : null;
+        }
+        if (command === "strikethrough" || command === "underline") {
+            const keyword = command === "strikethrough" ? "line-through" : "underline";
+            for (let current = node; ecIsElement(current); current = ecParent(current))
+                if (ecResolved(current, "text-decoration").includes(keyword) ||
+                    ecResolved(current, "text-decoration-line").includes(keyword)) return keyword;
+            return null;
+        }
+        const property = ecRelevantProperty(command);
+        return property ? ecResolved(node, property) : null;
+    }
+    // execCommand #specified-command-value.
+    function ecSpecifiedCommandValue(element, command) {
+        if ((command === "backColor" || command === "hiliteColor") && ecResolved(element, "display") !== "inline") return null;
+        if (command === "createLink" || command === "unlink")
+            return ecIsHTML(element, "a") && ecHasAttribute(element, "href") ? ecAttribute(element, "href") : null;
+        if (command === "subscript" || command === "superscript")
+            return ecIsHTML(element, "sup") ? "superscript" : ecIsHTML(element, "sub") ? "subscript" : null;
+        if (command === "strikethrough" || command === "underline") {
+            const keyword = command === "strikethrough" ? "line-through" : "underline";
+            const decoration = ecInlineTextDecoration(element);
+            if (decoration) return decoration.includes(keyword) ? keyword : null;
+            if (command === "strikethrough" && ecIsHTML(element, "s", "strike")) return "line-through";
+            if (command === "underline" && ecIsHTML(element, "u")) return "underline";
+        }
+        const property = ecRelevantProperty(command);
+        if (property === null) return null;
+        const inline = ecInlineStyleValue(element, property);
+        if (inline) return inline;
+        if (ecIsHTML(element, "font")) {
+            if (property === "color" && ecHasAttribute(element, "color")) {
+                const color = cssOp("legacy-color", ecAttribute(element, "color"));
+                if (color !== null) return color;
+            }
+            if (property === "font-family" && ecHasAttribute(element, "face")) return ecAttribute(element, "face");
+            if (property === "font-size" && ecHasAttribute(element, "size")) {
+                const size = cssOp("legacy-font-size", ecAttribute(element, "size"));
+                if (size !== null) return size;
+            }
+        }
+        if (property === "font-weight" && ecIsHTML(element, "b", "strong")) return "bold";
+        if (property === "font-style" && ecIsHTML(element, "i", "em")) return "italic";
+        return null;
+    }
+    const EC_RECORDED_COMMANDS = ["subscript", "bold", "fontName", "fontSize", "foreColor", "hiliteColor",
+        "italic", "strikethrough", "underline"];
+    // execCommand #record-the-values.
+    function ecRecordTheValues(nodeList) {
+        const values = [];
+        for (const node of nodeList) {
+            for (const command of EC_RECORDED_COMMANDS) {
+                let ancestor = ecIsElement(node) ? node : ecParent(node);
+                while (ecIsElement(ancestor) && ecSpecifiedCommandValue(ancestor, command) === null) ancestor = ecParent(ancestor);
+                values.push([node, command, ecIsElement(ancestor) ? ecSpecifiedCommandValue(ancestor, command) : null]);
+            }
+        }
+        return values;
+    }
+    // execCommand #restore-the-values.
+    function ecRestoreTheValues(document, values) {
+        for (const [node, command, value] of values) {
+            let ancestor = ecIsElement(node) ? node : ecParent(node);
+            while (ecIsElement(ancestor) && ecSpecifiedCommandValue(ancestor, command) === null) ancestor = ecParent(ancestor);
+            if (value === null && ecIsElement(ancestor)) ecPushDownValues(document, node, value, command);
+            else if ((ecIsElement(ancestor) && !ecEquivalentValues(command, ecSpecifiedCommandValue(ancestor, command), value)) ||
+                (!ecIsElement(ancestor) && value !== null))
+                ecForceTheValue(document, node, value, command);
+        }
+    }
+    // execCommand #clear-the-value.
+    function ecClearTheValue(element, command) {
+        if (!ecIsEditable(element)) return [];
+        if (ecSpecifiedCommandValue(element, command) === null) return [];
+        if (ecIsSimpleModifiableElement(element)) {
+            const children = ecChildren(element);
+            for (const child of children) ecInsertBeforePreservingRanges(child, element);
+            ecRemove(element);
+            return children;
+        }
+        if (command === "strikethrough" || command === "underline") {
+            const keyword = command === "strikethrough" ? "line-through" : "underline";
+            const decoration = ecInlineTextDecoration(element);
+            if (decoration.includes(keyword)) {
+                const rest = decoration.split(/\s+/).filter((token) => token && token !== keyword);
+                if (!rest.length || (rest.length === 1 && rest[0] === "none")) ecUnsetInlineStyle(element, "text-decoration");
+                else ecSetInlineStyle(element, "text-decoration-line", rest.join(" "));
+            }
+        }
+        const property = ecRelevantProperty(command);
+        if (property !== null) ecUnsetInlineStyle(element, property);
+        if (ecIsHTML(element, "font")) {
+            if (command === "foreColor") ecRemoveAttribute(element, "color");
+            if (command === "fontName") ecRemoveAttribute(element, "face");
+            if (command === "fontSize") ecRemoveAttribute(element, "size");
+        }
+        if (ecIsHTML(element, "a") && (command === "createLink" || command === "unlink")) ecRemoveAttribute(element, "href");
+        if (ecSpecifiedCommandValue(element, command) === null) return [];
+        return [ecSetTagName(element, "span")];
+    }
+    // execCommand #push-down-values.
+    function ecPushDownValues(document, node, newValue, command) {
+        if (!ecIsElement(ecParent(node))) return;
+        if (ecLooselyEquivalentValues(command, ecEffectiveCommandValue(node, command), newValue)) return;
+        let currentAncestor = ecParent(node);
+        const ancestorList = [];
+        while (ecIsElement(currentAncestor) && ecIsEditable(currentAncestor) &&
+            !ecLooselyEquivalentValues(command, ecEffectiveCommandValue(currentAncestor, command), newValue)) {
+            ancestorList.push(currentAncestor);
+            currentAncestor = ecParent(currentAncestor);
+        }
+        if (!ancestorList.length) return;
+        const lastAncestor = ancestorList[ancestorList.length - 1];
+        let propagatedValue = ecSpecifiedCommandValue(lastAncestor, command);
+        if (propagatedValue === null && propagatedValue !== newValue) return;
+        if (newValue !== null &&
+            !ecLooselyEquivalentValues(command, ecEffectiveCommandValue(ecParent(lastAncestor), command), newValue)) return;
+        while (ancestorList.length) {
+            currentAncestor = ancestorList.pop();
+            if (ecSpecifiedCommandValue(currentAncestor, command) !== null)
+                propagatedValue = ecSpecifiedCommandValue(currentAncestor, command);
+            const children = ecChildren(currentAncestor);
+            if (ecSpecifiedCommandValue(currentAncestor, command) !== null) ecClearTheValue(currentAncestor, command);
+            for (const child of children) {
+                if (rangeSame(child, node)) continue;
+                if (ecIsElement(child) && ecSpecifiedCommandValue(child, command) !== null &&
+                    !ecEquivalentValues(command, ecSpecifiedCommandValue(child, command), propagatedValue)) continue;
+                if (ancestorList.length && rangeSame(child, ancestorList[ancestorList.length - 1])) continue;
+                ecForceTheValue(document, child, propagatedValue, command);
+            }
+        }
+    }
+    // execCommand #force-the-value.
+    function ecForceTheValue(document, node, newValue, command) {
+        if (!ecParent(node) || newValue === null) return;
+        if (ecIsAllowedChild(node, "span")) {
+            ecReorderModifiableDescendants(ecPreviousSibling(node), command, newValue);
+            ecReorderModifiableDescendants(ecNextSibling(node), command, newValue);
+            ecWrap([node], (sibling) => ecIsSimpleModifiableElement(sibling) &&
+                ecEquivalentValues(command, ecSpecifiedCommandValue(sibling, command), newValue) &&
+                ecLooselyEquivalentValues(command, ecEffectiveCommandValue(sibling, command), newValue), () => null);
+        }
+        if (ecIsInvisible(node)) return;
+        if (ecLooselyEquivalentValues(command, ecEffectiveCommandValue(node, command), newValue)) return;
+        if (!ecIsAllowedChild(node, "span")) {
+            const children = ecChildren(node).filter((child) => !(ecIsElement(child) &&
+                ecSpecifiedCommandValue(child, command) !== null &&
+                !ecEquivalentValues(command, ecSpecifiedCommandValue(child, command), newValue)));
+            for (const child of children) ecForceTheValue(document, child, newValue, command);
+            return;
+        }
+        if (ecLooselyEquivalentValues(command, ecEffectiveCommandValue(node, command), newValue)) return;
+        const owner = ecNodeDocument(node);
+        let newParent = null;
+        const cssStyling = ecEditingState(document).cssStyling;
+        if (!cssStyling) {
+            if (command === "bold" && newValue === "bold") newParent = ecCreate(owner, "b");
+            if (command === "italic" && newValue === "italic") newParent = ecCreate(owner, "i");
+            if (command === "strikethrough" && newValue === "line-through") newParent = ecCreate(owner, "s");
+            if (command === "underline" && newValue === "underline") newParent = ecCreate(owner, "u");
+            if (command === "foreColor") {
+                const color = ecColor(newValue);
+                if (Array.isArray(color) && color[3] === 255) {
+                    newParent = ecCreate(owner, "font");
+                    ecSetAttribute(newParent, "color", ecSimpleColor(color));
+                }
+            }
+            if (command === "fontName") {
+                newParent = ecCreate(owner, "font");
+                ecSetAttribute(newParent, "face", newValue);
+            }
+        }
+        if (command === "createLink" || command === "unlink") {
+            newParent = ecCreate(owner, "a");
+            ecSetAttribute(newParent, "href", newValue);
+            let ancestor = ecParent(node);
+            while (ancestor) {
+                if (ecIsHTML(ancestor, "a")) ancestor = ecSetTagName(ancestor, "span");
+                ancestor = ecParent(ancestor);
+            }
+        }
+        if (command === "fontSize" && EC_FONT_SIZE_KEYWORDS.includes(newValue) &&
+            (!cssStyling || newValue === "xxx-large")) {
+            newParent = ecCreate(owner, "font");
+            ecSetAttribute(newParent, "size", String(EC_FONT_SIZE_KEYWORDS.indexOf(newValue) + 1));
+        }
+        if ((command === "subscript" || command === "superscript") && newValue === "subscript") newParent = ecCreate(owner, "sub");
+        if ((command === "subscript" || command === "superscript") && newValue === "superscript") newParent = ecCreate(owner, "sup");
+        if (!newParent) newParent = ecCreate(owner, "span");
+        ecInsertBefore(ecParent(node), newParent, node);
+        const property = ecRelevantProperty(command);
+        // Step 17: setProperty() ignores a value that would not be valid.
+        if (property !== null && !ecLooselyEquivalentValues(command, ecEffectiveCommandValue(newParent, command), newValue))
+            ecSetInlineStyle(newParent, property, newValue);
+        if (command === "strikethrough" && newValue === "line-through" &&
+            ecEffectiveCommandValue(newParent, "strikethrough") !== "line-through")
+            ecSetInlineStyle(newParent, "text-decoration", "line-through");
+        if (command === "underline" && newValue === "underline" &&
+            ecEffectiveCommandValue(newParent, "underline") !== "underline")
+            ecSetInlineStyle(newParent, "text-decoration", "underline");
+        ecAppendPreservingRanges(node, newParent);
+        if (ecIsElement(node) && !ecLooselyEquivalentValues(command, ecEffectiveCommandValue(node, command), newValue)) {
+            ecInsertBeforePreservingRanges(node, newParent);
+            ecRemove(newParent);
+            const children = ecChildren(node).filter((child) => !(ecIsElement(child) &&
+                ecSpecifiedCommandValue(child, command) !== null &&
+                !ecEquivalentValues(command, ecSpecifiedCommandValue(child, command), newValue)));
+            for (const child of children) ecForceTheValue(document, child, newValue, command);
+        }
+    }
+    // execCommand #reorder-modifiable-descendants.
+    function ecReorderModifiableDescendants(node, command, newValue) {
+        if (!node) return;
+        let candidate = node;
+        while (ecIsModifiableElement(candidate) && ecChildren(candidate).length === 1 &&
+            ecIsModifiableElement(ecFirstChild(candidate)) &&
+            (!ecIsSimpleModifiableElement(candidate) ||
+                !ecEquivalentValues(command, ecSpecifiedCommandValue(candidate, command), newValue)))
+            candidate = ecFirstChild(candidate);
+        if (rangeSame(candidate, node) || !ecIsSimpleModifiableElement(candidate) ||
+            !ecEquivalentValues(command, ecSpecifiedCommandValue(candidate, command), newValue) ||
+            !ecLooselyEquivalentValues(command, ecEffectiveCommandValue(candidate, command), newValue)) return;
+        for (let child = ecFirstChild(candidate); child; child = ecFirstChild(candidate))
+            ecInsertBeforePreservingRanges(child, candidate);
+        ecInsertBefore(ecParent(node), candidate, ecNextSibling(node));
+        ecAppendPreservingRanges(node, candidate);
+    }
+    // execCommand #set-the-selection's-value.
+    function ecSetTheSelectionsValue(document, newValue, command) {
+        const range = ecActiveRange(document);
+        if (!range) return;
+        const state = rangeState(range);
+        if (!ecEffectivelyContainedNodes(state).some(ecIsFormattableNode)) {
+            if (EC_ACTIVATED_VALUES[command]) ecSetStateOverride(document, command, EC_ACTIVATED_VALUES[command].includes(newValue));
+            if (command === "subscript") ecUnsetStateOverride(document, "superscript");
+            if (command === "superscript") ecUnsetStateOverride(document, "subscript");
+            if (newValue === null) ecUnsetValueOverride(document, command);
+            else if (command === "createLink" || EC_COMMANDS[command].value) ecSetValueOverride(document, command, newValue);
+            return;
+        }
+        if (ecIsText(state.startNode) && ecIsEditable(state.startNode) && state.startOffset !== 0 &&
+            state.startOffset !== ecLength(state.startNode)) {
+            const tail = ecCall(ecSplitTextMethod, state.startNode, state.startOffset);
+            setRangeBoundary(range, tail, 0, true);
+        }
+        if (ecIsText(state.endNode) && ecIsEditable(state.endNode) && state.endOffset !== 0 &&
+            state.endOffset !== ecLength(state.endNode))
+            ecCall(ecSplitTextMethod, state.endNode, state.endOffset);
+        for (const element of ecEffectivelyContainedNodes(state).filter((node) => ecIsElement(node) && ecIsEditable(node)))
+            ecClearTheValue(element, command);
+        for (const node of ecEffectivelyContainedNodes(state).filter(ecIsEditable)) {
+            ecPushDownValues(document, node, newValue, command);
+            if (ecIsAllowedChild(node, "span")) ecForceTheValue(document, node, newValue, command);
+        }
+    }
+
+    // --- Editing state, overrides and the active range ---------------------
+    // execCommand #css-styling-flag, #default-single-line-container-name,
+    // #state-override and #value-override, kept per Document.
+    function ecEditingState(document) {
+        const slots = internalsFor(document);
+        if (!slots.editing) slots.editing = {cssStyling: false, defaultSingleLineContainerName: "div",
+            stateOverrides: new Map(), valueOverrides: new Map(), overrideSelection: null,
+            undo: [], redo: [], typing: null};
+        return slots.editing;
+    }
+    // execCommand #active-range.
+    function ecActiveRange(document) {
+        const state = selectionState(selectionFor(document));
+        return selectionVisible(state) ? state.range : null;
+    }
+    function ecSelectionKey(selection) {
+        const state = selectionState(selection);
+        if (!selectionVisible(state)) return null;
+        const range = rangeState(state.range);
+        return [range.startNode, range.startOffset, range.endNode, range.endOffset];
+    }
+    function ecRememberOverrideSelection(document) {
+        ecEditingState(document).overrideSelection = ecSelectionKey(selectionFor(document));
+    }
+    // "Whenever the number of ranges in the selection changes to something
+    // different, and whenever a boundary point of the range at a given index
+    // in the selection changes to something different, the state override
+    // and value override must be unset for every command."
+    function ecSelectionChanged(selection) {
+        const document = selectionState(selection).document;
+        const editing = internalsOf(document).editing;
+        if (!editing || (!editing.stateOverrides.size && !editing.valueOverrides.size)) return;
+        const now = ecSelectionKey(selection), before = editing.overrideSelection;
+        if (now === null && before === null) return;
+        if (now !== null && before !== null && now.every((value, index) => value === before[index])) return;
+        editing.stateOverrides.clear();
+        editing.valueOverrides.clear();
+    }
+    function ecSetStateOverride(document, command, value) {
+        ecEditingState(document).stateOverrides.set(command, value);
+        ecRememberOverrideSelection(document);
+    }
+    function ecUnsetStateOverride(document, command) { ecEditingState(document).stateOverrides.delete(command); }
+    // The backColor and hiliteColor value overrides are one value.
+    function ecOverrideKey(command) { return command === "backColor" ? "hiliteColor" : command; }
+    function ecSetValueOverride(document, command, value) {
+        ecEditingState(document).valueOverrides.set(ecOverrideKey(command), value);
+        ecRememberOverrideSelection(document);
+    }
+    function ecUnsetValueOverride(document, command) { ecEditingState(document).valueOverrides.delete(ecOverrideKey(command)); }
+    function ecStateOverride(document, command) {
+        const map = ecEditingState(document).stateOverrides;
+        return map.has(command) ? map.get(command) : undefined;
+    }
+    function ecValueOverride(document, command) {
+        const map = ecEditingState(document).valueOverrides, key = ecOverrideKey(command);
+        return map.has(key) ? map.get(key) : undefined;
+    }
+    function ecFirstFormattableNode(document) {
+        const range = ecActiveRange(document);
+        if (!range) return null;
+        return ecEffectivelyContainedNodes(rangeState(range)).find(ecIsFormattableNode) || null;
+    }
+    // execCommand #record-current-overrides.
+    function ecRecordCurrentOverrides(document) {
+        const overrides = [];
+        if (ecValueOverride(document, "createLink") !== undefined)
+            overrides.push(["createLink", ecValueOverride(document, "createLink")]);
+        for (const command of ["bold", "italic", "strikethrough", "subscript", "superscript", "underline"])
+            if (ecStateOverride(document, command) !== undefined) overrides.push([command, ecStateOverride(document, command)]);
+        for (const command of ["fontName", "fontSize", "foreColor", "hiliteColor"])
+            if (ecValueOverride(document, command) !== undefined) overrides.push([command, ecValueOverride(document, command)]);
+        return overrides;
+    }
+    // execCommand #record-current-states-and-values.
+    function ecRecordCurrentStatesAndValues(document) {
+        const overrides = [];
+        const node = ecFirstFormattableNode(document);
+        if (!node) return overrides;
+        overrides.push(["createLink", ecEffectiveCommandValue(node, "createLink")]);
+        for (const command of ["bold", "italic", "strikethrough", "subscript", "superscript", "underline"])
+            overrides.push([command, EC_ACTIVATED_VALUES[command].includes(ecEffectiveCommandValue(node, command))]);
+        for (const command of ["fontName", "foreColor", "hiliteColor"])
+            overrides.push([command, ecQueryCommandValue(document, command)]);
+        overrides.push(["fontSize", ecEffectiveCommandValue(node, "fontSize")]);
+        return overrides;
+    }
+    // execCommand #restore-states-and-values.
+    function ecRestoreStatesAndValues(document, overrides) {
+        let node = ecFirstFormattableNode(document);
+        if (node) {
+            for (let [command, override] of overrides) {
+                if (typeof override === "boolean") {
+                    if (ecQueryCommandState(document, command) !== override) ecTakeAction(document, command, "");
+                    else continue;
+                } else if (typeof override === "string" && command !== "createLink" && command !== "fontSize") {
+                    if (!ecEquivalentValues(command, ecQueryCommandValue(document, command), override))
+                        ecTakeAction(document, command, override);
+                    else continue;
+                } else if (typeof override === "string" && command === "createLink") {
+                    const value = ecValueOverride(document, "createLink");
+                    if ((value !== undefined && value !== override) ||
+                        (value === undefined && ecEffectiveCommandValue(node, "createLink") !== override))
+                        ecTakeAction(document, "createLink", override);
+                    else continue;
+                } else if (typeof override === "string" && command === "fontSize") {
+                    const value = ecValueOverride(document, "fontSize");
+                    if ((value !== undefined && value !== override) ||
+                        (value === undefined && !ecLooselyEquivalentValues("fontSize", ecEffectiveCommandValue(node, "fontSize"), override))) {
+                        override = ecLegacyFontSize(ecPixels(override));
+                        ecTakeAction(document, "fontSize", override);
+                    } else continue;
+                } else continue;
+                node = ecFirstFormattableNode(document) || node;
+            }
+        } else {
+            for (const [command, override] of overrides) {
+                if (typeof override === "boolean") ecSetStateOverride(document, command, override);
+                if (typeof override === "string") ecSetValueOverride(document, command, override);
+            }
+        }
+    }
+    // A CSS font-size value as an integer number of pixels.
+    function ecPixels(value) {
+        value = String(value).trim();
+        const keyword = EC_FONT_SIZE_KEYWORDS.indexOf(value);
+        if (keyword >= 0) return EC_FONT_SIZE_PIXELS[keyword];
+        return Math.round(parseFloat(value)) || 0;
+    }
+    // execCommand #legacy-font-size-for.
+    function ecLegacyFontSize(pixelSize) {
+        let returnedSize = 1;
+        while (returnedSize < 7) {
+            const lower = EC_FONT_SIZE_PIXELS[returnedSize - 1], upper = EC_FONT_SIZE_PIXELS[returnedSize];
+            if (pixelSize < (upper + lower) / 2) return String(returnedSize);
+            returnedSize++;
+        }
+        return "7";
+    }
+
+    // --- Block formatting definitions and algorithms ----------------------
+    // execCommand #indentation-element.
+    function ecSetsMargin(element) {
+        return ecStyleDeclarationNames(element).some((name) => name === "margin" || name.startsWith("margin-"));
+    }
+    function ecIsIndentationElement(node) {
+        if (ecIsHTML(node, "blockquote")) return true;
+        return ecIsHTML(node, "div") && ecHasAttribute(node, "style") && ecSetsMargin(node);
+    }
+    // execCommand #simple-indentation-element.
+    function ecIsSimpleIndentationElement(node) {
+        if (!ecIsIndentationElement(node)) return false;
+        for (const attr of ecAttributeList(node)) {
+            if (attr.namespaceURI !== null) return false;
+            if (attr.name === "dir") continue;
+            if (attr.name !== "style") return false;
+            if (!ecStyleDeclarationNames(node).every((name) => /^(margin|border|padding)(-|$)/.test(name))) return false;
+        }
+        return true;
+    }
+    // execCommand #non-list-single-line-container / #single-line-container.
+    function ecIsNonListSingleLineContainer(node) {
+        return ecIsHTML(node, "address", "div", "h1", "h2", "h3", "h4", "h5", "h6", "listing", "p", "pre", "xmp");
+    }
+    function ecIsSingleLineContainer(node) {
+        return ecIsNonListSingleLineContainer(node) || ecIsHTML(node, "li", "dt", "dd");
+    }
+    // execCommand #block-node-of.
+    function ecBlockNodeOf(node) {
+        while (node && ecIsInlineNode(node)) node = ecParent(node);
+        return node;
+    }
+    // execCommand #fix-disallowed-ancestors.
+    function ecFixDisallowedAncestors(document, node) {
+        if (!ecIsEditable(node)) return;
+        let allowedSomewhere = false;
+        for (let ancestor = ecParent(node); ancestor && !allowedSomewhere; ancestor = ecParent(ancestor))
+            allowedSomewhere = ecInSameEditingHost(node, ancestor) && ecIsAllowedChild(node, ancestor);
+        if (!allowedSomewhere) {
+            if (ecIsHTML(node, "dd", "dt")) {
+                ecWrap([node], (sibling) => ecIsHTML(sibling, "dl") && !ecAttributeList(sibling).length,
+                    () => ecCreate(document, "dl"));
+                return;
+            }
+            if (!ecIsAllowedChild("p", ecEditingHostOf(node))) return;
+            if (!ecIsProhibitedParagraphChild(node)) return;
+            node = ecSetTagName(node, ecEditingState(document).defaultSingleLineContainerName);
+            ecFixDisallowedAncestors(document, node);
+            for (const child of ecChildren(node)) {
+                if (!ecIsProhibitedParagraphChild(child)) continue;
+                const values = ecRecordTheValues([child]);
+                ecSplitTheParent(document, [child]);
+                ecRestoreTheValues(document, values);
+            }
+            return;
+        }
+        const values = ecRecordTheValues([node]);
+        while (ecParent(node) && !ecIsAllowedChild(node, ecParent(node))) {
+            const parent = ecParent(node);
+            ecSplitTheParent(document, [node]);
+            if (rangeSame(ecParent(node), parent)) break;
+        }
+        ecRestoreTheValues(document, values);
+    }
+    // execCommand #normalize-sublists.
+    function ecNormalizeSublists(item) {
+        if (!ecIsHTML(item, "li") || !ecIsEditable(item) || !ecIsEditable(ecParent(item))) return;
+        let newItem = null;
+        while (ecChildren(item).some((child) => ecIsHTML(child, "ol", "ul"))) {
+            const child = ecLastChild(item);
+            if (ecIsHTML(child, "ol", "ul") || (newItem === null && ecIsText(child) && /^[\t\n\f\r ]*$/.test(ecData(child)))) {
+                newItem = null;
+                ecInsertAfterPreservingRanges(child, item);
+            } else {
+                if (newItem === null) {
+                    newItem = ecCreate(ecNodeDocument(item), "li");
+                    ecInsertBefore(ecParent(item), newItem, ecNextSibling(item));
+                }
+                ecMovePreservingRanges(child, newItem, 0);
+            }
+        }
+    }
+    function ecListItemsAtActiveRange(range) {
+        const items = [];
+        for (const node of [range.startNode, range.endNode])
+            for (let ancestor = node; ancestor; ancestor = ecParent(ancestor))
+                if (ecIsHTML(ancestor, "li") && !items.includes(ancestor)) items.push(ancestor);
+        return items;
+    }
+    // execCommand #selection's-list-state.
+    function ecSelectionsListState(document) {
+        const active = ecActiveRange(document);
+        if (!active) return "none";
+        const newRange = ecBlockExtend(rangeState(active));
+        const nodeList = [];
+        for (const node of ecNodesContainedIn(newRange)) {
+            if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], node)) continue;
+            if (!ecIsEditable(node) || ecIsIndentationElement(node)) continue;
+            if (ecIsHTML(node, "ol", "ul") || ecIsHTML(ecParent(node), "ol", "ul") || ecIsAllowedChild(node, "li"))
+                nodeList.push(node);
+        }
+        if (!nodeList.length) return "none";
+        const is = (node, name) => ecIsHTML(node, name);
+        const childOf = (node, name) => ecIsHTML(ecParent(node), name);
+        const grandchildOf = (node, name) => ecIsHTML(ecParent(node), "li") && ecIsHTML(ecParent(ecParent(node)), name);
+        const ancestorOf = (node, name) => ecHasHTMLDescendant(node, name);
+        if (nodeList.every((node) => is(node, "ol") || childOf(node, "ol") || grandchildOf(node, "ol")) &&
+            !nodeList.some((node) => is(node, "ul") || ancestorOf(node, "ul"))) return "ol";
+        if (nodeList.every((node) => is(node, "ul") || childOf(node, "ul") || grandchildOf(node, "ul")) &&
+            !nodeList.some((node) => is(node, "ol") || ancestorOf(node, "ol"))) return "ul";
+        const hasOl = nodeList.some((node) => is(node, "ol") || childOf(node, "ol") || ancestorOf(node, "ol") || grandchildOf(node, "ol"));
+        const hasUl = nodeList.some((node) => is(node, "ul") || childOf(node, "ul") || ancestorOf(node, "ul") || grandchildOf(node, "ul"));
+        if (hasOl && hasUl) return "mixed";
+        if (hasOl) return "mixed ol";
+        if (hasUl) return "mixed ul";
+        return "none";
+    }
+    function ecHasHTMLDescendant(node, name) {
+        for (let current = ecNextNode(node); current && ecIsAncestor(node, current); current = ecNextNode(current))
+            if (ecIsHTML(current, name)) return true;
+        return false;
+    }
+    // HTML #the-directionality of an element.
+    function ecDirectionality(element) {
+        return ecResolved(element, "direction") === "rtl" ? "rtl" : "ltr";
+    }
+    // execCommand #alignment-value.
+    function ecAlignmentValue(node) {
+        while (node && (!ecIsElement(node) || ["inline", "none"].includes(ecResolved(node, "display")))) node = ecParent(node);
+        if (!ecIsElement(node)) return "left";
+        const align = ecResolved(node, "text-align");
+        if (align === "start") return ecDirectionality(node) === "ltr" ? "left" : "right";
+        if (align === "end") return ecDirectionality(node) === "ltr" ? "right" : "left";
+        if (["center", "justify", "left", "right"].includes(align)) return align;
+        return "left";
+    }
+    // execCommand #next-equivalent-point / #previous-equivalent-point.
+    function ecNextEquivalentPoint(node, offset) {
+        if (ecLength(node) === 0) return null;
+        const parent = ecParent(node);
+        if (offset === ecLength(node) && parent && ecIsInlineNode(node)) return [parent, 1 + ecIndex(node)];
+        const child = ecChildAt(node, offset);
+        if (child && ecLength(child) !== 0 && ecIsInlineNode(child)) return [child, 0];
+        return null;
+    }
+    function ecPreviousEquivalentPoint(node, offset) {
+        if (ecLength(node) === 0) return null;
+        const parent = ecParent(node);
+        if (offset === 0 && parent && ecIsInlineNode(node)) return [parent, ecIndex(node)];
+        const child = ecChildAt(node, offset - 1);
+        if (child && ecLength(child) !== 0 && ecIsInlineNode(child)) return [child, ecLength(child)];
+        return null;
+    }
+    // execCommand #first-equivalent-point / #last-equivalent-point.
+    function ecFirstEquivalentPoint(node, offset) {
+        for (let previous = ecPreviousEquivalentPoint(node, offset); previous; previous = ecPreviousEquivalentPoint(node, offset))
+            [node, offset] = previous;
+        return [node, offset];
+    }
+    function ecLastEquivalentPoint(node, offset) {
+        for (let next = ecNextEquivalentPoint(node, offset); next; next = ecNextEquivalentPoint(node, offset))
+            [node, offset] = next;
+        return [node, offset];
+    }
+    // execCommand #block-start-point / #block-end-point / #block-boundary-point.
+    function ecIsBlockStartPoint(node, offset) {
+        if (!ecParent(node) && offset === 0) return true;
+        const child = ecChildAt(node, offset - 1);
+        return !!child && ecIsVisible(child) && (ecIsBlockNode(child) || ecIsHTML(child, "br"));
+    }
+    function ecIsBlockEndPoint(node, offset) {
+        if (!ecParent(node) && offset === ecLength(node)) return true;
+        const child = ecChildAt(node, offset);
+        return !!child && ecIsVisible(child) && ecIsBlockNode(child);
+    }
+    function ecIsBlockBoundaryPoint(node, offset) { return ecIsBlockStartPoint(node, offset) || ecIsBlockEndPoint(node, offset); }
+    // execCommand #block-extend.
+    function ecBlockExtend(range) {
+        let startNode = range.startNode, startOffset = range.startOffset;
+        let endNode = range.endNode, endOffset = range.endOffset;
+        let lastItem = null;
+        for (let ancestor = startNode; ancestor; ancestor = ecParent(ancestor)) if (ecIsHTML(ancestor, "li")) lastItem = ancestor;
+        if (lastItem) { startOffset = ecIndex(lastItem); startNode = ecParent(lastItem); }
+        if (!ecIsBlockStartPoint(startNode, startOffset)) {
+            do {
+                if (startOffset === 0) { startOffset = ecIndex(startNode); startNode = ecParent(startNode); }
+                else startOffset--;
+            } while (!ecIsBlockBoundaryPoint(startNode, startOffset));
+        }
+        while (startOffset === 0 && ecParent(startNode)) { startOffset = ecIndex(startNode); startNode = ecParent(startNode); }
+        lastItem = null;
+        for (let ancestor = endNode; ancestor; ancestor = ecParent(ancestor)) if (ecIsHTML(ancestor, "li")) lastItem = ancestor;
+        if (lastItem) { endOffset = 1 + ecIndex(lastItem); endNode = ecParent(lastItem); }
+        if (!ecIsBlockEndPoint(endNode, endOffset)) {
+            do {
+                if (endOffset === ecLength(endNode)) { endOffset = 1 + ecIndex(endNode); endNode = ecParent(endNode); }
+                else endOffset++;
+            } while (!ecIsBlockBoundaryPoint(endNode, endOffset));
+        }
+        while (endOffset === ecLength(endNode) && ecParent(endNode)) { endOffset = 1 + ecIndex(endNode); endNode = ecParent(endNode); }
+        return {startNode, startOffset, endNode, endOffset};
+    }
+    // execCommand #follows-a-line-break / #precedes-a-line-break.
+    function ecFollowsLineBreak(node) {
+        let offset = 0;
+        while (!ecIsBlockBoundaryPoint(node, offset)) {
+            const child = ecChildAt(node, offset - 1);
+            if (child && ecIsVisible(child)) return false;
+            if (offset === 0 || !ecHasChildren(node)) { offset = ecIndex(node); node = ecParent(node); }
+            else { node = ecChildAt(node, offset - 1); offset = ecLength(node); }
+        }
+        return true;
+    }
+    function ecPrecedesLineBreak(node) {
+        let offset = ecLength(node);
+        while (!ecIsBlockBoundaryPoint(node, offset)) {
+            const child = ecChildAt(node, offset);
+            if (child && ecIsVisible(child)) return false;
+            if (offset === ecLength(node) || !ecHasChildren(node)) { offset = 1 + ecIndex(node); node = ecParent(node); }
+            else { node = ecChildAt(node, offset); offset = 0; }
+        }
+        return true;
+    }
+    function ecSelectionOf(document) { return selectionFor(document); }
+    function ecCollapse(document, node, offset) { ecCall(ecSelectionCollapseMethod, ecSelectionOf(document), node, offset); }
+    function ecExtend(document, node, offset) { ecCall(ecSelectionExtendMethod, ecSelectionOf(document), node, offset); }
+    function ecCollapseToStart(document) {
+        const range = ecActiveRange(document);
+        if (range) { const state = rangeState(range); ecCollapse(document, state.startNode, state.startOffset); }
+    }
+    function ecCollapseToEnd(document) { ecCall(ecCollapseToEndMethod, ecSelectionOf(document)); }
+    function ecStart(document) { const state = rangeState(ecActiveRange(document)); return [state.startNode, state.startOffset]; }
+    function ecEnd(document) { const state = rangeState(ecActiveRange(document)); return [state.endNode, state.endOffset]; }
+    // execCommand #delete-the-selection.
+    function ecDeleteTheSelection(document, blockMerging = true, stripWrappers = true, direction = "forward") {
+        if (!ecActiveRange(document)) return;
+        ecCanonicalizeWhitespace(document, ...ecStart(document));
+        ecCanonicalizeWhitespace(document, ...ecEnd(document));
+        let [startNode, startOffset] = ecLastEquivalentPoint(...ecStart(document));
+        let [endNode, endOffset] = ecFirstEquivalentPoint(...ecEnd(document));
+        const collapseByDirection = () => {
+            if (direction === "forward") ecCollapseToStart(document);
+            else ecCollapseToEnd(document);
+        };
+        if (rangeOrder(endNode, endOffset, startNode, startOffset) !== 1) { collapseByDirection(); return; }
+        if (ecIsText(startNode) && startOffset === 0) { startOffset = ecIndex(startNode); startNode = ecParent(startNode); }
+        if (ecIsText(endNode) && endOffset === ecLength(endNode)) { endOffset = 1 + ecIndex(endNode); endNode = ecParent(endNode); }
+        ecCollapse(document, startNode, startOffset);
+        ecExtend(document, endNode, endOffset);
+        let startBlock = rangeState(ecActiveRange(document)).startNode;
+        while (ecInSameEditingHost(ecParent(startBlock), startBlock) && ecIsInlineNode(startBlock)) startBlock = ecParent(startBlock);
+        if ((!ecIsBlockNode(startBlock) && !ecIsEditingHost(startBlock)) || !ecIsAllowedChild("span", startBlock) ||
+            ecIsHTML(startBlock, "td", "th")) startBlock = null;
+        let endBlock = rangeState(ecActiveRange(document)).endNode;
+        while (ecInSameEditingHost(ecParent(endBlock), endBlock) && ecIsInlineNode(endBlock)) endBlock = ecParent(endBlock);
+        if ((!ecIsBlockNode(endBlock) && !ecIsEditingHost(endBlock)) || !ecIsAllowedChild("span", endBlock) ||
+            ecIsHTML(endBlock, "td", "th")) endBlock = null;
+        const overrides = ecRecordCurrentStatesAndValues(document);
+        if (rangeSame(startNode, endNode) && ecIsText(startNode) && ecIsEditable(startNode)) {
+            ecCall(ecReplaceDataMethod, startNode, startOffset, endOffset - startOffset, "");
+            ecCanonicalizeWhitespace(document, startNode, startOffset, false);
+            collapseByDirection();
+            ecRestoreStatesAndValues(document, overrides);
+            return;
+        }
+        if (ecIsText(startNode) && ecIsEditable(startNode))
+            ecCall(ecReplaceDataMethod, startNode, startOffset, ecLength(startNode) - startOffset, "");
+        const nodeList = [];
+        for (const node of ecNodesContainedIn(rangeState(ecActiveRange(document)))) {
+            if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], node)) continue;
+            if (!ecIsEditable(node) || ecIsHTML(node, "thead", "tbody", "tfoot", "tr", "th", "td")) continue;
+            nodeList.push(node);
+        }
+        for (const node of nodeList) {
+            let parent = ecParent(node);
+            ecRemove(node);
+            if (!ecFirstVisibleChild(ecBlockNodeOf(parent)) && (ecIsEditable(parent) || ecIsEditingHost(parent)))
+                ecAppend(parent, ecCreate(document, "br"));
+            if (stripWrappers || !ecIsInclusiveAncestor(parent, startNode)) {
+                while (ecIsEditable(parent) && ecIsInlineNode(parent) && ecLength(parent) === 0) {
+                    const grandparent = ecParent(parent);
+                    ecRemove(parent);
+                    parent = grandparent;
+                }
+            }
+        }
+        if (ecIsText(endNode) && ecIsEditable(endNode)) ecCall(ecReplaceDataMethod, endNode, 0, endOffset, "");
+        ecCanonicalizeWhitespace(document, ...ecStart(document), false);
+        ecCanonicalizeWhitespace(document, ...ecEnd(document), false);
+        if (!blockMerging || !startBlock || !endBlock || !ecInSameEditingHost(startBlock, endBlock) || rangeSame(startBlock, endBlock)) {
+            collapseByDirection();
+            ecRestoreStatesAndValues(document, overrides);
+            return;
+        }
+        if (ecChildren(startBlock).length === 1 && ecIsCollapsedBlockProp(ecFirstChild(startBlock))) ecRemove(ecFirstChild(startBlock));
+        let values;
+        if (ecIsAncestor(startBlock, endBlock)) {
+            let referenceNode = endBlock;
+            while (!rangeSame(ecParent(referenceNode), startBlock)) referenceNode = ecParent(referenceNode);
+            ecCollapse(document, startBlock, ecIndex(referenceNode));
+            if (!ecHasChildren(endBlock)) {
+                while (ecIsEditable(endBlock) && ecChildren(ecParent(endBlock)).length === 1 && !rangeSame(ecParent(endBlock), startBlock)) {
+                    const parent = ecParent(endBlock);
+                    ecRemove(endBlock);
+                    endBlock = parent;
+                }
+                if (ecIsEditable(endBlock) && !ecIsInlineNode(endBlock) && ecIsInlineNode(ecPreviousSibling(endBlock)) &&
+                    ecIsInlineNode(ecNextSibling(endBlock)))
+                    ecInsertBefore(ecParent(endBlock), ecCreate(document, "br"), ecNextSibling(endBlock));
+                if (ecIsEditable(endBlock)) ecRemove(endBlock);
+                ecRestoreStatesAndValues(document, overrides);
+                return;
+            }
+            if (!ecIsInlineNode(ecFirstChild(endBlock))) {
+                ecRestoreStatesAndValues(document, overrides);
+                return;
+            }
+            const children = [ecFirstChild(endBlock)];
+            while (!ecIsHTML(children[children.length - 1], "br") && ecIsInlineNode(ecNextSibling(children[children.length - 1])))
+                children.push(ecNextSibling(children[children.length - 1]));
+            values = ecRecordTheValues(children);
+            while (!rangeSame(ecParent(children[0]), startBlock)) {
+                const parent = ecParent(children[0]);
+                ecSplitTheParent(document, children);
+                if (rangeSame(ecParent(children[0]), parent)) break;
+            }
+            const previous = ecPreviousSibling(children[0]);
+            if (ecIsHTML(previous, "br") && ecIsEditable(previous)) ecRemove(previous);
+        } else if (ecIsAncestor(endBlock, startBlock)) {
+            ecCollapse(document, startBlock, ecLength(startBlock));
+            let referenceNode = startBlock;
+            while (!rangeSame(ecParent(referenceNode), endBlock)) referenceNode = ecParent(referenceNode);
+            if (ecIsInlineNode(ecNextSibling(referenceNode)) && ecIsHTML(ecLastChild(startBlock), "br"))
+                ecRemove(ecLastChild(startBlock));
+            const nodesToMove = [];
+            const next = ecNextSibling(referenceNode);
+            if (next && !ecIsBlockNode(next)) nodesToMove.push(next);
+            while (nodesToMove.length && !ecIsHTML(nodesToMove[nodesToMove.length - 1], "br") &&
+                ecNextSibling(nodesToMove[nodesToMove.length - 1]) && !ecIsBlockNode(ecNextSibling(nodesToMove[nodesToMove.length - 1])))
+                nodesToMove.push(ecNextSibling(nodesToMove[nodesToMove.length - 1]));
+            values = ecRecordTheValues(nodesToMove);
+            for (const node of nodesToMove) ecAppendPreservingRanges(node, startBlock);
+        } else {
+            ecCollapse(document, startBlock, ecLength(startBlock));
+            if (ecIsInlineNode(ecFirstChild(endBlock)) && ecIsHTML(ecLastChild(startBlock), "br")) ecRemove(ecLastChild(startBlock));
+            values = ecRecordTheValues(ecChildren(endBlock));
+            for (let child = ecFirstChild(endBlock); child; child = ecFirstChild(endBlock)) ecAppendPreservingRanges(child, startBlock);
+            while (endBlock && !ecHasChildren(endBlock)) {
+                const parent = ecParent(endBlock);
+                ecRemove(endBlock);
+                endBlock = parent;
+            }
+        }
+        let ancestor = startBlock;
+        const sameKindNext = (node) => {
+            const next = ecNextSibling(node);
+            return (ecIsHTML(node, "ol") && ecIsHTML(next, "ol") || ecIsHTML(node, "ul") && ecIsHTML(next, "ul")) &&
+                ecInSameEditingHost(node, next);
+        };
+        const mergeable = () => {
+            for (let current = ancestor; current; current = ecParent(current))
+                if (ecInSameEditingHost(ancestor, current) && sameKindNext(current)) return true;
+            return false;
+        };
+        while (mergeable()) {
+            while (!sameKindNext(ancestor)) ancestor = ecParent(ancestor);
+            const next = ecNextSibling(ancestor);
+            for (let child = ecFirstChild(next); child; child = ecFirstChild(next)) ecAppendPreservingRanges(child, ancestor);
+            ecRemove(next);
+        }
+        ecRestoreTheValues(document, values);
+        if (!ecHasChildren(startBlock)) ecAppend(startBlock, ecCreate(document, "br"));
+        ecRemoveExtraneousLineBreaksAtTheEndOf(startBlock);
+        ecRestoreStatesAndValues(document, overrides);
+    }
+    // execCommand #split-the-parent.
+    function ecSplitTheParent(document, nodeList) {
+        const originalParent = ecParent(nodeList[0]);
+        if (!ecIsEditable(originalParent) || !ecParent(originalParent)) return;
+        const inList = (node) => !!node && nodeList.some((member) => rangeSame(member, node));
+        if (inList(ecFirstChild(originalParent))) ecRemoveExtraneousLineBreaksBefore(originalParent);
+        const followsLineBreak = inList(ecFirstChild(originalParent)) && ecFollowsLineBreak(originalParent);
+        const precedesLineBreak = inList(ecLastChild(originalParent)) && ecPrecedesLineBreak(originalParent);
+        const last = nodeList[nodeList.length - 1];
+        if (!inList(ecFirstChild(originalParent)) && inList(ecLastChild(originalParent))) {
+            for (let i = nodeList.length - 1; i >= 0; i--) ecInsertAfterPreservingRanges(nodeList[i], originalParent);
+            if (precedesLineBreak && !ecPrecedesLineBreak(last))
+                ecInsertBefore(ecParent(last), ecCreate(document, "br"), ecNextSibling(last));
+            ecRemoveExtraneousLineBreaksAtTheEndOf(originalParent);
+            return;
+        }
+        if (!inList(ecFirstChild(originalParent))) {
+            const clonedParent = ecCall(ecCloneMethod, originalParent, false);
+            ecRemoveAttribute(originalParent, "id");
+            ecInsertBefore(ecParent(originalParent), clonedParent, originalParent);
+            while (ecPreviousSibling(nodeList[0])) ecAppendPreservingRanges(ecFirstChild(originalParent), clonedParent);
+        }
+        for (const node of nodeList) ecInsertBeforePreservingRanges(node, originalParent);
+        if (followsLineBreak && !ecFollowsLineBreak(nodeList[0]))
+            ecInsertBefore(ecParent(nodeList[0]), ecCreate(document, "br"), nodeList[0]);
+        if (ecIsInlineNode(last) && !ecIsHTML(last, "br") && ecIsHTML(ecFirstChild(originalParent), "br") &&
+            !ecIsInlineNode(originalParent))
+            ecRemove(ecFirstChild(originalParent));
+        if (!ecHasChildren(originalParent)) {
+            ecRemove(originalParent);
+            if (precedesLineBreak && !ecPrecedesLineBreak(last))
+                ecInsertBefore(ecParent(last), ecCreate(document, "br"), ecNextSibling(last));
+        } else ecRemoveExtraneousLineBreaksBefore(originalParent);
+        if (!ecNextSibling(last) && ecParent(last)) ecRemoveExtraneousLineBreaksAtTheEndOf(ecParent(last));
+    }
+    // execCommand #preserving-its-descendants.
+    function ecRemovePreservingDescendants(document, node) {
+        if (ecHasChildren(node)) ecSplitTheParent(document, ecChildren(node));
+        else ecRemove(node);
+    }
+    // execCommand #canonical-space-sequence.
+    function ecCanonicalSpaceSequence(n, nonBreakingStart, nonBreakingEnd) {
+        if (n === 0) return "";
+        if (n === 1 && !nonBreakingStart && !nonBreakingEnd) return " ";
+        if (n === 1) return "\xa0";
+        let buffer = "";
+        const repeatedPair = nonBreakingStart ? "\xa0 " : " \xa0";
+        while (n > 3) { buffer += repeatedPair; n -= 2; }
+        if (n === 3) {
+            buffer += !nonBreakingStart && !nonBreakingEnd ? " \xa0 " : nonBreakingStart && !nonBreakingEnd ? "\xa0\xa0 "
+                : !nonBreakingStart && nonBreakingEnd ? " \xa0\xa0" : "\xa0 \xa0";
+        } else {
+            buffer += !nonBreakingStart && !nonBreakingEnd ? "\xa0 " : nonBreakingStart && !nonBreakingEnd ? "\xa0 "
+                : !nonBreakingStart && nonBreakingEnd ? " \xa0" : "\xa0\xa0";
+        }
+        return buffer;
+    }
+    function ecPreservesSpaces(text) {
+        const space = ecResolved(ecParent(text), "white-space");
+        return space === "pre" || space === "pre-wrap";
+    }
+    // execCommand #canonicalize-whitespace.
+    function ecCanonicalizeWhitespace(document, node, offset, fixCollapsedSpace = true) {
+        if (!ecIsEditable(node) && !ecIsEditingHost(node)) return;
+        let startNode = node, startOffset = offset;
+        for (;;) {
+            const child = ecChildAt(startNode, startOffset - 1);
+            if (child && ecInSameEditingHost(startNode, child)) { startNode = child; startOffset = ecLength(startNode); }
+            else if (startOffset === 0 && !ecFollowsLineBreak(startNode) && ecInSameEditingHost(ecParent(startNode), startNode)) {
+                startOffset = ecIndex(startNode); startNode = ecParent(startNode);
+            } else if (ecIsText(startNode) && !ecPreservesSpaces(startNode) && startOffset !== 0 &&
+                /[ \xa0]/.test(ecData(startNode)[startOffset - 1])) startOffset--;
+            else break;
+        }
+        let endNode = startNode, endOffset = startOffset, length = 0;
+        let collapseSpaces = startOffset === 0 && ecFollowsLineBreak(startNode);
+        for (;;) {
+            const child = ecChildAt(endNode, endOffset);
+            if (child && ecInSameEditingHost(endNode, child)) { endNode = child; endOffset = 0; }
+            else if (endOffset === ecLength(endNode) && !ecPrecedesLineBreak(endNode) && ecInSameEditingHost(ecParent(endNode), endNode)) {
+                endOffset = 1 + ecIndex(endNode); endNode = ecParent(endNode);
+            } else if (ecIsText(endNode) && !ecPreservesSpaces(endNode) && endOffset !== ecLength(endNode) &&
+                /[ \xa0]/.test(ecData(endNode)[endOffset])) {
+                if (fixCollapsedSpace && collapseSpaces && ecData(endNode)[endOffset] === " ") {
+                    ecCall(ecReplaceDataMethod, endNode, endOffset, 1, "");
+                    continue;
+                }
+                collapseSpaces = ecData(endNode)[endOffset] === " ";
+                endOffset++;
+                length++;
+            } else break;
+        }
+        if (fixCollapsedSpace) {
+            while (rangeOrder(startNode, startOffset, endNode, endOffset) === -1) {
+                const child = ecChildAt(endNode, endOffset - 1);
+                if (child && ecInSameEditingHost(endNode, child)) { endNode = child; endOffset = ecLength(endNode); }
+                else if (endOffset === 0 && ecInSameEditingHost(ecParent(endNode), endNode)) {
+                    endOffset = ecIndex(endNode); endNode = ecParent(endNode);
+                } else if (ecIsText(endNode) && !ecPreservesSpaces(endNode) && endOffset === ecLength(endNode) &&
+                    ecData(endNode).endsWith(" ") && ecPrecedesLineBreak(endNode)) {
+                    endOffset--;
+                    length--;
+                    ecCall(ecReplaceDataMethod, endNode, endOffset, 1, "");
+                } else break;
+            }
+        }
+        let replacement = ecCanonicalSpaceSequence(length, startOffset === 0 && ecFollowsLineBreak(startNode),
+            endOffset === ecLength(endNode) && ecPrecedesLineBreak(endNode));
+        while (rangeOrder(startNode, startOffset, endNode, endOffset) === -1) {
+            const child = ecChildAt(startNode, startOffset);
+            if (child) { startNode = child; startOffset = 0; }
+            else if (!ecIsText(startNode) || startOffset === ecLength(startNode)) {
+                startOffset = 1 + ecIndex(startNode); startNode = ecParent(startNode);
+            } else {
+                const element = replacement[0];
+                replacement = replacement.slice(1);
+                if (element !== ecData(startNode)[startOffset]) {
+                    ecCall(ecReplaceDataMethod, startNode, startOffset, 0, element);
+                    ecCall(ecReplaceDataMethod, startNode, startOffset + 1, 1, "");
+                }
+                startOffset++;
+            }
+        }
+    }
+    // execCommand #indent.
+    function ecIndent(document, nodeList) {
+        if (!nodeList.length) return;
+        const firstNode = nodeList[0];
+        if (ecIsHTML(ecParent(firstNode), "ol", "ul")) {
+            const tag = htmlElementName(ecParent(firstNode));
+            ecWrap(nodeList, (sibling) => ecIsHTML(sibling, tag), () => ecCreate(ecNodeDocument(firstNode), tag));
+            return;
+        }
+        const newParent = ecWrap(nodeList, ecIsSimpleIndentationElement,
+            () => ecCreate(ecNodeDocument(firstNode), "blockquote"));
+        if (newParent) ecFixDisallowedAncestors(document, newParent);
+    }
+    // execCommand #outdent.
+    function ecOutdent(document, node) {
+        if (!ecIsEditable(node)) return;
+        if (ecIsSimpleIndentationElement(node)) { ecRemovePreservingDescendants(document, node); return; }
+        if (ecIsIndentationElement(node)) {
+            ecRemoveAttribute(node, "dir");
+            for (const property of ["margin", "padding", "border"]) ecUnsetInlineStyle(node, property);
+            ecSetTagName(node, "div");
+            return;
+        }
+        let currentAncestor = ecParent(node);
+        let ancestorList = [];
+        while (ecIsElement(currentAncestor) && ecIsEditable(currentAncestor) &&
+            !ecIsSimpleIndentationElement(currentAncestor) && !ecIsHTML(currentAncestor, "ol", "ul")) {
+            ancestorList.push(currentAncestor);
+            currentAncestor = ecParent(currentAncestor);
+        }
+        if (!(ecIsEditable(currentAncestor) && ecIsSimpleIndentationElement(currentAncestor))) {
+            currentAncestor = ecParent(node);
+            ancestorList = [];
+            while (ecIsElement(currentAncestor) && ecIsEditable(currentAncestor) &&
+                !ecIsIndentationElement(currentAncestor) && !ecIsHTML(currentAncestor, "ol", "ul")) {
+                ancestorList.push(currentAncestor);
+                currentAncestor = ecParent(currentAncestor);
+            }
+        }
+        if (ecIsHTML(node, "ol", "ul") && !(ecIsEditable(currentAncestor) && ecIsIndentationElement(currentAncestor))) {
+            for (const attribute of ["reversed", "start", "type"]) ecRemoveAttribute(node, attribute);
+            const children = ecChildren(node);
+            if (ecAttributeList(node).length && !ecIsHTML(ecParent(node), "ol", "ul")) ecSetTagName(node, "div");
+            else {
+                const values = ecRecordTheValues(ecChildren(node));
+                ecRemovePreservingDescendants(document, node);
+                ecRestoreTheValues(document, values);
+            }
+            for (const child of children) ecFixDisallowedAncestors(document, child);
+            return;
+        }
+        if (!(ecIsEditable(currentAncestor) && ecIsIndentationElement(currentAncestor))) return;
+        ancestorList.push(currentAncestor);
+        const originalAncestor = currentAncestor;
+        while (ancestorList.length) {
+            currentAncestor = ancestorList.pop();
+            const marker = ancestorList.length ? ancestorList[ancestorList.length - 1] : node;
+            const target = ecChildren(currentAncestor).find((child) => rangeSame(child, node) || rangeSame(child, marker));
+            if (!target) continue;
+            if (ecIsInlineNode(target) && !ecIsHTML(target, "br") && ecIsHTML(ecNextSibling(target), "br"))
+                ecRemove(ecNextSibling(target));
+            const precedingSiblings = [], followingSiblings = [];
+            for (let sibling = ecPreviousSibling(target); sibling; sibling = ecPreviousSibling(sibling)) precedingSiblings.unshift(sibling);
+            for (let sibling = ecNextSibling(target); sibling; sibling = ecNextSibling(sibling)) followingSiblings.push(sibling);
+            ecIndent(document, precedingSiblings);
+            ecIndent(document, followingSiblings);
+        }
+        ecOutdent(document, originalAncestor);
+    }
+    // execCommand #toggle-lists.
+    function ecToggleLists(document, tagName) {
+        const mode = ecSelectionsListState(document) === tagName ? "disable" : "enable";
+        const otherTagName = tagName === "ol" ? "ul" : "ol";
+        const active = ecActiveRange(document);
+        for (const item of ecListItemsAtActiveRange(rangeState(active))) ecNormalizeSublists(item);
+        let newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+        if (mode === "enable") {
+            const listsToConvert = ecNodesContainedIn(newRange).filter((node) => ecIsEditable(node) && ecIsHTML(node, otherTagName));
+            for (const list of listsToConvert) {
+                const previous = ecPreviousSibling(list), next = ecNextSibling(list);
+                if ((ecIsEditable(previous) && ecIsHTML(previous, tagName)) || (ecIsEditable(next) && ecIsHTML(next, tagName))) {
+                    const children = ecChildren(list);
+                    const values = ecRecordTheValues(children);
+                    ecSplitTheParent(document, children);
+                    ecWrap(children, (sibling) => ecIsHTML(sibling, tagName));
+                    ecRestoreTheValues(document, values);
+                } else ecSetTagName(list, tagName);
+            }
+        }
+        newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+        let nodeList = [];
+        for (const node of ecNodesContainedIn(newRange)) {
+            if (!ecIsEditable(node)) continue;
+            if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], node)) continue;
+            if (ecIsIndentationElement(node)) continue;
+            if (ecIsHTML(node, "ol", "ul") || ecIsHTML(ecParent(node), "ol", "ul") || ecIsAllowedChild(node, "li"))
+                nodeList.push(node);
+        }
+        if (mode === "enable")
+            nodeList = nodeList.filter((node) => !(ecIsHTML(node, "ol", "ul") && !ecIsHTML(ecParent(node), "ol", "ul")));
+        if (mode === "disable") {
+            while (nodeList.length) {
+                const sublist = [nodeList.shift()];
+                if (ecIsHTML(sublist[0], tagName)) { ecOutdent(document, sublist[0]); continue; }
+                while (nodeList.length && rangeSame(nodeList[0], ecNextSibling(sublist[sublist.length - 1])) &&
+                    !ecIsHTML(nodeList[0], tagName)) sublist.push(nodeList.shift());
+                const values = ecRecordTheValues(sublist);
+                ecSplitTheParent(document, sublist);
+                for (const node of sublist) ecFixDisallowedAncestors(document, node);
+                ecRestoreTheValues(document, values);
+            }
+            return;
+        }
+        while (nodeList.length) {
+            const sublist = [];
+            while (!sublist.length || (nodeList.length && rangeSame(nodeList[0], ecNextSibling(sublist[sublist.length - 1])))) {
+                if (ecIsHTML(nodeList[0], "p", "div")) {
+                    sublist.push(ecSetTagName(nodeList[0], "li"));
+                    nodeList.shift();
+                } else if (ecIsHTML(nodeList[0], "li", "ol", "ul")) sublist.push(nodeList.shift());
+                else {
+                    const nodesToWrap = [];
+                    while (!nodesToWrap.length || (nodeList.length &&
+                        rangeSame(nodeList[0], ecNextSibling(nodesToWrap[nodesToWrap.length - 1])) &&
+                        ecIsInlineNode(nodeList[0]) && ecIsInlineNode(nodesToWrap[nodesToWrap.length - 1]) &&
+                        !ecIsHTML(nodesToWrap[nodesToWrap.length - 1], "br")))
+                        nodesToWrap.push(nodeList.shift());
+                    const wrapped = ecWrap(nodesToWrap, () => false, () => ecCreate(document, "li"));
+                    if (wrapped) sublist.push(wrapped);
+                    else if (!sublist.length) break;
+                }
+            }
+            if (!sublist.length) continue;
+            if (ecIsHTML(ecParent(sublist[0]), tagName) || sublist.every((node) => ecIsHTML(node, "ol", "ul"))) continue;
+            if (ecIsHTML(ecParent(sublist[0]), otherTagName)) {
+                const values = ecRecordTheValues(sublist);
+                ecSplitTheParent(document, sublist);
+                ecWrap(sublist, (sibling) => ecIsHTML(sibling, tagName), () => ecCreate(document, tagName));
+                ecRestoreTheValues(document, values);
+                continue;
+            }
+            const result = ecWrap(sublist, (sibling) => ecIsHTML(sibling, tagName), () => {
+                const parent = ecParent(sublist[0]), previous = parent && ecPreviousSibling(parent);
+                if (!(ecIsEditable(parent) && ecIsSimpleIndentationElement(parent)) ||
+                    !(ecIsEditable(previous) && ecIsHTML(previous, tagName)))
+                    return ecCreate(document, tagName);
+                const list = previous;
+                ecNormalizeSublists(ecLastChild(list));
+                if (!(ecIsEditable(ecLastChild(list)) && ecIsHTML(ecLastChild(list), tagName)))
+                    ecAppend(list, ecCreate(document, tagName));
+                return ecLastChild(list);
+            });
+            if (result) ecFixDisallowedAncestors(document, result);
+        }
+    }
+    // execCommand #justify-the-selection.
+    function ecJustifyTheSelection(document, alignment) {
+        let newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+        const hasHTMLAlign = (element) => ecAttributeList(element).some((attr) => attr.namespaceURI === null && attr.localName === "align");
+        const elementList = ecNodesContainedIn(newRange).filter((node) => ecIsElement(node) && ecIsEditable(node) &&
+            (hasHTMLAlign(node) || ecInlineStyleValue(node, "text-align") !== "" || ecIsHTML(node, "center")));
+        for (const element of elementList) {
+            if (hasHTMLAlign(element)) ecRemoveAttribute(element, "align");
+            ecUnsetInlineStyle(element, "text-align");
+            if (ecIsHTML(element, "div", "span", "center") && !ecAttributeList(element).length)
+                ecRemovePreservingDescendants(document, element);
+            else if (ecIsHTML(element, "center")) ecSetTagName(element, "div");
+        }
+        newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+        const nodeList = [];
+        for (const node of ecNodesContainedIn(newRange)) {
+            if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], node)) continue;
+            if (ecIsEditable(node) && ecIsAllowedChild(node, "div") && ecAlignmentValue(node) !== alignment) nodeList.push(node);
+        }
+        while (nodeList.length) {
+            const sublist = [nodeList.shift()];
+            while (nodeList.length && rangeSame(nodeList[0], ecNextSibling(sublist[sublist.length - 1]))) sublist.push(nodeList.shift());
+            ecWrap(sublist, (sibling) => {
+                if (!ecIsHTML(sibling, "div")) return false;
+                const attributes = ecAttributeList(sibling);
+                if (!attributes.length) return false;
+                return attributes.every((attr) => {
+                    if (attr.name === "align") return asciiLower(attr.value) === alignment;
+                    if (attr.name !== "style") return false;
+                    const names = ecStyleDeclarationNames(sibling);
+                    return names.length === 1 && names[0] === "text-align" && ecInlineStyleValue(sibling, "text-align") === alignment;
+                });
+            }, () => {
+                const div = ecCreate(document, "div");
+                ecSetInlineStyle(div, "text-align", alignment);
+                return div;
+            });
+        }
+    }
+    // execCommand #autolinkable-url and HTML #valid-e-mail-address.
+    const EC_AUTOLINKABLE_URL = /^(?:[a-zA-Z][a-zA-Z0-9+.\-]*:\/\/|mailto:)[^\t\n\f\r ]*[^!"'(),\-.:;<>[\]`{}]$/;
+    const EC_EMAIL = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+    // execCommand #autolink.
+    function ecAutolink(document, node, endOffset) {
+        for (let previous = ecPreviousEquivalentPoint(node, endOffset); previous; previous = ecPreviousEquivalentPoint(node, endOffset))
+            [node, endOffset] = previous;
+        if (!ecIsText(node)) return;
+        for (let ancestor = ecParent(node); ancestor; ancestor = ecParent(ancestor)) if (ecIsHTML(ancestor, "a")) return;
+        const data = ecData(node);
+        const search = /[^\t\n\f\r ]*$/.exec(data.slice(0, endOffset))[0];
+        const someSubstring = (pattern) => {
+            for (let i = 0; i < search.length; i++)
+                for (let j = i + 1; j <= search.length; j++) if (pattern.test(search.slice(i, j))) return true;
+            return false;
+        };
+        const longestEndingAt = (pattern, end) => {
+            for (let start = 0; start < end; start++) if (pattern.test(data.slice(start, end))) return start;
+            return -1;
+        };
+        let startOffset, href;
+        if (someSubstring(EC_AUTOLINKABLE_URL)) {
+            while (endOffset > 0 && longestEndingAt(EC_AUTOLINKABLE_URL, endOffset) < 0) endOffset--;
+            startOffset = longestEndingAt(EC_AUTOLINKABLE_URL, endOffset);
+            href = data.slice(startOffset, endOffset);
+        } else if (someSubstring(EC_EMAIL)) {
+            while (endOffset > 0 && longestEndingAt(EC_EMAIL, endOffset) < 0) endOffset--;
+            startOffset = longestEndingAt(EC_EMAIL, endOffset);
+            href = "mailto:" + data.slice(startOffset, endOffset);
+        } else return;
+        if (startOffset < 0) return;
+        const selection = ecSelectionOf(document), state = selectionState(selection);
+        const originalRange = state.range, originalDirection = state.direction;
+        const range = createLiveRange(document);
+        setRangeBoundary(range, node, startOffset, true);
+        setRangeBoundary(range, node, endOffset, false);
+        setSelectionRange(selection, range, "forwards");
+        ecTakeAction(document, "createLink", href);
+        setSelectionRange(selection, originalRange, originalDirection);
+    }
+
+    // --- Command definitions ----------------------------------------------
+    function ecFormattableEffective(document) {
+        const range = ecActiveRange(document);
+        return range ? ecEffectivelyContainedNodes(rangeState(range)).filter(ecIsFormattableNode) : [];
+    }
+    // execCommand #inline-command-activated-values: indeterminacy and state.
+    function ecActivatedIndeterm(document, command) {
+        const values = EC_ACTIVATED_VALUES[command];
+        const nodes = ecFormattableEffective(document);
+        return nodes.some((node) => values.includes(ecEffectiveCommandValue(node, command))) &&
+            nodes.some((node) => !values.includes(ecEffectiveCommandValue(node, command)));
+    }
+    function ecActivatedState(document, command) {
+        const values = EC_ACTIVATED_VALUES[command];
+        const range = ecActiveRange(document);
+        if (!range) return false;
+        const nodes = ecFormattableEffective(document);
+        if (!nodes.length) return values.includes(ecEffectiveCommandValue(rangeState(range).startNode, command));
+        return nodes.every((node) => values.includes(ecEffectiveCommandValue(node, command)));
+    }
+    // execCommand #standard-inline-value-command.
+    function ecStandardIndeterm(document, command) {
+        const nodes = ecFormattableEffective(document);
+        if (!nodes.length) return false;
+        const first = ecEffectiveCommandValue(nodes[0], command);
+        return nodes.some((node) => ecEffectiveCommandValue(node, command) !== first);
+    }
+    function ecStandardValue(document, command) {
+        const range = ecActiveRange(document);
+        if (!range) return "";
+        const nodes = ecFormattableEffective(document);
+        const value = ecEffectiveCommandValue(nodes.length ? nodes[0] : rangeState(range).startNode, command);
+        return value === null ? "" : value;
+    }
+    // Color commands' value validation (#the-backcolor-command steps 1-2).
+    function ecColorArgument(value) {
+        if (!ecIsValidColor(value)) value = "#" + value;
+        const color = ecColor(value);
+        return color === null || color === "currentcolor" ? null : value;
+    }
+    function ecInlineValueCommand(command) {
+        return (document, value) => {
+            if (EC_COLOR_COMMANDS.has(command)) {
+                value = ecColorArgument(value);
+                if (value === null) return false;
+            }
+            ecSetTheSelectionsValue(document, value, command);
+            return true;
+        };
+    }
+    function ecToggleCommand(command, on, off) {
+        return (document) => {
+            ecSetTheSelectionsValue(document, ecQueryCommandState(document, command) ? off : on, command);
+            return true;
+        };
+    }
+    // HTML #valid-floating-point-number.
+    const EC_FLOAT = /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+    function ecFontSizeAction(document, value) {
+        value = value.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "");
+        if (!EC_FLOAT.test(value) && !(value[0] === "+" && EC_FLOAT.test(value.slice(1)))) return false;
+        let mode = "absolute";
+        if (value[0] === "+") { value = value.slice(1); mode = "relative-plus"; }
+        else if (value[0] === "-") { value = value.slice(1); mode = "relative-minus"; }
+        // HTML #rules-for-parsing-non-negative-integers; an error yields 0.
+        const digits = /^[\t\n\f\r ]*(\d+)/.exec(value);
+        let number = digits ? Math.min(Number(digits[1]), 1e9) : 0;
+        if (mode === "relative-plus") number += 3;
+        if (mode === "relative-minus") number = 3 - number;
+        number = Math.max(1, Math.min(7, number));
+        ecSetTheSelectionsValue(document, EC_FONT_SIZE_KEYWORDS[number - 1], "fontSize");
+        return true;
+    }
+    function ecFontSizeValue(document) {
+        const range = ecActiveRange(document);
+        if (!range) return "";
+        const nodes = ecFormattableEffective(document);
+        const value = ecEffectiveCommandValue(nodes.length ? nodes[0] : rangeState(range).startNode, "fontSize");
+        return ecLegacyFontSize(ecPixels(value === null ? "" : value));
+    }
+    function ecCreateLinkAction(document, value) {
+        if (value === "") return false;
+        const range = rangeState(ecActiveRange(document));
+        const links = new Set();
+        for (const node of ecEffectivelyContainedNodes(range))
+            for (let ancestor = ecParent(node); ancestor; ancestor = ecParent(ancestor))
+                if (ecIsHTML(ancestor, "a") && ecHasAttribute(ancestor, "href") && ecIsEditable(ancestor)) links.add(ancestor);
+        for (const link of links) ecSetAttribute(link, "href", value);
+        ecSetTheSelectionsValue(document, value, "createLink");
+        return true;
+    }
+    const EC_REMOVE_FORMAT_CANDIDATES = ["abbr", "acronym", "b", "bdi", "bdo", "big", "blink", "cite", "code", "dfn",
+        "em", "font", "i", "ins", "kbd", "mark", "nobr", "q", "s", "samp", "small", "span", "strike", "strong",
+        "sub", "sup", "tt", "u", "var"];
+    // execCommand #removeformat-candidate.
+    function ecIsRemoveFormatCandidate(node) {
+        return ecIsEditable(node) && ecIsHTML(node, ...EC_REMOVE_FORMAT_CANDIDATES);
+    }
+    function ecRemoveFormatAction(document) {
+        const range = ecActiveRange(document), state = rangeState(range);
+        for (const element of ecEffectivelyContainedNodes(state).filter(ecIsRemoveFormatCandidate)) {
+            for (let child = ecFirstChild(element); child; child = ecFirstChild(element)) ecInsertBeforePreservingRanges(child, element);
+            ecRemove(element);
+        }
+        if (ecIsText(state.startNode) && ecIsEditable(state.startNode) && state.startOffset !== 0 &&
+            state.startOffset !== ecLength(state.startNode))
+            setRangeBoundary(range, ecCall(ecSplitTextMethod, state.startNode, state.startOffset), 0, true);
+        if (ecIsText(state.endNode) && ecIsEditable(state.endNode) && state.endOffset !== 0 &&
+            state.endOffset !== ecLength(state.endNode))
+            ecCall(ecSplitTextMethod, state.endNode, state.endOffset);
+        for (const node of ecEffectivelyContainedNodes(state).filter(ecIsEditable)) {
+            while (ecIsRemoveFormatCandidate(ecParent(node)) && ecInSameEditingHost(ecParent(node), node)) {
+                const parent = ecParent(node);
+                ecSplitTheParent(document, [node]);
+                if (rangeSame(ecParent(node), parent)) break;
+            }
+        }
+        for (const command of ["subscript", "bold", "fontName", "fontSize", "foreColor", "hiliteColor", "italic",
+            "strikethrough", "underline"]) ecSetTheSelectionsValue(document, null, command);
+        return true;
+    }
+    function ecScriptAction(command, on) {
+        return (document) => {
+            const state = ecQueryCommandState(document, command);
+            ecSetTheSelectionsValue(document, null, command);
+            if (!state) ecSetTheSelectionsValue(document, on, command);
+            return true;
+        };
+    }
+    function ecScriptIndeterm(command) {
+        return (document) => {
+            const nodes = ecFormattableEffective(document);
+            const values = nodes.map((node) => ecEffectiveCommandValue(node, command));
+            return (values.includes(command) && values.some((value) => value !== command)) || values.includes("mixed");
+        };
+    }
+    function ecUnlinkAction(document) {
+        const range = rangeState(ecActiveRange(document));
+        const hyperlinks = [];
+        const add = (node) => { if (ecIsHTML(node, "a") && ecHasAttribute(node, "href") && !hyperlinks.includes(node)) hyperlinks.push(node); };
+        for (const node of [range.startNode, range.endNode])
+            for (let ancestor = node; ancestor; ancestor = ecParent(ancestor)) add(ancestor);
+        for (const node of ecNodesContainedIn(range)) add(node);
+        hyperlinks.sort(ecTreeOrder);
+        for (const link of hyperlinks) ecClearTheValue(link, "unlink");
+        return true;
+    }
+    // execCommand #the-delete-command.
+    function ecDeleteAction(document) {
+        const active = ecActiveRange(document);
+        if (!rangeIsCollapsed(rangeState(active))) { ecDeleteTheSelection(document); return true; }
+        ecCanonicalizeWhitespace(document, ...ecStart(document));
+        let [node, offset] = ecStart(document);
+        for (;;) {
+            const previousChild = ecChildAt(node, offset - 1);
+            if (offset === 0 && ecPreviousSibling(node) && ecIsEditable(ecPreviousSibling(node)) && ecIsInvisible(ecPreviousSibling(node)))
+                ecRemove(ecPreviousSibling(node));
+            else if (previousChild && ecIsEditable(previousChild) && ecIsInvisible(previousChild)) { ecRemove(previousChild); offset--; }
+            else if ((offset === 0 && ecIsInlineNode(node)) || ecIsInvisible(node)) { offset = ecIndex(node); node = ecParent(node); }
+            else if (previousChild && ecIsEditable(previousChild) && ecIsHTML(previousChild, "a")) {
+                ecRemovePreservingDescendants(document, previousChild);
+                return true;
+            } else if (previousChild && !ecIsBlockNode(previousChild) && !ecIsHTML(previousChild, "br", "img")) {
+                node = previousChild; offset = ecLength(node);
+            } else break;
+            if (!node) return true;
+        }
+        const previousChild = ecChildAt(node, offset - 1);
+        if ((ecIsText(node) && offset !== 0) || (ecIsBlockNode(node) && previousChild && ecIsHTML(previousChild, "br", "hr", "img"))) {
+            ecCollapse(document, node, offset);
+            ecExtend(document, node, offset - 1);
+            ecDeleteTheSelection(document);
+            return true;
+        }
+        if (ecIsInlineNode(node)) return true;
+        if (ecIsHTML(node, "li", "dt", "dd") && rangeSame(ecFirstChild(ecParent(node)), node) && offset === 0) {
+            const items = [];
+            for (let ancestor = ecParent(node); ancestor; ancestor = ecParent(ancestor)) if (ecIsHTML(ancestor, "li")) items.unshift(ancestor);
+            for (const item of items) ecNormalizeSublists(item);
+            const values = ecRecordTheValues([node]);
+            ecSplitTheParent(document, [node]);
+            ecRestoreTheValues(document, values);
+            node = ecOutdentListItemName(document, node);
+            ecFixDisallowedAncestors(document, node);
+            return true;
+        }
+        let startNode = node, startOffset = offset;
+        for (;;) {
+            const child = ecChildAt(startNode, startOffset - 1);
+            if (startOffset === 0) { startOffset = ecIndex(startNode); startNode = ecParent(startNode); }
+            else if (child && ecIsEditable(child) && ecIsInvisible(child)) { ecRemove(child); startOffset--; }
+            else break;
+            // Leaving the editing host leaves nothing to merge with: the
+            // remaining steps would only reach non-editable content, which
+            // the algorithms never modify (#editable).
+            if (!startNode || (!ecIsEditable(startNode) && !ecIsEditingHost(startNode))) return true;
+        }
+        if (offset === 0) {
+            let indented = false;
+            for (let ancestor = node; ancestor; ancestor = ecParent(ancestor))
+                if (ecIsEditable(ancestor) && ecInSameEditingHost(ancestor, node) && ecIsIndentationElement(ancestor)) { indented = true; break; }
+            if (indented) {
+                const newRange = ecBlockExtend({startNode: node, startOffset: 0, endNode: node, endOffset: 0});
+                const nodeList = [];
+                for (const current of ecNodesContainedIn(newRange)) {
+                    if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], current)) continue;
+                    if (ecIsEditable(current) && !ecHasEditableDescendant(current)) nodeList.push(current);
+                }
+                for (const current of nodeList) ecOutdent(document, current);
+                return true;
+            }
+        }
+        if (ecIsHTML(ecChildAt(startNode, startOffset), "table")) return true;
+        if (ecIsHTML(ecChildAt(startNode, startOffset - 1), "table")) {
+            ecCollapse(document, startNode, startOffset - 1);
+            ecExtend(document, startNode, startOffset);
+            return true;
+        }
+        const before = ecChildAt(startNode, startOffset - 1);
+        if (offset === 0 && (ecIsHTML(before, "hr") ||
+            (ecIsHTML(before, "br") && (ecIsHTML(ecPreviousSibling(before), "br") || !ecIsInlineNode(ecPreviousSibling(before)))))) {
+            ecCollapse(document, startNode, startOffset - 1);
+            ecExtend(document, startNode, startOffset);
+            ecDeleteTheSelection(document);
+            ecCollapse(document, node, offset);
+            return true;
+        }
+        const at = ecChildAt(startNode, startOffset);
+        if (ecIsHTML(at, "li", "dt", "dd") && ecIsInlineNode(ecFirstChild(at)) && startOffset !== 0) {
+            const previousItem = ecChildAt(startNode, startOffset - 1);
+            if (ecIsInlineNode(ecLastChild(previousItem)) && !ecIsHTML(ecLastChild(previousItem), "br"))
+                ecAppend(previousItem, ecCreate(document, "br"));
+            if (ecIsInlineNode(ecLastChild(previousItem))) ecAppend(previousItem, ecCreate(document, "br"));
+        }
+        if (ecIsHTML(at, "li", "dt", "dd") && ecIsHTML(ecPreviousSibling(at), "li", "dt", "dd")) {
+            const originalRange = ecCall(ecRangeCloneMethod, ecActiveRange(document));
+            startNode = ecChildAt(startNode, startOffset - 1);
+            startOffset = ecLength(startNode);
+            node = ecNextSibling(startNode);
+            ecCollapse(document, startNode, startOffset);
+            ecExtend(document, node, 0);
+            ecDeleteTheSelection(document);
+            ecCall(ecRemoveAllRangesMethod, ecSelectionOf(document));
+            ecCall(ecAddRangeMethod, ecSelectionOf(document), originalRange);
+            return true;
+        }
+        for (let child = ecChildAt(startNode, startOffset - 1); child; child = ecChildAt(startNode, startOffset - 1)) {
+            if (ecIsEditable(child) && ecIsInvisible(child)) { ecRemove(child); startOffset--; }
+            else { startNode = child; startOffset = ecLength(startNode); }
+        }
+        ecCollapse(document, startNode, startOffset);
+        ecExtend(document, node, offset);
+        ecDeleteTheSelection(document, true, true, "backward");
+        return true;
+    }
+    function ecHasEditableDescendant(node) {
+        for (let current = ecNextNode(node); current && ecIsAncestor(node, current); current = ecNextNode(current))
+            if (ecIsEditable(current)) return true;
+        return false;
+    }
+    // The dt/dd step shared by delete and insertParagraph: an item that is
+    // allowed nowhere in its editing host takes the default single-line
+    // container name.
+    function ecOutdentListItemName(document, node) {
+        if (!ecIsHTML(node, "dd", "dt")) return node;
+        for (let ancestor = ecParent(node); ancestor; ancestor = ecParent(ancestor))
+            if (ecInSameEditingHost(node, ancestor) && ecIsAllowedChild(node, ancestor)) return node;
+        return ecSetTagName(node, ecEditingState(document).defaultSingleLineContainerName);
+    }
+    // execCommand #the-forwarddelete-command.
+    function ecForwardDeleteAction(document) {
+        const active = ecActiveRange(document);
+        if (!rangeIsCollapsed(rangeState(active))) { ecDeleteTheSelection(document); return true; }
+        ecCanonicalizeWhitespace(document, ...ecStart(document));
+        let [node, offset] = ecStart(document);
+        for (;;) {
+            const child = ecChildAt(node, offset);
+            if (offset === ecLength(node) && ecNextSibling(node) && ecIsEditable(ecNextSibling(node)) && ecIsInvisible(ecNextSibling(node)))
+                ecRemove(ecNextSibling(node));
+            else if (child && ecIsEditable(child) && ecIsInvisible(child)) ecRemove(child);
+            else if ((offset === ecLength(node) && ecIsInlineNode(node)) || ecIsInvisible(node)) {
+                offset = 1 + ecIndex(node); node = ecParent(node);
+            } else if (child && !ecIsBlockNode(child) && !ecIsHTML(child, "br", "img") && !ecIsCollapsedBlockProp(child)) {
+                node = child; offset = 0;
+            } else break;
+            if (!node) return true;
+        }
+        if (ecIsText(node) && offset !== ecLength(node)) {
+            let endOffset = offset + 1;
+            const data = ecData(node);
+            while (endOffset !== ecLength(node) && /\p{M}/u.test(data[endOffset])) endOffset++;
+            ecCollapse(document, node, offset);
+            ecExtend(document, node, endOffset);
+            ecDeleteTheSelection(document);
+            return true;
+        }
+        if (ecIsInlineNode(node)) return true;
+        const child = ecChildAt(node, offset);
+        if (child && ecIsHTML(child, "br", "hr", "img") && !ecIsCollapsedBlockProp(child)) {
+            ecCollapse(document, node, offset);
+            ecExtend(document, node, offset + 1);
+            ecDeleteTheSelection(document);
+            return true;
+        }
+        let endNode = node, endOffset = offset;
+        if (ecChildAt(endNode, endOffset) && ecIsCollapsedBlockProp(ecChildAt(endNode, endOffset))) endOffset++;
+        for (;;) {
+            const next = ecChildAt(endNode, endOffset);
+            if (endOffset === ecLength(endNode)) { endOffset = 1 + ecIndex(endNode); endNode = ecParent(endNode); }
+            else if (next && ecIsEditable(next) && ecIsInvisible(next)) ecRemove(next);
+            else break;
+            // As for delete: nothing beyond the editing host is merged.
+            if (!endNode || (!ecIsEditable(endNode) && !ecIsEditingHost(endNode))) return true;
+        }
+        if (ecIsHTML(ecChildAt(endNode, endOffset - 1), "table")) return true;
+        if (ecIsHTML(ecChildAt(endNode, endOffset), "table")) {
+            ecCollapse(document, endNode, endOffset);
+            ecExtend(document, endNode, endOffset + 1);
+            return true;
+        }
+        if (offset === ecLength(node) && ecIsHTML(ecChildAt(endNode, endOffset), "hr", "br")) {
+            ecCollapse(document, endNode, endOffset);
+            ecExtend(document, endNode, endOffset + 1);
+            ecDeleteTheSelection(document);
+            ecCollapse(document, node, offset);
+            return true;
+        }
+        for (let next = ecChildAt(endNode, endOffset); next; next = ecChildAt(endNode, endOffset)) {
+            if (ecIsEditable(next) && ecIsInvisible(next)) ecRemove(next);
+            else { endNode = next; endOffset = 0; }
+        }
+        ecCollapse(document, node, offset);
+        ecExtend(document, endNode, endOffset);
+        ecDeleteTheSelection(document);
+        return true;
+    }
+    // execCommand #formattable-block-name.
+    const EC_FORMATTABLE_BLOCK_NAMES = ["address", "dd", "div", "dt", "h1", "h2", "h3", "h4", "h5", "h6", "p", "pre"];
+    function ecIsAncestorOfProhibitedParagraphChild(node) {
+        for (let current = ecNextNode(node); current && ecIsAncestor(node, current); current = ecNextNode(current))
+            if (ecIsProhibitedParagraphChild(current)) return true;
+        return false;
+    }
+    function ecFormatBlockAction(document, value) {
+        if (value.startsWith("<") && value.endsWith(">")) value = value.slice(1, -1);
+        value = asciiLower(value);
+        if (!EC_FORMATTABLE_BLOCK_NAMES.includes(value)) return false;
+        const newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+        let nodeList = [];
+        for (const node of ecNodesContainedIn(newRange)) {
+            if (!ecIsEditable(node)) continue;
+            if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], node)) continue;
+            if (!(ecIsNonListSingleLineContainer(node) || ecIsAllowedChild(node, "p") || ecIsHTML(node, "dd", "dt"))) continue;
+            if (ecIsAncestorOfProhibitedParagraphChild(node)) continue;
+            nodeList.push(node);
+        }
+        const values = ecRecordTheValues(nodeList);
+        for (const node of nodeList) {
+            for (;;) {
+                let splittable = false;
+                for (let ancestor = ecParent(node); ancestor; ancestor = ecParent(ancestor)) {
+                    if (ecIsEditable(ancestor) && ecInSameEditingHost(ancestor, node) &&
+                        ecIsHTML(ancestor, ...EC_FORMATTABLE_BLOCK_NAMES) && !ecIsAncestorOfProhibitedParagraphChild(ancestor)) {
+                        splittable = true;
+                        break;
+                    }
+                }
+                if (!splittable) break;
+                const parent = ecParent(node);
+                ecSplitTheParent(document, [node]);
+                if (rangeSame(ecParent(node), parent)) break;
+            }
+        }
+        ecRestoreTheValues(document, values);
+        while (nodeList.length) {
+            let sublist;
+            if (ecIsSingleLineContainer(nodeList[0])) {
+                sublist = ecChildren(nodeList[0]);
+                const recorded = ecRecordTheValues(sublist);
+                ecRemovePreservingDescendants(document, nodeList[0]);
+                ecRestoreTheValues(document, recorded);
+                nodeList.shift();
+            } else {
+                sublist = [nodeList.shift()];
+                while (nodeList.length && rangeSame(nodeList[0], ecNextSibling(sublist[sublist.length - 1])) &&
+                    !ecIsSingleLineContainer(nodeList[0]) && !ecIsHTML(sublist[sublist.length - 1], "br"))
+                    sublist.push(nodeList.shift());
+            }
+            const result = ecWrap(sublist, value === "div" || value === "p" ? () => false
+                : (sibling) => ecIsHTML(sibling, value) && !ecAttributeList(sibling).length,
+            () => ecCreate(document, value));
+            if (result) ecFixDisallowedAncestors(document, result);
+        }
+        return true;
+    }
+    function ecFormatBlockNode(node) {
+        while (ecIsEditable(ecParent(node)) && ecInSameEditingHost(ecParent(node), node) &&
+            !ecIsHTML(node, ...EC_FORMATTABLE_BLOCK_NAMES)) node = ecParent(node);
+        return node;
+    }
+    function ecFormatBlockType(node) {
+        node = ecFormatBlockNode(node);
+        return ecIsEditable(node) && ecIsHTML(node, ...EC_FORMATTABLE_BLOCK_NAMES) && !ecIsAncestorOfProhibitedParagraphChild(node)
+            ? htmlElementName(node) : "";
+    }
+    function ecVisibleEditableLeaves(document) {
+        const range = ecActiveRange(document);
+        if (!range) return null;
+        return ecNodesContainedIn(ecBlockExtend(rangeState(range)))
+            .filter((node) => ecIsVisible(node) && ecIsEditable(node) && !ecHasChildren(node));
+    }
+    function ecFormatBlockIndeterm(document) {
+        const nodeList = ecVisibleEditableLeaves(document);
+        if (!nodeList || !nodeList.length) return false;
+        let type = null;
+        for (const node of nodeList) {
+            const current = ecFormatBlockType(node);
+            if (type === null) type = current;
+            else if (type !== current) return true;
+        }
+        return false;
+    }
+    function ecFormatBlockValue(document) {
+        const nodeList = ecVisibleEditableLeaves(document);
+        if (!nodeList || !nodeList.length) return "";
+        return asciiLower(ecFormatBlockType(nodeList[0]));
+    }
+    // execCommand #the-indent-command.
+    function ecIndentAction(document) {
+        for (const item of ecListItemsAtActiveRange(rangeState(ecActiveRange(document)))) ecNormalizeSublists(item);
+        const newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+        const nodeList = [];
+        for (const node of ecNodesContainedIn(newRange)) {
+            if (!ecIsEditable(node) || !(ecIsAllowedChild(node, "div") || ecIsAllowedChild(node, "ol"))) continue;
+            if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], node)) continue;
+            nodeList.push(node);
+        }
+        const firstVisible = nodeList.find(ecIsVisible);
+        if (firstVisible && ecIsHTML(firstVisible, "li") && ecIsHTML(ecParent(firstVisible), "ol", "ul")) {
+            let sibling = ecPreviousSibling(firstVisible);
+            while (sibling && ecIsInvisible(sibling)) sibling = ecPreviousSibling(sibling);
+            if (ecIsHTML(sibling, "li")) ecNormalizeSublists(sibling);
+        }
+        while (nodeList.length) {
+            const sublist = [nodeList.shift()];
+            while (nodeList.length && rangeSame(nodeList[0], ecNextSibling(sublist[sublist.length - 1]))) sublist.push(nodeList.shift());
+            ecIndent(document, sublist);
+        }
+        return true;
+    }
+    // execCommand #the-outdent-command.
+    function ecOutdentAction(document) {
+        for (const item of ecListItemsAtActiveRange(rangeState(ecActiveRange(document)))) ecNormalizeSublists(item);
+        const newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+        const nodeList = [];
+        for (const node of ecNodesContainedIn(newRange)) {
+            if (nodeList.length && ecIsAncestor(nodeList[nodeList.length - 1], node)) continue;
+            if (!ecIsEditable(node)) continue;
+            if (!ecHasEditableDescendant(node) || ecIsHTML(node, "ol", "ul") ||
+                (ecIsHTML(node, "li") && ecIsHTML(ecParent(node), "ol", "ul"))) nodeList.push(node);
+        }
+        while (nodeList.length) {
+            while (nodeList.length && (ecIsHTML(nodeList[0], "ol", "ul") || !ecIsHTML(ecParent(nodeList[0]), "ol", "ul")))
+                ecOutdent(document, nodeList.shift());
+            if (!nodeList.length) break;
+            const sublist = [nodeList.shift()];
+            while (nodeList.length && rangeSame(nodeList[0], ecNextSibling(sublist[sublist.length - 1])) &&
+                !ecIsHTML(nodeList[0], "ol", "ul")) sublist.push(nodeList.shift());
+            const values = ecRecordTheValues(sublist);
+            ecSplitTheParent(document, sublist);
+            for (const node of sublist) ecFixDisallowedAncestors(document, node);
+            ecRestoreTheValues(document, values);
+        }
+        return true;
+    }
+    // Moves a Text boundary off the start or end of its node (the shared
+    // insertHorizontalRule/insertLineBreak steps).
+    function ecLeaveTextEdges(document) {
+        let [node, offset] = ecStart(document);
+        if (ecIsText(node) && offset === 0) ecCollapse(document, ecParent(node), ecIndex(node));
+        [node, offset] = ecStart(document);
+        if (ecIsText(node) && offset === ecLength(node)) ecCollapse(document, ecParent(node), 1 + ecIndex(node));
+    }
+    // execCommand #the-inserthorizontalrule-command.
+    function ecInsertHorizontalRuleAction(document) {
+        let [startNode, startOffset] = ecStart(document), [endNode, endOffset] = ecEnd(document);
+        while (startOffset === 0 && ecParent(startNode)) { startOffset = ecIndex(startNode); startNode = ecParent(startNode); }
+        while (endOffset === ecLength(endNode) && ecParent(endNode)) { endOffset = 1 + ecIndex(endNode); endNode = ecParent(endNode); }
+        ecCollapse(document, startNode, startOffset);
+        ecExtend(document, endNode, endOffset);
+        ecDeleteTheSelection(document, false);
+        const start = ecStart(document)[0];
+        if (!ecIsEditable(start) && !ecIsEditingHost(start)) return true;
+        const hr = ecCreate(document, "hr");
+        ecLeaveTextEdges(document);
+        ecCall(ecRangeInsertNodeMethod, ecActiveRange(document), hr);
+        ecFixDisallowedAncestors(document, hr);
+        ecCollapse(document, ecParent(hr), 1 + ecIndex(hr));
+        return true;
+    }
+    // execCommand #the-inserthtml-command.
+    function ecInsertHTMLAction(document, value) {
+        ecDeleteTheSelection(document);
+        let [start, startOffset] = ecStart(document);
+        if (!ecIsEditable(start) && !ecIsEditingHost(start)) return true;
+        const fragment = ecCall(ecRangeFragmentMethod, ecActiveRange(document), value);
+        const lastChild = ecLastChild(fragment);
+        if (!lastChild) return true;
+        const descendants = [];
+        for (let node = ecNextNode(fragment); node && ecIsAncestor(fragment, node); node = ecNextNode(node)) descendants.push(node);
+        [start, startOffset] = ecStart(document);
+        if (ecIsBlockNode(start)) {
+            const props = ecChildren(start).filter((child, index) => index >= startOffset && ecIsEditable(child) && ecIsCollapsedBlockProp(child));
+            for (const node of props) ecRemove(node);
+        }
+        ecCall(ecRangeInsertNodeMethod, ecActiveRange(document), fragment);
+        start = ecStart(document)[0];
+        if (ecIsBlockNode(start) && !ecFirstVisibleChild(start)) ecAppend(start, ecCreate(document, "br"));
+        ecCollapse(document, ecParent(lastChild), 1 + ecIndex(lastChild));
+        for (const node of descendants) ecFixDisallowedAncestors(document, node);
+        return true;
+    }
+    // execCommand #the-insertimage-command.
+    function ecInsertImageAction(document, value) {
+        if (value === "") return false;
+        ecDeleteTheSelection(document, true, false);
+        const range = ecActiveRange(document), state = rangeState(range);
+        if (!ecIsEditable(state.startNode) && !ecIsEditingHost(state.startNode)) return true;
+        if (ecIsBlockNode(state.startNode) && ecChildren(state.startNode).length === 1 &&
+            ecIsHTML(ecFirstChild(state.startNode), "br") && state.startOffset === 0)
+            ecRemove(ecFirstChild(state.startNode));
+        const img = ecCreate(document, "img");
+        ecSetAttribute(img, "src", value);
+        ecCall(ecRangeInsertNodeMethod, range, img);
+        ecCollapse(document, ecParent(img), 1 + ecIndex(img));
+        return true;
+    }
+    // execCommand #the-insertlinebreak-command.
+    function ecInsertLineBreakAction(document) {
+        ecDeleteTheSelection(document, true, false);
+        let start = ecStart(document)[0];
+        if (!ecIsEditable(start) && !ecIsEditingHost(start)) return true;
+        if (ecIsElement(start) && !ecIsAllowedChild("br", start)) return true;
+        if (!ecIsElement(start) && !ecIsAllowedChild("br", ecParent(start))) return true;
+        ecLeaveTextEdges(document);
+        const br = ecCreate(document, "br");
+        ecCall(ecRangeInsertNodeMethod, ecActiveRange(document), br);
+        ecCollapse(document, ecParent(br), 1 + ecIndex(br));
+        if (ecIsCollapsedLineBreak(br)) ecInsertExtraLineBreak(document, br);
+        return true;
+    }
+    // Inserts an extra br at the collapsed active range, after `br`. The
+    // specification predates DOM #concept-range-insert extending a
+    // collapsed range over the inserted node; the caret stays where the
+    // algorithm placed it, before the extra br.
+    function ecInsertExtraLineBreak(document, br) {
+        ecCall(ecRangeInsertNodeMethod, ecActiveRange(document), ecCreate(document, "br"));
+        ecCollapse(document, ecParent(br), 1 + ecIndex(br));
+    }
+    // execCommand #the-insertparagraph-command.
+    function ecInsertParagraphAction(document) {
+        ecDeleteTheSelection(document);
+        let [node, offset] = ecStart(document);
+        if (!ecIsEditable(node) && !ecIsEditingHost(node)) return true;
+        if (ecIsText(node) && offset !== 0 && offset !== ecLength(node)) ecCall(ecSplitTextMethod, node, offset);
+        if (ecIsText(node) && offset === ecLength(node)) { offset = 1 + ecIndex(node); node = ecParent(node); }
+        if (ecIsText(node) || ecType(node) === 8) { offset = ecIndex(node); node = ecParent(node); }
+        ecCollapse(document, node, offset);
+        let container = node;
+        while (!ecIsSingleLineContainer(container) && ecIsEditable(ecParent(container)) && ecInSameEditingHost(ecParent(container), node))
+            container = ecParent(container);
+        if (ecIsEditable(container) && ecIsSingleLineContainer(container) && ecInSameEditingHost(container, node) &&
+            ecIsHTML(container, "p", "div")) {
+            let outerContainer = container;
+            while (!ecIsHTML(outerContainer, "dd", "dt", "li") && ecIsEditable(ecParent(outerContainer))) outerContainer = ecParent(outerContainer);
+            if (ecIsHTML(outerContainer, "dd", "dt", "li")) container = outerContainer;
+        }
+        if (!ecIsEditable(container) || !ecInSameEditingHost(container, node) || !ecIsSingleLineContainer(container)) {
+            const tag = ecEditingState(document).defaultSingleLineContainerName;
+            const newRange = ecBlockExtend(rangeState(ecActiveRange(document)));
+            const nodeList = [];
+            const first = ecNodesContainedIn(newRange).find((candidate) => ecIsAllowedChild(candidate, "p"));
+            if (first) nodeList.push(first);
+            if (!nodeList.length) {
+                const start = ecStart(document)[0];
+                if (!ecIsAllowedChild(tag, start)) return true;
+                container = ecCreate(document, tag);
+                ecCall(ecRangeInsertNodeMethod, ecActiveRange(document), container);
+                ecAppend(container, ecCreate(document, "br"));
+                ecCollapse(document, container, 0);
+                return true;
+            }
+            while (ecNextSibling(nodeList[nodeList.length - 1]) && ecIsAllowedChild(ecNextSibling(nodeList[nodeList.length - 1]), "p"))
+                nodeList.push(ecNextSibling(nodeList[nodeList.length - 1]));
+            container = ecWrap(nodeList, () => false, () => ecCreate(document, tag));
+            if (!container) return true;
+        }
+        if (ecIsHTML(container, "address", "listing", "pre")) {
+            const br = ecCreate(document, "br");
+            ecCall(ecRangeInsertNodeMethod, ecActiveRange(document), br);
+            ecCollapse(document, node, offset + 1);
+            let last = container;
+            for (let child = ecLastChild(last); child; child = ecLastChild(last)) last = child;
+            if (rangeSame(last, br)) ecInsertExtraLineBreak(document, br);
+            return true;
+        }
+        if (ecIsHTML(container, "li", "dt", "dd") && (!ecHasChildren(container) ||
+            (ecChildren(container).length === 1 && ecIsHTML(ecFirstChild(container), "br")))) {
+            ecSplitTheParent(document, [container]);
+            if (!ecHasChildren(container)) ecAppend(container, ecCreate(document, "br"));
+            container = ecOutdentListItemName(document, container);
+            ecFixDisallowedAncestors(document, container);
+            return true;
+        }
+        const startState = rangeState(ecActiveRange(document));
+        const newLineRange = {startNode: startState.startNode, startOffset: startState.startOffset,
+            endNode: container, endOffset: ecLength(container)};
+        while (newLineRange.startOffset === 0 && !ecIsProhibitedParagraphChild(newLineRange.startNode)) {
+            newLineRange.startOffset = ecIndex(newLineRange.startNode);
+            newLineRange.startNode = ecParent(newLineRange.startNode);
+        }
+        while (newLineRange.startOffset === ecLength(newLineRange.startNode) && !ecIsProhibitedParagraphChild(newLineRange.startNode)) {
+            newLineRange.startOffset = 1 + ecIndex(newLineRange.startNode);
+            newLineRange.startNode = ecParent(newLineRange.startNode);
+        }
+        const contained = ecNodesContainedIn(newLineRange);
+        const endOfLine = !contained.length || (contained.length === 1 && ecIsHTML(contained[0], "br"));
+        let newContainerName;
+        if (ecIsHTML(container, ...EC_HEADINGS) && endOfLine) newContainerName = ecEditingState(document).defaultSingleLineContainerName;
+        else if (ecIsHTML(container, "dt") && endOfLine) newContainerName = "dd";
+        else if (ecIsHTML(container, "dd") && endOfLine) newContainerName = "dt";
+        else newContainerName = htmlElementName(container);
+        let newContainer = ecCreate(document, newContainerName);
+        ecCopyAttributes(container, newContainer);
+        ecRemoveAttribute(newContainer, "id");
+        ecInsertBefore(ecParent(container), newContainer, ecNextSibling(container));
+        const liveRange = newRangeFor(document, newLineRange.startNode, newLineRange.startOffset, newLineRange.endNode, newLineRange.endOffset);
+        const fragment = ecCall(ecRangeExtractMethod, liveRange);
+        for (let descendant = ecNextNode(fragment); descendant && ecIsAncestor(fragment, descendant); descendant = ecNextNode(descendant))
+            if (ecIsElement(descendant) && !contained.includes(descendant)) ecRemoveAttribute(descendant, "id");
+        ecAppend(newContainer, fragment);
+        while (ecIsProhibitedParagraphChild(ecLastChild(container))) container = ecLastChild(container);
+        while (ecIsProhibitedParagraphChild(ecLastChild(newContainer))) newContainer = ecLastChild(newContainer);
+        if (!ecFirstVisibleChild(container)) ecAppend(container, ecCreate(document, "br"));
+        if (!ecFirstVisibleChild(newContainer)) ecAppend(newContainer, ecCreate(document, "br"));
+        ecCollapse(document, newContainer, 0);
+        return true;
+    }
+    // execCommand #the-inserttext-command.
+    function ecInsertTextAction(document, value) {
+        ecDeleteTheSelection(document, true, false);
+        const start = ecStart(document)[0];
+        if (!ecIsEditable(start) && !ecIsEditingHost(start)) return true;
+        // Step 3 runs the action once per code unit. A surrogate pair stays
+        // one insertion so that no intermediate DOM holds a lone surrogate
+        // (the specification's TODO for non-BMP input).
+        const units = Array.from(value);
+        if (units.length > 1) {
+            for (const unit of units) ecInsertTextAction(document, unit);
+            return true;
+        }
+        if (value === "") return true;
+        if (value === "\n") { ecInsertParagraphAction(document); return true; }
+        let [node, offset] = ecStart(document);
+        const before = ecChildAt(node, offset - 1);
+        if (before && ecIsText(before)) { node = before; offset = ecLength(node); }
+        const at = ecChildAt(node, offset);
+        if (at && ecIsText(at)) { node = at; offset = 0; }
+        const overrides = ecRecordCurrentOverrides(document);
+        ecCollapse(document, node, offset);
+        ecCanonicalizeWhitespace(document, node, offset);
+        [node, offset] = ecStart(document);
+        if (ecIsText(node)) {
+            ecCall(ecReplaceDataMethod, node, offset, 0, value);
+            ecCollapse(document, node, offset);
+            ecExtend(document, node, offset + value.length);
+        } else {
+            const children = ecChildren(node);
+            if (children.length === 1 && ecIsCollapsedLineBreak(children[0])) ecRemove(children[0]);
+            const text = ecCall(ecCreateTextMethod, document, value);
+            ecCall(ecRangeInsertNodeMethod, ecActiveRange(document), text);
+            ecCollapse(document, text, 0);
+            ecExtend(document, text, value.length);
+        }
+        ecRestoreStatesAndValues(document, overrides);
+        ecCanonicalizeWhitespace(document, ...ecStart(document), false);
+        ecCanonicalizeWhitespace(document, ...ecEnd(document), false);
+        if (/^[\t\n\f\r ]$/.test(value)) ecAutolink(document, ...ecStart(document));
+        ecCollapseToEnd(document);
+        return true;
+    }
+    function ecJustifyIndeterm(alignment) {
+        return (document) => {
+            const nodes = ecVisibleEditableLeaves(document);
+            if (!nodes) return false;
+            return nodes.some((node) => ecAlignmentValue(node) === alignment) && nodes.some((node) => ecAlignmentValue(node) !== alignment);
+        };
+    }
+    function ecJustifyState(alignment) {
+        return (document) => {
+            const nodes = ecVisibleEditableLeaves(document);
+            return !!nodes && nodes.length > 0 && nodes.every((node) => ecAlignmentValue(node) === alignment);
+        };
+    }
+    function ecJustifyValue(document) {
+        const nodes = ecVisibleEditableLeaves(document);
+        if (!nodes) return "";
+        return nodes.length ? ecAlignmentValue(nodes[0]) : "left";
+    }
+    function ecMiscStyleWithCSS(document, value) {
+        ecEditingState(document).cssStyling = asciiLower(value) !== "false";
+        return true;
+    }
+    function ecMiscUseCSS(document, value) {
+        ecEditingState(document).cssStyling = asciiLower(value) === "false";
+        return true;
+    }
+    function ecDefaultParagraphSeparatorAction(document, value) {
+        value = asciiLower(value);
+        if (value !== "p" && value !== "div") return false;
+        ecEditingState(document).defaultSingleLineContainerName = value;
+        return true;
+    }
+    // execCommand #the-selectall-command.
+    function ecSelectAllAction(document) {
+        let target = document.body;
+        if (!target) target = document.documentElement;
+        if (!target) ecCall(ecRemoveAllRangesMethod, ecSelectionOf(document));
+        else ecCall(ecSelectAllChildrenMethod, ecSelectionOf(document), target);
+        return true;
+    }
+    // The commands of the specification. `inputType` is the mapped value of
+    // #map-an-edit-command-to-input-type-value; where that table has no row
+    // for a command whose intention Input Events 2 names (formatItalic,
+    // formatUnderline, formatSubscript, formatRemove, and formatBackColor for
+    // hiliteColor, which "behave[s] identically" to backColor), that name is
+    // used, since Input Events 2 requires the corresponding inputType for an
+    // editing operation that changes the DOM.
+    const EC_BLOCK_PRESERVING = true;
+    const EC_COMMANDS = {
+        backColor: {action: ecInlineValueCommand("backColor"), indeterm: (d) => ecStandardIndeterm(d, "backColor"),
+            value: (d) => ecStandardValue(d, "backColor"), inputType: "formatBackColor", plaintext: false},
+        bold: {action: ecToggleCommand("bold", "bold", "normal"), indeterm: (d) => ecActivatedIndeterm(d, "bold"),
+            state: (d) => ecActivatedState(d, "bold"), inputType: "formatBold", plaintext: false},
+        createLink: {action: ecCreateLinkAction, inputType: "insertLink", plaintext: false},
+        fontName: {action: ecInlineValueCommand("fontName"), indeterm: (d) => ecStandardIndeterm(d, "fontName"),
+            value: (d) => ecStandardValue(d, "fontName"), inputType: "formatFontName", plaintext: false},
+        fontSize: {action: ecFontSizeAction, indeterm: (d) => ecStandardIndeterm(d, "fontSize"), value: ecFontSizeValue,
+            inputType: "", plaintext: false},
+        foreColor: {action: ecInlineValueCommand("foreColor"), indeterm: (d) => ecStandardIndeterm(d, "foreColor"),
+            value: (d) => ecStandardValue(d, "foreColor"), inputType: "formatFontColor", plaintext: false},
+        hiliteColor: {action: ecInlineValueCommand("hiliteColor"), indeterm: (d) => ecStandardIndeterm(d, "hiliteColor"),
+            value: (d) => ecStandardValue(d, "hiliteColor"), inputType: "formatBackColor", plaintext: false},
+        italic: {action: ecToggleCommand("italic", "italic", "normal"), indeterm: (d) => ecActivatedIndeterm(d, "italic"),
+            state: (d) => ecActivatedState(d, "italic"), inputType: "formatItalic", plaintext: false},
+        removeFormat: {action: ecRemoveFormatAction, inputType: "formatRemove", plaintext: false},
+        strikethrough: {action: ecToggleCommand("strikethrough", "line-through", null),
+            indeterm: (d) => ecActivatedIndeterm(d, "strikethrough"), state: (d) => ecActivatedState(d, "strikethrough"),
+            inputType: "formatStrikeThrough", plaintext: false},
+        subscript: {action: ecScriptAction("subscript", "subscript"), indeterm: ecScriptIndeterm("subscript"),
+            state: (d) => ecActivatedState(d, "subscript"), inputType: "formatSubscript", plaintext: false},
+        superscript: {action: ecScriptAction("superscript", "superscript"), indeterm: ecScriptIndeterm("superscript"),
+            state: (d) => ecActivatedState(d, "superscript"), inputType: "formatSuperscript", plaintext: false},
+        underline: {action: ecToggleCommand("underline", "underline", null), indeterm: (d) => ecActivatedIndeterm(d, "underline"),
+            state: (d) => ecActivatedState(d, "underline"), inputType: "formatUnderline", plaintext: false},
+        unlink: {action: ecUnlinkAction, inputType: "", plaintext: false},
+        delete: {action: ecDeleteAction, inputType: "deleteContentBackward", preserves: EC_BLOCK_PRESERVING},
+        formatBlock: {action: ecFormatBlockAction, indeterm: ecFormatBlockIndeterm, value: ecFormatBlockValue,
+            inputType: "", preserves: EC_BLOCK_PRESERVING},
+        forwardDelete: {action: ecForwardDeleteAction, inputType: "deleteContentForward", preserves: EC_BLOCK_PRESERVING},
+        indent: {action: ecIndentAction, inputType: "formatIndent", preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        insertHorizontalRule: {action: ecInsertHorizontalRuleAction, inputType: "insertHorizontalRule",
+            preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        insertHTML: {action: ecInsertHTMLAction, inputType: "", preserves: EC_BLOCK_PRESERVING},
+        insertImage: {action: ecInsertImageAction, inputType: "", preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        insertLineBreak: {action: ecInsertLineBreakAction, inputType: "insertLineBreak", preserves: EC_BLOCK_PRESERVING},
+        insertOrderedList: {action: (d) => { ecToggleLists(d, "ol"); return true; },
+            indeterm: (d) => ["mixed", "mixed ol"].includes(ecSelectionsListState(d)),
+            state: (d) => ecSelectionsListState(d) === "ol", inputType: "insertOrderedList",
+            preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        insertParagraph: {action: ecInsertParagraphAction, inputType: "insertParagraph", preserves: EC_BLOCK_PRESERVING},
+        insertText: {action: ecInsertTextAction, inputType: "insertText"},
+        insertUnorderedList: {action: (d) => { ecToggleLists(d, "ul"); return true; },
+            indeterm: (d) => ["mixed", "mixed ul"].includes(ecSelectionsListState(d)),
+            state: (d) => ecSelectionsListState(d) === "ul", inputType: "insertUnorderedList",
+            preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        justifyCenter: {action: (d) => { ecJustifyTheSelection(d, "center"); return true; }, indeterm: ecJustifyIndeterm("center"),
+            state: ecJustifyState("center"), value: ecJustifyValue, inputType: "formatJustifyCenter",
+            preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        justifyFull: {action: (d) => { ecJustifyTheSelection(d, "justify"); return true; }, indeterm: ecJustifyIndeterm("justify"),
+            state: ecJustifyState("justify"), value: ecJustifyValue, inputType: "formatJustifyFull",
+            preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        justifyLeft: {action: (d) => { ecJustifyTheSelection(d, "left"); return true; }, indeterm: ecJustifyIndeterm("left"),
+            state: ecJustifyState("left"), value: ecJustifyValue, inputType: "formatJustifyLeft",
+            preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        justifyRight: {action: (d) => { ecJustifyTheSelection(d, "right"); return true; }, indeterm: ecJustifyIndeterm("right"),
+            state: ecJustifyState("right"), value: ecJustifyValue, inputType: "formatJustifyRight",
+            preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        outdent: {action: ecOutdentAction, inputType: "formatOutdent", preserves: EC_BLOCK_PRESERVING, plaintext: false},
+        copy: {action: (d) => ecClipboardAction(d, "copy"), misc: true},
+        cut: {action: (d) => ecClipboardAction(d, "cut"), misc: true},
+        defaultParagraphSeparator: {action: ecDefaultParagraphSeparatorAction,
+            value: (d) => ecEditingState(d).defaultSingleLineContainerName, misc: true},
+        redo: {action: (d) => ecHistoryAction(d, "redo"), misc: true},
+        selectAll: {action: ecSelectAllAction, misc: true},
+        styleWithCSS: {action: ecMiscStyleWithCSS, state: (d) => ecEditingState(d).cssStyling, misc: true},
+        undo: {action: (d) => ecHistoryAction(d, "undo"), misc: true},
+        useCSS: {action: ecMiscUseCSS, misc: true},
+    };
+    // ASCII case-insensitive command names (#methods-to-query-and-execute-commands).
+    const EC_COMMAND_NAMES = new Map(Object.keys(EC_COMMANDS).map((name) => [asciiLower(name), name]));
+    // execCommand #supported-commands. The paste command is optional and is
+    // not supported: script may never read TRust's clipboard, so it would
+    // do nothing at all (a command that must not be supported).
+    function ecSupportedCommand(command) {
+        const name = EC_COMMAND_NAMES.get(asciiLower(command));
+        return name === undefined ? null : name;
+    }
+    // execCommand #enabled.
+    function ecIsEnabled(document, command) {
+        const definition = EC_COMMANDS[command];
+        if (definition.misc && command !== "cut") return true;
+        const range = ecActiveRange(document);
+        if (!range) return false;
+        const {startNode, endNode} = rangeState(range);
+        if (!(ecIsEditable(startNode) || ecIsEditingHost(startNode)) || !(ecIsEditable(endNode) || ecIsEditingHost(endNode))) return false;
+        if (!ecAffectedEditingHost(document)) return false;
+        if (definition.plaintext === false && (ecContentEditableState(ecEditingHostOf(startNode)) === "plaintext-only" ||
+            ecContentEditableState(ecEditingHostOf(endNode)) === "plaintext-only")) return false;
+        return true;
+    }
+    // The editing host that is an inclusive ancestor of the active range's
+    // start and end nodes and an ancestor of no other such editing host.
+    function ecAffectedEditingHost(document) {
+        const range = ecActiveRange(document);
+        if (!range) return null;
+        const {startNode, endNode} = rangeState(range);
+        for (let ancestor = startNode; ancestor; ancestor = ecParent(ancestor))
+            if (ecIsEditingHost(ancestor) && ecIsInclusiveAncestor(ancestor, endNode)) return ancestor;
+        return null;
+    }
+    // Take the action for a command (within another command's algorithm),
+    // with "preserves overrides" handling.
+    function ecTakeAction(document, command, value) {
+        const definition = EC_COMMANDS[command];
+        if (!definition.preserves) return definition.action(document, value);
+        const overrides = ecRecordCurrentOverrides(document);
+        const result = definition.action(document, value);
+        const range = ecActiveRange(document);
+        if (range && rangeIsCollapsed(rangeState(range))) ecRestoreStatesAndValues(document, overrides);
+        return result;
+    }
+    // queryCommandState()/queryCommandValue() steps for a supported command.
+    function ecQueryCommandState(document, command) {
+        const definition = EC_COMMANDS[command];
+        if (!definition.state) return false;
+        const override = ecStateOverride(document, command);
+        if (override !== undefined) return override;
+        return !!definition.state(document);
+    }
+    function ecQueryCommandValue(document, command) {
+        const definition = EC_COMMANDS[command];
+        if (!definition.value) return "";
+        if (command === "fontSize" && ecValueOverride(document, "fontSize") !== undefined)
+            return ecLegacyFontSize(ecPixels(ecValueOverride(document, "fontSize")));
+        const override = ecValueOverride(document, command);
+        if (override !== undefined) return override;
+        return String(definition.value(document));
+    }
+
+    // --- Undo history ------------------------------------------------------
+    // The undo and redo commands are defined "by the UndoManager
+    // specification", which was never completed; Input Events 2 defines
+    // their historyUndo/historyRedo events. Each editing operation (a
+    // command, or a native edit through Input Events) is one transaction:
+    // the DOM mutation records (DOM #mutation-observers) of its editing
+    // host's subtree, gathered by an internal observer that author script
+    // cannot reach. Undo reverts the records in reverse order, recording
+    // that reversal for redo, so the same node objects are restored and the
+    // cost follows the size of the edit, not of the document. Consecutive
+    // typing at one caret coalesces, as in other user agents.
+    const EC_HISTORY_LIMIT = 100;
+    // Coalesced typing becomes a new history entry after this many records.
+    const EC_TYPING_RECORDS = 256;
+    const ecMutationObserverClass = g.MutationObserver;
+    const ecObserveMethod = ecMutationObserverClass.prototype.observe;
+    const ecTakeRecordsMethod = ecMutationObserverClass.prototype.takeRecords;
+    const ecDisconnectMethod = ecMutationObserverClass.prototype.disconnect;
+    const ecRemoveAttributeNSMethod = Element.prototype.removeAttributeNS;
+    const ecGetAttributeNodeNSMethod = Element.prototype.getAttributeNodeNS;
+    const ecAttrValueSetter = ecDescriptor(Attr.prototype, "value").set;
+    function ecRecorder(host) {
+        const observer = new ecMutationObserverClass(() => {});
+        ecCall(ecObserveMethod, observer, host, {childList: true, attributes: true, characterData: true,
+            subtree: true, attributeOldValue: true, characterDataOldValue: true});
+        return observer;
+    }
+    function ecRecords(observer) {
+        const records = ecCall(ecTakeRecordsMethod, observer);
+        ecCall(ecDisconnectMethod, observer);
+        return records;
+    }
+    function ecSelectionRecord(document) {
+        const state = selectionState(selectionFor(document));
+        if (!selectionVisible(state)) return null;
+        return [selectionAnchor(state), selectionFocus(state)];
+    }
+    function ecRestoreSelection(document, record, host) {
+        const selection = selectionFor(document);
+        try {
+            if (record && rangeContains(host, record[0][0]) && rangeContains(host, record[1][0]) &&
+                record[0][1] <= ecLength(record[0][0]) && record[1][1] <= ecLength(record[1][0])) {
+                ecCall(ecSetBaseAndExtentMethod, selection, record[0][0], record[0][1], record[1][0], record[1][1]);
+                return;
+            }
+        } catch (_) {}
+        ecCall(ecSelectionCollapseMethod, selection, host, 0);
+    }
+    function ecBeginTransaction(document, host) {
+        if (!host) return null;
+        return {document, host, observer: ecRecorder(host), selectionBefore: ecSelectionRecord(document)};
+    }
+    // Records the transaction; returns whether the operation changed the DOM.
+    function ecEndTransaction(transaction, kind) {
+        if (!transaction) return false;
+        const {document, host} = transaction;
+        const records = ecRecords(transaction.observer);
+        if (!records.length) return false;
+        const editing = ecEditingState(document);
+        const selectionAfter = ecSelectionRecord(document);
+        const previous = editing.undo[editing.undo.length - 1];
+        if (kind === "typing" && previous && previous === editing.typing && previous.host === host &&
+            previous.records.length < EC_TYPING_RECORDS && ecSameSelectionRecord(previous.selectionAfter, transaction.selectionBefore)) {
+            for (const record of records) previous.records.push(record);
+            previous.selectionAfter = selectionAfter;
+        } else {
+            const entry = {host, kind, records, selectionBefore: transaction.selectionBefore, selectionAfter};
+            editing.undo.push(entry);
+            if (editing.undo.length > EC_HISTORY_LIMIT) editing.undo.shift();
+            editing.typing = kind === "typing" ? entry : null;
+        }
+        editing.redo.length = 0;
+        return true;
+    }
+    function ecSameSelectionRecord(a, b) {
+        if (!a || !b) return false;
+        return rangeSame(a[0][0], b[0][0]) && a[0][1] === b[0][1] && rangeSame(a[1][0], b[1][0]) && a[1][1] === b[1][1];
+    }
+    // Reverts mutation records, last first. Each record describes the change
+    // from the state just before it, which the later records' reversal
+    // restores, so its siblings locate removed nodes again.
+    function ecRevertRecords(records) {
+        for (let i = records.length - 1; i >= 0; i--) {
+            const record = records[i], target = record.target;
+            if (record.type === "childList") {
+                for (const node of record.addedNodes)
+                    if (rangeSame(ecParent(node), target)) ecCall(ecRemoveChildMethod, target, node);
+                let reference = record.nextSibling;
+                if (!reference || !rangeSame(ecParent(reference), target))
+                    reference = record.previousSibling && rangeSame(ecParent(record.previousSibling), target)
+                        ? ecNextSibling(record.previousSibling) : record.previousSibling ? null : ecFirstChild(target);
+                for (const node of record.removedNodes) ecInsertBefore(target, node, reference);
+            } else if (record.type === "attributes") {
+                const namespace = record.attributeNamespace, name = record.attributeName;
+                if (record.oldValue === null) ecCall(ecRemoveAttributeNSMethod, target, namespace, name);
+                else {
+                    const attr = ecCall(ecGetAttributeNodeNSMethod, target, namespace, name);
+                    if (attr) ecCall(ecAttrValueSetter, attr, record.oldValue);
+                    else ecCall(ecSetAttributeNSMethod, target, namespace, name, record.oldValue);
+                }
+            } else ecCall(ecReplaceDataMethod, target, 0, ecLength(target), record.oldValue);
+        }
+    }
+    // Input Events 2 #event-type-beforeinput / #event-type-input. Returns
+    // false when a cancelable beforeinput was canceled.
+    function ecDispatchInputEvent(target, type, inputType, data, targetRanges = []) {
+        const event = createTrustedEvent(InputEvent, type, {bubbles: true, cancelable: type === "beforeinput",
+            composed: true, view: g, detail: 0, inputType, data, isComposing: false, targetRanges});
+        dispatch(target, event, false);
+        return !event.defaultPrevented;
+    }
+    // The undo and redo commands' action.
+    function ecHistoryAction(document, which) {
+        const editing = ecEditingState(document);
+        const stack = which === "undo" ? editing.undo : editing.redo;
+        while (stack.length) {
+            const entry = stack[stack.length - 1];
+            if (!entry.host.isConnected || !ecIsEditingHost(entry.host) || ecNodeDocument(entry.host) !== document) {
+                stack.pop();
+                continue;
+            }
+            const inputType = which === "undo" ? "historyUndo" : "historyRedo";
+            if (!ecDispatchInputEvent(entry.host, "beforeinput", inputType, null)) return false;
+            const index = stack.lastIndexOf(entry);
+            if (index < 0) return false;
+            stack.splice(index, 1);
+            editing.typing = null;
+            const observer = ecRecorder(entry.host);
+            try {
+                ecRevertRecords(entry.records);
+            } catch (error) {
+                // Author script rearranged the edited nodes so that the
+                // history no longer applies: discard it.
+                ecRecords(observer);
+                editing.undo.length = 0;
+                editing.redo.length = 0;
+                reportException(error, "execCommand " + which);
+                return false;
+            }
+            const records = ecRecords(observer);
+            ecRestoreSelection(document, entry.selectionBefore, entry.host);
+            (which === "undo" ? editing.redo : editing.undo).push({host: entry.host, kind: which, records,
+                selectionBefore: entry.selectionAfter, selectionAfter: entry.selectionBefore});
+            ecDispatchInputEvent(entry.host, "input", inputType, null);
+            return true;
+        }
+        return false;
+    }
+
+    // --- Clipboard commands (Clipboard API and events, local
+    // w3c/clipboard-apis 6201fd1, #integration-with-rich-text-editing and
+    // #clipboard-actions) ---------------------------------------------------
+    // The target of a clipboard event (#fire-a-clipboard-event): in an
+    // editable context, the element containing the selection's start;
+    // otherwise the focused element; else the body element.
+    function ecClipboardTarget(document) {
+        const range = ecActiveRange(document);
+        if (range && ecEditingHostOf(rangeState(range).startNode)) {
+            const start = rangeState(range).startNode;
+            return ecIsElement(start) ? start : (parentElementOf(start) || document.body || document);
+        }
+        const active = document.activeElement;
+        return active && active !== document.body ? active : (document.body || document.documentElement || document);
+    }
+    // A DataTransfer whose drag data store is in read/write mode
+    // (HTML #the-datatransfer-interface).
+    function ecClipboardDataTransfer() {
+        const store = createDragDataStore();
+        store.mode = "rw";
+        return {store, transfer: createDataTransfer(store)};
+    }
+    function ecWriteClipboard(text) {
+        __clipboard_write(text, () => {});
+    }
+    // The copy and cut actions with the script-triggered flag set: the
+    // script may access the clipboard only when it is allowed to modify it,
+    // i.e. with transient activation.
+    function ecClipboardAction(document, action) {
+        if (!hasTransientActivation()) return false;
+        const target = ecClipboardTarget(document);
+        const data = ecClipboardDataTransfer();
+        const event = createTrustedEvent(ClipboardEvent, action, {bubbles: true, cancelable: true, composed: true,
+            clipboardData: data ? data.transfer : null});
+        dispatch(target, event, false);
+        if (data && typeof dissociateDataTransfer === "function") {
+            data.store.mode = "p";
+            dissociateDataTransfer(data.transfer);
+        }
+        if (event.defaultPrevented) {
+            // #write-content-to-the-clipboard: TRust's clipboard holds text.
+            const item = data && data.store.items.find((entry) => entry.kind === "text" && entry.type === "text/plain");
+            if (item) ecWriteClipboard(String(item.data));
+            return true;
+        }
+        const selection = ecSelectionOf(document);
+        const text = String(ecCall(ecSelectionToStringMethod, selection));
+        if (action === "copy") {
+            if (text !== "") ecWriteClipboard(text);
+            return true;
+        }
+        const range = ecActiveRange(document);
+        if (!range || rangeIsCollapsed(rangeState(range)) || !ecIsEnabled(document, "cut")) return false;
+        ecWriteClipboard(text);
+        const host = ecAffectedEditingHost(document);
+        const state = rangeState(range);
+        if (!ecDispatchInputEvent(host, "beforeinput", "deleteByCut", null,
+            [createStaticRange(state.startNode, state.startOffset, state.endNode, state.endOffset)])) return true;
+        if (!ecActiveRange(document)) return true;
+        const transaction = ecBeginTransaction(document, ecAffectedEditingHost(document) || host);
+        ecDeleteTheSelection(document);
+        if (ecEndTransaction(transaction, "deleteByCut")) ecDispatchInputEvent(host, "input", "deleteByCut", null);
+        return true;
+    }
+
+    // --- Document.execCommand() and the queryCommand*() methods -------------
+    // execCommand #execcommand().
+    function ecExecCommand(document, command, value) {
+        const name = ecSupportedCommand(command);
+        if (name === null || !ecIsEnabled(document, name)) return false;
+        const definition = EC_COMMANDS[name];
+        if (definition.misc) return !!definition.action(document, value);
+        let host = ecAffectedEditingHost(document);
+        const range = rangeState(ecActiveRange(document));
+        // Input Events 2 names the operation; execCommand fixes data as null.
+        if (!ecDispatchInputEvent(host, "beforeinput", definition.inputType, null,
+            [createStaticRange(range.startNode, range.startOffset, range.endNode, range.endOffset)])) return false;
+        if (!ecIsEnabled(document, name)) return false;
+        host = ecAffectedEditingHost(document);
+        const transaction = ecBeginTransaction(document, host);
+        let result = false, modified = false;
+        try {
+            result = ecTakeAction(document, name, value);
+        } catch (error) {
+            reportException(error, "execCommand " + name);
+            result = false;
+        } finally {
+            modified = ecEndTransaction(transaction, name === "insertText" ? "typing" : name);
+        }
+        if (!result) return false;
+        if (modified) ecDispatchInputEvent(host, "input", definition.inputType, null);
+        return true;
+    }
+    function ecCommandArgument(commandId) { return idlDOMString(commandId); }
+    const ecDocumentMethods = {
+        execCommand(commandId, showUI = false, value = "") {
+            const document = documentReceiver(this);
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'execCommand' on 'Document': 1 argument required, but only 0 present.");
+            // showUI is ignored (#execcommand(): no behavior is defined).
+            commandId = ecCommandArgument(commandId);
+            value = idlDOMString(value);
+            return ecExecCommand(document, commandId, value);
+        },
+        queryCommandEnabled(commandId) {
+            const document = documentReceiver(this);
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'queryCommandEnabled' on 'Document': 1 argument required, but only 0 present.");
+            const name = ecSupportedCommand(ecCommandArgument(commandId));
+            return name !== null && ecIsEnabled(document, name);
+        },
+        queryCommandIndeterm(commandId) {
+            const document = documentReceiver(this);
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'queryCommandIndeterm' on 'Document': 1 argument required, but only 0 present.");
+            const name = ecSupportedCommand(ecCommandArgument(commandId));
+            if (name === null || !EC_COMMANDS[name].indeterm) return false;
+            return !!EC_COMMANDS[name].indeterm(document);
+        },
+        queryCommandState(commandId) {
+            const document = documentReceiver(this);
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'queryCommandState' on 'Document': 1 argument required, but only 0 present.");
+            const name = ecSupportedCommand(ecCommandArgument(commandId));
+            return name !== null && ecQueryCommandState(document, name);
+        },
+        queryCommandSupported(commandId) {
+            documentReceiver(this);
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'queryCommandSupported' on 'Document': 1 argument required, but only 0 present.");
+            return ecSupportedCommand(ecCommandArgument(commandId)) !== null;
+        },
+        queryCommandValue(commandId) {
+            const document = documentReceiver(this);
+            if (arguments.length < 1) throw new TypeError("Failed to execute 'queryCommandValue' on 'Document': 1 argument required, but only 0 present.");
+            const name = ecSupportedCommand(ecCommandArgument(commandId));
+            return name === null ? "" : ecQueryCommandValue(document, name);
+        },
+    };
+    for (const name of Object.keys(ecDocumentMethods))
+        Object.defineProperty(Document.prototype, name, {value: ecDocumentMethods[name], writable: true, enumerable: true, configurable: true});
+    // Native editing (Input Events 2) records its transactions in the same
+    // history and applies the overrides of #the-inserttext-command when text
+    // is typed at a collapsed caret.
+    function ecNativeEditBegin(host) {
+        const document = ecNodeDocument(host);
+        return {transaction: ecBeginTransaction(document, host), document};
+    }
+    function ecNativeEditEnd(record, inputType) {
+        if (!record) return;
+        ecEndTransaction(record.transaction, inputType === "insertText" ? "typing" : inputType);
+    }
+    function ecApplyTypedOverrides(document, overrides, node, start, end) {
+        if (!overrides.length) return;
+        ecCall(ecSetBaseAndExtentMethod, selectionFor(document), node, start, node, end);
+        ecRestoreStatesAndValues(document, overrides);
+        ecCollapseToEnd(document);
+    }
+    // Ctrl/Meta+Z, Ctrl/Meta+Shift+Z and Ctrl+Y in an editing host undo
+    // and redo through execCommand() (#additional-requirements).
+    function ecHistoryShortcut(host, key, shift) {
+        const lower = asciiLower(String(key));
+        const command = lower === "z" ? (shift ? "redo" : "undo") : lower === "y" && !shift ? "redo" : null;
+        if (!command) return false;
+        ecExecCommand(ecNodeDocument(host), command, "");
+        return true;
     }
     /*__CLASS_STRINGS_BEGIN__*/
     // Web IDL #interface-prototype-object and #namespace-object: every

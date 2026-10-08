@@ -69,6 +69,7 @@ mod transitions;
 mod validity;
 mod xml;
 mod xml_serialize;
+pub(crate) mod xpath;
 pub use xml_serialize::NotWellFormed;
 
 pub type NodeId = usize;
@@ -564,6 +565,10 @@ pub fn last_mutation_ms() -> u128 {
     LAST_MUTATION_MS.with(|c| c.get())
 }
 
+/// `@import` sheets awaiting a fetch, as (importing sheet's owner node,
+/// absolute URL) pairs, and every URL ever requested.
+type ImportRequests = (Vec<(NodeId, String)>, FxHashSet<String>);
+
 pub struct Dom {
     nodes: arena::DenseIdMap<Node>,
     /// Numeric IDs may briefly be held by binding code before its JS owner registers them.
@@ -586,6 +591,10 @@ pub struct Dom {
     /// Network font sources a font set is waiting for, for the host to fetch,
     /// and every source ever requested.
     font_requests: RefCell<(Vec<url::Url>, FxHashSet<String>)>,
+    /// Style sheets `@import` rules need that no fetch obtained yet: the
+    /// importing sheet's owner node and the absolute URL, each URL once
+    /// (CSS Cascade 4 #fetch-an-import), for the page actor to fetch.
+    import_requests: RefCell<ImportRequests>,
     input_values: FxHashMap<NodeId, input::InputValue>,
     /// Element state that is not a content attribute: form control
     /// checkedness, option selectedness and textarea raw values, and custom
@@ -663,11 +672,12 @@ pub struct Dom {
     /// adoptedStyleSheets text per scope (DOCUMENT or a shadow root
     /// fragment), pushed by the prelude on adoption/replaceSync.
     adopted_styles: FxHashMap<NodeId, String>,
-    /// Fetched `<link rel=stylesheet>` text, keyed by the link element.
-    external_sheets: FxHashMap<NodeId, String>,
-    /// Sheets imported by inline `<style>` elements, by absolute URL; the
-    /// style index splices them in place of each `@import`.
-    inline_imports: FxHashMap<String, String>,
+    /// Fetched `<link rel=stylesheet>` sheets, keyed by the link element.
+    external_sheets: FxHashMap<NodeId, cssom::LinkedSheet>,
+    /// Sheets fetched by `@import` rules, by absolute request URL; the style
+    /// index splices them in place of each `@import`, and the CSSOM exposes
+    /// each as a CSSImportRule's style sheet.
+    imported_sheets: FxHashMap<String, cssom::ImportedSheet>,
     /// CSSOM edits replace a sheet's rule list, without mutating its DOM text.
     cssom_sheets: FxHashMap<NodeId, cssom::Sheet>,
     cssom_sheet_versions: FxHashMap<NodeId, u64>,
@@ -1118,6 +1128,7 @@ impl Dom {
             document_encodings,
             downloaded_fonts,
             font_requests,
+            import_requests,
             input_values,
             element_states,
             media_fallbacks,
@@ -1145,7 +1156,7 @@ impl Dom {
             style_epoch,
             adopted_styles,
             external_sheets,
-            inline_imports,
+            imported_sheets,
             cssom_sheets,
             cssom_sheet_versions,
             cssom_inline,
@@ -1290,6 +1301,14 @@ impl Dom {
                 .saturating_add(font.as_ref().map_or(0, |font| font.len()));
         }
         {
+            let (pending, requested) = &*import_requests.borrow();
+            fixed_map!(pending, (NodeId, String));
+            fixed_map!(requested, String);
+            for url in requested {
+                bytes = bytes.saturating_add(url.capacity());
+            }
+        }
+        {
             let (pending, requested) = &*font_requests.borrow();
             fixed_map!(pending, url::Url);
             fixed_map!(requested, String);
@@ -1352,7 +1371,7 @@ impl Dom {
         for text in adopted_styles.values() {
             bytes = bytes.saturating_add(text.capacity());
         }
-        fixed_map!(external_sheets, (NodeId, String));
+        fixed_map!(external_sheets, (NodeId, cssom::LinkedSheet));
         bytes = bytes.saturating_add(properties.retained_bytes());
         bytes = bytes.saturating_add(pending_style_invalidations.retained_bytes());
         bytes = bytes.saturating_add(transitions.retained_bytes());
@@ -1362,12 +1381,18 @@ impl Dom {
         for sheet in cssom_sheets.values() {
             bytes += sheet.text.capacity() + sheet.media.capacity();
         }
-        for text in external_sheets.values() {
-            bytes = bytes.saturating_add(text.capacity());
+        for sheet in external_sheets.values() {
+            bytes = bytes.saturating_add(
+                sheet.text.capacity()
+                    + sheet.location.capacity()
+                    + sheet.base.capacity()
+                    + sheet.cascade.capacity(),
+            );
         }
-        fixed_map!(inline_imports, (String, String));
-        for (url, text) in inline_imports {
-            bytes = bytes.saturating_add(url.capacity() + text.capacity());
+        fixed_map!(imported_sheets, (String, cssom::ImportedSheet));
+        for (url, sheet) in imported_sheets {
+            bytes = bytes
+                .saturating_add(url.capacity() + sheet.text.capacity() + sheet.base.capacity());
         }
 
         match style_cache.try_borrow() {
@@ -1662,6 +1687,7 @@ impl Dom {
             document_encodings: FxHashMap::default(),
             downloaded_fonts: FxHashMap::default(),
             font_requests: RefCell::default(),
+            import_requests: RefCell::default(),
             input_values: FxHashMap::default(),
             element_states: FxHashMap::default(),
             media_fallbacks: RefCell::new(media::MediaFallbacks::default()),
@@ -1689,7 +1715,7 @@ impl Dom {
             style_epoch: 0,
             adopted_styles: FxHashMap::default(),
             external_sheets: FxHashMap::default(),
-            inline_imports: FxHashMap::default(),
+            imported_sheets: FxHashMap::default(),
             cssom_sheets: FxHashMap::default(),
             cssom_sheet_versions: FxHashMap::default(),
             cssom_inline: FxHashMap::default(),
@@ -3834,6 +3860,20 @@ impl Dom {
             .get(&doc)
             .copied()
             .unwrap_or(encoding_rs::UTF_8)
+    }
+
+    /// The character encoding of `id`'s node document: the query encoding of
+    /// HTML #encoding-parsing-a-url relative to that document.
+    pub(crate) fn node_document_encoding(&self, id: NodeId) -> &'static encoding_rs::Encoding {
+        let document = if matches!(
+            self.nodes.get(id).map(|node| &node.data),
+            Some(NodeData::Document)
+        ) {
+            id
+        } else {
+            self.owner_document(id).unwrap_or(DOCUMENT)
+        };
+        self.document_encoding(document)
     }
 
     /// Set the encoding a document's bytes were decoded with (HTML
@@ -8676,36 +8716,47 @@ impl Dom {
                 // including when it declares no downloadable fonts at all.
                 font_faces.entry(id).or_default();
             }
+            // CSS Cascade 5 #at-import: imported sheets cascade in place of
+            // their `@import` rules. A CSSOM-modified sheet's text already
+            // holds the imported rules its rule objects expose; any import
+            // left in it is spliced from the fetched sheets like the source.
             let css: Cow<str> = match self.tag_name(id) {
-                Some("style") if self.style_sheet_applies(id) => match self.cssom_sheets.get(&id) {
-                    Some(sheet) => Cow::Borrowed(&sheet.text),
-                    None => {
-                        let text = self.text_content(id);
-                        // Imports resolve against the document base URL,
-                        // including `<base href>`, as they were fetched.
-                        let spliced = (!self.inline_imports.is_empty())
-                            .then(|| {
-                                let base = self
-                                    .doc_url
-                                    .as_ref()
-                                    .map(|page| self.resource_base_url(id, page));
-                                crate::http::splice_inline_imports(&text, base.as_ref(), |url| {
-                                    self.inline_imports.get(url)
-                                })
-                            })
-                            .flatten();
-                        Cow::Owned(spliced.unwrap_or(text))
+                Some("style") if self.style_sheet_applies(id) => {
+                    // Imports resolve against the document base URL,
+                    // including `<base href>`, as they were fetched.
+                    let base = || {
+                        self.doc_url
+                            .as_ref()
+                            .map(|page| self.resource_base_url(id, page))
+                    };
+                    match self.cssom_sheets.get(&id) {
+                        Some(sheet) => self
+                            .splice_imported_sheets(&sheet.text, base().as_ref(), None, Some(id))
+                            .map_or(Cow::Borrowed(sheet.text.as_str()), Cow::Owned),
+                        None => {
+                            let text = self.text_content(id);
+                            Cow::Owned(
+                                self.splice_imported_sheets(&text, base().as_ref(), None, Some(id))
+                                    .unwrap_or(text),
+                            )
+                        }
                     }
-                },
+                }
                 Some("link") if self.style_sheet_applies(id) => {
-                    match self
-                        .cssom_sheets
-                        .get(&id)
-                        .map(|sheet| &sheet.text)
-                        .or_else(|| self.external_sheets.get(&id))
-                    {
-                        Some(css) => Cow::Borrowed(css.as_str()),
-                        None => continue,
+                    let linked = self.external_sheets.get(&id);
+                    match (self.cssom_sheets.get(&id), linked) {
+                        (Some(sheet), _) => {
+                            let base = linked.and_then(|linked| url::Url::parse(&linked.base).ok());
+                            self.splice_imported_sheets(
+                                &sheet.text,
+                                base.as_ref(),
+                                linked.map(|linked| linked.location.as_str()),
+                                Some(id),
+                            )
+                            .map_or(Cow::Borrowed(sheet.text.as_str()), Cow::Owned)
+                        }
+                        (None, Some(linked)) => Cow::Borrowed(linked.cascade.as_str()),
+                        (None, None) => continue,
                     }
                 }
                 _ => continue,
@@ -9113,9 +9164,22 @@ impl Dom {
     /// scope-aware like any `<style>`. ONE document walk collects the
     /// candidate links (this used to walk the whole document once per
     /// sheet — O(sheets × nodes) on a 48-sheet page).
-    pub fn attach_external_sheets(&mut self, sheets: &[(String, String)]) {
+    pub fn attach_external_sheets(&mut self, sheets: &[crate::http::PageSheet]) {
         if sheets.is_empty() {
             return;
+        }
+        // Imported sheets first: a link's cascade text splices them.
+        let mut imported = false;
+        for sheet in sheets.iter().filter(|sheet| sheet.link_href.is_none()) {
+            self.imported_sheets.insert(
+                sheet.url.clone(),
+                cssom::ImportedSheet {
+                    text: sheet.text.clone(),
+                    base: sheet.base.clone(),
+                    cors_same_origin: sheet.cors_same_origin,
+                },
+            );
+            imported = true;
         }
         let links: Vec<(NodeId, String)> = self
             .shadow_including_subtree(DOCUMENT)
@@ -9123,13 +9187,10 @@ impl Dom {
             .filter(|&id| self.is_stylesheet_link(id))
             .filter_map(|id| self.attr(id, "href").map(|h| (id, h.to_string())))
             .collect();
-        let mut imported = false;
-        for (href, css) in sheets {
-            if let Some(url) = href.strip_prefix(crate::http::INLINE_IMPORT_KEY) {
-                self.inline_imports.insert(url.to_string(), css.clone());
-                imported = true;
+        for sheet in sheets {
+            let Some(href) = &sheet.link_href else {
                 continue;
-            }
+            };
             // A fetched URL can be linked from several independent shadow
             // scopes. Each link owns a sheet, even when prefetch deduplicates
             // the response body (HTML #rel-stylesheet).
@@ -9138,8 +9199,12 @@ impl Dom {
                 .filter(|(id, h)| !self.external_sheets.contains_key(id) && h == href)
                 .map(|(id, _)| *id)
                 .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            let linked = self.linked_sheet(sheet);
             for id in hits {
-                self.external_sheets.insert(id, css.clone());
+                self.external_sheets.insert(id, linked.clone());
                 self.touch_style_at(id);
             }
         }
@@ -9152,6 +9217,22 @@ impl Dom {
             for id in styles {
                 self.touch_style_at(id);
             }
+        }
+    }
+
+    /// A `<link>` sheet's record, with its cascade text spliced from the
+    /// imported sheets already attached.
+    fn linked_sheet(&self, sheet: &crate::http::PageSheet) -> cssom::LinkedSheet {
+        let base = url::Url::parse(&sheet.base).ok();
+        let cascade = self
+            .splice_imported_sheets(&sheet.text, base.as_ref(), Some(&sheet.url), None)
+            .unwrap_or_else(|| sheet.text.clone());
+        cssom::LinkedSheet {
+            text: sheet.text.clone(),
+            location: sheet.url.clone(),
+            base: sheet.base.clone(),
+            origin_clean: sheet.cors_same_origin,
+            cascade,
         }
     }
 
@@ -9171,9 +9252,25 @@ impl Dom {
     /// any tree sheet; `touch_style` re-parses the style index and forces the
     /// full relayout a sheet-set change requires. Replaces any earlier body on
     /// the same link (a loader may rewrite `href` and re-trigger the load).
-    pub fn attach_sheet_to_link(&mut self, id: NodeId, css: String) {
+    pub fn attach_sheet_to_link(
+        &mut self,
+        id: NodeId,
+        sheet: crate::http::PageSheet,
+        imports: Vec<crate::http::PageSheet>,
+    ) {
+        for import in imports {
+            self.imported_sheets.insert(
+                import.url,
+                cssom::ImportedSheet {
+                    text: import.text,
+                    base: import.base,
+                    cors_same_origin: import.cors_same_origin,
+                },
+            );
+        }
         self.reset_cssom_sheet(id);
-        self.external_sheets.insert(id, css);
+        let linked = self.linked_sheet(&sheet);
+        self.external_sheets.insert(id, linked);
         self.touch_style_at(id);
     }
 
@@ -22108,6 +22205,12 @@ fn supports_condition(cond: &str) -> bool {
     cssom::condition(cond).unwrap_or(false)
 }
 
+/// CSS Cascade 5 #conditional-import: an `@import` rule's `supports()`
+/// condition, where a bare `<declaration>` is a `<supports-decl>`.
+pub(crate) fn import_supports_condition(text: &str) -> bool {
+    supports_condition(text) || supports_condition(&format!("({text})"))
+}
+
 fn split_supports_kw(cond: &str, keyword: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut start = 0;
@@ -22288,6 +22391,18 @@ fn blockified_display(display: &str) -> String {
         "ruby" | "inline ruby" => "block ruby".to_owned(),
         _ => display.to_owned(),
     }
+}
+
+/// HTML #rules-for-parsing-a-legacy-colour-value, as the `<font color>`
+/// presentational hint gives it (execCommand #specified-command-value).
+pub(crate) fn legacy_color_value(value: &str) -> Option<String> {
+    html_hints::legacy_color(value)
+}
+
+/// The font-size keyword of the `<font size>` presentational hint
+/// (HTML #fonts-and-colors), for execCommand #specified-command-value.
+pub(crate) fn legacy_font_size_value(value: &str) -> Option<&'static str> {
+    html_hints::legacy_font_size(value)
 }
 
 pub(crate) fn supports_color_value(value: &str) -> bool {
@@ -25782,16 +25897,16 @@ mod tests {
              @import url(missing.css);.x{color:blue}</style><p class=x>a</p><p class=y>b</p>",
         );
         dom.set_doc_url(url::Url::parse("https://e.test/page.html").ok());
-        let key = |url: &str| format!("{}{url}", crate::http::INLINE_IMPORT_KEY);
+        let import = |url: &str, text: &str| crate::http::PageSheet {
+            link_href: None,
+            url: url.into(),
+            base: url.into(),
+            text: text.into(),
+            cors_same_origin: true,
+        };
         dom.attach_external_sheets(&[
-            (
-                key("https://e.test/css/a.css"),
-                ".x{color:red}.y{color:green}".into(),
-            ),
-            (
-                key("https://e.test/css/print.css"),
-                ".y{color:purple}".into(),
-            ),
+            import("https://e.test/css/a.css", ".x{color:red}.y{color:green}"),
+            import("https://e.test/css/print.css", ".y{color:purple}"),
         ]);
         let color = |class: &str| {
             let node = dom
@@ -25805,13 +25920,72 @@ mod tests {
     }
 
     #[test]
+    fn imports_added_after_the_fetch_are_requested_once_and_spliced() {
+        // CSS Cascade 4 #fetch-an-import and 5 #at-import: an import whose
+        // sheet navigation did not fetch is requested for its owner, once;
+        // the arriving sheet then cascades in place of its @import. Imports
+        // that only follow other rules, and false supports() conditions,
+        // fetch nothing.
+        let mut dom = Dom::parse_document(
+            "<style id=s>@import url(late.css) screen; @import url(never.css) supports(display: no-such);\
+             p { margin: 0 } @import url(invalid.css);</style><p id=p>x</p>",
+        );
+        dom.set_doc_url(url::Url::parse("https://e.test/page.html").ok());
+        let p = dom.get_by_id("p").unwrap();
+        let style = dom.get_by_id("s").unwrap();
+        assert_ne!(
+            dom.computed_value(p, "color").as_deref(),
+            Some("rgb(1, 2, 3)")
+        );
+        assert_eq!(
+            dom.take_import_requests(),
+            vec![(style, String::from("https://e.test/late.css"))]
+        );
+        dom.touch_style();
+        assert_ne!(
+            dom.computed_value(p, "color").as_deref(),
+            Some("rgb(1, 2, 3)")
+        );
+        assert!(dom.take_import_requests().is_empty(), "requested once");
+        dom.attach_imported_sheets(vec![crate::http::PageSheet {
+            link_href: None,
+            url: "https://e.test/late.css".into(),
+            base: "https://e.test/late.css".into(),
+            text: "@import 'deeper.css'; #p { color: rgb(1, 2, 3) }".into(),
+            cors_same_origin: true,
+        }]);
+        assert_eq!(
+            dom.computed_value(p, "color").as_deref(),
+            Some("rgb(1, 2, 3)")
+        );
+        // The arrived sheet's own import is requested for the same owner.
+        assert_eq!(
+            dom.take_import_requests(),
+            vec![(style, String::from("https://e.test/deeper.css"))]
+        );
+
+        // Navigation already attempted the imports of the parsed sheets.
+        let mut fetched = Dom::parse_document("<style>@import url(gone.css);</style><p>x</p>");
+        fetched.set_doc_url(url::Url::parse("https://e.test/page.html").ok());
+        fetched.note_fetched_imports();
+        let _ = fetched.computed_value(DOCUMENT, "color");
+        fetched.touch_style();
+        let body = fetched
+            .descendants(DOCUMENT)
+            .find(|&n| fetched.tag_name(n) == Some("p"))
+            .unwrap();
+        let _ = fetched.computed_value(body, "color");
+        assert!(fetched.take_import_requests().is_empty());
+    }
+
+    #[test]
     fn external_sheets_join_the_cascade() {
         let mut dom = Dom::parse_document(
             "<head><link rel=stylesheet href='/a.css'></head>
              <body><p class=x>linked hide</p></body>",
         );
         assert_eq!(dom.stylesheet_links(), vec![String::from("/a.css")]);
-        dom.attach_external_sheets(&[(String::from("/a.css"), String::from(".x{display:none}"))]);
+        dom.attach_external_sheets(&[crate::http::PageSheet::link("/a.css", ".x{display:none}")]);
         assert!(!dom.serialize(DOCUMENT).contains("linked hide"));
     }
 
@@ -25829,14 +26003,8 @@ mod tests {
         );
         dom.set_viewport_px(800.0, 600.0);
         dom.attach_external_sheets(&[
-            (
-                String::from("/print.css"),
-                String::from(".theater{display:none !important}"),
-            ),
-            (
-                String::from("/screen.css"),
-                String::from(".theater{display:block}"),
-            ),
+            crate::http::PageSheet::link("/print.css", ".theater{display:none !important}"),
+            crate::http::PageSheet::link("/screen.css", ".theater{display:block}"),
         ]);
         let target = dom.get_by_id("target").unwrap();
         assert_eq!(dom.computed_display(target).as_deref(), Some("block"));
@@ -31241,11 +31409,9 @@ mod tests {
              <body><ul><li><a id=l href=/post>post</a></li></ul></body>",
         );
         let link = dom.get_by_id("l").unwrap();
-        dom.attach_external_sheets(&[(
-            String::from("style.css"),
-            String::from(
-                "body{color:black}a{color:#FF6666;font-weight:bold}a:hover{color:#FF8888}",
-            ),
+        dom.attach_external_sheets(&[crate::http::PageSheet::link(
+            "style.css",
+            "body{color:black}a{color:#FF6666;font-weight:bold}a:hover{color:#FF8888}",
         )]);
         let idle = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
         assert!(idle.contains("color:#ff6666"), "idle link color: {idle}");

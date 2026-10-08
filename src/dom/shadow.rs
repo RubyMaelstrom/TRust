@@ -279,7 +279,7 @@ mod tests {
         );
         assert!(resources.iter().any(|r| r.source == "nav.js"));
         assert!(!resources.iter().any(|r| r.source.starts_with("inert")));
-        dom.attach_external_sheets(&[("nav.css".into(), "a { color: red }".into())]);
+        dom.attach_external_sheets(&[crate::http::PageSheet::link("nav.css", "a { color: red }")]);
         for id in ["one", "two"] {
             let root = dom.shadow_root(dom.get_by_id(id).unwrap()).unwrap();
             let link = query(&dom, root, "a");

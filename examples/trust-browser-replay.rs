@@ -164,7 +164,9 @@ fn run() -> Result<(serde_json::Value, bool), String> {
                     .collect();
                 environment.sheets = sheets
                     .iter()
-                    .map(|(name, _, _, text)| (name.clone(), text.clone()))
+                    .map(|(name, _, _, text)| {
+                        trust::http::PageSheet::link(name.clone(), text.clone())
+                    })
                     .collect();
                 let started = Instant::now();
                 let (output, outcome) = trust::js::transform(source, &environment);

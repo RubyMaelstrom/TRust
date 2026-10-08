@@ -83,7 +83,10 @@ pub fn select(
         .iter()
         .find(|(_, density)| *density >= target)
         .or_else(|| normalized.last())?;
-    let source = resolve_url(&base, &candidate.url)?;
+    // HTML #update-the-image-data: encoding-parse-and-serialize the selected
+    // source relative to the element's node document.
+    let encoding = dom.node_document_encoding(img);
+    let source = resolve_url(&base, &candidate.url, encoding)?;
     Some(SelectedImage {
         source,
         density: *density,
@@ -634,12 +637,12 @@ fn supported_image_mime(input: &str) -> bool {
     )
 }
 
-fn resolve_url(base: &Url, raw: &str) -> Option<String> {
+fn resolve_url(base: &Url, raw: &str, encoding: &'static encoding_rs::Encoding) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
-    base.join(raw)
+    crate::form_encoding::encoding_parse_url(raw, Some(base), encoding)
         .or_else(|_| Url::parse(raw))
         .ok()
         .map(|url| url.to_string())

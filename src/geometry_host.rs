@@ -22,6 +22,10 @@ const ATTRIBUTES: [&str; 8] = [
 struct Rectangle {
     values: [f64; 4],
     mutable: bool,
+    /// SVG 2 types.html#InterfaceSVGAnimatedRect: a rectangle that reflects
+    /// a `viewBox` attribute. Its writes first run the platform's
+    /// `svgRectWrite` steps (read-only check, attribute reserialization).
+    observed: bool,
 }
 
 impl Rectangle {
@@ -311,7 +315,15 @@ fn construct(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Res
         .clone();
     }
     let value = ctx.new_object_with_proto(&prototype);
-    register(ctx, &value, Rectangle { values, mutable })?;
+    register(
+        ctx,
+        &value,
+        Rectangle {
+            values,
+            mutable,
+            observed: false,
+        },
+    )?;
     Ok(value)
 }
 
@@ -351,15 +363,46 @@ fn get(ctx: &mut Ctx, this: Value, _: &[Value], captures: &[Value]) -> Result<Va
 fn set(ctx: &mut Ctx, this: Value, args: &[Value], captures: &[Value]) -> Result<Value, Value> {
     // Web IDL #dfn-attribute-setter: check the interface brand before running
     // observable ToNumber. No native borrow survives that reentrant operation.
-    let (key, _) = record(ctx, &this, true)?;
+    let (key, rectangle) = record(ctx, &this, true)?;
     let number = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))?;
     let index = captures[0].as_num_opt().unwrap() as usize;
-    ctx.host_mut::<HostState>()
+    if rectangle.observed {
+        // An SVGRect reflecting `viewBox` (SVG 2 #InterfaceSVGAnimatedRect)
+        // throws for a read-only animVal and reserializes the attribute.
+        super::host_call_trust(
+            ctx,
+            "svgRectWrite",
+            &[this, Value::Num(index as f64), Value::Num(number)],
+        )?;
+    }
+    if let Some(rectangle) = ctx
+        .host_mut::<HostState>()
         .expect("geometry host")
         .geometry
         .get_mut(key)
-        .unwrap()
-        .values[index] = number;
+    {
+        rectangle.values[index] = number;
+    }
+    Ok(Value::Undefined)
+}
+
+/// `updateRect(rect, x, y, width, height, observed)`: the platform updates
+/// a reflecting SVGRect from its attribute without running its write steps,
+/// and marks it observed.
+fn update(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
+    let (key, _) = record(ctx, args.first().unwrap_or(&Value::Undefined), false)?;
+    let values =
+        std::array::from_fn(|i| args.get(i + 1).and_then(Value::as_num_opt).unwrap_or(0.0));
+    let observed = matches!(args.get(5), Some(Value::Bool(true)));
+    if let Some(rectangle) = ctx
+        .host_mut::<HostState>()
+        .expect("geometry host")
+        .geometry
+        .get_mut(key)
+    {
+        rectangle.values = values;
+        rectangle.observed = observed;
+    }
     Ok(Value::Undefined)
 }
 
@@ -382,6 +425,7 @@ fn create(ctx: &mut Ctx, _: Value, args: &[Value], captures: &[Value]) -> Result
         Rectangle {
             values,
             mutable: matches!(captures[1], Value::Bool(true)),
+            observed: false,
         },
     )?;
     Ok(value)
@@ -452,6 +496,7 @@ pub(super) fn bind(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Val
             create,
             vec![readonly, Value::Bool(false)],
         ),
+        Value::Obj(ctx.make_native("updateRect", 6, update)),
     ]))
 }
 

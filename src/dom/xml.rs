@@ -432,6 +432,13 @@ fn xml_attributes(
                 element.attribute_node(local)
             }
             .ok_or("Missing normalized XML attribute")?;
+            // Namespaces in XML 1.0 §3: the xml prefix is bound to the XML
+            // namespace without being declared.
+            let namespace = if prefix == Some("xml") {
+                Some(XML)
+            } else {
+                namespace
+            };
             (namespace.unwrap_or(""), attr.value())
         };
         attrs.push(Attribute {

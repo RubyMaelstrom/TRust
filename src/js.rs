@@ -159,7 +159,7 @@ pub struct PageEnv {
     /// screen coordinates (CSSOM View #dom-window-screenx).
     pub screen_position: (i32, i32),
     pub externals: Vec<(String, Option<std::sync::Arc<Vec<u8>>>)>,
-    pub sheets: Vec<(String, String)>,
+    pub sheets: Vec<crate::http::PageSheet>,
     pub cache: std::sync::Arc<crate::http::PageCache>,
     pub net: Option<tokio::runtime::Handle>,
     pub storage: Option<WebStorage>,
@@ -263,7 +263,7 @@ pub(crate) fn scan_module_imports(src: &[u8]) -> Vec<String> {
 
 pub fn css_bake(
     html: &str,
-    sheets: &[(String, String)],
+    sheets: &[crate::http::PageSheet],
     viewport: (u16, u16),
     cell_px: (u16, u16),
 ) -> String {
@@ -286,7 +286,7 @@ pub fn css_prepare_css(html: &str, viewport: crate::layout2::Viewport) -> Dom {
     dom
 }
 
-pub fn css_finish(mut dom: Dom, sheets: &[(String, String)]) -> String {
+pub fn css_finish(mut dom: Dom, sheets: &[crate::http::PageSheet]) -> String {
     if !sheets.is_empty() {
         dom.attach_external_sheets(sheets);
     }

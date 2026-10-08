@@ -59,6 +59,7 @@ pub mod file;
 pub mod file_picker;
 pub mod file_select;
 mod font_system;
+mod form_encoding;
 pub mod gemini;
 pub mod gopher;
 pub mod http;

@@ -5513,9 +5513,14 @@ pub(crate) fn prefetch_page_scripts(
             }
             _ => false,
         };
+        // HTML #encoding-parsing-a-url relative to the document.
         if allowed
             && !job.source.is_empty()
-            && let Ok(url) = base.join(&job.source)
+            && let Ok(url) = crate::form_encoding::encoding_parse_url(
+                &job.source,
+                Some(&base),
+                env.document_encoding,
+            )
             && matches!(url.scheme(), "http" | "https" | "file")
             && subresource_allowed(&client, &url)
         {
@@ -5674,14 +5679,18 @@ async fn execute_js_with_presentation(
         let doc_base = doc_base.clone();
         let page_url = response.url.clone();
         async move {
-            let resolved = doc_base
-                .join(&job.source)
-                .ok()
-                .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
-                // File symbols must not enter the origin-unpartitioned SVG
-                // sprite cache (see dom::prime_sprite_sheet).
-                .filter(|u| !matches!(job.kind, Kind::Sprite) || u.scheme() != "file")
-                .filter(|u| subresource_allowed(&page_url, u));
+            // HTML #encoding-parsing-a-url relative to the document.
+            let resolved = crate::form_encoding::encoding_parse_url(
+                &job.source,
+                Some(&doc_base),
+                document_encoding,
+            )
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
+            // File symbols must not enter the origin-unpartitioned SVG
+            // sprite cache (see dom::prime_sprite_sheet).
+            .filter(|u| !matches!(job.kind, Kind::Sprite) || u.scheme() != "file")
+            .filter(|u| subresource_allowed(&page_url, u));
             let resp = match &resolved {
                 Some(u) => {
                     if std::env::var_os("TRUST_NET_TRACE").is_some() {
@@ -5712,6 +5721,7 @@ async fn execute_js_with_presentation(
     let mut resource_timings = Vec::new();
     for (job, resolved, details) in results {
         let kind = job.kind;
+        let cors_mode = job.cors_credentials().is_some();
         let raw = job.source;
         let resp = match details {
             Some(Ok(details)) => Some(details.response),
@@ -5764,15 +5774,23 @@ async fn execute_js_with_presentation(
                         &r.body,
                         Some(environment),
                     );
-                    let css = expand_stylesheet_imports(
+                    let fetched = fetched_stylesheet(
                         css,
-                        url,
+                        url.clone(),
+                        r.url.clone(),
                         response.url.clone(),
-                        Vec::new(),
+                        cors_mode,
                         encoding,
                     )
                     .await;
-                    sheets.push((raw, css));
+                    sheets.push(PageSheet {
+                        link_href: Some(raw),
+                        url: url.to_string(),
+                        base: fetched.base,
+                        text: fetched.text,
+                        cors_same_origin: fetched.cors_same_origin,
+                    });
+                    push_imported_sheets(&mut sheets, fetched.imports);
                 }
             }
             Kind::Sprite => {
@@ -5787,7 +5805,8 @@ async fn execute_js_with_presentation(
         }
     }
     if !prefetched {
-        sheets.extend(fetch_inline_style_imports(&html, &response.url, document_encoding).await);
+        let inline = fetch_inline_style_imports(&html, &response.url, document_encoding).await;
+        push_imported_sheets(&mut sheets, inline);
     }
     install_stylesheet_fonts(&html, &sheets, &response.url).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
@@ -5944,54 +5963,142 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
     .await;
 }
 
-/// The sheets-list key prefix for a stylesheet imported by an inline
-/// `<style>` element, followed by the import's absolute URL. Such entries
-/// travel with the page's fetched sheets; the DOM splices them into the
-/// importing `<style>` (`splice_inline_imports`).
-pub(crate) const INLINE_IMPORT_KEY: &str = "\u{0}inline-import:";
+/// One style sheet of a page's sheet list, fetched before the page's DOM
+/// exists and attached to it by `Dom::attach_external_sheets`: a
+/// `<link rel=stylesheet>` sheet (HTML #link-type-stylesheet) or a sheet an
+/// `@import` rule fetched (CSS Cascade 4 #fetch-an-import). Each sheet keeps
+/// its own text; the cascade splices imported sheets in place of their
+/// `@import` rules (CSS Cascade 5 #at-import), and the CSSOM exposes each as
+/// its own CSSStyleSheet (CSSOM #css-style-sheets).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageSheet {
+    /// The raw `href` attribute of the `<link>` the sheet belongs to, or
+    /// `None` for an imported sheet.
+    pub link_href: Option<String>,
+    /// CSSOM #concept-css-style-sheet-location: the absolute URL of the
+    /// sheet's first request. An imported sheet is found by this URL.
+    pub url: String,
+    /// The response URL, against which the sheet's `@import` URLs resolve.
+    pub base: String,
+    /// The decoded sheet, its `url()` tokens made absolute against `base`
+    /// (CSS Values 4 #relative-urls). Its `@import` rules remain as written.
+    pub text: String,
+    /// The response was CORS-same-origin (Fetch
+    /// #concept-response-cors-same-origin), CSSOM's origin-clean flag before
+    /// an imported sheet also takes its parent's flag.
+    pub cors_same_origin: bool,
+}
 
-/// CSS Cascade 5 §2.2 for an inline `<style>`: replace each `@import` by the
-/// fetched sheet for its URL (resolved against `base`), under the import's
-/// conditions; an import that was not fetched contributes no rules. `None`
-/// when the sheet has no imports.
-pub(crate) fn splice_inline_imports<'a>(
-    css: &str,
-    base: Option<&Url>,
-    imported: impl Fn(&str) -> Option<&'a String>,
-) -> Option<String> {
-    let imports = stylesheet_imports(css);
-    if imports.is_empty() {
-        return None;
-    }
-    let mut out = String::with_capacity(css.len());
-    let mut cursor = 0usize;
-    for import in imports {
-        out.push_str(&css[cursor..import.start]);
-        cursor = import.end;
-        let url = match base {
-            Some(base) => base.join(&import.url).ok(),
-            None => Url::parse(&import.url).ok(),
-        };
-        if let Some(sheet) = url.and_then(|url| imported(url.as_str())) {
-            out.push_str(&wrap_import_condition(sheet.clone(), &import.condition));
+impl PageSheet {
+    /// A same-origin `<link>` sheet whose `href` is also its location and
+    /// base, for presentation snapshots and tests.
+    pub fn link(href: impl Into<String>, text: impl Into<String>) -> Self {
+        let href = href.into();
+        Self {
+            link_href: Some(href.clone()),
+            url: href.clone(),
+            base: href,
+            text: text.into(),
+            cors_same_origin: true,
         }
     }
-    out.push_str(&css[cursor..]);
-    Some(out)
+}
+
+/// A style sheet fetched after its document's DOM exists (a script-inserted
+/// `<link>`): its own text and every sheet its `@import` rules reached.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FetchedStyleSheet {
+    /// The sheet's own text, as `PageSheet::text`.
+    pub text: String,
+    /// The response URL.
+    pub base: String,
+    /// The response was CORS-same-origin.
+    pub cors_same_origin: bool,
+    /// Its imported sheets, in the order the imports first reached them.
+    pub imports: Vec<PageSheet>,
+}
+
+/// Fetch #concept-response-cors-same-origin for a style sheet response: a
+/// CORS-mode request that succeeded passed the CORS check; a no-cors
+/// response is CORS-same-origin only when neither the request nor the final
+/// response left the client's (tuple) origin.
+fn sheet_cors_same_origin(client: &Url, request: &Url, response: &Url, cors_mode: bool) -> bool {
+    if cors_mode {
+        return true;
+    }
+    let origin = client.origin();
+    origin.is_tuple() && request.origin() == origin && response.origin() == origin
+}
+
+/// CSS Cascade 5 #at-import: replace each valid `@import` of `css` by the
+/// imported sheet for its URL (resolved against `base`), under the import's
+/// conditions, recursively. `imported` finds a fetched sheet's text and base
+/// by its absolute request URL; an import without a sheet, or one that would
+/// import an importing sheet again (`own_url` and the sheets above it),
+/// contributes no rules. `None` when the sheet has no imports.
+pub(crate) fn splice_imports<'a>(
+    css: &str,
+    base: Option<&Url>,
+    own_url: Option<&str>,
+    imported: &dyn Fn(&str) -> Option<(&'a str, &'a str)>,
+) -> Option<String> {
+    fn splice<'a>(
+        css: &str,
+        base: Option<&Url>,
+        imported: &dyn Fn(&str) -> Option<(&'a str, &'a str)>,
+        ancestry: &mut Vec<String>,
+    ) -> Option<String> {
+        let imports = stylesheet_imports(css);
+        if imports.is_empty() {
+            return None;
+        }
+        let mut out = String::with_capacity(css.len());
+        let mut cursor = 0usize;
+        for import in imports {
+            out.push_str(&css[cursor..import.start]);
+            cursor = import.end;
+            let url = match base {
+                Some(base) => base.join(&import.url).ok(),
+                None => Url::parse(&import.url).ok(),
+            };
+            // A false supports() condition loads nothing (CSS Cascade 5
+            // #conditional-import); only an applicable import looks its
+            // sheet up.
+            let sheet = url
+                .filter(|url| !ancestry.iter().any(|seen| seen == url.as_str()))
+                .filter(|_| import_supports_holds(&import.condition))
+                .and_then(|url| Some((url.to_string(), imported(url.as_str())?)));
+            let content = match sheet {
+                Some((url, (text, sheet_base))) => {
+                    ancestry.push(url);
+                    let sheet_base = Url::parse(sheet_base).ok();
+                    let spliced = splice(text, sheet_base.as_ref(), imported, ancestry)
+                        .unwrap_or_else(|| text.to_string());
+                    ancestry.pop();
+                    spliced
+                }
+                _ => String::new(),
+            };
+            out.push_str(&wrap_import_condition(content, &import.condition));
+        }
+        out.push_str(&css[cursor..]);
+        Some(out)
+    }
+    let mut ancestry: Vec<String> = own_url.map(str::to_string).into_iter().collect();
+    splice(css, base, imported, &mut ancestry)
 }
 
 /// Fetch every external stylesheet a page declares concurrently, returning
-/// `(href, css)` in document order, followed by the sheets that inline
-/// `<style>` elements `@import` (keyed by `INLINE_IMPORT_KEY` and URL). The
-/// request pool bounds simultaneous I/O; no arbitrary declaration-count
-/// cutoff is applied to the cascade.
-/// `encoding` is the document's character encoding, the style sheets'
-/// environment encoding unless a link names its own `charset`.
+/// each `<link>` sheet in document order followed by the sheets its imports
+/// and those of inline `<style>` elements reached. The request pool bounds
+/// simultaneous I/O; no arbitrary declaration-count cutoff is applied to the
+/// cascade. `encoding` is the document's character encoding, the style
+/// sheets' environment encoding unless a link names its own `charset`.
 async fn fetch_page_sheets(
     html: &str,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
-) -> Vec<(String, String)> {
+) -> Vec<PageSheet> {
     let base = base_with_doc_base(html, page_url);
     let jobs = crate::js::external_resources(html)
         .into_iter()
@@ -6000,11 +6107,13 @@ async fn fetch_page_sheets(
         let base = base.clone();
         let page_url = page_url.clone();
         async move {
-            let resolved = base
-                .join(&job.source)
-                .ok()
-                .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
-                .filter(|u| subresource_allowed(&page_url, u));
+            // HTML #link-type-stylesheet fetches the encoding-parsed href.
+            let resolved =
+                crate::form_encoding::encoding_parse_url(&job.source, Some(&base), encoding)
+                    .ok()
+                    .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
+                    .filter(|u| subresource_allowed(&page_url, u));
+            let cors_mode = job.cors_credentials().is_some();
             let resp = match &resolved {
                 Some(u) => fetch(&Request::subresource(
                     u.clone(),
@@ -6016,14 +6125,14 @@ async fn fetch_page_sheets(
                 .ok(),
                 None => None,
             };
-            (job.source, job.charset, resolved, resp)
+            (job.source, job.charset, resolved, resp, cors_mode)
         }
     }))
     .buffered(PREFETCH_CONCURRENCY)
     .collect::<Vec<_>>()
     .await
     .into_iter()
-    .filter_map(|(raw, charset, resolved, resp)| {
+    .filter_map(|(raw, charset, resolved, resp, cors_mode)| {
         let url = resolved?;
         let response = resp?.filter_stylesheet()?;
         let environment = charset
@@ -6035,82 +6144,77 @@ async fn fetch_page_sheets(
             &response.body,
             Some(environment),
         );
+        let sheet = PageSheet {
+            link_href: Some(raw),
+            cors_same_origin: sheet_cors_same_origin(page_url, &url, &response.url, cors_mode),
+            text: absolutize_css_urls(&css, &response.url),
+            url: url.to_string(),
+            base: response.url.to_string(),
+        };
         // Stream the boxed futures themselves: a closure taking the encoding
         // reference and returning an async block would be lifetime-generic,
         // and spawned callers could no longer prove their futures `Send`.
-        let expanded = expand_stylesheet_imports(css, url, page_url.clone(), Vec::new(), encoding);
-        Some((raw, expanded))
+        let imports = fetch_sheet_imports(
+            sheet.text.clone(),
+            response.url,
+            page_url.clone(),
+            vec![sheet.url.clone()],
+            encoding,
+        );
+        Some((sheet, imports))
     })
     .collect::<Vec<_>>();
-    let (sources, imports): (Vec<_>, Vec<_>) = fetched.into_iter().unzip();
-    let expanded: Vec<String> = futures::stream::iter(imports)
+    let (mut sheets, imports): (Vec<_>, Vec<_>) = fetched.into_iter().unzip();
+    let imported: Vec<Vec<PageSheet>> = futures::stream::iter(imports)
         .buffered(PREFETCH_CONCURRENCY)
         .collect()
         .await;
-    let mut sheets: Vec<(String, String)> = sources.into_iter().zip(expanded).collect();
-    sheets.extend(fetch_inline_style_imports(html, page_url, encoding).await);
+    for imported in imported {
+        push_imported_sheets(&mut sheets, imported);
+    }
+    let inline = fetch_inline_style_imports(html, page_url, encoding).await;
+    push_imported_sheets(&mut sheets, inline);
     sheets
 }
 
+/// Add imported sheets to a page's sheet list, once per request URL.
+fn push_imported_sheets(sheets: &mut Vec<PageSheet>, imported: Vec<PageSheet>) {
+    for sheet in imported {
+        if !sheets
+            .iter()
+            .any(|seen| seen.link_href.is_none() && seen.url == sheet.url)
+        {
+            sheets.push(sheet);
+        }
+    }
+}
+
 /// Fetch the sheets that a document's inline `<style>` elements `@import`,
-/// keyed for the sheets list by `INLINE_IMPORT_KEY` and absolute URL.
-/// An inline sheet's text is part of the document, so the document's
-/// `encoding` is the imported sheets' environment encoding.
+/// and the sheets those import. An inline sheet's text is part of the
+/// document, so the document's `encoding` is the imported sheets'
+/// environment encoding.
 async fn fetch_inline_style_imports(
     html: &str,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
-) -> Vec<(String, String)> {
-    let base = base_with_doc_base(html, page_url);
-    let urls = inline_style_import_urls(html, &base, page_url);
-    futures::stream::iter(urls.into_iter().map(|url| {
-        let page_url = page_url.clone();
-        async move {
-            let response = fetch(&Request::subresource(url.clone(), &page_url, "style", None))
-                .await
-                .ok()
-                .and_then(StylesheetResponseExt::filter_stylesheet)?;
-            let (css, encoding) = crate::document_encoding::decode_stylesheet(
-                &response.content_type,
-                &response.body,
-                Some(encoding),
-            );
-            let key = format!("{INLINE_IMPORT_KEY}{url}");
-            Some((
-                key,
-                expand_stylesheet_imports(css, url, page_url, Vec::new(), encoding).await,
-            ))
-        }
-    }))
-    .buffered(PREFETCH_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-/// The distinct `@import` URLs of a document's inline `<style>` sheets,
-/// resolved against the document base, in document order.
-fn inline_style_import_urls(html: &str, base: &Url, page_url: &Url) -> Vec<Url> {
+) -> Vec<PageSheet> {
     if !html.to_ascii_lowercase().contains("@import") {
         return Vec::new();
     }
-    let mut urls: Vec<Url> = Vec::new();
-    for css in crate::dom::Dom::parse_document(html).inline_stylesheets() {
-        for import in stylesheet_imports(&css) {
-            if let Some(url) = base
-                .join(&import.url)
-                .ok()
-                .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
-                .filter(|url| subresource_allowed(page_url, url))
-                && !urls.contains(&url)
-            {
-                urls.push(url);
-            }
-        }
+    let base = base_with_doc_base(html, page_url);
+    let styles = crate::dom::Dom::parse_document(html).inline_stylesheets();
+    let fetched: Vec<Vec<PageSheet>> =
+        futures::stream::iter(styles.into_iter().map(|css| {
+            fetch_sheet_imports(css, base.clone(), page_url.clone(), Vec::new(), encoding)
+        }))
+        .buffered(PREFETCH_CONCURRENCY)
+        .collect()
+        .await;
+    let mut sheets = Vec::new();
+    for imported in fetched {
+        push_imported_sheets(&mut sheets, imported);
     }
-    urls
+    sheets
 }
 
 trait StylesheetResponseExt {
@@ -6126,7 +6230,7 @@ impl StylesheetResponseExt for Response {
 }
 
 #[derive(Clone, Debug)]
-struct CssImport {
+pub(crate) struct CssImport {
     start: usize,
     end: usize,
     url: String,
@@ -6136,177 +6240,322 @@ struct CssImport {
 /// CSS Values 4 #relative-urls: a fetched style sheet's own URL, after
 /// redirects, is the base of its `url()` tokens and `@import` rules, not the
 /// document's. Process a sheet fetched after parsing (a script-inserted
-/// `<link>`, or a sheet of a scripted frame) as the parser-time loader does.
-/// `encoding` is the sheet's own encoding, its imports' environment encoding.
-pub(crate) async fn fetched_stylesheet_text(
+/// `<link>`, or a sheet of a scripted frame) as the parser-time loader does:
+/// `request` is the URL the element requested and `cors_mode` whether that
+/// was a CORS request. `encoding` is the sheet's own encoding, its imports'
+/// environment encoding.
+pub(crate) async fn fetched_stylesheet(
     css: String,
+    request: Url,
     sheet_url: Url,
     client: Url,
+    cors_mode: bool,
     encoding: &'static encoding_rs::Encoding,
-) -> String {
-    expand_stylesheet_imports(css, sheet_url, client, Vec::new(), encoding).await
+) -> FetchedStyleSheet {
+    let text = absolutize_css_urls(&css, &sheet_url);
+    let imports = fetch_sheet_imports(
+        text.clone(),
+        sheet_url.clone(),
+        client.clone(),
+        vec![request.to_string()],
+        encoding,
+    )
+    .await;
+    FetchedStyleSheet {
+        cors_same_origin: sheet_cors_same_origin(&client, &request, &sheet_url, cors_mode),
+        base: sheet_url.to_string(),
+        text,
+        imports,
+    }
 }
 
-/// CSS Cascade 5 §2.2: replace each applicable `@import` in source order by
-/// the imported rules. Imports are cycle-checked; a failed resource contributes
-/// no rules. URL tokens are then made absolute
-/// against the stylesheet that contained them, as CSSOM URL resolution
-/// requires, rather than against the HTML document. `encoding` is the
-/// sheet's encoding: the environment encoding of the sheets it imports
-/// (CSS Cascade 5 #at-import).
-fn expand_stylesheet_imports(
+/// CSS Cascade 4 #fetch-an-import for each valid `@import` of a sheet whose
+/// `@import` URLs resolve against `sheet_base`, recursively: every imported
+/// sheet, once per request URL, in the order the imports first reach it. An
+/// import whose `supports()` condition is false is not fetched; one naming a
+/// sheet in `ancestry` (the importing sheets) would be a cycle and loads
+/// nothing; a failed fetch contributes no sheet. `encoding` is the importing
+/// sheet's encoding, the environment encoding of the sheets it imports
+/// (CSS Cascade 5 #import-processing).
+fn fetch_sheet_imports(
     css: String,
-    sheet_url: Url,
-    page_url: Url,
-    mut ancestry: Vec<String>,
+    sheet_base: Url,
+    client: Url,
+    ancestry: Vec<String>,
     encoding: &'static encoding_rs::Encoding,
-) -> futures::future::BoxFuture<'static, String> {
+) -> futures::future::BoxFuture<'static, Vec<PageSheet>> {
     use futures::FutureExt as _;
     async move {
-        if ancestry.iter().any(|seen| seen == sheet_url.as_str()) {
-            return String::new();
-        }
-        ancestry.push(sheet_url.to_string());
-        let imports = stylesheet_imports(&css);
-        if imports.is_empty() {
-            return absolutize_css_urls(&css, &sheet_url);
-        }
-        let mut out = String::with_capacity(css.len());
-        let mut cursor = 0usize;
-        for import in imports {
-            out.push_str(&css[cursor..import.start]);
-            cursor = import.end;
-            let Some(url) = sheet_url
+        let mut sheets: Vec<PageSheet> = Vec::new();
+        for import in stylesheet_imports(&css) {
+            let Some(url) = sheet_base
                 .join(&import.url)
                 .ok()
                 .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
-                .filter(|url| subresource_allowed(&page_url, url))
+                .filter(|url| subresource_allowed(&client, url))
             else {
                 continue;
             };
-            if ancestry.iter().any(|seen| seen == url.as_str()) {
+            if ancestry.iter().any(|seen| seen == url.as_str())
+                || sheets.iter().any(|seen| seen.url == url.as_str())
+                || !import_supports_holds(&import.condition)
+            {
                 continue;
             }
-            let Some(response) =
-                fetch(&Request::subresource(url.clone(), &page_url, "style", None))
-                    .await
-                    .ok()
-                    .and_then(StylesheetResponseExt::filter_stylesheet)
-            else {
-                continue;
-            };
-            let (child, child_encoding) = crate::document_encoding::decode_stylesheet(
-                &response.content_type,
-                &response.body,
-                Some(encoding),
-            );
-            let child = expand_stylesheet_imports(
-                child,
-                url,
-                page_url.clone(),
-                ancestry.clone(),
-                child_encoding,
-            )
-            .await;
-            out.push_str(&wrap_import_condition(child, &import.condition));
+            let fetched =
+                fetch_imported_sheet(url, client.clone(), ancestry.clone(), encoding).await;
+            push_imported_sheets(&mut sheets, fetched);
         }
-        out.push_str(&css[cursor..]);
-        absolutize_css_urls(&out, &sheet_url)
+        sheets
     }
     .boxed()
 }
 
-fn wrap_import_condition(css: String, condition: &str) -> String {
-    let condition = condition.trim();
-    if condition.is_empty() {
-        return css;
+/// CSS Cascade 4 #fetch-an-import steps 4-6 for one import URL: fetch it in
+/// no-cors mode for `client`, decode it with `encoding` as its environment
+/// encoding, and fetch its own imports. Returns the sheet followed by the
+/// sheets its imports reached; nothing when the fetch fails or the
+/// response is not a style sheet.
+pub(crate) fn fetch_imported_sheet(
+    url: Url,
+    client: Url,
+    ancestry: Vec<String>,
+    encoding: &'static encoding_rs::Encoding,
+) -> futures::future::BoxFuture<'static, Vec<PageSheet>> {
+    use futures::FutureExt as _;
+    async move {
+        let Some(response) = fetch(&Request::subresource(url.clone(), &client, "style", None))
+            .await
+            .ok()
+            .and_then(StylesheetResponseExt::filter_stylesheet)
+        else {
+            return Vec::new();
+        };
+        let (child, child_encoding) = crate::document_encoding::decode_stylesheet(
+            &response.content_type,
+            &response.body,
+            Some(encoding),
+        );
+        let text = absolutize_css_urls(&child, &response.url);
+        let mut child_ancestry = ancestry;
+        child_ancestry.push(url.to_string());
+        let nested = fetch_sheet_imports(
+            text.clone(),
+            response.url.clone(),
+            client.clone(),
+            child_ancestry,
+            child_encoding,
+        )
+        .await;
+        let mut sheets = vec![PageSheet {
+            link_href: None,
+            cors_same_origin: sheet_cors_same_origin(&client, &url, &response.url, false),
+            url: url.to_string(),
+            base: response.url.to_string(),
+            text,
+        }];
+        push_imported_sheets(&mut sheets, nested);
+        sheets
     }
-    // CSS Cascade 5 §2.1 defines layer/supports/media modifiers in that
-    // order. Preserve the common media-only form exactly; the parser already
-    // understands nested @media blocks. Layer/supports modifiers remain on a
-    // generated grouping rule so their cascade/condition semantics survive.
-    if let Some(layer) = condition.strip_prefix("layer(")
-        && let Some((name, rest)) = layer.split_once(')')
-    {
-        return wrap_import_condition(format!("@layer {name}{{{css}}}"), rest);
-    }
-    if let Some(rest) = condition.strip_prefix("layer") {
-        return wrap_import_condition(format!("@layer{{{css}}}"), rest);
-    }
-    if let Some(supports) = condition.strip_prefix("supports(")
-        && let Some((query, rest)) = supports.rsplit_once(')')
-    {
-        return wrap_import_condition(format!("@supports ({query}){{{css}}}"), rest);
-    }
-    format!("@media {condition}{{{css}}}")
+    .boxed()
 }
 
-fn stylesheet_imports(css: &str) -> Vec<CssImport> {
+/// The parts of an `@import` rule's conditions after its URL (CSS Cascade 5
+/// #at-import): `layer` or `layer(<layer-name>)` (`Some("")` for an
+/// anonymous layer), then `supports(...)`, then a media query list.
+pub(crate) fn import_condition_parts(condition: &str) -> (Option<String>, Option<String>, String) {
+    let mut rest = condition.trim();
+    let mut layer = None;
+    if rest
+        .get(..6)
+        .is_some_and(|word| word.eq_ignore_ascii_case("layer("))
+        && let Some(close) = rest.find(')')
+    {
+        layer = Some(rest[6..close].trim().to_string());
+        rest = rest[close + 1..].trim_start();
+    } else if rest
+        .get(..5)
+        .is_some_and(|word| word.eq_ignore_ascii_case("layer"))
+        && rest[5..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == ';')
+    {
+        layer = Some(String::new());
+        rest = rest[5..].trim_start();
+    }
+    let mut supports = None;
+    if rest
+        .get(..9)
+        .is_some_and(|word| word.eq_ignore_ascii_case("supports("))
+    {
+        let mut depth = 0usize;
+        let mut quote = None;
+        for (index, c) in rest.char_indices().skip(8) {
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        supports = Some(rest[9..index].trim().to_string());
+                        rest = rest[index + 1..].trim_start();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (layer, supports, rest.trim().to_string())
+}
+
+/// Whether an import's `supports()` condition, if any, is true (CSS Cascade
+/// 5 #conditional-import): a bare declaration is a `<supports-decl>`.
+fn import_supports_holds(condition: &str) -> bool {
+    match import_condition_parts(condition).1 {
+        Some(supports) => crate::dom::import_supports_condition(&supports),
+        None => true,
+    }
+}
+
+/// The rules of an imported sheet under its import's conditions: a cascade
+/// layer, then `@supports`, then `@media` (CSS Cascade 5 #at-import and
+/// #conditional-import: "as if the imported stylesheet were wrapped in
+/// @media and/or @supports blocks").
+fn wrap_import_condition(css: String, condition: &str) -> String {
+    let (layer, supports, media) = import_condition_parts(condition);
+    let mut css = match layer {
+        Some(name) if name.is_empty() => format!("@layer{{{css}}}"),
+        Some(name) => format!("@layer {name}{{{css}}}"),
+        None => css,
+    };
+    if let Some(query) = supports {
+        css = format!("@supports ({query}){{{css}}}");
+    }
+    if !media.is_empty() {
+        css = format!("@media {media}{{{css}}}");
+    }
+    css
+}
+
+/// The valid `@import` rules of a style sheet, in order (CSS Cascade 5
+/// #at-import): an `@import` must precede every other at-rule and style
+/// rule except `@charset` and `@layer` statements, so scanning stops at the
+/// first other rule.
+pub(crate) fn stylesheet_imports(css: &str) -> Vec<CssImport> {
     let bytes = css.as_bytes();
     let mut imports = Vec::new();
     let mut i = 0usize;
-    let mut brace_depth = 0usize;
-    let mut quote = None;
-    let mut comment = false;
+    let at_keyword = |i: usize, keyword: &str| {
+        css.get(i..i + keyword.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+            && css[i + keyword.len()..].chars().next().is_none_or(|c| {
+                !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+            })
+    };
     while i < bytes.len() {
-        if comment {
-            if bytes.get(i..i + 2) == Some(b"*/") {
-                comment = false;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if let Some(q) = quote {
-            if bytes[i] == b'\\' {
-                i = (i + 2).min(bytes.len());
-            } else {
-                if bytes[i] == q {
-                    quote = None;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if bytes.get(i..i + 2) == Some(b"/*") {
-            comment = true;
-            i += 2;
-            continue;
-        }
-        if matches!(bytes[i], b'\'' | b'"') {
-            quote = Some(bytes[i]);
+        if bytes[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
-        match bytes[i] {
-            b'{' => brace_depth += 1,
-            b'}' => brace_depth = brace_depth.saturating_sub(1),
-            b'@' if brace_depth == 0
-                && css[i..]
-                    .get(..7)
-                    .is_some_and(|word| word.eq_ignore_ascii_case("@import")) =>
-            {
-                let start = i;
-                let Some(end) = css_statement_end(css, i + 7) else {
-                    break;
-                };
-                if let Some((url, condition)) = parse_import_prelude(&css[i + 7..end - 1]) {
-                    imports.push(CssImport {
-                        start,
-                        end,
-                        url,
-                        condition,
-                    });
+        if bytes.get(i..i + 2) == Some(b"/*") {
+            i = css[i + 2..]
+                .find("*/")
+                .map_or(css.len(), |end| i + 2 + end + 2);
+            continue;
+        }
+        // CSS Syntax 3 #parse-a-css-stylesheet discards top-level CDO/CDC.
+        if bytes.get(i..i + 4) == Some(b"<!--") {
+            i += 4;
+            continue;
+        }
+        if bytes.get(i..i + 3) == Some(b"-->") {
+            i += 3;
+            continue;
+        }
+        if at_keyword(i, "@import") {
+            let start = i;
+            let Some(end) = css_statement_end(css, i + 7) else {
+                break;
+            };
+            if let Some((url, condition)) = parse_import_prelude(&css[i + 7..end - 1]) {
+                imports.push(CssImport {
+                    start,
+                    end,
+                    url,
+                    condition,
+                });
+            }
+            i = end;
+            continue;
+        }
+        if at_keyword(i, "@charset") {
+            let Some(end) = css_statement_end(css, i + 8) else {
+                break;
+            };
+            i = end;
+            continue;
+        }
+        if at_keyword(i, "@layer") {
+            // A statement (`@layer a, b;`) may precede imports; a block may not.
+            match css_statement_or_block(css, i + 6) {
+                Some(end) => {
+                    i = end;
+                    continue;
                 }
-                i = end;
+                None => break,
+            }
+        }
+        break;
+    }
+    imports
+}
+
+/// The absolute URLs of a sheet's valid `@import` rules, resolved against
+/// `base`.
+pub(crate) fn stylesheet_import_urls(css: &str, base: Option<&Url>) -> Vec<String> {
+    stylesheet_imports(css)
+        .into_iter()
+        .filter_map(|import| match base {
+            Some(base) => base.join(&import.url).ok(),
+            None => Url::parse(&import.url).ok(),
+        })
+        .map(String::from)
+        .collect()
+}
+
+/// The end (after its `;`) of an at-rule statement starting at `i`, or
+/// `None` when a `{` block begins first or the input ends.
+fn css_statement_or_block(css: &str, mut i: usize) -> Option<usize> {
+    let bytes = css.as_bytes();
+    let mut quote = None;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' {
+                i = (i + 2).min(bytes.len());
                 continue;
             }
-            _ => {}
+            if bytes[i] == q {
+                quote = None;
+            }
+        } else {
+            match bytes[i] {
+                b'\'' | b'"' => quote = Some(bytes[i]),
+                b'{' => return None,
+                b';' => return Some(i + 1),
+                _ => {}
+            }
         }
         i += 1;
     }
-    imports
+    None
 }
 
 fn css_statement_end(css: &str, mut i: usize) -> Option<usize> {
@@ -6387,7 +6636,18 @@ fn absolutize_css_urls(css: &str, base: &Url) -> String {
     let mut out = String::with_capacity(css.len());
     let mut cursor = 0usize;
     let mut i = 0usize;
+    // An `@import` keeps its URL as written: CSSOM #dom-cssimportrule-href
+    // returns it, and imports resolve against the sheet's response URL.
+    let imports = stylesheet_imports(css);
+    let mut imports = imports.iter().peekable();
     while i < css.len() {
+        if let Some(import) = imports.peek()
+            && i >= import.start
+        {
+            i = i.max(import.end);
+            imports.next();
+            continue;
+        }
         if css[i..].starts_with("/*") {
             i = css[i + 2..]
                 .find("*/")
@@ -6767,20 +7027,16 @@ struct DocumentFontFace {
     unicode_range: Vec<(u32, u32)>,
 }
 
-fn document_font_faces(
-    html: &str,
-    sheets: &[(String, String)],
-    page_url: &Url,
-) -> Vec<DocumentFontFace> {
+fn document_font_faces(html: &str, sheets: &[PageSheet], page_url: &Url) -> Vec<DocumentFontFace> {
     // CSS Fonts 4 §4.1 defines downloadable faces from the complete set of
     // sheets belonging to the document. Inline style URLs use the document
     // base URL; external-sheet URLs were made absolute against their own sheet
-    // by `expand_stylesheet_imports` before reaching this point.
+    // when they were fetched (`PageSheet::text`).
     let document_base = base_with_doc_base(html, page_url);
     let inline = crate::dom::Dom::parse_document(html).inline_stylesheets();
     inline
         .iter()
-        .chain(sheets.iter().map(|(_, css)| css))
+        .chain(sheets.iter().map(|sheet| &sheet.text))
         .flat_map(|css| stylesheet_font_faces(css))
         .filter_map(|face| {
             let sources = face
@@ -6802,7 +7058,7 @@ fn document_font_faces(
         .collect()
 }
 
-async fn install_stylesheet_fonts(html: &str, sheets: &[(String, String)], page_url: &Url) {
+async fn install_stylesheet_fonts(html: &str, sheets: &[PageSheet], page_url: &Url) {
     let faces = document_font_faces(html, sheets, page_url);
     let fonts = futures::stream::iter(faces.into_iter().map(
         |DocumentFontFace {
@@ -6917,7 +7173,7 @@ async fn css_only_with_sheets(
     viewport: (u16, u16),
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
-    sheets: Vec<(String, String)>,
+    sheets: Vec<PageSheet>,
     frames: Option<FrameDocuments>,
     terminal_presentation: bool,
 ) -> Response {
@@ -6939,10 +7195,14 @@ async fn css_only_with_sheets(
     let mut frame_sheets = Vec::new();
     for (frame_url, markup, encoding) in frames.values() {
         let frame_base = base_with_doc_base(markup, frame_url);
-        for (source, css) in fetch_page_sheets(markup, frame_url, encoding).await {
-            if let Ok(url) = frame_base.join(&source) {
-                frame_sheets.push((url.to_string(), css));
+        for mut sheet in fetch_page_sheets(markup, frame_url, encoding).await {
+            if let Some(source) = sheet.link_href.take() {
+                match frame_base.join(&source) {
+                    Ok(url) => sheet.link_href = Some(url.to_string()),
+                    Err(_) => continue,
+                }
             }
+            frame_sheets.push(sheet);
         }
     }
     // The terminal lays text out in its cell font from the cascade on (`ch`
@@ -6951,6 +7211,7 @@ async fn css_only_with_sheets(
     let _cells = terminal_presentation
         .then(|| crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px)));
     let mut dom = crate::js::css_prepare(&html, viewport, cell_px);
+    dom.set_document_encoding(crate::dom::DOCUMENT, document_encoding);
     if !frames.is_empty() {
         install_page_frames(&mut dom, &response.url, &frames);
     }
@@ -7156,8 +7417,16 @@ fn base_with_doc_base(html: &str, doc_url: &Url) -> Url {
 /// scheme-fetch path below. The circular-navigation guard follows HTML (a
 /// frame may not load a URL already held by an inclusive ancestor navigable).
 /// `None` means "don't load".
-fn resolve_frame_src(src: &str, base: &Url, page_url: &Url, ancestors: &[String]) -> Option<Url> {
-    let url = base.join(src.trim()).ok()?;
+fn resolve_frame_src(
+    src: &str,
+    base: &Url,
+    page_url: &Url,
+    ancestors: &[String],
+    encoding: &'static encoding_rs::Encoding,
+) -> Option<Url> {
+    // HTML #shared-attribute-processing-steps-for-iframe-and-frame-elements:
+    // encoding-parse relative to the element's node document.
+    let url = crate::form_encoding::encoding_parse_url(src.trim(), Some(base), encoding).ok()?;
     if !matches!(url.scheme(), "http" | "https" | "file" | "data") {
         return None;
     }
@@ -7215,6 +7484,7 @@ fn scan_frame_sources(
     base: &Url,
     page_url: &Url,
     ancestors: &[String],
+    encoding: &'static encoding_rs::Encoding,
 ) -> (Vec<Url>, Vec<String>) {
     let dom = crate::dom::Dom::parse_document(html);
     let mut srcs = Vec::new();
@@ -7230,7 +7500,7 @@ fn scan_frame_sources(
             continue;
         }
         if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
-            && let Some(url) = resolve_frame_src(src, base, page_url, ancestors)
+            && let Some(url) = resolve_frame_src(src, base, page_url, ancestors, encoding)
         {
             srcs.push(url);
         }
@@ -7275,7 +7545,7 @@ async fn prefetch_frame_documents(
     ));
 
     while let Some((markup, base, ancestors, origin_url, encoding)) = queue.pop_front() {
-        let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors);
+        let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors, encoding);
 
         let cookie_ancestor = ancestors.iter().any(|ancestor| {
             Url::parse(ancestor)
@@ -7372,41 +7642,59 @@ fn install_page_frames(dom: &mut crate::dom::Dom, page_url: &Url, fetched: &Fram
         }
         b
     };
-    // (subtree root, base for that subtree, fragment-stripped ancestor URLs)
-    let mut queue: VecDeque<(NodeId, Url, Vec<String>)> = VecDeque::new();
+    // (subtree root, base for that subtree, fragment-stripped ancestor URLs,
+    // that document's character encoding, as `prefetch_frame_documents`
+    // tracks it)
+    let mut queue: VecDeque<(NodeId, Url, Vec<String>, &'static encoding_rs::Encoding)> =
+        VecDeque::new();
     queue.push_back((
         DOCUMENT,
         base,
         vec![strip_fragment(page_url.as_str()).to_string()],
+        dom.document_encoding(DOCUMENT),
     ));
 
-    while let Some((root, base, ancestors)) = queue.pop_front() {
+    while let Some((root, base, ancestors, encoding)) = queue.pop_front() {
         // Collect each frame's content first (immutable borrow), then install
         // (mutable borrow) — can't hold the descendants borrow across install.
-        let mut plans: Vec<(NodeId, String, Url, Option<Url>)> = Vec::new();
+        type Plan = (
+            NodeId,
+            String,
+            Url,
+            Option<Url>,
+            &'static encoding_rs::Encoding,
+        );
+        let mut plans: Vec<Plan> = Vec::new();
         for id in dom.descendants(root) {
             match dom.tag_name(id) {
                 Some("iframe") | Some("frame") => {}
                 _ => continue,
             }
             if let Some(srcdoc) = dom.attr(id, "srcdoc") {
-                plans.push((id, srcdoc.to_string(), base.clone(), None));
+                plans.push((
+                    id,
+                    srcdoc.to_string(),
+                    base.clone(),
+                    None,
+                    encoding_rs::UTF_8,
+                ));
                 continue;
             }
             if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
-                && let Some(url) = resolve_frame_src(src, &base, page_url, &ancestors)
-                && let Some((final_url, content, _)) = fetched.get(url.as_str())
+                && let Some(url) = resolve_frame_src(src, &base, page_url, &ancestors, encoding)
+                && let Some((final_url, content, child_encoding)) = fetched.get(url.as_str())
             {
                 plans.push((
                     id,
                     content.clone(),
                     final_url.clone(),
                     Some(final_url.clone()),
+                    *child_encoding,
                 ));
             }
         }
 
-        for (frame, content, frame_base, frame_url) in plans {
+        for (frame, content, frame_base, frame_url, child_encoding) in plans {
             if let Some(body) = dom.install_frame_document(frame, &content, frame_base.as_str()) {
                 let restricted = ancestors.iter().any(|ancestor| {
                     Url::parse(ancestor)
@@ -7420,7 +7708,7 @@ fn install_page_frames(dom: &mut crate::dom::Dom, page_url: &Url, fetched: &Fram
                 if let Some(u) = &frame_url {
                     child_ancestors.push(strip_fragment(u.as_str()).to_string());
                 }
-                queue.push_back((body, frame_base, child_ancestors));
+                queue.push_back((body, frame_base, child_ancestors, child_encoding));
             }
         }
     }
@@ -8602,9 +8890,16 @@ fn walk_forms_arena(
                     Some(m) if m.eq_ignore_ascii_case("post") => FormMethod::Post,
                     _ => FormMethod::Get,
                 };
-                let action = base
-                    .join(dom.attr(child, "action").unwrap_or(""))
-                    .unwrap_or_else(|_| base.clone());
+                // HTML #form-submission-algorithm: encoding-parse the action
+                // relative to the node document, and submit in the encoding
+                // #picking-an-encoding-for-the-form selects.
+                let document_encoding = dom.node_document_encoding(child);
+                let action = crate::form_encoding::encoding_parse_url(
+                    dom.attr(child, "action").unwrap_or(""),
+                    Some(base),
+                    document_encoding,
+                )
+                .unwrap_or_else(|_| base.clone());
                 // HTML #attr-fs-enctype: an enumerated attribute whose
                 // missing and invalid value default is urlencoded.
                 let enctype = dom
@@ -8618,6 +8913,10 @@ fn walk_forms_arena(
                     enctype,
                     fields: Vec::new(),
                     live_node: live_node(dom, child),
+                    encoding: crate::form_encoding::form_submission_encoding(
+                        dom.attr(child, "accept-charset"),
+                        document_encoding,
+                    ),
                 });
                 let form = forms.len() - 1;
                 walk_forms_arena(dom, child, Some(form), base, forms, map, implicit);
@@ -8664,6 +8963,7 @@ fn walk_forms_arena(
                             enctype: String::from(crate::js::FORM_URLENCODED),
                             fields: Vec::new(),
                             live_node: None,
+                            encoding: encoding_rs::UTF_8,
                         });
                         forms.len() - 1
                     }),
@@ -8692,6 +8992,7 @@ fn walk_forms_arena(
                             enctype: String::from(crate::js::FORM_URLENCODED),
                             fields: Vec::new(),
                             live_node: None,
+                            encoding: encoding_rs::UTF_8,
                         });
                         forms.len() - 1
                     }),
@@ -9233,21 +9534,43 @@ mod tests {
         )
         .await;
         let url = page.join("css/fonts.css").unwrap();
-        assert_eq!(sheets.len(), 1, "one fetch per distinct import");
-        assert_eq!(sheets[0].0, format!("{INLINE_IMPORT_KEY}{url}"));
-        assert!(sheets[0].1.contains(".nested"));
+        let nested = page.join("css/nested.css").unwrap();
+        // Each imported sheet is its own record (CSSOM #css-style-sheets),
+        // fetched once per URL and in the order the imports first reach it.
+        assert_eq!(sheets.len(), 2, "one fetch per distinct import");
+        assert_eq!(sheets[0].link_href, None);
+        assert_eq!(sheets[0].url, url.as_str());
+        assert_eq!(sheets[1].url, nested.as_str());
+        assert!(
+            sheets[0].text.starts_with("@import 'nested.css';"),
+            "{}",
+            sheets[0].text
+        );
         assert!(
             sheets[0]
-                .1
+                .text
                 .contains(page.join("css/f.ttf").unwrap().as_str())
         );
-        let spliced = splice_inline_imports(
+        assert_eq!(sheets[1].text, ".nested{color:red}");
+        // file: responses are not CORS-same-origin (opaque origin).
+        assert!(!sheets[0].cors_same_origin);
+        let lookup = |key: &str| {
+            sheets
+                .iter()
+                .find(|sheet| sheet.url == key)
+                .map(|sheet| (sheet.text.as_str(), sheet.base.as_str()))
+        };
+        let spliced = splice_imports(
             r#"@import url("fonts.css") screen; p{color:blue}"#,
             Some(&page.join("css/").unwrap()),
-            |key| (key == url.as_str()).then_some(&sheets[0].1),
+            None,
+            &lookup,
         )
         .unwrap();
-        assert!(spliced.starts_with("@media screen{"));
+        assert!(
+            spliced.starts_with("@media screen{.nested{color:red}"),
+            "{spliced}"
+        );
         assert!(spliced.ends_with(" p{color:blue}"));
     }
 
@@ -9307,18 +9630,20 @@ mod tests {
         let text = |name: &str| {
             sheets
                 .iter()
-                .find(|(source, _)| source == name)
-                .map(|(_, css)| css.clone())
+                .find(|sheet| {
+                    sheet.link_href.as_deref() == Some(name)
+                        || (sheet.link_href.is_none() && sheet.url.ends_with(name))
+                })
+                .map(|sheet| sheet.text.clone())
                 .unwrap()
         };
         assert!(text("plain.css").contains("content:'é'"));
         assert!(text("labelled.css").contains("content:'а'"));
         let declared = text("declared.css");
-        assert!(
-            declared.contains("u::after{content:'а'}")
-                && declared.contains("i::after{content:'а'}"),
-            "{declared}"
-        );
+        assert!(declared.contains("i::after{content:'а'}"), "{declared}");
+        // The imported sheet is its own record, decoded in its importer's
+        // encoding.
+        assert!(text("imported.css").contains("u::after{content:'а'}"));
     }
 
     #[tokio::test]
@@ -9342,12 +9667,18 @@ mod tests {
             encoding_rs::UTF_8,
         )
         .await;
-        assert_eq!(sheets.len(), 1);
-        assert!(sheets[0].1.contains(".imported"));
-        assert!(sheets[0].1.contains(".main"));
+        // The linked sheet and the sheet it imports, each with its own text.
+        assert_eq!(sheets.len(), 2);
+        assert_eq!(sheets[0].link_href.as_deref(), Some("main.css"));
+        assert!(sheets[0].text.contains(".main"));
+        assert_eq!(
+            sheets[1].url,
+            page.join("assets/more.css").unwrap().as_str()
+        );
+        assert!(sheets[1].text.contains(".imported"));
         assert!(
-            sheets[0]
-                .1
+            sheets[1]
+                .text
                 .contains(page.join("assets/icon.png").unwrap().as_str())
         );
 
@@ -9361,7 +9692,9 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert!(resolve_frame_src(page.as_str(), &page, &remote, &[]).is_none());
+        assert!(
+            resolve_frame_src(page.as_str(), &page, &remote, &[], encoding_rs::UTF_8).is_none()
+        );
         assert!(
             fetch_graphical_image(&remote, page.as_str(), None)
                 .await
@@ -10097,7 +10430,7 @@ mod tests {
             "<head><link rel=stylesheet href=app.css></head>\
              <body><svg id=icon class='icon h-5 w-5' viewBox='0 0 40 40'></svg></body>",
         );
-        dom.attach_external_sheets(&[("app.css".into(), resolved)]);
+        dom.attach_external_sheets(&[PageSheet::link("app.css", resolved)]);
         let icon = dom.get_by_id("icon").unwrap();
         assert_eq!(
             dom.computed_style(icon, "width").as_deref(),
@@ -10156,14 +10489,12 @@ mod tests {
         let html = "<base href='/assets/'><style>\
                     @font-face{font-family:Inline;src:url(fonts/inline.ttf)}\
                     </style>";
-        // External sheets have already passed through
-        // `expand_stylesheet_imports`, which absolutizes their URL tokens
-        // against the stylesheet URL rather than the document base.
-        let sheets = vec![(
-            "../css/site.css".into(),
+        // External sheets' URL tokens were made absolute against the
+        // stylesheet URL when fetched, rather than against the document base.
+        let sheets = vec![PageSheet::link(
+            "../css/site.css",
             "@font-face{font-family:External;\
-             src:url(https://cdn.example.test/fonts/external.woff2)}"
-                .into(),
+             src:url(https://cdn.example.test/fonts/external.woff2)}",
         )];
         let faces = document_font_faces(html, &sheets, &page);
         assert_eq!(faces.len(), 2);

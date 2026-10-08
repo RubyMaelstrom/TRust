@@ -25,6 +25,9 @@ const POINT_IN_STROKE: u8 = 6;
 const NUMBER_OF_CHARS: u8 = 7;
 const COMPUTED_TEXT_LENGTH: u8 = 8;
 const SUBSTRING_LENGTH: u8 = 9;
+/// SVG 2 types.html#__svg__SVGLength__value: the bases relative lengths of
+/// an element resolve against, `[viewport width, viewport height, font size]`.
+const LENGTH_CONTEXT: u8 = 10;
 
 fn number(args: &[Value], index: usize) -> f64 {
     args.get(index)
@@ -100,7 +103,11 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     }) else {
         return Ok(Value::Null);
     };
-    let outer = outer_viewport(ctx, id, matches!(operation, CTM | SCREEN_CTM));
+    let outer = outer_viewport(
+        ctx,
+        id,
+        matches!(operation, CTM | SCREEN_CTM | LENGTH_CONTEXT),
+    );
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(match operation {
@@ -153,6 +160,14 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                     .map_or(Value::Null, Value::Num),
                 _ => Value::Null,
             }
+        }
+        LENGTH_CONTEXT => {
+            let [width, height, font_size] = dom.svg_length_context(id, outer);
+            ctx.make_array(vec![
+                Value::Num(width),
+                Value::Num(height),
+                Value::Num(font_size),
+            ])
         }
         _ => Value::Null,
     })

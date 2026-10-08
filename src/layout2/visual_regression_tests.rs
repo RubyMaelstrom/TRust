@@ -860,13 +860,12 @@ fn captured_page_computed_style_diagnostic() {
         .unwrap()
         .iter()
         .map(|s| {
-            (
+            crate::http::PageSheet::link(
                 s["href"]
                     .as_str()
                     .unwrap()
-                    .trim_start_matches("https://openai.com")
-                    .to_string(),
-                s["text"].as_str().unwrap().to_string(),
+                    .trim_start_matches("https://openai.com"),
+                s["text"].as_str().unwrap(),
             )
         })
         .collect::<Vec<_>>();
