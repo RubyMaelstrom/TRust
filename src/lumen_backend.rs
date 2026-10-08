@@ -20863,6 +20863,83 @@ mod tests {
     }
 
     #[test]
+    fn body_form_data_round_trips_and_constructors_extract_content_types() {
+        // Fetch #concept-bodyinit-extract: constructing a Request or Response
+        // extracts the body and appends the Content-Type it implies (a
+        // FormData's carries the boundary of its multipart encoding) unless
+        // the headers name one. #dom-body-formdata then decodes the read bytes
+        // by that MIME type: RFC 7578 multipart parts become strings or Files
+        // (text/plain by default), urlencoded bodies are parsed as by URL's
+        // urlencoded parser, and anything else rejects with a TypeError.
+        // Login forms in React Router apps read `request.formData()`.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.result = undefined;
+            (async () => {
+                const out = [];
+                const form = new FormData();
+                form.append('email', 'user@example.com');
+                form.append('note', 'line 1\nline 2 ✓');
+                form.append('upload', new Blob(['%PDF\r\n--x'], {type: 'application/pdf'}), 'a "b".pdf');
+                form.append('email', 'second');
+                const request = new Request('https://example.com/login', {method: 'POST', body: form});
+                const type = request.headers.get('content-type');
+                out.push(/^multipart\/form-data; boundary=\S+$/.test(type));
+                const parsed = await request.clone().formData();
+                const file = parsed.get('upload');
+                out.push(JSON.stringify(parsed.getAll('email')), parsed.get('note') === 'line 1\r\nline 2 ✓',
+                    file instanceof File, file.name, file.type, await file.text());
+                out.push(request.bodyUsed, (await request.text()).includes(type.slice(type.indexOf('=') + 1)), request.bodyUsed);
+
+                const response = new Response('a=1&b=%20x+y&a=3&%3Fq=%E2%9C%93', {headers: {'Content-Type': 'application/x-www-form-urlencoded'}});
+                const urlencoded = await response.formData();
+                out.push(JSON.stringify([...urlencoded]));
+
+                const boundary = 'XyZ';
+                const raw = 'preamble\r\n--XyZ \r\nContent-Disposition: form-data; name="f"; filename="n.txt"\r\n\r\nfile body\r\n' +
+                    '--XyZ\r\ncontent-disposition: FORM-DATA; name=plain\r\nContent-Type: text/plain; charset=latin1\r\n\r\né\r\n--XyZ--\r\nepilogue';
+                const handmade = await new Response(raw, {headers: {'content-type': 'multipart/form-data; boundary="XyZ"'}}).formData();
+                const named = handmade.get('f');
+                out.push(named.name, named.type, await named.text(), handmade.get('plain'));
+
+                const rejects = async (body, contentType) => {
+                    try { await new Response(body, {headers: {'content-type': contentType}}).formData(); return 'resolved'; }
+                    catch (e) { return e.name; }
+                };
+                out.push(await rejects('a=1', 'text/plain'),
+                    await rejects('--b\r\nContent-Disposition: form-data; name="x"\r\n\r\nv', 'multipart/form-data; boundary=b'),
+                    await rejects('--b--', 'multipart/form-data'),
+                    await rejects('--b\r\nContent-Type: text/plain\r\n\r\nv\r\n--b--', 'multipart/form-data; boundary=b'));
+
+                out.push(new Response('text').headers.get('content-type'),
+                    new Response(new URLSearchParams('a=1')).headers.get('content-type'),
+                    new Response(new Blob(['x'], {type: 'image/png'})).headers.get('content-type'),
+                    new Response(new Uint8Array([1])).headers.get('content-type'),
+                    new Response('x', {headers: {'content-type': 'text/html'}}).headers.get('content-type'),
+                    Response.json({a: 1}).headers.get('content-type'),
+                    new Response('x').clone().headers.get('content-type'),
+                    new Request('https://example.com/', {method: 'POST', body: 'x', headers: {'Content-Type': 'text/csv'}}).headers.get('content-type'));
+                globalThis.result = out.join('|');
+            })().catch((e) => { globalThis.result = 'threw ' + e; });
+            "#,
+            "Body formData and extraction",
+        )
+        .unwrap();
+        for _ in 0..20 {
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "String(globalThis.result)"),
+            "true|[\"user@example.com\",\"second\"]|true|true|a %22b%22.pdf|application/pdf|%PDF\r\n--x|false|true|true|\
+             [[\"a\",\"1\"],[\"b\",\" x y\"],[\"a\",\"3\"],[\"?q\",\"✓\"]]|n.txt|text/plain|file body|é|\
+             TypeError|TypeError|TypeError|TypeError|\
+             text/plain;charset=UTF-8|application/x-www-form-urlencoded;charset=UTF-8|image/png||text/html|application/json|text/plain;charset=UTF-8|text/csv"
+        );
+    }
+
+    #[test]
     fn location_is_a_location_with_unforgeable_members() {
         // HTML #the-location-interface: every member is [LegacyUnforgeable]
         // (own, non-configurable properties), creation adds own valueOf and

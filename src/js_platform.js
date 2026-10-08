@@ -22634,11 +22634,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     g.Headers = Headers;
     /*__HEADERS_END__*/
-    // The wire body for a request/response: the platform accepts strings,
-    // URLSearchParams, Blob/File, and ArrayBuffer views; our syscall takes a
-    // string, so flatten to one. Unknown objects stringify (no multipart and no
-    // FormData yet — the encoder just isn't built; the urlencoded path covers
-    // ~every form), null stays null.
+    // The text of a request/response body: the platform accepts strings,
+    // URLSearchParams, Blob/File, and ArrayBuffer views. A FormData body is
+    // encoded to multipart bytes when the Request or Response is constructed
+    // (`__extractBody`), so it never reaches this. null stays null.
     const __bodyText = (body) => {
         if (body === null || body === undefined) return null;
         if (typeof body === "string") return body;
@@ -22703,11 +22702,154 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // type must carry the boundary of the encoded body.)
     const __bodyType = (body) => {
         if (body === null || body === undefined) return null;
+        if (typeof g.ReadableStream === "function" && body instanceof g.ReadableStream) return null;
         if (typeof body === "string") return "text/plain;charset=UTF-8";
         if (body instanceof URLSearchParams) return "application/x-www-form-urlencoded;charset=UTF-8";
         if (Array.isArray(internalsFor(body).parts)) return body.type || null; // Blob/File
         if (typeof body.byteLength === "number") return null;
         return "text/plain;charset=UTF-8";
+    };
+    // Fetch #concept-bodyinit-extract, run when a Request or Response is
+    // constructed: the body's source and the Content-Type it implies. A
+    // FormData is encoded here, once, so the boundary in that type is the one
+    // in the bytes later sent (fetch) or read back (formData()). Encoded and
+    // BufferSource bodies live in `bytes`; other BodyInits stay in `body`.
+    const __extractBody = (body) => {
+        if (body === null || body === undefined) return { body: null, bytes: null, type: null };
+        if (body instanceof g.FormData && Array.isArray(internalsFor(body).entries)) {
+            const encoded = __formDataWire(body);
+            return { body: null, bytes: encoded.wire, type: encoded.type };
+        }
+        if (body instanceof ArrayBuffer || ArrayBuffer.isView(body))
+            return { body: null, bytes: __body_buffer(body), type: null };
+        return { body, bytes: null, type: __bodyType(body) };
+    };
+    // Fetch #concept-header-extract-mime-type over a Headers object: each
+    // comma-separated Content-Type value is parsed, the last valid one other
+    // than */* wins, and a charset carries over while the essence repeats.
+    const __extractMimeType = (headers) => {
+        const combined = headers.get("content-type");
+        if (combined === null) return null;
+        const values = [];
+        let current = "", quoted = false;
+        for (let i = 0; i < combined.length; i++) {
+            const ch = combined[i];
+            if (quoted && ch === "\\" && i + 1 < combined.length) { current += ch + combined[++i]; continue; }
+            if (ch === '"') quoted = !quoted;
+            if (ch === "," && !quoted) { values.push(current); current = ""; continue; }
+            current += ch;
+        }
+        values.push(current);
+        let mimeType = null, charset = null, essence = null;
+        for (const value of values) {
+            const parsed = parseMimeType(value.replace(/^[\t ]+|[\t ]+$/g, ""));
+            if (!parsed || parsed.essence === "*/*") continue;
+            mimeType = parsed;
+            if (parsed.essence !== essence) {
+                charset = parsed.parameters.has("charset") ? parsed.parameters.get("charset") : null;
+                essence = parsed.essence;
+            } else if (!parsed.parameters.has("charset") && charset !== null) {
+                parsed.parameters.set("charset", charset);
+            }
+        }
+        return mimeType;
+    };
+    // Fetch #dom-body-formdata, multipart/form-data: parts delimited by the
+    // `boundary` parameter (RFC 2046 §5.1.1) and described by RFC 7578. A
+    // part whose Content-Disposition has a filename becomes a File typed by
+    // its Content-Type (text/plain by default, RFC 7578 §4.4); any other part
+    // is its UTF-8 content, whatever its charset. Malformed input throws a
+    // TypeError, as the method requires.
+    const __parseMultipartFormData = (bytes, boundary) => {
+        const fail = () => { throw new TypeError("Body is not valid multipart/form-data"); };
+        if (typeof boundary !== "string" || boundary.length < 1 || boundary.length > 70) fail();
+        const encode = (text) => new g.TextEncoder().encode(text);
+        const decode = (view) => new g.TextDecoder("utf-8", { ignoreBOM: true }).decode(view);
+        const find = (haystack, needle, from) => {
+            for (let i = haystack.indexOf(needle[0], from); i >= 0 && i + needle.length <= haystack.length;
+                i = haystack.indexOf(needle[0], i + 1)) {
+                let j = 1;
+                while (j < needle.length && haystack[i + j] === needle[j]) j++;
+                if (j === needle.length) return i;
+            }
+            return -1;
+        };
+        // Every delimiter follows a CRLF except one that opens the body.
+        const data = new Uint8Array(bytes.length + 2);
+        data[0] = 13; data[1] = 10; data.set(bytes, 2);
+        const delimiter = encode("\r\n--" + boundary), headerEnd = encode("\r\n\r\n");
+        const entries = [];
+        let pos = find(data, delimiter, 0);
+        if (pos < 0) fail();
+        for (;;) {
+            pos += delimiter.length;
+            if (data[pos] === 45 && data[pos + 1] === 45) return entries;
+            while (data[pos] === 32 || data[pos] === 9) pos++;
+            if (data[pos] !== 13 || data[pos + 1] !== 10) fail();
+            pos += 2;
+            const next = find(data, delimiter, pos);
+            if (next < 0) fail();
+            const part = data.subarray(pos, next);
+            let headersEnd = 0, contentStart = 2;
+            if (part[0] !== 13 || part[1] !== 10) {
+                headersEnd = find(part, headerEnd, 0);
+                if (headersEnd < 0) fail();
+                contentStart = headersEnd + 4;
+            }
+            const fields = new Map();
+            let last = null;
+            for (const line of decode(part.subarray(0, headersEnd)).split("\r\n")) {
+                if (!line) continue;
+                if ((line[0] === " " || line[0] === "\t") && last !== null) {
+                    fields.set(last, fields.get(last) + " " + line.trim());
+                    continue;
+                }
+                const colon = line.indexOf(":");
+                if (colon < 1) fail();
+                last = line.slice(0, colon).trim().toLowerCase();
+                if (!fields.has(last)) fields.set(last, line.slice(colon + 1).trim());
+            }
+            const disposition = fields.get("content-disposition");
+            if (disposition === undefined) fail();
+            const semicolon = disposition.indexOf(";");
+            const kind = (semicolon < 0 ? disposition : disposition.slice(0, semicolon)).trim().toLowerCase();
+            if (kind !== "form-data") fail();
+            const parameters = new Map();
+            let i = semicolon < 0 ? disposition.length : semicolon;
+            while (i < disposition.length) {
+                i++;
+                while (disposition[i] === " " || disposition[i] === "\t") i++;
+                const start = i;
+                while (i < disposition.length && disposition[i] !== "=" && disposition[i] !== ";") i++;
+                const name = disposition.slice(start, i).trim().toLowerCase();
+                if (disposition[i] !== "=") continue;
+                i++;
+                let value = "";
+                if (disposition[i] === '"') {
+                    i++;
+                    while (i < disposition.length && disposition[i] !== '"') {
+                        if (disposition[i] === "\\" && i + 1 < disposition.length) i++;
+                        value += disposition[i++];
+                    }
+                    if (disposition[i] !== '"') fail();
+                    i++;
+                    while (i < disposition.length && disposition[i] !== ";") i++;
+                } else {
+                    const valueStart = i;
+                    while (i < disposition.length && disposition[i] !== ";") i++;
+                    value = disposition.slice(valueStart, i).trim();
+                }
+                if (name && !parameters.has(name)) parameters.set(name, value);
+            }
+            if (!parameters.has("name")) fail();
+            const content = part.subarray(contentStart);
+            const value = parameters.has("filename")
+                ? new g.File([content.slice()], parameters.get("filename"),
+                    { type: fields.has("content-type") ? fields.get("content-type") : "text/plain" })
+                : decode(content);
+            entries.push([parameters.get("name"), value]);
+            pos = next;
+        }
     };
     // Fetch §5.3 "consume body": fully read a ReadableStream BodyInit and join
     // its BufferSource chunks into one byte sequence before converting it to
@@ -22760,7 +22902,28 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const t = (this.headers && this.headers.get && this.headers.get("content-type")) || "";
             return __consumeBodyBytes(this).then((bytes) => new g.Blob([bytes], { type: t || "" }));
         },
-        formData() { return Promise.reject(new TypeError("formData unsupported")); },
+        // Fetch #dom-body-formdata: the body read through consume body, then
+        // decoded by the MIME type its headers carry at that point.
+        formData() {
+            const owner = this;
+            return __consumeBodyBytes(this).then((bytes) => {
+                const mimeType = __extractMimeType(owner.headers);
+                const formData = new g.FormData();
+                if (mimeType && mimeType.essence === "multipart/form-data") {
+                    for (const [name, value] of __parseMultipartFormData(bytes, mimeType.parameters.get("boundary")))
+                        formData.append(name, value);
+                    return formData;
+                }
+                if (mimeType && mimeType.essence === "application/x-www-form-urlencoded") {
+                    // URL #concept-urlencoded-parser; the leading "&" only
+                    // keeps URLSearchParams from dropping a literal "?".
+                    const text = new g.TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+                    for (const [name, value] of new URLSearchParams("&" + text)) formData.append(name, value);
+                    return formData;
+                }
+                throw new TypeError("Body is not multipart/form-data or application/x-www-form-urlencoded");
+            });
+        },
     };
     // Fetch API Request (https://fetch.spec.whatwg.org/#request-class). The bare
     // `Request` global is referenced by many bundles (GitHub's react-core throws
@@ -22787,9 +22950,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 ? upperMethod
                 : method;
             internalsFor(this).headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? internalsFor(input).headers : undefined));
-            internalsFor(this).body = init.body !== undefined ? init.body : (fromReq ? internalsFor(input).body : null);
-            if (internalsFor(this).body instanceof ArrayBuffer || ArrayBuffer.isView(internalsFor(this).body))
-                internalsFor(this).body = __body_buffer(internalsFor(this).body);
+            internalsFor(this).body = fromReq ? internalsFor(input).body : null;
+            internalsFor(this).bytes = fromReq ? internalsFor(input).bytes : null;
+            // Fetch #dom-request: an init body is extracted, and the type it
+            // implies is appended unless the headers already name one.
+            if (init.body !== undefined && init.body !== null) {
+                const extracted = __extractBody(init.body);
+                internalsFor(this).body = extracted.body;
+                internalsFor(this).bytes = extracted.bytes;
+                if (extracted.type !== null && !internalsFor(this).headers.has("content-type"))
+                    internalsFor(this).headers.append("content-type", extracted.type);
+            } else if (init.body === null) {
+                internalsFor(this).body = null;
+                internalsFor(this).bytes = null;
+            }
             const credentials = init.credentials !== undefined
                 ? String(init.credentials)
                 : (fromReq ? internalsFor(input).credentials : "same-origin");
@@ -22832,20 +23006,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     Object.assign(Request.prototype, __bodyMethods);
     g.Request = Request;
     // Fetch API Response (https://fetch.spec.whatwg.org/#response-class).
+    // Responses the platform builds from fetched, data:, blob: or cloned
+    // state carry exactly the headers they were given. Only author-constructed
+    // responses get the Content-Type their body implies.
+    let __rawResponseDepth = 0;
+    const __rawResponse = (body, init) => {
+        __rawResponseDepth++;
+        try { return new Response(body, init); } finally { __rawResponseDepth--; }
+    };
     class Response {
         constructor(body, init) {
             init = init || {};
-            internalsFor(this).body = body !== undefined ? body : null;
             // Fetch #concept-bodyinit-extract snapshots a BufferSource at
             // construction. Preserve its byte range and avoid per-byte JS
             // string conversion for multi-megabyte Wasm/image/cache bodies.
-            if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-                internalsFor(this).bytes = __body_buffer(body);
-                internalsFor(this).body = null;
-            }
+            const extracted = __extractBody(body);
+            internalsFor(this).body = extracted.body;
+            internalsFor(this).bytes = extracted.bytes;
             this.status = init.status !== undefined ? (init.status | 0) : 200;
             this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
             this.headers = new Headers(init.headers);
+            // Fetch #initialize-a-response: the extracted type is appended
+            // unless the headers already name one.
+            if (extracted.type !== null && __rawResponseDepth === 0 && !this.headers.has("content-type"))
+                this.headers.append("content-type", extracted.type);
             this.ok = this.status >= 200 && this.status < 300;
             this.url = init.url ? String(init.url) : "";
             this.redirected = false;
@@ -22876,12 +23060,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return internalsFor(this).bodyStream;
         }
         clone() {
-            const r = new Response(internalsFor(this).body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
+            const r = __rawResponse(internalsFor(this).body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
             r.type = this.type; r.redirected = this.redirected; internalsFor(r).bytes = internalsFor(this).bytes; return r;
         }
         static error() { const r = new Response(null, { status: 0 }); r.type = "error"; return r; }
         static redirect(url, status) { const r = new Response(null, { status: status || 302 }); r.headers.set("location", String(url)); return r; }
-        static json(data, init) { const r = new Response(JSON.stringify(data), init); if (!r.headers.has("content-type")) r.headers.set("content-type", "application/json"); return r; }
+        static json(data, init) { const r = __rawResponse(JSON.stringify(data), init); if (!r.headers.has("content-type")) r.headers.set("content-type", "application/json"); return r; }
     }
     Object.assign(Response.prototype, __bodyMethods);
     g.Response = Response;
@@ -26811,7 +26995,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (url.slice(0, 5) === "data:") {
                 const dp = __dataURLParts(url);
                 if (!dp) return Promise.reject(new TypeError("fetch failed: invalid data: URL"));
-                const dresp = new Response(dp.text, { status: 200, statusText: "", headers: { "content-type": dp.ctype }, url: url });
+                const dresp = __rawResponse(dp.text, { status: 200, statusText: "", headers: { "content-type": dp.ctype }, url: url });
                 dresp.type = "basic";
                 internalsFor(dresp).bytes = dp.bytes; // byte-exact body for arrayBuffer()/blob()
                 return Promise.resolve(dresp);
@@ -26823,16 +27007,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 const be = __resolveBlobURL(url);
                 if (!be) return Promise.reject(new TypeError("fetch failed: no blob URL entry: " + url));
                 const bh = {}; if (be.type) bh["content-type"] = be.type;
-                const bresp = new Response(new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), { status: 200, statusText: "", headers: bh, url: url });
+                const bresp = __rawResponse(new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), { status: 200, statusText: "", headers: bh, url: url });
                 bresp.type = "basic";
                 internalsFor(bresp).bytes = be.bytes; // byte-exact body for arrayBuffer()/blob()
                 return Promise.resolve(bresp);
             }
-            const isFD = internalsFor(req).body instanceof g.FormData && Array.isArray(internalsFor(internalsFor(req).body).entries);
-            const enc = isFD ? __formDataWire(internalsFor(req).body) : null;
-            const body = isFD ? enc.wire : __bodyWire(internalsFor(req).body);
-            const ctype = internalsFor(req).headers.get("content-type")
-                || (isFD ? enc.type : __bodyType(internalsFor(req).body));
+            // The Request extracted its body and Content-Type at construction.
+            const body = internalsFor(req).bytes != null ? internalsFor(req).bytes : __bodyWire(internalsFor(req).body);
+            const ctype = internalsFor(req).headers.get("content-type");
             return raceAbort(__http_fetch_async(
                 url, internalsFor(req).method, body, ctype, __hdrBlob(internalsFor(internalsFor(req).headers).h),
                 internalsFor(req).mode, internalsFor(req).credentials, 'fetch'
@@ -26849,7 +27031,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 // content-type only.
                 const hdrs = __parseHdrBlob(r[4]);
                 if (respCType && hdrs["content-type"] === undefined) hdrs["content-type"] = respCType;
-                const resp = new Response(text, { status: status, statusText: "", headers: hdrs, url: url });
+                const resp = __rawResponse(text, { status: status, statusText: "", headers: hdrs, url: url });
                 // Fetch's response tainting is observable: a successful
                 // cross-origin CORS fetch produces a `cors` response, while a
                 // same-origin fetch is `basic`. The Rust side has already
