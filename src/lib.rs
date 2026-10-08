@@ -50,6 +50,7 @@ mod webgl;
 // These are the existing engine modules. They are declared exactly once here;
 // binaries import this library rather than compiling private copies with `mod`.
 pub mod app;
+mod compression_host;
 pub mod cp437;
 pub mod doc;
 mod document_encoding;

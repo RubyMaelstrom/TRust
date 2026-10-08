@@ -646,17 +646,34 @@ async fn receive(
     let (status, headers, cookies) = response_head(&mut recv, timing, clock)
         .await
         .inspect_err(|error| recv.stop_sending(error.code))?;
+    receive_body(recv, (status, headers, cookies), request, timing).await
+}
+
+/// Whether a response to `request` with this head has a body that is not
+/// read: none at all, or a download navigation or a media subresource.
+fn body_unread(request: &Request, status: u16, headers: &Headers) -> (bool, bool) {
     let no_content = request.method == "HEAD" || matches!(status, 204 | 205 | 304);
     let navigation_get = request.method == "GET"
         && request
             .fetch_metadata
             .is_some_and(|m| m.destination == "document");
     let skip = !no_content
-        && ((navigation_get && super::navigation_headers_need_download(&headers))
+        && ((navigation_get && super::navigation_headers_need_download(headers))
             || headers.get("content-type").is_some_and(|c| {
                 let c = c.trim_start().to_ascii_lowercase();
                 c.starts_with("video/") || c.starts_with("audio/")
             }));
+    (no_content, skip)
+}
+
+/// Read the whole body of a response whose head `response_head` returned.
+async fn receive_body(
+    recv: Receive,
+    (status, headers, cookies): (u16, Headers, Vec<String>),
+    request: &Request,
+    timing: &mut FetchTiming,
+) -> Result<ResponseParts, Error> {
+    let (no_content, skip) = body_unread(request, status, &headers);
     if skip {
         timing.response_end = crate::performance::now_ms();
         return Ok((status, headers, Vec::new(), cookies));
@@ -717,6 +734,131 @@ pub(super) async fn exchange(
             .map_or(Code::H3_NO_ERROR, |error| error.code),
     );
     result
+}
+
+/// The result of [`exchange_streaming`].
+pub(super) enum Exchanged {
+    Complete(ResponseParts),
+    /// A final response whose body is read incrementally.
+    Streaming {
+        status: u16,
+        headers: Headers,
+        cookies: Vec<String>,
+        body: Box<StreamingBody>,
+    },
+}
+
+/// [`exchange`] for a consumer that reads the body as it arrives (Fetch
+/// #concept-http-network-fetch). Once the request has been sent, a final
+/// response with a body returns at its header section. When the response
+/// head arrives before the request body has been sent, the whole response is
+/// read while sending continues, as in [`exchange`].
+pub(super) async fn exchange_streaming(
+    lease: &Lease,
+    request: &Request,
+    origin: Option<&str>,
+    timing: &mut FetchTiming,
+) -> Result<Exchanged, Error> {
+    let (mut send, mut recv) = start(lease, request, origin, false, timing).await?;
+    let payload = request
+        .body
+        .as_ref()
+        .map_or(&[][..], |(_, bytes)| bytes.as_slice());
+    let clock = lease.session.clock.clone();
+    let mut upload_future = Box::pin(upload(&mut send, payload));
+    let mut head_future = Box::pin(response_head(&mut recv, timing, &clock));
+    let (head, uploaded) = tokio::select! {
+        biased;
+        head = &mut head_future => (head, false),
+        result = &mut upload_future => match result {
+            // STOP_SENDING closes only the request direction (§4.1).
+            Ok(()) | Err(StreamError::RemoteTerminate { .. }) => ((&mut head_future).await, true),
+            Err(error) => (Err(error.into()), true),
+        },
+    };
+    drop(head_future);
+    let head = match head {
+        Ok(head) => head,
+        Err(error) => {
+            drop(upload_future);
+            recv.stop_sending(error.code);
+            send.stop_stream(error.code);
+            return Err(error);
+        }
+    };
+    if !uploaded {
+        // An early final response: read it whole while the upload continues,
+        // exactly as `exchange` does.
+        let mut body_future = Box::pin(receive_body(recv, head, request, timing));
+        let result = tokio::select! {
+            biased;
+            result = &mut body_future => {
+                if result.is_ok() { let _ = tokio::time::timeout(FIRST_WAIT, &mut upload_future).await; }
+                result
+            }
+            result = &mut upload_future => match result {
+                Ok(()) | Err(StreamError::RemoteTerminate { .. }) => body_future.await,
+                Err(error) => Err(error.into()),
+            },
+        };
+        drop(upload_future);
+        send.stop_stream(
+            result
+                .as_ref()
+                .err()
+                .map_or(Code::H3_NO_ERROR, |error| error.code),
+        );
+        return result.map(Exchanged::Complete);
+    }
+    drop(upload_future);
+    let (status, headers, cookies) = head;
+    let (no_content, skip) = body_unread(request, status, &headers);
+    if no_content || skip || !super::body_stream::streamable_status(status) {
+        let result = receive_body(recv, (status, headers, cookies), request, timing).await;
+        send.stop_stream(
+            result
+                .as_ref()
+                .err()
+                .map_or(Code::H3_NO_ERROR, |error| error.code),
+        );
+        return result.map(Exchanged::Complete);
+    }
+    let incoming = match Incoming::new(recv, &headers, false, super::MAX_BODY) {
+        Ok(incoming) => incoming,
+        Err(error) => {
+            send.stop_stream(error.code);
+            return Err(error);
+        }
+    };
+    // The request was sent; a finished stream ignores this.
+    send.stop_stream(Code::H3_NO_ERROR);
+    Ok(Exchanged::Streaming {
+        status,
+        headers,
+        cookies,
+        body: Box::new(StreamingBody {
+            incoming,
+            _send: send,
+            _lease: lease.clone(),
+        }),
+    })
+}
+
+/// A response body read as it arrives. Dropping it before the end stops the
+/// stream in both directions with H3_REQUEST_CANCELLED (`http3_io`).
+pub(crate) struct StreamingBody {
+    incoming: Incoming,
+    _send: Send,
+    _lease: Lease,
+}
+
+impl StreamingBody {
+    pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, String> {
+        self.incoming
+            .next()
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) struct DownloadResponse {

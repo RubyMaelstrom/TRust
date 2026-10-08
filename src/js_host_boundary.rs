@@ -153,6 +153,8 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__http_navigate", 3),
     ("__http_navigate_async", 4),
     ("__http_fetch_async", 5),
+    ("__http_fetch_pull", 1),
+    ("__http_fetch_cancel", 1),
     ("__dom_run_injected_script", 1),
     ("__dom_script_started", 1),
     ("__dom_insertion_resources", 1),

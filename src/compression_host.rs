@@ -257,7 +257,10 @@ fn deflate_into(
 // Decompression
 // ---------------------------------------------------------------------------
 
-enum Decompressor {
+/// One incremental decompression context. HTTP content-coding decoding of
+/// incrementally read response bodies (`http::content_coding`) shares these
+/// decoders with `DecompressionStream`.
+pub(crate) enum Decompressor {
     /// `deflate` (zlib) or `deflate-raw`.
     Deflate {
         inflate: Decompress,
@@ -268,7 +271,18 @@ enum Decompressor {
 }
 
 impl Decompressor {
-    fn new(format: &str) -> Option<Self> {
+    /// Whether the end of the compressed data has been decoded. Output that
+    /// [`Self::write`] reports as failed after this is true failed only
+    /// because input followed the compressed data.
+    pub(crate) fn finished(&self) -> bool {
+        match self {
+            Self::Deflate { ended, .. } => *ended,
+            Self::Gzip(decoder) => matches!(decoder.phase, GzipPhase::Done),
+            Self::Brotli(decoder) => decoder.ended,
+        }
+    }
+
+    pub(crate) fn new(format: &str) -> Option<Self> {
         Some(match format {
             "deflate" => Self::Deflate {
                 inflate: Decompress::new(true),
@@ -284,7 +298,7 @@ impl Decompressor {
         })
     }
 
-    fn write(&mut self, input: &[u8], finish: bool) -> Output {
+    pub(crate) fn write(&mut self, input: &[u8], finish: bool) -> Output {
         match self {
             Self::Deflate { inflate, ended } => {
                 let mut out = Vec::new();
@@ -351,7 +365,7 @@ enum GzipPhase {
 }
 
 /// RFC 1952 member decoder: header, raw DEFLATE body, CRC32/ISIZE trailer.
-struct GzipDecoder {
+pub(crate) struct GzipDecoder {
     phase: GzipPhase,
     header: Vec<u8>,
     inflate: Decompress,
@@ -522,7 +536,7 @@ impl GzipDecoder {
     }
 }
 
-struct BrotliDecoder {
+pub(crate) struct BrotliDecoder {
     state: brotli_decompressor::BrotliState<
         brotli_decompressor::StandardAlloc,
         brotli_decompressor::StandardAlloc,

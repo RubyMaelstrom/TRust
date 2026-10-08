@@ -2270,6 +2270,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
         }
         discardTasks(networkTasks);
+        discardTasks(remoteEventTasks);
         discardTasks(domTasks);
         discardTasks(intersectionTasks);
         discardTasks(messageTasks);
@@ -31406,6 +31407,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 windowState: frame ? windowStateForFrame(frame) : topWindowState });
         }
     };
+    // HTML #remote-event-task-source: EventSource's tasks.
+    const remoteEventTasks = [];
+    const __queue_remote_event_task = function (fn, frame) {
+        if (typeof fn === "function") {
+            frame = frame === undefined ? (trust.__activeFrame || null) : frame;
+            remoteEventTasks.push({ fn: fn, frame: frame,
+                windowState: frame ? windowStateForFrame(frame) : topWindowState });
+        }
+    };
     const domTasks = [];
     const bitmapTasks = [];
     const __queue_dom_task = function (fn, frame) {
@@ -37274,6 +37284,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const internals = __platform_slots("internals", new WeakMap());
     const streamsAPI = g.__streams_api, abortAPI = g.__abort_api, fileAPI = g.__file_api;
     const urlParse = __url_parse, httpFetchAsync = __http_fetch_async, httpFetchSync = __http_fetch;
+    const httpFetchPull = __http_fetch_pull, httpFetchCancel = __http_fetch_cancel;
     const isArray = Array.isArray;
     const apply = Reflect.apply, construct = Reflect.construct, define = Object.defineProperty;
     const getOwn = Object.getOwnPropertyDescriptor, ownKeys = Reflect.ownKeys, objectCreate = Object.create;
@@ -37286,6 +37297,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const bufferByteLength = getOwn(ArrayBuffer.prototype, "byteLength").get;
     const typedArrayProto = getPrototypeOf(Uint8Array.prototype);
     const typedArraySubarray = typedArrayProto.subarray;
+    const typedArrayTag = getOwn(typedArrayProto, Symbol.toStringTag).get;
     const charCodeAt = String.prototype.charCodeAt, stringSlice = String.prototype.slice;
     const fromCharCode = String.fromCharCode, toWellFormed = String.prototype.toWellFormed;
     const arraySort = Array.prototype.sort, iteratorSymbol = Symbol.iterator, toStringTag = Symbol.toStringTag;
@@ -37779,6 +37791,84 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         body.stream = stream;
         if (body.streamError !== undefined) streamsAPI.error(stream, body.streamError);
         return stream;
+    }
+    // #concept-http-network-fetch: a network response's body is a byte stream
+    // whose pullAlgorithm pulls from the host's network buffer for fetch `id`
+    // and whose cancelAlgorithm aborts the fetch. The host suspends the
+    // transfer while the buffer holds more than its upper limit, so an unread
+    // body keeps bounded memory; a stream that becomes unreachable cancels
+    // its transfer.
+    const FinalizationRegistryCtor = g.FinalizationRegistry;
+    const hostBodyRelease = typeof FinalizationRegistryCtor === "function"
+        ? new FinalizationRegistryCtor(function (id) { httpFetchCancel(id); }) : null;
+    const registryRegister = hostBodyRelease === null ? null : FinalizationRegistryCtor.prototype.register;
+    const registryUnregister = hostBodyRelease === null ? null : FinalizationRegistryCtor.prototype.unregister;
+    function bodyFromHost(id) {
+        const body = bodyFromStream(null, null, null);
+        const token = {};
+        let pending = null, settled = false, stream = null;
+        // The transfer is over or abandoned: it needs no cancellation.
+        const settle = function () {
+            if (settled) return false;
+            settled = true;
+            if (hostBodyRelease !== null) apply(registryUnregister, hostBodyRelease, [token]);
+            return true;
+        };
+        const done = function () {
+            if (typeof body.onDone === "function") { const callback = body.onDone; body.onDone = null; callback(); }
+        };
+        // #fetch-controller-abort / #fetch-controller-terminate
+        body.terminate = function () { if (settle()) httpFetchCancel(id); };
+        stream = streamsAPI.setUpBytes(function () {
+            if (pending !== null && pending.length) {
+                pending = streamsAPI.pullFromBytes(stream, pending);
+                return undefined;
+            }
+            return react(httpFetchPull(id), function (chunk) {
+                if (chunk === null) {
+                    settle();
+                    if (streamsAPI.readable(stream)) streamsAPI.close(stream);
+                    done();
+                } else if (isArrayBuffer(chunk)) {
+                    if (streamsAPI.readable(stream)) pending = streamsAPI.pullFromBytes(stream, new Uint8ArrayCtor(chunk));
+                } else {
+                    // A network error after the response: a TypeError.
+                    settle();
+                    if (streamsAPI.readable(stream)) streamsAPI.error(stream, new TypeErrorCtor("Failed to fetch"));
+                    done();
+                }
+            });
+        }, function () {
+            if (settle()) httpFetchCancel(id);
+            return undefined;
+        });
+        body.stream = stream;
+        if (hostBodyRelease !== null) apply(registryRegister, hostBodyRelease, [stream, id, token]);
+        return body;
+    }
+    // Abort or terminate the transfer behind a body, if it is still running.
+    function terminateBody(body) {
+        if (body !== null && typeof body.terminate === "function") body.terminate();
+    }
+    // #body-incrementally-read: each chunk, the end and an error are processed
+    // in fetch tasks queued with `queue`.
+    function incrementallyReadBody(body, processBodyChunk, processEndOfBody, processBodyError, queue) {
+        const reader = streamsAPI.getReader(bodyStream(body));
+        const loop = function () {
+            streamsAPI.readChunk(reader, {
+                chunk(chunk) {
+                    if (!isView(chunk) || apply(typedArrayTag, chunk, []) !== "Uint8Array") {
+                        queue(function () { processBodyError(new TypeErrorCtor("The body chunk is not a Uint8Array")); });
+                        return;
+                    }
+                    const bytes = new Uint8ArrayCtor(chunk);
+                    queue(function () { processBodyChunk(bytes); loop(); });
+                },
+                close() { queue(processEndOfBody); },
+                error(e) { queue(function () { processBodyError(e); }); },
+            });
+        };
+        loop();
     }
     function bodyDisturbed(body) { return body.stream !== null && streamsAPI.disturbed(body.stream); }
     function bodyLocked(body) { return body.stream !== null && streamsAPI.locked(body.stream); }
@@ -38762,7 +38852,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // The host's HTTP(S) fetch: CORS checks and response filtering, cookies and
     // redirects run natively. Resolves with a response record.
-    function httpFetch(request, bodyBytes, sync = false) {
+    // `stream`: the caller reads the body as it arrives; otherwise the host
+    // delivers it whole.
+    function httpFetch(request, bodyBytes, sync = false, stream = false) {
         let headerWire = "";
         for (let i = 0; i < request.headerList.length; i++)
             headerWire += (headerWire ? "\n" : "") + request.headerList[i][0] + "\n" + request.headerList[i][1];
@@ -38774,7 +38866,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 request.mode, request.credentials, initiator));
         }
         return react(httpFetchAsync(request.url, request.method, bodyBytes, contentType, headerWire,
-            request.mode, request.credentials, initiator), function (result) {
+            request.mode, request.credentials, initiator, !!stream, request.cache), function (result) {
             return hostResponse(request, result);
         }, function () { return networkError(); });
     }
@@ -38795,10 +38887,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const finalURL = typeof result[5] === "string" && result[5] !== "" ? result[5] : request.url;
         const withoutFragment = url => { const hash = url.indexOf("#"); return hash < 0 ? url : apply(stringSlice, url, [0, hash]); };
         const urlList = withoutFragment(finalURL) !== withoutFragment(request.url) ? [request.url, finalURL] : [request.url];
-        const bytes = isArrayBuffer(result[3]) ? new Uint8ArrayCtor(result[3]) : utf8(`${result[2] || ""}`);
         const type = request.mode === "cors" && !sameOrigin(finalURL, adapter.origin()) ? "cors" : "basic";
+        let body;
+        if (typeof result[8] === "number") body = bodyFromHost(result[8]);
+        else {
+            const bytes = isArrayBuffer(result[3]) ? new Uint8ArrayCtor(result[3]) : utf8(`${result[2] || ""}`);
+            body = bodyFromBytes(bytes, null, bytes.length);
+        }
         return newResponseRecord({type, status, statusMessage: typeof result[7] === "string" ? result[7] : "",
-            headerList, urlList, body: bodyFromBytes(bytes, null, bytes.length)});
+            headerList, urlList, body});
     }
     // XHR #the-send()-method fetch: a "cors" request with credentials per
     // withCredentials and the "xmlhttprequest" initiator type, through
@@ -38815,9 +38912,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const httpScheme = scheme === "http:" || scheme === "https:" || scheme === "file:";
         const finish = function (response) {
             // A "cors" request never yields an opaque response.
-            if (response.type === "opaque") return networkError();
-            if (response.type !== "error" && (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(response.status) >= 0))
+            if (response.type === "opaque") { terminateBody(response.body); return networkError(); }
+            if (response.type !== "error" && (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(response.status) >= 0)) {
+                terminateBody(response.body);
                 response.body = null;
+            }
             // XHR receives the whole body: a blob: response's selected file is
             // read now, and a failed read is processBodyError's network error.
             if (response.body !== null && response.body.leaves !== null) {
@@ -38840,9 +38939,44 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             deliver(finish(local));
             return null;
         }
-        react(httpFetch(request, fields.body), function (response) { deliver(finish(response)); },
+        // The asynchronous response body is read incrementally (XHR
+        // #the-send()-method processResponse).
+        react(httpFetch(request, fields.body, false, true), function (response) { deliver(finish(response)); },
             function () { deliver(networkError()); });
         return null;
+    }
+    // HTML #dom-eventsource: fetch an event stream. The request is a
+    // potential-CORS request for `credentials` ("same-origin" for Anonymous,
+    // "include" for Use Credentials) with a `text/event-stream` Accept, the
+    // `Last-Event-ID` of a reestablished connection, cache mode "no-store" and
+    // initiator type "other". Its body is read as it arrives. `deliver` runs
+    // in a networking task (queued with `queue` for a local scheme) with the
+    // response record; the returned function aborts the fetch.
+    function fetchForEventSource(url, credentials, lastEventId, queue, deliver) {
+        const headerList = [["Accept", "text/event-stream"]];
+        // The last event ID string, UTF-8 encoded by the host.
+        if (lastEventId !== "") headerList.push(["Last-Event-ID", lastEventId]);
+        const request = newRequestRecord({url, urlList: [url], method: "GET", headerList, mode: "cors",
+            credentials, cache: "no-store"});
+        request.initiatorType = "other";
+        let aborted = false;
+        const processResponse = function (response) {
+            if (aborted) { terminateBody(response.body); return; }
+            deliver(response);
+        };
+        const parsed = parseURL(url, null);
+        const scheme = parsed === null ? "" : parsed.protocol;
+        if (scheme === "http:" || scheme === "https:" || scheme === "file:") {
+            react(httpFetch(request, null, false, true), processResponse,
+                function () { processResponse(networkError()); });
+        } else {
+            // #main-fetch: same-origin and data: URLs are fetched here; other
+            // schemes are a network error in "cors" mode.
+            const local = sameOrigin(url, adapter.origin()) || scheme === "data:" ? schemeFetch(request) : null;
+            const response = local === null ? networkError() : local;
+            queue(function () { processResponse(response); });
+        }
+        return function () { aborted = true; };
     }
     // Subresource Integrity #does-response-match-metadatalist over the body.
     const SRI_ALGORITHMS = {sha256: ["SHA-256", 1], sha384: ["SHA-384", 2], sha512: ["SHA-512", 3]};
@@ -38915,6 +39049,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (response.body !== null) {
             if (response.body.stream === null) response.body.streamError = error;
             else if (streamsAPI.readable(response.body.stream)) streamsAPI.error(response.body.stream, error);
+            terminateBody(response.body);
         }
     }
     function fetchMethod(input, init = undefined) {
@@ -38936,11 +39071,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         abortAPI.add(request.signal, abortSteps);
         const processResponse = function (response) {
-            if (locallyAborted) return;
+            if (locallyAborted) { terminateBody(response.body); return; }
             // #main-fetch: a HEAD request or a null body status has a null body.
             if (response.type !== "error" && response.type !== "opaque" &&
-                (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(response.status) >= 0))
+                (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(response.status) >= 0)) {
+                terminateBody(response.body);
                 response.body = null;
+            }
             if (response.type === "error") {
                 abortAPI.remove(request.signal, abortSteps);
                 rejectFn(new TypeErrorCtor("Failed to fetch"));
@@ -38984,7 +39121,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (locallyAborted) return;
             const keepaliveLength = request.keepalive && bodyBytes !== null ? bodyBytes.length : 0;
             if (request.keepalive && !reserveKeepalive(keepaliveLength)) { processResponse(networkError()); return; }
-            react(httpFetch(request, bodyBytes), function (response) {
+            // A response is handed over once its header section arrives and
+            // its body streams (#concept-http-network-fetch). Integrity
+            // metadata is checked against the whole body first (#main-fetch).
+            react(httpFetch(request, bodyBytes, false, request.integrity === ""), function (response) {
                 if (request.keepalive) releaseKeepalive(keepaliveLength);
                 if (response.type === "error" || request.integrity === "" || response.body === null) {
                     processResponse(response);
@@ -39071,6 +39211,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         toByteString,
         createFormData,
         fetchForXHR,
+        fetchForEventSource,
+        incrementallyReadBody,
+        terminateBody,
         isURLSearchParams,
         convertBodyInit,
         headerListGet,
@@ -40995,12 +41138,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     };
     // HTML leaves selection among runnable task sources implementation-defined,
     // while requiring the event loop to keep making progress. Rotate among the
-    // nine represented sources so a self-replenishing source cannot starve
+    // ten represented sources so a self-replenishing source cannot starve
     // another one. FIFO ordering remains intact within each source.
     let platformSourceCursor = 0;
     trust.hasPlatformTask = function () {
         if (networkTasks.length > 0 || domTasks.length > 0 || intersectionTasks.length > 0 || controlSelectionTasks.length > 0 ||
-            trust.hasMessageTask() || idleTasks.length > 0 || bitmapTasks.length > 0 ||
+            trust.hasMessageTask() || idleTasks.length > 0 || bitmapTasks.length > 0 || remoteEventTasks.length > 0 ||
             (trust.hasPerformanceTask && trust.hasPerformanceTask())) return true;
         for (const childTrust of childWindowTrusts) {
             if (childTrust && childTrust.hasPlatformTask()) return true;
@@ -41009,7 +41152,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     };
     trust.runPlatformTask = function () {
         const children = Array.from(childWindowTrusts);
-        const sourceCount = 9 + children.length;
+        const sourceCount = 10 + children.length;
         for (let offset = 0; offset < sourceCount; offset++) {
             const source = (platformSourceCursor + offset) % sourceCount;
             let task = null;
@@ -41036,8 +41179,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 task = bitmapTasks.shift(); label = "bitmap task";
             } else if (source === 8 && controlSelectionTasks.length) {
                 task = controlSelectionTasks.shift(); label = "user interaction task";
-            } else if (source >= 9) {
-                const childTrust = children[source - 9];
+            } else if (source === 9 && remoteEventTasks.length) {
+                task = remoteEventTasks.shift(); label = "remote event task";
+            } else if (source >= 10) {
+                const childTrust = children[source - 10];
                 if (childTrust && childTrust.runPlatformTask()) {
                     platformSourceCursor = (source + 1) % sourceCount;
                     return true;
@@ -41087,7 +41232,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return "timers=" + timers.q.length + "(once=" + oneShots + ",interval=" + intervals + ")" +
             ",raf=" + animationFrames.q.length +
             ",idle=" + idleCallbacks.pending.length + "/" + idleCallbacks.runnable.length + "/" + idleTasks.length +
-            ",network=" + networkTasks.length + ",dom=" + domTasks.length + "[" + domSample + "]" +
+            ",network=" + networkTasks.length + ",remoteEvent=" + remoteEventTasks.length +
+            ",dom=" + domTasks.length + "[" + domSample + "]" +
             ",loadListeners=" + lsFor(g, "load").length + "[" + loadSample + "]" +
             ",frameLoad=" + (trust.lastFrameLoadState || "none") +
             ",intersection=" + intersectionTasks.length +
@@ -41365,6 +41511,346 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     adapter.bind(event);
     })(globalThis);
     /*__WEBSOCKET_END__*/
+    // The shared EVENTSOURCE block's view of this Window: its events, the
+    // remote event task source and networking task source of the
+    // constructing frame, and the timer queue for the reconnection delay.
+    g.__eventsource_adapter = {
+        EventTarget, MessageEvent,
+        add(target, type, fn) { addL(target, type, fn, false); },
+        remove(target, type, fn) { removeL(target, type, fn, false); },
+        create(C, type, init) { return createTrustedEvent(C || Event, type, init); },
+        dispatch(target, event) { dispatch(target, event, false); },
+        // HTML #encoding-parsing-a-url relative to the relevant settings
+        // object (a Window's document encoding is the query encoding).
+        parseURL(url) {
+            const document = trust.__activeFrame ? frameDocument(trust.__activeFrame) : g.document;
+            const parsed = encodingParseURL(url, windowAPIBaseURL(), document);
+            return parsed ? parsed[0] : null;
+        },
+        remoteEventQueue() {
+            const frame = trust.__activeFrame || null;
+            return function (fn) { __queue_remote_event_task(fn, frame); };
+        },
+        networkQueue() {
+            const frame = trust.__activeFrame || null;
+            return function (fn) { __queue_network_task(fn, frame); };
+        },
+        // The reconnection wait, on the timer queue but outside the
+        // setTimeout() identifier space.
+        delay(ms, fn) {
+            const entry = {id: 0.5, at: currentTime() + ms, fn, every: null, args: [], nesting: 0, wait: ms,
+                frame: trust.__activeFrame || null, windowState: activeWindowState()};
+            timers.q.push(entry);
+            return entry;
+        },
+        cancelDelay(entry) {
+            const index = timers.q.indexOf(entry);
+            if (index >= 0) timers.q.splice(index, 1);
+        },
+    };
+    /*__EVENTSOURCE_BEGIN__*/
+    // HTML Standard server-sent events (local whatwg/html@e5071a2,
+    // #server-sent-events), shared verbatim by Window and Worker realms: the
+    // EventSource interface (#the-eventsource-interface), its processing
+    // model (#sse-processing-model) and #event-stream-interpretation. The event
+    // stream is fetched through the Fetch block and its body is read as it
+    // arrives; events are dispatched from the remote event task source.
+    (function (g) {
+    "use strict";
+    const adapter = g.__eventsource_adapter;
+    delete g.__eventsource_adapter;
+    const fetchAPI = g.__fetch_api;
+    const internals = __platform_slots("internals", new WeakMap());
+    const apply = Reflect.apply, define = Object.defineProperty, getOwn = Object.getOwnPropertyDescriptor;
+    const objectCreate = Object.create, getOwnNames = Object.getOwnPropertyNames;
+    const weakGet = WeakMap.prototype.get, weakSet = WeakMap.prototype.set;
+    const TypeErrorCtor = TypeError, DOMExceptionCtor = g.DOMException, NumberCtor = Number;
+    const toWellFormed = String.prototype.toWellFormed, stringIndexOf = String.prototype.indexOf;
+    const stringSlice = String.prototype.slice, charCodeAt = String.prototype.charCodeAt;
+    const regexpExec = RegExp.prototype.exec, regexpTest = RegExp.prototype.test;
+    const URLCtor = g.URL, urlOrigin = getOwn(URLCtor.prototype, "origin").get;
+    const TextDecoderCtor = g.TextDecoder, textDecode = TextDecoderCtor.prototype.decode;
+    const CONNECTING = 0, OPEN = 1, CLOSED = 2;
+    // #concept-event-stream-reconnection-time starts implementation-defined.
+    const DEFAULT_RECONNECTION_TIME = 3000;
+    // The memory one stream may hold before an event completes: its
+    // unfinished line and its data buffer, in UTF-16 code units. A stream
+    // that exceeds it fails its connection.
+    const MAX_PENDING = 8 * 1024 * 1024;
+    const LINE_END = /[\r\n]/g, DIGITS = /^[0-9]+$/;
+    const STREAM = {stream: true};
+    const exception = (message, name) => new DOMExceptionCtor(message, name);
+    const isObject = value => (typeof value === "object" && value !== null) || typeof value === "function";
+    const usvString = value => apply(toWellFormed, `${value}`, []);
+
+    function record(object) {
+        let slots = apply(weakGet, internals, [object]);
+        if (slots === undefined) {
+            slots = objectCreate(null);
+            apply(weakSet, internals, [object, slots]);
+        }
+        return slots;
+    }
+    function state(object) {
+        const slots = isObject(object) ? apply(weakGet, internals, [object]) : undefined;
+        const source = slots && slots.eventSource;
+        if (!source) throw new TypeErrorCtor("Illegal EventSource invocation");
+        return source;
+    }
+    function fire(target, type) { adapter.dispatch(target, adapter.create(null, type, {})); }
+
+    class EventSource extends adapter.EventTarget {
+        // #dom-eventsource
+        constructor(url, eventSourceInitDict = undefined) {
+            if (arguments.length < 1) throw new TypeErrorCtor("EventSource requires a URL");
+            url = usvString(url);
+            let withCredentials = false;
+            if (eventSourceInitDict !== undefined && eventSourceInitDict !== null) {
+                if (!isObject(eventSourceInitDict)) throw new TypeErrorCtor("EventSourceInit must be a dictionary");
+                withCredentials = !!eventSourceInitDict.withCredentials;
+            }
+            super();
+            const href = adapter.parseURL(url);
+            if (href === null) throw exception("Invalid EventSource URL", "SyntaxError");
+            // #concept-event-stream-request: a potential-CORS request whose
+            // CORS settings attribute state is Anonymous or Use Credentials.
+            const source = {url: href, withCredentials, credentials: withCredentials ? "include" : "same-origin",
+                readyState: CONNECTING, reconnectionTime: DEFAULT_RECONNECTION_TIME, lastEventId: "",
+                remote: adapter.remoteEventQueue(), network: adapter.networkQueue(),
+                // The current connection attempt: aborting its fetch, the
+                // body being read and the reconnection wait.
+                generation: 0, abort: null, reading: null, timer: null};
+            record(this).eventSource = source;
+            connect(this, source);
+        }
+        get url() { return state(this).url; }
+        get withCredentials() { return state(this).withCredentials; }
+        get readyState() { return state(this).readyState; }
+        // #dom-eventsource-close
+        close() {
+            const source = state(this);
+            stop(source);
+            source.readyState = CLOSED;
+        }
+    }
+    // Abort the fetch, its body and any reconnection wait.
+    function stop(source) {
+        source.generation++;
+        if (source.abort !== null) { const abort = source.abort; source.abort = null; abort(); }
+        if (source.reading !== null) { const body = source.reading; source.reading = null; fetchAPI.terminateBody(body); }
+        if (source.timer !== null) { adapter.cancelDelay(source.timer); source.timer = null; }
+    }
+    function connect(target, source) {
+        const generation = ++source.generation;
+        source.abort = fetchAPI.fetchForEventSource(source.url, source.credentials, source.lastEventId, source.network,
+            function (response) {
+                source.abort = null;
+                if (source.generation !== generation || source.readyState === CLOSED) {
+                    fetchAPI.terminateBody(response.body);
+                    return;
+                }
+                processResponse(target, source, generation, response);
+            });
+    }
+    // The processResponse steps of #dom-eventsource.
+    function processResponse(target, source, generation, response) {
+        if (response.type === "error") {
+            if (response.aborted) failConnection(target, source);
+            else reestablishConnection(target, source);
+            return;
+        }
+        const mimeType = fetchAPI.extractMimeType(response.headerList);
+        if (response.status !== 200 || mimeType === null || mimeType.essence !== "text/event-stream") {
+            fetchAPI.terminateBody(response.body);
+            failConnection(target, source);
+            return;
+        }
+        announceConnection(target, source);
+        interpret(target, source, generation, response);
+    }
+    // #announce-the-connection
+    function announceConnection(target, source) {
+        source.remote(function () {
+            if (source.readyState === CLOSED) return;
+            source.readyState = OPEN;
+            fire(target, "open");
+        });
+    }
+    // #reestablish-the-connection
+    function reestablishConnection(target, source) {
+        const generation = ++source.generation;
+        let taskRan = false, waited = false;
+        const reconnect = function () {
+            source.remote(function () {
+                if (source.readyState !== CONNECTING || source.generation !== generation) return;
+                connect(target, source);
+            });
+        };
+        source.remote(function () {
+            if (source.readyState === CLOSED) return;
+            source.readyState = CONNECTING;
+            fire(target, "error");
+            taskRan = true;
+            if (waited) reconnect();
+        });
+        source.timer = adapter.delay(source.reconnectionTime, function () {
+            source.timer = null;
+            if (source.generation !== generation) return;
+            waited = true;
+            if (taskRan) reconnect();
+        });
+    }
+    // #fail-the-connection
+    function failConnection(target, source) {
+        stop(source);
+        source.remote(function () {
+            if (source.readyState === CLOSED) return;
+            source.readyState = CLOSED;
+            fire(target, "error");
+        });
+    }
+    // #event-stream-interpretation: the body is UTF-8 decoded (one leading
+    // byte order mark is stripped) and parsed line by line as it arrives.
+    function interpret(target, source, generation, response) {
+        const urls = response.urlList;
+        let origin = "null";
+        try { origin = apply(urlOrigin, new URLCtor(urls.length ? urls[urls.length - 1] : source.url), []); }
+        catch (_) { origin = "null"; }
+        // The parse state of this stream. The last event ID buffer starts at
+        // the last event ID string, so an event of a reestablished
+        // connection without an `id` field keeps it (#dispatchMessage).
+        const parser = {origin, line: "", sawCR: false, data: "", eventType: "",
+            lastEventIdBuffer: source.lastEventId, decoder: new TextDecoderCtor("utf-8")};
+        const body = response.body;
+        const current = function () { return source.generation === generation && source.readyState !== CLOSED; };
+        if (body === null) { reestablishConnection(target, source); return; }
+        source.reading = body;
+        fetchAPI.incrementallyReadBody(body, function (bytes) {
+            if (!current()) return;
+            if (!parse(target, source, parser, apply(textDecode, parser.decoder, [bytes, STREAM])))
+                failConnection(target, source);
+        }, function () {
+            if (!current()) return;
+            source.reading = null;
+            parse(target, source, parser, apply(textDecode, parser.decoder, []));
+            // Pending data at the end of the stream is discarded, and the
+            // connection is reestablished (processEventSourceEndOfBody).
+            reestablishConnection(target, source);
+        }, function () {
+            if (!current()) return;
+            // A network error ended the body: reestablish the connection.
+            source.reading = null;
+            reestablishConnection(target, source);
+        }, source.network);
+    }
+    // Feed decoded text; false when the stream exceeded its memory bound.
+    function parse(target, source, parser, text) {
+        let index = 0;
+        const length = text.length;
+        if (parser.sawCR) {
+            // A CR ended the previous line; an LF right after it belongs to it.
+            parser.sawCR = false;
+            if (length > 0 && apply(charCodeAt, text, [0]) === 10) index = 1;
+        }
+        while (index < length) {
+            LINE_END.lastIndex = index;
+            const match = apply(regexpExec, LINE_END, [text]);
+            if (match === null) {
+                parser.line += apply(stringSlice, text, [index]);
+                break;
+            }
+            let end = match.index;
+            const line = parser.line + apply(stringSlice, text, [index, end]);
+            parser.line = "";
+            if (apply(charCodeAt, text, [end]) === 13) {
+                if (end + 1 < length) {
+                    if (apply(charCodeAt, text, [end + 1]) === 10) end++;
+                } else parser.sawCR = true;
+            }
+            index = end + 1;
+            processLine(target, source, parser, line);
+            if (source.readyState === CLOSED) return true;
+        }
+        return parser.line.length + parser.data.length <= MAX_PENDING;
+    }
+    function processLine(target, source, parser, line) {
+        if (line === "") { dispatchMessage(target, source, parser); return; }
+        const colon = apply(stringIndexOf, line, [":"]);
+        if (colon === 0) return;
+        let field = line, value = "";
+        if (colon > 0) {
+            field = apply(stringSlice, line, [0, colon]);
+            value = apply(stringSlice, line, [colon + 1]);
+            if (value.length && apply(charCodeAt, value, [0]) === 32) value = apply(stringSlice, value, [1]);
+        }
+        // Field names are compared literally.
+        if (field === "event") parser.eventType = value;
+        else if (field === "data") parser.data += value + "\n";
+        else if (field === "id") {
+            if (apply(stringIndexOf, value, ["\0"]) < 0) parser.lastEventIdBuffer = value;
+        } else if (field === "retry") {
+            if (apply(regexpTest, DIGITS, [value])) source.reconnectionTime = NumberCtor(value);
+        }
+    }
+    // #dispatchMessage for web browsers.
+    function dispatchMessage(target, source, parser) {
+        source.lastEventId = parser.lastEventIdBuffer;
+        if (parser.data === "") { parser.eventType = ""; return; }
+        let data = parser.data;
+        if (apply(charCodeAt, data, [data.length - 1]) === 10) data = apply(stringSlice, data, [0, data.length - 1]);
+        const event = adapter.create(adapter.MessageEvent, parser.eventType === "" ? "message" : parser.eventType,
+            {data, origin: parser.origin, lastEventId: source.lastEventId});
+        parser.data = "";
+        parser.eventType = "";
+        source.remote(function () {
+            if (source.readyState !== CLOSED) adapter.dispatch(target, event);
+        });
+    }
+
+    for (const name of ["open", "message", "error"]) {
+        const property = "on" + name;
+        const accessors = {
+            get [property]() {
+                state(this);
+                const slots = record(this);
+                return slots.esHandlers && slots.esHandlers[name] ? slots.esHandlers[name].value : null;
+            },
+            set [property](value) {
+                state(this);
+                const slots = record(this);
+                const handlers = slots.esHandlers || (slots.esHandlers = objectCreate(null));
+                const handler = isObject(value) ? value : null;
+                if (handler === null) {
+                    if (handlers[name]) adapter.remove(this, name, handlers[name].listener);
+                    handlers[name] = null;
+                } else if (handlers[name]) handlers[name].value = handler;
+                else {
+                    const entry = {value: handler, listener: null};
+                    // #the-event-handler-processing-algorithm
+                    entry.listener = function (event) {
+                        if (typeof entry.value !== "function") return;
+                        if (apply(entry.value, this, [event]) === false) event.preventDefault();
+                    };
+                    handlers[name] = entry;
+                    adapter.add(this, name, entry.listener);
+                }
+            },
+        };
+        const descriptor = getOwn(accessors, property);
+        define(EventSource.prototype, property, {get: descriptor.get, set: descriptor.set, enumerable: true, configurable: true});
+    }
+    const names = getOwnNames(EventSource.prototype);
+    for (let i = 0; i < names.length; i++) if (names[i] !== "constructor") define(EventSource.prototype, names[i], {enumerable: true});
+    const constants = [["CONNECTING", CONNECTING], ["OPEN", OPEN], ["CLOSED", CLOSED]];
+    for (let i = 0; i < constants.length; i++) {
+        define(EventSource, constants[i][0], {value: constants[i][1], enumerable: true});
+        define(EventSource.prototype, constants[i][0], {value: constants[i][1], enumerable: true});
+    }
+    define(EventSource, "length", {value: 1, configurable: true});
+    define(EventSource.prototype, Symbol.toStringTag, {value: "EventSource", configurable: true});
+    define(g, "EventSource", {value: EventSource, writable: true, configurable: true});
+    })(globalThis);
+    /*__EVENTSOURCE_END__*/
 
     // ---- Web Workers --------------------------------------------------------
     // The structured-clone WIRE CODEC (HTML "StructuredSerialize" /
@@ -43349,9 +43835,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // withCredentials, upload, send, abort) and the response steps (status,
     // headers, response types, text and document responses). Requests run
     // through the Fetch block's #main-fetch in "cors" mode. The host transmits
-    // the whole request body before the response and delivers the response
-    // body complete, so processRequestEndOfBody runs once and processBodyChunk
-    // runs once before the end of the body.
+    // the whole request body before the response, so processRequestEndOfBody
+    // runs once; an asynchronous response body is read incrementally as it
+    // arrives (processBodyChunk), a synchronous one whole.
     (function (g) {
     "use strict";
     const adapter = g.__xhr_adapter;
@@ -43369,7 +43855,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const fromCharCode = String.fromCharCode, mathMax = Math.max;
     const jsonParse = JSON.parse, toWellFormed = String.prototype.toWellFormed;
     const typedBuffer = getOwn(Object.getPrototypeOf(Bytes.prototype), "buffer").get;
-    const typedSubarray = Bytes.prototype.subarray;
+    const typedSubarray = Bytes.prototype.subarray, typedSet = Object.getPrototypeOf(Bytes.prototype).set;
     const TextDecoderCtor = g.TextDecoder, textDecode = TextDecoderCtor.prototype.decode;
     const encodingName = __text_encoding_name;
     const URLCtor = g.URL, urlHref = getOwn(URLCtor.prototype, "href").get;
@@ -43503,6 +43989,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 sync: false, uploadComplete: false, uploadListener: false, timedOut: false,
                 response: networkError(), received: new Bytes(0), responseType: "", responseObject: null,
                 overrideMime: null, controller: 0, sendStart: 0, timer: null,
+                // The incrementally read response body, and when its last
+                // progress event fired.
+                readingBody: null, receivedStore: null, lastProgress: 0,
             };
         }
         get readyState() { return state(this).state; }
@@ -43647,7 +44136,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
                 fetchAPI.fetchForXHR(fields, function (response) {
                     queue(function () {
-                        if (xhr.controller === controller) processResponse(target, xhr, response, controller);
+                        if (xhr.controller === controller) processResponse(target, xhr, response, controller, queue);
+                        else fetchAPI.terminateBody(response.body);
                     });
                 });
                 xhr.sendStart = adapter.now();
@@ -43804,10 +44294,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (converted.kind === "stream") return {kind: "string", value: usvString(value)};
         return {kind: converted.kind, value: converted.kind === "string" || converted.kind === "bytes" ? converted.value : value};
     }
-    // Terminate the fetch controller: results of the earlier fetch are stale.
+    // Terminate the fetch controller: results of the earlier fetch are stale,
+    // and a body still being read stops transferring.
     function terminate(xhr) {
         xhr.controller++;
         cancelTimeout(xhr);
+        if (xhr.readingBody !== null) {
+            const body = xhr.readingBody;
+            xhr.readingBody = null;
+            fetchAPI.terminateBody(body);
+        }
+    }
+    // Append to the received bytes, growing their buffer geometrically so a
+    // long incrementally read body costs linear copying.
+    function appendReceived(xhr, bytes) {
+        const used = xhr.received.length, length = used + bytes.length;
+        let store = xhr.receivedStore;
+        if (store === null || store.length < length) {
+            const grown = new Bytes(mathMax(length, store === null ? 0 : store.length * 2, 4096));
+            apply(typedSet, grown, [xhr.received, 0]);
+            store = grown;
+            xhr.receivedStore = grown;
+        }
+        apply(typedSet, store, [bytes, used]);
+        xhr.received = apply(typedSubarray, store, [0, length]);
     }
     function cancelTimeout(xhr) {
         if (xhr.timer !== null) { adapter.cancelDelay(xhr.timer); xhr.timer = null; }
@@ -43828,16 +44338,50 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
     }
     // send() step 11.9: processResponse, processBodyChunk and processEndOfBody.
-    function processResponse(target, xhr, response, controller) {
+    function processResponse(target, xhr, response, controller, queue) {
         xhr.response = response;
-        if (handleErrors(target, xhr)) return;
+        if (handleErrors(target, xhr)) { fetchAPI.terminateBody(response.body); return; }
         if (isNetworkError(xhr.response)) return;
         xhr.state = HEADERS_RECEIVED;
         fireReadyStateChange(target);
-        if (xhr.state !== HEADERS_RECEIVED || xhr.controller !== controller) return;
+        if (xhr.state !== HEADERS_RECEIVED || xhr.controller !== controller) {
+            if (xhr.controller !== controller) fetchAPI.terminateBody(response.body);
+            return;
+        }
         if (xhr.response.body === null) { handleResponseEndOfBody(target, xhr); return; }
         let length = extractLength(xhr.response.headerList);
         if (length === null) length = 0;
+        if (typeof xhr.response.body.terminate === "function") {
+            // #body-incrementally-read the body as it arrives.
+            const body = xhr.response.body;
+            xhr.readingBody = body;
+            xhr.received = new Bytes(0);
+            xhr.receivedStore = null;
+            xhr.lastProgress = -Infinity;
+            fetchAPI.incrementallyReadBody(body, function (bytes) {
+                if (xhr.controller !== controller) return;
+                appendReceived(xhr, bytes);
+                // processBodyChunk: at most one event pair every roughly 50ms.
+                const now = adapter.now();
+                if (now - xhr.lastProgress < 50) return;
+                xhr.lastProgress = now;
+                if (xhr.state === HEADERS_RECEIVED) xhr.state = LOADING;
+                fireReadyStateChange(target);
+                if (xhr.controller !== controller) return;
+                fireProgress(target, "progress", xhr.received.length, length);
+            }, function () {
+                if (xhr.controller !== controller) return;
+                xhr.readingBody = null;
+                handleResponseEndOfBody(target, xhr);
+            }, function () {
+                if (xhr.controller !== controller) return;
+                xhr.readingBody = null;
+                // processBodyError
+                xhr.response = networkError();
+                handleErrors(target, xhr);
+            }, queue);
+            return;
+        }
         const bytes = xhr.response.body.bytes || new Bytes(0);
         if (bytes.length) {
             xhr.received = bytes;

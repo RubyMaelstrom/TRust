@@ -631,12 +631,24 @@ impl Incoming {
     }
 }
 
-async fn receive(
+/// A final response head and the stream its body arrives on.
+struct Head {
+    status: u16,
+    headers: Headers,
+    cookies: Vec<String>,
+    recv: RecvStream,
+    /// The response has no body (HEAD, 204, 205, 304).
+    no_content: bool,
+    /// The body is not read: a download navigation or a media subresource.
+    skip: bool,
+}
+
+async fn receive_head(
     response: client::ResponseFuture,
     request: &Request,
     timing: &mut FetchTiming,
     clock: &ResponseClock,
-) -> Result<(ResponseParts, bool), Error> {
+) -> Result<Head, Error> {
     let (status, headers, cookies, recv) = response_head(response, timing, clock).await?;
     let no_content =
         request.method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 205 | 304);
@@ -650,6 +662,40 @@ async fn receive(
                 let c = c.trim_start().to_ascii_lowercase();
                 c.starts_with("video/") || c.starts_with("audio/")
             }));
+    Ok(Head {
+        status,
+        headers,
+        cookies,
+        recv,
+        no_content,
+        skip,
+    })
+}
+
+async fn receive(
+    response: client::ResponseFuture,
+    request: &Request,
+    timing: &mut FetchTiming,
+    clock: &ResponseClock,
+) -> Result<(ResponseParts, bool), Error> {
+    let head = receive_head(response, request, timing, clock).await?;
+    receive_body(head, timing).await
+}
+
+/// Read the whole body of `head`. The boolean is false when the body was
+/// skipped, leaving the stream unread.
+async fn receive_body(
+    head: Head,
+    timing: &mut FetchTiming,
+) -> Result<(ResponseParts, bool), Error> {
+    let Head {
+        status,
+        headers,
+        cookies,
+        recv,
+        no_content,
+        skip,
+    } = head;
     if skip {
         timing.response_end = crate::performance::now_ms();
         return Ok(((status, headers, Vec::new(), cookies), false));
@@ -711,6 +757,159 @@ pub(super) async fn exchange(
         reset.armed = false;
     }
     Ok(parts)
+}
+
+/// What [`exchange_streaming`] received before deciding how to read the body.
+enum Received {
+    /// The request was sent (or the server stopped reading it) before the
+    /// final response head arrived.
+    Head(Head),
+    /// The head arrived first; the whole response has been read racing the
+    /// rest of the upload. `whole.1` is false for a skipped body.
+    Whole {
+        whole: (ResponseParts, bool),
+        uploaded: bool,
+    },
+}
+
+/// The result of [`exchange_streaming`].
+pub(super) enum Exchanged {
+    Complete(ResponseParts),
+    /// A final response whose body is read incrementally.
+    Streaming {
+        status: u16,
+        headers: Headers,
+        cookies: Vec<String>,
+        body: StreamingBody,
+    },
+}
+
+/// [`exchange`] for a consumer that reads the body as it arrives (Fetch
+/// #concept-http-network-fetch). Once the request has been sent, a final
+/// response with a body returns at its header section. When the response
+/// head arrives before the request body has been sent, the whole response is
+/// read while sending continues, as in [`exchange`].
+pub(super) async fn exchange_streaming(
+    lease: &Lease,
+    request: &Request,
+    origin: Option<&str>,
+    timing: &mut FetchTiming,
+) -> Result<Exchanged, Error> {
+    let payload = request
+        .body
+        .as_ref()
+        .map_or(&[][..], |(_, bytes)| bytes.as_slice());
+    let wire = wire_request(request, origin, false)?;
+    let (response, mut reset) = start(lease, wire, payload.is_empty(), timing).await?;
+    let clock = lease.session.clock.clone();
+    let result: Result<Received, Error> = async {
+        let mut head_future = Box::pin(receive_head(response, request, timing, &clock));
+        if payload.is_empty() {
+            return Ok(Received::Head(head_future.await?));
+        }
+        let mut upload_future = Box::pin(upload(&mut reset.send, payload));
+        let early = tokio::select! {
+            biased;
+            head = &mut head_future => Some(head?),
+            result = &mut upload_future => match result {
+                Ok(()) => None,
+                Err(error) if error.reason() == Some(Reason::NO_ERROR) => None,
+                Err(error) => return Err(Error::wire(error, false)),
+            },
+        };
+        let Some(head) = early else {
+            drop(upload_future);
+            return Ok(Received::Head(head_future.await?));
+        };
+        drop(head_future);
+        // HTTP is full duplex. An early final response (e.g. 413) must not
+        // deadlock behind an upload for which the server stopped giving credit.
+        let mut body_future = Box::pin(receive_body(head, timing));
+        let (whole, uploaded) = tokio::select! {
+            biased;
+            parts = &mut body_future => (parts?, false),
+            result = &mut upload_future => match result {
+                Ok(()) => (body_future.await?, true),
+                Err(error) if error.reason() == Some(Reason::NO_ERROR) => (body_future.await?, false),
+                Err(error) => return Err(Error::wire(error, false)),
+            },
+        };
+        Ok(Received::Whole { whole, uploaded })
+    }
+    .await;
+    let head = match result.inspect_err(|error| reset.fail(error))? {
+        Received::Head(head) => head,
+        Received::Whole {
+            whole: (parts, complete),
+            uploaded,
+        } => {
+            if complete {
+                if !uploaded {
+                    reset.send.send_reset(Reason::NO_ERROR);
+                }
+                reset.armed = false;
+            }
+            return Ok(Exchanged::Complete(parts));
+        }
+    };
+    if head.no_content || head.skip || !super::body_stream::streamable_status(head.status) {
+        let (parts, complete) = receive_body(head, timing)
+            .await
+            .inspect_err(|error| reset.fail(error))?;
+        if complete {
+            reset.armed = false;
+        }
+        return Ok(Exchanged::Complete(parts));
+    }
+    let Head {
+        status,
+        headers,
+        cookies,
+        recv,
+        ..
+    } = head;
+    let incoming = Incoming::new(recv, &headers, false, super::MAX_BODY)
+        .inspect_err(|error| reset.fail(error))?;
+    Ok(Exchanged::Streaming {
+        status,
+        headers,
+        cookies,
+        body: StreamingBody {
+            incoming,
+            reset,
+            _lease: lease.clone(),
+        },
+    })
+}
+
+/// A response body read as it arrives. Flow-control credit is returned as
+/// the consumer takes each piece, so an unread body holds at most a stream
+/// window of data. Dropping it before the end resets the stream with CANCEL.
+pub(crate) struct StreamingBody {
+    incoming: Incoming,
+    reset: ResetOnDrop,
+    _lease: Lease,
+}
+
+impl StreamingBody {
+    pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, String> {
+        match self.incoming.next().await {
+            Ok(Some(chunk)) => {
+                self.incoming
+                    .consumed(chunk.len())
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(chunk))
+            }
+            Ok(None) => {
+                self.reset.armed = false;
+                Ok(None)
+            }
+            Err(error) => {
+                self.reset.fail(&error);
+                Err(error.to_string())
+            }
+        }
+    }
 }
 
 /// Streaming downloads hold flow-control credits until bytes reach disk.
@@ -1012,6 +1211,87 @@ mod tests {
             Some(Reason::CANCEL)
         );
         request.url.set_path("/healthy");
+        assert_eq!(fetch(&request).await.unwrap().body, b"still alive");
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn http2_streamed_body_arrives_before_the_response_ends_and_drop_resets_it() {
+        // Fetch #concept-http-network-fetch: the response returns at its
+        // header section and its body is read as DATA frames arrive. A
+        // POST's request body is sent first. Abandoning the body transmits
+        // RST_STREAM (CANCEL) for that stream only (RFC 9113 §8.7).
+        let site = Site::new(&[b"h2"]).await;
+        let mut request = site.request.clone();
+        request.url.set_path("/stream");
+        request.method = "POST".into();
+        request.body = Some(("text/plain".into(), b"prompt".to_vec()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let (reset_tx, mut reset_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = site.serve(move |request, mut respond| {
+            let release = release_rx.clone();
+            let reset = reset_tx.clone();
+            async move {
+                if request.uri().path() == "/healthy" {
+                    ok(&mut respond, b"still alive");
+                    return;
+                }
+                let mut body = request.into_body();
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    received.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(received, b"prompt");
+                let head = http_wire::Response::builder()
+                    .header("content-type", "application/x-ndjson")
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(head, false).unwrap();
+                send.send_data(Bytes::from_static(b"{\"n\":1}\n"), false)
+                    .unwrap();
+                let waiting = release.lock().unwrap().take();
+                if let Some(waiting) = waiting {
+                    let _ = waiting.await;
+                    send.send_data(Bytes::from_static(b"{\"n\":2}\n"), true)
+                        .unwrap();
+                } else {
+                    let reason = poll_fn(|cx| send.poll_reset(cx)).await.unwrap();
+                    reset.send(reason).unwrap();
+                }
+            }
+        });
+        let (response, body) = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::super::fetch_script_streaming(&request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_empty());
+        let mut body = body.expect("the body streams");
+        assert_eq!(body.next().await.unwrap().unwrap(), b"{\"n\":1}\n");
+        release_tx.send(()).unwrap();
+        assert_eq!(body.next().await.unwrap().unwrap(), b"{\"n\":2}\n");
+        assert!(body.next().await.unwrap().is_none());
+        assert_eq!(body.encoded_size(), 16);
+
+        let (_, body) = super::super::fetch_script_streaming(&request)
+            .await
+            .unwrap();
+        let mut body = body.expect("the body streams");
+        assert_eq!(body.next().await.unwrap().unwrap(), b"{\"n\":1}\n");
+        drop(body);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reset_rx.recv())
+                .await
+                .unwrap(),
+            Some(Reason::CANCEL)
+        );
+        request.url.set_path("/healthy");
+        request.method = "GET".into();
+        request.body = None;
         assert_eq!(fetch(&request).await.unwrap().body, b"still alive");
         assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     }

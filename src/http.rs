@@ -28,10 +28,16 @@ pub use crate::performance::{FetchTiming, NavigationType};
 use crate::tls;
 
 mod alt_svc;
+mod body_stream;
+mod content_coding;
 pub(crate) mod http2;
 pub(crate) mod http3;
 mod http3_io;
 mod wire;
+
+#[cfg(test)]
+pub(crate) use body_stream::BODY_FLOW_UPPER;
+pub(crate) use body_stream::{BodyFlow, BodyStream, pump};
 
 // Per-response memory guard, shared by HTTP framing and content decoding.
 // Fetch/XHR bodies include binary application assets (archives, disk images,
@@ -1848,16 +1854,29 @@ pub(crate) async fn fetch_with_timing(
     request: &Request,
     policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
+    fetch_with_timing_into(request, policy, None).await
+}
+
+async fn fetch_with_timing_into(
+    request: &Request,
+    policy: crate::referrer_policy::ReferrerPolicy,
+    mut sink: BodySink<'_>,
+) -> Result<FetchResponseDetails, TimedFetchError> {
     if std::env::var_os("TRUST_NET_TRACE").is_none() {
-        return fetch_redirecting(request, policy).await;
+        return fetch_redirecting(request, policy, sink).await;
     }
     let at = trace_ms();
     let started = std::time::Instant::now();
-    let result = fetch_redirecting(request, policy).await;
+    let result = fetch_redirecting(request, policy, sink.as_deref_mut()).await;
     let ms = started.elapsed().as_millis();
+    let streamed = if sink.is_some_and(|slot| slot.is_some()) {
+        " (body streams)"
+    } else {
+        ""
+    };
     match &result {
         Ok(r) => eprintln!(
-            "net: @{at:>6}ms +{ms:>5}ms {} {}B protocol={} reused={} {}",
+            "net: @{at:>6}ms +{ms:>5}ms {} {}B{streamed} protocol={} reused={} {}",
             r.response.status,
             r.response.body.len(),
             r.response
@@ -1894,8 +1913,28 @@ pub(crate) async fn fetch_script(request: &Request) -> Result<Response, String> 
 pub(crate) async fn fetch_script_with_timing(
     request: &Request,
 ) -> Result<Response, TimedFetchError> {
+    fetch_script_timing_into(request, None).await
+}
+
+/// [`fetch_script_with_timing`] for a consumer that reads the response body
+/// as it arrives (Fetch #concept-http-network-fetch). The response returns
+/// once its header section has arrived; a body that remains to be read is
+/// returned beside it, and the response's own `body` is then empty. Its
+/// timing record lacks the end of the body, which [`BodyStream`] reports.
+pub(crate) async fn fetch_script_streaming(
+    request: &Request,
+) -> Result<(Response, Option<BodyStream>), TimedFetchError> {
+    let mut body = None;
+    let response = fetch_script_timing_into(request, Some(&mut body)).await?;
+    Ok((response, body))
+}
+
+async fn fetch_script_timing_into(
+    request: &Request,
+    sink: BodySink<'_>,
+) -> Result<Response, TimedFetchError> {
     let start = crate::performance::now_ms();
-    let result = fetch_script_timing_inner(request).await;
+    let result = fetch_script_timing_inner(request, sink).await;
     result
         .map(|mut response| {
             if let Some(timing) = response.timing.as_mut() {
@@ -1915,19 +1954,22 @@ pub(crate) async fn fetch_script_with_timing(
         })
 }
 
-async fn fetch_timed(request: &Request) -> Result<Response, TimedFetchError> {
-    fetch_with_timing(request, Default::default())
+async fn fetch_timed(request: &Request, sink: BodySink<'_>) -> Result<Response, TimedFetchError> {
+    fetch_with_timing_into(request, Default::default(), sink)
         .await
         .map(|details| details.response)
 }
 
-async fn fetch_script_timing_inner(request: &Request) -> Result<Response, TimedFetchError> {
+async fn fetch_script_timing_inner(
+    request: &Request,
+    sink: BodySink<'_>,
+) -> Result<Response, TimedFetchError> {
     let Some(policy) = &request.fetch_policy else {
-        return fetch_timed(request).await;
+        return fetch_timed(request, sink).await;
     };
     let cross_origin = !same_origin(&policy.origin, &request.url);
     if !cross_origin {
-        return fetch_timed(request).await;
+        return fetch_timed(request, sink).await;
     }
     let needs_preflight = cors_preflight_required(request);
     if policy.mode == RequestMode::SameOrigin {
@@ -1940,7 +1982,7 @@ async fn fetch_script_timing_inner(request: &Request) -> Result<Response, TimedF
             )
             .into());
         }
-        return fetch_timed(request).await;
+        return fetch_timed(request, sink).await;
     }
     if needs_preflight {
         let names = cors_non_safelisted_header_names(request);
@@ -1982,7 +2024,7 @@ async fn fetch_script_timing_inner(request: &Request) -> Result<Response, TimedF
         let response = fetch_preflight(&preflight).await?;
         validate_cors_preflight(&response, request, &names)?;
     }
-    fetch_timed(request).await
+    fetch_timed(request, sink).await
 }
 
 fn cors_preflight_required(request: &Request) -> bool {
@@ -2192,9 +2234,32 @@ async fn fetch_preflight(request: &Request) -> Result<Response, TimedFetchError>
     Ok(response)
 }
 
+/// Fetch with redirects. With a body sink, the final response's body is left
+/// unread for the sink; redirect bodies are always read whole. A response
+/// that fails the request's policy, or is filtered to an opaque response,
+/// drops a streamed body.
 async fn fetch_redirecting(
     request: &Request,
+    policy: crate::referrer_policy::ReferrerPolicy,
+    mut sink: BodySink<'_>,
+) -> Result<FetchResponseDetails, TimedFetchError> {
+    let result = fetch_redirecting_inner(request, policy, sink.as_deref_mut()).await;
+    if let Some(slot) = sink
+        && result
+            .as_ref()
+            .map_or(true, |details| details.response.status == 0)
+    {
+        // A network error, or Fetch #concept-filtered-response-opaque, whose
+        // body is null: cancel the transfer.
+        *slot = None;
+    }
+    result
+}
+
+async fn fetch_redirecting_inner(
+    request: &Request,
     mut policy: crate::referrer_policy::ReferrerPolicy,
+    mut sink: BodySink<'_>,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
     let navigation_start = crate::performance::now_ms();
     let mut redirect_end = 0.0;
@@ -2235,10 +2300,13 @@ async fn fetch_redirecting(
             return Err(String::from("same-origin fetch crossed origins").into());
         }
         let origin = request_origin_header(&request, policy, &url_list);
-        let response = tokio::time::timeout(FETCH_TIMEOUT, fetch_once(&request, origin.as_deref()))
-            .await
-            .map_err(|_| TimedFetchError::network(String::from("timed out"), navigation_start))?
-            .map_err(|error| TimedFetchError::network(error, navigation_start))?;
+        let response = tokio::time::timeout(
+            FETCH_TIMEOUT,
+            fetch_once_into(&request, origin.as_deref(), sink.as_deref_mut()),
+        )
+        .await
+        .map_err(|_| TimedFetchError::network(String::from("timed out"), navigation_start))?
+        .map_err(|error| TimedFetchError::network(error, navigation_start))?;
         if let Some(client) = &client {
             cross_origin_response |= !same_origin(client, &request.url);
             let opaque_origin = url_list
@@ -4287,6 +4355,45 @@ fn request_origin_header(
 }
 
 async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response, String> {
+    fetch_once_into(request, origin, None).await
+}
+
+/// A slot that receives a final response's unread body, for consumers that
+/// read it incrementally. Without one, bodies are read whole.
+type BodySink<'a> = Option<&'a mut Option<BodyStream>>;
+
+/// Finish an HTTP/1.1 exchange: a complete response returns its connection
+/// to the pool; a streamed body takes the connection with it.
+fn finish_http1(
+    request: &Request,
+    exchanged: Http1Exchange,
+    io: BufReader<Conn>,
+    key: PoolKey,
+    timing: crate::performance::FetchTiming,
+    sink: BodySink<'_>,
+) -> Result<Response, String> {
+    match exchanged {
+        Http1Exchange::Complete(parts) => finish_response(request, parts, io, key, timing),
+        Http1Exchange::Streaming(head) => {
+            let body = body_stream::Http1Body::new(io, key, &head);
+            let stream = BodyStream::http1(body, &head.headers);
+            if let Some(slot) = sink {
+                *slot = Some(stream);
+            }
+            finish_response_parts(
+                request,
+                (head.status, head.headers, Vec::new(), head.set_cookies),
+                timing,
+            )
+        }
+    }
+}
+
+async fn fetch_once_into(
+    request: &Request,
+    origin: Option<&str>,
+    mut sink: BodySink<'_>,
+) -> Result<Response, String> {
     let url = &request.url;
     if url.scheme() == "file" {
         // Fetch includes `file` in its fetch-scheme set but leaves the
@@ -4301,9 +4408,33 @@ async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response,
     let key = PoolKey::for_request(request)?;
 
     if let Some(lease) = http3::acquire(&key, &mut timing).await {
-        match http3::exchange(&lease, request, origin, &mut timing).await {
-            Ok(parts) if parts.0 != 421 => return finish_response_parts(request, parts, timing),
-            Ok(parts) => {
+        let exchanged = if sink.is_some() {
+            http3::exchange_streaming(&lease, request, origin, &mut timing).await
+        } else {
+            http3::exchange(&lease, request, origin, &mut timing)
+                .await
+                .map(http3::Exchanged::Complete)
+        };
+        match exchanged {
+            Ok(http3::Exchanged::Streaming {
+                status,
+                headers,
+                cookies,
+                body,
+            }) => {
+                if let Some(slot) = sink.as_deref_mut() {
+                    *slot = Some(BodyStream::http3(body, &headers));
+                }
+                return finish_response_parts(
+                    request,
+                    (status, headers, Vec::new(), cookies),
+                    timing,
+                );
+            }
+            Ok(http3::Exchanged::Complete(parts)) if parts.0 != 421 => {
+                return finish_response_parts(request, parts, timing);
+            }
+            Ok(http3::Exchanged::Complete(parts)) => {
                 for cookie in &parts.3 {
                     response_cookie(request, cookie);
                 }
@@ -4339,7 +4470,15 @@ async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response,
             timing.reused_connection(url.scheme() == "https");
             timing.first_interim_response_start = 0.0;
             timing.final_response_start = 0.0;
-            if let Ok(parts) = exchange(&mut io, request, &host, port, origin, &mut timing).await {
+            if sink.is_some() {
+                if let Ok(exchanged) =
+                    exchange_streaming(&mut io, request, &host, port, origin, &mut timing).await
+                {
+                    return finish_http1(request, exchanged, io, key, timing, sink);
+                }
+            } else if let Ok(parts) =
+                exchange(&mut io, request, &host, port, origin, &mut timing).await
+            {
                 return finish_response(request, parts, io, key, timing);
             }
         }
@@ -4356,12 +4495,40 @@ async fn fetch_once(request: &Request, origin: Option<&str>) -> Result<Response,
         }
         match http2::acquire(&key, &mut timing).await? {
             http2::Transport::Http1(mut io) => {
+                if sink.is_some() {
+                    let exchanged =
+                        exchange_streaming(&mut io, request, &host, port, origin, &mut timing)
+                            .await?;
+                    return finish_http1(request, exchanged, io, key, timing, sink);
+                }
                 let parts = exchange(&mut io, request, &host, port, origin, &mut timing).await?;
                 return finish_response(request, parts, io, key, timing);
             }
             http2::Transport::Http2(lease) => {
-                match http2::exchange(&lease, request, origin, &mut timing).await {
-                    Ok(parts) => {
+                let exchanged = if sink.is_some() {
+                    http2::exchange_streaming(&lease, request, origin, &mut timing).await
+                } else {
+                    http2::exchange(&lease, request, origin, &mut timing)
+                        .await
+                        .map(http2::Exchanged::Complete)
+                };
+                match exchanged {
+                    Ok(http2::Exchanged::Streaming {
+                        status,
+                        headers,
+                        cookies,
+                        body,
+                    }) => {
+                        if let Some(slot) = sink.as_deref_mut() {
+                            *slot = Some(BodyStream::http2(body, &headers));
+                        }
+                        return finish_response_parts(
+                            request,
+                            (status, headers, Vec::new(), cookies),
+                            timing,
+                        );
+                    }
+                    Ok(http2::Exchanged::Complete(parts)) => {
                         // Fetch #http-network-or-cache-fetch: 421 is retried
                         // once on a new connection. Our bodies are replayable
                         // byte sources, not non-rewindable upload streams.
@@ -4711,6 +4878,43 @@ async fn exchange(
     origin: Option<&str>,
     timing: &mut crate::performance::FetchTiming,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+    let head = exchange_head(io, request, host, port, origin, timing).await?;
+    read_http1_body(io, head, Some(timing)).await
+}
+
+/// [`exchange`] for a consumer that reads the body incrementally: the final
+/// response head, with its body still unread on `io` when it has one.
+async fn exchange_streaming(
+    io: &mut BufReader<Conn>,
+    request: &Request,
+    host: &str,
+    port: u16,
+    origin: Option<&str>,
+    timing: &mut crate::performance::FetchTiming,
+) -> Result<Http1Exchange, String> {
+    let head = exchange_head(io, request, host, port, origin, timing).await?;
+    if head.framing.streams() && body_stream::streamable_status(head.status) {
+        return Ok(Http1Exchange::Streaming(head));
+    }
+    read_http1_body(io, head, Some(timing))
+        .await
+        .map(Http1Exchange::Complete)
+}
+
+enum Http1Exchange {
+    Complete((u16, Headers, Vec<u8>, bool, Vec<String>)),
+    Streaming(Http1Head),
+}
+
+/// Write one HTTP/1.1 request and read the final response head.
+async fn exchange_head(
+    io: &mut BufReader<Conn>,
+    request: &Request,
+    host: &str,
+    port: u16,
+    origin: Option<&str>,
+    timing: &mut crate::performance::FetchTiming,
+) -> Result<Http1Head, String> {
     let url = &request.url;
     let path = &url[url::Position::BeforePath..url::Position::AfterQuery];
     let host_header = match (url.scheme(), port) {
@@ -4742,7 +4946,7 @@ async fn exchange(
         && request
             .fetch_metadata
             .is_some_and(|metadata| metadata.destination == "document");
-    read_response_with_timing(
+    read_response_head(
         io,
         request.method.eq_ignore_ascii_case("HEAD"),
         navigation_get,
@@ -4807,12 +5011,36 @@ async fn read_response_with_policy<R: AsyncRead + Unpin>(
     read_response_with_timing(io, is_head, navigation_get, None).await
 }
 
+#[cfg(test)]
 async fn read_response_with_timing<R: AsyncRead + Unpin>(
     io: &mut BufReader<R>,
     is_head: bool,
     navigation_get: bool,
     mut timing: Option<&mut crate::performance::FetchTiming>,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+    let head = read_response_head(io, is_head, navigation_get, timing.as_deref_mut()).await?;
+    read_http1_body(io, head, timing).await
+}
+
+/// An HTTP/1.x final response head and how its message body is delimited
+/// (RFC 9112 §6.3).
+pub(crate) struct Http1Head {
+    status: u16,
+    headers: Headers,
+    set_cookies: Vec<String>,
+    /// Whether the connection can be reused once the body is read.
+    reusable: bool,
+    framing: body_stream::Http1Framing,
+}
+
+/// Read the final response head and decide how its body is delimited.
+async fn read_response_head<R: AsyncRead + Unpin>(
+    io: &mut BufReader<R>,
+    is_head: bool,
+    navigation_get: bool,
+    mut timing: Option<&mut crate::performance::FetchTiming>,
+) -> Result<Http1Head, String> {
+    use body_stream::Http1Framing;
     // RFC 9110 §5.4 sets no limit on field lines or on the section as a
     // whole. These byte bounds keep parsing bounded; the line count is bounded
     // by them, so a response with many short fields (CDNs append one timing
@@ -4940,10 +5168,13 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
             || length.is_some_and(|value| parse_content_length(value).is_err())
             || (status == 204 && (transfer || length.is_some()));
         reusable &= status != 101 && !contradictory;
-        if let Some(timing) = timing.as_deref_mut() {
-            timing.response_end = crate::performance::now_ms();
-        }
-        return Ok((status, headers, Vec::new(), reusable, set_cookies));
+        return Ok(Http1Head {
+            status,
+            headers,
+            set_cookies,
+            reusable,
+            framing: Http1Framing::None,
+        });
     }
 
     let transfer_encoding = headers.get("transfer-encoding").map(|value| {
@@ -4977,10 +5208,13 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
     // Stop after headers for GET navigations; Save/Open owns a separate bounded
     // streaming transfer, so large PDFs/media never enter the 16 MiB page heap.
     if navigation_get && navigation_headers_need_download(&headers) {
-        if let Some(timing) = timing.as_deref_mut() {
-            timing.response_end = crate::performance::now_ms();
-        }
-        return Ok((status, headers, Vec::new(), false, set_cookies));
+        return Ok(Http1Head {
+            status,
+            headers,
+            set_cookies,
+            reusable: false,
+            framing: Http1Framing::None,
+        });
     }
 
     // Media subresources are not presentation documents. Top-level media
@@ -4992,19 +5226,17 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
         let c = c.trim_start().to_ascii_lowercase();
         c.starts_with("video/") || c.starts_with("audio/")
     }) {
-        if let Some(timing) = timing.as_deref_mut() {
-            timing.response_end = crate::performance::now_ms();
-        }
-        return Ok((status, headers, Vec::new(), false, set_cookies));
+        return Ok(Http1Head {
+            status,
+            headers,
+            set_cookies,
+            reusable: false,
+            framing: Http1Framing::None,
+        });
     }
 
-    let body = if transfer_encoding.is_some() {
-        let (body, complete) = read_chunked(io).await?;
-        if !complete {
-            return Err(String::from("incomplete chunked response"));
-        }
-        reusable &= complete;
-        body
+    let framing = if transfer_encoding.is_some() {
+        Http1Framing::Chunked
     } else if let Some(len) = content_length {
         if len > MAX_BODY {
             return Err(format!(
@@ -5012,16 +5244,60 @@ async fn read_response_with_timing<R: AsyncRead + Unpin>(
                 MAX_BODY / (1024 * 1024)
             ));
         }
-        let (body, complete) = read_exactly(io, len).await?;
-        if !complete {
-            return Err(String::from("incomplete response body"));
-        }
-        reusable &= complete;
-        body
+        Http1Framing::Length(len)
     } else {
         // No delimiter: the old read-to-EOF world. Never reusable.
         reusable = false;
-        read_to_eof(io).await?
+        Http1Framing::Eof
+    };
+    Ok(Http1Head {
+        status,
+        headers,
+        set_cookies,
+        reusable,
+        framing,
+    })
+}
+
+/// Read the whole body [`read_response_head`] delimited and undo its
+/// content codings. Returns (status, headers, body, reusable, cookies).
+async fn read_http1_body<R: AsyncRead + Unpin>(
+    io: &mut BufReader<R>,
+    head: Http1Head,
+    mut timing: Option<&mut crate::performance::FetchTiming>,
+) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
+    use body_stream::Http1Framing;
+    let Http1Head {
+        status,
+        headers,
+        set_cookies,
+        mut reusable,
+        framing,
+    } = head;
+    let body = match framing {
+        Http1Framing::None => {
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.response_end = crate::performance::now_ms();
+            }
+            return Ok((status, headers, Vec::new(), reusable, set_cookies));
+        }
+        Http1Framing::Chunked => {
+            let (body, complete) = read_chunked(io).await?;
+            if !complete {
+                return Err(String::from("incomplete chunked response"));
+            }
+            reusable &= complete;
+            body
+        }
+        Http1Framing::Length(len) => {
+            let (body, complete) = read_exactly(io, len).await?;
+            if !complete {
+                return Err(String::from("incomplete response body"));
+            }
+            reusable &= complete;
+            body
+        }
+        Http1Framing::Eof => read_to_eof(io).await?,
     };
     if let Some(timing) = timing.as_deref_mut() {
         timing.response_end = crate::performance::now_ms();

@@ -310,17 +310,43 @@ current behavior and limits; consult the governing standards before changing it.
   only its stream. Never blindly replay a possibly processed POST after
   network failure. The owned h3-quinn adapter fixes pending-read cancellation
   without copying receive buffers; keep its focused regression coverage.
-- XMLHttpRequest and WebSocket are shared Window/Worker platform blocks
-  (`/*__XHR_BEGIN__*/` and `/*__WEBSOCKET_BEGIN__*/` in `src/js_platform.js`,
-  assembled for workers by `js::worker_prelude()`); each realm supplies only
-  an adapter. Workers may send synchronous XHR, which blocks only the worker
-  thread; `responseXML` and the "document" response type are Window-only. A
-  worker's WebSockets follow its owner document's subresource policy, arrive
-  as host tasks of the worker loop and close when the worker ends. Response
-  bodies arrive complete, so XHR fires one LOADING `readystatechange` and a
-  synchronous timeout is detected only after the response. `statusText` stays
-  empty (the host response keeps no reason phrase), and XHR's use-CORS-preflight
-  flag for upload listeners is not forwarded to the host.
+- XMLHttpRequest, WebSocket and EventSource are shared Window/Worker platform
+  blocks (`/*__XHR_BEGIN__*/`, `/*__WEBSOCKET_BEGIN__*/` and
+  `/*__EVENTSOURCE_BEGIN__*/` in `src/js_platform.js`, assembled for workers by
+  `js::worker_prelude()`); each realm supplies only an adapter. Workers may
+  send synchronous XHR, which blocks only the worker thread; `responseXML` and
+  the "document" response type are Window-only. A worker's WebSockets follow
+  its owner document's subresource policy, arrive as host tasks of the worker
+  loop and close when the worker ends. Asynchronous XHR reads its body as it
+  arrives (LOADING, `readystatechange` and `progress` at most every ~50 ms);
+  a synchronous XHR receives it whole, so its timeout is detected only after
+  the response. `statusText` stays empty (the host response keeps no reason
+  phrase), and XHR's use-CORS-preflight flag for upload listeners is not
+  forwarded to the host.
+- Script `fetch()` and asynchronous XHR responses resolve at the response
+  header section; HTTP/1.1, HTTP/2 and HTTP/3 bodies then stream
+  (`http::fetch_script_streaming`, `http/body_stream.rs`) with incremental
+  content decoding (`http/content_coding.rs`: gzip, deflate, br, zstd) into
+  the body's ReadableStream, which pulls from a per-response host buffer
+  (`LumenHostTask::FetchHead`/`FetchBodyChunk`/`FetchBodyEnd`,
+  `__http_fetch_pull`). The transfer suspends while more than 1 MiB waits
+  unread and resumes below 256 KiB. Aborting the fetch, canceling or
+  garbage-collecting its stream, or unloading its document cancels the
+  transfer (HTTP/2 RST_STREAM CANCEL, HTTP/3 stop, HTTP/1.1 close); a body
+  read to its end returns an HTTP/1.1 connection to the pool. Redirect and
+  421 bodies, integrity-checked fetches, cached page resources and
+  browser-owned subresources still use whole bodies. Resource Timing reports
+  at the end of the body.
+- EventSource (HTML #server-sent-events) runs over that streaming fetch: a
+  potential-CORS request (`withCredentials` selects credentials "include"),
+  `Accept: text/event-stream`, cache mode "no-store", initiator type "other".
+  Non-200 statuses and other MIME types fail the connection; the end of the
+  body or a network error reestablishes it after the reconnection time
+  (initially 3 s, set by `retry`) with `Last-Event-ID`. The last event ID
+  persists across reconnections. Events are queued on the Window's remote
+  event task source (the worker's platform task queue); an event stream's
+  unfinished line plus data buffer is capped at 8 Mi code units, beyond
+  which the connection fails. data: and same-origin blob: URLs work.
 - `--renderer=auto` selects Hybrid only after surface, adapter, device, and
   capability initialization succeed; recoverable later failures fall back to
   Vello CPU. `--renderer=cpu` forces the reference renderer, while

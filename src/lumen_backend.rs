@@ -22,8 +22,7 @@ use std::time::{Duration, Instant};
 mod canvas_host;
 #[path = "challenge_message_trace.rs"]
 mod challenge_message_trace;
-#[path = "compression_host.rs"]
-mod compression_host;
+use crate::compression_host;
 #[path = "geometry_host.rs"]
 mod geometry_host;
 #[path = "image_bitmap_host.rs"]
@@ -213,6 +212,25 @@ enum LumenHostTask {
         result: LumenFetchResult,
         timing: Option<LumenResourceTiming>,
     },
+    /// A script fetch's response whose body is read as it arrives (Fetch
+    /// #concept-http-network-fetch): the header section, then the body's
+    /// bytes in order, then its end.
+    FetchHead {
+        id: usize,
+        result: LumenFetchResult,
+        flow: Arc<crate::http::BodyFlow>,
+    },
+    FetchBodyChunk {
+        id: usize,
+        bytes: Vec<u8>,
+    },
+    /// `ok` is false when a network error ended the body. The resource timing
+    /// entry reports at the end of the body (Fetch #fetch-finale).
+    FetchBodyEnd {
+        id: usize,
+        ok: bool,
+        timing: Option<LumenResourceTiming>,
+    },
     NavigateDone {
         id: usize,
         details: Option<Box<crate::http::FetchResponseDetails>>,
@@ -267,6 +285,39 @@ struct LumenNetwork {
     fetched: Arc<std::sync::atomic::AtomicUsize>,
     next_fetch_id: usize,
     pending_fetches: HashMap<usize, LumenPendingFetch>,
+    /// Response bodies still being read, by fetch id.
+    body_streams: HashMap<usize, LumenBodyStream>,
+}
+
+/// Fetch #concept-http-network-fetch's network buffer for one response body:
+/// bytes the transfer delivered that the body's stream has not yet pulled.
+/// The transfer suspends while more than `http::BODY_FLOW_UPPER` bytes wait
+/// here and resumes when a pull leaves fewer than `http::BODY_FLOW_LOWER`.
+struct LumenBodyStream {
+    /// The environment whose Realm owns the response body's stream.
+    context: u64,
+    flow: Arc<crate::http::BodyFlow>,
+    buffer: Vec<u8>,
+    /// None while the transfer runs; then whether it ended normally.
+    end: Option<bool>,
+    /// The resolve function of the stream's pending pullAlgorithm promise.
+    pull: Option<Value>,
+}
+
+impl LumenBodyStream {
+    /// The transfer still runs on its own: it will queue more tasks without
+    /// waiting for script to pull.
+    fn transferring(&self) -> bool {
+        self.end.is_none() && !self.flow.suspended()
+    }
+}
+
+impl Drop for LumenBodyStream {
+    /// A body nobody can pull any more (its environment or agent is gone)
+    /// stops its transfer, including one suspended waiting for a pull.
+    fn drop(&mut self) {
+        self.flow.cancel();
+    }
 }
 
 struct LumenPendingFetch {
@@ -826,6 +877,7 @@ impl HostState {
             fetched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_fetch_id: 0,
             pending_fetches: HashMap::new(),
+            body_streams: HashMap::new(),
         });
     }
 
@@ -1254,12 +1306,33 @@ impl RetainedMemory for HostState {
             let bytes = network
                 .pending_fetches
                 .capacity()
-                .saturating_mul(std::mem::size_of::<(usize, LumenPendingFetch)>());
+                .saturating_mul(std::mem::size_of::<(usize, LumenPendingFetch)>())
+                .saturating_add(
+                    network
+                        .body_streams
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(usize, LumenBodyStream)>()),
+                )
+                .saturating_add(
+                    network
+                        .body_streams
+                        .values()
+                        .map(|stream| stream.buffer.capacity())
+                        .sum(),
+                );
             if network.pending_fetches.capacity() != 0 {
                 visitor.opaque_storage();
             }
             for pending in network.pending_fetches.values() {
                 visitor.value(&pending.resolve);
+            }
+            if network.body_streams.capacity() != 0 {
+                visitor.opaque_storage();
+            }
+            for stream in network.body_streams.values() {
+                if let Some(pull) = &stream.pull {
+                    visitor.value(pull);
+                }
             }
             report_arc_payload(
                 visitor,
@@ -3915,10 +3988,13 @@ mod desktop {
                         .pending_dynamic_modules
                         .load(std::sync::atomic::Ordering::Relaxed)
                         > 0
-                    || state
-                        .network
-                        .as_ref()
-                        .is_some_and(|network| !network.pending_fetches.is_empty())
+                    || state.network.as_ref().is_some_and(|network| {
+                        !network.pending_fetches.is_empty()
+                            || network
+                                .body_streams
+                                .values()
+                                .any(LumenBodyStream::transferring)
+                    })
             })
     }
 
@@ -3944,10 +4020,13 @@ mod desktop {
                         .pending_dynamic_modules
                         .load(std::sync::atomic::Ordering::Relaxed)
                         > 0
-                    || state
-                        .network
-                        .as_ref()
-                        .is_some_and(|network| !network.pending_fetches.is_empty())
+                    || state.network.as_ref().is_some_and(|network| {
+                        !network.pending_fetches.is_empty()
+                            || network
+                                .body_streams
+                                .values()
+                                .any(LumenBodyStream::transferring)
+                    })
                     || state
                         .websockets
                         .as_ref()
@@ -10229,6 +10308,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__http_navigate", 3, host_http_navigate),
     ("__http_navigate_async", 4, host_http_navigate_async),
     ("__http_fetch_async", 5, host_http_fetch_async),
+    ("__http_fetch_pull", 1, host_http_fetch_pull),
+    ("__http_fetch_cancel", 1, host_http_fetch_cancel),
     ("__dom_run_injected_script", 1, guarded_run_injected_script),
     ("__dom_script_started", 1, guarded_script_started),
     ("__dom_insertion_resources", 1, guarded_insertion_resources),
@@ -12051,6 +12132,8 @@ fn resource_initiator(ctx: &mut Ctx, args: &[Value]) -> &'static str {
         "fetch" => "fetch",
         "xmlhttprequest" => "xmlhttprequest",
         "beacon" => "beacon",
+        // HTML #dom-eventsource: an EventSource request's initiator type.
+        "other" => "other",
         _ => "",
     }
 }
@@ -12413,6 +12496,15 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         return Ok(promise);
     };
     let initiator = resource_initiator(ctx, args);
+    // The caller reads the response body as it arrives (Fetch
+    // #concept-http-network-fetch); otherwise it needs the whole body at once.
+    let stream_body = matches!(args.get(8), Some(Value::Bool(true)));
+    // Fetch #concept-request-cache-mode: these modes never use a stored
+    // response, including one the document's own loads put in the page cache.
+    let bypass_cache = matches!(
+        host_arg_string(ctx, args, 9).as_str(),
+        "no-store" | "reload" | "no-cache"
+    );
     let started = crate::performance::now_ms();
     let client = request_client_url(ctx);
     let cookie_context = request_cookie_context(ctx);
@@ -12440,27 +12532,28 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 .join(&target)
                 .ok()
                 .is_some_and(|url| crate::http::same_origin_for_host(&client, &url));
-        let cached = if cache_safe_for_policy && !cookie_context.cross_site_ancestor {
-            state.network.as_ref().and_then(|network| {
-                (method.eq_ignore_ascii_case("GET") && body.is_none())
-                    .then(|| client.join(&target).ok())
-                    .flatten()
-                    .and_then(|url| network.cache.peek(&url))
-                    .filter(|shared| {
-                        policy.is_none()
-                            || shared.peek().is_some_and(|result| {
-                                result.as_ref().is_ok_and(|response| {
-                                    !response.url_list.is_empty()
-                                        && response.url_list.iter().all(|url| {
-                                            crate::http::same_origin_for_host(&client, url)
-                                        })
+        let cached =
+            if cache_safe_for_policy && !cookie_context.cross_site_ancestor && !bypass_cache {
+                state.network.as_ref().and_then(|network| {
+                    (method.eq_ignore_ascii_case("GET") && body.is_none())
+                        .then(|| client.join(&target).ok())
+                        .flatten()
+                        .and_then(|url| network.cache.peek(&url))
+                        .filter(|shared| {
+                            policy.is_none()
+                                || shared.peek().is_some_and(|result| {
+                                    result.as_ref().is_ok_and(|response| {
+                                        !response.url_list.is_empty()
+                                            && response.url_list.iter().all(|url| {
+                                                crate::http::same_origin_for_host(&client, url)
+                                            })
+                                    })
                                 })
-                            })
-                    })
-            })
-        } else {
-            None
-        };
+                        })
+                })
+            } else {
+                None
+            };
         let source = match cached {
             Some(shared) => Some(AsyncFetchSource::Cached(shared)),
             None => prepare_client_request(state, &client, &target, method, body, headers, policy)
@@ -12539,6 +12632,21 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 }
                 Err(()) => (None, None),
             },
+            AsyncFetchSource::Request(request) if stream_body => {
+                let name = request.url.to_string();
+                match crate::http::fetch_script_streaming(&request).await {
+                    Ok((response, Some(body))) => {
+                        let (result, timing) =
+                            timed_fetch_result(Ok(response), name, initiator, started);
+                        stream_fetch_body(id, result, timing, body, events).await;
+                        return;
+                    }
+                    Ok((response, None)) => {
+                        timed_fetch_result(Ok(response), name, initiator, started)
+                    }
+                    Err(error) => timed_fetch_result(Err(error), name, initiator, started),
+                }
+            }
             AsyncFetchSource::Request(request) => {
                 let name = request.url.to_string();
                 timed_fetch_result(
@@ -12552,6 +12660,237 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         let _ = events.send(LumenHostTask::FetchDone { id, result, timing });
     });
     Ok(promise)
+}
+
+/// Fetch #concept-http-network-fetch's in-parallel body steps for a response
+/// that has been handed to script: queue the head, then each decoded piece
+/// of the body, then its end, as networking tasks for the fetch's global.
+/// The transfer suspends while the body's stream leaves too many bytes
+/// unpulled, and stops when the fetch is aborted or its stream canceled.
+async fn stream_fetch_body(
+    id: usize,
+    result: LumenFetchResult,
+    timing: Option<LumenResourceTiming>,
+    mut body: crate::http::BodyStream,
+    events: LumenTaskSender,
+) {
+    /// A transfer abandoned by its task (the document stopped loading or
+    /// was unloaded) ends its body with a network error, as Fetch
+    /// #fetch-controller-terminate requires, instead of leaving it pending.
+    struct EndOnDrop {
+        id: usize,
+        events: Option<LumenTaskSender>,
+    }
+    impl Drop for EndOnDrop {
+        fn drop(&mut self) {
+            if let Some(events) = self.events.take() {
+                let _ = events.send(LumenHostTask::FetchBodyEnd {
+                    id: self.id,
+                    ok: false,
+                    timing: None,
+                });
+            }
+        }
+    }
+    let flow = crate::http::BodyFlow::new();
+    if events
+        .send(LumenHostTask::FetchHead {
+            id,
+            result,
+            flow: flow.clone(),
+        })
+        .is_err()
+    {
+        return;
+    }
+    let mut guard = EndOnDrop {
+        id,
+        events: Some(events.clone()),
+    };
+    let outcome = crate::http::pump(&mut body, &flow, |bytes| {
+        events
+            .send(LumenHostTask::FetchBodyChunk { id, bytes })
+            .is_ok()
+    })
+    .await;
+    guard.events = None;
+    if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
+        eprintln!(
+            "[fetch-trace] body id={id} end={outcome:?} encoded={} decoded={}",
+            body.encoded_size(),
+            body.decoded_size()
+        );
+    }
+    let ok = match outcome {
+        // Canceled: the consumer is gone and nothing more is queued.
+        Ok(false) => return,
+        Ok(true) => true,
+        Err(_) => false,
+    };
+    let timing = timing.map(|mut report| {
+        report.timing.response_end = crate::performance::now_ms();
+        report.timing.encoded_body_size = body.encoded_size();
+        report.timing.decoded_body_size = body.decoded_size();
+        report
+    });
+    let _ = events.send(LumenHostTask::FetchBodyEnd { id, ok, timing });
+}
+
+fn body_stream_id(args: &[Value]) -> Option<usize> {
+    args.first()
+        .and_then(Value::as_num_opt)
+        .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize))
+}
+
+/// The response body stream's pullAlgorithm (Fetch #concept-http-network-fetch):
+/// a promise for the bytes buffered for fetch `id` (an ArrayBuffer), once there
+/// are any; `null` at the end of the body; `false` after a network error or
+/// when the transfer no longer exists.
+fn host_http_fetch_pull(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    enum Ready {
+        Bytes(Vec<u8>),
+        End(bool),
+        Wait(Option<Value>),
+    }
+    let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+    let id = body_stream_id(args);
+    let ready = match ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.network.as_mut())
+        .zip(id)
+    {
+        None => Ready::End(false),
+        Some((network, id)) => match network.body_streams.get_mut(&id) {
+            None => Ready::End(false),
+            Some(stream) if !stream.buffer.is_empty() => {
+                let bytes = std::mem::take(&mut stream.buffer);
+                stream.flow.taken(bytes.len());
+                Ready::Bytes(bytes)
+            }
+            Some(stream) => match stream.end {
+                Some(ok) => {
+                    network.body_streams.remove(&id);
+                    Ready::End(ok)
+                }
+                None => Ready::Wait(stream.pull.replace(resolve.clone())),
+            },
+        },
+    };
+    match ready {
+        Ready::Bytes(bytes) => {
+            let value = ctx.make_array_buffer(&bytes).unwrap_or(Value::Bool(false));
+            ctx.invoke(resolve, Value::Undefined, &[value])?;
+        }
+        Ready::End(ok) => {
+            let value = if ok { Value::Null } else { Value::Bool(false) };
+            ctx.invoke(resolve, Value::Undefined, &[value])?;
+        }
+        // A stream has one pull in flight; a superseded one fails.
+        Ready::Wait(Some(previous)) => {
+            ctx.invoke(previous, Value::Undefined, &[Value::Bool(false)])?;
+        }
+        Ready::Wait(None) => {}
+    }
+    Ok(promise)
+}
+
+/// Abort or terminate fetch `id`'s transfer: its body's stream was canceled,
+/// the fetch was aborted, or the stream was garbage collected.
+fn host_http_fetch_cancel(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let stream = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.network.as_mut())
+        .zip(body_stream_id(args))
+        .and_then(|(network, id)| network.body_streams.remove(&id));
+    if let Some(mut stream) = stream {
+        stream.flow.cancel();
+        if let Some(pull) = stream.pull.take() {
+            ctx.invoke(pull, Value::Undefined, &[Value::Bool(false)])?;
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+/// Run `run` in the Realm of the environment `context`; a task for an
+/// environment whose Document is no longer active does not run.
+fn run_in_context_realm(
+    engine: &mut lumen::Engine,
+    context: u64,
+    label: &str,
+    run: impl FnOnce(&mut lumen::Engine) -> Result<(), String>,
+) -> Result<(), String> {
+    if context == engine.ctx().host_job_context() {
+        return run(engine);
+    }
+    let realm = engine
+        .ctx()
+        .host_mut::<HostState>()
+        .and_then(|state| state.window_realms.get(&context).cloned());
+    let Some(realm) = realm else {
+        return Ok(());
+    };
+    match engine.with_embed_realm(&realm, run) {
+        Ok(result) => result,
+        Err(error) => {
+            let message = engine
+                .ctx()
+                .coerce_string(&error)
+                .map(|message| message.to_string())
+                .unwrap_or_else(|_| String::from("unknown Window Realm"));
+            Err(format!("{label} Realm: {message}"))
+        }
+    }
+}
+
+/// Settle fetch `id`'s pending body pull when bytes or the end are available
+/// (#concept-http-network-fetch pullAlgorithm: pull from bytes into stream).
+fn settle_body_pull(engine: &mut lumen::Engine, id: usize) -> Result<(), String> {
+    let ready = {
+        let Some(network) = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .and_then(|state| state.network.as_mut())
+        else {
+            return Ok(());
+        };
+        let Some(stream) = network.body_streams.get_mut(&id) else {
+            return Ok(());
+        };
+        let context = stream.context;
+        match stream.pull.take() {
+            None => return Ok(()),
+            Some(pull) if !stream.buffer.is_empty() => {
+                let bytes = std::mem::take(&mut stream.buffer);
+                stream.flow.taken(bytes.len());
+                (context, pull, Ok(bytes))
+            }
+            Some(pull) => match stream.end {
+                Some(ok) => {
+                    network.body_streams.remove(&id);
+                    (context, pull, Err(ok))
+                }
+                None => {
+                    stream.pull = Some(pull);
+                    return Ok(());
+                }
+            },
+        }
+    };
+    let (context, pull, ready) = ready;
+    run_in_context_realm(engine, context, "fetch body task", move |engine| {
+        let value = match ready {
+            Ok(bytes) => engine
+                .ctx()
+                .make_array_buffer(&bytes)
+                .unwrap_or(Value::Bool(false)),
+            Err(true) => Value::Null,
+            Err(false) => Value::Bool(false),
+        };
+        engine
+            .call_function_interruptible(&pull, Value::Undefined, &[value])
+            .map(|_| ())
+            .map_err(|error| describe_eval_error(engine, error, "fetch body task"))
+    })
 }
 
 fn host_trust(ctx: &mut Ctx) -> Result<Value, Value> {
@@ -13051,6 +13390,16 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             network
                 .pending_fetches
                 .retain(|_, pending| pending.context != context);
+            // HTML #unload-a-document aborts the Document's fetches
+            // (Fetch #fetch-controller-abort): stop its response bodies'
+            // transfers, which may otherwise never end (event streams).
+            network.body_streams.retain(|_, stream| {
+                let keep = stream.context != context;
+                if !keep {
+                    stream.flow.cancel();
+                }
+                keep
+            });
         }
         if let Some(workers) = state.workers.as_mut() {
             // Removing the sole owner closes these dedicated workers. Dropping
@@ -14350,6 +14699,8 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__url_set", 3, host_url_set as NativeFn),
         ("__http_fetch", 5, host_http_fetch as NativeFn),
         ("__http_fetch_async", 5, host_http_fetch_async as NativeFn),
+        ("__http_fetch_pull", 1, host_http_fetch_pull as NativeFn),
+        ("__http_fetch_cancel", 1, host_http_fetch_cancel as NativeFn),
         ("__ws_open", 2, host_ws_open as NativeFn),
         ("__ws_send", 3, host_ws_send as NativeFn),
         ("__ws_close", 3, host_ws_close as NativeFn),
@@ -14863,6 +15214,7 @@ fn run_lumen_worker(
         fetched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         next_fetch_id: 0,
         pending_fetches: HashMap::new(),
+        body_streams: HashMap::new(),
     });
     // WebSocket is [Exposed=(Window,Worker)]: the worker's connections follow
     // its owner document's subresource policy and wake this worker's loop.
@@ -16087,6 +16439,98 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                     .unwrap_or(Value::Null),
                 None => Value::Null,
             })?;
+        }
+        LumenHostTask::FetchHead { id, result, flow } => {
+            let pending = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.network.as_mut())
+                .and_then(|network| network.pending_fetches.remove(&id));
+            let Some(pending) = pending else {
+                flow.cancel();
+                return Ok(());
+            };
+            let context = pending.context;
+            let realm_active = context == engine.ctx().host_job_context()
+                || engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .is_some_and(|state| state.window_realms.contains_key(&context));
+            if !realm_active {
+                flow.cancel();
+                return Ok(());
+            }
+            if let Some(network) = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.network.as_mut())
+            {
+                network.body_streams.insert(
+                    id,
+                    LumenBodyStream {
+                        context,
+                        flow,
+                        buffer: Vec::new(),
+                        end: None,
+                        pull: None,
+                    },
+                );
+            }
+            let resolve = pending.resolve;
+            run_in_context_realm(engine, context, "fetch task", move |engine| {
+                let value = host_fetch_result_value(engine.ctx(), result);
+                if matches!(value, Value::Obj(_)) {
+                    // The body is read from the network buffer: element 8 is
+                    // the fetch id the body's stream pulls with.
+                    engine
+                        .ctx()
+                        .member_set(&value, "8", Value::Num(id as f64))
+                        .map_err(|_| String::from("fetch task: response record"))?;
+                }
+                engine
+                    .call_function_interruptible(&resolve, Value::Undefined, &[value])
+                    .map(|_| ())
+                    .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))
+            })?;
+        }
+        LumenHostTask::FetchBodyChunk { id, bytes } => {
+            let Some(network) = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.network.as_mut())
+            else {
+                return Ok(());
+            };
+            let Some(stream) = network.body_streams.get_mut(&id) else {
+                return Ok(());
+            };
+            if stream.buffer.is_empty() {
+                stream.buffer = bytes;
+            } else {
+                stream.buffer.extend_from_slice(&bytes);
+            }
+            settle_body_pull(engine, id)?;
+        }
+        LumenHostTask::FetchBodyEnd { id, ok, timing } => {
+            let context = {
+                let Some(network) = engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .and_then(|state| state.network.as_mut())
+                else {
+                    return Ok(());
+                };
+                let Some(stream) = network.body_streams.get_mut(&id) else {
+                    return Ok(());
+                };
+                stream.end = Some(ok);
+                stream.context
+            };
+            run_in_context_realm(engine, context, "fetch task", move |engine| {
+                record_resource_timing(engine.ctx(), timing);
+                Ok(())
+            })?;
+            settle_body_pull(engine, id)?;
         }
         LumenHostTask::FetchDone { id, result, timing } => {
             let pending = engine
@@ -21135,6 +21579,10 @@ fn value_string(engine: &mut lumen::Engine, value: &Value) -> String {
         .map(|string| string.to_string())
         .unwrap_or_else(|_| format!("<{}>", value.type_of()))
 }
+
+#[cfg(test)]
+#[path = "fetch_stream_tests.rs"]
+mod fetch_stream_tests;
 
 #[cfg(test)]
 mod tests {
@@ -28055,7 +28503,7 @@ mod tests {
         );
     }
 
-    fn configured_engine(state: HostState, url: &str) -> lumen::Engine {
+    pub(super) fn configured_engine(state: HostState, url: &str) -> lumen::Engine {
         let mut engine = configured_engine_before_prelude(state, url);
         eval_platform_prelude(&mut engine).unwrap();
         engine
@@ -28163,7 +28611,7 @@ mod tests {
         }
     }
 
-    fn run_microtask_checkpoint(engine: &mut lumen::Engine) {
+    pub(super) fn run_microtask_checkpoint(engine: &mut lumen::Engine) {
         engine
             .run_microtasks_interruptible()
             .unwrap_or_else(|reason| {
@@ -28184,7 +28632,7 @@ mod tests {
         }
     }
 
-    fn string_value(engine: &mut lumen::Engine, expression: &str) -> String {
+    pub(super) fn string_value(engine: &mut lumen::Engine, expression: &str) -> String {
         let value = eval_value(engine, expression, expression).unwrap();
         value_string(engine, &value)
     }
@@ -28266,7 +28714,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 230, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 232, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -28277,7 +28725,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 230);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 232);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

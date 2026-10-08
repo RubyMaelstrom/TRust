@@ -797,3 +797,82 @@ async fn http3_rejects_oversized_encoded_header_before_buffering_payload() {
         .unwrap();
     assert_eq!(site.tcp_requests.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn http3_streamed_body_arrives_before_the_response_ends_and_drop_stops_it() {
+    // Fetch #concept-http-network-fetch over HTTP/3: the response returns at
+    // its header section; DATA arrives as it is sent. Abandoning the body
+    // stops the stream with H3_REQUEST_CANCELLED (RFC 9114 §4.1.1).
+    let release = Arc::new(Notify::new());
+    let (report, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let site = Site::new({
+        let release = release.clone();
+        move |request, mut stream, conn| {
+            let release = release.clone();
+            let report = report.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                if path != "/stream" && path != "/drop" {
+                    ok(request, stream, conn).await;
+                    return;
+                }
+                stream
+                    .send_response(http_wire::Response::new(()))
+                    .await
+                    .unwrap();
+                stream.send_data(Bytes::from_static(b"one")).await.unwrap();
+                if path == "/stream" {
+                    release.notified().await;
+                    stream.send_data(Bytes::from_static(b"two")).await.unwrap();
+                    stream.finish().await.unwrap();
+                    return;
+                }
+                let stopped = loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    match stream.send_data(Bytes::from_static(b"more")).await {
+                        Ok(()) => {}
+                        Err(StreamError::RemoteTerminate { code, .. }) => {
+                            break code == Code::H3_REQUEST_CANCELLED;
+                        }
+                        Err(_) => break false,
+                    }
+                };
+                report.send(stopped).unwrap();
+            }
+        }
+    })
+    .await;
+    site.warm().await;
+    let mut request = site.request.clone();
+    request.url.set_path("/stream");
+    let mut slot = None;
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::super::fetch_once_into(&request, None, Some(&mut slot)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.timing.as_ref().unwrap().next_hop_protocol, "h3");
+    assert!(response.body.is_empty());
+    let mut body = slot.take().expect("the body streams");
+    assert_eq!(body.next().await.unwrap().unwrap(), b"one");
+    release.notify_one();
+    assert_eq!(body.next().await.unwrap().unwrap(), b"two");
+    assert!(body.next().await.unwrap().is_none());
+
+    request.url.set_path("/drop");
+    super::super::fetch_once_into(&request, None, Some(&mut slot))
+        .await
+        .unwrap();
+    let mut body = slot.take().expect("the body streams");
+    assert_eq!(body.next().await.unwrap().unwrap(), b"one");
+    drop(body);
+    let stopped = tokio::time::timeout(Duration::from_secs(3), reports.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stopped, "the server saw H3_REQUEST_CANCELLED");
+    assert_eq!(site.fetch(&site.request).await.unwrap().body, b"quic");
+    assert_eq!(site.connections.load(Ordering::SeqCst), 1);
+}

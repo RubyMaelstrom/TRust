@@ -868,4 +868,29 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         documentBody() { return null; },
         documentResponse() { return null; },
     };
+    // The shared EVENTSOURCE block's view of this worker: its events, its
+    // platform task queue (remote event and networking tasks) and its timer
+    // list for the reconnection delay.
+    g.__eventsource_adapter = {
+        EventTarget: g.EventTarget, MessageEvent,
+        add(target, type, callback) { addListener.call(target, type, callback); },
+        remove(target, type, callback) { removeListener.call(target, type, callback); },
+        create(C, type, init) { return trustedScopeEvent(C || Event, type, init); },
+        dispatch(target, event) { dispatchScopeEvent(event, true, target); },
+        // A worker's query encoding is UTF-8; the href, or null.
+        parseURL(url) {
+            try { return new XHRURL(url, lp[0]).href; } catch (_) { return null; }
+        },
+        remoteEventQueue() { return function (fn) { platformTasks.push(fn); }; },
+        networkQueue() { return function (fn) { platformTasks.push(fn); }; },
+        delay(ms, fn) {
+            const entry = { id: xhrTimerId, at: currentTime() + ms, timeout: ms, fn: fn, args: [], interval: false, nesting: 0 };
+            WK.timers.push(entry);
+            return entry;
+        },
+        cancelDelay(entry) {
+            const index = WK.timers.indexOf(entry);
+            if (index >= 0) WK.timers.splice(index, 1);
+        },
+    };
 })();
