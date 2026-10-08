@@ -973,7 +973,8 @@ impl SelectorDependencies {
             // (covered like :disabled); :lang() reads ancestor attributes only.
             // The tree operation already restyles the moved subtree, so none
             // of them changes outside it. :placeholder-shown reads a textarea's
-            // own children, handled at that parent below.
+            // own children, handled at that parent below. :defined and
+            // :state() read the element's own custom element state.
             self.structure_global |= !matches!(
                 state,
                 StatePseudo::AnyLink
@@ -991,6 +992,8 @@ impl SelectorDependencies {
                     | StatePseudo::ReadOnly
                     | StatePseudo::Lang(_)
                     | StatePseudo::PlaceholderShown
+                    | StatePseudo::Defined
+                    | StatePseudo::Custom(_)
             );
             self.indeterminate |= matches!(state, StatePseudo::Indeterminate);
             self.text_direction |= matches!(state, StatePseudo::Dir(_));

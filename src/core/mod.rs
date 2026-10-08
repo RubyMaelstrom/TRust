@@ -3032,14 +3032,24 @@ impl BrowserController {
             return;
         };
         if submission.method.eq_ignore_ascii_case("post") {
-            self.begin_form_post(action, submission.body);
+            self.begin_form_post_body(action, submission.content_type, submission.body);
         } else if !submission.method.eq_ignore_ascii_case("dialog") {
-            action.set_query((!submission.body.is_empty()).then_some(&submission.body));
+            action.set_query(submission.query());
             self.begin_page_fetch(Link::Http(action), false, NavigationIntent::New);
         }
     }
 
     fn begin_form_post(&mut self, url: url::Url, body: String) {
+        self.begin_form_post_body(
+            url,
+            crate::js::FORM_URLENCODED.to_string(),
+            body.into_bytes(),
+        );
+    }
+
+    /// POST a form's entity body in the MIME type of its enctype
+    /// (HTML #submit-body).
+    fn begin_form_post_body(&mut self, url: url::Url, content_type: String, body: Vec<u8>) {
         // HTML #plan-to-navigate / #process-a-navigate-fetch retain the form
         // document as the fetch client (local snapshot e5071a20, 2026-09-06).
         // Capture it before retiring the actor so Fetch can derive Origin,
@@ -3050,10 +3060,25 @@ impl BrowserController {
             Link::Http(url) => Some(url.clone()),
             _ => None,
         });
-        self.begin_post(url, body, source);
+        self.begin_post_body(url, content_type, body, source);
     }
 
     fn begin_post(&mut self, url: url::Url, body: String, source: Option<url::Url>) {
+        self.begin_post_body(
+            url,
+            crate::js::FORM_URLENCODED.to_string(),
+            body.into_bytes(),
+            source,
+        );
+    }
+
+    fn begin_post_body(
+        &mut self,
+        url: url::Url,
+        content_type: String,
+        body: Vec<u8>,
+        source: Option<url::Url>,
+    ) {
         if crate::media::is_youtube_video_url(&url) {
             self.delegate_external_media(url);
             return;
@@ -3083,7 +3108,7 @@ impl BrowserController {
                 source.as_ref(),
                 window_environment,
                 storage,
-                Some(body),
+                Some((content_type, body)),
                 NavigationIntent::New,
             )
             .await;
@@ -3172,7 +3197,7 @@ async fn fetch_protocol_interactive(
     referrer: Option<&url::Url>,
     window_environment: tokio::sync::watch::Receiver<WindowEnvironment>,
     storage: crate::js::WebStorage,
-    post_body: Option<String>,
+    post_body: Option<(String, Vec<u8>)>,
     intent: NavigationIntent,
 ) -> Result<InteractiveFetch, String> {
     if let Link::Gopher(url) = target
@@ -3227,10 +3252,7 @@ async fn fetch_protocol_interactive(
             let mut request = http::Request {
                 method: String::from("POST"),
                 url: url.clone(),
-                body: Some((
-                    String::from("application/x-www-form-urlencoded"),
-                    body.into_bytes(),
-                )),
+                body: Some(body),
                 headers: Vec::new(),
                 fetch_metadata: None,
                 cookie_context: None,
@@ -3582,7 +3604,8 @@ mod tests {
                             submission: Some(crate::js::FormSubmission {
                                 action: action.to_string(),
                                 method: "post".into(),
-                                body: body.into(),
+                                content_type: crate::js::FORM_URLENCODED.into(),
+                                body: body.as_bytes().to_vec(),
                             }),
                         });
                     }

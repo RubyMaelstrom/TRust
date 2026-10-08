@@ -583,6 +583,10 @@ pub struct Dom {
     /// and every source ever requested.
     font_requests: RefCell<(Vec<url::Url>, FxHashSet<String>)>,
     input_values: FxHashMap<NodeId, input::InputValue>,
+    /// Element state that is not a content attribute: form control
+    /// checkedness, option selectedness and textarea raw values, and custom
+    /// element definedness and states sets (`input::ElementState`).
+    element_states: FxHashMap<NodeId, input::ElementState>,
     media_fallbacks: RefCell<media::MediaFallbacks>,
     control_selections: FxHashMap<NodeId, crate::doc::ControlSelection>,
     pub(crate) canvases: RefCell<FxHashMap<NodeId, crate::canvas::Canvas>>,
@@ -1075,6 +1079,7 @@ impl Dom {
             downloaded_fonts,
             font_requests,
             input_values,
+            element_states,
             media_fallbacks,
             control_selections,
             canvases,
@@ -1246,6 +1251,10 @@ impl Dom {
             }
         }
         fixed_map!(input_values, (NodeId, input::InputValue));
+        fixed_map!(element_states, (NodeId, input::ElementState));
+        for state in element_states.values() {
+            bytes = bytes.saturating_add(state.retained_bytes());
+        }
         bytes = bytes.saturating_add(media_fallbacks.borrow().retained_bytes());
         // Url exposes its length but not its allocation capacity.
         opaque |= media_fallbacks.borrow().retained_bytes() != 0;
@@ -1604,6 +1613,7 @@ impl Dom {
             downloaded_fonts: FxHashMap::default(),
             font_requests: RefCell::default(),
             input_values: FxHashMap::default(),
+            element_states: FxHashMap::default(),
             media_fallbacks: RefCell::new(media::MediaFallbacks::default()),
             control_selections: FxHashMap::default(),
             canvases: RefCell::new(FxHashMap::default()),
@@ -3608,6 +3618,14 @@ impl Dom {
             let n = &self.nodes[id];
             (n.parent, n.prev_sibling, n.next_sibling)
         };
+        // HTML #the-select-element: options leaving a select's list of
+        // options run its selectedness setting algorithm, over the states
+        // the options had (a pristine select's are derived, so fix them
+        // first).
+        let affected_select = parent.and_then(|parent| self.select_losing_options(parent, id));
+        if let Some(select) = affected_select {
+            self.materialize_select_states(select);
+        }
         // The PARENT's child list is what changed; `None` (an already-orphan
         // node, e.g. a fresh child about to be appended) is a no-op for the
         // rendered tree — dirties the epoch but records no relayout target.
@@ -3642,6 +3660,9 @@ impl Dom {
             self.child_collection_changed(parent, id, false);
             self.note_picture_child_change(parent, id);
             self.clear_modal_disconnected();
+        }
+        if let Some(select) = affected_select {
+            self.run_selectedness_setting_algorithm(select);
         }
     }
 
@@ -9069,7 +9090,13 @@ impl Dom {
             if id != root && matches!(self.nodes[id].data, NodeData::Document) {
                 continue;
             }
-            if self.tag_name(id).is_some_and(|t| t.contains('-')) {
+            // HTML #look-up-a-custom-element-definition: an autonomous
+            // custom element's name, or a customized built-in's `is` value.
+            if self.tag_name(id).is_some_and(|t| {
+                input::is_valid_custom_element_name(t)
+                    || self.attr(id, "is").is_some()
+                    || self.is_value(id).is_some()
+            }) {
                 out.push(id);
             }
             self.push_composed_children(id, &mut stack);
@@ -9674,6 +9701,16 @@ impl Dom {
         if let Some(value) = self.input_values.get(&id).cloned() {
             self.input_values.insert(copy, value);
         }
+        // HTML input/textarea cloning steps propagate checkedness, the dirty
+        // checkedness flag, the raw value and the dirty value flag; an
+        // option's selectedness is initialized from its attribute instead.
+        if let Some(state) = self
+            .element_states
+            .get(&id)
+            .and_then(input::ElementState::for_clone)
+        {
+            self.element_states.insert(copy, state);
+        }
         // HTML #script-processing-model cloning steps: copy "already started".
         if self.started_scripts.contains(&id) {
             self.started_scripts.insert(copy);
@@ -9749,14 +9786,36 @@ impl Dom {
         html: &str,
         scripting: bool,
     ) -> Vec<NodeId> {
+        self.parse_html_fragment_with(context, html, scripting, false)
+    }
+
+    fn parse_html_fragment_with(
+        &mut self,
+        context: Option<NodeId>,
+        html: &str,
+        scripting: bool,
+        declarative_shadow_roots: bool,
+    ) -> Vec<NodeId> {
         match context.map(|id| &self.nodes[id].data) {
             Some(NodeData::Element { name, attrs, .. }) => {
                 let (name, attrs) = (name.clone(), attrs.clone());
-                self.parse_fragment_with(name, attrs, html, scripting)
+                self.parse_fragment_with_roots(
+                    name,
+                    attrs,
+                    html,
+                    scripting,
+                    declarative_shadow_roots,
+                )
             }
             _ => {
                 let context = QualName::new(None, ns!(html), "body".into());
-                self.parse_fragment_with(context, Vec::new(), html, scripting)
+                self.parse_fragment_with_roots(
+                    context,
+                    Vec::new(),
+                    html,
+                    scripting,
+                    declarative_shadow_roots,
+                )
             }
         }
     }
@@ -9774,6 +9833,19 @@ impl Dom {
         context: Option<NodeId>,
         markup: &str,
         check_only: bool,
+    ) -> Option<Vec<NodeId>> {
+        self.fragment_parse_with_shadow_roots(target, context, markup, check_only, false)
+    }
+
+    /// The HTML fragment parsing algorithm with allowDeclarativeShadowRoots
+    /// (HTML #unsafely-set-html for setHTMLUnsafe()).
+    pub(crate) fn fragment_parse_with_shadow_roots(
+        &mut self,
+        target: NodeId,
+        context: Option<NodeId>,
+        markup: &str,
+        check_only: bool,
+        declarative_shadow_roots: bool,
     ) -> Option<Vec<NodeId>> {
         let context = context.and_then(|id| match self.nodes[id].data {
             NodeData::Element { .. } => Some(id),
@@ -9793,7 +9865,7 @@ impl Dom {
             return Some(Vec::new());
         }
         let scripting = self.scripting_enabled_for(target);
-        Some(self.parse_html_fragment_for(context, markup, scripting))
+        Some(self.parse_html_fragment_with(context, markup, scripting, declarative_shadow_roots))
     }
 
     fn parse_fragment_with(
@@ -9803,11 +9875,23 @@ impl Dom {
         html: &str,
         scripting: bool,
     ) -> Vec<NodeId> {
+        self.parse_fragment_with_roots(context, context_attrs, html, scripting, false)
+    }
+
+    fn parse_fragment_with_roots(
+        &mut self,
+        context: QualName,
+        context_attrs: Vec<Attribute>,
+        html: &str,
+        scripting: bool,
+        declarative_shadow_roots: bool,
+    ) -> Vec<NodeId> {
         let sink = Sink {
             dom: RefCell::new(Dom::new()),
             // HTML #dom-element-innerhtml / fragment parsing defaults to
-            // disallowing declarative roots, unlike navigation parsing.
-            allow_declarative_shadow_roots: false,
+            // disallowing declarative roots, unlike navigation parsing;
+            // setHTMLUnsafe() allows them (#unsafely-set-html).
+            allow_declarative_shadow_roots: declarative_shadow_roots,
         };
         // HTML #html-fragment-parsing-algorithm steps 10–12: the scripting
         // mode is Inert, or Disabled when scripting is disabled for the
@@ -9834,11 +9918,22 @@ impl Dom {
     /// which breaks any consumer that reads `newDocument.head`/`.body` separately
     /// (a view-transitions swap, most notably).
     pub fn parse_document_into(&mut self, html: &str) -> NodeId {
+        self.parse_document_into_with(html, false)
+    }
+
+    /// `parse_document_into` with the new Document's allow declarative
+    /// shadow roots flag (true for Document.parseHTMLUnsafe(),
+    /// HTML #dom-parsehtmlunsafe).
+    pub fn parse_document_into_with(
+        &mut self,
+        html: &str,
+        declarative_shadow_roots: bool,
+    ) -> NodeId {
         // DOMParser's new Document keeps allow declarative shadow roots false,
         // and has no browsing context, so its parser's scripting mode is
         // Disabled (HTML #dom-domparser-parsefromstring, #scripting-mode):
         // noscript content parses as markup.
-        let src = Dom::parse_html_document_with(html, false, false);
+        let src = Dom::parse_html_document_with(html, declarative_shadow_roots, false);
         let doc = self.new_node(NodeData::Document);
         self.nodes[doc].owner_document = doc;
         self.document_modes.insert(doc, src.document_mode(DOCUMENT));
@@ -10075,6 +10170,73 @@ impl Dom {
 
     /// JS-facing `innerHTML`: preserves `<template>` content (single caller is
     /// `sys_inner_html`). See `serialize_js`.
+    /// HTML #html-fragment-serialisation-algorithm with
+    /// serializableShadowRoots and shadowRoots (Element.getHTML() and
+    /// ShadowRoot.getHTML()): a shadow host's qualifying shadow root is
+    /// serialized as a declarative `<template shadowrootmode>` first child.
+    pub fn html_with_shadow_roots(
+        &self,
+        id: NodeId,
+        serializable: bool,
+        roots: Vec<NodeId>,
+    ) -> String {
+        SHADOW_SERIALIZATION.with(|cell| {
+            *cell.borrow_mut() = Some(ShadowSerialization {
+                serializable,
+                roots: roots.into_iter().collect(),
+            });
+        });
+        let mut out = String::new();
+        if !matches!(self.tag_name(id), Some(tag) if is_serialized_void(tag)) {
+            self.write_serialized_shadow_root(id, MarkupMode::Script, &mut out);
+            for c in self.child_iter(self.content_target(id)) {
+                self.serialize_node_inner(c, None, MarkupMode::Script, &mut out);
+            }
+        }
+        SHADOW_SERIALIZATION.with(|cell| *cell.borrow_mut() = None);
+        out
+    }
+
+    fn write_serialized_shadow_root(&self, host: NodeId, mode: MarkupMode, out: &mut String) {
+        let Some(root) = self.shadow_roots.get(&host).copied() else {
+            return;
+        };
+        let include = SHADOW_SERIALIZATION.with(|cell| {
+            cell.borrow().as_ref().is_some_and(|options| {
+                (options.serializable
+                    && self
+                        .shadow_data
+                        .get(&root)
+                        .is_some_and(|data| data.serializable))
+                    || options.roots.contains(&root)
+            })
+        });
+        if !include {
+            return;
+        }
+        let data = self.shadow_data.get(&root).cloned().unwrap_or_default();
+        out.push_str("<template shadowrootmode=\"");
+        out.push_str(if data.closed { "closed" } else { "open" });
+        out.push('"');
+        if data.delegates_focus {
+            out.push_str(" shadowrootdelegatesfocus=\"\"");
+        }
+        if data.serializable {
+            out.push_str(" shadowrootserializable=\"\"");
+        }
+        if data.manual_slot_assignment {
+            out.push_str(" shadowrootslotassignment=\"manual\"");
+        }
+        if data.clonable {
+            out.push_str(" shadowrootclonable=\"\"");
+        }
+        out.push('>');
+        for c in self.child_iter(root) {
+            self.serialize_node_inner(c, None, mode, out);
+        }
+        out.push_str("</template>");
+    }
+
     pub fn inner_html(&self, id: NodeId) -> String {
         self.cached_string(id, 1, || {
             let mut out = String::new();
@@ -11080,6 +11242,16 @@ impl Dom {
                 out.push('<');
                 out.push_str(tag);
                 if spec_markup {
+                    // HTML #serialising-html-fragments: an is value the
+                    // element was created with, when it has no is attribute,
+                    // precedes the attributes.
+                    if let Some(is) = self.is_value(id)
+                        && self.attr(id, "is").is_none()
+                    {
+                        out.push_str(" is=\"");
+                        out.push_str(&escape_fragment_string(is, true));
+                        out.push('"');
+                    }
                     // The element's own attributes only: the baked layout
                     // declarations and generated-content markers are for
                     // the re-parsed layout arena, never for script.
@@ -11088,10 +11260,11 @@ impl Dom {
                     self.write_attrs(id, attrs, &mut |_, _| None, out);
                     if !js_serialization {
                         self.write_input_presentation(id, out);
+                        self.write_control_presentation(id, out);
                     }
                 }
                 out.push('>');
-                if VOID_ELEMENTS.contains(&tag) {
+                if VOID_ELEMENTS.contains(&tag) || (spec_markup && is_serialized_void(tag)) {
                     return;
                 }
                 // A shadow root renders IN PLACE of the light children
@@ -11102,6 +11275,9 @@ impl Dom {
                         self.serialize_node_inner(c, Some(id), mode, out);
                     }
                 } else {
+                    if spec_markup {
+                        self.write_serialized_shadow_root(id, mode, out);
+                    }
                     for c in self.child_iter(id) {
                         self.serialize_node_inner(c, host, mode, out);
                     }
@@ -11286,6 +11462,7 @@ impl Dom {
         );
         // A live anchor that never had an href still needs the marker.
         self.write_input_presentation(id, out);
+        self.write_control_presentation(id, out);
         if is_click && is_anchor && self.attr(id, "href").is_none() {
             out.push_str(&format!(" href=\"x-trust-js:{id}:\""));
         }
@@ -12428,25 +12605,31 @@ impl<'a> StyleView<'a> {
             StatePseudo::Focus => self.matches_focus(id),
             StatePseudo::FocusWithin => self.matches_focus_within(id),
             StatePseudo::AnyLink => matches!(tag, "a" | "area") && self.attr(id, "href").is_some(),
+            // HTML #selector-checked: checkedness and option selectedness.
             StatePseudo::Checked => match tag {
                 "input" => {
                     matches!(self.input_type(id).as_str(), "checkbox" | "radio")
-                        && self.attr(id, "checked").is_some()
+                        && self.checkedness(id)
                 }
-                "option" => self.attr(id, "selected").is_some(),
+                "option" => self.option_selectedness(id),
                 _ => false,
             },
+            // HTML #selector-indeterminate: a checkbox whose indeterminate
+            // IDL attribute is true, a radio button whose group has no
+            // checked button, and a progress bar without a value.
             StatePseudo::Indeterminate => match tag {
+                "input" if self.input_type(id) == "checkbox" => self.indeterminate(id),
                 "input" => self.input_type(id) == "radio" && !self.radio_group_has_checked(id),
                 "progress" => self.attr(id, "value").is_none(),
                 _ => false,
             },
             StatePseudo::Disabled => self.actually_disabled(id, tag),
             StatePseudo::Enabled => {
-                matches!(
+                (matches!(
                     tag,
                     "button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
-                ) && !self.actually_disabled(id, tag)
+                ) || self.is_form_associated_custom_element(id))
+                    && !self.actually_disabled(id, tag)
             }
             StatePseudo::Required => {
                 self.required_applies(id, tag) && self.attr(id, "required").is_some()
@@ -12466,7 +12649,9 @@ impl<'a> StyleView<'a> {
                         && self.input_value(id).is_empty()
                         && self.input_editing_value(id).is_none()
                 }
-                "textarea" => self.attr(id, "placeholder").is_some() && self.is_element_empty(id),
+                "textarea" => {
+                    self.attr(id, "placeholder").is_some() && self.textarea_api_value(id).is_empty()
+                }
                 _ => false,
             },
             StatePseudo::Lang(ranges) => {
@@ -12484,6 +12669,8 @@ impl<'a> StyleView<'a> {
             }
             StatePseudo::Dir(want_rtl) => self.direction_rtl(id) == *want_rtl,
             StatePseudo::Modal => tag == "dialog" && self.is_modal(id),
+            StatePseudo::Defined => self.is_defined(id),
+            StatePseudo::Custom(name) => self.has_custom_state(id, name),
         }
     }
 
@@ -12528,7 +12715,7 @@ impl<'a> StyleView<'a> {
     fn radio_group_has_checked(&self, id: NodeId) -> bool {
         let name = self.attr(id, "name").unwrap_or("");
         if name.is_empty() {
-            return self.attr(id, "checked").is_some();
+            return self.checkedness(id);
         }
         let root = self.nearest_form(id);
         self.descendants(root).any(|c| {
@@ -12536,7 +12723,7 @@ impl<'a> StyleView<'a> {
                 && self.input_type(c) == "radio"
                 && self.attr(c, "name") == Some(name)
                 && self.nearest_form(c) == root
-                && self.attr(c, "checked").is_some()
+                && self.checkedness(c)
         })
     }
 
@@ -12556,24 +12743,26 @@ impl<'a> StyleView<'a> {
     /// HTML's "actually disabled": a disableable element with the `disabled`
     /// attribute, an `<option>` under a disabled `<optgroup>`, or a form
     /// control inside a disabled `<fieldset>` (outside its first `<legend>`).
+    /// HTML #concept-element-disabled: form controls (form-associated
+    /// custom elements included, #concept-fe-disabled) and fieldsets with a
+    /// disabled attribute or inside a disabled fieldset outside its first
+    /// legend, optgroups with the attribute, and options that have it or
+    /// whose parent optgroup does (#concept-option-disabled).
     fn actually_disabled(&self, id: NodeId, tag: &str) -> bool {
         match tag {
-            "button" | "input" | "select" | "textarea" => {
+            "button" | "input" | "select" | "textarea" | "fieldset" => {
                 self.attr(id, "disabled").is_some() || self.disabled_by_fieldset(id)
             }
-            "optgroup" | "fieldset" => self.attr(id, "disabled").is_some(),
+            "optgroup" => self.attr(id, "disabled").is_some(),
             "option" => {
-                if self.attr(id, "disabled").is_some() {
-                    return true;
-                }
-                let mut cur = self.nodes.parent(id);
-                while let Some(a) = cur {
-                    if self.tag_name(a) == Some("optgroup") {
-                        return self.attr(a, "disabled").is_some();
-                    }
-                    cur = self.nodes.parent(a);
-                }
-                false
+                self.attr(id, "disabled").is_some()
+                    || self.nodes.parent(id).is_some_and(|parent| {
+                        self.tag_name(parent) == Some("optgroup")
+                            && self.attr(parent, "disabled").is_some()
+                    })
+            }
+            _ if self.is_form_associated_custom_element(id) => {
+                self.attr(id, "disabled").is_some() || self.disabled_by_fieldset(id)
             }
             _ => false,
         }
@@ -12653,7 +12842,8 @@ impl<'a> StyleView<'a> {
             return self.attr(id, "readonly").is_none() && !self.actually_disabled(id, tag);
         }
         // Editing hosts / editable elements: the nearest contenteditable
-        // attribute decides (missing/"false" = not editable).
+        // attribute decides (missing/"false" = not editable), and otherwise
+        // a Document whose design mode is enabled makes them editable.
         let mut cur = Some(id);
         while let Some(n) = cur {
             if let Some(ce) = self.attr(n, "contenteditable") {
@@ -12661,7 +12851,7 @@ impl<'a> StyleView<'a> {
             }
             cur = self.style_parent(n);
         }
-        false
+        self.in_design_mode_document(id)
     }
 
     /// The element's language: the nearest ancestor-or-self `lang` (or
@@ -12757,7 +12947,7 @@ impl<'a> StyleView<'a> {
 /// contributes to any ancestor's contained-text auto directionality. Equal
 /// results prove a CharacterData edit cannot change a :dir() match, even
 /// when preceding text or excluded descendants determine the ancestor's value.
-fn text_node_directionality(text: &str) -> Option<bool> {
+pub(crate) fn text_node_directionality(text: &str) -> Option<bool> {
     use unicode_bidi::BidiClass;
     text.chars()
         .find_map(|c| match unicode_bidi::bidi_class(c) {
@@ -12930,6 +13120,23 @@ fn write_serialized_attrs(attrs: &[Attribute], out: &mut String) {
         out.push_str(&escape_fragment_string(&attribute.value, true));
         out.push('"');
     }
+}
+
+/// The shadow roots the HTML fragment serialization algorithm includes
+/// (`Dom::html_with_shadow_roots`), for the duration of one serialization.
+struct ShadowSerialization {
+    serializable: bool,
+    roots: FxHashSet<NodeId>,
+}
+
+thread_local! {
+    static SHADOW_SERIALIZATION: RefCell<Option<ShadowSerialization>> = const { RefCell::new(None) };
+}
+
+/// HTML #serializes-as-void.
+fn is_serialized_void(tag: &str) -> bool {
+    VOID_ELEMENTS.contains(&tag)
+        || matches!(tag, "basefont" | "bgsound" | "frame" | "keygen" | "param")
 }
 
 fn escape_attr(s: &str) -> Cow<'_, str> {
@@ -13378,6 +13585,12 @@ enum StatePseudo {
     Dir(bool),
     /// `:modal` — a `dialog` shown with `showModal()` (`Dom::is_modal`).
     Modal,
+    /// `:defined` — HTML #selector-defined: an element whose custom element
+    /// state is "uncustomized" or "custom".
+    Defined,
+    /// `:state(<ident>)` — HTML #selector-custom: a custom element whose
+    /// states set contains the identifier.
+    Custom(String),
 }
 
 /// Parse a state pseudo-class by name (+ its argument for the functional
@@ -13399,6 +13612,23 @@ fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
         "read-only" => StatePseudo::ReadOnly,
         "placeholder-shown" => StatePseudo::PlaceholderShown,
         "modal" if arg.is_none() => StatePseudo::Modal,
+        "defined" if arg.is_none() => StatePseudo::Defined,
+        "state" => {
+            // CSS Selectors 4 / HTML: `:state(<ident>)`; anything else in the
+            // argument fails the selector.
+            let raw = arg?.trim();
+            if raw.starts_with(|c: char| c.is_ascii_digit())
+                || raw.starts_with("-") && raw[1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                return None;
+            }
+            let mut chars = raw.chars().peekable();
+            let name = take_name(&mut chars)?;
+            if chars.next().is_some() || name.contains('*') {
+                return None;
+            }
+            StatePseudo::Custom(name)
+        }
         "lang" => {
             let ranges: Vec<String> = split_top_level(arg?, ',')
                 .into_iter()
@@ -14198,47 +14428,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
             }
             '[' => {
                 chars.next();
-                let inner: String = chars.by_ref().take_while(|&c| c != ']').collect();
-                let (name, op, value, ci) = match inner.split_once('=') {
-                    Some((n, v)) => {
-                        let (n, op) = match n.chars().last() {
-                            Some('~') => (&n[..n.len() - 1], AttrOp::Includes),
-                            Some('|') => (&n[..n.len() - 1], AttrOp::Dash),
-                            Some('^') => (&n[..n.len() - 1], AttrOp::Prefix),
-                            Some('$') => (&n[..n.len() - 1], AttrOp::Suffix),
-                            Some('*') => (&n[..n.len() - 1], AttrOp::Substring),
-                            _ => (n, AttrOp::Exact),
-                        };
-                        // A trailing standalone `i` makes the comparison ASCII
-                        // case-insensitive; `s` forces the (default) sensitive
-                        // match (Selectors 4 §6.3). A quoted value protects a
-                        // literal trailing i (`[t="a i"]` has no whitespace-
-                        // separated bare flag token).
-                        let mut v = v.trim();
-                        let mut ci = false;
-                        if let Some((head, flag)) = v.rsplit_once(char::is_whitespace)
-                            && !head.trim().is_empty()
-                        {
-                            if flag.eq_ignore_ascii_case("i") {
-                                ci = true;
-                                v = head.trim();
-                            } else if flag.eq_ignore_ascii_case("s") {
-                                v = head.trim();
-                            }
-                        }
-                        (n, op, Some(v.trim_matches(['"', '\'']).to_string()), ci)
-                    }
-                    None => (inner.as_str(), AttrOp::Exact, None, false),
-                };
-                if name.trim().is_empty() {
-                    return None;
-                }
-                compound.attrs.push(AttrSel {
-                    name: name.trim().to_ascii_lowercase(),
-                    op,
-                    value,
-                    ci,
-                });
+                compound.attrs.push(parse_attribute_selector(chars)?);
             }
             ':' => {
                 chars.next();
@@ -14355,6 +14545,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                             | "nth-last-of-type"
                             | "lang"
                             | "dir"
+                            | "state"
                     )
                 {
                     return None;
@@ -14712,6 +14903,158 @@ fn is_ident_code_point(c: char) -> bool {
             0xB7 | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0x37D | 0x37F..=0x1FFF
             | 0x200C | 0x200D | 0x203F | 0x2040 | 0x2070..=0x218F | 0x2C00..=0x2FEF
             | 0x3001..=0xD7FF | 0xF900..=0xFDCF | 0xFDF0..=0xFFFD | 0x10000..)
+}
+
+/// Selectors 4 #attribute-selectors over CSS Syntax 3 tokens, after the
+/// `[`: `[ <wq-name> ]` or `[ <wq-name> <attr-matcher> [ <string-token> |
+/// <ident-token> ] <attr-modifier>? ]`. Strings and identifiers decode their
+/// escapes (#consume-string-token, #consume-escaped-code-point); a `]`
+/// inside a string does not end the selector.
+fn parse_attribute_selector(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<AttrSel> {
+    fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>) {
+        while chars
+            .peek()
+            .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+        {
+            chars.next();
+        }
+    }
+    fn consume_string(
+        chars: &mut std::iter::Peekable<std::str::Chars>,
+        quote: char,
+    ) -> Option<String> {
+        let mut out = String::new();
+        while let Some(c) = chars.next() {
+            if c == quote {
+                return Some(out);
+            }
+            match c {
+                // A newline in a string is a bad-string token.
+                '\n' | '\r' | '\x0c' => return None,
+                '\\' => match chars.peek().copied() {
+                    None => {}
+                    // An escaped newline continues the string.
+                    Some('\n' | '\x0c') => {
+                        chars.next();
+                    }
+                    Some('\r') => {
+                        chars.next();
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                        }
+                    }
+                    Some(_) => out.push(consume_escape(chars)),
+                },
+                c => out.push(c),
+            }
+        }
+        // EOF ends the string (a parse error, not a failure).
+        Some(out)
+    }
+    fn consume_escape(chars: &mut std::iter::Peekable<std::str::Chars>) -> char {
+        let mut hex = String::new();
+        while hex.len() < 6 && chars.peek().is_some_and(char::is_ascii_hexdigit) {
+            hex.push(chars.next().unwrap());
+        }
+        if hex.is_empty() {
+            return chars.next().unwrap_or('\u{FFFD}');
+        }
+        if chars
+            .peek()
+            .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\x0c'))
+        {
+            chars.next();
+        } else if chars.peek() == Some(&'\r') {
+            chars.next();
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        }
+        let value = u32::from_str_radix(&hex, 16).unwrap_or(0);
+        char::from_u32(value)
+            .filter(|_| value != 0)
+            .unwrap_or('\u{FFFD}')
+    }
+    skip_whitespace(chars);
+    // <wq-name>: `*|name` (any namespace) and `|name` (no namespace) match
+    // the attribute's local name; no other prefix is declared.
+    if chars.peek() == Some(&'*') {
+        chars.next();
+        if chars.next()? != '|' {
+            return None;
+        }
+    } else if chars.peek() == Some(&'|') {
+        chars.next();
+    }
+    let name = take_name(chars)?;
+    if name.contains('*') {
+        return None;
+    }
+    skip_whitespace(chars);
+    let op = match chars.next()? {
+        ']' => {
+            return Some(AttrSel {
+                name: name.to_ascii_lowercase(),
+                op: AttrOp::Exact,
+                value: None,
+                ci: false,
+            });
+        }
+        '=' => AttrOp::Exact,
+        c @ ('~' | '|' | '^' | '$' | '*') => {
+            if chars.next()? != '=' {
+                return None;
+            }
+            match c {
+                '~' => AttrOp::Includes,
+                '|' => AttrOp::Dash,
+                '^' => AttrOp::Prefix,
+                '$' => AttrOp::Suffix,
+                _ => AttrOp::Substring,
+            }
+        }
+        _ => return None,
+    };
+    skip_whitespace(chars);
+    let value = match chars.peek().copied()? {
+        quote @ ('"' | '\'') => {
+            chars.next();
+            consume_string(chars, quote)?
+        }
+        first => {
+            // An <ident-token>: not a digit, nor a hyphen followed by a
+            // digit (numbers are not valid attribute values).
+            if first.is_ascii_digit() {
+                return None;
+            }
+            let ident = take_name(chars)?;
+            if ident.contains('*')
+                || (ident.starts_with('-') && ident[1..].starts_with(|c: char| c.is_ascii_digit()))
+            {
+                return None;
+            }
+            ident
+        }
+    };
+    skip_whitespace(chars);
+    let mut ci = false;
+    match chars.next()? {
+        ']' => {}
+        flag @ ('i' | 'I' | 's' | 'S') => {
+            ci = flag.eq_ignore_ascii_case(&'i');
+            skip_whitespace(chars);
+            if chars.next()? != ']' {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(AttrSel {
+        name: name.to_ascii_lowercase(),
+        op,
+        value: Some(value),
+        ci,
+    })
 }
 
 fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {

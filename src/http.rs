@@ -8728,7 +8728,8 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
     } else {
         dom.attr(id, "value").unwrap_or("").to_string()
     };
-    let checked = dom.attr(id, "checked").is_some();
+    let checked = tag == "input" && dom.checkedness(id);
+    let default_checked = dom.attr(id, "checked").is_some();
     let mut label = String::new();
     let kind = match tag {
         "input" => {
@@ -8797,14 +8798,16 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
             }
         }
         "textarea" => {
-            let value = dom.text_content(id);
+            // HTML #concept-textarea-api-value: the control's raw value.
+            let value = dom.textarea_api_value(id);
+            let default_value = dom.text_content(id);
             // HTML §4.10.11.3: the hint belongs to the textarea's placeholder
             // attribute. Keep it in the presentation field while the value is
             // empty so the graphical control paints the authored hint.
             label = dom.attr(id, "placeholder").unwrap_or("").to_string();
             return Some(Field {
                 name,
-                default_value: value.clone(),
+                default_value,
                 value,
                 checked: false,
                 default_checked: false,
@@ -8816,18 +8819,16 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
             });
         }
         "select" => {
+            // HTML #concept-select-option-list and #concept-option-selectedness.
             let mut options: Vec<(String, String)> = Vec::new();
             let mut selected = None;
-            for option in dom.children(id) {
-                if dom.tag_name(option) != Some("option") {
-                    continue;
-                }
+            for option in dom.select_options(id) {
                 let text = dom.text_content(option).trim().to_string();
                 let value = dom
                     .attr(option, "value")
                     .map(str::to_owned)
                     .unwrap_or_else(|| text.clone());
-                if dom.attr(option, "selected").is_some() {
+                if selected.is_none() && dom.option_selectedness(option) {
                     selected = Some(options.len());
                 }
                 options.push((text, value));
@@ -8874,7 +8875,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
         },
         value,
         checked,
-        default_checked: checked,
+        default_checked,
         label,
         kind,
         number,

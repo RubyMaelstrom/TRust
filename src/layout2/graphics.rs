@@ -2654,7 +2654,7 @@ fn paint_checkable_widget(
         side,
     );
     let scheme = dom.color_scheme(style_node);
-    let checked = dom.attr(style_node, "checked").is_some();
+    let checked = dom.checkedness(style_node);
     let disabled = dom.actually_disabled(style_node, "input");
     let accent = dom
         .computed_value_resolved(style_node, "accent-color")

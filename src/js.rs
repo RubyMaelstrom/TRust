@@ -504,12 +504,31 @@ pub struct SubtreePatch {
     pub tier: BoundaryTier,
 }
 
+/// A form submission planned by the page (HTML #form-submission-algorithm):
+/// the parsed action URL and method; for GET, `body` is the
+/// application/x-www-form-urlencoded query that replaces the action URL's
+/// query ("mutate action URL"); for POST it is the entity body, in the MIME
+/// type `content_type` selected by the submitter's enctype
+/// ("submit as entity body").
 #[derive(Debug, Clone)]
 pub struct FormSubmission {
     pub action: String,
     pub method: String,
-    pub body: String,
+    pub content_type: String,
+    pub body: Vec<u8>,
 }
+
+impl FormSubmission {
+    /// The GET query, which the page's urlencoded serializer keeps ASCII.
+    pub fn query(&self) -> Option<&str> {
+        std::str::from_utf8(&self.body)
+            .ok()
+            .filter(|query| !query.is_empty())
+    }
+}
+
+/// The MIME type of form-encoded POST bodies TRust sends itself.
+pub const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
 
 #[derive(Debug)]
 pub enum PageEvt {

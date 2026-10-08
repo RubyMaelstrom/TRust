@@ -4149,12 +4149,22 @@ mod desktop {
                     .map(String::from),
             );
         }
-        let rejections = page.engine.take_unhandled_rejections();
-        for rejection in rejections {
-            let message = value_string(&mut page.engine, &rejection);
-            page.outcome
-                .console
-                .push(format!("unhandled rejection: {message}"));
+        // HTML #notify-about-rejected-promises: the platform queues the
+        // unhandledrejection events and reports the uncanceled ones.
+        let rejections = page.engine.take_unhandled_rejections_full();
+        for (promise, reason) in rejections {
+            if engine_call_trust(
+                &mut page.engine,
+                "notifyRejectedPromise",
+                &[promise, reason.clone()],
+            )
+            .is_err()
+            {
+                let message = value_string(&mut page.engine, &reason);
+                page.outcome
+                    .console
+                    .push(format!("unhandled rejection: {message}"));
+            }
         }
         if std::env::var_os("TRUST_LUMEN_TRACE").is_some() {
             for error in &page.outcome.errors[error_start..] {
@@ -5897,10 +5907,27 @@ mod desktop {
         )?;
         let json = value_to_string(page, &value)?;
         let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+        let method = value.get("method")?.as_str()?.to_string();
+        let body = value.get("body")?.as_str()?;
+        // A POST body arrives as a byte string (one code unit per byte); a
+        // GET query is ASCII text.
+        let body = if method == "post" {
+            body.chars()
+                .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+                .collect()
+        } else {
+            body.as_bytes().to_vec()
+        };
         Some(FormSubmission {
             action: value.get("action")?.as_str()?.to_string(),
-            method: value.get("method")?.as_str()?.to_string(),
-            body: value.get("body")?.as_str()?.to_string(),
+            content_type: value
+                .get("enctype")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .unwrap_or(crate::js::FORM_URLENCODED)
+                .to_string(),
+            method,
+            body,
         })
     }
 
@@ -8043,7 +8070,11 @@ mod desktop {
                             let submission = submission.expect("live form entry list");
                             assert_eq!(submission.action, "https://example.com/login");
                             assert_eq!(submission.method, "post");
-                            assert_eq!(submission.body, "username=dummy&password=fixture&go=yes");
+                            assert_eq!(submission.body, b"username=dummy&password=fixture&go=yes");
+                            assert_eq!(
+                                submission.content_type,
+                                "application/x-www-form-urlencoded"
+                            );
                             break;
                         }
                         Some(PageEvt::Updated { outcome, .. }) => {
@@ -8113,7 +8144,7 @@ mod desktop {
 
             assert_eq!(submission.action, "https://example.com/verify");
             assert_eq!(submission.method, "get");
-            assert_eq!(submission.body, "solution=42&token=abc");
+            assert_eq!(submission.body, b"solution=42&token=abc");
         }
 
         #[test]
@@ -9523,7 +9554,6 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
         3,
         host_install_readonly_indexed,
     ),
-    ("__dom_nodelist_for_each", 4, host_nodelist_for_each),
     ("__dom_contains", 2, host_contains),
     ("__dom_set_hover", 1, guarded_set_hover),
     ("__dom_focus", 2, guarded_focus),
@@ -12449,6 +12479,38 @@ fn host_fetch_classic_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
     Ok(host_fetch_result_value(ctx, result))
 }
 
+/// HTML §8.1.4.6 #report-the-exception for a script's uncaught exception:
+/// the platform fires the cancelable `error` ErrorEvent at the Window. Returns
+/// whether the exception remains "not handled" (to be logged by the caller).
+fn host_report_exception(ctx: &mut Ctx, exception: Value, label: &str, muted: bool) -> bool {
+    match host_call_trust(
+        ctx,
+        "reportException",
+        &[
+            exception,
+            Value::from_string(label.to_string()),
+            Value::Bool(muted),
+        ],
+    ) {
+        Ok(Value::Bool(not_handled)) => not_handled,
+        _ => true,
+    }
+}
+
+/// HTML #muted-errors: a classic script fetched from another origin without
+/// CORS (no `crossorigin` attribute) reports its errors as "Script error.".
+fn classic_script_errors_muted(ctx: &mut Ctx, node_id: usize, url: &str) -> bool {
+    let cors = host_dom(ctx)
+        .borrow()
+        .attr(node_id, "crossorigin")
+        .is_some();
+    if cors {
+        return false;
+    }
+    let document = element_request_client_url(ctx, node_id);
+    url::Url::parse(url).is_ok_and(|script| script.origin() != document.origin())
+}
+
 fn host_push_injected_error(ctx: &mut Ctx, message: impl Into<String>) {
     let Ok(trust) = host_trust(ctx) else {
         return;
@@ -12929,18 +12991,27 @@ fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, name: &str, source: S
                 .coerce_string(&error)
                 .map(|message| message.to_string())
                 .unwrap_or_else(|_| String::from("classic script threw"));
-            host_push_injected_error(ctx, format!("{name}: {message}"));
+            if host_report_exception(ctx, error, name, false) {
+                host_push_injected_error(ctx, format!("{name}: {message}"));
+            }
         }
         Ok(Err(EvalError::Interrupted(reason))) => {
             host_push_injected_error(ctx, format!("{name}: {}", reason.message()));
         }
-        Err(error) => host_push_injected_error(
-            ctx,
-            format!(
-                "{name} parse error at line {}: {}",
-                error.line, error.message
-            ),
-        ),
+        Err(error) => {
+            // HTML #run-a-classic-script: a script's parse error is reported
+            // as a SyntaxError of its realm.
+            let syntax_error = ctx.make_error("SyntaxError", error.message.clone());
+            if host_report_exception(ctx, syntax_error, name, false) {
+                host_push_injected_error(
+                    ctx,
+                    format!(
+                        "{name} parse error at line {}: {}",
+                        error.line, error.message
+                    ),
+                );
+            }
+        }
     }
     if let (Some(trust), Some(old_current)) = (trust.as_ref(), old_current) {
         let _ = ctx.member_set(trust, "currentScript", old_current);
@@ -14621,7 +14692,11 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
                 .and_then(|value| ctx.coerce_string(value).ok())
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| String::from("module evaluation failed"));
-            host_push_injected_error(ctx, format!("module {failed_name}: {reason}"));
+            // HTML #run-a-module-script: report the evaluation's exception.
+            let exception = args.first().cloned().unwrap_or(Value::Undefined);
+            if host_report_exception(ctx, exception, &failed_name, false) {
+                host_push_injected_error(ctx, format!("module {failed_name}: {reason}"));
+            }
             host_fire_script_event(ctx, node_id, "error");
             Ok(Value::Undefined)
         }),
@@ -14666,19 +14741,33 @@ fn run_injected_classic_task(
     let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.eval_value_interruptible_with_origin(source, Some(&origin))
     }));
+    let muted = classic_script_errors_muted(engine.ctx(), node_id, url);
     match evaluated {
         Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(EvalError::Throw(error)))) => {
+            if host_report_exception(engine.ctx(), error.clone(), name, muted) {
+                let message = describe_throw(engine, error, name);
+                push_engine_error(engine, message);
+            }
+        }
         Ok(Ok(Err(error))) => {
             let message = describe_eval_error(engine, error, name);
             push_engine_error(engine, message);
         }
-        Ok(Err(error)) => push_engine_error(
-            engine,
-            format!(
-                "{name} parse error at line {}: {}",
-                error.line, error.message
-            ),
-        ),
+        Ok(Err(error)) => {
+            let syntax_error = engine
+                .ctx()
+                .make_error("SyntaxError", error.message.clone());
+            if host_report_exception(engine.ctx(), syntax_error, name, muted) {
+                push_engine_error(
+                    engine,
+                    format!(
+                        "{name} parse error at line {}: {}",
+                        error.line, error.message
+                    ),
+                );
+            }
+        }
         Err(_) => push_engine_error(engine, format!("{name}: Lumen engine panic")),
     }
     // HTML clean-up after running script performs a checkpoint once the script stack is empty.
@@ -15378,8 +15467,12 @@ fn host_parse_document(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     // DOMParser and createHTMLDocument keep DOM's UTF-8 default.
     let encoding = host_arg_encoding(ctx, args, 2);
     let dom = host_dom(ctx);
+    // A fourth argument true: Document.parseHTMLUnsafe()'s document, which
+    // allows declarative shadow roots.
+    let declarative = matches!(args.get(3), Some(Value::Bool(true)));
     let id = if content_type == "text/html" {
-        dom.borrow_mut().parse_document_into(&html)
+        dom.borrow_mut()
+            .parse_document_into_with(&html, declarative)
     } else {
         // The XML parser reads the DOMString's scalar values: a lone
         // surrogate becomes U+FFFD (HTML #dom-domparser-parsefromstring).
@@ -15848,30 +15941,6 @@ fn host_install_readonly_indexed(
     Ok(Value::Bool(true))
 }
 
-fn host_nodelist_for_each(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let values = args.first().cloned().unwrap_or(Value::Undefined);
-    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
-    if !callback.is_callable() {
-        return Err(ctx.make_error("TypeError", "NodeList callback is not callable"));
-    }
-    let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let owner = args.get(3).cloned().unwrap_or(Value::Undefined);
-    let length = ctx
-        .member_get(&values, "length")?
-        .as_num_opt()
-        .filter(|length| length.is_finite() && *length >= 0.0)
-        .map_or(0, |length| length.min(usize::MAX as f64) as usize);
-    for index in 0..length {
-        let value = ctx.member_get(&values, &index.to_string())?;
-        ctx.invoke(
-            callback.clone(),
-            this_arg.clone(),
-            &[value, Value::Num(index as f64), owner.clone()],
-        )?;
-    }
-    Ok(Value::Undefined)
-}
-
 fn host_contains(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let dom = dom.borrow();
@@ -16089,11 +16158,178 @@ fn host_input(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     let arg = args.get(2).cloned().unwrap_or(Value::Undefined);
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
-    let Some(id) = host_arg_node(&dom, args, 0)
-        .filter(|id| matches!(dom.tag_name(*id), Some("input" | "textarea")))
-    else {
+    // The options (with their nearest ancestor select, or -1) and checked
+    // radio buttons of a subtree, as flattened [kind, id, select] triples:
+    // kind 0 is an option, kind 1 a checked radio button.
+    if op == "subtree-controls" {
+        let Some(root) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Null);
+        };
+        let mut values = Vec::new();
+        for node in std::iter::once(root).chain(dom.descendants(root)) {
+            match dom.tag_name(node) {
+                Some("option") if dom.is_html_element(node) => {
+                    values.push(Value::Num(0.0));
+                    values.push(Value::Num(node as f64));
+                    values.push(Value::Num(
+                        dom.option_nearest_select(node).map_or(-1.0, |s| s as f64),
+                    ));
+                }
+                Some("input")
+                    if dom.is_html_element(node)
+                        && dom.input_type(node) == "radio"
+                        && dom.checkedness(node) =>
+                {
+                    values.push(Value::Num(1.0));
+                    values.push(Value::Num(node as f64));
+                    values.push(Value::Num(0.0));
+                }
+                _ => {}
+            }
+        }
+        drop(dom);
+        return Ok(ctx.make_array(values));
+    }
+    // HTML #designMode: a Document's design mode enabled flag.
+    if op == "design-mode" {
+        if let Some(document) = host_arg_node(&dom, args, 0) {
+            dom.set_design_mode(document, matches!(arg, Value::Bool(true)));
+        }
+        return Ok(Value::Undefined);
+    }
+    // HTML #text-node-directionality of a string: the bidirectional class of
+    // its first strong character (for the auto directionality of a control's
+    // value and of contained text).
+    if op == "text-direction" {
+        drop(dom);
+        let text = host_arg_string(ctx, args, 2);
+        return Ok(match crate::dom::text_node_directionality(&text) {
+            Some(true) => Value::from_engine_text(String::from("rtl")),
+            Some(false) => Value::from_engine_text(String::from("ltr")),
+            None => Value::Null,
+        });
+    }
+    // HTML #custom-element-state and #customstateset: what `:defined` and
+    // `:state()` match for an element.
+    if op == "custom-defined"
+        || op == "custom-states"
+        || op == "form-associated"
+        || op == "is-value"
+        || op == "is-value-get"
+    {
+        let Some(id) = host_arg_node(&dom, args, 0).filter(|id| dom.tag_name(*id).is_some()) else {
+            return Ok(Value::Null);
+        };
+        if op == "form-associated" {
+            dom.set_form_associated_custom_element(id, matches!(arg, Value::Bool(true)));
+            return Ok(Value::Undefined);
+        }
+        if op == "is-value-get" {
+            return Ok(dom.is_value_of(id).map_or(Value::Null, |value| {
+                Value::from_engine_text(value.to_owned())
+            }));
+        }
+        if op == "is-value" {
+            let value = match &arg {
+                Value::Null | Value::Undefined => None,
+                _ => Some(host_arg_string(ctx, args, 2)),
+            };
+            dom.set_is_value(id, value.as_deref());
+            return Ok(Value::Undefined);
+        }
+        if op == "custom-defined" {
+            let defined = match &arg {
+                Value::Bool(defined) => Some(*defined),
+                _ => None,
+            };
+            dom.set_custom_element_defined(id, defined);
+            return Ok(Value::Undefined);
+        }
+        drop(dom);
+        let length = ctx
+            .member_get(&arg, "length")
+            .ok()
+            .and_then(|v| v.as_num_opt())
+            .unwrap_or(0.0)
+            .max(0.0) as usize;
+        let mut states = Vec::with_capacity(length.min(1024));
+        for index in 0..length {
+            let value = ctx
+                .member_get(&arg, &index.to_string())
+                .unwrap_or(Value::Undefined);
+            states.push(
+                ctx.coerce_engine_text(&value)
+                    .map(|text| text.to_string())
+                    .unwrap_or_default(),
+            );
+        }
+        host_dom(ctx).borrow_mut().set_custom_states(id, states);
+        return Ok(Value::Undefined);
+    }
+    let Some(id) = host_arg_node(&dom, args, 0).filter(|id| {
+        matches!(
+            dom.tag_name(*id),
+            Some("input" | "textarea" | "option" | "select")
+        )
+    }) else {
         return Ok(Value::Null);
     };
+    let flag = |ctx: &mut Ctx, index: usize| -> Option<bool> {
+        match ctx.member_get(&arg, &index.to_string()).ok()? {
+            Value::Bool(value) => Some(value),
+            _ => None,
+        }
+    };
+    // HTML form control state (see `dom::input::ElementState`).
+    match (op.as_str(), dom.tag_name(id)) {
+        ("checked-get", Some("input")) => return Ok(Value::Bool(dom.checkedness(id))),
+        ("checked-dirty", Some("input")) => return Ok(Value::Bool(dom.checked_dirty(id))),
+        ("checked-set", Some("input")) => {
+            let checked = flag(ctx, 0).unwrap_or(false);
+            let dirty = flag(ctx, 1);
+            return Ok(Value::Bool(dom.set_checkedness(id, checked, dirty)));
+        }
+        ("checked-reset", Some("input")) => return Ok(Value::Bool(dom.reset_checkedness(id))),
+        ("indeterminate-get", Some("input")) => return Ok(Value::Bool(dom.indeterminate(id))),
+        ("indeterminate-set", Some("input")) => {
+            dom.set_indeterminate(id, matches!(arg, Value::Bool(true)));
+            return Ok(Value::Undefined);
+        }
+        ("selected-get", Some("option")) => return Ok(Value::Bool(dom.option_selectedness(id))),
+        ("selected-dirty", Some("option")) => return Ok(Value::Bool(dom.option_dirtiness(id))),
+        ("selected-set", Some("option")) => {
+            let selected = flag(ctx, 0);
+            let dirty = flag(ctx, 1);
+            return Ok(Value::Bool(
+                dom.set_option_selectedness(id, selected, dirty),
+            ));
+        }
+        ("nearest-select", Some("option")) => {
+            return Ok(dom
+                .option_nearest_select(id)
+                .map_or(Value::Null, |select| Value::Num(select as f64)));
+        }
+        ("options", Some("select")) => {
+            let options = dom.select_options(id);
+            drop(dom);
+            return Ok(host_ids_array(ctx, options));
+        }
+        ("raw-get", Some("textarea")) => {
+            return Ok(Value::from_engine_text(dom.textarea_api_value(id)));
+        }
+        ("raw-dirty", Some("textarea")) => return Ok(Value::Bool(dom.textarea_dirty(id))),
+        ("raw-set", Some("textarea")) => {
+            let value = match &arg {
+                Value::Null | Value::Undefined => None,
+                _ => Some(host_arg_string(ctx, args, 2)),
+            };
+            return Ok(Value::Bool(
+                dom.set_textarea_raw_value(id, value.as_deref()),
+            ));
+        }
+        (_, Some("option" | "select")) => return Ok(Value::Null),
+        _ => {}
+    }
     Ok(match op.as_str() {
         "selection-get" => match dom.control_selection(id) {
             Some(s) => ctx.make_array(vec![
@@ -16312,6 +16548,36 @@ fn fragment_serialization(
 }
 
 fn host_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    // getHTML(): `(node, serializableShadowRoots, shadowRootIds)`.
+    if let Some(serializable) = args
+        .get(1)
+        .filter(|value| !matches!(value, Value::Undefined))
+    {
+        let serializable = matches!(serializable, Value::Bool(true));
+        let roots_value = args.get(2).cloned().unwrap_or(Value::Undefined);
+        let length = ctx
+            .member_get(&roots_value, "length")
+            .ok()
+            .and_then(|v| v.as_num_opt())
+            .unwrap_or(0.0)
+            .max(0.0) as usize;
+        let mut roots = Vec::new();
+        for index in 0..length {
+            if let Some(id) = ctx
+                .member_get(&roots_value, &index.to_string())
+                .ok()
+                .and_then(|v| v.as_num_opt())
+            {
+                roots.push(id as usize);
+            }
+        }
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let markup = host_arg_node(&dom, args, 0)
+            .map(|id| dom.html_with_shadow_roots(id, serializable, roots))
+            .unwrap_or_default();
+        return Ok(Value::from_engine_text(markup));
+    }
     let dom = host_dom(ctx);
     let dom = dom.borrow();
     Ok(match host_arg_node(&dom, args, 0) {
@@ -16357,7 +16623,12 @@ fn host_set_inner_html(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
         };
         // HTML's innerHTML setter parses first, then DOM's replace-all
         // operation removes the old children and inserts the parsed fragment.
-        let Some(nodes) = dom.fragment_parse(id, context, &html, check_only) else {
+        // A fifth argument true: setHTMLUnsafe(), whose fragment parse allows
+        // declarative shadow roots (HTML #unsafely-set-html).
+        let declarative = matches!(args.get(4), Some(Value::Bool(true)));
+        let Some(nodes) =
+            dom.fragment_parse_with_shadow_roots(id, context, &html, check_only, declarative)
+        else {
             return Ok(Value::Bool(false));
         };
         if !check_only {
@@ -16617,7 +16888,7 @@ fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     let dom = state.dom.borrow();
     let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
     else {
-        return Ok(Value::Num(63.0));
+        return Ok(Value::Num(127.0));
     };
     let mut effects = 0u32;
     if state.live_ranges.may_have_ranges() {
@@ -16628,6 +16899,10 @@ fn host_insertion_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
     }
     if dom.may_affect_slot_assignment(parent) {
         effects |= 4;
+    }
+    // HTML option insertion steps and radio button group insertion.
+    if dom.subtree_has_form_state_controls(node) {
+        effects |= 64;
     }
     // HTML's post-connection steps for script, link and base elements among
     // the inserted node's shadow-including inclusive descendants, once that
@@ -16654,7 +16929,7 @@ fn host_removal_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     let dom = state.dom.borrow();
     let (Some(node), Some(parent)) = (host_arg_node(&dom, args, 0), host_arg_node(&dom, args, 1))
     else {
-        return Ok(Value::Num(7.0));
+        return Ok(Value::Num(15.0));
     };
     let mut effects = 0u32;
     if dom.shadow_including_subtree_has_frames(node) {
@@ -16665,6 +16940,10 @@ fn host_removal_effects(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
     }
     if dom.may_affect_slot_assignment(parent) {
         effects |= 4;
+    }
+    // HTML option removing steps (the old select's selectedness).
+    if dom.subtree_has_form_state_controls(node) {
+        effects |= 8;
     }
     Ok(Value::Num(effects as f64))
 }
@@ -20813,7 +21092,10 @@ mod tests {
                 &mut engine,
                 "const tag = o => Object.prototype.toString.call(o).slice(8, -1);\n\
                  const list = document.createElement('div').getClientRects();\n\
-                 const range = document.createRange().getClientRects();\n\
+                 const shown = document.createElement('div'); shown.style.height = '10px';\n\
+                 (document.documentElement || document.appendChild(document.createElement('html'))).append(shown);\n\
+                 const selected = document.createRange(); selected.selectNode(shown);\n\
+                 const range = selected.getClientRects();\n\
                  let cloned; try { structuredClone(list); cloned = 'cloned'; } catch (e) { cloned = e.name; }\n\
                  let constructed; try { new DOMRectList(); } catch (e) { constructed = e.name; }\n\
                  [tag(list), Array.isArray(list), list.length, list.item(0), tag(range), range.length,\n\
@@ -20822,6 +21104,862 @@ mod tests {
                   cloned, constructed].join('|')"
             ),
             "DOMRectList|false|0||DOMRectList|1|DOMRect|true||0|true|1|DataCloneError|TypeError"
+        );
+    }
+
+    /// A Window realm whose Document has `<html><head></head><body></body>`,
+    /// for tests that need connected elements.
+    fn platform_engine_with_body() -> lumen::Engine {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            "const html = document.createElement('html'); document.append(html);\n\
+             html.append(document.createElement('head'), document.createElement('body'));",
+            "test body",
+        )
+        .unwrap();
+        engine
+    }
+
+    #[test]
+    fn dom_collections_iterate_with_array_intrinsics() {
+        // Web IDL #define-the-iteration-methods: an indexed getter with an
+        // integer length gives %Array.prototype.values% as @@iterator; value
+        // iterables (NodeList, DOMTokenList) also take entries, keys and
+        // forEach from %Array.prototype%. DOM #interface-domtokenlist has an
+        // indexed getter.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const values = Array.prototype.values;
+                    const d = document.createElement('div'); d.className = 'a b a';
+                    const sheet = new CSSStyleSheet();
+                    sheet.replaceSync('@keyframes k { from { color: red } to { color: blue } } p { color: red }');
+                    return [
+                        NodeList.prototype[Symbol.iterator] === values,
+                        NodeList.prototype.entries === Array.prototype.entries,
+                        NodeList.prototype.keys === Array.prototype.keys,
+                        NodeList.prototype.forEach === Array.prototype.forEach,
+                        HTMLCollection.prototype[Symbol.iterator] === values,
+                        'entries' in HTMLCollection.prototype,
+                        DOMTokenList.prototype[Symbol.iterator] === values,
+                        DOMTokenList.prototype.forEach === Array.prototype.forEach,
+                        d.classList.length, d.classList[1], Object.keys(d.classList).join(), [...d.classList].join(),
+                        CSSRuleList.prototype[Symbol.iterator] === values,
+                        StyleSheetList.prototype[Symbol.iterator] === values,
+                        CSSKeyframesRule.prototype[Symbol.iterator] === values,
+                        sheet.cssRules[0].length, sheet.cssRules[0][1].keyText, [...sheet.cssRules[0]].length,
+                        SVGTransformList.prototype[Symbol.iterator] === values,
+                    ].join('|');
+                })()"#
+            ),
+            "true|true|true|true|true|false|true|true|2|b|0,1|a,b|true|true|true|2|100%|2|true"
+        );
+    }
+
+    #[test]
+    fn live_ranges_follow_dom_boundary_point_algorithms() {
+        // DOM #interface-range: boundary comparison, cloning, extraction and
+        // insertion, the removing steps' live updates, surroundContents()'s
+        // partially-contained check, and StaticRange's validation.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const p = document.createElement('p'); p.innerHTML = 'one<b>two</b>three'; document.body.append(p);
+                    const r = document.createRange(); r.setStart(p.firstChild, 1); r.setEnd(p.lastChild, 2);
+                    const out = [r.toString(), r.commonAncestorContainer === p, r.collapsed];
+                    const clone = r.cloneContents(); out.push(clone.childNodes.length, clone.textContent);
+                    const r2 = document.createRange(); r2.selectNodeContents(p);
+                    out.push(r.compareBoundaryPoints(Range.START_TO_START, r2), r.compareBoundaryPoints(Range.END_TO_END, r2));
+                    out.push(r.comparePoint(p, 0), r.isPointInRange(p.childNodes[1], 0), r.intersectsNode(p.childNodes[1]));
+                    const extracted = r.extractContents();
+                    out.push(extracted.textContent, p.innerHTML, r.collapsed, r.startContainer === p, r.startOffset);
+                    r.insertNode(document.createTextNode('X')); out.push(p.innerHTML, r.toString());
+                    try { r.setStart(document.implementation.createDocumentType('html', '', ''), 0); } catch (e) { out.push(e.name); }
+                    const r3 = document.createRange(); r3.selectNodeContents(p.firstChild); p.firstChild.remove();
+                    out.push(r3.startContainer === p, r3.startOffset, r3.collapsed);
+                    const d = document.createElement('div'); d.innerHTML = 'ab<i>cd</i>ef'; document.body.append(d);
+                    const r4 = document.createRange(); r4.setStart(d.childNodes[1].firstChild, 1); r4.setEnd(d.lastChild, 1);
+                    try { r4.surroundContents(document.createElement('span')); } catch (e) { out.push(e.name); }
+                    const r5 = document.createRange(); r5.setStart(d.firstChild, 1); r5.setEnd(d.lastChild, 1);
+                    r5.surroundContents(document.createElement('span')); out.push(d.innerHTML);
+                    const s = new StaticRange({startContainer: d, startOffset: 0, endContainer: d, endOffset: 1});
+                    out.push(s.collapsed, s.endOffset, s instanceof AbstractRange, Object.prototype.toString.call(s));
+                    try { new StaticRange({startContainer: document.implementation.createDocumentType('x', '', ''), startOffset: 0, endContainer: d, endOffset: 0}); }
+                    catch (e) { out.push(e.name); }
+                    return out.join('|');
+                })()"#
+            ),
+            "netwoth|true|false|3|netwoth|1|-1|-1|true|true|netwoth|oree|true|true|1|oXree|X|\
+             InvalidNodeTypeError|true|0|true|InvalidStateError|a<span>b<i>cd</i>e</span>f|false|1|true|\
+             [object StaticRange]|InvalidNodeTypeError"
+        );
+    }
+
+    #[test]
+    fn selection_api_tracks_its_range_and_direction() {
+        // Selection API #selection-interface: collapse/extend/setBaseAndExtent
+        // set the direction, toString() is the range's text, and
+        // getComposedRanges() returns StaticRanges.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const d = document.createElement('div'); d.innerHTML = '<span>hello</span> <em>world</em>'; document.body.append(d);
+                    const sel = getSelection(); sel.removeAllRanges();
+                    const out = [sel.rangeCount, sel.type, sel.anchorNode];
+                    sel.collapse(d.firstChild.firstChild, 1); out.push(sel.type, sel.anchorOffset, sel.isCollapsed, sel.direction);
+                    sel.extend(d.lastChild.firstChild, 3); out.push(sel.type, sel.toString(), sel.direction, sel.focusOffset);
+                    sel.extend(d.firstChild.firstChild, 0); out.push(sel.direction, sel.toString());
+                    sel.setBaseAndExtent(d.lastChild.firstChild, 2, d.firstChild.firstChild, 2);
+                    out.push(sel.direction, sel.toString(), sel.containsNode(d.childNodes[1]), sel.containsNode(d.firstChild, true));
+                    const composed = sel.getComposedRanges();
+                    out.push(composed.length, composed[0] instanceof StaticRange, composed[0].startOffset);
+                    sel.selectAllChildren(d); out.push(sel.toString(), sel.anchorNode === d, sel.focusOffset);
+                    sel.deleteFromDocument(); out.push(d.childNodes.length, document.getSelection() === sel);
+                    return out.join('|');
+                })()"#
+            ),
+            "0|None||Caret|1|true|none|Range|ello wor|forward|3|backward|h|backward|llo wo|true|true|1|true|2|hello world|true|3|0|true"
+        );
+    }
+
+    #[test]
+    fn event_listeners_honor_options_and_dispatch_flags() {
+        // DOM #dom-eventtarget-addeventlistener options (passive, signal,
+        // once), #concept-event-dispatch's phases and dispatch flag, and Web
+        // IDL dictionary conversion order (inherited members first).
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const out = [];
+                    const d = document.createElement('div'); document.body.append(d);
+                    d.addEventListener('x', (e) => { e.preventDefault(); out.push('passive:' + e.defaultPrevented); }, {passive: true});
+                    const ev = new Event('x', {cancelable: true}); d.dispatchEvent(ev); out.push(ev.defaultPrevented);
+                    const ac = new AbortController(); let count = 0;
+                    d.addEventListener('y', () => count++, {signal: ac.signal});
+                    d.dispatchEvent(new Event('y')); ac.abort(); d.dispatchEvent(new Event('y')); out.push(count);
+                    let once = 0; d.addEventListener('z', () => once++, {once: true});
+                    d.dispatchEvent(new Event('z')); d.dispatchEvent(new Event('z')); out.push(once);
+                    const order = [];
+                    document.body.addEventListener('w', () => order.push('bubble'));
+                    document.body.addEventListener('w', () => order.push('capture'), true);
+                    d.addEventListener('w', (e) => { order.push('target'); e.stopImmediatePropagation(); });
+                    d.addEventListener('w', () => order.push('never'));
+                    d.dispatchEvent(new Event('w', {bubbles: true})); out.push(order.join('>'));
+                    const inner = new Event('q'); let err;
+                    d.addEventListener('q', () => { try { d.dispatchEvent(inner); } catch (e) { err = e.name; } });
+                    d.dispatchEvent(inner); out.push(err);
+                    const reads = [];
+                    new MouseEvent('m', {get bubbles() { reads.push('bubbles'); return true; },
+                        get button() { reads.push('button'); return 1; }, get altKey() { reads.push('altKey'); return false; }});
+                    out.push(reads.join());
+                    const e2 = new Event('r', {cancelable: true}); e2.returnValue = false; out.push(e2.defaultPrevented, e2.returnValue);
+                    out.push([CommandEvent, FormDataEvent, TextEvent, TouchList, BeforeUnloadEvent].every((C) => typeof C === 'function'));
+                    return out.join('|');
+                })()"#
+            ),
+            "passive:false|false|1|1|capture>target|InvalidStateError|bubbles,altKey,button|true|false|true"
+        );
+    }
+
+    #[test]
+    fn event_handler_attributes_compile_with_html_scopes() {
+        // HTML #getting-the-current-value-of-the-event-handler: content
+        // attributes compile with the element, form and document scopes,
+        // `return false` cancels, window.event is the current event, and
+        // reportError() runs the error event handler with five arguments.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const out = [];
+                    const d = document.createElement('div'); document.body.append(d); globalThis.target = d;
+                    d.setAttribute('onclick', 'globalThis.probe = [this === target, typeof event, event.type, window.event === event]; return false;');
+                    const ev = new MouseEvent('click', {cancelable: true}); d.dispatchEvent(ev);
+                    out.push(globalThis.probe.join(','), ev.defaultPrevented, typeof d.onclick, d.onclick.length);
+                    d.onclick = null; out.push(d.getAttribute('onclick') !== null, d.onclick);
+                    const f = document.createElement('form');
+                    f.innerHTML = '<input name=q value=v><button onclick="globalThis.scope = typeof q + \':\' + typeof elements">b</button>';
+                    document.body.append(f);
+                    f.querySelector('button').dispatchEvent(new MouseEvent('click')); out.push(globalThis.scope);
+                    let args; window.onerror = function (...a) { args = a.length + ':' + a[0]; return true; };
+                    reportError(new Error('boom')); out.push(args); window.onerror = null;
+                    let seen; window.addEventListener('error', (e) => { seen = e.constructor.name + ':' + e.error.message; }, {once: true});
+                    reportError(new TypeError('t1')); out.push(seen, window.event === undefined);
+                    return out.join('|');
+                })()"#
+            ),
+            "true,object,click,true|true|function|1|true||object:object|5:Uncaught Error: boom|ErrorEvent:t1|true"
+        );
+    }
+
+    #[test]
+    fn abort_signals_follow_dependent_signal_rules() {
+        // DOM #interface-AbortSignal: any() links dependents to the source
+        // signals, abort reasons propagate, and AbortSignal is not
+        // constructible.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const out = [];
+                    const a = new AbortController(), b = new AbortController();
+                    const any = AbortSignal.any([a.signal, b.signal]), nested = AbortSignal.any([any]);
+                    const fired = [];
+                    any.onabort = () => fired.push('any'); nested.addEventListener('abort', () => fired.push('nested'));
+                    b.abort('why'); out.push(any.aborted, any.reason, nested.reason, fired.join());
+                    out.push(AbortSignal.abort().reason.name, AbortSignal.abort(5).reason);
+                    try { AbortSignal.abort('r').throwIfAborted(); } catch (e) { out.push(e); }
+                    out.push(AbortSignal.timeout(10) instanceof AbortSignal);
+                    try { new AbortSignal(); } catch (e) { out.push(e.name); }
+                    out.push(Object.prototype.toString.call(any));
+                    return out.join('|');
+                })()"#
+            ),
+            "true|why|why|any,nested|AbortError|5|r|true|TypeError|[object AbortSignal]"
+        );
+    }
+
+    #[test]
+    fn reflected_attributes_follow_html_reflection_rules() {
+        // HTML #reflecting-content-attributes-in-idl-attributes: unsigned and
+        // limited numbers, URLs, enumerated keywords, DOMTokenLists with
+        // supported tokens, and Element? reflection; HTML #element-interfaces.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const img = document.createElement('img'); img.setAttribute('width', '-5');
+                    const input = document.createElement('input');
+                    let e1; try { input.maxLength = -1; } catch (e) { e1 = e.name; }
+                    const a = document.createElement('a'); a.setAttribute('href', 'https://example.com/x?y#z');
+                    const form = document.createElement('form'); form.setAttribute('method', 'POST');
+                    const td = document.createElement('td'); td.colSpan = 5000;
+                    const link = document.createElement('link'); link.rel = 'stylesheet preload';
+                    const b = document.createElement('button'), pop = document.createElement('div'); document.body.append(pop, b);
+                    b.popoverTargetElement = pop;
+                    const iframe = document.createElement('iframe'); iframe.sandbox = 'allow-scripts';
+                    const area = document.createElement('textarea'); area.rows = 0;
+                    const names = ['applet', 'my-el', 'dir', 'font', 'frameset', 'blink', 'selectedcontent', 'xmp']
+                        .map((n) => Object.prototype.toString.call(document.createElement(n)).slice(8, -1)).join(',');
+                    return [img.width, input.maxLength, e1, document.createElement('ol').start, a.href, form.method, td.colSpan,
+                        link.relList.length, link.relList.supports('stylesheet'), b.getAttribute('popovertarget'),
+                        b.popoverTargetElement === pop, iframe.sandbox.length, iframe.sandbox.supports('allow-same-origin'),
+                        (input.type = 'EMAIL', input.type), area.rows, area.getAttribute('rows'), names].join('|');
+                })()"#
+            ),
+            "0|-1|IndexSizeError|1|https://example.com/x?y#z|post|1000|2|true||true|1|true|email|2|2|\
+             HTMLUnknownElement,HTMLElement,HTMLDirectoryElement,HTMLFontElement,HTMLFrameSetElement,\
+             HTMLUnknownElement,HTMLSelectedContentElement,HTMLPreElement"
+        );
+    }
+
+    #[test]
+    fn window_obsolete_and_bar_members_exist() {
+        // HTML #barprop, #external and the Window's obsolete members.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"[typeof window.moveTo, window.locationbar.visible, Object.prototype.toString.call(window.menubar),
+                    typeof External, Object.prototype.toString.call(window.external), JSON.stringify(window.status),
+                    window.opener, window.originAgentCluster, typeof window.captureEvents].join('|')"#
+            ),
+            "function|true|[object BarProp]|function|[object External]|\"\"||false|function"
+        );
+    }
+
+    #[test]
+    fn select_elements_keep_option_state_and_options_collection() {
+        // HTML #the-select-element and #htmloptionscollection: the indexed
+        // getter, length setter, add/remove, selectedness setting algorithm
+        // (including when options are removed) and the reset algorithm.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const s = document.createElement('select');
+                    s.innerHTML = '<option>a</option><option value=bv>b</option><optgroup><option>c</option></optgroup>';
+                    document.body.append(s);
+                    const out = [s.length, s[1].value, s.item(2).text, s.options.length, s.options === s.options,
+                        Object.prototype.toString.call(s.options), s.selectedIndex, s.value, s.type];
+                    s.selectedIndex = 2; out.push(s.value, s.options[2].selected, s.options[0].selected);
+                    s.value = 'bv'; out.push(s.selectedIndex);
+                    s.options.add(new Option('d', 'dv'), 0); out.push(s.length, s[0].value, s.selectedIndex);
+                    s.options.remove(0); out.push(s.length);
+                    s.length = 5; out.push(s.length, s[4].value);
+                    s.length = 2; out.push(s.length);
+                    s[3] = new Option('z'); out.push(s.length, s[2].value, s[3].text);
+                    s.multiple = true; s.options[0].selected = true; s.options[1].selected = true;
+                    out.push(s.selectedOptions.length, s.type);
+                    const o = s.options[0]; o.defaultSelected = true; o.selected = false;
+                    const f = document.createElement('form'); f.append(s); document.body.append(f); f.reset();
+                    out.push(o.selected, s.options[1].selected, document.querySelectorAll('option:checked').length);
+                    const t = document.createElement('select');
+                    t.innerHTML = '<option disabled>a<option>b<option selected>c<option selected>d';
+                    out.push(t.selectedIndex, t.value);
+                    t.options[3].remove(); out.push(t.selectedIndex);
+                    t.innerHTML = ''; out.push(t.selectedIndex, t.value === '');
+                    return out.join('|');
+                })()"#
+            ),
+            "3|bv|c|3|true|[object HTMLOptionsCollection]|0|a|select-one|c|true|false|1|4|dv|2|3|5||2|4||z|\
+             2|select-multiple|true|false|1|3|d|1|-1|true"
+        );
+    }
+
+    #[test]
+    fn textarea_raw_value_is_separate_from_its_children() {
+        // HTML #the-textarea-element: the raw value and dirty value flag;
+        // the API value normalizes newlines; reset restores the child text
+        // content; rows/cols/maxLength reflect their limits.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const a = document.createElement('textarea'); a.textContent = 'x';
+                    const out = [a.value, a.defaultValue, a.textLength];
+                    a.value = 'y\r\nz'; out.push(JSON.stringify(a.value), a.textContent, a.defaultValue, a.textLength);
+                    a.textContent = 'w'; out.push(JSON.stringify(a.value));
+                    a.defaultValue = 'q'; out.push(a.textContent);
+                    const f = document.createElement('form'); f.append(a); f.reset(); out.push(a.value);
+                    a.cols = 7; out.push(a.cols, a.getAttribute('cols'), a.wrap, a.readOnly, a.required, a.maxLength, a.minLength, a.type);
+                    try { a.maxLength = -2; } catch (e) { out.push(e.name); }
+                    return out.join('|');
+                })()"#
+            ),
+            "x|x|1|\"y\\nz\"|x|x|3|\"y\\nz\"|q|q|7|7||false|false|-1|-1|textarea|IndexSizeError"
+        );
+    }
+
+    #[test]
+    fn checkable_inputs_keep_checkedness_apart_from_the_attribute() {
+        // HTML #concept-fe-checked: checkedness and its dirty flag, radio
+        // button groups, the indeterminate flag (:indeterminate), reset and
+        // cloning.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const f = document.createElement('form'); document.body.append(f);
+                    f.innerHTML = '<input type=checkbox name=c checked><input type=radio name=r value=1 checked><input type=radio name=r value=2>';
+                    const [c, r1, r2] = f.querySelectorAll('input');
+                    const out = [c.checked, c.defaultChecked];
+                    c.checked = false; out.push(c.checked, c.hasAttribute('checked'));
+                    c.removeAttribute('checked'); c.setAttribute('checked', ''); out.push(c.checked);
+                    r2.checked = true; out.push(r1.checked, r2.checked, f.querySelectorAll(':checked').length);
+                    c.indeterminate = true; out.push(c.indeterminate, c.matches(':indeterminate'));
+                    f.reset(); out.push(c.checked, c.indeterminate, r1.checked, r2.checked, c.cloneNode().checked);
+                    r2.click(); out.push(r2.checked, r1.checked);
+                    c.checked = false; c.click(); out.push(c.checked);
+                    return out.join('|');
+                })()"#
+            ),
+            "true|true|false|true|false|false|true|1|true|true|true|true|true|false|true|true|false|true"
+        );
+    }
+
+    #[test]
+    fn constraint_validation_reports_validity_states() {
+        // HTML #constraints: validity states, barring (disabled, readonly,
+        // datalist ancestors), custom validity, invalid events from form
+        // static validation, and requestSubmit()'s interactive validation.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const f = document.createElement('form'); document.body.append(f);
+                    f.innerHTML = '<input name=a required><input name=b type=email value="x"><input name=c pattern="[0-9]+" value="12a">' +
+                        '<input name=d type=number min=5 value=3><input name=e disabled required>' +
+                        '<select required name=s><option value="">pick</option><option>x</option></select><textarea required></textarea>';
+                    const [a, b, c, d, e] = f.querySelectorAll('input'); const s = f.querySelector('select'), ta = f.querySelector('textarea');
+                    const out = [a.validity.valueMissing, a.willValidate, a.validationMessage !== '', b.validity.typeMismatch,
+                        c.validity.patternMismatch, d.validity.rangeUnderflow, e.willValidate, e.validity.valid,
+                        s.validity.valueMissing, ta.validity.valueMissing];
+                    let invalid = [];
+                    f.addEventListener('invalid', (ev) => invalid.push(ev.target.name || ev.target.localName), true);
+                    out.push(f.checkValidity(), invalid.join());
+                    invalid = []; a.setCustomValidity('custom');
+                    out.push(a.validity.customError, a.validationMessage, a.checkValidity(), invalid.join());
+                    a.setCustomValidity(''); a.value = 'v'; b.value = 'a@b.c'; c.value = '1'; d.value = '6'; s.selectedIndex = 1; ta.value = 't';
+                    out.push(f.checkValidity(), Object.prototype.toString.call(a.validity), a.validity === a.validity);
+                    let submitted = 0; f.addEventListener('submit', (ev) => { submitted++; ev.preventDefault(); });
+                    a.value = ''; f.requestSubmit(); out.push(submitted);
+                    f.noValidate = true; f.requestSubmit(); out.push(submitted);
+                    const dl = document.createElement('datalist'), inp = document.createElement('input'); dl.append(inp); f.append(dl);
+                    const ro = document.createElement('input'); ro.readOnly = true;
+                    out.push(inp.willValidate, ro.willValidate, document.createElement('input').willValidate, typeof ValidityState);
+                    return out.join('|');
+                })()"#
+            ),
+            "true|true|true|true|true|true|false|true|true|true|false|a,b,c,d,s,textarea|true|custom|false|a|\
+             true|[object ValidityState]|true|0|1|false|false|true|function"
+        );
+    }
+
+    #[test]
+    fn form_entry_lists_follow_html_construction_steps() {
+        // HTML #constructing-the-form-data-set via XHR's new FormData(form,
+        // submitter): owner forms by attribute, disabled fieldsets (first
+        // legend excepted), datalists, submitters, image coordinates,
+        // dirname, _charset_, empty files, and the formdata event (with its
+        // InvalidStateError for reentrant construction).
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const f = document.createElement('form'); f.id = 'ff'; document.body.append(f);
+                    f.innerHTML = '<input name=t value="v1"><input type=checkbox name=c><input type=checkbox name=c2 checked>' +
+                        '<input type=radio name=r value=r1 checked>' +
+                        '<select name=s multiple><option selected>s1<option selected disabled>s2<option selected value=s3v>s3</select>' +
+                        '<fieldset disabled><input name=dis value=no><legend><input name=leg value=yes></legend></fieldset>' +
+                        '<input type=submit name=sub value=go><input type=image name=img><button name=btn value=bv>b</button>' +
+                        '<datalist><input name=dl value=no></datalist>' +
+                        '<input name=dir dirname=t.dir value="abc"><input type=hidden name=_charset_><input type=file name=up>';
+                    const outside = document.createElement('input'); outside.name = 'out'; outside.value = 'o';
+                    outside.setAttribute('form', 'ff'); document.body.append(outside);
+                    let events = 0; f.addEventListener('formdata', (e) => { events++; e.formData.append('extra', 'x'); });
+                    const entries = (fd) => Array.from(fd, ([k, v]) => k + '=' + (typeof v === 'string' ? v : 'File(' + v.name + ',' + v.type + ')')).join('&');
+                    const out = [entries(new FormData(f)), events, entries(new FormData(f, f.querySelector('button'))),
+                        entries(new FormData(f, f.querySelector('[type=image]')))];
+                    try { new FormData(f, f.querySelector('[name=t]')); } catch (e) { out.push(e.name); }
+                    let reentrant;
+                    f.addEventListener('formdata', () => { try { new FormData(f); } catch (e) { reentrant = e.name; } }, {once: true});
+                    new FormData(f); out.push(reentrant);
+                    return out.join(' ; ');
+                })()"#
+            ),
+            "t=v1&c2=on&r=r1&s=s1&s=s3v&leg=yes&dir=abc&t.dir=ltr&_charset_=UTF-8&up=File(,application/octet-stream)&out=o&extra=x ; 1 ; \
+             t=v1&c2=on&r=r1&s=s1&s=s3v&leg=yes&btn=bv&dir=abc&t.dir=ltr&_charset_=UTF-8&up=File(,application/octet-stream)&out=o&extra=x ; \
+             t=v1&c2=on&r=r1&s=s1&s=s3v&leg=yes&img.x=0&img.y=0&dir=abc&t.dir=ltr&_charset_=UTF-8&up=File(,application/octet-stream)&out=o&extra=x ; \
+             TypeError ; InvalidStateError"
+        );
+    }
+
+    #[test]
+    fn form_submission_validates_and_fires_submit_and_dialog_results() {
+        // HTML #concept-form-submit: requestSubmit() validates and fires a
+        // SubmitEvent with the submitter (null for the form itself); method
+        // dialog closes the ancestor dialog with the submitter's value.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const f = document.createElement('form'); f.action = 'http://127.0.0.1:9/x'; document.body.append(f);
+                    f.innerHTML = '<input name=a value=1><button>go</button>';
+                    const out = [];
+                    f.addEventListener('submit', (e) => { out.push('submit:' + (e.submitter && e.submitter.localName)); e.preventDefault(); });
+                    f.addEventListener('formdata', () => out.push('formdata'));
+                    f.requestSubmit(); f.requestSubmit(f.querySelector('button'));
+                    try { f.requestSubmit(f.querySelector('input')); } catch (e) { out.push(e.name); }
+                    const dialog = document.createElement('dialog'), df = document.createElement('form'); df.method = 'dialog';
+                    df.innerHTML = '<button value=ok>x</button>'; dialog.append(df); document.body.append(dialog); dialog.show();
+                    df.querySelector('button').click(); out.push(dialog.open, dialog.returnValue);
+                    return out.join(',');
+                })()"#
+            ),
+            "submit:null,submit:button,TypeError,false,ok"
+        );
+    }
+
+    #[test]
+    fn form_related_elements_expose_their_html_members() {
+        // HTML #dom-form-elements, #dom-fieldset-elements, the output
+        // element's value mode, labels/control/form, datalist options, map
+        // areas, progress position and showPicker()'s activation check.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const f = document.createElement('form'); document.body.append(f);
+                    f.innerHTML = '<fieldset name=fs><legend>l</legend><input name=x><output name=o for="x">5</output><object name=ob></object>' +
+                        '<input type=image name=im></fieldset><label for=x2>L</label><input id=x2 name=x2>';
+                    const fs = f.querySelector('fieldset'), o = f.querySelector('output'), x2 = document.getElementById('x2');
+                    const out = [f.elements.length, Array.from(f.elements, (e) => e.localName).join(), fs.elements.length, fs.type,
+                        f.elements.namedItem('o') === o, o.htmlFor.value, o.type, o.value, o.labels.length,
+                        x2.labels[0].localName, x2.labels === x2.labels, f.querySelector('label').control === x2,
+                        f.querySelector('label').form === f, f.querySelector('legend').form === f];
+                    o.value = 'b'; o.defaultValue = 'c'; out.push(o.textContent, o.defaultValue); f.reset(); out.push(o.value);
+                    const dl = document.createElement('datalist'); dl.innerHTML = '<option>a<option>b<p><option>c</p>';
+                    const map = document.createElement('map'); map.innerHTML = '<area><div><area></div>';
+                    const p = document.createElement('progress'), before = p.position; p.value = 0.5;
+                    out.push(dl.options.length, map.areas.length, before, p.position);
+                    try { x2.showPicker(); } catch (e) { out.push(e.name); }
+                    const hidden = document.createElement('input'); hidden.type = 'hidden'; out.push(hidden.labels);
+                    return out.join('|');
+                })()"#
+            ),
+            "5|fieldset,input,output,object,input|4|fieldset|true|x|output|5|0|label|true|true|true|true|b|c|c|3|2|-1|0.5|NotAllowedError|"
+        );
+    }
+
+    #[test]
+    fn custom_element_definitions_follow_the_html_registry_algorithms() {
+        // HTML #dom-customelementregistry-define: IsConstructor, name and
+        // reentrancy checks, callbacks and observedAttributes read once (their
+        // exceptions propagate), customized built-ins, the HTML element
+        // constructor's NewTarget checks, attributeChangedCallback for every
+        // set, upgrades only when connected (or through upgrade()), and the
+        // is value in serialization.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const out = [], log = [];
+                    class XEl extends HTMLElement {
+                        static observedAttributes = ['x'];
+                        attributeChangedCallback(n, o, v) { log.push(n + ':' + o + ':' + v); }
+                        connectedCallback() { log.push('connected'); }
+                    }
+                    customElements.define('x-el', XEl);
+                    const made = new XEl();
+                    out.push(made.localName, made.isConnected, made.matches(':defined'), customElements.getName(XEl));
+                    for (const attempt of [() => { class U extends HTMLElement {} new U(); }, () => new HTMLElement(),
+                        () => { class D extends HTMLDivElement {} customElements.define('d-el', D); new D(); },
+                        () => customElements.define('a-el', () => {}), () => customElements.define('Ab-c', class extends HTMLElement {}),
+                        () => customElements.define('x-el', class extends HTMLElement {}),
+                        () => { class O extends HTMLElement { attributeChangedCallback() {} static get observedAttributes() { throw new RangeError('obs'); } } customElements.define('o-el', O); },
+                        () => customElements.define('q-el', class extends HTMLElement {}, {extends: 'q-x'})]) {
+                        try { attempt(); out.push('ok'); } catch (e) { out.push(e.name); }
+                    }
+                    out.push(customElements.get('o-el'), !!customElements.get('d-el'));
+                    customElements.define('x-é:y', class extends HTMLElement {}); out.push(!!customElements.get('x-é:y'));
+                    const el = document.createElement('x-el'); el.setAttribute('x', '1'); el.setAttribute('x', '1'); el.setAttribute('y', '2');
+                    document.body.append(el); out.push(log.splice(0).join(','));
+                    const div = document.createElement('div'); div.innerHTML = '<x-el></x-el>';
+                    out.push(div.firstChild instanceof XEl, div.firstChild.matches(':defined'), document.querySelectorAll(':not(:defined)').length);
+                    customElements.upgrade(div); out.push(div.firstChild instanceof XEl);
+                    class Fancy extends HTMLButtonElement {}
+                    customElements.define('fancy-button', Fancy, {extends: 'button'});
+                    const b = document.createElement('button', {is: 'fancy-button'});
+                    out.push(b instanceof Fancy, b.localName, new Fancy().outerHTML, b.cloneNode() instanceof Fancy,
+                        document.createElement('fancy-button') instanceof Fancy);
+                    return out.join('|');
+                })()"#
+            ),
+            "x-el|false|true|x-el|TypeError|TypeError|TypeError|TypeError|SyntaxError|NotSupportedError|RangeError|\
+             NotSupportedError||true|true|x:null:1,x:1:1,connected|false|false|0|true|true|button|\
+             <button is=\"fancy-button\"></button>|true|false"
+        );
+    }
+
+    #[test]
+    fn form_associated_custom_elements_use_element_internals() {
+        // HTML #custom-elements-face and #the-elementinternals-interface:
+        // attachInternals() rules, form owner and disabled callbacks, form
+        // values in the entry list, setValidity(), labels, reset, and the
+        // states set matched by :state().
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const out = [], log = [];
+                    class FaceEl extends HTMLElement {
+                        static formAssociated = true;
+                        constructor() { super(); this.internals = this.attachInternals(); }
+                        formAssociatedCallback(f) { log.push('form:' + (f && f.id)); }
+                        formDisabledCallback(d) { log.push('disabled:' + d); }
+                        formResetCallback() { log.push('reset'); }
+                    }
+                    customElements.define('face-el', FaceEl);
+                    const form = document.createElement('form'); form.id = 'f1'; document.body.append(form);
+                    const fs = document.createElement('fieldset'); form.append(fs);
+                    const el = document.createElement('face-el'); el.setAttribute('name', 'face'); fs.append(el);
+                    const internals = el.internals;
+                    out.push(log.splice(0).join(','), internals.form === form, Array.from(form.elements, (e) => e.localName).join(),
+                        Object.prototype.toString.call(internals));
+                    try { el.attachInternals(); } catch (e) { out.push(e.name); }
+                    fs.disabled = true; out.push(log.splice(0).join(','), el.matches(':disabled'), internals.willValidate);
+                    fs.disabled = false; log.splice(0);
+                    internals.setFormValue('v1'); out.push(new FormData(form).get('face'));
+                    const fd = new FormData(); fd.append('a', '1'); fd.append('b', '2'); internals.setFormValue(fd);
+                    out.push(Array.from(new FormData(form), ([k, v]) => k + '=' + v).join('&'));
+                    try { internals.setValidity({valueMissing: true}); } catch (e) { out.push(e.name); }
+                    internals.setValidity({valueMissing: true}, 'need\r\nit');
+                    out.push(internals.validity.valid, internals.validity.valueMissing, JSON.stringify(internals.validationMessage),
+                        internals.checkValidity(), form.checkValidity());
+                    internals.setValidity({}); out.push(internals.validity.valid, form.checkValidity());
+                    internals.states.add('on');
+                    out.push(internals.states.has('on'), [...internals.states].join(), el.matches(':state(on)'),
+                        document.querySelector('face-el:state(on)') === el);
+                    internals.states.delete('on'); out.push(el.matches(':state(on)'));
+                    form.reset(); out.push(log.splice(0).join(','));
+                    const label = document.createElement('label'); label.append('L'); form.append(label); label.append(el);
+                    log.splice(0); out.push(internals.labels.length, label.control === el);
+                    el.setAttribute('form', 'f2'); const f2 = document.createElement('form'); f2.id = 'f2'; document.body.append(f2);
+                    out.push(log.splice(0).join(','), internals.form === f2);
+                    internals.role = 'checkbox'; out.push(internals.role, el.getAttribute('role'));
+                    class Plain extends HTMLElement {}
+                    customElements.define('plain-el', Plain);
+                    const plain = new Plain(), plainInternals = plain.attachInternals();
+                    try { plainInternals.form; } catch (e) { out.push(e.name); }
+                    class Disabled extends HTMLElement { static disabledFeatures = ['internals', 'shadow']; }
+                    customElements.define('disabled-el', Disabled);
+                    for (const f of [() => new Disabled().attachInternals(), () => new Disabled().attachShadow({mode: 'open'})])
+                        try { f(); } catch (e) { out.push(e.name); }
+                    return out.join('|');
+                })()"#
+            ),
+            "form:f1|true|fieldset,face-el|[object ElementInternals]|NotSupportedError|disabled:true|true|false|v1|a=1&b=2|\
+             TypeError|false|true|\"need\\nit\"|false|false|true|true|true|on|true|true|false|reset|1|true|\
+             form:null,form:f2|true|checkbox||NotSupportedError|NotSupportedError|NotSupportedError"
+        );
+    }
+
+    #[test]
+    fn traversal_objects_keep_their_state_in_internal_slots() {
+        // DOM #traversal: filters (callable or acceptNode, results converted
+        // to unsigned short), the is-active guard, attributes on the
+        // prototype, and NodeIterator's pre-remove steps.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const d = document.createElement('div'); d.innerHTML = '<p>a<b>b</b></p><!--c--><i>i</i>'; document.body.append(d);
+                    const out = [];
+                    const w = document.createTreeWalker(d, NodeFilter.SHOW_ELEMENT,
+                        {acceptNode: (n) => n.localName === 'b' ? NodeFilter.FILTER_SKIP : NodeFilter.FILTER_ACCEPT});
+                    const names = []; for (let n = w.nextNode(); n; n = w.nextNode()) names.push(n.localName);
+                    out.push(names.join(), w.currentNode.localName, Object.keys(w).length, 'root' in TreeWalker.prototype, w.whatToShow);
+                    w.currentNode = d.firstChild;
+                    out.push(w.firstChild(), w.nextSibling().localName, w.previousSibling().localName, w.parentNode() === d);
+                    try { new TreeWalker(); } catch (e) { out.push(e.name); }
+                    const it = document.createNodeIterator(d);
+                    const seq = []; let n; while ((n = it.nextNode())) seq.push(n.nodeName); out.push(seq.join());
+                    const it2 = document.createNodeIterator(d); it2.nextNode(); it2.nextNode();
+                    d.firstChild.remove(); out.push(it2.referenceNode === d, it2.pointerBeforeReferenceNode);
+                    out.push(Object.prototype.toString.call(it), document.createNodeIterator(d, NodeFilter.SHOW_COMMENT).nextNode().nodeName);
+                    let active; const it4 = document.createNodeIterator(d, NodeFilter.SHOW_ALL,
+                        () => { try { it4.nextNode(); } catch (e) { active = e.name; } return 1; });
+                    it4.nextNode(); out.push(active);
+                    try { document.createTreeWalker(d, 1, 'x'); } catch (e) { out.push(e.name); }
+                    const w2 = document.createTreeWalker(d, 0xFFFFFFFF, () => '1'); out.push(w2.firstChild().nodeName);
+                    return out.join('|');
+                })()"#
+            ),
+            "p,i|i|0|true|1||i|p|true|TypeError|DIV,P,#text,B,#text,#comment,I,#text|true|false|[object NodeIterator]|#comment|\
+             InvalidStateError|TypeError|#comment"
+        );
+    }
+
+    #[test]
+    fn document_legacy_members_and_design_mode() {
+        // HTML §16.3 obsolete Document members and #designMode, which makes
+        // the document element an editing host (:read-write).
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    document.body.setAttribute('text', 'red'); const out = [document.fgColor, document.linkColor];
+                    document.bgColor = 'blue'; out.push(document.body.getAttribute('bgcolor'));
+                    const a = document.createElement('a'); a.name = 'n'; document.body.append(a, document.createElement('embed'));
+                    out.push(document.anchors.length, document.applets.length, document.embeds.length, document.plugins === document.embeds,
+                        document.clear(), typeof document.captureEvents);
+                    out.push(document.designMode, document.body.isContentEditable);
+                    document.designMode = 'ON'; out.push(document.designMode, document.body.isContentEditable, document.body.matches(':read-write'));
+                    document.designMode = 'off'; out.push(document.designMode, document.body.isContentEditable, document.body.matches(':read-write'));
+                    document.body.onhashchange = () => {}; out.push(window.onhashchange === document.body.onhashchange);
+                    out.push('onslotchange' in ShadowRoot.prototype);
+                    return out.join('|');
+                })()"#
+            ),
+            "red||blue|1|0|1|true||function|off|false|on|true|true|off|false|false|true|true"
+        );
+    }
+
+    #[test]
+    fn html_element_text_members_follow_their_definitions() {
+        // HTML #dom-title-text, #dom-a-text, DOM #dom-text-wholetext,
+        // #dom-nonelementparentnode-getelementbyid on fragments, and the
+        // draggable/spellcheck/translate/nonce attributes; attribute
+        // selectors decode CSS string escapes.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const title = document.createElement('title'); title.append('a', document.createElement('b'), 'c');
+                    title.firstElementChild.textContent = 'X';
+                    const out = [title.text]; title.text = 'new'; out.push(title.childNodes.length);
+                    const a = document.createElement('a'); a.innerHTML = 'x<b>y</b>'; out.push(a.text, a.draggable);
+                    const p = document.createElement('p'); p.append('one', 'two', document.createComment('c'), 'three');
+                    out.push(p.childNodes[1].wholeText, p.lastChild.wholeText);
+                    const f = document.createDocumentFragment(), s = document.createElement('span'); s.id = 'q"x]'; f.append(s);
+                    out.push(f.getElementById('q"x]') === s, f.getElementById(''), f.querySelector('[id="q\\22 x]"]') === s);
+                    out.push(document.createElement('img').draggable, document.createElement('div').spellcheck,
+                        document.createElement('textarea').spellcheck);
+                    const outer = document.createElement('div'); outer.setAttribute('translate', 'no');
+                    const inner = document.createElement('span'); outer.append(inner); out.push(inner.translate);
+                    const script = document.createElement('script'); script.setAttribute('nonce', 'abc'); script.nonce = 'def';
+                    out.push(script.nonce, script.getAttribute('nonce'));
+                    for (const selector of ['[a=1]', '[a="x"i]', '[*|a]', '[a="b]"]']) {
+                        try { document.querySelector(selector); out.push('ok'); } catch (e) { out.push(e.name); }
+                    }
+                    return out.join('|');
+                })()"#
+            ),
+            "ac|1|xy|false|onetwo|three|true||true|true|false|true|false|def|abc|SyntaxError|ok|ok|ok"
+        );
+    }
+
+    #[test]
+    fn inner_text_follows_the_rendered_text_collection_steps() {
+        // HTML #the-innertext-idl-attribute: block boundaries, paragraphs,
+        // br, table cells and rows, white-space collapsing and preservation,
+        // text-transform, and display:none content; the setters' rendered
+        // text fragments; outerText's merge with adjacent text.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const d = document.createElement('div');
+                    d.innerHTML = '<p>Hello   <b>big</b>\n world</p><div>line<br>break</div><span style="display:none">hidden</span>' +
+                        '<ul><li>one</li><li>two</li></ul><table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>' +
+                        '<pre>  keep   space</pre><span style="text-transform:uppercase">up</span>';
+                    document.body.append(d);
+                    const out = [JSON.stringify(d.innerText)];
+                    const hidden = document.createElement('div'); hidden.style.display = 'none'; hidden.innerHTML = '<p>a</p><p>b</p>';
+                    document.body.append(hidden); out.push(JSON.stringify(hidden.innerText));
+                    const set = document.createElement('div'); set.innerText = 'a\nb\r\nc'; out.push(set.innerHTML);
+                    const outer = document.createElement('div'); outer.innerHTML = 'x<span>y</span>z'; document.body.append(outer);
+                    outer.querySelector('span').outerText = 'Y'; out.push(outer.childNodes.length, outer.textContent);
+                    try { document.createElement('span').outerText = 'q'; } catch (e) { out.push(e.name); }
+                    out.push('innerText' in Element.prototype, d.checkVisibility(), hidden.checkVisibility());
+                    return out.join(' ; ');
+                })()"#
+            ),
+            "\"Hello big world\\n\\nline\\nbreak\\none\\ntwo\\na\\tb\\nc\\td\\n  keep   space\\nUP\" ; \"ab\" ; a<br>b<br>c ; 1 ; xYz ; \
+             NoModificationAllowedError ; false ; true ; false"
+        );
+    }
+
+    #[test]
+    fn shadow_roots_serialize_and_parse_declaratively_on_request() {
+        // HTML #dom-element-gethtml (serializable or listed shadow roots as
+        // declarative templates), #dom-element-sethtmlunsafe and
+        // #dom-parsehtmlunsafe (declarative shadow roots), while innerHTML
+        // keeps declarations inert.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const host = document.createElement('div'); host.innerHTML = '<p>light</p>';
+                    const root = host.attachShadow({mode: 'open', serializable: true}); root.innerHTML = '<slot></slot><b>shadow</b>';
+                    const closedHost = document.createElement('span'), closed = closedHost.attachShadow({mode: 'closed'});
+                    closed.innerHTML = '<i>c</i>'; host.append(closedHost);
+                    const out = [host.getHTML(), host.getHTML({serializableShadowRoots: true}), host.getHTML({shadowRoots: [closed]}), root.getHTML()];
+                    const target = document.createElement('div');
+                    target.setHTMLUnsafe('<div><template shadowrootmode=open><em>in shadow</em></template>light</div>');
+                    out.push(target.firstChild.shadowRoot.innerHTML);
+                    target.innerHTML = '<div><template shadowrootmode=open><em>x</em></template></div>';
+                    out.push(target.firstChild.shadowRoot, target.innerHTML);
+                    const doc = Document.parseHTMLUnsafe('<div id=a><template shadowrootmode=open>s</template></div>');
+                    out.push(doc.getElementById('a').shadowRoot.textContent, doc.URL, root.styleSheets.length);
+                    return out.join(' ; ');
+                })()"#
+            ),
+            "<p>light</p><span></span> ; \
+             <template shadowrootmode=\"open\" shadowrootserializable=\"\"><slot></slot><b>shadow</b></template><p>light</p><span></span> ; \
+             <p>light</p><span><template shadowrootmode=\"closed\"><i>c</i></template></span> ; <slot></slot><b>shadow</b> ; \
+             <em>in shadow</em> ;  ; <div><template shadowrootmode=\"open\"><em>x</em></template></div> ; s ; about:blank ; 0"
+        );
+    }
+
+    #[test]
+    fn command_invokers_and_aria_element_reflection() {
+        // HTML #the-button-element activation behavior (commandfor/command,
+        // CommandEvent, dialog command steps, popover targets) and WAI-ARIA
+        // #ARIAMixin element reflection (Element? and FrozenArray<Element>?).
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const out = [];
+                    const dialog = document.createElement('dialog'); dialog.id = 'dlg'; document.body.append(dialog);
+                    const open = document.createElement('button'); open.setAttribute('commandfor', 'dlg'); open.command = 'show-modal';
+                    const custom = document.createElement('button'); custom.commandForElement = dialog; custom.setAttribute('command', '--go');
+                    const bad = document.createElement('button'); bad.setAttribute('commandfor', 'dlg'); bad.setAttribute('command', 'bogus');
+                    document.body.append(open, custom, bad);
+                    dialog.addEventListener('command', (e) => out.push(e.command + ':' + (e.source === open || e.source === custom) + ':' + e.isTrusted));
+                    out.push(open.command, custom.command, bad.command);
+                    open.click(); out.push(dialog.open);
+                    custom.click(); bad.click();
+                    const closer = document.createElement('button'); closer.commandForElement = dialog; closer.command = 'close'; closer.value = 'done';
+                    dialog.append(closer); closer.click(); out.push(dialog.open, dialog.returnValue);
+                    const pop = document.createElement('div'); pop.popover = 'manual'; pop.id = 'pp'; document.body.append(pop);
+                    const toggler = document.createElement('button'); toggler.popoverTargetElement = pop; document.body.append(toggler);
+                    toggler.click(); out.push(pop.matches(':popover-open'));
+                    const host = document.createElement('div'), a = document.createElement('span'), b = document.createElement('span');
+                    a.id = 'a1'; b.id = 'b1'; document.body.append(host, a, b);
+                    host.setAttribute('aria-labelledby', 'b1 a1 missing');
+                    const first = host.ariaLabelledByElements;
+                    out.push(first.map((e) => e.id).join(), Object.isFrozen(first), first === host.ariaLabelledByElements);
+                    host.ariaLabelledByElements = [a]; out.push(host.getAttribute('aria-labelledby'), host.ariaLabelledByElements[0] === a);
+                    a.remove(); out.push(host.ariaLabelledByElements.length);
+                    host.ariaActiveDescendantElement = b; out.push(host.getAttribute('aria-activedescendant'), host.ariaActiveDescendantElement === b);
+                    host.setAttribute('aria-activedescendant', 'nope'); out.push(host.ariaActiveDescendantElement);
+                    return out.join('|');
+                })()"#
+            ),
+            "show-modal|--go||show-modal:true:true|true|--go:true:true|close:false:true|false|done|true|b1,a1|true|true||true|0||true|"
+        );
+    }
+
+    #[test]
+    fn input_value_as_date_and_list_follow_their_states() {
+        // HTML #dom-input-valueasdate (date, month, week and time convert
+        // through UTC; other states return null or throw) and #dom-input-list.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                    const i = document.createElement('input'); i.type = 'date'; i.value = '2024-02-29';
+                    const out = [i.valueAsDate.toISOString()];
+                    i.valueAsDate = new Date(Date.UTC(2020, 0, 15, 13)); out.push(i.value);
+                    i.type = 'month'; i.value = '2021-03'; out.push(i.valueAsDate.toISOString());
+                    i.valueAsDate = new Date(Date.UTC(1999, 11, 31)); out.push(i.value);
+                    i.type = 'week'; i.value = '2021-W01'; out.push(i.valueAsDate.toISOString());
+                    i.valueAsDate = new Date(Date.UTC(2021, 0, 13)); out.push(i.value);
+                    i.type = 'time'; i.value = '13:45'; out.push(i.valueAsDate.toISOString());
+                    i.valueAsDate = new Date(Date.UTC(2000, 1, 1, 7, 5, 30)); out.push(i.value);
+                    i.valueAsDate = null; out.push(JSON.stringify(i.value));
+                    i.type = 'text'; out.push(i.valueAsDate);
+                    try { i.valueAsDate = new Date(); } catch (e) { out.push(e.name); }
+                    i.type = 'date'; try { i.valueAsDate = 5; } catch (e) { out.push(e.name); }
+                    const dl = document.createElement('datalist'); dl.id = 'opts';
+                    const j = document.createElement('input'); j.setAttribute('list', 'opts'); document.body.append(dl, j);
+                    out.push(j.list === dl); j.type = 'checkbox'; out.push(j.list); j.type = 'range'; out.push(j.list === dl);
+                    return out.join('|');
+                })()"#
+            ),
+            "2024-02-29T00:00:00.000Z|2020-01-15|2021-03-01T00:00:00.000Z|1999-12|2021-01-04T00:00:00.000Z|2021-W02|\
+             1970-01-01T13:45:00.000Z|07:05:30|\"\"||InvalidStateError|TypeError|true||true"
         );
     }
 
@@ -24437,7 +25575,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 214, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 213, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -24448,7 +25586,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 214);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 213);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(

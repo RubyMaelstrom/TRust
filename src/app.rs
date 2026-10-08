@@ -3837,6 +3837,23 @@ impl App {
     /// POST a form-encoded body to a web URL (her use case; the UX can
     /// grow content-type options once the target application is known).
     fn start_post(&mut self, url: url::Url, body: String, referrer: Option<url::Url>) {
+        self.start_post_body(
+            url,
+            crate::js::FORM_URLENCODED.to_string(),
+            body.into_bytes(),
+            referrer,
+        );
+    }
+
+    /// POST an entity body of the given MIME type (HTML form submission's
+    /// "submit as entity body" for each enctype).
+    fn start_post_body(
+        &mut self,
+        url: url::Url,
+        content_type: String,
+        body: Vec<u8>,
+        referrer: Option<url::Url>,
+    ) {
         if crate::media::is_youtube_video_url(&url) {
             self.start_fetch_opts(Link::Http(url), false, referrer);
             return;
@@ -3855,10 +3872,7 @@ impl App {
             let mut request = http::Request {
                 method: String::from("POST"),
                 url: url.clone(),
-                body: Some((
-                    String::from("application/x-www-form-urlencoded"),
-                    body.into_bytes(),
-                )),
+                body: Some((content_type, body)),
                 headers: Vec::new(),
                 fetch_metadata: None,
                 cookie_context: None,
@@ -9270,10 +9284,12 @@ impl App {
         }
         let referrer = self.http_referrer();
         match submission.method.as_str() {
-            "post" => self.start_post(action, submission.body, referrer),
+            "post" => {
+                self.start_post_body(action, submission.content_type, submission.body, referrer)
+            }
             "dialog" => {}
             _ => {
-                action.set_query((!submission.body.is_empty()).then_some(&submission.body));
+                action.set_query(submission.query());
                 self.start_fetch_opts(Link::Http(action), false, referrer);
             }
         }
@@ -10484,7 +10500,8 @@ mod tests {
             submission: Some(crate::js::FormSubmission {
                 action: String::from("https://example.com/verify?old=discarded"),
                 method: String::from("get"),
-                body: String::from("solution=42&token=abc"),
+                content_type: String::new(),
+                body: b"solution=42&token=abc".to_vec(),
             }),
         });
         assert!(app.loading(), "page-driven native GET started");

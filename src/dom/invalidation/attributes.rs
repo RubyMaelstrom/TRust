@@ -393,6 +393,12 @@ impl Dependencies {
                     (&["contenteditable", "readonly", "disabled", "type"], true)
                 }
                 StatePseudo::PlaceholderShown => (&["placeholder", "value", "type"], false),
+                // HTML #selector-defined / #selector-custom: the element's own
+                // custom element state, changed through `Dom` setters that
+                // touch these dependency names (and `is`, which can make a
+                // never-upgraded element undefined).
+                StatePseudo::Defined => (&[super::super::input::DEFINED_DEPENDENCY, "is"], false),
+                StatePseudo::Custom(_) => (&[super::super::input::CUSTOM_STATE_DEPENDENCY], false),
                 StatePseudo::Lang(_) => (&["lang", "xml:lang"], true),
                 StatePseudo::Dir(_) => {
                     self.direction = true;
