@@ -7,6 +7,7 @@ use super::errors::{
     LinkerError,
 };
 use crate::{
+    ExnRef,
     TrapCode,
     engine::{ResumableHostTrapError, ResumableOutOfFuelError, TranslationError},
     limits::LimitsError,
@@ -70,6 +71,33 @@ impl Error {
     #[cold]
     pub fn i32_exit(status: i32) -> Self {
         Self::from_kind(ErrorKind::I32ExitStatus(status))
+    }
+
+    /// TRust: creates an [`Error`] that throws the WebAssembly exception `exn`.
+    ///
+    /// WebAssembly Core 3.0, `exec/instructions.rst` (`exec-throw_ref`) and the WebAssembly
+    /// JavaScript Interface, "create a host function" step 3.10 (local snapshot of the spec
+    /// repository 37d6b059): a host function that returns this error raises `exn` at its call
+    /// site, where the handlers of the calling Wasm frames may catch it, exactly as if the
+    /// caller had executed `throw_ref`. An exception that no handler catches ends the execution
+    /// with an error of the same kind, which the embedder receives from `Func::call`.
+    ///
+    /// # Note
+    ///
+    /// The error transfers one hold of `exn` (see [`ExnRef::hold`]): raising the exception
+    /// releases it, and an embedder that receives an uncaught exception owns that hold.
+    #[inline]
+    #[cold]
+    pub fn exception(exn: ExnRef) -> Self {
+        Self::from_kind(ErrorKind::Exception(exn))
+    }
+
+    /// TRust: returns the thrown WebAssembly exception if `self` is an exception.
+    ///
+    /// Returns `None` otherwise, for example for traps.
+    #[inline]
+    pub fn as_exception(&self) -> Option<ExnRef> {
+        self.kind().as_exception()
     }
 
     /// Returns the [`ErrorKind`] of the [`Error`].
@@ -163,6 +191,10 @@ pub enum ErrorKind {
     I32ExitStatus(i32),
     /// A trap as defined by the WebAssembly specification.
     Host(Box<dyn HostError>),
+    /// TRust: a thrown WebAssembly exception (see [`Error::exception`]).
+    ///
+    /// Unlike a trap, Wasm handlers catch it when a host function returns it.
+    Exception(ExnRef),
     /// An error returned from a resumable call when a host function traps.
     ///
     /// # Note
@@ -233,6 +265,15 @@ impl ErrorKind {
         Some(trap_code)
     }
 
+    /// TRust: returns the thrown exception if [`ErrorKind`] is an [`ErrorKind::Exception`].
+    #[inline]
+    pub fn as_exception(&self) -> Option<ExnRef> {
+        match self {
+            Self::Exception(exn) => Some(*exn),
+            _ => None,
+        }
+    }
+
     /// Returns a [`i32`] if [`ErrorKind`] is an [`ErrorKind::I32ExitStatus`].
     pub fn as_i32_exit_status(&self) -> Option<i32> {
         match self {
@@ -275,6 +316,7 @@ impl Display for ErrorKind {
             Self::I32ExitStatus(status) => writeln!(f, "Exited with i32 exit status {status}"),
             Self::Message(message) => Display::fmt(message, f),
             Self::Host(error) => Display::fmt(error, f),
+            Self::Exception(_) => f.write_str("uncaught WebAssembly exception"),
             Self::Global(error) => Display::fmt(error, f),
             Self::Memory(error) => Display::fmt(error, f),
             Self::Table(error) => Display::fmt(error, f),

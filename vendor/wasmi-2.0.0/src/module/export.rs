@@ -60,6 +60,25 @@ impl MemoryIdx {
     }
 }
 
+/// TRust: the index of an exception tag within the tag index space of a [`Module`].
+///
+/// [`Module`]: [`super::Module`]
+#[derive(Debug, Copy, Clone)]
+pub struct TagIdx(u32);
+
+impl From<u32> for TagIdx {
+    fn from(index: u32) -> Self {
+        Self(index)
+    }
+}
+
+impl TagIdx {
+    /// Returns the [`TagIdx`] as `u32`.
+    pub fn into_u32(self) -> u32 {
+        self.0
+    }
+}
+
 /// An external item of an [`ExportType`] definition within a [`Module`].
 ///
 /// [`Module`]: [`crate::Module`]
@@ -81,6 +100,10 @@ pub enum ExternIdx {
     ///
     /// [`Module`]: [`super::Module`]
     Global(GlobalIdx),
+    /// TRust: an exported exception tag and its index within the [`Module`].
+    ///
+    /// [`Module`]: [`super::Module`]
+    Tag(TagIdx),
 }
 
 impl ExternIdx {
@@ -95,9 +118,7 @@ impl ExternIdx {
             wasmparser::ExternalKind::Table => Ok(ExternIdx::Table(TableIdx(index))),
             wasmparser::ExternalKind::Memory => Ok(ExternIdx::Memory(MemoryIdx(index))),
             wasmparser::ExternalKind::Global => Ok(ExternIdx::Global(GlobalIdx::from(index))),
-            wasmparser::ExternalKind::Tag => {
-                panic!("wasmi does not support the `exception-handling` Wasm proposal")
-            }
+            wasmparser::ExternalKind::Tag => Ok(ExternIdx::Tag(TagIdx(index))),
         }
     }
 }

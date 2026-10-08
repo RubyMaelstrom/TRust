@@ -8,6 +8,8 @@ use crate::{
     MemoryType,
     Table,
     TableType,
+    Tag,
+    TagType,
     collections::map::Iter as MapIter,
 };
 use alloc::boxed::Box;
@@ -29,6 +31,14 @@ pub enum Extern {
     Memory(Memory),
     /// A WebAssembly function which can be called.
     Func(Func),
+    /// TRust: a WebAssembly exception tag.
+    Tag(Tag),
+}
+
+impl From<Tag> for Extern {
+    fn from(tag: Tag) -> Self {
+        Self::Tag(tag)
+    }
 }
 
 impl From<Global> for Extern {
@@ -96,6 +106,16 @@ impl Extern {
         None
     }
 
+    /// TRust: returns the underlying exception tag if `self` is a tag.
+    ///
+    /// Returns `None` otherwise.
+    pub fn into_tag(self) -> Option<Tag> {
+        if let Self::Tag(tag) = self {
+            return Some(tag);
+        }
+        None
+    }
+
     /// Returns the type associated with this [`Extern`].
     ///
     /// # Panics
@@ -107,6 +127,7 @@ impl Extern {
             Extern::Table(table) => table.ty(ctx).into(),
             Extern::Memory(memory) => memory.ty(ctx).into(),
             Extern::Func(func) => func.ty(ctx).into(),
+            Extern::Tag(tag) => tag.ty(ctx).into(),
         }
     }
 }
@@ -124,6 +145,14 @@ pub enum ExternType {
     Memory(MemoryType),
     /// The type of an [`Extern::Func`].
     Func(FuncType),
+    /// TRust: the type of an [`Extern::Tag`].
+    Tag(TagType),
+}
+
+impl From<TagType> for ExternType {
+    fn from(tag: TagType) -> Self {
+        Self::Tag(tag)
+    }
 }
 
 impl From<GlobalType> for ExternType {
@@ -179,6 +208,14 @@ impl ExternType {
     pub fn func(&self) -> Option<&FuncType> {
         match self {
             Self::Func(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    /// TRust: returns the underlying [`TagType`] or `None` if it is of a different type.
+    pub fn tag(&self) -> Option<&TagType> {
+        match self {
+            Self::Tag(ty) => Some(ty),
             _ => None,
         }
     }
@@ -239,6 +276,11 @@ impl<'instance> Export<'instance> {
     /// Returns the underlying [`Global`], if the [`Export`] is a global variable or `None` otherwise.
     pub fn into_global(self) -> Option<Global> {
         self.definition.into_global()
+    }
+
+    /// TRust: returns the underlying [`Tag`], if the [`Export`] is a tag or `None` otherwise.
+    pub fn into_tag(self) -> Option<Tag> {
+        self.definition.into_tag()
     }
 }
 

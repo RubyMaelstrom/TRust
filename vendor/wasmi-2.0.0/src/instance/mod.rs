@@ -16,6 +16,7 @@ use crate::{
     Module,
     StoreContext,
     Table,
+    Tag,
     TypedFunc,
     WasmParams,
     WasmResults,
@@ -179,6 +180,18 @@ impl Instance {
     /// If `store` does not own this [`Instance`].
     pub fn get_memory(&self, store: impl AsContext, name: &str) -> Option<Memory> {
         self.get_export(store, name)?.into_memory()
+    }
+
+    /// TRust: looks up an exported [`Tag`] by `name`.
+    ///
+    /// Returns `None` if there was no export named `name`,
+    /// or if there was but it wasn’t a tag.
+    ///
+    /// # Panics
+    ///
+    /// If `store` does not own this [`Instance`].
+    pub fn get_tag(&self, store: impl AsContext, name: &str) -> Option<Tag> {
+        self.get_export(store, name)?.into_tag()
     }
 
     /// Returns an iterator over the exports of the [`Instance`].

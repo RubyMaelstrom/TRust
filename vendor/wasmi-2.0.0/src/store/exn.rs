@@ -19,18 +19,26 @@
 //! collection, so that Wasm code catching references in a loop runs in bounded memory. Its
 //! roots are the `exnref` globals and tables of the store, the executing [`Stack`] (scanned
 //! conservatively: any cell that encodes the reference of a live exception keeps it) and the
-//! exceptions referenced from outside the store, which are pinned: references read by the host
-//! and those held by a suspended resumable call. The fields of reachable exceptions are scanned
-//! conservatively as well. A collection only runs while no enclosing execution is parked
-//! behind a host function, since parked stacks are not reachable from the store.
+//! exceptions referenced from outside the store. Those are either pinned for good (references
+//! read by the host and those held by a suspended resumable call) or held: an embedder that
+//! tracks the lifetime of its references, such as a JavaScript `WebAssembly.Exception` object
+//! ([`ExnRef::release`]), counts holds that it releases again. The fields of reachable
+//! exceptions are scanned conservatively as well. A collection only runs while no enclosing
+//! execution is parked behind a host function, since parked stacks are not reachable from the
+//! store.
+//!
+//! The exception instances are identified by their tag (a [`Tag`] handle, WebAssembly Core 3.0
+//! `exec/runtime.rst` "Exception Instances"), never by the instance that threw them.
 //!
 //! [`Stack`]: crate::engine::Stack
+//! [`ExnRef::release`]: crate::ExnRef::release
 
-use crate::{core::RawRef, engine::Cell};
+use crate::{Tag, core::RawRef, engine::Cell};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
+    mem,
     num::NonZero,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 /// An odd multiplier that spreads the encodings of exception references over the 32-bit range.
@@ -64,35 +72,35 @@ const MIN_COLLECTION_THRESHOLD: usize = 256;
 /// An exception instance: its tag address and field values.
 #[derive(Debug)]
 pub struct ExnEntity {
-    /// The index of the tag within its defining instance.
-    tag: u32,
-    /// The exposed address of the instance defining the tag.
-    instance: usize,
+    /// The tag of the exception.
+    tag: Tag,
     /// The tag fields in cells.
     fields: Box<[Cell]>,
-    /// `true` if a reference to this exception exists outside the store.
+    /// `true` if a reference to this exception exists outside the store for good.
     pinned: AtomicBool,
+    /// The number of releasable embedder holds of this exception.
+    holds: AtomicU32,
 }
 
 impl ExnEntity {
-    /// Creates a new [`ExnEntity`] of `tag` defined by the exposed `instance` address.
-    pub fn new(tag: u32, instance: usize, fields: Vec<Cell>) -> Self {
+    /// Creates a new [`ExnEntity`] of `tag` with the tag fields `fields`.
+    pub fn new(tag: Tag, fields: Vec<Cell>) -> Self {
         Self {
             tag,
-            instance,
             fields: fields.into_boxed_slice(),
             pinned: AtomicBool::new(false),
+            holds: AtomicU32::new(0),
         }
     }
 
-    /// Returns the index of the tag within its defining instance.
-    pub fn tag(&self) -> u32 {
+    /// Returns the tag of the exception.
+    pub fn tag(&self) -> Tag {
         self.tag
     }
 
-    /// Returns the exposed address of the instance defining the tag.
-    pub fn instance(&self) -> usize {
-        self.instance
+    /// Returns `true` if the store must keep the exception regardless of Wasm roots.
+    fn is_external_root(&self, holds: bool) -> bool {
+        self.pinned.load(Ordering::Relaxed) || (holds && self.holds.load(Ordering::Relaxed) != 0)
     }
 
     /// Returns the tag fields.
@@ -199,6 +207,31 @@ impl ExnStore {
         }
     }
 
+    /// Adds a releasable embedder hold to the exception referenced by `raw`.
+    ///
+    /// Returns `false` for null or dangling references.
+    pub fn hold(&self, raw: RawRef) -> bool {
+        let Some(entity) = self.get(raw) else {
+            return false;
+        };
+        // Saturate instead of wrapping: an exhausted count keeps the exception for good.
+        update_holds(&entity.holds, |holds| holds.checked_add(1));
+        true
+    }
+
+    /// Releases one embedder hold of the exception referenced by `raw`, see [`ExnStore::hold`].
+    ///
+    /// Does nothing for null or dangling references and exceptions without holds.
+    pub fn release(&self, raw: RawRef) {
+        if let Some(entity) = self.get(raw) {
+            update_holds(&entity.holds, |holds| match holds {
+                // A saturated count can no longer be balanced.
+                0 | u32::MAX => None,
+                holds => Some(holds - 1),
+            });
+        }
+    }
+
     /// Pins every live exception that a cell of `cells` references.
     pub fn pin_cells(&self, cells: impl IntoIterator<Item = u64>) {
         for cell in cells {
@@ -213,23 +246,30 @@ impl ExnStore {
         self.live >= self.threshold
     }
 
-    /// Frees all exceptions that are neither pinned nor reachable from the roots `trace` marks.
-    pub fn collect(&mut self, trace: impl FnOnce(&mut ExnMarker<'_>)) {
+    /// Marks the exceptions reachable from the roots `trace` marks and from the pinned ones,
+    /// and from the held ones if `holds` is `true`, into `marks`; returns the scanned cells.
+    fn mark(
+        &self,
+        marks: &mut Vec<u64>,
+        worklist: &mut Vec<u32>,
+        trace: impl FnOnce(&mut ExnMarker<'_>),
+        holds: bool,
+    ) -> usize {
         let words = self.slots.len().div_ceil(64);
-        self.marks.clear();
-        self.marks.resize(words, 0);
-        self.worklist.clear();
+        marks.clear();
+        marks.resize(words, 0);
+        worklist.clear();
         let mut marker = ExnMarker {
             store: &self.slots,
-            marks: &mut self.marks,
-            worklist: &mut self.worklist,
+            marks,
+            worklist,
             scanned: 0,
         };
         trace(&mut marker);
         for (index, slot) in self.slots.iter().enumerate() {
             if slot
                 .as_ref()
-                .is_some_and(|entity| entity.pinned.load(Ordering::Relaxed))
+                .is_some_and(|entity| entity.is_external_root(holds))
             {
                 marker.mark_index(index);
             }
@@ -244,16 +284,60 @@ impl ExnStore {
                 marker.mark_cell(u64::from(*field));
             }
         }
-        let scanned = marker.scanned;
+        marker.scanned
+    }
+
+    /// Reports the live exceptions that the roots `trace` marks or the pinned exceptions reach,
+    /// directly or through the fields of other exceptions, to `reachable`, and every field of a
+    /// live exception that references a live exception to `edge` (conservatively, as cells).
+    ///
+    /// # Note
+    ///
+    /// Releasable holds are no roots here: this tells an embedder which of the exceptions it
+    /// holds the store would keep without its holds, and which held exceptions keep others.
+    pub fn visit_references(
+        &self,
+        trace: impl FnOnce(&mut ExnMarker<'_>),
+        mut reachable: impl FnMut(RawRef),
+        mut edge: impl FnMut(RawRef, RawRef),
+    ) {
+        let mut marks = Vec::new();
+        let mut worklist = Vec::new();
+        self.mark(&mut marks, &mut worklist, trace, false);
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(entity) = slot else { continue };
+            let raw = Self::encode(index);
+            if marks[index / 64] & (1 << (index % 64)) != 0 {
+                reachable(raw);
+            }
+            for field in entity.fields.iter() {
+                let Ok(field) = u32::try_from(u64::from(*field)) else {
+                    continue;
+                };
+                if let Some(target) = self.index_of(field) {
+                    edge(raw, Self::encode(target));
+                }
+            }
+        }
+    }
+
+    /// Frees all exceptions that are neither pinned, held nor reachable from the roots `trace`
+    /// marks.
+    pub fn collect(&mut self, trace: impl FnOnce(&mut ExnMarker<'_>)) {
+        let mut marks = mem::take(&mut self.marks);
+        let mut worklist = mem::take(&mut self.worklist);
+        let scanned = self.mark(&mut marks, &mut worklist, trace, true);
         // Sweep, trim the trailing free slots and list the others for reuse, lowest last.
         self.free.clear();
         for (index, slot) in self.slots.iter_mut().enumerate() {
-            let marked = self.marks[index / 64] & (1 << (index % 64)) != 0;
+            let marked = marks[index / 64] & (1 << (index % 64)) != 0;
             if slot.is_some() && !marked {
                 *slot = None;
                 self.live -= 1;
             }
         }
+        self.marks = marks;
+        self.worklist = worklist;
         while let Some(None) = self.slots.last() {
             self.slots.pop();
         }
@@ -272,6 +356,17 @@ impl ExnStore {
         let work = scanned.saturating_add(self.slots.len());
         let headroom = MIN_COLLECTION_THRESHOLD.max(self.live).max(work / 4);
         self.threshold = self.live.saturating_add(headroom);
+    }
+}
+
+/// Atomically replaces the hold count `holds` by `update(holds)` unless that is `None`.
+fn update_holds(holds: &AtomicU32, update: impl Fn(u32) -> Option<u32>) {
+    let mut current = holds.load(Ordering::Relaxed);
+    while let Some(next) = update(current) {
+        match holds.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
     }
 }
 
@@ -342,7 +437,10 @@ mod tests {
     use crate::Nullable;
 
     fn exn(fields: &[u64]) -> ExnEntity {
-        ExnEntity::new(0, 0, fields.iter().copied().map(Cell::from).collect())
+        use crate::{Handle as _, RawHandle, store::AsStoreId as _};
+        // The arena never resolves the tag of an exception, so any tag handle does.
+        let tag = Tag::from_raw(crate::store::id::StoreId::new().wrap(RawHandle::new(0)));
+        ExnEntity::new(tag, fields.iter().copied().map(Cell::from).collect())
     }
 
     #[test]

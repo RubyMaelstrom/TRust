@@ -498,6 +498,14 @@ impl<T> Linker<T> {
                     .ok_or_else(|| invalid_type(context))?;
                 Ok(Extern::Global(global))
             }
+            ExternType::Tag(_expected) => {
+                let tag = resolved
+                    .as_extern()
+                    .copied()
+                    .and_then(Extern::into_tag)
+                    .ok_or_else(|| invalid_type(context))?;
+                Ok(Extern::Tag(tag))
+            }
         }
     }
 }

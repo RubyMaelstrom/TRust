@@ -18,6 +18,7 @@ use crate::{
     Nullable,
     Ref,
     Table,
+    Tag,
     Val,
     core::RawRef,
     engine::Inst,
@@ -67,6 +68,7 @@ impl Module {
         let mut builder = InstanceEntity::build(self);
 
         self.extract_imports(&context, &mut builder, externals)?;
+        self.extract_tags(&mut context, &mut builder);
         self.extract_functions(&mut context, &mut builder, handle);
         self.extract_tables(&mut context, &mut builder)?;
         self.extract_memories(&mut context, &mut builder)?;
@@ -192,6 +194,20 @@ impl Module {
                     }
                     builder.push_global(global);
                 }
+                (ExternType::Tag(required), Extern::Tag(tag)) => {
+                    // TRust: WebAssembly Core 3.0, `valid/matching.rst` `match-tagtype`: the tag
+                    //        types must match in both directions, which for Wasmi's types means
+                    //        they are equal.
+                    let imported = &tag.ty(&store);
+                    if imported != required {
+                        return Err(InstantiationError::tag_type_mismatch(
+                            import_name,
+                            required,
+                            imported,
+                        ));
+                    }
+                    builder.push_tag(tag);
+                }
                 (expected_import, actual_extern_val) => {
                     return Err(InstantiationError::import_type_mismatch(
                         import_name,
@@ -202,6 +218,17 @@ impl Module {
             }
         }
         Ok(())
+    }
+
+    /// TRust: allocates a fresh tag for each tag definition of the module (WebAssembly Core 3.0,
+    /// `exec/modules.rst` `alloc-module`, which allocates tag addresses per instantiation).
+    ///
+    /// This also stores the [`Tag`] references into the [`Instance`] under construction.
+    fn extract_tags(&self, mut context: impl AsContextMut, builder: &mut InstanceEntityBuilder) {
+        for tag_type in self.internal_tags() {
+            let tag = Tag::new(context.as_context_mut(), tag_type);
+            builder.push_tag(tag);
+        }
     }
 
     /// Extracts the Wasm functions from the module and stores them into the [`Store`].
@@ -365,6 +392,10 @@ impl Module {
                     let global_index = global_index.into_u32();
                     let global = builder.get_global(global_index);
                     Extern::Global(global)
+                }
+                export::ExternIdx::Tag(tag_index) => {
+                    let tag = builder.get_tag(tag_index.into_u32());
+                    Extern::Tag(tag)
                 }
             };
             builder.push_export(field, external);

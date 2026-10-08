@@ -1,6 +1,7 @@
 use crate::{
     Error,
     Func,
+    Tag,
     TrapCode,
     core::RawRef,
     engine::{
@@ -89,6 +90,12 @@ impl ExecContext {
     #[inline]
     pub fn stack_mut(&mut self) -> &mut Stack {
         &mut self.stack
+    }
+
+    /// TRust: returns a shared reference to the [`Stack`].
+    #[inline]
+    pub fn stack(&self) -> &Stack {
+        &self.stack
     }
 
     /// Consumes `self` and returns its [`Stack`].
@@ -935,40 +942,47 @@ type ReturnCallHost = Control<(Ip, Sp, Inst), Sp>;
 ///
 /// # Note
 ///
-/// The tag address of the specification is identified by the defining instance and the
-/// tag's index within it, since tags are neither imported nor exported by Wasmi.
+/// The tag is the tag address of the specification: catch clauses compare it with the tag of
+/// their own tag index, so an exception is caught by every instance that imports its tag.
 ///
-/// An exception that was raised by `throw_ref`, or caught by reference before, also carries
-/// its exception reference: it is the exception instance at that address in the store, and
-/// catching it by reference again yields the same address (WebAssembly Core 3.0,
-/// `exec-throw_ref`). Exceptions raised by `throw` enter the store only when a `catch_ref` or
-/// `catch_all_ref` clause catches them.
+/// An exception that was raised by `throw_ref`, by a host function, or caught by reference
+/// before, also carries its exception reference: it is the exception instance at that address
+/// in the store, and catching it by reference again yields the same address (WebAssembly Core
+/// 3.0, `exec-throw_ref`). Exceptions raised by `throw` enter the store only when a `catch_ref`
+/// or `catch_all_ref` clause catches them or they leave the execution uncaught.
 #[derive(Debug)]
 pub struct WasmException {
-    /// The index of the tag within its defining instance.
-    tag: u32,
-    /// The exposed address of the instance defining the tag.
-    instance: usize,
+    /// The tag of the exception.
+    tag: Tag,
     /// The tag fields in cells.
     fields: Vec<Cell>,
     /// The reference of the exception instance in the store, if one exists.
     exn: Option<RawRef>,
 }
 
+/// TRust: returns the tag at `index` of the tag index space of `instance`.
+#[inline]
+fn instance_tag(instance: Inst, index: u32) -> Tag {
+    // SAFETY: every `Inst` addresses a live instance (see `Inst`).
+    match unsafe { instance.as_ptr().get_tag(index) } {
+        Some(tag) => tag,
+        None => panic!("validated tag index out of bounds: {index}"),
+    }
+}
+
 impl WasmException {
-    /// Creates a new [`WasmException`] of `tag` defined by `instance`.
-    pub fn new(tag: u32, instance: Inst, fields: Vec<Cell>) -> Self {
+    /// Creates a new [`WasmException`] of `tag`.
+    pub fn new(tag: Tag, fields: Vec<Cell>) -> Self {
         Self {
             tag,
-            instance: instance.as_ptr().expose_provenance(),
             fields,
             exn: None,
         }
     }
 
-    /// Returns `true` if `self` is an exception of `tag` defined by `instance`.
-    pub fn is_tag(&self, tag: u32, instance: Inst) -> bool {
-        self.tag == tag && self.instance == instance.as_ptr().expose_provenance()
+    /// Returns `true` if `self` is an exception of `tag`.
+    pub fn is_tag(&self, tag: Tag) -> bool {
+        self.tag == tag
     }
 
     /// Returns the tag fields of `self`.
@@ -983,14 +997,13 @@ impl WasmException {
 
     /// Returns an [`ExnEntity`] for the store holding the tag and fields of `self`.
     pub fn into_entity(self) -> ExnEntity {
-        ExnEntity::new(self.tag, self.instance, self.fields)
+        ExnEntity::new(self.tag, self.fields)
     }
 
     /// Re-creates the exception instance `entity` at `exn` for raising it again.
     pub fn from_entity(entity: &ExnEntity, exn: RawRef) -> Self {
         Self {
             tag: entity.tag(),
-            instance: entity.instance(),
             fields: entity.fields().to_vec(),
             exn: Some(exn),
         }
@@ -1042,6 +1055,8 @@ struct ExceptionState {
     pending: Option<WasmException>,
     /// The dispatch [`Ip`], [`Sp`] and [`Inst`] of the handler selected by the last raise.
     unwind: Option<(Ip, Sp, Inst)>,
+    /// The exception of the last raise that no handler selected: it ends the execution.
+    uncaught: Option<WasmException>,
 }
 
 impl ExceptionState {
@@ -1051,6 +1066,7 @@ impl ExceptionState {
         self.caught.clear();
         self.pending = None;
         self.unwind = None;
+        self.uncaught = None;
     }
 }
 
@@ -1073,19 +1089,20 @@ impl Stack {
         });
     }
 
-    /// TRust: unwinds to the innermost handler covering the throw site `ip` of the current
+    /// TRust: unwinds to the innermost handler covering the throw site `site` of the current
     /// frame or the call sites of its callers.
     ///
     /// Makes `exception` the pending exception and records the dispatch [`Ip`] of the selected
     /// handler and the [`Sp`] and [`Inst`] of its frame for [`Stack::take_unwind_target`].
-    /// Returns `false`, leaving `self` unchanged, if no handler exists.
+    /// Returns `false` if no handler exists, leaving the frames unchanged and `exception` as the
+    /// uncaught exception that ends the execution ([`Stack::take_uncaught_exception`]).
     ///
     /// With `delegate_to`, only the handler of that `try` may select the exception in the
     /// current frame ([`NO_DELEGATE_TARGET`]: none), as for `delegate` (`exec-throw_ref` step
     /// 16h, which leaves the handlers within the delegate's target label).
     fn raise_exception(
         &mut self,
-        ip: Ip,
+        site: usize,
         exception: WasmException,
         delegate_to: Option<u32>,
     ) -> bool {
@@ -1093,7 +1110,7 @@ impl Stack {
         let mut target = None;
         'frames: for depth in (1..=top).rev() {
             let site = match depth == top {
-                true => ip.addr(),
+                true => site,
                 // Note: callers hold the address after their call operator.
                 false => self.frames.frames[depth - 1].ip.addr().wrapping_sub(1),
             };
@@ -1108,6 +1125,7 @@ impl Stack {
             }
         }
         let Some((depth, handler)) = target else {
+            self.exceptions.uncaught = Some(exception);
             return false;
         };
         while self.frames.frames.len() > depth {
@@ -1131,8 +1149,8 @@ impl Stack {
         true
     }
 
-    /// TRust: raises a new exception of `tag` defined by `instance` at `ip`, with the tag fields
-    /// in the cells `values` of the frame at `sp`.
+    /// TRust: raises a new exception of the tag at index `tag` of `instance` at `ip`, with the
+    /// tag fields in the cells `values` of the frame at `sp`.
     ///
     /// Returns `true` if a handler was selected, see [`Stack::take_unwind_target`].
     ///
@@ -1158,7 +1176,8 @@ impl Stack {
                 field
             })
             .collect();
-        self.raise_exception(ip, WasmException::new(tag, instance, fields), None)
+        let tag = instance_tag(instance, tag);
+        self.raise_exception(ip.addr(), WasmException::new(tag, fields), None)
     }
 
     /// TRust: re-raises the exception for `rethrow` of `try_id` at `ip`.
@@ -1167,7 +1186,7 @@ impl Stack {
     #[inline(never)]
     pub fn rethrow(&mut self, ip: Ip, try_id: u32) -> Option<bool> {
         let exception = self.rethrow_exception(try_id)?;
-        Some(self.raise_exception(ip, exception, None))
+        Some(self.raise_exception(ip.addr(), exception, None))
     }
 
     /// TRust: re-raises the pending exception at `ip` for the `delegate` of a legacy `try`
@@ -1178,7 +1197,7 @@ impl Stack {
     #[inline(never)]
     pub fn delegate(&mut self, ip: Ip, target: u32) -> Option<bool> {
         let exception = self.exceptions.pending.take()?;
-        Some(self.raise_exception(ip, exception, Some(target)))
+        Some(self.raise_exception(ip.addr(), exception, Some(target)))
     }
 
     /// TRust: returns the target recorded by the last successful raise.
@@ -1187,8 +1206,24 @@ impl Stack {
         self.exceptions.unwind.take()
     }
 
-    /// TRust: catches the pending exception if it is of `tag` defined by `instance`, writing
-    /// its fields to the cells `results` of the frame at `sp`.
+    /// TRust: returns the exception that the last raise left uncaught, see
+    /// [`Stack::raise`].
+    #[inline(never)]
+    pub fn take_uncaught_exception(&mut self) -> Option<WasmException> {
+        self.exceptions.uncaught.take()
+    }
+
+    /// TRust: returns `true` if the uncaught exception has no exception instance in the store
+    /// yet.
+    pub fn uncaught_exception_needs_alloc(&self) -> bool {
+        self.exceptions
+            .uncaught
+            .as_ref()
+            .is_some_and(|exception| exception.exn.is_none())
+    }
+
+    /// TRust: catches the pending exception if it is of the tag at index `tag` of `instance`,
+    /// writing its fields to the cells `results` of the frame at `sp`.
     ///
     /// Returns `true` if the exception was caught by the clause of `try_id`.
     #[inline(never)]
@@ -1218,8 +1253,8 @@ impl Stack {
         }
     }
 
-    /// TRust: takes the pending exception if it is of `tag` defined by `instance`, or any
-    /// exception if `tag` is `None`.
+    /// TRust: takes the pending exception if it is of the tag at index `tag` of `instance`, or
+    /// any exception if `tag` is `None`.
     pub fn take_pending_exception_if(
         &mut self,
         tag: Option<u32>,
@@ -1227,7 +1262,7 @@ impl Stack {
     ) -> Option<WasmException> {
         let pending = self.exceptions.pending.as_ref()?;
         if let Some(tag) = tag {
-            if !pending.is_tag(tag, instance) {
+            if !pending.is_tag(instance_tag(instance, tag)) {
                 return None;
             }
         }
@@ -1262,27 +1297,27 @@ impl Stack {
         let exception = &caught[index].exception;
         Some(WasmException {
             tag: exception.tag,
-            instance: exception.instance,
             fields: exception.fields.clone(),
             exn: exception.exn,
         })
     }
 
-    /// TRust: returns `Some` if the pending exception is of `tag` defined by `instance`, or any
-    /// exception if `tag` is `None`, with the reference of its exception instance if it has one.
+    /// TRust: returns `Some` if the pending exception is of the tag at index `tag` of
+    /// `instance`, or any exception if `tag` is `None`, with the reference of its exception
+    /// instance if it has one.
     pub fn pending_exn(&self, tag: Option<u32>, instance: Inst) -> Option<Option<RawRef>> {
         let pending = self.exceptions.pending.as_ref()?;
         if let Some(tag) = tag {
-            if !pending.is_tag(tag, instance) {
+            if !pending.is_tag(instance_tag(instance, tag)) {
                 return None;
             }
         }
         Some(pending.exn())
     }
 
-    /// TRust: catches the pending exception if it is of `tag` defined by `instance`, writing
-    /// its fields to the cells `results` of the frame at `sp`, for the `catch` clause of a
-    /// `try_table` (WebAssembly Core 3.0, `exec-throw_ref` step 15c).
+    /// TRust: catches the pending exception if it is of the tag at index `tag` of `instance`,
+    /// writing its fields to the cells `results` of the frame at `sp`, for the `catch` clause
+    /// of a `try_table` (WebAssembly Core 3.0, `exec-throw_ref` step 15c).
     ///
     /// Returns `true` if the exception was caught.
     #[inline(never)]
@@ -1310,7 +1345,16 @@ impl Stack {
     /// TRust: raises `exception` at `ip`, see [`Stack::throw_exception`].
     #[inline(never)]
     pub fn raise(&mut self, ip: Ip, exception: WasmException) -> bool {
-        self.raise_exception(ip, exception, None)
+        self.raise_exception(ip.addr(), exception, None)
+    }
+
+    /// TRust: raises `exception` at the call operator that precedes the return address
+    /// `return_ip` of the current frame, for an exception that a called host function threw.
+    ///
+    /// Returns `true` if a handler was selected, see [`Stack::take_unwind_target`].
+    pub fn raise_at_call(&mut self, return_ip: Ip, exception: WasmException) -> bool {
+        // Note: like the call sites of callers, a return address follows its call operator.
+        self.raise_exception(return_ip.addr().wrapping_sub(1), exception, None)
     }
 
     /// TRust: conservatively marks the exceptions referenced by the cells, the saved integer
@@ -1330,7 +1374,11 @@ impl Stack {
         let cells = self.values.cells.iter().map(|cell| u64::from(*cell));
         let regs = [u64::from(self.ireg)];
         let exceptions = &self.exceptions;
-        let pending = exceptions.pending.iter().flat_map(WasmException::ref_cells);
+        let pending = exceptions
+            .pending
+            .iter()
+            .chain(&exceptions.uncaught)
+            .flat_map(WasmException::ref_cells);
         let caught = exceptions
             .caught
             .iter()

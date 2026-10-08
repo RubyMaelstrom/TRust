@@ -146,7 +146,9 @@ stat -c '%s bytes' target/release/trust
 ```
 
 Run the owned Wasmi regressions, including native-versus-interpreter
-comparisons and legacy exception handling, with its local dependency patches:
+comparisons, legacy and standardized exception handling, tag imports and
+exports, and exceptions crossing host functions, with its local dependency
+patches:
 
 ```sh
 cargo test --manifest-path vendor/wasmi-2.0.0/Cargo.toml \
@@ -171,9 +173,19 @@ scripts run with
 in front of the command and `--test mod legacy_exception_spec -- --ignored`
 after it; the standardized ones (`try_table`, `throw_ref`, `throw`, `tag`) with
 `WASMI_EH_DIR=/big/web-standards/repositories/WebAssembly/spec/test/core/exceptions`
-and `--test mod integration::exceptions::exception_spec -- --ignored --nocapture`,
-which lists the skipped directives (tag imports and typed references are
-unsupported).
+and `--test mod integration::exceptions::exception_spec -- --ignored --nocapture`.
+Both runners register modules and link their tag imports; they list each skipped
+directive, which are only those needing typed function references or GC rec
+groups (proposals Wasmi does not implement).
+
+The official WebAssembly JS API tag and exception tests
+(`test/js-api/tag/*` and `test/js-api/exception/*`) run in every Lumen tier with
+a minimal testharness:
+
+```sh
+WASM_JS_API_DIR=/big/web-standards/repositories/WebAssembly/spec/test/js-api \
+  cargo test --release --lib webassembly_official_exception_js_api_tests -- --ignored --nocapture
+```
 
 `vendor/wasmi-2.0.0/trust/gen_native_decode.py` regenerates the native
 operator table (`src/engine/native_jit/decode_table.rs`) from the executor's

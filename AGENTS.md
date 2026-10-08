@@ -421,11 +421,19 @@ current behavior and limits; consult the governing standards before changing it.
 - WebAssembly exception handling runs both the legacy (`try`/`catch`/
   `rethrow`/`delegate`) and the standardized (`try_table`, `throw_ref`,
   `exnref`) instructions in the Wasmi fork; exceptions caught by reference
-  live in a collected per-store arena. exnref never crosses into JavaScript
-  (TypeError). Tag imports/exports, `WebAssembly.Tag`, `WebAssembly.Exception`
-  and `JSTag` are unimplemented: an uncaught Wasm exception reaches JavaScript
-  as a `LinkError` instead of an `Exception`, and JavaScript exceptions thrown
-  into Wasm trap instead of being catchable.
+  live in a collected per-store arena. Tags are store objects that modules
+  import and export by identity. `WebAssembly.Tag`, `WebAssembly.Exception`
+  (`getArg`, `is`, `traceStack`/`stack`) and the per-agent `WebAssembly.JSTag`
+  follow the JS API: an uncaught Wasm exception reaches JavaScript as its
+  cached `Exception` object (agent-wide object caches, GC-traced while Wasm
+  still references the exception), or as the original value for JSTag; any
+  throw completion of an imported function (including import TypeErrors and
+  RuntimeErrors that crossed JavaScript) is catchable in Wasm and keeps its
+  identity when thrown back out. Host interruptions stay uncatchable traps.
+  As the JS API requires, exnref never crosses into JavaScript (TypeError for
+  signatures, globals, tables and `Exception` payloads), and v128 fields of
+  `Exception` objects are unreadable. JavaScript values thrown through Wasm
+  are interned like other externrefs and retained for the agent's lifetime.
 - XML MIME types (text/xml, application/xml and any +xml type, including
   application/xhtml+xml and image/svg+xml) navigate to XML documents built by
   the XML parser (`src/dom/xml.rs`), in frames and in the page actor; the

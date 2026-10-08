@@ -1,13 +1,19 @@
 use crate::{
+    AsContext,
     AsContextMut,
+    Error,
     Func,
     RefType,
     StoreContext,
+    Tag,
+    TrapCode,
+    Val,
     core::RawRef,
+    engine::{Cell, LiftFromCells as _, LowerToCells as _, required_cells_for_tys},
     handle::RawHandle,
-    store::{AsStoreId, Stored},
+    store::{AsStoreId, ExnEntity, Stored},
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::{any::Any, num::NonZero};
 
 /// A nullable reference type.
@@ -274,9 +280,138 @@ define_handle! {
     ///
     /// # Note
     ///
-    /// Exception references are only handed out by Wasm results, host function parameters
-    /// and global or table reads. The exception they address stays alive as long as the store.
+    /// The exception that a Wasm result, a host function parameter or a global or table read
+    /// hands out stays alive as long as the store. Exceptions that the host allocates with
+    /// [`ExnRef::new`] or receives as an uncaught exception ([`Error::as_exception`]) are held
+    /// instead, and the store may free them once the host released its holds and Wasm no
+    /// longer references them.
     struct ExnRef(NonZero<u32>, Stored) => ExnRefEntity;
+}
+
+impl ExnRef {
+    /// TRust: allocates a new exception of `tag` with the tag fields `fields` (`exn_alloc`,
+    /// WebAssembly Core 3.0 `appendix/embedding.rst` `embed-exn-alloc`).
+    ///
+    /// The new exception is held once (see [`ExnRef::hold`]): it stays allocated until that
+    /// hold is released, for example by [`ExnRef::release`] or by throwing it from a host
+    /// function with [`Error::exception`].
+    ///
+    /// # Errors
+    ///
+    /// - If `tag` or a value of `fields` does not originate from `ctx`.
+    /// - If the types of `fields` do not match the parameter types of `tag`.
+    /// - If the store cannot allocate another exception.
+    pub fn new(mut ctx: impl AsContextMut, tag: &Tag, fields: &[Val]) -> Result<Self, Error> {
+        let store = &mut ctx.as_context_mut().store.inner;
+        let ty = store
+            .try_resolve_tag(tag)
+            .map_err(|error| Error::new(alloc::format!("invalid exception tag: {error}")))?
+            .ty()
+            .clone();
+        ty.func_type().match_params(fields)?;
+        let len_cells = usize::from(required_cells_for_tys(ty.params())?);
+        let mut cells: Vec<Cell> = (0..len_cells).map(|_| Cell::from(0_u64)).collect();
+        fields
+            .lower_to_cells(&*store, &mut &mut cells[..])
+            .map_err(|error| Error::new(alloc::format!("invalid exception field: {error}")))?;
+        // Host allocations collect as well: exceptions that the host released must not
+        // accumulate while Wasm catches nothing by reference.
+        store.collect_exns_if_due();
+        let raw = store
+            .exns_mut()
+            .alloc(ExnEntity::new(*tag, cells))
+            .ok_or(TrapCode::OutOfSystemMemory)?;
+        store.exns().hold(RawRef::from(raw.get()));
+        Ok(Self::from_raw_parts(raw, &*store))
+    }
+
+    /// TRust: returns the tag of the exception (`exn_tag`).
+    ///
+    /// Returns `None` if `self` does not originate from `ctx` or the exception was freed.
+    pub fn tag(&self, ctx: impl AsContext) -> Option<Tag> {
+        let store = &ctx.as_context().store.inner;
+        let raw = self.unwrap_raw(store)?;
+        Some(store.exns().get(raw)?.tag())
+    }
+
+    /// TRust: returns the tag fields of the exception (`exn_read`).
+    ///
+    /// Returns `None` if `self` does not originate from `ctx` or the exception was freed.
+    pub fn fields(&self, ctx: impl AsContext) -> Option<Vec<Val>> {
+        let store = &ctx.as_context().store.inner;
+        let raw = self.unwrap_raw(store)?;
+        let entity = store.exns().get(raw)?;
+        let ty = store.try_resolve_tag(&entity.tag()).ok()?.ty();
+        let mut fields: Vec<Val> = ty
+            .params()
+            .iter()
+            .copied()
+            .map(Val::default_for_ty)
+            .collect();
+        (&mut fields[..])
+            .lift_from_cells(store, &mut &entity.fields()[..])
+            .ok()?;
+        // The host may keep the exception references it reads.
+        store.pin_exn_vals(&fields);
+        Some(fields)
+    }
+
+    /// TRust: returns the tag field at `index` of the exception (one value of `exn_read`).
+    ///
+    /// Returns `None` if `self` does not originate from `ctx`, the exception was freed or
+    /// `index` is out of bounds.
+    pub fn field(&self, ctx: impl AsContext, index: usize) -> Option<Val> {
+        let store = &ctx.as_context().store.inner;
+        let raw = self.unwrap_raw(store)?;
+        let entity = store.exns().get(raw)?;
+        let params = store.try_resolve_tag(&entity.tag()).ok()?.ty().params();
+        let ty = *params.get(index)?;
+        let offset = usize::from(required_cells_for_tys(&params[..index]).ok()?);
+        let mut field = Val::default_for_ty(ty);
+        (&mut field)
+            .lift_from_cells(store, &mut &entity.fields()[offset..])
+            .ok()?;
+        store.pin_exn_vals(core::slice::from_ref(&field));
+        Some(field)
+    }
+
+    /// TRust: adds a releasable hold of the exception, which keeps it allocated until a
+    /// matching [`ExnRef::release`].
+    ///
+    /// Returns `false` if `self` does not originate from `ctx` or the exception was freed.
+    pub fn hold(&self, ctx: impl AsContext) -> bool {
+        let store = &ctx.as_context().store.inner;
+        self.unwrap_raw(store)
+            .is_some_and(|raw| store.exns().hold(raw))
+    }
+
+    /// TRust: releases one hold of the exception (see [`ExnRef::hold`]).
+    ///
+    /// The store frees the exception once it is neither held nor reachable from Wasm.
+    pub fn release(&self, ctx: impl AsContext) {
+        let store = &ctx.as_context().store.inner;
+        if let Some(raw) = self.unwrap_raw(store) {
+            store.exns().release(raw);
+        }
+    }
+
+    /// TRust: returns the exception address of `self`: a nonzero number that identifies the
+    /// exception while it is allocated, for embedder caches keyed by exception address (for
+    /// example the WebAssembly JavaScript Interface's Exception object cache).
+    ///
+    /// Returns `None` if `self` does not originate from `ctx`.
+    pub fn addr(&self, ctx: impl AsContext) -> Option<u32> {
+        self.unwrap_raw(&ctx.as_context().store.inner)
+            .map(u32::from)
+    }
+
+    /// TRust: returns the reference of the allocated exception at the address `addr` (see
+    /// [`ExnRef::addr`]), or `None` if no exception of `ctx` is allocated there.
+    pub fn from_addr(ctx: impl AsContext, addr: u32) -> Option<Self> {
+        let store = &ctx.as_context().store.inner;
+        store.exns().get(RawRef::from(addr))?;
+        Some(Self::from_raw_parts(NonZero::new(addr)?, store))
+    }
 }
 
 #[test]

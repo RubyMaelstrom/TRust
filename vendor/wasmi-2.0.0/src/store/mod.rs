@@ -107,6 +107,44 @@ impl<T> Store<T> {
         self.inner.visit_function_references(group, root);
     }
 
+    /// TRust: visits the exception references needed by an embedding garbage collector's
+    /// exception identity cache (WebAssembly JavaScript Interface #object-caches, Exception
+    /// object cache).
+    ///
+    /// `reachable` receives every allocated exception that the store keeps on its own: those
+    /// referenced from `exnref` globals and tables, pinned for good, or referenced from the
+    /// fields of such exceptions, transitively. Releasable holds (see [`ExnRef::hold`]) are no
+    /// roots here, so an exception the embedder holds is not reported unless Wasm reaches it as
+    /// well. `edge(from, to)` receives each field of an allocated exception `from` that
+    /// references an allocated exception `to` (conservatively: fields are untyped cells).
+    ///
+    /// Call only while the Store is idle, like [`Store::visit_function_references`].
+    ///
+    /// [`ExnRef::hold`]: crate::ExnRef::hold
+    pub fn visit_exception_references(
+        &self,
+        mut reachable: impl FnMut(crate::ExnRef),
+        mut edge: impl FnMut(crate::ExnRef, crate::ExnRef),
+    ) {
+        let id = self.inner.id();
+        let exn = move |raw: crate::core::RawRef| {
+            core::num::NonZero::new(u32::from(raw))
+                .map(|value| crate::ExnRef::from_raw_parts(value, id))
+        };
+        self.inner.visit_exn_references(
+            |raw| {
+                if let Some(exn) = exn(raw) {
+                    reachable(exn);
+                }
+            },
+            |from, to| {
+                if let (Some(from), Some(to)) = (exn(from), exn(to)) {
+                    edge(from, to);
+                }
+            },
+        );
+    }
+
     /// Returns an exclusive reference to the user provided data owned by this [`Store`].
     pub fn data_mut(&mut self) -> &mut T {
         &mut self.typed.data

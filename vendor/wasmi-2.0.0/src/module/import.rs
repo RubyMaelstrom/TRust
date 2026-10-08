@@ -84,11 +84,10 @@ impl TryFrom<wasmparser::Import<'_>> for Import {
             TypeRef::Table(ty) => ExternTypeIdx::Table(TableType::from_wasmparser(ty)),
             TypeRef::Memory(ty) => ExternTypeIdx::Memory(MemoryType::from_wasmparser(ty)),
             TypeRef::Global(ty) => ExternTypeIdx::Global(GlobalType::from_wasmparser(ty)),
-            // TRust: validation admits tags for legacy exception handling, but Wasmi has no tag
-            //        externs to satisfy an import with. Reject the module instead of panicking.
-            TypeRef::Tag(_) => {
-                return Err(crate::Error::new("tag imports are not supported"));
-            }
+            // TRust: a tag import names the function type of the tag (WebAssembly Core 3.0,
+            //        `binary/modules.rst` `binary-importdesc`); validation has checked that its
+            //        results are empty and its attribute is `exception`.
+            TypeRef::Tag(ty) => ExternTypeIdx::Tag(ty.func_type_idx.into()),
         };
         Ok(Self::new(import.module, import.name, kind))
     }
@@ -126,6 +125,8 @@ pub enum ExternTypeIdx {
     Memory(MemoryType),
     /// An imported global variable.
     Global(GlobalType),
+    /// TRust: an imported exception tag of the given function type.
+    Tag(FuncTypeIdx),
 }
 
 /// A [`FuncType`] index.

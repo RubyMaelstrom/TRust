@@ -43,7 +43,8 @@ pub struct ModuleBuilder {
     pub memories: Vec<MemoryType>,
     pub globals: Vec<GlobalType>,
     pub globals_init: Vec<ConstExpr>,
-    pub tags: Vec<FuncTypeIdx>,
+    /// TRust: the types of the tag index space, imported tags first.
+    pub tags: Vec<DedupFuncType>,
     pub exports: Map<Box<str>, ExternIdx>,
     pub export_order: Vec<Box<str>>,
     pub start: Option<FuncIdx>,
@@ -172,6 +173,7 @@ pub struct ModuleImportsBuilder {
     pub tables: Vec<ImportName>,
     pub memories: Vec<ImportName>,
     pub globals: Vec<ImportName>,
+    pub tags: Vec<ImportName>,
 }
 
 impl ModuleImportsBuilder {
@@ -181,6 +183,7 @@ impl ModuleImportsBuilder {
         let len_globals = self.globals.len();
         let len_memories = self.memories.len();
         let len_tables = self.tables.len();
+        let len_tags = self.tags.len();
         let items = self.items.into_boxed_slice();
         ModuleImports {
             items,
@@ -188,6 +191,7 @@ impl ModuleImportsBuilder {
             len_globals,
             len_memories,
             len_tables,
+            len_tags,
         }
     }
 }
@@ -262,6 +266,12 @@ impl ModuleBuilder {
                     self.imports.globals.push(name);
                     self.globals.push(global_type);
                 }
+                ExternTypeIdx::Tag(func_type_idx) => {
+                    self.imports.items.push(Imported::Tag(name.clone()));
+                    self.imports.tags.push(name);
+                    let func_type = self.func_types[func_type_idx.into_u32() as usize];
+                    self.tags.push(func_type);
+                }
             }
         }
         Ok(())
@@ -301,11 +311,23 @@ impl ModuleBuilder {
     }
 
     /// Pushes the exception tag declarations to the module under construction.
+    ///
+    /// # Note
+    ///
+    /// The defined tags follow the imported ones in the tag index space.
     pub fn push_tags<T>(&mut self, tags: T) -> Result<(), Error>
     where
         T: IntoIterator<Item = Result<FuncTypeIdx, Error>>,
     {
-        self.tags = tags.into_iter().collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            self.tags.len(),
+            self.imports.tags.len(),
+            "tried to initialize module tag declarations twice"
+        );
+        for tag in tags {
+            let func_type = self.func_types[tag?.into_u32() as usize];
+            self.tags.push(func_type);
+        }
         Ok(())
     }
 

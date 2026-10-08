@@ -923,6 +923,35 @@ fn invoke_host(
     Ok(())
 }
 
+/// TRust: where execution continues after a host function call.
+#[derive(Debug, Copy, Clone)]
+pub enum HostCallControl {
+    /// The host function returned to its caller, whose frame starts at the [`Sp`].
+    Return(Sp),
+    /// The host function threw a WebAssembly exception that the handler at the [`Ip`] of the
+    /// frame at the [`Sp`] in the [`Inst`] caught.
+    Unwind(Ip, Sp, Inst),
+}
+
+/// TRust: raises the exception `error` that a host function threw at the call operator before
+/// `return_ip` (WebAssembly JavaScript Interface, "create a host function" step 3.10).
+///
+/// Continues at the selected handler or ends the execution with the uncaught exception.
+#[inline]
+fn raise_host_exception_at(
+    store: &mut PrunedStore,
+    return_ip: Ip,
+    error: Error,
+) -> Control<(Ip, Sp, Inst), Break> {
+    match super::exec::raise_host_exception(store.inner_mut(), return_ip, error) {
+        super::exec::HostRaise::Caught => match store.stack_mut().take_unwind_target() {
+            Some(target) => Control::Continue(target),
+            None => unsafe { unreachable_unchecked!("a caught exception has an unwind target") },
+        },
+        super::exec::HostRaise::Uncaught => super::dispatch::control_break(),
+    }
+}
+
 pub fn call_host(
     store: &mut PrunedStore,
     func: Func,
@@ -931,7 +960,7 @@ pub fn call_host(
     params: BoundedSlotSpan,
     instance: Option<Inst>,
     call_hooks: CallHooks,
-) -> Control<Sp, Break> {
+) -> Control<HostCallControl, Break> {
     debug_assert_eq!(params.len(), host_func.len_param_cells());
     let trampoline = *host_func.trampoline();
     let (sp, frame) = store
@@ -942,9 +971,17 @@ pub fn call_host(
     //       can be derived right away.
     let inout = store.stack_mut().host_inout(frame);
     if let Err(error) = invoke_host(store, trampoline, instance, inout, call_hooks) {
+        // TRust: a thrown exception is raised in the calling frame instead of ending (and
+        //        possibly suspending) the execution like a host trap.
+        if let Some(caller_ip) = caller_ip
+            && error.as_exception().is_some()
+        {
+            let (ip, sp, instance) = raise_host_exception_at(store, caller_ip, error)?;
+            return Control::Continue(HostCallControl::Unwind(ip, sp, instance));
+        }
         done!(store, DoneReason::host_error(error, func, params.span()))
     }
-    Control::Continue(sp)
+    Control::Continue(HostCallControl::Return(sp))
 }
 
 pub fn return_call_host(
@@ -964,6 +1001,14 @@ pub fn return_call_host(
     //       so the `InOutParams` can be derived right away.
     let inout = store.stack_mut().host_inout(frame);
     if let Err(error) = invoke_host(store, trampoline, Some(instance), inout, CallHooks::Call) {
+        // TRust: the tail-called host function replaced its caller, so a thrown exception is
+        //        raised at the call site of the caller's caller. Without one it is uncaught.
+        if error.as_exception().is_some() {
+            if let Control::Continue((return_ip, _, _)) = control {
+                return raise_host_exception_at(store, return_ip, error);
+            }
+            done!(store, DoneReason::error(error))
+        }
         // Note: we won't allow resumption in case the execution would
         //       have returned with this the host function tail call.
         let reason = match control {
@@ -998,7 +1043,7 @@ pub fn call_wasm_or_host(
     let wasm_func = match func_entity {
         FuncEntity::Wasm(wasm_func) => wasm_func,
         FuncEntity::Host(host_func) => {
-            let sp = call_host(
+            let (ip, sp, instance) = match call_host(
                 store,
                 func,
                 Some(caller_ip),
@@ -1006,11 +1051,15 @@ pub fn call_wasm_or_host(
                 params,
                 Some(instance),
                 CallHooks::Call,
-            )?;
+            )? {
+                HostCallControl::Return(sp) => (caller_ip, sp, instance),
+                // TRust: continue at the handler that caught the host function's exception.
+                HostCallControl::Unwind(ip, sp, instance) => (ip, sp, instance),
+            };
             // Note: host functions may grow memories, invalidating the cached `(memory 0)`.
             //       Therefore, it is required to re-extract `(memory 0)` to avoid a stale cache.
             let (mem0, mem0_len) = extract_mem0(instance);
-            return Control::Continue((caller_ip, sp, mem0, mem0_len, instance));
+            return Control::Continue((ip, sp, mem0, mem0_len, instance));
         }
     };
     // Hot path: calling a Wasm function. Uses the cached `FuncEntry` and the same inlined

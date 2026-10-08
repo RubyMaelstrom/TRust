@@ -1,12 +1,13 @@
 //! TRust: a small runner for the official exception-handling `*.wast` scripts.
 //!
 //! It covers the directives of the exception-handling scripts of the WebAssembly specification
-//! and its exception-handling repository. Wasmi has no tag externs, so modules that import tags
-//! cannot be instantiated: their assertions are skipped, and every skip is reported with its
-//! reason.
+//! and its exception-handling repository, including registered modules whose tags others
+//! import. Modules that use proposals Wasmi does not implement (typed function references, GC
+//! rec groups) cannot be compiled: their assertions are skipped, and every skip is reported
+//! with its reason.
 
-use std::collections::HashMap;
-use wasmi::{Engine, ExternRef, Instance, Linker, Module, Nullable, Store, Val, ValType};
+use std::collections::{HashMap, HashSet};
+use wasmi::{Engine, Error, ExternRef, Instance, Linker, Module, Nullable, Store, Val, ValType};
 use wast::{
     Wast, WastArg, WastDirective, WastExecute, WastInvoke, WastRet,
     core::{AbstractHeapType, HeapType, NanPattern, WastArgCore, WastRetCore},
@@ -22,6 +23,8 @@ pub struct Runner {
     linker: Linker<()>,
     last: Option<Instance>,
     named: HashMap<String, Instance>,
+    /// The names under which modules were registered.
+    registered: HashSet<String>,
     /// The names of exports whose invocations are skipped.
     skipped_invokes: Vec<&'static str>,
     /// The reasons of skipped directives.
@@ -32,11 +35,15 @@ impl Runner {
     /// Creates a new [`Runner`] that skips the invocations of the exports `skipped_invokes`.
     pub fn new(skipped_invokes: &[&'static str]) -> Self {
         let engine = Engine::default();
+        let mut linker = Linker::new(&engine);
+        // A later `register` of the same name replaces the earlier one.
+        linker.allow_shadowing(true);
         Self {
             store: Store::new(&engine, ()),
-            linker: Linker::new(&engine),
+            linker,
             last: None,
             named: HashMap::new(),
+            registered: HashSet::new(),
             skipped_invokes: skipped_invokes.to_vec(),
             skips: Vec::new(),
         }
@@ -92,7 +99,8 @@ impl Runner {
         })
     }
 
-    fn invoke(&mut self, invoke: &WastInvoke<'_>) -> Result<Vec<Val>, String> {
+    /// Invokes `invoke`; the outer `Err` is a runner failure, the inner one the call's error.
+    fn invoke(&mut self, invoke: &WastInvoke<'_>) -> Result<Result<Vec<Val>, Error>, String> {
         let instance = self.instance(invoke.module).ok_or("no module")?;
         let func = instance
             .get_func(&self.store, invoke.name)
@@ -109,9 +117,9 @@ impl Runner {
             .copied()
             .map(Val::default_for_ty)
             .collect();
-        func.call(&mut self.store, &args, &mut results)
-            .map_err(|error| format!("error: {error}"))?;
-        Ok(results)
+        Ok(func
+            .call(&mut self.store, &args, &mut results)
+            .map(|()| results))
     }
 
     /// Returns `Some` if the invocation of `exec` is skipped, recording why.
@@ -126,7 +134,7 @@ impl Runner {
         }
         if self.skipped_invokes.contains(&invoke.name) {
             self.skips
-                .push(format!("{}: depends on an imported tag", invoke.name));
+                .push(format!("{}: skipped by the script's caller", invoke.name));
             return Some(());
         }
         None
@@ -196,7 +204,10 @@ impl Runner {
             }
             WastDirective::Register { name, module, .. } => {
                 if let Some(instance) = self.instance(*module) {
-                    let _ = self.linker.instance(&mut self.store, name, instance);
+                    self.linker
+                        .instance(&mut self.store, name, instance)
+                        .map_err(|error| format!("register {name}: {error}"))?;
+                    self.registered.insert(String::from(*name));
                 }
                 Ok(())
             }
@@ -207,7 +218,9 @@ impl Runner {
                 let WastExecute::Invoke(invoke) = exec else {
                     return Err(String::from("unsupported execution"));
                 };
-                let actual = self.invoke(invoke)?;
+                let actual = self
+                    .invoke(invoke)?
+                    .map_err(|error| format!("{}: error: {error}", invoke.name))?;
                 if actual.len() != results.len() {
                     return Err(format!("{}: result arity mismatch", invoke.name));
                 }
@@ -224,9 +237,24 @@ impl Runner {
                 let WastExecute::Invoke(invoke) = exec else {
                     return Err(String::from("unsupported execution"));
                 };
-                match self.invoke(invoke) {
-                    Err(error) if error.contains(UNCAUGHT) => Ok(()),
-                    other => Err(format!("{}: expected an exception: {other:?}", invoke.name)),
+                match self.invoke(invoke)? {
+                    Err(error) => match error.as_exception() {
+                        Some(exn) => {
+                            // The uncaught exception reached the host with its tag and fields.
+                            let tag = exn.tag(&self.store);
+                            let fields = exn.fields(&self.store);
+                            exn.release(&self.store);
+                            match (tag, fields) {
+                                (Some(_), Some(_)) => Ok(()),
+                                _ => Err(format!("{}: dangling uncaught exception", invoke.name)),
+                            }
+                        }
+                        None => Err(format!("{}: expected an exception: {error}", invoke.name)),
+                    },
+                    Ok(results) => Err(format!(
+                        "{}: expected an exception: returned {results:?}",
+                        invoke.name
+                    )),
                 }
             }
             WastDirective::AssertTrap { exec, .. } => {
@@ -236,8 +264,8 @@ impl Runner {
                 let WastExecute::Invoke(invoke) = exec else {
                     return Err(String::from("unsupported execution"));
                 };
-                match self.invoke(invoke) {
-                    Err(error) if !error.contains(UNCAUGHT) => Ok(()),
+                match self.invoke(invoke)? {
+                    Err(error) if error.as_exception().is_none() => Ok(()),
                     other => Err(format!("{}: expected a trap: {other:?}", invoke.name)),
                 }
             }
@@ -250,12 +278,31 @@ impl Runner {
                 },
             },
             WastDirective::AssertUnlinkable { module, .. } => {
-                // These assertions concern the typing of tag imports, which Wasmi rejects.
-                let _ = module_bytes(module)?;
-                self.skips.push(String::from(
-                    "assert_unlinkable: tag imports are unsupported",
-                ));
-                Ok(())
+                let bytes = module_bytes(module)?;
+                let module = match Module::new(self.store.engine(), &bytes[..]) {
+                    Ok(module) => module,
+                    Err(error) => {
+                        self.skips
+                            .push(format!("assert_unlinkable: module: {error}"));
+                        return Ok(());
+                    }
+                };
+                // An import of a module whose registration was skipped cannot show a typing
+                // error: the definition is missing for another reason.
+                if let Some(import) = module
+                    .imports()
+                    .find(|import| !self.registered.contains(import.module()))
+                {
+                    self.skips.push(format!(
+                        "assert_unlinkable: imports from the skipped module {:?}",
+                        import.module()
+                    ));
+                    return Ok(());
+                }
+                match self.linker.instantiate_and_start(&mut self.store, &module) {
+                    Err(error) if error.as_exception().is_none() => Ok(()),
+                    other => Err(format!("module unexpectedly linked: {other:?}")),
+                }
             }
             _ => Err("unsupported directive".into()),
         }

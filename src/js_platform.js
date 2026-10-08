@@ -42787,6 +42787,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     platformSlots.timeRanges || platformSlots.mediaQueryList ||
                     platformSlots.mediaQueryListEvent || platformSlots.locationObject))
                 throw dce("A platform object");
+            // WebAssembly.Tag and WebAssembly.Exception are not [Serializable] (JS API
+            // #tags, #exceptions); their store addresses may be 0.
+            if (platformSlots && (platformSlots.wasmTag !== undefined ||
+                    platformSlots.wasmExn !== undefined))
+                throw dce("A WebAssembly.Tag or WebAssembly.Exception");
             if (wasmClone) {
                 const module = wasmClone.serialize(v, forStorage);
                 if (module) return module;
@@ -45678,6 +45683,197 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
 
+    // ======================= Exception handling =========================
+    // WebAssembly JS API #tags, #exceptions and #js-exceptions (local snapshot
+    // of the spec repository 37d6b059). A Tag object's [[Address]] and an
+    // Exception object's [[Address]], [[Type]] and [[Stack]] are internal slots
+    // shared by this Agent's Realms. Both object caches are agent-wide and live
+    // natively (`lumen_wasm.rs`), like the Exported Function cache: a Wasm
+    // exception thrown out to JavaScript again yields the same Exception object.
+    const ErrorConstructor = Error;
+    const objectCreate = Object.create;
+    const mathTrunc = Math.trunc;
+    const captureStackTrace = Error.captureStackTrace;
+    const errorStackDescriptor = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
+    const errorStackGetter = errorStackDescriptor && errorStackDescriptor.get;
+
+    // Web IDL #js-sequence: GetMethod(V, @@iterator), then iterate to the end,
+    // converting each value with `convert`.
+    function webidlSequence(value, convert, what) {
+        if (!isObject(value)) throw new TypeError(what + " must be an iterable object");
+        const method = value[iteratorSymbol];
+        if (typeof method !== "function") throw new TypeError(what + " must be iterable");
+        const iterator = apply(method, value, []);
+        if (!isObject(iterator)) throw new TypeError(what + ": iterator must be an object");
+        const next = iterator.next;
+        const values = [];
+        while (true) {
+            const step = apply(next, iterator, []);
+            if (!isObject(step)) throw new TypeError(what + ": iterator result must be an object");
+            if (step.done) return values;
+            defineProperty(values, values.length, {
+                value: convert(step.value), writable: true, enumerable: true, configurable: true
+            });
+        }
+    }
+    // Web IDL enum ValueType (JS API #globals): ToString, then membership.
+    const valueTypes = ["i32", "i64", "f32", "f64", "v128", "externref", "anyfunc"];
+    function toValueTypeString(value) {
+        const name = `${value}`;
+        for (let i = 0; i < valueTypes.length; i++) if (valueTypes[i] === name) return name;
+        throw new TypeError("WebAssembly: '" + name + "' is not a valid value type");
+    }
+    function anyValue(value) {
+        return value;
+    }
+    // Web IDL [EnforceRange] unsigned long (#abstract-opdef-converttoint).
+    function enforceRangeU32(value, what) {
+        let number = +value;
+        if (number !== number || number === Infinity || number === -Infinity) {
+            throw new TypeError(what + " must be a finite number");
+        }
+        number = mathTrunc(number);
+        if (number < 0 || number > 0xffffffff) throw new TypeError(what + " is out of range");
+        return number === 0 ? 0 : number;
+    }
+    function tagSlot(value, what) {
+        const id = wasmAddress(value, "wasmTag");
+        if (id === undefined) throw new TypeError(what + " is not a WebAssembly.Tag");
+        return id;
+    }
+    function exceptionSlot(value, what) {
+        const address = wasmAddress(value, "wasmExn");
+        if (address === undefined) throw new TypeError(what + " is not a WebAssembly.Exception");
+        return address;
+    }
+
+    // "create a Tag object": one Tag object per tag address in this Agent.
+    function makeTag(tagId) {
+        const cached = __wasm_exception_binding("tagCache", tagId, undefined);
+        if (cached !== undefined) return cached;
+        const tag = objectCreate(Tag.prototype);
+        setWasmAddress(tag, "wasmTag", tagId);
+        return __wasm_exception_binding("tagCache", tagId, tag);
+    }
+    class Tag {
+        // `new Tag(type)` with the Web IDL dictionary TagType
+        // { required sequence<ValueType> parameters }.
+        constructor(type) {
+            if (arguments.length < 1) throw new TypeError("WebAssembly.Tag: 1 argument required");
+            if (type !== undefined && type !== null && !isObject(type)) {
+                throw new TypeError("WebAssembly.Tag: the tag type must be an object");
+            }
+            const parametersValue = type === undefined || type === null ? undefined : type.parameters;
+            if (parametersValue === undefined) {
+                throw new TypeError("WebAssembly.Tag: parameters is required");
+            }
+            const parameters = webidlSequence(
+                parametersValue, toValueTypeString, "WebAssembly.Tag: parameters");
+            const tagId = __wasm_exception_binding("tagNew", parameters, undefined);
+            // "initialize a Tag object": this object is the address's cached Tag object.
+            setWasmAddress(this, "wasmTag", tagId);
+            __wasm_exception_binding("tagCache", tagId, this);
+        }
+    }
+    defineProperty(Tag.prototype, Symbol.toStringTag, {
+        value: "WebAssembly.Tag", configurable: true
+    });
+
+    // "create an Exception object" for an exception that Wasm threw out to
+    // JavaScript (`lumen_wasm.rs` caches the result). [[Stack]] is undefined.
+    function makeException(address, tagId) {
+        const exception = objectCreate(Exception.prototype);
+        setWasmAddress(exception, "wasmExn", address);
+        setWasmAddress(exception, "exnTag", tagId);
+        setWasmAddress(exception, "exnStack", undefined);
+        return exception;
+    }
+    // "create a host function" step 3.10.2: the [[Address]] of an Exception
+    // object that an imported function threw, or -1 for any other value.
+    function exceptionAddress(value) {
+        const address = wasmAddress(value, "wasmExn");
+        return address === undefined ? -1 : address;
+    }
+    // ExceptionOptions.traceStack: a representation of the call stack that
+    // called the Exception constructor, in the format of Error.prototype.stack.
+    function captureCallStack() {
+        try {
+            if (typeof captureStackTrace === "function") {
+                const holder = {};
+                apply(captureStackTrace, ErrorConstructor, [holder, Exception]);
+                const stack = holder.stack;
+                if (typeof stack === "string") return stack;
+            }
+            if (typeof errorStackGetter === "function") {
+                const stack = apply(errorStackGetter, new ErrorConstructor(), []);
+                if (typeof stack === "string") return stack;
+            }
+        } catch (error) {
+            // The specification permits undefined when no representation exists.
+        }
+        return undefined;
+    }
+    class Exception {
+        constructor(exceptionTag, payload, options) {
+            if (arguments.length < 2) {
+                throw new TypeError("WebAssembly.Exception: 2 arguments required");
+            }
+            // Web IDL argument conversions, in order.
+            const tagId = tagSlot(exceptionTag, "WebAssembly.Exception: exceptionTag");
+            const values = webidlSequence(payload, anyValue, "WebAssembly.Exception: payload");
+            if (options !== undefined && options !== null && !isObject(options)) {
+                throw new TypeError("WebAssembly.Exception: options must be an object");
+            }
+            const traceStackValue =
+                options === undefined || options === null ? undefined : options.traceStack;
+            const traceStack = traceStackValue === undefined ? false : !!traceStackValue;
+            // Steps 1–9 (the JSTag check, the payload's types and exn_alloc).
+            const address = __wasm_exception_binding("exceptionNew", tagId, values);
+            // Step 10, "initialize an Exception object".
+            setWasmAddress(this, "wasmExn", address);
+            setWasmAddress(this, "exnTag", tagId);
+            setWasmAddress(this, "exnStack", undefined);
+            __wasm_exception_binding("exceptionCache", address, this);
+            // Step 11.
+            if (traceStack) setWasmAddress(this, "exnStack", captureCallStack());
+        }
+        getArg(exceptionTag, index) {
+            const address = exceptionSlot(this, "WebAssembly.Exception.prototype.getArg: this");
+            if (arguments.length < 2) {
+                throw new TypeError("WebAssembly.Exception.prototype.getArg: 2 arguments required");
+            }
+            const tagId = tagSlot(exceptionTag, "WebAssembly.Exception.prototype.getArg: exceptionTag");
+            const position = enforceRangeU32(index, "WebAssembly.Exception.prototype.getArg: index");
+            if (wasmAddress(this, "exnTag") !== tagId) {
+                throw new TypeError("WebAssembly.Exception.prototype.getArg: the exception has another tag");
+            }
+            return __wasm_exception_binding("exceptionArg", address, position);
+        }
+        is(exceptionTag) {
+            exceptionSlot(this, "WebAssembly.Exception.prototype.is: this");
+            if (arguments.length < 1) {
+                throw new TypeError("WebAssembly.Exception.prototype.is: 1 argument required");
+            }
+            const tagId = tagSlot(exceptionTag, "WebAssembly.Exception.prototype.is: exceptionTag");
+            return wasmAddress(this, "exnTag") === tagId;
+        }
+        get stack() {
+            exceptionSlot(this, "WebAssembly.Exception.prototype.stack: this");
+            return wasmAddress(this, "exnStack");
+        }
+    }
+    // Web IDL #interface-object: the constructor's length counts the required
+    // arguments; regular operations and attributes are enumerable.
+    defineProperty(Exception, "length", { value: 2, configurable: true });
+    for (const name of ["getArg", "is", "stack"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(Exception.prototype, name);
+        descriptor.enumerable = true;
+        defineProperty(Exception.prototype, name, descriptor);
+    }
+    defineProperty(Exception.prototype, Symbol.toStringTag, {
+        value: "WebAssembly.Exception", configurable: true
+    });
+
     // Build an Instance's exports object (js-api "create the exports"): a
     // null-prototype, frozen object mapping each export name to its wrapper.
     function buildExports(instanceId, moduleId) {
@@ -45692,6 +45888,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             else if (kind === "global") exports[name] = makeGlobal(sub);
             else if (kind === "memory") exports[name] = makeMemory(sub);
             else if (kind === "table") exports[name] = makeTable(sub, auxiliaryType);
+            else if (kind === "tag") exports[name] = makeTag(sub);
         }
         return Object.freeze(exports);
     }
@@ -45800,6 +45997,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                         throw new LinkError(
                             "import '" + imp.module + "." + imp.name +
                             "' must be a WebAssembly.Table"
+                        );
+                    }
+                    break;
+                case "tag":
+                    // "read the imports" step 4.11: v must implement Tag.
+                    if (wasmAddress(value, "wasmTag") !== undefined) {
+                        descriptor.push(["tg", wasmAddress(value, "wasmTag")]);
+                    } else {
+                        throw new LinkError(
+                            "import '" + imp.module + "." + imp.name +
+                            "' must be a WebAssembly.Tag"
                         );
                     }
                     break;
@@ -45915,6 +46123,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         value: "WebAssembly",
         configurable: true,
     });
+    // [LegacyNamespace=WebAssembly] interfaces are writable, configurable,
+    // non-enumerable properties of the namespace (Web IDL #legacy-namespace).
+    defineProperty(WebAssembly, "Tag", { value: Tag, writable: true, configurable: true });
+    defineProperty(WebAssembly, "Exception", {
+        value: Exception, writable: true, configurable: true
+    });
+    // The JSTag namespace attribute: an enumerable, configurable accessor
+    // without a setter whose getter is named "get JSTag".
+    defineProperty(WebAssembly, "JSTag", {
+        get: Object.getOwnPropertyDescriptor({
+            get JSTag() {
+                return makeTag(__wasm_exception_binding("jsTag", undefined, undefined));
+            }
+        }, "JSTag").get,
+        enumerable: true,
+        configurable: true,
+    });
     g.WebAssembly = WebAssembly;
     // The native Wasm bridge reaches these operations through this Realm's
     // private control object (Window or worker), never through the global.
@@ -45925,6 +46150,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     bridge.externGet = externGet;
     bridge.invokeImport = invokeImport;
     bridge.importResults = importResults;
+    bridge.makeException = makeException;
+    bridge.exceptionAddress = exceptionAddress;
     apply(weakGet, __platform_slots("controls", new WeakMap()), [g]).wasm = bridge;
 })(typeof globalThis !== "undefined" ? globalThis : this);
 /*__WASM_END__*/

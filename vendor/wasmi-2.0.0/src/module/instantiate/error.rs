@@ -6,6 +6,7 @@ use crate::{
     MemoryType,
     Table,
     TableType,
+    TagType,
     errors::{MemoryError, TableError},
     module::ImportName,
 };
@@ -68,6 +69,15 @@ pub enum InstantiationError {
         expected: MemoryType,
         /// The actual memory type of the import.
         actual: MemoryType,
+    },
+    /// TRust: returned when an imported exception tag has a mismatching type.
+    TagTypeMismatch {
+        /// Name and module of the import.
+        name: ImportName,
+        /// The expected tag type of the import.
+        expected: TagType,
+        /// The actual tag type of the import.
+        actual: TagType,
     },
     /// Caused when an element segment does not fit into the specified table instance.
     ElementSegmentDoesNotFit {
@@ -165,6 +175,18 @@ impl InstantiationError {
     }
 }
 
+impl InstantiationError {
+    /// TRust: creates a new [`Self::TagTypeMismatch`] from its parts.
+    #[cold]
+    pub fn tag_type_mismatch(name: &ImportName, expected: &TagType, actual: &TagType) -> Self {
+        Self::TagTypeMismatch {
+            name: name.clone(),
+            expected: expected.clone(),
+            actual: actual.clone(),
+        }
+    }
+}
+
 impl Error for InstantiationError {}
 
 impl Display for InstantiationError {
@@ -221,6 +243,14 @@ impl Display for InstantiationError {
             } => write!(
                 f,
                 "out of bounds table access: {table:?} does not fit {amount} elements starting from offset {offset}",
+            ),
+            Self::TagTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "imported tag {name} type mismatch. expected {expected:?} but found {actual:?}"
             ),
             Self::UnexpectedStartFn { index } => {
                 write!(f, "found an unexpected start function with index {index}")

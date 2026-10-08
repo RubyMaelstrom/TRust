@@ -36,9 +36,16 @@ wasmi
   try/catch/catch_all/throw/rethrow/delegate, and execution. A `try` installs a
   handler whose coverage is its encoded body; unwinding validates the throw or
   call site of each frame against it, so branches, returns and tail calls out of
-  a body need no bookkeeping. Tags are identified by their defining instance and
-  index. Tag imports are rejected and tag exports omitted with errors instead of
-  panics (Wasmi has no tag externs).
+  a body need no bookkeeping.
+- Tags (WebAssembly 3.0 exec/modules.rst `alloc-tag`, valid/matching.rst
+  `match-tagtype`; src/tag.rs): `Tag`/`TagType` are store objects and
+  `Extern::Tag`/`ExternType::Tag` externs. Modules import tags (the tag index
+  space starts with them; types must be equal) and export them; each
+  instantiation allocates fresh tags for the module's definitions, and the host
+  allocates tags with `Tag::new` (`tag_alloc`). Exceptions are identified by
+  their tag address, so a catch clause catches the exceptions of every instance
+  that shares the tag. Instances keep their tag index space in the instance
+  header (`InstanceEntity::get_tag`, `ThinPtr::get_tag`).
 - Standardized exception handling (WebAssembly 3.0, exec/instructions.rst
   `exec-try_table`, `exec-throw_ref`): `try_table` installs a handler like a
   `try`; its catch clauses (`catch`, `catch_ref`, `catch_all`,
@@ -50,7 +57,22 @@ wasmi
   (src/store/exn.rs) only once a reference to them exists; a conservative mark
   and sweep collection frees unreachable ones (roots: `exnref` globals and
   tables, the executing stack; references read by the host or held by a
-  suspended resumable call are pinned).
+  suspended resumable call are pinned; embedders may instead count releasable
+  holds, `ExnRef::hold`/`ExnRef::release`).
+- Exceptions across host functions (appendix/embedding.rst `embed-func-invoke`;
+  WebAssembly JS API "call an Exported Function" step 11, "create a host
+  function" step 3.10): an exception that no handler of an execution catches
+  enters the store and ends it with `ErrorKind::Exception` (`Error::exception`,
+  `Error::as_exception`), carrying one hold for the embedder. A host function
+  that returns such an error raises its exception at the call operator of its
+  caller (a tail-called host function at its caller's caller), where Wasm
+  handlers catch it; raising releases the transferred hold. Host traps stay
+  uncatchable. `ExnRef::new` (`exn_alloc`, held once and collecting when due),
+  `ExnRef::tag` (`exn_tag`), `ExnRef::fields`/`ExnRef::field` (`exn_read`),
+  `ExnRef::addr`/`ExnRef::from_addr` (exception addresses for embedder caches)
+  and `Store::visit_exception_references` (which held exceptions Wasm still
+  reaches, and the exception references in exception fields) serve the
+  WebAssembly JS API's Exception objects.
 - Public API: `Memory::share`, `SharedBytes`,
   `Store::visit_function_references` (conservative function-liveness groups
   and funcref roots, including stored exception fields, for an embedder's
@@ -69,11 +91,15 @@ wasmi
   trust/gen_native_decode.py from the executor's handler tables. Tests:
   src/engine/native_jit/{tests.rs,tests/simd.rs,spec.rs}.
 - Tests: tests/integration/{module_metadata.rs,legacy_exceptions.rs,
-  exceptions.rs,wast_script.rs} and src/store/exn.rs.
+  exceptions.rs,wast_script.rs} and src/store/exn.rs. The official
+  exception-handling scripts run with their registered modules and tag
+  imports; only directives that need typed function references or GC rec
+  groups (proposals Wasmi does not implement) are skipped.
 - Stack-safe dispatch: optimized builds pass control between handlers with
   sibling calls, which LLVM drops when a handler local's address escapes. The
   native-entry hook and the exception handlers keep their state in the store
-  and call out-of-line helpers with scalars only. `memory.grow` and
+  and call out-of-line helpers with scalars only (`raise_host_exception`,
+  `end_with_uncaught_exception`). `memory.grow` and
   `table.grow` likewise grow out of line (`grow_memory`, `grow_table`); in
   pristine 2.0 each executed grow left one native frame behind. TRust builds
   these crates non-incrementally in its release profile because incremental

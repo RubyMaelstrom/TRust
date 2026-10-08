@@ -11,6 +11,8 @@ use crate::{
     InstanceEntity,
     Memory,
     Table,
+    Tag,
+    TagEntity,
     collections::arena::{Arena, ArenaError, ArenaKey, StableArena},
     core::{CoreElementSegment, CoreGlobal, CoreMemory, CoreTable, Fuel},
     engine::{DedupFuncType, ExecContext, Inst},
@@ -18,6 +20,7 @@ use crate::{
     reftype::{ExternRef, ExternRefEntity},
     store::{
         AsStoreId as _,
+        ExnMarker,
         ExnStore,
         Handle,
         RawHandle,
@@ -156,6 +159,8 @@ pub struct StoreInner {
     /// TRust: `true` if hot regions may run natively, copied from the [`Engine`]'s config.
     #[cfg(wasmi_native_jit)]
     native_jit: bool,
+    /// TRust: the exception tags (`tag_alloc`, module tag definitions).
+    tags: StoreArena<Tag>,
     /// TRust: the exception instances addressed by exception references.
     exns: ExnStore,
     /// TRust: the number of executions on this store, including parked enclosing ones.
@@ -186,6 +191,7 @@ impl StoreInner {
             features,
             #[cfg(wasmi_native_jit)]
             native_jit: config.native_jit_enabled(),
+            tags: Arena::new(),
             exns: ExnStore::default(),
             exec_depth: 0,
         }
@@ -258,19 +264,57 @@ impl StoreInner {
             tables,
             ..
         } = self;
-        exns.collect(|marker| {
-            for (_, global) in globals.iter() {
-                if global.ty().content() == crate::ValType::ExnRef {
-                    marker.mark_cells([u64::from(*global.get_raw())]);
-                }
+        exns.collect(|marker| Self::trace_exn_roots(globals, tables, exec, marker));
+    }
+
+    /// TRust: marks the exceptions that the `exnref` globals and tables and the installed
+    /// execution [`Stack`] reference.
+    ///
+    /// [`Stack`]: crate::engine::Stack
+    fn trace_exn_roots(
+        globals: &StableStoreArena<Global>,
+        tables: &StableStoreArena<Table>,
+        exec: &ExecContext,
+        marker: &mut ExnMarker<'_>,
+    ) {
+        for (_, global) in globals.iter() {
+            if global.ty().content() == crate::ValType::ExnRef {
+                marker.mark_cells([u64::from(*global.get_raw())]);
             }
-            for (_, table) in tables.iter() {
-                if table.ty().element() == crate::RefType::Exn {
-                    marker.mark_refs(table.raw_elements().iter().copied());
-                }
+        }
+        for (_, table) in tables.iter() {
+            if table.ty().element() == crate::RefType::Exn {
+                marker.mark_refs(table.raw_elements().iter().copied());
             }
-            exec.stack_mut().trace_exns(marker);
-        });
+        }
+        exec.stack().trace_exns(marker);
+    }
+
+    /// TRust: reports the exceptions the store keeps without releasable embedder holds to
+    /// `reachable`, and the exception references in the fields of live exceptions to `edge`
+    /// (see [`ExnStore::visit_references`]).
+    ///
+    /// # Note
+    ///
+    /// The roots are those of the store's exception collection. Executions parked behind a host
+    /// function are not visible, so this is only complete while no Wasm executes.
+    pub fn visit_exn_references(
+        &self,
+        reachable: impl FnMut(crate::core::RawRef),
+        edge: impl FnMut(crate::core::RawRef, crate::core::RawRef),
+    ) {
+        let Self {
+            exns,
+            exec,
+            globals,
+            tables,
+            ..
+        } = self;
+        exns.visit_references(
+            |marker| Self::trace_exn_roots(globals, tables, exec, marker),
+            reachable,
+            edge,
+        );
     }
 
     /// Returns the [`StoreId`] of `self`.
@@ -492,6 +536,15 @@ impl StoreInner {
             Err(err) => handle_arena_err(err, "alloc element segment"),
         };
         ElementSegment::from_raw(self.id.wrap(key))
+    }
+
+    /// TRust: allocates a new [`TagEntity`] and returns a [`Tag`] reference to it.
+    pub fn alloc_tag(&mut self, value: TagEntity) -> Tag {
+        let key = match self.tags.alloc(value) {
+            Ok(key) => key,
+            Err(err) => handle_arena_err(err, "alloc tag"),
+        };
+        Tag::from_raw(self.id.wrap(key))
     }
 
     /// Allocates a new [`ExternRefEntity`] and returns a [`ExternRef`] reference to it.
@@ -881,6 +934,16 @@ impl StoreInner {
         self.resolve(key.as_raw(), &self.instances)
     }
 
+    /// TRust: returns a shared reference to the [`TagEntity`] associated to the given [`Tag`].
+    ///
+    /// # Errors
+    ///
+    /// - If the [`Tag`] does not originate from this [`StoreInner`].
+    /// - If the [`Tag`] cannot be resolved to its entity.
+    pub fn try_resolve_tag(&self, key: &Tag) -> Result<&TagEntity, InternalStoreError> {
+        self.resolve(key.as_raw(), &self.tags)
+    }
+
     /// Returns a shared reference to the [`ExternRefEntity`] associated to the given [`ExternRef`].
     ///
     /// # Errors
@@ -1012,6 +1075,7 @@ impl StoreInner {
 
         pub fn resolve_instance(&Self, instance: &Instance) -> &InstanceEntity = Self::try_resolve_instance;
         pub fn resolve_externref(&Self, data: &ExternRef) -> &ExternRefEntity = Self::try_resolve_externref;
+        pub fn resolve_tag(&Self, tag: &Tag) -> &TagEntity = Self::try_resolve_tag;
 
         pub fn resolve_memory_ptr(&mut Self, memory: &Memory) -> NonNull<CoreMemory> = Self::try_resolve_memory_ptr;
         pub fn resolve_global_ptr(&mut Self, global: &Global) -> NonNull<CoreGlobal> = Self::try_resolve_global_ptr;

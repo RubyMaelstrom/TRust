@@ -7,12 +7,37 @@
 //! branch to labels counted from outside the `try_table`; catch clauses with `_ref` also push
 //! the exception reference, which `throw_ref` raises again.
 //!
+//! Tags are store objects that modules import and export by identity (`exec/modules.rst`
+//! `alloc-tag`, `valid/matching.rst` `match-tagtype`), and exceptions cross host functions in
+//! both directions (`appendix/embedding.rst` `embed-func-invoke`): an uncaught exception reaches
+//! the host as [`Error::as_exception`], and a host function that returns [`Error::exception`]
+//! raises it at its call site.
+//!
 //! `WASMI_EH_DIR=/path/to/spec/test/core/exceptions cargo test exception_spec -- --ignored`
-//! runs the official scripts. Modules that import tags are skipped: Wasmi has no tag externs.
+//! runs the official scripts. Only modules that need typed function references or GC rec groups
+//! are skipped: Wasmi does not implement those proposals.
 
 use super::wast_script::{Runner, UNCAUGHT};
-use std::path::Path;
-use wasmi::{Engine, Func, FuncType, Instance, Linker, Module, Nullable, Store, Val, ValType};
+use std::{collections::HashSet, path::Path};
+use wasmi::{
+    Caller,
+    Engine,
+    Error,
+    ExnRef,
+    Extern,
+    Func,
+    FuncType,
+    Instance,
+    Linker,
+    Module,
+    Nullable,
+    Store,
+    Tag,
+    TagType,
+    Val,
+    ValType,
+    errors::{ErrorKind, InstantiationError},
+};
 
 fn instantiate(wat: &str) -> (Store<()>, Instance) {
     let engine = Engine::default();
@@ -24,8 +49,8 @@ fn instantiate(wat: &str) -> (Store<()>, Instance) {
     (store, instance)
 }
 
-fn call(
-    store: &mut Store<()>,
+fn call<T>(
+    store: &mut Store<T>,
     instance: Instance,
     name: &str,
     args: &[Val],
@@ -43,8 +68,8 @@ fn call(
     Ok(results)
 }
 
-fn call_i32(
-    store: &mut Store<()>,
+fn call_i32<T>(
+    store: &mut Store<T>,
     instance: Instance,
     name: &str,
     args: &[Val],
@@ -704,25 +729,359 @@ fn fuel_metering_charges_catch_clauses() {
     assert!(!error.contains(UNCAUGHT), "{error}");
 }
 
+/// Returns the uncaught exception of `result`, panicking if it is anything else.
+fn uncaught<T: std::fmt::Debug>(result: Result<T, Error>) -> ExnRef {
+    match result {
+        Err(error) => error
+            .as_exception()
+            .unwrap_or_else(|| panic!("expected an exception: {error}")),
+        Ok(value) => panic!("expected an exception, got {value:?}"),
+    }
+}
+
+fn module(engine: &Engine, wat: &str) -> Module {
+    Module::new(engine, wat::parse_str(wat).unwrap()).unwrap()
+}
+
+#[test]
+fn tags_are_shared_by_import_and_fresh_per_instantiation() {
+    // `alloc-module` allocates new tags for each instantiation, and an imported tag is the
+    // exporter's tag, so the importer's clauses catch the exporter's exceptions.
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let mut linker = <Linker<()>>::new(&engine);
+    let exporter = module(
+        &engine,
+        r#"
+        (module
+          (tag $e (export "e") (param i32))
+          (func (export "throw") (param i32) (throw $e (local.get 0))))
+        "#,
+    );
+    let a = linker.instantiate_and_start(&mut store, &exporter).unwrap();
+    let b = linker.instantiate_and_start(&mut store, &exporter).unwrap();
+    let ea = a.get_tag(&store, "e").unwrap();
+    let eb = b.get_tag(&store, "e").unwrap();
+    assert_ne!(ea, eb, "each instantiation allocates its own tags");
+    assert_eq!(ea.ty(&store), TagType::new([ValType::I32]));
+    assert_eq!(ea.ty(&store).params(), &[ValType::I32]);
+    linker.instance(&mut store, "a", a).unwrap();
+    linker
+        .define("b", "throw", b.get_func(&store, "throw").unwrap())
+        .unwrap();
+    let importer = module(
+        &engine,
+        r#"
+        (module
+          (import "a" "e" (tag $e (param i32)))
+          (import "a" "throw" (func $throw_a (param i32)))
+          (import "b" "throw" (func $throw_b (param i32)))
+          (export "e" (tag $e))
+          (func (export "catch_a") (result i32)
+            (block $h (result i32)
+              (try_table (catch $e $h) (call $throw_a (i32.const 7)))
+              (i32.const -1)))
+          (func (export "catch_b") (result i32)
+            (block $h (result i32)
+              (try_table (catch $e $h) (call $throw_b (i32.const 8)))
+              (i32.const -1))))
+        "#,
+    );
+    let types: Vec<_> = importer
+        .imports()
+        .map(|import| import.ty().clone())
+        .collect();
+    assert!(matches!(&types[0], wasmi::ExternType::Tag(ty) if ty.params() == [ValType::I32]));
+    assert!(matches!(
+        importer.get_export("e"),
+        Some(wasmi::ExternType::Tag(_))
+    ));
+    let instance = linker.instantiate_and_start(&mut store, &importer).unwrap();
+    assert_eq!(instance.get_tag(&store, "e"), Some(ea), "re-exported tag");
+    assert_eq!(call_i32(&mut store, instance, "catch_a", &[]), Ok(7));
+    // The other instance's tag is a different tag: its exception is not caught.
+    let catch_b = instance.get_func(&store, "catch_b").unwrap();
+    let exn = uncaught(catch_b.call(&mut store, &[], &mut [Val::I32(0)]));
+    assert_eq!(exn.tag(&store), Some(eb));
+    assert!(matches!(exn.fields(&store).as_deref(), Some([Val::I32(8)])));
+    exn.release(&store);
+}
+
+#[test]
+fn tag_imports_check_their_types() {
+    // `match-tagtype`: the imported tag's type must be equivalent to the declared one.
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let mut linker = <Linker<()>>::new(&engine);
+    let tag = Tag::new(&mut store, TagType::new([ValType::I64]));
+    linker.define("host", "tag", tag).unwrap();
+    linker.func_wrap("host", "func", |_: i32| {}).unwrap();
+    let mismatch = module(
+        &engine,
+        r#"(module (import "host" "tag" (tag (param i32))))"#,
+    );
+    let error = linker
+        .instantiate_and_start(&mut store, &mismatch)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            ErrorKind::Instantiation(InstantiationError::TagTypeMismatch { .. })
+        ),
+        "{error}"
+    );
+    let wrong_kind = module(
+        &engine,
+        r#"(module (import "host" "func" (tag (param i32))))"#,
+    );
+    assert!(
+        linker
+            .instantiate_and_start(&mut store, &wrong_kind)
+            .is_err()
+    );
+    let matching = module(
+        &engine,
+        r#"(module (import "host" "tag" (tag (param i64))))"#,
+    );
+    linker.instantiate_and_start(&mut store, &matching).unwrap();
+}
+
+#[test]
+fn host_functions_throw_exceptions_that_wasm_catches() {
+    // A host function's exception is raised at its call site (JavaScript Interface, "create a
+    // host function" step 3.10): the caller's clauses catch it by tag, and a reference to it
+    // keeps the address the host allocated.
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, Vec::<u32>::new());
+    let tag = Tag::new(&mut store, TagType::new([ValType::I32, ValType::F64]));
+    let mut linker = <Linker<Vec<u32>>>::new(&engine);
+    linker.define("host", "tag", tag).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "throw",
+            move |mut caller: Caller<'_, Vec<u32>>, value: i32| -> Result<(), Error> {
+                let exn = ExnRef::new(&mut caller, &tag, &[Val::I32(value), Val::F64(2.5.into())])?;
+                let addr = exn.addr(&caller).unwrap();
+                caller.data_mut().push(addr);
+                Err(Error::exception(exn))
+            },
+        )
+        .unwrap();
+    let module = module(
+        &engine,
+        r#"
+        (module
+          (import "host" "tag" (tag $t (param i32 f64)))
+          (import "host" "throw" (func $throw (param i32)))
+          (global $kept (mut exnref) (ref.null exn))
+          (func (export "payload") (param i32) (result i32)
+            (block $h (result i32 f64)
+              (try_table (catch $t $h) (call $throw (local.get 0)))
+              (unreachable))
+            (drop))
+          (func (export "keep") (param i32)
+            (global.set $kept
+              (block $h (result exnref)
+                (try_table (catch_all_ref $h) (call $throw (local.get 0)))
+                (unreachable))))
+          (func (export "rethrow") (throw_ref (global.get $kept)))
+          (func (export "uncaught") (param i32) (call $throw (local.get 0)))
+          (func $tail (param i32) (return_call $throw (local.get 0)))
+          (func (export "tail") (param i32) (return_call $throw (local.get 0)))
+          (func (export "catch_tail") (param i32) (result i32)
+            (block $h (result i32 f64)
+              (try_table (catch $t $h) (call $tail (local.get 0)))
+              (unreachable))
+            (drop)))
+        "#,
+    );
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+    assert_eq!(
+        call_i32(&mut store, instance, "payload", &[Val::I32(5)]),
+        Ok(5)
+    );
+    // Tail-called host functions raise at the call site of their caller's caller.
+    assert_eq!(
+        call_i32(&mut store, instance, "catch_tail", &[Val::I32(4)]),
+        Ok(4)
+    );
+    call(&mut store, instance, "keep", &[Val::I32(6)]).unwrap();
+    let kept = *store.data().last().unwrap();
+    let mut reachable = Vec::new();
+    store.visit_exception_references(|exn| reachable.push(exn.addr(&store).unwrap()), |_, _| {});
+    assert!(
+        reachable.contains(&kept),
+        "an exnref global keeps the exception"
+    );
+    let rethrow = instance.get_func(&store, "rethrow").unwrap();
+    let exn = uncaught(rethrow.call(&mut store, &[], &mut []));
+    assert_eq!(exn.addr(&store), Some(kept), "rethrown with its address");
+    assert_eq!(exn.tag(&store), Some(tag));
+    assert!(matches!(
+        exn.fields(&store).as_deref(),
+        Some([Val::I32(6), Val::F64(f)]) if f.to_float() == 2.5
+    ));
+    exn.release(&store);
+    for name in ["uncaught", "tail"] {
+        let func = instance.get_func(&store, name).unwrap();
+        let exn = uncaught(func.call(&mut store, &[Val::I32(9)], &mut []));
+        assert_eq!(exn.addr(&store), store.data().last().copied(), "{name}");
+        assert!(matches!(
+            exn.fields(&store).as_deref(),
+            Some([Val::I32(9), _])
+        ));
+        exn.release(&store);
+    }
+    // A host function's trap is no exception: no handler catches it.
+    let trap = Func::wrap(&mut store, || -> Result<(), Error> {
+        Err(Error::new("trap"))
+    });
+    linker.allow_shadowing(true);
+    linker.define("host", "throw", trap).unwrap();
+    let trapping = module_with_trap(&engine);
+    let instance = linker.instantiate_and_start(&mut store, &trapping).unwrap();
+    let error = call(&mut store, instance, "run", &[]).unwrap_err();
+    assert!(!error.contains(UNCAUGHT), "{error}");
+}
+
+fn module_with_trap(engine: &Engine) -> Module {
+    module(
+        engine,
+        r#"
+        (module
+          (import "host" "throw" (func $trap))
+          (func (export "run") (result i32)
+            (block $h
+              (try_table (catch_all $h) (call $trap)))
+            (i32.const 1)))
+        "#,
+    )
+}
+
+#[test]
+fn exceptions_propagate_through_nested_executions() {
+    // An exception that leaves a nested execution reaches the calling host function, which
+    // passes it on to its Wasm caller unchanged: the caller catches the same exception.
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, Vec::<u32>::new());
+    let mut linker = <Linker<Vec<u32>>>::new(&engine);
+    linker
+        .func_wrap(
+            "host",
+            "reenter",
+            |mut caller: Caller<'_, Vec<u32>>, n: i32| -> Result<(), Error> {
+                let Some(Extern::Func(inner)) = caller.get_export("inner") else {
+                    panic!("missing export `inner`")
+                };
+                let result = inner.call(&mut caller, &[Val::I32(n)], &mut []);
+                if let Some(exn) = result.as_ref().err().and_then(Error::as_exception) {
+                    let addr = exn.addr(&caller).unwrap();
+                    caller.data_mut().push(addr);
+                }
+                result
+            },
+        )
+        .unwrap();
+    let module = module(
+        &engine,
+        r#"
+        (module
+          (import "host" "reenter" (func $reenter (param i32)))
+          (tag $e (param i32))
+          (global $kept (mut exnref) (ref.null exn))
+          (func (export "inner") (param i32) (throw $e (local.get 0)))
+          (func (export "outer") (param i32) (result i32)
+            (block $h (result i32 exnref)
+              (try_table (catch_ref $e $h) (call $reenter (local.get 0)))
+              (unreachable))
+            (global.set $kept))
+          (func (export "rethrow") (throw_ref (global.get $kept))))
+        "#,
+    );
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+    assert_eq!(
+        call_i32(&mut store, instance, "outer", &[Val::I32(11)]),
+        Ok(11)
+    );
+    let seen = store.data()[0];
+    let rethrow = instance.get_func(&store, "rethrow").unwrap();
+    let exn = uncaught(rethrow.call(&mut store, &[], &mut []));
+    assert_eq!(exn.addr(&store), Some(seen));
+    exn.release(&store);
+}
+
+#[test]
+fn start_functions_throw_exceptions() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let module = module(
+        &engine,
+        r#"
+        (module
+          (tag $e (export "e") (param i32))
+          (func $start (throw $e (i32.const 3)))
+          (start $start))
+        "#,
+    );
+    let exn = uncaught(Linker::new(&engine).instantiate_and_start(&mut store, &module));
+    assert!(matches!(exn.fields(&store).as_deref(), Some([Val::I32(3)])));
+    exn.release(&store);
+}
+
+#[test]
+fn host_exceptions_are_typed_and_released() {
+    // `exn_alloc` checks the fields against the tag type; released exceptions that Wasm does
+    // not reference are reclaimed, held ones stay.
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let tag = Tag::new(&mut store, TagType::new([ValType::I32]));
+    assert!(ExnRef::new(&mut store, &tag, &[]).is_err());
+    assert!(ExnRef::new(&mut store, &tag, &[Val::I64(1)]).is_err());
+    let kept = ExnRef::new(&mut store, &tag, &[Val::I32(42)]).unwrap();
+    let kept_addr = kept.addr(&store).unwrap();
+    let mut addresses = HashSet::new();
+    for value in 0..100_000 {
+        let exn = ExnRef::new(&mut store, &tag, &[Val::I32(value)]).unwrap();
+        addresses.insert(exn.addr(&store).unwrap());
+        exn.release(&store);
+    }
+    assert!(
+        addresses.len() < 4_096,
+        "reclaimed addresses: {}",
+        addresses.len()
+    );
+    assert!(!addresses.contains(&kept_addr));
+    assert_eq!(
+        ExnRef::from_addr(&store, kept_addr).and_then(|e| e.addr(&store)),
+        Some(kept_addr)
+    );
+    assert!(matches!(
+        kept.fields(&store).as_deref(),
+        Some([Val::I32(42)])
+    ));
+    // Holds are no store roots, but fields referencing other exceptions are edges.
+    let outer_tag = Tag::new(&mut store, TagType::new([ValType::ExnRef]));
+    let outer = ExnRef::new(&mut store, &outer_tag, &[Val::ExnRef(Nullable::Val(kept))]).unwrap();
+    let (mut reachable, mut edges) = (Vec::new(), Vec::new());
+    store.visit_exception_references(
+        |exn| reachable.push(exn.addr(&store).unwrap()),
+        |from, to| edges.push((from.addr(&store).unwrap(), to.addr(&store).unwrap())),
+    );
+    assert!(reachable.is_empty(), "{reachable:?}");
+    assert_eq!(edges, [(outer.addr(&store).unwrap(), kept_addr)]);
+    outer.release(&store);
+    kept.release(&store);
+}
+
 #[test]
 #[ignore]
 fn exception_spec() {
     let dir = std::env::var_os("WASMI_EH_DIR").expect("set WASMI_EH_DIR");
     for script in ["throw.wast", "try_table.wast", "throw_ref.wast", "tag.wast"] {
         let path = Path::new(&dir).join(script);
-        // Tags cannot be imported: give `try_table.wast`'s main module local tags instead, and
-        // skip only the assertions that depend on the identity of the imported tag.
-        let source = std::fs::read_to_string(&path)
-            .unwrap()
-            .replace(
-                r#"(tag $imported-e0 (import "test" "e0"))"#,
-                "(tag $imported-e0)",
-            )
-            .replace(
-                r#"(tag $imported-e0-alias (import "test" "e0"))"#,
-                "(tag $imported-e0-alias)",
-            );
-        let runner = Runner::new(&["catch-imported", "catch-imported-alias"]);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let runner = Runner::new(&[]);
         let (directives, skips) = runner.run_script(&path.display().to_string(), &source);
         std::println!("{script}: {directives} directives, {} skipped", skips.len());
         for skip in skips {

@@ -14,20 +14,29 @@
 //! raises the referenced exception again, keeping its address in the store, or traps on null.
 //! Both kinds of handlers select the same pending exception, so one exception can pass through
 //! legacy and standardized handlers alike.
+//!
+//! Exceptions cross host function boundaries in both directions (WebAssembly Core 3.0
+//! `appendix/embedding.rst` `embed-func-invoke`; WebAssembly JavaScript Interface, "call an
+//! Exported Function" step 11 and "create a host function" step 3.10): an exception that no
+//! handler of an execution catches ends it with [`Error::exception`], whose exception instance
+//! the store keeps for the embedder, and a host function that returns such an error raises its
+//! exception at the call site, where the handlers of its Wasm callers may catch it.
 
 use super::super::{
     Args,
-    dispatch::Done,
+    dispatch::{Done, control_break},
     state::{DoneReason, Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp, WasmException},
 };
 use crate::{
     Error,
+    ExnRef,
     TrapCode,
     core::RawRef,
     engine::executor::CellsWriter,
     ir::BoundedSlotSpan,
     store::{PrunedStore, StoreInner},
 };
+use core::num::NonZero;
 
 /// Dispatches the clauses of the handler selected by a raise, or ends the execution with an
 /// uncaught exception.
@@ -44,10 +53,8 @@ macro_rules! dispatch_raised {
             false => None,
         };
         let Some((handler, sp, instance)) = target else {
-            done!(
-                $store,
-                DoneReason::error(Error::new("uncaught WebAssembly exception"))
-            )
+            end_with_uncaught_exception($store.inner_mut());
+            return control_break();
         };
         $args.set_ip(handler);
         $args.sp = sp;
@@ -194,12 +201,97 @@ execution_handler! {
     }
 }
 
+/// TRust: ends the execution with the exception that the last raise left uncaught.
+///
+/// The exception enters the store if it has no exception instance yet, and the resulting
+/// [`Error::exception`] carries one hold of it for the embedder (`exec-throw_ref` step 16: an
+/// exception without handler propagates out of the invocation, `embed-func-invoke` step 1b).
+///
+/// # Note
+///
+/// Takes only scalars so that the calling handler keeps its sibling call.
+#[cold]
+#[inline(never)]
+fn end_with_uncaught_exception(store: &mut StoreInner) {
+    let error = uncaught_exception_error(store);
+    store.exec_mut().done_with(move || DoneReason::error(error));
+}
+
+/// TRust: returns the [`Error::exception`] of the uncaught exception, see
+/// [`end_with_uncaught_exception`].
+fn uncaught_exception_error(store: &mut StoreInner) -> Error {
+    if store.exec_mut().stack().uncaught_exception_needs_alloc() {
+        // Collect while the uncaught exception is still a root of the store's collector: its
+        // fields may reference other exceptions.
+        store.collect_exns_if_due();
+    }
+    let Some(exception) = store.exec_mut().stack_mut().take_uncaught_exception() else {
+        return Error::new("uncaught WebAssembly exception without an exception");
+    };
+    let raw = match exception.exn() {
+        Some(exn) => exn,
+        None => match store.exns_mut().alloc(exception.into_entity()) {
+            Some(raw) => RawRef::from(raw.get()),
+            None => return Error::from(TrapCode::OutOfSystemMemory),
+        },
+    };
+    let Some(addr) = NonZero::new(u32::from(raw)) else {
+        return Error::new("uncaught WebAssembly exception without an exception");
+    };
+    store.exns().hold(raw);
+    Error::exception(ExnRef::from_raw_parts(addr, store.id()))
+}
+
+/// TRust: the outcome of [`raise_host_exception`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum HostRaise {
+    /// A handler was selected, see [`Stack::take_unwind_target`](super::super::Stack).
+    Caught,
+    /// No handler caught the exception: the execution ended with it.
+    Uncaught,
+}
+
+/// TRust: raises the exception that a host function, called by the current frame with the
+/// return address `return_ip`, threw with [`Error::exception`].
+///
+/// Raising releases the hold that `error` transferred: from now on the raised exception is
+/// referenced by the executing stack. An exception reference that the store does not know
+/// ends the execution with an error instead.
+///
+/// # Note
+///
+/// Takes and returns only scalars so that the calling handler keeps its sibling call.
+#[cold]
+#[inline(never)]
+pub fn raise_host_exception(store: &mut StoreInner, return_ip: Ip, error: Error) -> HostRaise {
+    let entity = error
+        .as_exception()
+        .and_then(|exn| exn.unwrap_raw(&*store))
+        .and_then(|raw| Some((raw, store.exns().get(raw)?)));
+    let Some((raw, entity)) = entity else {
+        store.exec_mut().done_with(move || DoneReason::error(error));
+        return HostRaise::Uncaught;
+    };
+    let exception = WasmException::from_entity(entity, raw);
+    // The exception is a root of the stack from here on, so releasing cannot free it.
+    let raised = store
+        .exec_mut()
+        .stack_mut()
+        .raise_at_call(return_ip, exception);
+    store.exns().release(raw);
+    if raised {
+        return HostRaise::Caught;
+    }
+    end_with_uncaught_exception(store);
+    HostRaise::Uncaught
+}
+
 /// TRust: catches the pending exception for a `catch_ref` (`tag` is `Some`) or `catch_all_ref`
 /// clause of a `try_table` (`exec-throw_ref` steps 15d and 15f): writes its fields, if `tag` is
 /// `Some`, followed by its exception reference to the cells `results` of the frame at `sp`.
 ///
-/// Returns `Some(false)` if the pending exception is not of `tag` defined by `instance`, and
-/// `None` if the store cannot allocate another exception instance.
+/// Returns `Some(false)` if the pending exception is not of the tag at index `tag` of
+/// `instance`, and `None` if the store cannot allocate another exception instance.
 ///
 /// # Note
 ///

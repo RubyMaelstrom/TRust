@@ -324,11 +324,7 @@ impl ModuleParser {
         }
         let exports = section
             .into_iter()
-            // TRust: Wasmi has no tag externs. Omitting tag exports keeps modules that export
-            //        their exception tags (for example for host interop) instantiable.
-            .filter(|export| {
-                !matches!(export, Ok(export) if export.kind == wasmparser::ExternalKind::Tag)
-            })
+            // TRust: tag exports are `Extern::Tag` items of the instance.
             .map(|export| {
                 let export = export?;
                 let field: Box<str> = export.name.into();

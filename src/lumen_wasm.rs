@@ -7,6 +7,17 @@
 //! so writes on either side are visible to the other without copying. Growth detaches the
 //! previous buffer at the next JS/wasm transition, before JavaScript can observe it
 //! ("refresh the Memory buffer"); the replacement is created on the next `buffer` access.
+//!
+//! Exception handling (JS API #tags, #exceptions, #js-exceptions, "call an Exported Function"
+//! step 11 and "create a host function" step 3.10; local snapshot of the spec repository
+//! 37d6b059): tags are store objects identified by their address, so a tag that JavaScript
+//! imports into several instances is one tag everywhere. A Wasm exception that leaves an
+//! exported function becomes its cached `WebAssembly.Exception` object, or, for the
+//! JavaScript exception tag, the original JavaScript value again. A JavaScript exception that
+//! leaves an imported function becomes a Wasm exception that `catch`, `catch_all` and
+//! `try_table` handlers catch: an `Exception` object throws its own exception address, any
+//! other value is the `externref` payload of a fresh exception of the agent's JavaScript
+//! exception tag. Host interruptions are no JavaScript exceptions and stay uncatchable traps.
 
 use super::HostState;
 use lumen::embed::{
@@ -59,6 +70,17 @@ impl PageWasm {
             .map_or(0, |state| state.function_cache.len())
     }
 
+    /// The numbers of cached Tag objects and cached Exception objects.
+    #[cfg(test)]
+    pub(super) fn cached_exception_objects(&self) -> (usize, usize) {
+        self.state.borrow().as_ref().map_or((0, 0), |state| {
+            (
+                state.exceptions.tag_cache.len(),
+                state.exceptions.exception_cache.len(),
+            )
+        })
+    }
+
     pub(super) fn new() -> Self {
         Self {
             state: Rc::new(RefCell::new(None)),
@@ -78,6 +100,39 @@ impl PageWasm {
                             .saturating_mul(std::mem::size_of::<(usize, Value)>()),
                     );
                     for value in state.function_cache.values() {
+                        visitor.value(value);
+                    }
+                    let objects = &state.exceptions;
+                    state_bytes = state_bytes
+                        .saturating_add(
+                            objects
+                                .tags
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<wasmi::Tag>()),
+                        )
+                        .saturating_add(
+                            objects
+                                .tag_ids
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(wasmi::Tag, usize)>()),
+                        )
+                        .saturating_add(
+                            objects
+                                .tag_cache
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(usize, Value)>()),
+                        )
+                        .saturating_add(
+                            objects
+                                .exception_cache
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(u32, Value)>()),
+                        );
+                    for value in objects
+                        .tag_cache
+                        .values()
+                        .chain(objects.exception_cache.values())
+                    {
                         visitor.value(value);
                     }
                     state_bytes =
@@ -187,6 +242,7 @@ impl HostGc for PageWasm {
             return;
         };
         let Some(state) = state.as_ref() else { return };
+        trace_exception_objects(state, visitor);
         if state.function_cache.is_empty() {
             return;
         }
@@ -262,6 +318,71 @@ impl HostGc for PageWasm {
         };
         if let Some(state) = state.as_mut() {
             state.function_cache.retain(|_, value| is_live(value));
+            state.exceptions.tag_cache.retain(|_, value| is_live(value));
+            // A collected Exception object releases its exception, which the store frees once
+            // Wasm no longer references it either.
+            let store = &state.store;
+            state.exceptions.exception_cache.retain(|&address, value| {
+                let live = is_live(value);
+                if !live && let Some(exn) = wasmi::ExnRef::from_addr(store, address) {
+                    exn.release(store);
+                }
+                live
+            });
+        }
+    }
+}
+
+/// JS API #object-caches: the Tag and Exception object caches.
+///
+/// Both caches hold internal handles. A Tag object is only observable again through a
+/// JavaScript reference to it, so its entry adds nothing else. An Exception object stays
+/// observable while Wasm can still throw its exception out to JavaScript ("create an Exception
+/// object" returns the cached object): it is a root while an `exnref` global or table, or a
+/// field of such an exception, reaches its exception, and an Exception object whose exception's
+/// fields reach another cached exception keeps that object alive as well.
+fn trace_exception_objects(state: &WasmState, visitor: &mut dyn HostGcVisitor) {
+    let objects = &state.exceptions;
+    for wrapper in objects.tag_cache.values() {
+        visitor.internal(wrapper);
+    }
+    if objects.exception_cache.is_empty() {
+        return;
+    }
+    for wrapper in objects.exception_cache.values() {
+        visitor.internal(wrapper);
+    }
+    let store = &state.store;
+    let mut reachable = HashSet::new();
+    let mut fields: HashMap<u32, Vec<u32>> = HashMap::new();
+    store.visit_exception_references(
+        |exn| {
+            if let Some(address) = exn.addr(store) {
+                reachable.insert(address);
+            }
+        },
+        |from, to| {
+            if let (Some(from), Some(to)) = (from.addr(store), to.addr(store)) {
+                fields.entry(from).or_default().push(to);
+            }
+        },
+    );
+    for (address, wrapper) in &objects.exception_cache {
+        if reachable.contains(address) {
+            visitor.root(wrapper);
+        }
+        // Edges through uncached exceptions end at the next cached one, whose own outgoing
+        // edges Lumen's mark queue follows.
+        let mut pending = fields.get(address).cloned().unwrap_or_default();
+        let mut seen = HashSet::new();
+        while let Some(target) = pending.pop() {
+            if !seen.insert(target) {
+                continue;
+            }
+            match objects.exception_cache.get(&target) {
+                Some(object) => visitor.edge(wrapper, object),
+                None => pending.extend(fields.get(&target).into_iter().flatten()),
+            }
         }
     }
 }
@@ -386,6 +507,44 @@ struct WasmState {
     memories: Vec<MemorySlot>,
     tables: Vec<wasmi::Table>,
     table_ids: HashMap<wasmi::Table, usize>,
+    /// Tags and the Tag and Exception object caches.
+    exceptions: ExceptionObjects,
+}
+
+/// The tags and exception objects of one agent (JS API #object-caches, #js-exceptions).
+#[derive(Default)]
+struct ExceptionObjects {
+    /// Tag addresses by integer handle; handles are never reused.
+    tags: Vec<wasmi::Tag>,
+    tag_ids: HashMap<wasmi::Tag, usize>,
+    /// The handle of the agent's JavaScript exception tag, « externref » → « », allocated on
+    /// first use ("get the JavaScript exception tag").
+    js_tag: Option<usize>,
+    /// The Tag object cache by tag handle. Its handles are internal edges without roots: a
+    /// Tag object that JavaScript no longer references cannot be observed again, so a later
+    /// lookup may create a new one.
+    tag_cache: HashMap<usize, Value>,
+    /// The Exception object cache by exception address. Each entry holds its exception once
+    /// (`wasmi::ExnRef::hold`), and HostGc keeps the entry while Wasm can still reach the
+    /// exception, so that throwing it out again yields the same object.
+    exception_cache: HashMap<u32, Value>,
+}
+
+impl ExceptionObjects {
+    fn register_tag(&mut self, tag: wasmi::Tag) -> usize {
+        register(&mut self.tags, &mut self.tag_ids, tag)
+    }
+
+    /// "get the JavaScript exception tag": the agent's tag for JavaScript exceptions.
+    fn js_tag(&mut self, context: impl wasmi::AsContextMut) -> usize {
+        if let Some(id) = self.js_tag {
+            return id;
+        }
+        let tag = wasmi::Tag::new(context, wasmi::TagType::new([wasmi::ValType::ExternRef]));
+        let id = self.register_tag(tag);
+        self.js_tag = Some(id);
+        id
+    }
 }
 
 impl WasmState {
@@ -410,6 +569,7 @@ impl WasmState {
             memories: Vec::new(),
             tables: Vec::new(),
             table_ids: HashMap::new(),
+            exceptions: ExceptionObjects::default(),
         }
     }
 
@@ -569,6 +729,8 @@ fn wasm_kind(value: &wasmi::ExternType) -> &'static str {
         wasmi::ExternType::Table(_) => "table",
         wasmi::ExternType::Memory(_) => "memory",
         wasmi::ExternType::Global(_) => "global",
+        // JS API #modules, ImportExportKind "tag".
+        wasmi::ExternType::Tag(_) => "tag",
     }
 }
 
@@ -987,6 +1149,62 @@ fn wasm_trap() -> wasmi::Error {
     wasmi::Error::new("WebAssembly host import raised a JavaScript exception")
 }
 
+/// Ends the Wasm execution with an uncatchable trap and rethrows `error` unchanged when it
+/// returns to JavaScript.
+fn pending_trap(error: Value) -> wasmi::Error {
+    PENDING_THROW.with(|slot| *slot.borrow_mut() = Some(error));
+    wasm_trap()
+}
+
+/// JS API "create a host function" step 3.10: the throw completion `thrown` of an imported
+/// JavaScript function becomes a WebAssembly exception that Wasmi raises at the call site.
+///
+/// An `Exception` object throws its own exception address (step 3.10.2); any other value
+/// becomes the `externref` payload of a new exception of the JavaScript exception tag (step
+/// 3.10.3). A host interruption is no JavaScript exception (Lumen's `RuntimeInterrupt`): no
+/// Wasm handler may catch it, so it unwinds as a trap and resumes in JavaScript.
+fn thrown_to_wasm(ctx: &mut Ctx, thrown: Value) -> wasmi::Error {
+    if ctx.pending_interrupt().is_some() {
+        return pending_trap(thrown);
+    }
+    let address = match call_bridge(ctx, "exceptionAddress", std::slice::from_ref(&thrown)) {
+        Ok(address) => address
+            .as_num_opt()
+            .filter(|address| (1.0..=f64::from(u32::MAX)).contains(address))
+            .map(|address| address as u32),
+        Err(error) => return pending_trap(error),
+    };
+    let exn = match address {
+        Some(address) => with_active_caller(|caller| {
+            let exn = wasmi::ExnRef::from_addr(&*caller, address)?;
+            // The Exception object keeps its own hold; the error transfers this one.
+            exn.hold(&*caller).then_some(exn)
+        })
+        .flatten(),
+        None => {
+            let payload = match prepare_ref(ctx, &thrown, wasmi::ValType::ExternRef) {
+                Ok(payload) => payload,
+                Err(error) => return pending_trap(error),
+            };
+            let Some(payload) = build_active_ref(payload) else {
+                return pending_trap(thrown);
+            };
+            with_active_caller(|caller| {
+                let tag = with_active_state(|state| {
+                    let id = state.exceptions.js_tag(&mut *caller);
+                    state.exceptions.tags[id]
+                })?;
+                wasmi::ExnRef::new(&mut *caller, &tag, &[payload]).ok()
+            })
+            .flatten()
+        }
+    };
+    match exn {
+        Some(exn) => wasmi::Error::exception(exn),
+        None => pending_trap(thrown),
+    }
+}
+
 fn import_results(
     ctx: &mut Ctx,
     returned: Value,
@@ -1053,16 +1271,16 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
         // SAFETY: ContextGuard leaves the initiating `&mut Ctx` dormant while wasmi runs. This
         // callback is synchronous and executes on the same agent thread.
         let ctx = unsafe { &mut *context_pointer };
+        let _caller_guard = CallerGuard::set(&mut caller);
         if opaque {
-            // "run a host function" step 2 throws before the JavaScript function runs.
+            // "run a host function" step 2 throws before the JavaScript function runs; like
+            // every throw completion of a host function, the TypeError is catchable in Wasm.
             let error = type_error(
                 ctx,
                 "WebAssembly: cannot call a host function whose signature contains v128 or exnref",
             );
-            PENDING_THROW.with(|slot| *slot.borrow_mut() = Some(error));
-            return Err(wasm_trap());
+            return Err(thrown_to_wasm(ctx, error));
         }
-        let _caller_guard = CallerGuard::set(&mut caller);
         refresh_active_buffers(ctx);
         let mut arguments = Vec::with_capacity(params.len());
         for value in params {
@@ -1072,11 +1290,11 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
                     make_exported_func(ctx, id)
                 }
                 wasmi::Val::ExternRef(wasmi::Nullable::Val(reference)) => {
-                    let id = reference
-                        .data(&caller)
-                        .downcast_ref::<usize>()
-                        .copied()
-                        .unwrap_or(0);
+                    let id = with_active_caller(|caller| {
+                        reference.data(&*caller).downcast_ref::<usize>().copied()
+                    })
+                    .flatten()
+                    .unwrap_or(0);
                     extern_get(ctx, id)
                 }
                 wasmi::Val::FuncRef(wasmi::Nullable::Null)
@@ -1085,10 +1303,7 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
             };
             match token {
                 Ok(value) => arguments.push(value),
-                Err(error) => {
-                    PENDING_THROW.with(|slot| *slot.borrow_mut() = Some(error));
-                    return Err(wasm_trap());
-                }
+                Err(error) => return Err(thrown_to_wasm(ctx, error)),
             }
         }
         let result = call_bridge(
@@ -1111,10 +1326,7 @@ fn make_import_func<C: wasmi::AsContextMut<Data = StoreData>>(
         }
         match result {
             Ok(()) => Ok(()),
-            Err(error) => {
-                PENDING_THROW.with(|slot| *slot.borrow_mut() = Some(error));
-                Err(wasm_trap())
-            }
+            Err(error) => Err(thrown_to_wasm(ctx, error)),
         }
     })
 }
@@ -1124,6 +1336,163 @@ fn error_kind(error: &wasmi::Error) -> &'static str {
         "Runtime"
     } else {
         "Link"
+    }
+}
+
+/// How a Wasm invocation (an exported call or a start function) ended without results.
+enum Failure {
+    /// A trap or another error: the JS API error class (see [`error_kind`]) and message.
+    Error(&'static str, String),
+    /// An uncaught WebAssembly exception.
+    Thrown(Thrown),
+}
+
+impl From<(&'static str, String)> for Failure {
+    fn from((kind, message): (&'static str, String)) -> Self {
+        Self::Error(kind, message)
+    }
+}
+
+/// An uncaught WebAssembly exception on its way to JavaScript ("call an Exported Function"
+/// step 11).
+enum Thrown {
+    /// Step 11.4.1: an exception of the JavaScript exception tag throws its payload again.
+    Value(OutputToken),
+    /// Step 11.5.1: the Exception object cache already holds the exception's object.
+    Object(Value),
+    /// Step 11.5.1: a new Exception object for the exception `address` of the tag `tag`. The
+    /// hold of the uncaught exception passes to the object's cache entry.
+    New { address: u32, tag: usize },
+}
+
+/// Classifies the error that ended a Wasm invocation; an uncaught exception's store is
+/// `context` and its tags are `objects`.
+fn failure(
+    error: wasmi::Error,
+    objects: &mut ExceptionObjects,
+    context: impl wasmi::AsContextMut<Data = StoreData>,
+) -> Failure {
+    match error
+        .as_exception()
+        .and_then(|exn| uncaught_exception(objects, context, exn))
+    {
+        Some(thrown) => Failure::Thrown(thrown),
+        None => Failure::Error(error_kind(&error), error.to_string()),
+    }
+}
+
+/// "call an Exported Function" steps 11.1–11.5 for the uncaught exception `exn`, whose hold
+/// the caller owns. Returns `None` for an exception the store no longer knows.
+fn uncaught_exception(
+    objects: &mut ExceptionObjects,
+    mut context: impl wasmi::AsContextMut<Data = StoreData>,
+    exn: wasmi::ExnRef,
+) -> Option<Thrown> {
+    let tag = exn.tag(&context)?;
+    let js_tag = objects.js_tag(&mut context);
+    if objects.tags.get(js_tag) == Some(&tag) {
+        // The payload is the externref of the thrown JavaScript value (ToJSValue).
+        let token = match exn.field(&context, 0) {
+            Some(wasmi::Val::ExternRef(wasmi::Nullable::Val(reference))) => OutputToken::Extern(
+                reference
+                    .data(&context)
+                    .downcast_ref::<usize>()
+                    .copied()
+                    .unwrap_or(0),
+            ),
+            _ => OutputToken::Value(Value::Null),
+        };
+        exn.release(&context);
+        return Some(Thrown::Value(token));
+    }
+    let address = exn.addr(&context)?;
+    if let Some(object) = objects.exception_cache.get(&address) {
+        exn.release(&context);
+        return Some(Thrown::Object(object.clone()));
+    }
+    Some(Thrown::New {
+        address,
+        tag: objects.register_tag(tag),
+    })
+}
+
+/// [`failure`] against the store of the idle agent `state`.
+fn state_failure(state: &mut WasmState, error: wasmi::Error) -> Failure {
+    failure(error, &mut state.exceptions, &mut state.store)
+}
+
+/// [`failure`] while the store is lent to the active Caller.
+fn active_failure(error: wasmi::Error) -> Failure {
+    let Some(exn) = error.as_exception() else {
+        return Failure::Error(error_kind(&error), error.to_string());
+    };
+    let thrown = with_active_caller(|caller| {
+        with_active_state(|state| uncaught_exception(&mut state.exceptions, &mut *caller, exn))
+    })
+    .flatten()
+    .flatten();
+    match thrown {
+        Some(thrown) => Failure::Thrown(thrown),
+        None => Failure::Error(error_kind(&error), error.to_string()),
+    }
+}
+
+/// Turns an uncaught exception into the value JavaScript throws, creating and caching a new
+/// Exception object ("create an Exception object") if needed.
+fn thrown_to_js(ctx: &mut Ctx, page: &PageWasm, thrown: Thrown) -> Value {
+    match thrown {
+        Thrown::Value(token) => resolve_output(ctx, token).unwrap_or_else(|error| error),
+        Thrown::Object(object) => object,
+        Thrown::New { address, tag } => {
+            match call_bridge(
+                ctx,
+                "makeException",
+                &[Value::Num(f64::from(address)), Value::Num(tag as f64)],
+            ) {
+                Ok(object) => {
+                    cache_exception(page, address, object.clone());
+                    object
+                }
+                Err(error) => {
+                    release_exception(page, address);
+                    error
+                }
+            }
+        }
+    }
+}
+
+/// Enters `object` in the agent's Exception object cache for the exception `address`, whose
+/// hold passes to the entry.
+fn cache_exception(page: &PageWasm, address: u32, object: Value) {
+    let insert = |state: &mut WasmState| state.exceptions.exception_cache.insert(address, object);
+    let previous = match page.state.try_borrow_mut() {
+        Ok(mut state) => state.as_mut().map(insert),
+        Err(_) => with_active_state(insert),
+    };
+    if previous.flatten().is_some() {
+        // "initialize an Exception object" asserts a fresh address; never leak a hold.
+        release_exception(page, address);
+    }
+}
+
+/// Releases one hold of the exception `address`.
+fn release_exception(page: &PageWasm, address: u32) {
+    match page.state.try_borrow_mut() {
+        Ok(state) => {
+            if let Some(state) = state.as_ref()
+                && let Some(exn) = wasmi::ExnRef::from_addr(&state.store, address)
+            {
+                exn.release(&state.store);
+            }
+        }
+        Err(_) => {
+            let _ = with_active_caller(|caller| {
+                if let Some(exn) = wasmi::ExnRef::from_addr(&*caller, address) {
+                    exn.release(&*caller);
+                }
+            });
+        }
     }
 }
 
@@ -1273,6 +1642,8 @@ enum ImportBinding {
     GlobalValue(wasmi::Val),
     MemoryRef(usize),
     TableRef(usize),
+    /// JS API "read the imports" step 4.11: the [[Address]] of a `WebAssembly.Tag`.
+    TagRef(usize),
 }
 
 fn parse_imports(
@@ -1306,6 +1677,9 @@ fn parse_imports(
             "t" => output.push(ImportBinding::TableRef(
                 payload.as_num_opt().unwrap_or(0.0) as usize
             )),
+            "tg" => output.push(ImportBinding::TagRef(
+                payload.as_num_opt().unwrap_or(0.0) as usize
+            )),
             "gv" => {
                 let Some(global) = ty.global() else {
                     return Err((
@@ -1330,7 +1704,7 @@ fn instantiate_state(
     module: &wasmi::Module,
     token: u32,
     bindings: &[ImportBinding],
-) -> Result<usize, (&'static str, String)> {
+) -> Result<usize, Failure> {
     let mut linker = wasmi::Linker::new(&state.engine);
     for (index, import) in module.imports().enumerate() {
         let binding = bindings.get(index);
@@ -1408,8 +1782,20 @@ fn instantiate_state(
                         ),
                     )
                 })?,
+            (wasmi::ExternType::Tag(_), Some(ImportBinding::TagRef(id))) => state
+                .exceptions
+                .tags
+                .get(*id)
+                .copied()
+                .map(wasmi::Extern::Tag)
+                .ok_or_else(|| {
+                    (
+                        "Link",
+                        format!("import {}.{}: unknown tag", import.module(), import.name()),
+                    )
+                })?,
             _ => {
-                return Err((
+                return Err(Failure::Error(
                     "Link",
                     format!(
                         "import {}.{}: JavaScript value has the wrong kind",
@@ -1431,8 +1817,9 @@ fn instantiate_state(
             state.instances.push(instance);
             Ok(id)
         }
-        Ok(Err(error)) => Err((error_kind(&error), error.to_string())),
-        Err(_) => Err((
+        // An uncaught exception of the start function propagates like one of an exported call.
+        Ok(Err(error)) => Err(state_failure(state, error)),
+        Err(_) => Err(Failure::Error(
             "Link",
             "WebAssembly instantiation failed (unsupported feature)".to_string(),
         )),
@@ -1443,7 +1830,7 @@ fn instantiate_active(
     module: &wasmi::Module,
     token: u32,
     bindings: &[ImportBinding],
-) -> Result<usize, (&'static str, String)> {
+) -> Result<usize, Failure> {
     let engine = with_active_state(|state| state.engine.clone()).ok_or((
         "Runtime",
         "WebAssembly: unavailable re-entrant store".to_string(),
@@ -1525,8 +1912,19 @@ fn instantiate_active(
                     )
                 })?
             }
+            (wasmi::ExternType::Tag(_), Some(ImportBinding::TagRef(id))) => {
+                with_active_state(|state| state.exceptions.tags.get(*id).copied())
+                    .flatten()
+                    .map(wasmi::Extern::Tag)
+                    .ok_or_else(|| {
+                        (
+                            "Link",
+                            format!("import {}.{}: unknown tag", import.module(), import.name()),
+                        )
+                    })?
+            }
             _ => {
-                return Err((
+                return Err(Failure::Error(
                     "Link",
                     format!(
                         "import {}.{}: JavaScript value has the wrong kind",
@@ -1555,12 +1953,12 @@ fn instantiate_active(
             state.instances.push(instance);
             id
         })
-        .ok_or((
+        .ok_or(Failure::Error(
             "Runtime",
             "WebAssembly: unavailable re-entrant state".to_string(),
         )),
-        Ok(Err(error)) => Err((error_kind(&error), error.to_string())),
-        Err(_) => Err((
+        Ok(Err(error)) => Err(active_failure(error)),
+        Err(_) => Err(Failure::Error(
             "Link",
             "WebAssembly instantiation failed (unsupported feature)".to_string(),
         )),
@@ -1649,10 +2047,13 @@ pub(super) fn host_instantiate(
             wasm_trace!(format!("instantiate ok id={id}"));
             wasm_ok(ctx, Value::Num(id as f64))
         }
-        Err((kind, message)) => {
+        Err(Failure::Error(kind, message)) => {
             wasm_trace!(format!("instantiate error kind={kind} message={message}"));
             wasm_err(ctx, kind, message)
         }
+        // JS API "instantiate the core of a WebAssembly module" step 3: an exception of the
+        // start function propagates as the object it is in JavaScript.
+        Err(Failure::Thrown(thrown)) => return Err(thrown_to_js(ctx, &page, thrown)),
     })
 }
 
@@ -1731,6 +2132,9 @@ pub(super) fn host_instance_exports(
                     "table" => instance
                         .get_table(&state.store, &name)
                         .map(|value| state.register_table(value)),
+                    "tag" => instance
+                        .get_tag(&state.store, &name)
+                        .map(|value| state.exceptions.register_tag(value)),
                     _ => None,
                 };
                 let Some(id) = id else { continue };
@@ -1786,6 +2190,9 @@ pub(super) fn host_instance_exports(
                         }),
                         "table" => instance.get_table(&*caller, &name).and_then(|value| {
                             with_active_state(|state| state.register_table(value))
+                        }),
+                        "tag" => instance.get_tag(&*caller, &name).and_then(|value| {
+                            with_active_state(|state| state.exceptions.register_tag(value))
                         }),
                         _ => None,
                     })
@@ -1882,8 +2289,8 @@ pub(super) fn host_call_export(
     }
 
     let _context_guard = ContextGuard::set(ctx);
-    let call: Result<Vec<OutputToken>, (&'static str, String)> = match page.state.try_borrow_mut() {
-        Ok(mut state_slot) => (|| -> Result<Vec<OutputToken>, (&'static str, String)> {
+    let call: Result<Vec<OutputToken>, Failure> = match page.state.try_borrow_mut() {
+        Ok(mut state_slot) => (|| -> Result<Vec<OutputToken>, Failure> {
             let state = state_slot.get_or_insert_with(WasmState::new);
             let mut inputs = Vec::with_capacity(prepared.len());
             for value in prepared {
@@ -1927,12 +2334,12 @@ pub(super) fn host_call_export(
                         })
                         .collect()
                 }
-                Ok(Err(error)) => return Err((error_kind(&error), error.to_string())),
-                Err(_) => return Err(("Runtime", "WebAssembly trap".to_string())),
+                Ok(Err(error)) => return Err(state_failure(state, error)),
+                Err(_) => return Err(("Runtime", "WebAssembly trap".to_string()).into()),
             };
             Ok(tokens)
         })(),
-        Err(_) => (|| -> Result<Vec<OutputToken>, (&'static str, String)> {
+        Err(_) => (|| -> Result<Vec<OutputToken>, Failure> {
             let function = function_id.and_then(active_func).ok_or((
                 "Runtime",
                 "WebAssembly: unavailable re-entrant function".to_string(),
@@ -1980,8 +2387,8 @@ pub(super) fn host_call_export(
                     }
                     Ok(tokens)
                 }
-                Ok(Err(error)) => Err((error_kind(&error), error.to_string())),
-                Err(_) => Err(("Runtime", "WebAssembly trap".to_string())),
+                Ok(Err(error)) => Err(active_failure(error)),
+                Err(_) => Err(("Runtime", "WebAssembly trap".to_string()).into()),
             }
         })(),
     };
@@ -1991,7 +2398,7 @@ pub(super) fn host_call_export(
     }
     let tokens = match call {
         Ok(tokens) => tokens,
-        Err((kind, message)) => {
+        Err(Failure::Error(kind, message)) => {
             if trace_call {
                 wasm_trace!(format!(
                     "call #{} error kind={kind} message={message}",
@@ -1999,6 +2406,12 @@ pub(super) fn host_call_export(
                 ));
             }
             return Ok(wasm_err(ctx, kind, message));
+        }
+        Err(Failure::Thrown(thrown)) => {
+            if trace_call {
+                wasm_trace!(format!("call #{} uncaught exception", call_number + 1));
+            }
+            return Err(thrown_to_js(ctx, &page, thrown));
         }
     };
     let mut values = Vec::with_capacity(tokens.len());
@@ -2614,19 +3027,312 @@ pub(super) fn host_table_grow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
     }
 }
 
+/// JS API #tags, #exceptions and the `JSTag` attribute: the store operations behind
+/// `WebAssembly.Tag`, `WebAssembly.Exception` and `WebAssembly.JSTag`. The prelude performs
+/// the Web IDL conversions and brand checks; `args[0]` names the operation.
+pub(super) fn host_exception_binding(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let operation = arg_string(ctx, args, 0)?;
+    let Some(page) = page_wasm(ctx) else {
+        return Err(type_error(ctx, "WebAssembly is unavailable"));
+    };
+    match operation.as_str() {
+        "tagNew" => tag_new(ctx, &page, args.get(1).unwrap_or(&Value::Undefined)),
+        "jsTag" => js_tag(ctx, &page),
+        "tagCache" => Ok(cached_object(
+            &page,
+            arg_id(args, 1),
+            args.get(2),
+            |objects| &mut objects.tag_cache,
+        )),
+        "exceptionNew" => exception_new(
+            ctx,
+            &page,
+            arg_id(args, 1),
+            args.get(2).unwrap_or(&Value::Undefined),
+        ),
+        "exceptionCache" => Ok(cached_object(
+            &page,
+            arg_id(args, 1),
+            args.get(2),
+            |objects| &mut objects.exception_cache,
+        )),
+        "exceptionArg" => exception_arg(ctx, &page, arg_id(args, 1), arg_id(args, 2)),
+        _ => Err(type_error(ctx, "WebAssembly: unknown exception operation")),
+    }
+}
+
+/// `new Tag(type)` steps 1–5 for the already converted `ValueType` strings `types`
+/// (ToValueType, then `tag_alloc` of `parameters → « »`).
+fn tag_new(ctx: &mut Ctx, page: &PageWasm, types: &Value) -> Result<Value, Value> {
+    let length = ctx.member_get(types, "length")?.as_num_opt().unwrap_or(0.0) as usize;
+    let mut params = Vec::with_capacity(length);
+    for index in 0..length {
+        let name = array_get(ctx, types, index)?;
+        let name = ctx.coerce_string(&name)?.to_string();
+        let Some(ty) = value_type(&name) else {
+            return Err(type_error(ctx, "WebAssembly.Tag: invalid value type"));
+        };
+        params.push(ty);
+    }
+    let ty = wasmi::TagType::new(params);
+    let id = match page.state.try_borrow_mut() {
+        Ok(mut state) => {
+            let state = state.get_or_insert_with(WasmState::new);
+            let tag = wasmi::Tag::new(&mut state.store, ty);
+            state.exceptions.register_tag(tag)
+        }
+        Err(_) => {
+            let tag = with_active_caller(|caller| wasmi::Tag::new(caller, ty))
+                .ok_or_else(|| type_error(ctx, "WebAssembly is unavailable"))?;
+            with_active_state(|state| state.exceptions.register_tag(tag))
+                .ok_or_else(|| type_error(ctx, "WebAssembly is unavailable"))?
+        }
+    };
+    Ok(Value::Num(id as f64))
+}
+
+/// The getter of `WebAssembly.JSTag`, step 1: "get the JavaScript exception tag".
+fn js_tag(ctx: &mut Ctx, page: &PageWasm) -> Result<Value, Value> {
+    let id = match page.state.try_borrow_mut() {
+        Ok(mut state) => {
+            let state = state.get_or_insert_with(WasmState::new);
+            Some(state.exceptions.js_tag(&mut state.store))
+        }
+        Err(_) => with_active_caller(|caller| {
+            with_active_state(|state| state.exceptions.js_tag(&mut *caller))
+        })
+        .flatten(),
+    };
+    id.map(|id| Value::Num(id as f64))
+        .ok_or_else(|| type_error(ctx, "WebAssembly is unavailable"))
+}
+
+/// Looks `key` up in one of the agent's object caches (JS API #object-caches), entering
+/// `wrapper` if the cache has no object for it yet. Returns the cached object or undefined.
+fn cached_object<K: Copy + Eq + std::hash::Hash + TryFrom<usize>>(
+    page: &PageWasm,
+    key: Option<usize>,
+    wrapper: Option<&Value>,
+    cache: impl Fn(&mut ExceptionObjects) -> &mut HashMap<K, Value>,
+) -> Value {
+    let Some(key) = key.and_then(|key| K::try_from(key).ok()) else {
+        return Value::Undefined;
+    };
+    let lookup = |state: &mut WasmState| {
+        let cache = cache(&mut state.exceptions);
+        if let Some(object) = cache.get(&key) {
+            return object.clone();
+        }
+        match wrapper.filter(|wrapper| matches!(wrapper, Value::Obj(_))) {
+            Some(wrapper) => {
+                cache.insert(key, wrapper.clone());
+                wrapper.clone()
+            }
+            None => Value::Undefined,
+        }
+    };
+    match page.state.try_borrow_mut() {
+        Ok(mut state) => state.as_mut().map(lookup).unwrap_or(Value::Undefined),
+        Err(_) => with_active_state(lookup).unwrap_or(Value::Undefined),
+    }
+}
+
+/// `new Exception(exceptionTag, payload, options)` steps 1–8 for the tag handle `tag` and the
+/// converted `sequence<any>` `payload`. Returns the address of the new exception, which is
+/// held once for the Exception object cache entry that the prelude creates next.
+fn exception_new(
+    ctx: &mut Ctx,
+    page: &PageWasm,
+    tag: Option<usize>,
+    payload: &Value,
+) -> Result<Value, Value> {
+    let unavailable = |ctx: &mut Ctx| type_error(ctx, "WebAssembly is unavailable");
+    let Some(tag_id) = tag else {
+        return Err(type_error(ctx, "WebAssembly.Exception: unknown tag"));
+    };
+    // Steps 1–4: the JavaScript exception tag, and the tag's parameter types.
+    let found = match page.state.try_borrow_mut() {
+        Ok(mut state) => {
+            let state = state.get_or_insert_with(WasmState::new);
+            exception_tag_types(&mut state.exceptions, &mut state.store, tag_id)
+        }
+        Err(_) => with_active_caller(|caller| {
+            with_active_state(|state| {
+                exception_tag_types(&mut state.exceptions, &mut *caller, tag_id)
+            })
+            .flatten()
+        })
+        .flatten(),
+    };
+    let Some((js_tag, tag, types)) = found else {
+        return Err(unavailable(ctx));
+    };
+    if tag_id == js_tag {
+        return Err(type_error(
+            ctx,
+            "WebAssembly.Exception: the JavaScript exception tag cannot be constructed",
+        ));
+    }
+    // Step 5.
+    let length = ctx
+        .member_get(payload, "length")?
+        .as_num_opt()
+        .unwrap_or(0.0) as usize;
+    if length != types.len() {
+        return Err(type_error(
+            ctx,
+            "WebAssembly.Exception: the payload does not match the tag's parameters",
+        ));
+    }
+    // Steps 6–7, in order: each type check precedes that value's conversion.
+    let mut prepared = Vec::with_capacity(types.len());
+    for (index, ty) in types.iter().copied().enumerate() {
+        if is_js_opaque(ty) {
+            return Err(type_error(
+                ctx,
+                "WebAssembly.Exception: a v128 or exnref value cannot be created from JavaScript",
+            ));
+        }
+        let value = array_get(ctx, payload, index)?;
+        prepared.push(prepare_value(ctx, &value, ty)?);
+    }
+    // Step 8: exn_alloc.
+    let address = match page.state.try_borrow_mut() {
+        Ok(mut state) => {
+            let state = state.get_or_insert_with(WasmState::new);
+            let mut values = Vec::with_capacity(prepared.len());
+            for value in prepared {
+                values.push(build_value(state, value).map_err(|()| unavailable(ctx))?);
+            }
+            wasmi::ExnRef::new(&mut state.store, &tag, &values)
+                .ok()
+                .and_then(|exn| exn.addr(&state.store))
+        }
+        Err(_) => {
+            let mut values = Vec::with_capacity(prepared.len());
+            for value in prepared {
+                values.push(match value {
+                    PreparedValue::Numeric(value) => value,
+                    PreparedValue::Reference(value) => {
+                        build_active_ref(value).ok_or_else(|| unavailable(ctx))?
+                    }
+                });
+            }
+            with_active_caller(|caller| {
+                let exn = wasmi::ExnRef::new(&mut *caller, &tag, &values).ok()?;
+                exn.addr(&*caller)
+            })
+            .flatten()
+        }
+    };
+    address
+        .map(|address| Value::Num(f64::from(address)))
+        .ok_or_else(|| range_error(ctx, "WebAssembly.Exception: out of memory"))
+}
+
+/// Returns the JavaScript exception tag, the tag `tag_id` and its parameter types.
+fn exception_tag_types(
+    objects: &mut ExceptionObjects,
+    mut context: impl wasmi::AsContextMut<Data = StoreData>,
+    tag_id: usize,
+) -> Option<(usize, wasmi::Tag, Vec<wasmi::ValType>)> {
+    let js_tag = objects.js_tag(&mut context);
+    let tag = *objects.tags.get(tag_id)?;
+    Some((js_tag, tag, tag.ty(&context).params().to_vec()))
+}
+
+/// The outcome of [`read_exception_arg`].
+enum ExceptionArg {
+    /// `getArg` step 6: the index is not below the payload's size.
+    OutOfBounds,
+    /// `getArg` step 8: the field is a v128 or an exnref.
+    Opaque,
+    /// Step 9: the field, ToJSValue pending.
+    Value(OutputToken),
+}
+
+/// Reads the field `index` of the exception `address` for `getArg`.
+fn read_exception_arg<C: wasmi::AsContext<Data = StoreData>>(
+    state: &mut WasmState,
+    context: &C,
+    address: u32,
+    index: usize,
+) -> Option<ExceptionArg> {
+    let exn = wasmi::ExnRef::from_addr(context, address)?;
+    let types = exn.tag(context)?.ty(context);
+    let Some(ty) = types.params().get(index).copied() else {
+        return Some(ExceptionArg::OutOfBounds);
+    };
+    if is_js_opaque(ty) {
+        return Some(ExceptionArg::Opaque);
+    }
+    let field = exn.field(context, index)?;
+    Some(ExceptionArg::Value(extract_output(state, context, &field)))
+}
+
+/// `getArg(exceptionTag, index)` steps 3–9 for the exception `address`, after the prelude
+/// checked that `exceptionTag` is the exception's [[Type]] (step 2).
+fn exception_arg(
+    ctx: &mut Ctx,
+    page: &PageWasm,
+    address: Option<usize>,
+    index: Option<usize>,
+) -> Result<Value, Value> {
+    let (Some(address), Some(index)) = (address.and_then(|a| u32::try_from(a).ok()), index) else {
+        return Err(type_error(
+            ctx,
+            "WebAssembly.Exception.getArg: invalid arguments",
+        ));
+    };
+    let arg = match page.state.try_borrow_mut() {
+        Ok(mut state) => state.as_mut().and_then(|state| {
+            let store = &state.store as *const wasmi::Store<StoreData>;
+            // SAFETY: see host_call_export's result extraction.
+            read_exception_arg(state, unsafe { &*store }, address, index)
+        }),
+        Err(_) => with_active_caller(|caller| {
+            with_active_state(|state| read_exception_arg(state, &*caller, address, index)).flatten()
+        })
+        .flatten(),
+    };
+    match arg {
+        Some(ExceptionArg::Value(token)) => resolve_output(ctx, token),
+        Some(ExceptionArg::OutOfBounds) => Err(range_error(
+            ctx,
+            "WebAssembly.Exception.getArg: index out of bounds",
+        )),
+        Some(ExceptionArg::Opaque) => Err(type_error(
+            ctx,
+            "WebAssembly.Exception.getArg: a v128 or exnref value cannot be read from JavaScript",
+        )),
+        None => Err(type_error(
+            ctx,
+            "WebAssembly.Exception.getArg: unknown exception",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Wasmi 2.0's optimized interpreter only keeps a constant native stack while every
     /// handler reaches the next one with a sibling call (see the Wasmi profile overrides in
     /// Cargo.toml). A handler that loses it grows the stack once per executed operator, so
-    /// this loop over common operator families (including growth, legacy exception unwinding
-    /// and `try_table` catch clauses with `throw_ref`) would overflow the small thread stack
-    /// and abort the test binary under `cargo test --release`. Debug builds use Wasmi's
-    /// portable loop dispatch.
+    /// this loop over common operator families (including growth, legacy exception unwinding,
+    /// `try_table` catch clauses with `throw_ref`, host imports, and exceptions that a host
+    /// function throws with an imported tag) would overflow the small thread stack and abort
+    /// the test binary under `cargo test --release`. Debug builds use Wasmi's portable loop
+    /// dispatch.
     #[test]
     fn wasm_interpreter_dispatch_keeps_a_constant_native_stack() {
         const MODULE: &str = r#"
             (module
+              (import "host" "add" (func $host_add (param i64) (result i64)))
+              (import "host" "throw" (func $host_throw (param i32)))
+              (import "host" "tag" (tag $host_tag (param i32)))
               (memory 1)
               (global $g (mut i64) (i64.const 0))
               (type $t (func (param i64) (result i64)))
@@ -2696,6 +3402,12 @@ mod tests {
                   drop
                   i64.extend_i32_u
                   (local.set $acc (i64.add (local.get $acc)))
+                  (local.set $acc (call $host_add (local.get $acc)))
+                  (block $host (result i32)
+                    (try_table (catch $host_tag $host) (call $host_throw (local.get $n)))
+                    (i32.const 0))
+                  i64.extend_i32_u
+                  (local.set $acc (i64.add (local.get $acc)))
                   (br_if $again (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))
                 (i64.add (local.get $acc) (global.get $g))))
         "#;
@@ -2709,7 +3421,27 @@ mod tests {
                     let module = wasmi::Module::new(&engine, wat::parse_str(MODULE).unwrap())
                         .expect("valid module");
                     let mut store = wasmi::Store::new(&engine, ());
-                    let instance = wasmi::Linker::new(&engine)
+                    let tag =
+                        wasmi::Tag::new(&mut store, wasmi::TagType::new([wasmi::ValType::I32]));
+                    let mut linker = wasmi::Linker::new(&engine);
+                    linker.define("host", "tag", tag).expect("define tag");
+                    linker
+                        .func_wrap("host", "add", |value: i64| value.wrapping_add(3))
+                        .expect("define add");
+                    linker
+                        .func_wrap(
+                            "host",
+                            "throw",
+                            move |mut caller: wasmi::Caller<'_, ()>,
+                                  value: i32|
+                                  -> Result<(), wasmi::Error> {
+                                let fields = [wasmi::Val::I32(value)];
+                                let exn = wasmi::ExnRef::new(&mut caller, &tag, &fields)?;
+                                Err(wasmi::Error::exception(exn))
+                            },
+                        )
+                        .expect("define throw");
+                    let instance = linker
                         .instantiate_and_start(&mut store, &module)
                         .expect("instantiable module");
                     instance

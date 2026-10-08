@@ -42,6 +42,7 @@ use crate::{
     GlobalType,
     MemoryType,
     TableType,
+    TagType,
     collections::Map,
     engine::{DedupFuncType, EngineFunc, EngineFuncSpan, EngineFuncSpanIter, EngineWeak},
     instance::InstanceLayout,
@@ -82,7 +83,8 @@ struct ModuleHeaderInner {
     memories: Box<[MemoryType]>,
     globals: Box<[GlobalType]>,
     globals_init: Box<[ConstExpr]>,
-    tags: Box<[FuncTypeIdx]>,
+    /// TRust: the types of the tag index space, imported tags first.
+    tags: Box<[DedupFuncType]>,
     exports: Map<Box<str>, ExternIdx>,
     export_order: Box<[Box<str>]>,
     start: Option<FuncIdx>,
@@ -127,10 +129,10 @@ impl ModuleHeader {
         &self.inner.tables[table_idx.into_u32() as usize]
     }
 
-    /// Returns the function type associated with a legacy exception tag.
+    /// TRust: returns the function type of the exception tag at `tag_idx` of the tag index
+    /// space, which starts with the imported tags.
     pub fn get_type_of_tag(&self, tag_idx: u32) -> &DedupFuncType {
-        let func_type_idx = self.inner.tags[tag_idx as usize];
-        self.get_func_type(func_type_idx)
+        &self.inner.tags[tag_idx as usize]
     }
 
     /// Returns the [`EngineFunc`] for the given [`FuncIdx`].
@@ -186,6 +188,10 @@ pub enum Imported {
     Memory(ImportName),
     /// The name of an imported [`Global`].
     Global(ImportName),
+    /// TRust: the name of an imported [`Tag`].
+    ///
+    /// [`Tag`]: [`crate::Tag`]
+    Tag(ImportName),
 }
 
 /// The import names of the [`Module`] imports.
@@ -207,6 +213,10 @@ pub struct ModuleImports {
     ///
     /// [`Table`]: [`crate::Table`]
     len_tables: usize,
+    /// TRust: the amount of imported [`Tag`].
+    ///
+    /// [`Tag`]: [`crate::Tag`]
+    len_tags: usize,
 }
 
 impl ModuleImports {
@@ -335,6 +345,12 @@ impl Module {
         self.module_header().globals.len()
     }
 
+    /// TRust: returns the number of non-imported exception tags of the [`Module`].
+    pub(crate) fn len_tags(&self) -> usize {
+        let header = self.module_header();
+        header.tags.len() - header.imports.len_tags
+    }
+
     /// Returns the [`InstanceLayout`] shared by all instances of this [`Module`].
     pub(crate) fn instance_layout(&self) -> &InstanceLayout {
         &self.module_header().layout
@@ -351,6 +367,7 @@ impl Module {
             tables: header.tables[..imports.len_tables].iter(),
             memories: header.memories[..imports.len_memories].iter(),
             globals: header.globals[..imports.len_globals].iter(),
+            tags: header.tags[..imports.len_tags].iter(),
         }
     }
 
@@ -396,6 +413,15 @@ impl Module {
         // tables.
         let tables = &header.tables[len_imported..];
         tables.iter()
+    }
+
+    /// TRust: returns an iterator over the [`TagType`] of internally defined exception tags.
+    pub(crate) fn internal_tags(&self) -> impl ExactSizeIterator<Item = TagType> + '_ {
+        let header = self.module_header();
+        // The tag index space starts with the imported tags.
+        header.tags[header.imports.len_tags..].iter().map(|dedup| {
+            TagType::from_func_type(self.engine().resolve_func_type(dedup, Clone::clone))
+        })
     }
 
     /// Returns an iterator over the internally defined [`Global`].
@@ -455,6 +481,11 @@ impl Module {
                 let global_type = header.globals[index.into_u32() as usize];
                 ExternType::Global(global_type)
             }
+            ExternIdx::Tag(index) => {
+                let dedup = &header.tags[index.into_u32() as usize];
+                let func_type = self.engine().resolve_func_type(dedup, Clone::clone);
+                ExternType::Tag(TagType::from_func_type(func_type))
+            }
         }
     }
 
@@ -482,43 +513,51 @@ pub struct ModuleImportsIter<'a> {
     tables: SliceIter<'a, TableType>,
     memories: SliceIter<'a, MemoryType>,
     globals: SliceIter<'a, GlobalType>,
+    tags: SliceIter<'a, DedupFuncType>,
 }
 
 impl<'a> Iterator for ModuleImportsIter<'a> {
     type Item = ImportType<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let import = {
-            let imported = self.names.next()?;
-            match imported {
-                Imported::Func(name) => {
-                    let func_type = self.funcs.next().unwrap_or_else(|| {
-                        panic!("unexpected missing imported function for {name}")
-                    });
-                    let func_type = self.engine.resolve_func_type(func_type, FuncType::clone);
-                    ImportType::new(name, func_type)
+        let import =
+            {
+                let imported = self.names.next()?;
+                match imported {
+                    Imported::Func(name) => {
+                        let func_type = self.funcs.next().unwrap_or_else(|| {
+                            panic!("unexpected missing imported function for {name}")
+                        });
+                        let func_type = self.engine.resolve_func_type(func_type, FuncType::clone);
+                        ImportType::new(name, func_type)
+                    }
+                    Imported::Table(name) => {
+                        let table_type = self.tables.next().unwrap_or_else(|| {
+                            panic!("unexpected missing imported table for {name}")
+                        });
+                        ImportType::new(name, *table_type)
+                    }
+                    Imported::Memory(name) => {
+                        let memory_type = self.memories.next().unwrap_or_else(|| {
+                            panic!("unexpected missing imported linear memory for {name}")
+                        });
+                        ImportType::new(name, *memory_type)
+                    }
+                    Imported::Global(name) => {
+                        let global_type = self.globals.next().unwrap_or_else(|| {
+                            panic!("unexpected missing imported global variable for {name}")
+                        });
+                        ImportType::new(name, *global_type)
+                    }
+                    Imported::Tag(name) => {
+                        let tag_type = self.tags.next().unwrap_or_else(|| {
+                            panic!("unexpected missing imported tag for {name}")
+                        });
+                        let func_type = self.engine.resolve_func_type(tag_type, FuncType::clone);
+                        ImportType::new(name, TagType::from_func_type(func_type))
+                    }
                 }
-                Imported::Table(name) => {
-                    let table_type = self
-                        .tables
-                        .next()
-                        .unwrap_or_else(|| panic!("unexpected missing imported table for {name}"));
-                    ImportType::new(name, *table_type)
-                }
-                Imported::Memory(name) => {
-                    let memory_type = self.memories.next().unwrap_or_else(|| {
-                        panic!("unexpected missing imported linear memory for {name}")
-                    });
-                    ImportType::new(name, *memory_type)
-                }
-                Imported::Global(name) => {
-                    let global_type = self.globals.next().unwrap_or_else(|| {
-                        panic!("unexpected missing imported global variable for {name}")
-                    });
-                    ImportType::new(name, *global_type)
-                }
-            }
-        };
+            };
         Some(import)
     }
 

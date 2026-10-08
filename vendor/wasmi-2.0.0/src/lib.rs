@@ -125,6 +125,8 @@ mod module;
 mod reftype;
 mod store;
 mod table;
+// TRust: exception tags (tag imports, exports and `tag_alloc`).
+mod tag;
 mod value;
 
 /// Definitions from the `wasmi_core` crate.
@@ -227,6 +229,7 @@ pub use self::{
     reftype::{ExnRef, ExternRef, Nullable, Ref},
     store::{AsContext, AsContextMut, CallHook, Store, StoreContext, StoreContextMut},
     table::{Table, TableType},
+    tag::{Tag, TagType},
     value::Val,
 };
 use self::{
@@ -235,6 +238,7 @@ use self::{
     instance::{InstanceEntity, InstanceEntityBuilder},
     memory::{DataSegment, DataSegmentEntity},
     table::ElementSegment,
+    tag::TagEntity,
 };
 pub use wasmi_core::{
     CustomFuelCosts,

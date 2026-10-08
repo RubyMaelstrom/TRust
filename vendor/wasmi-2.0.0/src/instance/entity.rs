@@ -21,6 +21,7 @@ use crate::{
     Memory,
     Module,
     Table,
+    Tag,
     collections::Map,
     core::CoreTable,
     memory::DataSegment,
@@ -77,6 +78,14 @@ struct InstanceEntityHeader {
     exports: Map<Box<str>, Extern>,
     layout: InstanceLayout,
     table0: Option<Table0Ptr>,
+    /// TRust: the tag index space of the instance: imported tags followed by the tags its
+    /// module defines (WebAssembly Core 3.0, `exec/runtime.rst` "Module Instances").
+    ///
+    /// # Note
+    ///
+    /// Tags need no cached entity pointer: `throw` and catch clauses only compare their
+    /// handles, so they live in the header rather than in the trailing `handles` buffer.
+    tags: Box<[Tag]>,
 }
 
 /// The byte offset of the `handles` buffer within an [`InstanceEntity`] allocation.
@@ -164,6 +173,7 @@ impl InstanceEntity {
             Map::new(),
             InstanceLayout::uninit(),
             [],
+            Box::from([]),
         )
     }
 
@@ -172,11 +182,12 @@ impl InstanceEntity {
         exports: Map<Box<str>, Extern>,
         layout: InstanceLayout,
         handles: I,
+        tags: Box<[Tag]>,
     ) -> Box<Self>
     where
         I: IntoIterator<Item = AnyHandleAndEntity, IntoIter: ExactSizeIterator>,
     {
-        Self::alloc(InstanceState::Initialized, exports, layout, handles)
+        Self::alloc(InstanceState::Initialized, exports, layout, handles, tags)
     }
 
     /// Allocates a new [`InstanceEntity`] with the trailing `handles` buffer.
@@ -189,6 +200,7 @@ impl InstanceEntity {
         exports: Map<Box<str>, Extern>,
         layout: InstanceLayout,
         handles: I,
+        tags: Box<[Tag]>,
     ) -> Box<Self>
     where
         I: IntoIterator<Item = AnyHandleAndEntity>,
@@ -204,6 +216,7 @@ impl InstanceEntity {
             exports,
             layout,
             table0: None,
+            tags,
         };
         let alloc_layout = layout_for_handles(len);
         // Safety: `alloc_layout` has a non-zero size since `InstanceEntityHeader` is non-empty.
@@ -361,6 +374,12 @@ impl InstanceEntity {
         Some(unsafe { entry.as_typed_ref::<ElementSegment>() }.handle())
     }
 
+    /// TRust: returns the [`Tag`] at `index` of the tag index space if any.
+    #[inline]
+    pub fn get_tag(&self, index: u32) -> Option<Tag> {
+        self.header.tags.get(index as usize).copied()
+    }
+
     /// Returns the value exported to the given `name` if any.
     pub fn get_export(&self, name: &str) -> Option<Extern> {
         self.header.exports.get(name).copied()
@@ -460,6 +479,17 @@ impl ThinPtr<InstanceEntity> {
     pub unsafe fn layout<'a>(self) -> &'a InstanceLayout {
         // Safety: guaranteed by the caller.
         unsafe { self.header() }.layout()
+    }
+
+    /// TRust: returns the [`Tag`] at `index` of the pointee's tag index space if any.
+    ///
+    /// # Safety
+    ///
+    /// Same as for [`ThinPtr::as_ref`].
+    #[inline]
+    pub unsafe fn get_tag(self, index: u32) -> Option<Tag> {
+        // Safety: guaranteed by the caller.
+        unsafe { self.header() }.tags.get(index as usize).copied()
     }
 
     /// Returns the cached entity pointer for `(table 0)` if any.

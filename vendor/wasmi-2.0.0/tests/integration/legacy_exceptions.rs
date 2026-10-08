@@ -6,8 +6,8 @@
 //! catch clause, and `delegate` hands it to the `try` at its label.
 //!
 //! `WASMI_LEGACY_EH_DIR=/path/to/exception-handling/test/legacy/exceptions/core cargo test
-//! legacy_exception_spec -- --ignored` runs the official scripts. Modules that import or
-//! export tags are skipped: Wasmi has no tag externs.
+//! legacy_exception_spec -- --ignored` runs the official scripts, including the registered
+//! module whose tag `try_catch.wast` imports.
 
 use super::wast_script::Runner;
 use std::path::Path;
@@ -466,14 +466,10 @@ fn print_sexps(items: &[Sexp], out: &mut String) {
 }
 
 fn run_script(path: &Path) -> (usize, Vec<String>) {
-    // Tags cannot be imported: give `try_catch.wast`'s main module a local tag instead, and
-    // skip only the assertion that depends on the identity of the imported tag.
-    let original = std::fs::read_to_string(path)
-        .unwrap()
-        .replace(r#"(tag $imported-e0 (import "test" "e0"))"#, "(tag $imported-e0)");
+    let original = std::fs::read_to_string(path).unwrap();
     let mut source = String::new();
     print_sexps(&unfold_legacy_try(parse_sexps(&original)), &mut source);
-    Runner::new(&["catch-imported"]).run_script(&path.display().to_string(), &source)
+    Runner::new(&[]).run_script(&path.display().to_string(), &source)
 }
 
 #[test]

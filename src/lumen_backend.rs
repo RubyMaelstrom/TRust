@@ -10605,6 +10605,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__wasm_table_get", 2, lumen_wasm::host_table_get),
     ("__wasm_table_set", 3, lumen_wasm::host_table_set),
     ("__wasm_table_grow", 3, lumen_wasm::host_table_grow),
+    (
+        "__wasm_exception_binding",
+        3,
+        lumen_wasm::host_exception_binding,
+    ),
 ];
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
@@ -15026,6 +15031,11 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             "__wasm_table_grow",
             3,
             lumen_wasm::host_table_grow as NativeFn,
+        ),
+        (
+            "__wasm_exception_binding",
+            3,
+            lumen_wasm::host_exception_binding as NativeFn,
         ),
     ] {
         engine.define_global(name, len, function);
@@ -29808,7 +29818,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 235, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 236, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -29819,7 +29829,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 235);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 236);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -33016,6 +33026,584 @@ mod tests {
             string_value(&mut engine, "exnrefResult"),
             "5|true|true|true|true|true|1|2|true|false"
         );
+    }
+
+    #[test]
+    fn webassembly_tag_and_exception_interfaces_follow_web_idl() {
+        // WebAssembly JS API #tags, #exceptions and the JSTag attribute (local snapshot of the
+        // spec repository 37d6b059) with Web IDL's interface objects, dictionary, sequence,
+        // enum and [EnforceRange] conversions, brand checks and [LegacyNamespace] properties.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            eval(
+                &mut engine,
+                r#"
+                const failures = [];
+                const check = (name, condition) => { if (!condition) failures.push(name); };
+                const throws = (Ctor, f) => {
+                    try { f(); return false; }
+                    catch (e) { return e instanceof Ctor && e.constructor === Ctor; }
+                };
+                const W = WebAssembly, desc = Object.getOwnPropertyDescriptor;
+                for (const name of ['Tag', 'Exception']) {
+                    const d = desc(W, name);
+                    check(name + ' property', d.writable && !d.enumerable && d.configurable);
+                    const p = desc(W[name], 'prototype');
+                    check(name + ' prototype', !p.writable && !p.enumerable && !p.configurable);
+                    check(name + ' constructor', W[name].prototype.constructor === W[name]);
+                }
+                const jsTag = desc(W, 'JSTag');
+                check('JSTag accessor', typeof jsTag.get === 'function' && jsTag.set === undefined &&
+                    jsTag.enumerable && jsTag.configurable && jsTag.get.name === 'get JSTag' &&
+                    jsTag.get.length === 0);
+                check('JSTag identity', W.JSTag === W.JSTag && W.JSTag instanceof W.Tag);
+                check('lengths', W.Tag.length === 1 && W.Exception.length === 2 &&
+                    W.Tag.name === 'Tag' && W.Exception.name === 'Exception');
+                check('Tag class string', Object.prototype.toString.call(new W.Tag({ parameters: [] }))
+                    === '[object WebAssembly.Tag]' &&
+                    desc(W.Tag.prototype, Symbol.toStringTag).value === 'WebAssembly.Tag');
+                // new Tag(type): TagType { required sequence<ValueType> parameters }.
+                check('Tag without arguments', throws(TypeError, () => new W.Tag()));
+                check('Tag called', throws(TypeError, () => W.Tag({ parameters: [] })));
+                for (const bad of [undefined, null, false, 1, 'x', Symbol(), {}, { parameters: 1 }])
+                    check('Tag type ' + String(bad), throws(TypeError, () => new W.Tag(bad)));
+                for (const bad of ['i16', 'i32\0', 'funcref', 'exnref', 'anyref', Symbol()])
+                    check('ValueType ' + String(bad), throws(TypeError, () => new W.Tag({ parameters: [bad] })));
+                const every = new W.Tag({
+                    parameters: ['i32', 'i64', 'f32', 'f64', 'v128', 'externref', 'anyfunc']
+                });
+                check('iterable parameters', new W.Tag({ parameters: new Set(['i32']) }) instanceof W.Tag);
+                const i32 = new W.Tag({ parameters: ['i32'] });
+                check('distinct tags', i32 !== new W.Tag({ parameters: ['i32'] }));
+                // new Exception(exceptionTag, payload, options).
+                check('Exception arguments', throws(TypeError, () => new W.Exception()) &&
+                    throws(TypeError, () => new W.Exception(i32)));
+                check('Exception called', throws(TypeError, () => W.Exception(i32, [1])));
+                check('Exception tag brand', throws(TypeError, () => new W.Exception({}, [1])) &&
+                    throws(TypeError, () => new W.Exception(Object.create(W.Tag.prototype), [1])));
+                check('Exception payload', throws(TypeError, () => new W.Exception(i32, 1)));
+                check('Exception arity', throws(TypeError, () => new W.Exception(i32, [])) &&
+                    throws(TypeError, () => new W.Exception(i32, [1, 2])));
+                check('Exception JSTag', throws(TypeError, () => new W.Exception(W.JSTag, [{}])));
+                check('Exception v128', throws(TypeError,
+                    () => new W.Exception(every, [0, 0n, 0, 0, 0, null, null])));
+                check('Exception i64', throws(TypeError,
+                    () => new W.Exception(new W.Tag({ parameters: ['i64'] }), [1])));
+                check('Exception anyfunc', throws(TypeError,
+                    () => new W.Exception(new W.Tag({ parameters: ['anyfunc'] }), [() => {}])));
+                check('Exception options', throws(TypeError, () => new W.Exception(i32, [1], 5)));
+                const object = {};
+                const many = new W.Tag({ parameters: ['i32', 'i64', 'f32', 'f64', 'externref', 'anyfunc'] });
+                const e = new W.Exception(many, [{ valueOf() { return 7; } }, 5n, 1.5, -0, object, null]);
+                check('getArg values', e.getArg(many, 0) === 7 && e.getArg(many, 1) === 5n &&
+                    e.getArg(many, 2) === 1.5 && Object.is(e.getArg(many, 3), -0) &&
+                    e.getArg(many, 4) === object && e.getArg(many, 5) === null);
+                check('getArg out of bounds', throws(RangeError, () => e.getArg(many, 6)));
+                for (const bad of [undefined, NaN, Infinity, -Infinity, -1, 2 ** 32, '0x100000000',
+                    { valueOf() { return 2 ** 32; } }, 1n])
+                    check('getArg index ' + String(bad), throws(TypeError, () => e.getArg(many, bad)));
+                check('getArg conversions', e.getArg(many, 0.9) === 7 && e.getArg(many, '1') === 5n);
+                check('getArg arguments', throws(TypeError, () => e.getArg()) &&
+                    throws(TypeError, () => e.getArg(many)));
+                check('getArg tag', throws(TypeError, () => e.getArg(i32, 0)) &&
+                    throws(TypeError, () => e.getArg({}, 0)));
+                check('getArg brand', throws(TypeError, () => W.Exception.prototype.getArg.call({}, many, 0)));
+                check('is', e.is(many) && !e.is(i32) && throws(TypeError, () => e.is()) &&
+                    throws(TypeError, () => e.is({})) &&
+                    throws(TypeError, () => W.Exception.prototype.is.call(i32, i32)));
+                check('stack', e.stack === undefined &&
+                    new W.Exception(i32, [1], { traceStack: false }).stack === undefined &&
+                    typeof new W.Exception(i32, [1], { traceStack: true }).stack === 'string');
+                check('stack brand', throws(TypeError, () => W.Exception.prototype.stack));
+                const proto = W.Exception.prototype;
+                check('operations', desc(proto, 'getArg').enumerable && desc(proto, 'getArg').writable &&
+                    desc(proto, 'is').enumerable && desc(proto, 'stack').enumerable &&
+                    desc(proto, 'stack').set === undefined && proto.getArg.length === 2 &&
+                    proto.is.length === 1);
+                check('Exception class string', Object.prototype.toString.call(e) ===
+                    '[object WebAssembly.Exception]');
+                check('not an Error', !(e instanceof Error));
+                // HTML #structuredserializeinternal: neither interface is [Serializable].
+                for (const value of [i32, e, W.JSTag])
+                    check('not serializable', (() => {
+                        try { structuredClone(value); return false; }
+                        catch (error) { return error.name === 'DataCloneError'; }
+                    })());
+                globalThis.tagInterfaceResult = failures.join(',') || 'ok';
+                "#,
+                "WebAssembly exception interfaces",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "tagInterfaceResult"),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    const WASM_EXCEPTION_BOUNDARY_FIXTURE: &str = r#"
+        (module
+          (import "env" "tag" (tag $imported (param i32)))
+          (import "env" "js" (func $js (param i32)))
+          (import "env" "jsTag" (tag $jsTag (param externref)))
+          (tag $own (export "own") (param i32 i64 f64 externref funcref))
+          (tag $opaque (export "opaque") (param v128 exnref i32))
+          (export "imported" (tag $imported))
+          (global $kept (mut exnref) (ref.null exn))
+          (func $f (export "f") (result i32) (i32.const 1))
+          (elem declare func $f)
+          (func (export "throwOwn") (param i32 externref)
+            (throw $own (local.get 0) (i64.const -5) (f64.const 2.5) (local.get 1) (ref.func $f)))
+          (func (export "throwImported") (param i32) (throw $imported (local.get 0)))
+          (func (export "throwOpaque")
+            (throw $opaque (v128.const i32x4 1 2 3 4) (ref.null exn) (i32.const 3)))
+          (func (export "throwJsTag") (param externref) (throw $jsTag (local.get 0)))
+          (func (export "callJs") (param i32) (call $js (local.get 0)))
+          (func (export "catchImported") (param i32) (result i32)
+            (block $h (result i32)
+              (try_table (catch $imported $h) (call $js (local.get 0)))
+              (i32.const -1)))
+          (func (export "catchJs") (param i32) (result externref)
+            (block $h (result externref)
+              (try_table (catch $jsTag $h) (call $js (local.get 0)))
+              (ref.null extern)))
+          (func (export "catchAll") (param i32) (result i32)
+            (block $h
+              (try_table (catch_all $h) (call $js (local.get 0)))
+              (return (i32.const 0)))
+            (i32.const 1))
+          (func (export "keep") (param i32)
+            (global.set $kept
+              (block $h (result exnref)
+                (try_table (catch_all_ref $h) (call $js (local.get 0)))
+                (unreachable))))
+          (func (export "rethrow") (throw_ref (global.get $kept)))
+          (func (export "clear") (global.set $kept (ref.null exn)))
+          (func (export "legacyCatch") (param i32) (result i32)
+            try (result i32)
+              (call $js (local.get 0))
+              i32.const -1
+            catch $imported
+            end)
+          (func (export "trap") (unreachable)))
+    "#;
+
+    #[test]
+    fn webassembly_exceptions_cross_the_javascript_boundary() {
+        // JS API "call an Exported Function" step 11 and "create a host function" step 3.10:
+        // Wasm exceptions reach JavaScript as their cached Exception objects (or, for JSTag, the
+        // original value), and JavaScript exceptions of imports are catchable in Wasm, keeping
+        // their identity when they are thrown back out.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(&mut engine, WASM_EXCEPTION_BOUNDARY_FIXTURE);
+            eval(
+                &mut engine,
+                r#"
+                const failures = [];
+                const check = (name, condition) => { if (!condition) failures.push(name); };
+                const caught = f => { try { f(); return undefined; } catch (e) { return e; } };
+                const tag = new WebAssembly.Tag({ parameters: ['i32'] });
+                let mode = 'ok', thrown, last;
+                const js = n => {
+                    if (mode === 'exception') throw (last = new WebAssembly.Exception(tag, [n]));
+                    if (mode === 'value') throw thrown;
+                    if (mode === 'trap') x.trap();
+                    if (mode === 'nested') x.throwOwn(n, null);
+                };
+                const module = new WebAssembly.Module(wasmFixture);
+                const x = new WebAssembly.Instance(module, {
+                    env: { tag, js, jsTag: WebAssembly.JSTag }
+                }).exports;
+                check('kinds', WebAssembly.Module.imports(module).map(i => i.kind).join() ===
+                    'tag,function,tag' && WebAssembly.Module.exports(module)
+                        .filter(e => e.kind === 'tag').map(e => e.name).join() === 'own,opaque,imported');
+                check('re-exported tag', x.imported === tag);
+                check('exported tag', x.own instanceof WebAssembly.Tag && x.own !== tag);
+                // Wasm exceptions in JavaScript.
+                const object = {};
+                const own = caught(() => x.throwOwn(7, object));
+                check('Exception object', own instanceof WebAssembly.Exception && !(own instanceof Error));
+                check('Exception tag', own.is(x.own) && !own.is(tag) && own.stack === undefined);
+                check('Exception payload', own.getArg(x.own, 0) === 7 && own.getArg(x.own, 1) === -5n &&
+                    own.getArg(x.own, 2) === 2.5 && own.getArg(x.own, 3) === object &&
+                    own.getArg(x.own, 4) === x.f);
+                // getArg steps 7 and 9: v128 and exnref fields stay in Wasm.
+                const opaque = caught(() => x.throwOpaque());
+                check('opaque fields', opaque.getArg(x.opaque, 2) === 3 &&
+                    caught(() => opaque.getArg(x.opaque, 0)) instanceof TypeError &&
+                    caught(() => opaque.getArg(x.opaque, 1)) instanceof TypeError &&
+                    caught(() => opaque.getArg(x.opaque, 3)) instanceof RangeError &&
+                    caught(() => new WebAssembly.Exception(x.opaque, [0, null, 0])) instanceof TypeError);
+                const imported = caught(() => x.throwImported(3));
+                check('imported tag', imported.is(tag) && imported.getArg(tag, 0) === 3);
+                check('new exceptions', caught(() => x.throwImported(3)) !== imported);
+                check('JSTag payload', caught(() => x.throwJsTag(object)) === object &&
+                    caught(() => x.throwJsTag(null)) === null &&
+                    caught(() => x.throwJsTag(undefined)) === undefined);
+                // JavaScript exceptions in Wasm.
+                mode = 'exception';
+                check('catch imported', x.catchImported(5) === 5 && x.legacyCatch(6) === 6);
+                check('uncaught Exception identity', caught(() => x.catchJs(4)) === last);
+                check('direct Exception identity', caught(() => x.callJs(4)) === last);
+                check('catch_all', x.catchAll(1) === 1);
+                x.keep(9);
+                const kept = last;
+                kept.marker = 'kept';
+                check('rethrown Exception', caught(() => x.rethrow()) === kept);
+                mode = 'value';
+                thrown = { message: 'value' };
+                check('JSTag catch', x.catchJs(0) === thrown);
+                check('JSTag identity', caught(() => x.callJs(0)) === thrown &&
+                    caught(() => x.catchImported(0)) === thrown);
+                x.keep(0);
+                check('JSTag rethrow', caught(() => x.rethrow()) === thrown);
+                for (const value of [undefined, null, 0, -0, 'text', Symbol.iterator, 1n]) {
+                    thrown = value;
+                    check('thrown ' + String(value), Object.is(caught(() => x.callJs(0)), value) &&
+                        Object.is(x.catchJs(0), value));
+                }
+                thrown = new TypeError('from JavaScript');
+                check('catch_all JavaScript', x.catchAll(0) === 1);
+                mode = 'trap';
+                const trap = caught(() => x.callJs(0));
+                check('trap through JavaScript', trap instanceof WebAssembly.RuntimeError &&
+                    x.catchAll(0) === 1);
+                mode = 'nested';
+                const nested = caught(() => x.callJs(8));
+                check('nested exception', nested instanceof WebAssembly.Exception &&
+                    nested.is(x.own) && nested.getArg(x.own, 0) === 8);
+                x.keep(8);
+                check('nested rethrow', caught(() => x.rethrow()) !== nested &&
+                    caught(() => x.rethrow()) === caught(() => x.rethrow()));
+                mode = 'ok';
+                check('no exception', x.catchAll(0) === 0 && x.catchImported(0) === -1);
+                // Tag imports require Tag objects.
+                const link = imports => caught(() => new WebAssembly.Instance(module, {
+                    env: Object.assign({ tag, js, jsTag: WebAssembly.JSTag }, imports)
+                }));
+                check('tag import kind', link({ tag: {} }) instanceof WebAssembly.LinkError &&
+                    link({ tag: 1 }) instanceof WebAssembly.LinkError &&
+                    link({ tag: x.f }) instanceof WebAssembly.LinkError);
+                check('tag import type', link({ tag: new WebAssembly.Tag({ parameters: ['i64'] }) })
+                    instanceof WebAssembly.LinkError && link({ jsTag: tag }) instanceof WebAssembly.LinkError);
+                globalThis.boundaryResult = failures.join(',') || 'ok';
+                "#,
+                "WebAssembly exception boundary",
+            )
+            .unwrap();
+            assert_eq!(
+                string_value(&mut engine, "boundaryResult"),
+                "ok",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn webassembly_start_function_exceptions_propagate() {
+        // JS API "instantiate the core of a WebAssembly module" step 3: the start function's
+        // exception propagates as the object it is in JavaScript.
+        let mut engine = platform_engine();
+        install_wasm_test_fixture(
+            &mut engine,
+            r#"
+            (module
+              (import "env" "tag" (tag $t (param i32)))
+              (import "env" "start" (func $start (param i32)))
+              (func $run (call $start (i32.const 1)) (throw $t (i32.const 2)))
+              (start $run))
+            "#,
+        );
+        eval(
+            &mut engine,
+            r#"
+            const tag = new WebAssembly.Tag({ parameters: ['i32'] });
+            const value = { start: true };
+            let throwing = true;
+            const instantiate = () => {
+                try {
+                    new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {
+                        env: { tag, start() { if (throwing) throw value; } }
+                    });
+                    return undefined;
+                } catch (e) { return e; }
+            };
+            const first = instantiate();
+            throwing = false;
+            const second = instantiate();
+            globalThis.startResult = [first === value, second instanceof WebAssembly.Exception,
+                second.is(tag), second.getArg(tag, 0)].join();
+            "#,
+            "WebAssembly start function exceptions",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "startResult"), "true,true,true,2");
+    }
+
+    #[test]
+    fn webassembly_exception_objects_keep_identity_then_collect() {
+        // JS API #object-caches: while Wasm keeps an exception, its Exception object (and its
+        // expandos) survives the loss of every JavaScript reference; once neither side keeps
+        // it, the object and the exception are collected.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            install_wasm_test_fixture(&mut engine, WASM_EXCEPTION_BOUNDARY_FIXTURE);
+            eval(
+                &mut engine,
+                r#"
+                const tag = new WebAssembly.Tag({ parameters: ['i32'] });
+                let next;
+                globalThis.x = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {
+                    env: { tag, js() { throw next; }, jsTag: WebAssembly.JSTag }
+                }).exports;
+                (() => {
+                    next = new WebAssembly.Exception(tag, [41]);
+                    next.marker = 'kept';
+                    x.keep(0);
+                    next = null;
+                    for (let i = 0; i < 100; i++) new WebAssembly.Exception(tag, [i]);
+                })();
+                "#,
+                "WebAssembly Exception object identity",
+            )
+            .unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            let (_, exceptions) = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .wasm
+                .cached_exception_objects();
+            assert_eq!(exceptions, 1, "{tier:?}: only the kept Exception object");
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                    (() => {
+                        let e;
+                        try { x.rethrow(); } catch (error) { e = error; }
+                        return [e.marker, e.getArg(x.imported, 0)].join();
+                    })()
+                    "#
+                ),
+                "kept,41",
+                "{tier:?}"
+            );
+            eval(&mut engine, "x.clear()", "release the exception").unwrap();
+            collect_wasm_test_garbage(&mut engine);
+            let (_, exceptions) = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .unwrap()
+                .wasm
+                .cached_exception_objects();
+            assert_eq!(exceptions, 0, "{tier:?}: unreachable Exception objects");
+        }
+    }
+
+    #[test]
+    fn webassembly_tags_and_exceptions_keep_agent_identity_across_realms() {
+        // JS API #object-caches are per agent: a Tag object imported by an instance of another
+        // Realm of the agent is re-exported as itself, and an Exception object keeps its
+        // identity through Wasm of another Realm, while instanceof follows each object's Realm.
+        let mut engine = platform_engine();
+        install_wasm_test_fixture(&mut engine, WASM_EXCEPTION_BOUNDARY_FIXTURE);
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html"), body = document.createElement("body");
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<body></body>';
+            body.appendChild(frame);
+            __trust.hydrateFrames();
+            const FW = frame.contentWindow.WebAssembly;
+            const tag = new WebAssembly.Tag({ parameters: ['i32'] });
+            let next;
+            const x = new FW.Instance(new FW.Module(wasmFixture), {
+                env: { tag, js() { throw next; }, jsTag: FW.JSTag }
+            }).exports;
+            next = new WebAssembly.Exception(tag, [3]);
+            let rethrown;
+            x.keep(0);
+            try { x.rethrow(); } catch (e) { rethrown = e; }
+            let foreign;
+            try { x.throwImported(4); } catch (e) { foreign = e; }
+            globalThis.realmResult = [
+                FW !== WebAssembly, x.imported === tag, tag instanceof WebAssembly.Tag,
+                !(tag instanceof FW.Tag), x.own instanceof FW.Tag, FW.JSTag === WebAssembly.JSTag,
+                rethrown === next, foreign instanceof FW.Exception,
+                !(foreign instanceof WebAssembly.Exception),
+                WebAssembly.Exception.prototype.getArg.call(foreign, tag, 0) === 4,
+                FW.Exception.prototype.is.call(next, tag)
+            ].join();
+            "##,
+            "WebAssembly exception realms",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "realmResult"),
+            "true,true,true,true,true,true,true,true,true,true,true"
+        );
+    }
+
+    #[test]
+    fn webassembly_exceptions_work_in_workers() {
+        // The worker scope reuses the WebAssembly block with its own agent store and JSTag.
+        let mut engine = worker_platform_engine();
+        install_wasm_test_fixture(&mut engine, WASM_EXCEPTION_BOUNDARY_FIXTURE);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+                (() => {
+                    const tag = new WebAssembly.Tag({ parameters: ['i32'] });
+                    let thrown;
+                    const x = new WebAssembly.Instance(new WebAssembly.Module(wasmFixture), {
+                        env: { tag, js() { throw thrown; }, jsTag: WebAssembly.JSTag }
+                    }).exports;
+                    thrown = new WebAssembly.Exception(tag, [12]);
+                    const caught = x.catchImported(0);
+                    thrown = 'value';
+                    let escaped;
+                    try { x.catchImported(0); } catch (e) { escaped = e; }
+                    return [caught, escaped, x.imported === tag,
+                        typeof __wasm_exception_binding].join();
+                })()
+                "#
+            ),
+            "12,value,true,undefined"
+        );
+    }
+
+    /// A minimal testharness.js for the official WebAssembly JS API tests: `test`,
+    /// `promise_test` and the assertions they use, recording one line per subtest. Promises
+    /// that `WebAssembly.instantiate` returns are tracked, so that assertions in their
+    /// callbacks (as in `exception/identity.tentative.any.js`) fail the run as well.
+    const WASM_JS_API_HARNESS: &str = r#"
+        globalThis.__results = [];
+        globalThis.__pending = [];
+        function __record(name, error) {
+            __results.push(error === undefined ? 'PASS ' + name
+                : 'FAIL ' + name + ': ' + (error && error.message || format_value(error)));
+        }
+        function test(fn, name) {
+            try { fn(); __record(name); } catch (e) { __record(name, e); }
+        }
+        function promise_test(fn, name) {
+            __pending.push(Promise.resolve().then(() => fn())
+                .then(() => __record(name), e => __record(name, e)));
+        }
+        function format_value(v) {
+            try { return typeof v === 'symbol' ? v.toString() : String(v); }
+            catch (e) { return typeof v; }
+        }
+        function __fail(message) { throw new Error(message); }
+        function assert_true(v, m) { if (v !== true) __fail('assert_true: ' + m); }
+        function assert_false(v, m) { if (v !== false) __fail('assert_false: ' + m); }
+        function assert_equals(a, b, m) {
+            if (!Object.is(a, b)) __fail('assert_equals: ' + format_value(a) + ' vs ' + format_value(b) + ' ' + m);
+        }
+        function assert_not_equals(a, b, m) { if (Object.is(a, b)) __fail('assert_not_equals: ' + m); }
+        function assert_array_equals(a, b, m) {
+            if (a.length !== b.length) __fail('assert_array_equals length: ' + m);
+            for (let i = 0; i < a.length; i++) assert_equals(a[i], b[i], m);
+        }
+        function assert_not_reached(m) { __fail('assert_not_reached: ' + m); }
+        function assert_own_property(o, p, m) {
+            if (!Object.prototype.hasOwnProperty.call(o, p)) __fail('assert_own_property: ' + String(p));
+        }
+        function assert_class_string(o, c, m) {
+            const s = Object.prototype.toString.call(o);
+            if (s !== '[object ' + c + ']') __fail('assert_class_string: ' + s);
+        }
+        function assert_throws_js(C, f, m) {
+            try { f(); } catch (e) {
+                if (e !== null && typeof e === 'object' && e.constructor === C && e instanceof C) return;
+                __fail('assert_throws_js: ' + format_value(e) + ' ' + m);
+            }
+            __fail('assert_throws_js: nothing thrown ' + m);
+        }
+        function assert_throws_exactly(v, f, m) {
+            try { f(); } catch (e) {
+                if (Object.is(e, v)) return;
+                __fail('assert_throws_exactly: ' + format_value(e) + ' ' + m);
+            }
+            __fail('assert_throws_exactly: nothing thrown ' + m);
+        }
+        const __instantiate = WebAssembly.instantiate;
+        WebAssembly.instantiate = function () {
+            const promise = Reflect.apply(__instantiate, this, arguments);
+            const then = promise.then;
+            promise.then = function (onFulfilled, onRejected) {
+                const derived = Reflect.apply(then, promise, [onFulfilled, onRejected]);
+                __pending.push(derived.then(undefined, e => __record('instantiate callback', e)));
+                return derived;
+            };
+            return promise;
+        };
+    "#;
+
+    #[test]
+    #[ignore]
+    fn webassembly_official_exception_js_api_tests() {
+        // `WASM_JS_API_DIR=/big/web-standards/repositories/WebAssembly/spec/test/js-api`:
+        // the official tag and exception tests of the WebAssembly JS API in every tier.
+        let dir = std::env::var_os("WASM_JS_API_DIR").expect("set WASM_JS_API_DIR");
+        let dir = std::path::Path::new(&dir);
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let builder = read("wasm-module-builder.js");
+        let assertions = read("assertions.js");
+        let files = [
+            "tag/constructor.tentative.any.js",
+            "tag/toString.tentative.any.js",
+            "exception/basic.tentative.any.js",
+            "exception/constructor.tentative.any.js",
+            "exception/getArg.tentative.any.js",
+            "exception/identity.tentative.any.js",
+            "exception/is.tentative.any.js",
+            "exception/jsTag.tentative.any.js",
+            "exception/toString.tentative.any.js",
+        ];
+        let mut failures = Vec::new();
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let (mut passed, mut total) = (0, 0);
+            for file in files {
+                let mut engine = platform_engine();
+                engine.set_tier(tier);
+                for (source, label) in [
+                    (WASM_JS_API_HARNESS, "harness"),
+                    (builder.as_str(), "wasm-module-builder.js"),
+                    (assertions.as_str(), "assertions.js"),
+                ] {
+                    eval(&mut engine, source, label).unwrap();
+                }
+                if let Err(error) = eval(&mut engine, &read(file), file) {
+                    failures.push(format!("{tier:?} {file}: {error}"));
+                    continue;
+                }
+                // Settle the promise tests and their tracked callbacks.
+                for _ in 0..8 {
+                    run_microtask_checkpoint(&mut engine);
+                }
+                let results = string_value(&mut engine, "__results.join('\\n')");
+                for line in results.lines() {
+                    total += 1;
+                    if line.starts_with("PASS ") {
+                        passed += 1;
+                    } else {
+                        failures.push(format!("{tier:?} {file}: {line}"));
+                    }
+                }
+            }
+            std::println!("{tier:?}: {passed}/{total} subtests passed");
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     fn install_wasm_test_fixture(engine: &mut lumen::Engine, source: &str) {

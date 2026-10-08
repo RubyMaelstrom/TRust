@@ -9,6 +9,7 @@ use crate::{
     Memory,
     Module,
     Table,
+    Tag,
     collections::Map,
     instance::{AnyHandleAndEntity, InstanceLayout, handle::AnyHandle},
     memory::DataSegment,
@@ -24,6 +25,8 @@ pub struct InstanceEntityBuilder {
     funcs: Vec<Func>,
     memories: Vec<Memory>,
     globals: Vec<Global>,
+    /// TRust: the tag index space, imported tags first.
+    tags: Vec<Tag>,
     start_fn: Option<FuncIdx>,
     exports: Map<Box<str>, Extern>,
     data_segments: Vec<DataSegment>,
@@ -43,6 +46,7 @@ impl InstanceEntityBuilder {
         let mut len_globals = module.len_globals();
         let mut len_tables = module.len_tables();
         let mut len_memories = module.len_memories();
+        let mut len_tags = module.len_tags();
         for import in module.imports() {
             match import.ty() {
                 ExternType::Func(_) => {
@@ -57,6 +61,9 @@ impl InstanceEntityBuilder {
                 ExternType::Global(_) => {
                     len_globals += 1;
                 }
+                ExternType::Tag(_) => {
+                    len_tags += 1;
+                }
             }
         }
         let layout = *module.instance_layout();
@@ -65,6 +72,7 @@ impl InstanceEntityBuilder {
             funcs: vec_with_capacity_exact(len_funcs),
             memories: vec_with_capacity_exact(len_memories),
             globals: vec_with_capacity_exact(len_globals),
+            tags: vec_with_capacity_exact(len_tags),
             start_fn: None,
             exports: Map::default(),
             data_segments: Vec::new(),
@@ -140,6 +148,24 @@ impl InstanceEntityBuilder {
             .unwrap_or_else(|| panic!("missing `Func` at index: {index}"))
     }
 
+    /// TRust: returns the [`Tag`] at `index` of the tag index space.
+    ///
+    /// # Panics
+    ///
+    /// If there is no [`Tag`] at the given `index`.
+    pub fn get_tag(&self, index: u32) -> Tag {
+        self.tags
+            .get(index as usize)
+            .copied()
+            .unwrap_or_else(|| panic!("missing `Tag` at index: {index}"))
+    }
+
+    /// TRust: pushes a new [`Tag`] to the tag index space of the [`InstanceEntity`] under
+    /// construction.
+    pub fn push_tag(&mut self, tag: Tag) {
+        self.tags.push(tag);
+    }
+
     /// Pushes a new [`Memory`] to the [`InstanceEntity`] under construction.
     pub fn push_memory(&mut self, memory: Memory) {
         self.memories.push(memory);
@@ -188,7 +214,12 @@ impl InstanceEntityBuilder {
     /// Finishes constructing the [`InstanceEntity`].
     pub fn finish(self) -> Result<Box<InstanceEntity>, Error> {
         let handles = self.finish_handles();
-        Ok(InstanceEntity::new_init(self.exports, self.layout, handles))
+        Ok(InstanceEntity::new_init(
+            self.exports,
+            self.layout,
+            handles,
+            self.tags.into_boxed_slice(),
+        ))
     }
 
     /// Finishes construction of the [`AnyHandle`] buffer.
