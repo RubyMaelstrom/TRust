@@ -841,6 +841,11 @@ pub struct Dom {
     /// by `showModal()`/close through the `__dom_dialog_modal` syscall and
     /// cleared when the dialog is removed. Read by `:modal` (HTML #selector-modal).
     modal_dialogs: FxHashSet<NodeId>,
+    /// `script` elements whose "already started" flag is true (HTML
+    /// #already-started): set by the HTML fragment parser's Inert scripting
+    /// mode and when a script is prepared to run, copied by cloning, and
+    /// never cleared. A script whose subtree is inserted later is skipped.
+    started_scripts: FxHashSet<NodeId>,
 }
 
 /// The kind of DOM mutation, for incremental-layout boundary mapping. See
@@ -1146,6 +1151,7 @@ impl Dom {
             popover_open,
             popover_order,
             modal_dialogs,
+            started_scripts,
         } = self;
         let _ = (
             gc_allocation_leases,
@@ -1568,6 +1574,7 @@ impl Dom {
                 .saturating_mul(std::mem::size_of::<NodeId>()),
         );
         fixed_set!(modal_dialogs, NodeId);
+        fixed_set!(started_scripts, NodeId);
 
         match layout_cache.try_borrow() {
             Ok(cache) => {
@@ -1673,6 +1680,7 @@ impl Dom {
             popover_open: FxHashSet::default(),
             popover_order: Vec::new(),
             modal_dialogs: FxHashSet::default(),
+            started_scripts: FxHashSet::default(),
         };
         dom.new_node(NodeData::Document);
         dom
@@ -3547,6 +3555,36 @@ impl Dom {
             matches!(&node.data, NodeData::Element { name, .. } if name.ns == ns!(html))
                 && !self.is_xml_document(node.owner_document)
         })
+    }
+
+    /// Set a script element's "already started" flag (HTML #already-started).
+    pub(crate) fn mark_script_started(&mut self, id: NodeId) {
+        if self.is_valid(id) {
+            self.started_scripts.insert(id);
+        }
+    }
+
+    /// HTML's post-connection steps for an inserted node now connected: the
+    /// script elements not already started, and the `link` and `base`
+    /// elements, among its shadow-including inclusive descendants in tree
+    /// order. Empty when the node is not connected.
+    pub(crate) fn connected_insertion_resources(&self, root: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        // Connected, in a document with a browsing context (scripts of a
+        // DOMParser or createHTMLDocument document never run).
+        if !self.is_valid(root) || !self.is_dom_connected(root) || !self.scripting_enabled_for(root)
+        {
+            return out;
+        }
+        self.visit_shadow_including_subtree(root, |id| {
+            match self.tag_name(id) {
+                Some("script") if !self.started_scripts.contains(&id) => out.push(id),
+                Some("link" | "base") => out.push(id),
+                _ => {}
+            }
+            true
+        });
+        out
     }
 
     /// DOM #xml-document: a Document whose type is "xml", which is one whose
@@ -9636,6 +9674,10 @@ impl Dom {
         if let Some(value) = self.input_values.get(&id).cloned() {
             self.input_values.insert(copy, value);
         }
+        // HTML #script-processing-model cloning steps: copy "already started".
+        if self.started_scripts.contains(&id) {
+            self.started_scripts.insert(copy);
+        }
         if let Some(sc) = src_content {
             let frag = self.new_node(NodeData::Fragment);
             if let NodeData::Element {
@@ -9839,6 +9881,9 @@ impl Dom {
             _ => None,
         };
         let copy = self.new_node(data);
+        if other.started_scripts.contains(&id) {
+            self.started_scripts.insert(copy);
+        }
         if !inert {
             self.note_created_image(copy);
         }
@@ -21620,7 +21665,11 @@ impl TreeSink for Sink {
         }
     }
 
-    fn mark_script_already_started(&self, _node: &NodeId) {}
+    /// HTML #parsing-main-incdata: the Inert scripting mode of the fragment
+    /// parsing algorithm marks each script it creates already started.
+    fn mark_script_already_started(&self, node: &NodeId) {
+        self.dom.borrow_mut().started_scripts.insert(*node);
+    }
 }
 
 #[cfg(test)]

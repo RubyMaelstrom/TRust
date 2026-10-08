@@ -161,6 +161,7 @@ impl Dom {
                 .retain(|&doc, node| doc != id && *node != id);
             changed_popovers |= self.popover_open.remove(&id);
             self.modal_dialogs.remove(&id);
+            self.started_scripts.remove(&id);
             self.canvases.get_mut().remove(&id);
             self.container_sizes.get_mut().remove(&id);
             self.container_dependencies.get_mut().remove_node(id);
@@ -265,6 +266,7 @@ impl Dom {
             popover_open,
             popover_order,
             modal_dialogs,
+            started_scripts,
             focused_areas,
             dirty_nodes
         );
@@ -358,7 +360,8 @@ impl Dom {
             render_clickables,
             hover_chain,
             popover_open,
-            modal_dialogs
+            modal_dialogs,
+            started_scripts
         );
         self.popover_order.retain(|&id| valid(id));
         self.focused_areas
