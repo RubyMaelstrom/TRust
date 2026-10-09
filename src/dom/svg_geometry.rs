@@ -105,6 +105,37 @@ const INHERITED_GEOMETRY_PROPERTIES: &[&str] = &[
     "marker-end",
 ];
 
+/// Single-length attributes of the copied elements that may hold CSS units
+/// usvg does not resolve (see `Dom::usvg_length`).
+const GEOMETRY_LENGTH_ATTRIBUTES: &[&str] = &[
+    "x",
+    "y",
+    "width",
+    "height",
+    "cx",
+    "cy",
+    "r",
+    "rx",
+    "ry",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "fx",
+    "fy",
+    "fr",
+    "refX",
+    "refY",
+    "markerWidth",
+    "markerHeight",
+    "startOffset",
+    "textLength",
+    "stroke-width",
+    "stroke-dashoffset",
+    "letter-spacing",
+    "word-spacing",
+];
+
 /// CSS properties an outermost `<svg>` inherits from its HTML ancestors that
 /// affect text layout. Paint inheritance is `Dom::svg_inherited_paint_style`.
 const HTML_INHERITED_TEXT_PROPERTIES: &[&str] = &[
@@ -911,20 +942,44 @@ impl Dom {
             let local: &str = &attr.name.local;
             if attr.name.ns == ns!(xml) && local == "space" {
                 write_attr(out, "xml:space", &attr.value);
-            } else if attr.name.ns == ns!() && keep(local) {
+            } else if attr.name.ns == ns!() && keep(local) && local != "font-size" {
                 write_attr(out, local, &self.resolve_vars(id, &attr.value));
             }
         }
-        let style = self
+        let mut style = self
             .svg_element_declarations(id)
             .into_iter()
-            .filter(|(name, _)| keep(name))
+            .filter(|(name, _)| keep(name) && name != "font-size")
             .fold(String::new(), |mut style, (name, value)| {
                 push_declaration(&mut style, &name, &value);
                 style
             });
-        if !style.is_empty() {
-            write_attr(out, "style", &style);
+        self.push_computed_font_size(id, &mut style);
+        write_attr(out, "style", &style);
+    }
+
+    /// CSS Values 4 #font-relative-lengths: an `em` (or `ex`) in the
+    /// geometry document resolves against the element's computed font size,
+    /// whatever cascade, inheritance or calculation produced it, so each
+    /// copied element states it in px (after any `font` shorthand).
+    fn push_computed_font_size(&self, id: NodeId, style: &mut String) {
+        let size = crate::dom::cssom::css_number(self.svg_font_size(id));
+        push_declaration(style, "font-size", &format!("{size}px"));
+    }
+
+    /// A length attribute as usvg reads it: an SVG `<length>` (whose `em`
+    /// and `ex` use the computed font size the copy states) unchanged; any
+    /// other CSS length that needs no viewport percentage (`rem`, `ch`,
+    /// viewport units, math functions) resolved to px with the element's
+    /// font and the CSS viewport (SVG 2 types.html#presentation-attribute-css-value).
+    fn usvg_length<'v>(&self, id: NodeId, value: &'v str) -> Cow<'v, str> {
+        if value.trim().parse::<svgtypes::Length>().is_ok() {
+            return Cow::Borrowed(value);
+        }
+        let units = crate::layout2::Units::of(self, id);
+        match crate::layout2::absolute_length_px(value.trim(), units, self.viewport_px()) {
+            Some(px) => Cow::Owned(crate::dom::cssom::css_number(f64::from(px))),
+            None => Cow::Borrowed(value),
         }
     }
 
@@ -1033,10 +1088,15 @@ impl Dom {
             if !xml_name(local) || !keep_attr(local) {
                 continue;
             }
+            if local == "font-size" {
+                continue;
+            }
             // `href` is the local name of both `href` and the legacy
             // `xlink:href` (SVG 2 linking.html#XLinkRefAttrs).
             let value = if SVG_PRESENTATION_PROPERTIES.contains(&local) {
                 self.resolve_vars(id, &attr.value)
+            } else if GEOMETRY_LENGTH_ATTRIBUTES.contains(&local) {
+                self.usvg_length(id, &attr.value).into_owned()
             } else {
                 attr.value.to_string()
             };
@@ -1046,6 +1106,7 @@ impl Dom {
         if !stand_in {
             for (property, value) in self.svg_element_declarations(id) {
                 let keep = match property.as_str() {
+                    "font-size" => false,
                     "visibility" | "opacity" | "filter" | "mask" => false,
                     "display" => !forced,
                     "transform" | "transform-origin" | "transform-box" | "translate" | "rotate"
@@ -1061,6 +1122,7 @@ impl Dom {
                 }
             }
         }
+        self.push_computed_font_size(id, &mut style);
         if is_target {
             if copy.hide_others {
                 push_declaration(&mut style, "visibility", "visible");

@@ -266,8 +266,13 @@ fn custom_ident(name: &str) -> bool {
 
 pub(super) fn identifier_text(name: &str) -> String {
     let mut out = String::new();
-    cssparser::serialize_identifier(name, &mut out).unwrap();
+    identifier_text_into(name, &mut out);
     out
+}
+
+/// CSSOM #serialize-an-identifier, appended to `out`.
+pub(super) fn identifier_text_into(name: &str, out: &mut String) {
+    cssparser::serialize_identifier(name, out).unwrap();
 }
 
 pub(super) fn string_text(value: &str) -> String {

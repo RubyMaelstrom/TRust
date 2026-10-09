@@ -159,6 +159,23 @@ impl<'a> NodesRef<'a> {
         }
     }
 
+    /// Every attribute in no namespace, as (local name, value) in source
+    /// order.
+    #[inline]
+    pub(super) fn attrs_in_no_namespace(
+        self,
+        id: NodeId,
+    ) -> impl Iterator<Item = (&'a str, &'a str)> {
+        let attrs = match &self.0[id].data {
+            NodeData::Element { attrs, .. } => attrs.as_slice(),
+            _ => &[],
+        };
+        attrs
+            .iter()
+            .filter(|attribute| attribute.name.ns.is_empty())
+            .map(|attribute| (attribute.name.local.as_ref(), attribute.value.as_ref()))
+    }
+
     /// Every attribute's local name, in source order.
     #[inline]
     pub(super) fn attr_names(self, id: NodeId) -> impl Iterator<Item = &'a str> {

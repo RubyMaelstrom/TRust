@@ -658,10 +658,12 @@ pub struct BrowserController {
     occluded: bool,
     back: Vec<HistoryEntry>,
     forward: Vec<HistoryEntry>,
-    /// The live page has not yet been told the current session history size
-    /// (`PageCmd::SessionHistorySize`, HTML #script-closable): set when a
-    /// page attaches and when its history grows.
+    /// The live page has not yet been told the current session history
+    /// (`PageCmd::SessionHistory`, HTML #dom-history-length): set when a page
+    /// attaches and when its history changes.
     session_history_unsent: bool,
+    /// The live page's `PageEvt::HistoryUpdate`s applied so far.
+    history_updates_applied: u64,
     pending: Option<PendingNavigation>,
     task: Option<JoinHandle<()>>,
     declarative_refresh_task: Option<JoinHandle<()>>,
@@ -770,6 +772,7 @@ impl BrowserController {
             back: Vec::new(),
             forward: Vec::new(),
             session_history_unsent: false,
+            history_updates_applied: 0,
             pending: None,
             task: None,
             declarative_refresh_task: None,
@@ -2037,6 +2040,7 @@ impl BrowserController {
         if entry.same_document_generation == Some(self.document_generation) {
             let previous = self.same_document_history_entry();
             crate::history::traverse(&mut self.back, &mut self.forward, previous, delta);
+            self.session_history_unsent = true;
             let address = entry.target.to_string();
             self.apply_same_document_history_update(&address, true);
             self.pending_fragment = None;
@@ -3106,15 +3110,18 @@ impl BrowserController {
             .is_some_and(|handle| handle.cmds.try_send(command).is_ok())
     }
 
-    /// Report the session history size (the back and forward entries around
-    /// the current one) to the live page when it changed: its
-    /// `window.close()` needs it (HTML #script-closable). A full channel
-    /// leaves it unsent, so the next round retries.
+    /// Report the session history (the current entry's index among the back
+    /// and forward entries, and their number) to the live page when it
+    /// changed: `history.length` and `window.close()` read it (HTML
+    /// #dom-history-length, #script-closable). A full channel leaves it
+    /// unsent, so the next round retries.
     fn sync_session_history(&mut self) {
-        let size = self.back.len() + 1 + self.forward.len();
-        if self.session_history_unsent
-            && self.send_live(crate::js::PageCmd::SessionHistorySize(size))
-        {
+        let command = crate::js::PageCmd::SessionHistory {
+            index: self.back.len(),
+            length: self.back.len() + 1 + self.forward.len(),
+            applied: self.history_updates_applied,
+        };
+        if self.session_history_unsent && self.send_live(command) {
             self.session_history_unsent = false;
         }
     }
@@ -3243,6 +3250,7 @@ impl BrowserController {
     fn attach_live_page(&mut self, generation: u64, mut live: http::LivePage) {
         self.live_page = Some(live.handle);
         self.session_history_unsent = true;
+        self.history_updates_applied = 0;
         let tx = self.tx.clone();
         self.live_task = Some(self.runtime.spawn(async move {
             while let Some(event) = live.events.recv().await {
@@ -3469,6 +3477,8 @@ impl BrowserController {
                 }
             }
             PageEvt::HistoryUpdate { url, replace } => {
+                self.history_updates_applied += 1;
+                self.session_history_unsent = true;
                 self.apply_same_document_history_update(&url, replace)
             }
             PageEvt::ScrollToFragment(fragment) => {
@@ -3647,7 +3657,6 @@ impl BrowserController {
         if !replace {
             self.back.extend(self.same_document_history_entry());
             self.forward.clear();
-            self.session_history_unsent = true;
         }
         let live = self.live_page.is_some();
         let Some(page) = self.current.as_mut() else {
@@ -6114,7 +6123,11 @@ mod tests {
         browser.process_async_events();
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::js::PageCmd::SessionHistorySize(1))
+            Ok(crate::js::PageCmd::SessionHistory {
+                index: 0,
+                length: 1,
+                applied: 0
+            })
         ));
         browser.process_async_events();
         assert!(rx.try_recv().is_err(), "an unchanged size is not resent");
@@ -6125,7 +6138,31 @@ mod tests {
         browser.process_async_events();
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::js::PageCmd::SessionHistorySize(2))
+            Ok(crate::js::PageCmd::SessionHistory {
+                index: 1,
+                length: 2,
+                applied: 1
+            })
+        ));
+        // A same-document traversal moves the index, not the length.
+        browser.handle_page_event(crate::js::PageEvt::HistoryTraverse { delta: -1 });
+        while let Ok(command) = rx.try_recv() {
+            assert!(
+                matches!(
+                    command,
+                    crate::js::PageCmd::TraverseHistory { .. } | crate::js::PageCmd::Scroll { .. }
+                ),
+                "{command:?}"
+            );
+        }
+        browser.process_async_events();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::SessionHistory {
+                index: 0,
+                length: 2,
+                applied: 1
+            })
         ));
     }
 

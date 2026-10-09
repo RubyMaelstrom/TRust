@@ -5680,12 +5680,20 @@ mod desktop {
                 checkpoint(page, method);
                 finish_task_with_ack(page, events, false)
             }
-            PageCmd::SessionHistorySize(size) => {
+            PageCmd::SessionHistory {
+                index,
+                length,
+                applied,
+            } => {
                 let _ = call_trust(
                     page,
-                    "setSessionHistorySize",
-                    &[Value::Num(size as f64)],
-                    "session history size",
+                    "setSessionHistory",
+                    &[
+                        Value::Num(index as f64),
+                        Value::Num(length as f64),
+                        Value::Num(applied as f64),
+                    ],
+                    "session history",
                 );
                 true
             }
@@ -20736,7 +20744,9 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     serde_json::json!(dom.cssom_computed_names(id, which))
                 } else {
                     serde_json::json!(
-                        which.and_then(|which| dom.cssom_pseudo_resolved_value(id, which, &extra))
+                        which
+                            .and_then(|which| dom.cssom_pseudo_resolved_value(id, which, &extra))
+                            .map(|value| crate::dom::serialize_css_strings(&value).into_owned())
                     )
                 }
             } else {
@@ -21550,8 +21560,10 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     }
     Ok(read_layout_dependent_style(
         ctx,
+        // CSSOM #serialize-a-css-component-value: <string>s and <url>s
+        // serialize as #serialize-a-string and #serialize-a-url make them.
         |dom| match host_arg_node(dom, args, 0).and_then(|id| dom.cssom_resolved_value(id, &name)) {
-            Some(value) => Value::from_engine_text(value),
+            Some(value) => Value::from_engine_text(crate::dom::serialize_css_strings(&value)),
             None => Value::Null,
         },
     ))
@@ -27552,8 +27564,8 @@ mod tests {
                 const d = Object.getOwnPropertyDescriptor(window, 'close');
                 log.push([d.writable, d.enumerable, d.configurable, d.value.name, d.value.length].join());
                 close(); log.push('unknown:' + closed);
-                __trust.setSessionHistorySize(2); close(); log.push('two:' + closed);
-                __trust.setSessionHistorySize(1); window.close(); log.push('one:' + closed);
+                __trust.setSessionHistory(1, 2, 0); close(); log.push('two:' + closed);
+                __trust.setSessionHistory(0, 1, 0); window.close(); log.push('one:' + closed);
                 window.close(); log.push('again:' + closed + ':' + __trust.logs.length);
                 let illegal = 'none';
                 try { window.close.call({}); } catch (e) { illegal = e.name; }
@@ -27730,6 +27742,215 @@ mod tests {
                  rgb(0, 0, 238);rgb(255, 255, 255);rgb(118, 118, 118);rgb(85, 26, 139)|\
                  hsl(none 100% 50%);rgba(0, 0, 0, 0);hsl(none 100% 50%);hsl(none 100% 50%)|\
                  rgb(251, 251, 254);rgb(28, 27, 34);rgb(251, 251, 254);rgb(251, 251, 254)",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn font_shorthand_serializes_its_shortest_form() {
+        // CSSOM #serialize-a-css-value (local w3c/csswg-drafts 81c27f68):
+        // components at their initial values are omitted, in the canonical
+        // order of CSS Fonts 4 #font-prop, and a shorthand the longhands
+        // cannot be expressed by (here: its reset-only sub-properties were
+        // never set) is the empty string. The shorthand's grammar takes each
+        // of style (with an oblique angle), small-caps, weight (any number in
+        // [1, 1000]) and width once, `normal` for any of them.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const el = document.createElement('div');
+                const out = ['10px Arial', 'bold 10px/2 serif', 'normal normal italic 12px x',
+                    '450 12px x', 'oblique 10deg 12px/normal x', 'small-caps condensed 300 1em x',
+                    'foo 12px x', 'bold bold 12px x', 'oblique 100deg 12px x', 'caption'].map(value => {
+                    el.removeAttribute('style');
+                    el.style.font = value;
+                    return el.style.font;
+                });
+                el.removeAttribute('style');
+                Object.assign(el.style, {fontStyle: 'normal', fontWeight: '400', fontSize: '10px',
+                    lineHeight: 'normal', fontFamily: 'Arial'});
+                out.push(el.style.getPropertyValue('font'), el.style.cssText);
+                el.style.fontWeight = 'inherit';
+                out.push(el.style.font);
+                const style = document.createElement('style');
+                style.textContent = '.f{font:italic 10px/normal Georgia}';
+                document.head.append(style);
+                out.push(style.sheet.cssRules[0].cssText);
+                const p = document.createElement('p');
+                p.className = 'f';
+                document.body.append(p);
+                out.push(getComputedStyle(p).font);
+                out.join('|')
+            "#
+                ),
+                "10px Arial|bold 10px / 2 serif|italic 12px x|450 12px x|oblique 10deg 12px x|\
+                 small-caps 300 condensed 1em x|||||\
+                 |font-style: normal; font-weight: 400; font-size: 10px; line-height: normal; \
+                 font-family: Arial;||.f { font: italic 10px Georgia; }|italic 10px Georgia",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn css_strings_and_urls_serialize_as_cssom_strings() {
+        // CSSOM #serialize-a-string, #serialize-a-url, #serialize-a-css-rule
+        // and #serialize-a-simple-selector (local w3c/csswg-drafts
+        // 81c27f68): strings are double-quoted with `"`, `\` and control
+        // characters escaped, URLs are `url("…")` and attribute selector
+        // values are strings, whatever quotes the author used.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const el = document.createElement('div');
+                el.style.cssText = "content: 'a\"b\\\\c' attr(title); quotes: '«' '»'; " +
+                    "background-image: url(a.png); cursor: url( 'c.cur' ) 2 3, auto; " +
+                    "list-style-image: url('b c.png')";
+                const out = [el.style.content, el.style.quotes, el.style.backgroundImage,
+                    el.style.cursor, el.style.listStyleImage];
+                el.style.content = "'\\1 x'";
+                out.push(el.style.content);
+                const style = document.createElement('style');
+                style.textContent = "@import url('imp.css') print; @namespace s url(http://www.w3.org/2000/svg); " +
+                    "@font-face { font-family: 'My F'; src: url(f.woff) format('woff'), local('Y') } " +
+                    "a[href='x'], [ lang |= en ], [data-x=foo i], s|[ s|title='t' ], *|[|id=\"q\"], :lang('en') { color: red }";
+                document.head.append(style);
+                for (const rule of style.sheet.cssRules) out.push(rule.cssText);
+                out.push(style.sheet.cssRules[3].selectorText);
+                out.join('|')
+            "#
+                ),
+                "\"a\\\"b\\\\c\" attr(title)|\"«\" \"»\"|url(\"a.png\")|url(\"c.cur\") 2 3, auto|\
+                 url(\"b c.png\")|\"\\1 x\"|@import url(\"imp.css\") print;|\
+                 @namespace s url(\"http://www.w3.org/2000/svg\");|\
+                 @font-face { font-family: \"My F\"; src: url(\"f.woff\") format(\"woff\"), local(\"Y\"); }|\
+                 a[href=\"x\"], [lang|=\"en\"], [data-x=\"foo\" i], s|[s|title=\"t\"], *|[|id=\"q\"], \
+                 :lang(\"en\") { color: red; }|\
+                 a[href=\"x\"], [lang|=\"en\"], [data-x=\"foo\" i], s|[s|title=\"t\"], *|[|id=\"q\"], :lang(\"en\")",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyframes_names_are_names_and_serialize_per_cssom() {
+        // CSS Animations 1 #interface-csskeyframesrule-attributes and CSSOM
+        // #serialize-a-css-rule: `name` is the <keyframes-name> itself; a
+        // CSS-wide keyword, `default` or `none` serializes as a string, any
+        // other name as an identifier.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const style = document.createElement('style');
+            style.textContent = `@keyframes 'x y' {} @keyframes plain {} @keyframes "none" {}`;
+            document.head.append(style);
+            Array.from(style.sheet.cssRules, rule => rule.name + ' => ' + rule.cssText).join('|')
+        "#
+            ),
+            "x y => @keyframes x\\ y {  }|plain => @keyframes plain {  }|none => @keyframes \"none\" {  }"
+        );
+    }
+
+    #[test]
+    fn history_length_is_the_joint_session_history_length() {
+        // HTML #dom-history-length, #url-and-history-update-steps and
+        // #update-document-for-history-step-application (local whatwg/html
+        // e5071a20): the frontend reports the top-level traversable's index
+        // and length (`PageCmd::SessionHistory`); a push the frontend has
+        // not applied yet makes the length index + 1, a replace leaves it;
+        // child navigables read the same length.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const out = [history.length];
+                __trust.setSessionHistory(2, 5, 0);
+                out.push(history.length);
+                history.pushState(null, '', '#a');
+                out.push(history.length);
+                history.replaceState(null, '', '#b');
+                out.push(history.length);
+                JSON.parse(__trust.takeHistoryUpdates());
+                // A report from before the frontend applied them.
+                __trust.setSessionHistory(2, 5, 0);
+                out.push(history.length);
+                __trust.setSessionHistory(3, 4, 2);
+                out.push(history.length);
+                location.hash = 'c';
+                out.push(history.length);
+                const frame = document.createElement('iframe');
+                document.body.append(frame);
+                __trust.hydrateFrames();
+                out.push(frame.contentWindow.history.length);
+                out.join()
+            "#
+                ),
+                "1,5,4,4,4,4,5,5",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_presentation_attributes_are_author_declarations_of_specificity_zero() {
+        // SVG 2 styling.html #PresentationAttributes and types.html
+        // #presentation-attribute-css-value (local w3c/svgwg): an SVG
+        // element's presentation attributes are author-level declarations
+        // before every author style sheet, parsed as values of their
+        // property (a bare number is a length in user units); invalid values,
+        // `!important` included, and `fill` on animation elements contribute
+        // nothing. `em` lengths, in layout and in getBBox(), use the
+        // resulting computed font size.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                document.body.innerHTML = '<style>@layer l { #layered { color: green } } .styled { stroke-width: 7px }</style>' +
+                    '<div style="font-size:10px"><svg id=s font-size="20" width="10em" height="2em" display="block" ' +
+                    'visibility="hidden" font-family="Foo Bar"><rect id=r width="2em" height="1em" ' +
+                    'stroke-width="3" opacity="bogus"/><stop id=layered color="red" class=styled stroke-width="1"/>' +
+                    '<stop id=imp color="red !important" letter-spacing="2"/><stop id=c style="color:navy" color="red"/>' +
+                    '<animate id=a fill="freeze"/><rect id="plain"/><g id=g style="font-size:calc(1em + 5px)">' +
+                    '<rect id=gr width="2em" height="1em"/></g><circle id=circle r="1rem"/></svg></div>';
+                const cs = id => getComputedStyle(document.getElementById(id));
+                const svg = document.getElementById('s');
+                const out = [cs('s').fontSize, cs('s').display, cs('s').visibility, cs('s').fontFamily,
+                    svg.getBoundingClientRect().width + 'x' + svg.getBoundingClientRect().height,
+                    cs('r').strokeWidth, cs('r').opacity, cs('r').width,
+                    cs('layered').color, cs('layered').strokeWidth, cs('imp').color, cs('imp').letterSpacing,
+                    cs('c').color, cs('a').fill === cs('plain').fill];
+                const box = document.getElementById('gr').getBBox();
+                out.push(box.width + 'x' + box.height);
+                out.push(document.getElementById('circle').getBBox().width);
+                document.getElementById('c').removeAttribute('style');
+                document.getElementById('c').setAttribute('color', 'lime');
+                out.push(cs('c').color);
+                out.join('|')
+            "#
+                ),
+                "20px|block|hidden|Foo Bar|200x40|3px|1|40px|rgb(0, 128, 0)|7px|rgb(0, 0, 0)|2px|\
+                 rgb(0, 0, 128)|true|50x25|32|rgb(0, 255, 0)",
                 "{tier:?}"
             );
         }

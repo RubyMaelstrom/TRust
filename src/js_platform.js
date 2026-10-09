@@ -8531,7 +8531,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             name = cssPropertyName(domString(name));
             const state = declarationData(this);
             const direct = state.pairs.find((v) => v[0] === name);
-            if (direct) return direct[1].startsWith("\0trust-pending-box:") || direct[1].startsWith("\0trust-pending-background:") ? "" : direct[1];
+            if (direct) {
+                const value = direct[1];
+                if (value.startsWith("\0trust-pending-box:") || value.startsWith("\0trust-pending-background:")) return "";
+                // CSSOM #serialize-a-css-component-value: <string>s and <url>s
+                // as #serialize-a-string and #serialize-a-url make them.
+                return name.startsWith("--") || value.indexOf("'") < 0 && value.indexOf('"') < 0 && value.indexOf("(") < 0
+                    ? value : cssOp("public-value", name, value);
+            }
             return state.descriptors ? "" : cssOp("get", name, JSON.stringify(state.pairs));
         }
         getPropertyPriority(name) {
@@ -19892,7 +19899,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         get type() { return 1; }
         get style() { return internalsFor(this).style; }
         set style(value) { internalsFor(this).style.cssText = value; }
-        get selectorText() { return internalsFor(this).selector; }
+        // CSSOM #serialize-a-group-of-selectors: attribute values and other
+        // strings read back as #serialize-a-string makes them.
+        get selectorText() {
+            const slots = internalsFor(this);
+            if (slots.selectorSerializedFrom !== slots.selector) {
+                slots.selectorSerialized = cssOp("serialize-selector", slots.selector);
+                slots.selectorSerializedFrom = slots.selector;
+            }
+            return slots.selectorSerialized;
+        }
         set selectorText(value) { value = domString(value); if (cssOp("selector",value,this.parentRule instanceof CSSStyleRule ? "nested" : "")) { internalsFor(this).selector = value; cssChanged(this); } }
     }
     cssSerializers.set(CSSStyleRule.prototype, function (internal = false) { return this.selectorText + " { " + declarationText(this.style, internal) + (internalsFor(this).children.length ? " " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") : "") + " }"; });
@@ -19965,7 +19981,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // with `getter CSSKeyframeRule (unsigned long index)` over its keyframes.
     class CSSKeyframesRule extends CSSRule {
         constructor(j) {
-            super(j); internalsFor(this).name = j.name || ""; internalsFor(this).children = buildRules(j.r); internalsFor(this).list = new CSSRuleList(internalsFor(this).children);
+            super(j); internalsFor(this).name = cssOp("keyframes-name", j.name || ""); internalsFor(this).children = buildRules(j.r); internalsFor(this).list = new CSSRuleList(internalsFor(this).children);
             const keyframeAt = (t, p) => {
                 const index = nodeListArrayIndex(p);
                 return index < 0 ? undefined : internalsFor(t).children[index];
@@ -19999,7 +20015,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         deleteRule(key) { const rule = this.findRule(key); if (rule) { internalsFor(this).children.splice(internalsFor(this).children.indexOf(rule), 1); attachCssRule(rule, null, null); cssChanged(this); } }
     }
     defineIndexedIteration(CSSKeyframesRule);
-    cssSerializers.set(CSSKeyframesRule.prototype, function (internal = false) { return "@keyframes " + this.name + " { " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") + " }"; });
+    cssSerializers.set(CSSKeyframesRule.prototype, function (internal = false) { return "@keyframes " + cssOp("serialize-keyframes-name", internalsFor(this).name) + " { " + internalsFor(this).children.map((r) => cssSerialize(r, internal)).join(" ") + " }"; });
     // CSS Syntax 3 #consume-string-token / #consume-url-token: the value of
     // a string or url() token, escapes decoded.
     function cssUnescape(text) {
@@ -20225,12 +20241,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         return sheet;
     }
     class CSSNamespaceRule extends CSSRule {
-        constructor(j) { super(j); const m = (j.q || "").match(/^(?:([^\s]+)\s+)?(?:url\(\s*([\s\S]*?)\s*\)|("[^"]*"|'[^']*'))$/i); internalsFor(this).prefix = m?.[1] || ""; internalsFor(this).namespace = (m?.[2] || m?.[3] || "").replace(/^['"]|['"]$/g, ""); }
+        // CSS Namespaces 3 #syntax: `<namespace-prefix>? [ <string> | <url> ]`.
+        constructor(j) { super(j); const [prefix, namespace] = cssOp("namespace-prelude", j.q || "") || ["", ""]; internalsFor(this).prefix = prefix; internalsFor(this).namespace = namespace; }
         get type() { return 10; }
         get prefix() { return internalsFor(this).prefix; }
         get namespaceURI() { return internalsFor(this).namespace; }
     }
-    cssSerializers.set(CSSNamespaceRule.prototype, function (internal = false) { return "@namespace " + (this.prefix ? this.prefix + " " : "") + "url(" + JSON.stringify(this.namespaceURI) + ");"; });
+    // CSSOM #serialize-a-css-rule: the prefix as an identifier, then the
+    // namespace as #serialize-a-url.
+    cssSerializers.set(CSSNamespaceRule.prototype, function (internal = false) { const slots = internalsFor(this); return "@namespace " + (slots.prefix ? cssOp("identifier", slots.prefix) + " " : "") + "url(" + cssOp("string", slots.namespace) + ");"; });
     const counterDescriptors = ["system", "symbols", "additive-symbols", "negative", "prefix", "suffix", "range", "pad", "fallback", "speak-as"];
     class CSSCounterStyleRule extends CSSRule {
         constructor(j) { super(j); internalsFor(this).name = j.name || ""; internalsFor(this).style = ruleStyle(this, j.d, counterDescriptors); }
@@ -26005,8 +26024,45 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     trust.takeHistoryUpdates = function () {
         const updates = trust.historyUpdates;
         trust.historyUpdates = [];
+        for (const update of updates) {
+            unappliedHistoryUpdates.push(update.replace);
+            // A frontend that never reports leaves at most this many.
+            if (unappliedHistoryUpdates.length > 1024) {
+                unappliedHistoryUpdates.shift();
+                unappliedHistoryUpdatesFrom++;
+            }
+        }
         return JSON.stringify(updates);
     };
+    // HTML #concept-history-index and #concept-history-length: the session
+    // history of the top-level traversable lives in the frontend, which
+    // reports the active entry's index and the number of entries, and how
+    // many of this Document's history updates (push or replace, from the
+    // History API or a fragment navigation) it applied, whenever these change
+    // (`PageCmd::SessionHistory`, as #update-document-for-history-step-application
+    // sets them). The updates it had not applied yet are replayed on top as
+    // #url-and-history-update-steps' "temporary best-guess values": a push
+    // increments the index and makes the length index + 1.
+    let reportedSessionHistory = null;
+    const unappliedHistoryUpdates = [];
+    let unappliedHistoryUpdatesFrom = 0;
+    trust.setSessionHistory = function (index, length, applied) {
+        while (unappliedHistoryUpdatesFrom < applied && unappliedHistoryUpdates.length) {
+            unappliedHistoryUpdates.shift();
+            unappliedHistoryUpdatesFrom++;
+        }
+        unappliedHistoryUpdatesFrom = Math.max(unappliedHistoryUpdatesFrom, applied);
+        reportedSessionHistory = {index, length};
+    };
+    function jointSessionHistory() {
+        if (!reportedSessionHistory) return null;
+        let {index, length} = reportedSessionHistory;
+        const replay = (replace) => { if (!replace) { index++; length = index + 1; } };
+        for (const replace of unappliedHistoryUpdates) replay(replace);
+        for (const update of trust.historyUpdates) replay(update.replace);
+        return {index, length};
+    }
+    trust.jointSessionHistory = jointSessionHistory;
     // The pending same-document fragment scroll (see `navigateLoc`). `undefined`
     // (no signal) → null; a string (possibly `""` for the top) → that target.
     trust.takeScrollFragment = function () {
@@ -26936,7 +26992,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     class History {
         constructor() { throw new TypeError("Illegal constructor"); }
-        get length() { return activeHistoryRecord(this).length; }
+        // HTML #dom-history-length: the top-level traversable's session
+        // history (every Document of it reads the same length). Before the
+        // frontend has reported it, the Document's own entries.
+        get length() {
+            const record = activeHistoryRecord(this);
+            const top = cfg.topWindow && cfg.topWindow !== g ? trustOf(cfg.topWindow) : trust;
+            const joint = top && typeof top.jointSessionHistory === "function" ? top.jointSessionHistory() : null;
+            return joint ? joint.length : record.length;
+        }
         get state() { return activeHistoryRecord(this).state; }
         get scrollRestoration() { return activeHistoryRecord(this).scrollRestoration; }
         set scrollRestoration(value) {
@@ -27133,12 +27197,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             throw new TypeError("Illegal Window invocation");
         control.closeWindow(incumbent);
     }, "close", 0);
-    // HTML #script-closable needs the top-level traversable's session history
-    // entries, which the frontend owns: it reports their number whenever it
-    // changes (`PageCmd::SessionHistorySize`). Until it has, the traversable
-    // is not known to be script-closable.
-    let sessionHistorySize = null;
-    trust.setSessionHistorySize = function (size) { sessionHistorySize = size; };
     // The top-level Document's active sandboxing flag set, which a top-level
     // Document only gets from a CSP `sandbox` directive (HTML
     // #determining-the-creation-sandboxing-flags). TRust enforces no CSP, so
@@ -27161,8 +27219,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         // 6. HTML #script-closable: TRust creates no top-level traversable
         // for web content (window.open() opens nothing), so only a session
-        // history of one entry qualifies.
-        if (sessionHistorySize !== 1) return;
+        // history of one entry qualifies. Until the frontend has reported the
+        // session history, the traversable is not known to be closable.
+        const history = jointSessionHistory();
+        if (!history || history.length !== 1) return;
         const source = incumbentNavigable(incumbent);
         if (!source || !familiarWithThisTraversable(source)) return;
         if (!allowedBySandboxingToNavigateThis(source, sourceSnapshotParams)) return;

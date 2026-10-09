@@ -193,6 +193,24 @@ pub(crate) fn svg_dimension_hint(value: &str) -> Option<String> {
     }
 }
 
+/// A CSS `<length>` in px that needs no containing block: font-relative
+/// (`em`, `rem`, `ch`, …), viewport-relative and math-function lengths
+/// resolved with `units` and `viewport`. `None` for a percentage, `auto` or
+/// anything that is not a length.
+pub(crate) fn absolute_length_px(value: &str, units: Units, viewport: (f32, f32)) -> Option<f32> {
+    match Len::parse(
+        value,
+        units,
+        Vp {
+            w: viewport.0,
+            h: viewport.1,
+        },
+    )? {
+        Len::Val(node) => node.resolve(None).filter(|px| px.is_finite()),
+        _ => None,
+    }
+}
+
 /// SVG 2 §8.12: only definite CSS lengths supply intrinsic dimensions.
 /// Resolve math/font/viewport units without treating percentages as intrinsic.
 pub(crate) fn svg_resource_dimension(

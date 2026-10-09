@@ -1256,9 +1256,11 @@ mod tests {
             dom.computed_value(dom.get_by_id("css").unwrap(), "background-color"),
             None
         );
+        // No HTML hint: SVG 2 makes `color` an SVG presentation attribute.
         assert_eq!(
-            dom.computed_value(dom.get_by_id("svg").unwrap(), "color"),
-            None
+            dom.computed_value(dom.get_by_id("svg").unwrap(), "color")
+                .as_deref(),
+            Some("red")
         );
     }
 }

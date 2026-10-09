@@ -997,6 +997,18 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         }
         "font-style" => properties::fonts::font_style(value).is_some(),
         p if properties::fonts::owns(p) => properties::fonts::specified(p, value).is_some(),
+        // SVG 2 painting.html #SpecifyingPaint: `<paint> = none | <color> |
+        // <url> [none | <color>]? | context-fill | context-stroke`.
+        "fill" | "stroke" => {
+            one_of("none context-fill context-stroke")
+                || supports_color_value(value)
+                || crate::dom::css_url_prefix(value).is_some_and(|(_, rest)| {
+                    let rest = rest.trim();
+                    rest.is_empty()
+                        || rest.eq_ignore_ascii_case("none")
+                        || supports_color_value(rest)
+                })
+        }
         "text-decoration-style" => one_of("solid double dotted dashed wavy"),
         "-webkit-text-stroke-width" => text_stroke_width_px(
             value,
@@ -1440,6 +1452,20 @@ fn serialized_shorthands_of(longhand: &str) -> &'static [&'static str] {
         .map_or(&[], Vec::as_slice)
 }
 
+/// A declared value as CSSOM serializes it (#serialize-a-css-component-
+/// value): its <string>s and <url>s as #serialize-a-string and
+/// #serialize-a-url make them. TRust stores values as written, which every
+/// consumer reads; a custom property keeps its token stream.
+fn public_value(property: &str, value: String) -> String {
+    if property.starts_with("--") {
+        return value;
+    }
+    match crate::dom::serialize_css_strings(&value) {
+        std::borrow::Cow::Borrowed(_) => value,
+        std::borrow::Cow::Owned(serialized) => serialized,
+    }
+}
+
 /// CSSOM #serialize-a-css-declaration-block. Internal transport preserves
 /// pending-substitution values; public serialization never exposes them.
 fn serialize(declarations: &Declarations, internal: bool) -> String {
@@ -1505,6 +1531,11 @@ fn serialize(declarations: &Declarations, internal: bool) -> String {
                 },
             )
         });
+        let value = if internal {
+            value
+        } else {
+            public_value(&name, value)
+        };
         result.push(format!(
             "{}: {value}{};",
             properties::identifier_text(&name),
@@ -1861,9 +1892,13 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
         "expand" => json!(expanded(text, extra)),
         "expand-quirks" => json!(expanded_in(text, extra, true)),
         "names" => json!(&*property_names(text)),
-        "get" => json!(get(
+        // CSSOM #dom-cssstyledeclaration-getpropertyvalue.
+        "get" => json!(public_value(
             text,
-            &serde_json::from_str::<Vec<(String, String, bool)>>(extra).unwrap_or_default()
+            get(
+                text,
+                &serde_json::from_str::<Vec<(String, String, bool)>>(extra).unwrap_or_default()
+            )
         )),
         "supports" => json!(supports(text, extra)),
         "selector" => json!(selector_parses(&if extra == "nested" {
@@ -1872,13 +1907,234 @@ pub(crate) fn operation(op: &str, text: &str, extra: &str) -> Value {
             replace_nesting_tokens(text, ":scope").0
         })),
         "condition" => json!(supports_condition(text) || supports_condition(&format!("({text})"))),
+        "serialize-selector" => json!(serialize_selector_text(text)),
+        "public-value" => json!(public_value(text, extra.to_string())),
+        "keyframes-name" => json!(keyframes_name(text)),
+        "serialize-keyframes-name" => json!(serialize_keyframes_name(text)),
+        "namespace-prelude" => json!(namespace_prelude(text)),
         _ => Value::Null,
     }
+}
+
+/// CSSOM #serialize-a-selector for the parts TRust does not keep as written:
+/// an attribute selector serializes its name as an identifier and its value
+/// as a string (#serialize-a-simple-selector: `[lang|="en"]`, with a case
+/// flag as ` i`), and other strings (`:lang("en")`) as #serialize-a-string.
+pub(crate) fn serialize_selector_text(text: &str) -> String {
+    fn attribute(block: &mut cssparser::Parser<'_>) -> Option<String> {
+        let mut out = String::from("[");
+        block.skip_whitespace();
+        // `[ns|name]`, `[*|name]`, `[|name]` or `[name]`.
+        let first = block.next().ok()?.clone();
+        let name = match first {
+            cssparser::Token::Ident(name) => {
+                if block.try_parse(|p| p.expect_delim('|')).is_ok() {
+                    properties::identifier_text_into(&name, &mut out);
+                    out.push('|');
+                    block.expect_ident_cloned().ok()?
+                } else {
+                    name
+                }
+            }
+            cssparser::Token::Delim('*') => {
+                block.expect_delim('|').ok()?;
+                out.push_str("*|");
+                block.expect_ident_cloned().ok()?
+            }
+            cssparser::Token::Delim('|') => {
+                out.push('|');
+                block.expect_ident_cloned().ok()?
+            }
+            _ => return None,
+        };
+        properties::identifier_text_into(&name, &mut out);
+        block.skip_whitespace();
+        if block.is_exhausted() {
+            out.push(']');
+            return Some(out);
+        }
+        out.push_str(match block.next().ok()? {
+            cssparser::Token::Delim('=') => "=",
+            cssparser::Token::IncludeMatch => "~=",
+            cssparser::Token::DashMatch => "|=",
+            cssparser::Token::PrefixMatch => "^=",
+            cssparser::Token::SuffixMatch => "$=",
+            cssparser::Token::SubstringMatch => "*=",
+            _ => return None,
+        });
+        block.skip_whitespace();
+        let value = match block.next().ok()? {
+            cssparser::Token::Ident(value) | cssparser::Token::QuotedString(value) => value.clone(),
+            _ => return None,
+        };
+        let _ = cssparser::serialize_string(&value, &mut out);
+        block.skip_whitespace();
+        if let Ok(flag) = block.try_parse(|p| p.expect_ident_cloned()) {
+            if !flag.eq_ignore_ascii_case("i") && !flag.eq_ignore_ascii_case("s") {
+                return None;
+            }
+            out.push(' ');
+            out.push_str(&flag.to_ascii_lowercase());
+            block.skip_whitespace();
+        }
+        block.is_exhausted().then(|| {
+            out.push(']');
+            out
+        })
+    }
+    fn walk(parser: &mut cssparser::Parser<'_>, out: &mut String) {
+        loop {
+            let start = parser.position();
+            let token = match parser.next_including_whitespace_and_comments() {
+                Ok(token) => token.clone(),
+                Err(_) => return,
+            };
+            match token {
+                cssparser::Token::QuotedString(text) => {
+                    let _ = cssparser::serialize_string(&text, out);
+                }
+                cssparser::Token::SquareBracketBlock => {
+                    let mut serialized = None;
+                    let mut end = None;
+                    let _ = parser.parse_nested_block(|block| {
+                        let state = block.state();
+                        serialized = attribute(block);
+                        if serialized.is_none() {
+                            block.reset(&state);
+                            let mut inner = String::new();
+                            walk(block, &mut inner);
+                            serialized = Some(format!("[{inner}"));
+                            end = Some(block.position());
+                        }
+                        while block.next_including_whitespace_and_comments().is_ok() {}
+                        Ok::<_, cssparser::ParseError<()>>(())
+                    });
+                    let serialized = serialized.unwrap_or_default();
+                    out.push_str(&serialized);
+                    // An unparsed block keeps its own closing bracket.
+                    if let Some(end) = end {
+                        out.push_str(parser.slice(end..parser.position()));
+                    }
+                }
+                cssparser::Token::Function(_) | cssparser::Token::ParenthesisBlock => {
+                    out.push_str(parser.slice_from(start));
+                    let mut end = None;
+                    let _ = parser.parse_nested_block(|nested| {
+                        walk(nested, out);
+                        end = Some(nested.position());
+                        Ok::<_, cssparser::ParseError<()>>(())
+                    });
+                    if let Some(end) = end {
+                        out.push_str(parser.slice(end..parser.position()));
+                    }
+                }
+                _ => out.push_str(parser.slice_from(start)),
+            }
+        }
+    }
+    if !text.contains(['[', '"', '\'']) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    walk(&mut cssparser::Parser::new(text), &mut out);
+    out
+}
+
+/// CSS Animations 1 #typedef-keyframes-name: `<custom-ident> | <string>`,
+/// as the name it stands for (escapes resolved, quotes removed).
+fn keyframes_name(text: &str) -> String {
+    let mut parser = cssparser::Parser::new(text);
+    let name = parser.next().ok().and_then(|token| match token {
+        cssparser::Token::Ident(name) | cssparser::Token::QuotedString(name) => {
+            Some(name.to_string())
+        }
+        _ => None,
+    });
+    match name {
+        Some(name) if parser.is_exhausted() => name,
+        _ => text.trim().to_string(),
+    }
+}
+
+/// CSSOM #serialize-a-css-rule for `CSSKeyframesRule`: a name that is a
+/// CSS-wide keyword, `default` or `none` serializes as a string, any other
+/// as an identifier.
+fn serialize_keyframes_name(name: &str) -> String {
+    if wide_keyword(name).is_some()
+        || name.eq_ignore_ascii_case("default")
+        || name.eq_ignore_ascii_case("none")
+    {
+        properties::string_text(name)
+    } else {
+        properties::identifier_text(name)
+    }
+}
+
+/// An `@namespace` prelude, `<namespace-prefix>? [ <string> | <url> ]`
+/// (CSS Namespaces 3 #syntax): its prefix (empty without one) and its
+/// namespace URL, with string escapes resolved. `None` when invalid.
+fn namespace_prelude(text: &str) -> Option<(String, String)> {
+    let mut parser = cssparser::Parser::new(text);
+    parser.skip_whitespace();
+    let prefix = parser
+        .try_parse(|p| p.expect_ident_cloned())
+        .map(|prefix| prefix.to_string())
+        .unwrap_or_default();
+    parser.skip_whitespace();
+    let url = parser
+        .try_parse(|p| p.expect_string_cloned().map(|s| s.to_string()))
+        .ok()
+        .or_else(|| {
+            crate::dom::css_url_prefix(&text[parser.position().byte_index()..])
+                .and_then(|(url, rest)| rest.trim().is_empty().then_some(url))
+        });
+    url.map(|url| (prefix, url))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selectors_serialize_attribute_values_as_strings() {
+        // CSSOM #serialize-a-simple-selector: `[`, an optional namespace
+        // prefix and `|`, the name as an identifier, the matcher, the value
+        // as a string, ` i` for the case-sensitivity flag, `]`.
+        for (selector, expected) in [
+            ("a[href='x']", "a[href=\"x\"]"),
+            ("[ lang |= en ]", "[lang|=\"en\"]"),
+            ("[data-x=foo i]", "[data-x=\"foo\" i]"),
+            ("[data-x='y' S]", "[data-x=\"y\" s]"),
+            ("svg|[ xlink|href ^= '#' ]", "svg|[xlink|href^=\"#\"]"),
+            ("[*|id$=q], [|id*=r]", "[*|id$=\"q\"], [|id*=\"r\"]"),
+            ("[a~='b\"c']", "[a~=\"b\\\"c\"]"),
+            ("div:not([title='t']) > p", "div:not([title=\"t\"]) > p"),
+            ("p:lang('en')", "p:lang(\"en\")"),
+            ("div.c#i", "div.c#i"),
+        ] {
+            assert_eq!(serialize_selector_text(selector), expected, "{selector}");
+        }
+    }
+
+    #[test]
+    fn declaration_blocks_serialize_strings_and_urls() {
+        // CSSOM #serialize-a-css-declaration-block: values as written are
+        // stored; their strings and URLs serialize per #serialize-a-string
+        // and #serialize-a-url, except in a custom property's token stream.
+        let block = parse_in(
+            "content: 'a' url(b.png); --x: 'kept'; quotes: '<' '>'",
+            false,
+        );
+        assert_eq!(
+            serialize(&block, false),
+            "content: \"a\" url(\"b.png\"); --x: 'kept'; quotes: \"<\" \">\";"
+        );
+        assert_eq!(
+            operation("get", "content", &serde_json::to_string(&block).unwrap()),
+            json!("\"a\" url(\"b.png\")")
+        );
+        assert!(serialize(&block, true).contains("content: 'a' url(b.png);"));
+    }
 
     #[test]
     fn css_numbers_serialize_in_the_shortest_form() {

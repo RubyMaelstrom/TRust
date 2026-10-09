@@ -12156,6 +12156,11 @@ impl Dom {
                 // them. The standalone raster resource has no document CSS,
                 // so materialize each direct cascade winner as inline style.
                 let mut paint = self.svg_resource_style(id);
+                // A use instance resolves `currentcolor` from its host `use`
+                // in the renderer, which spells the keyword `currentColor`.
+                if keep_current_color {
+                    paint = replace_css_current_color(&paint, "currentColor");
+                }
                 if let Some(inherited) = images.references.root_style(self, id, &color) {
                     paint.insert_str(0, &inherited);
                 }
@@ -19269,7 +19274,13 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         }
         let tokens = split_top_level_ws(value);
         let mut size_index = None;
-        for (index, tok) in tokens.iter().copied().enumerate() {
+        let mut index = 0;
+        // `[ <'font-style'> || <font-variant-css2> || <'font-weight'> ||
+        // <font-width-css3> ]?` before the size: each at most once, and
+        // `normal` stands for any of them. Anything else is invalid. TRust
+        // tracks no font-variant or font-width longhand, so those two are
+        // only validated.
+        while let Some(&tok) = tokens.get(index) {
             // CSS Syntax 3 #consume-component-value: a slash inside a
             // calculation is not the font-size/line-height separator.
             let t = split_top_level_slash(tok).map_or(tok, |(size, _)| size);
@@ -19285,6 +19296,7 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 size_index = Some(index);
                 break;
             }
+            index += 1;
         }
         // No size ⇒ not a valid `font` shorthand (a system-font keyword or
         // garbage) — drop whole.
@@ -20465,7 +20477,129 @@ fn custom_property_sources<'m>(
     })
 }
 
+/// SVG 2 styling.html #PresentationAttributes: the presentation attributes
+/// any SVG element may carry (the geometry properties are the designated
+/// elements' alone, see `svg_presentation_attributes`). `transform` and its
+/// `patternTransform`/`gradientTransform` forms take SVG's own transform
+/// syntax and are left to the SVG renderer.
+const SVG_PRESENTATION_ATTRIBUTES: &[&str] = &[
+    "alignment-baseline",
+    "baseline-shift",
+    "clip-path",
+    "clip-rule",
+    "color",
+    "color-interpolation",
+    "color-interpolation-filters",
+    "cursor",
+    "direction",
+    "display",
+    "dominant-baseline",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "filter",
+    "flood-color",
+    "flood-opacity",
+    "font-family",
+    "font-size",
+    "font-size-adjust",
+    "font-stretch",
+    "font-style",
+    "font-variant",
+    "font-weight",
+    "glyph-orientation-vertical",
+    "image-rendering",
+    "letter-spacing",
+    "lighting-color",
+    "marker-end",
+    "marker-mid",
+    "marker-start",
+    "mask",
+    "mask-type",
+    "opacity",
+    "overflow",
+    "paint-order",
+    "pointer-events",
+    "shape-rendering",
+    "stop-color",
+    "stop-opacity",
+    "stroke",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-opacity",
+    "stroke-width",
+    "text-anchor",
+    "text-decoration",
+    "text-overflow",
+    "text-rendering",
+    "transform-origin",
+    "unicode-bidi",
+    "vector-effect",
+    "visibility",
+    "white-space",
+    "word-spacing",
+    "writing-mode",
+];
+
+/// Presentation attributes whose property takes a `<length>` or
+/// `<length-percentage>`: SVG 2 types.html #presentation-attribute-css-value
+/// also accepts a bare `<number>` there, in user units (CSS px).
+const SVG_LENGTH_PRESENTATION_ATTRIBUTES: &[&str] = &[
+    "baseline-shift",
+    "font-size",
+    "letter-spacing",
+    "word-spacing",
+    "stroke-dashoffset",
+    "stroke-width",
+];
+
 impl StyleView<'_> {
+    /// The CSS declarations of the presentation attributes of SVG element
+    /// `id` (SVG 2 styling.html #PresentationAttributes), for the properties
+    /// TRust tracks: each attribute is parsed as a value of its property
+    /// (types.html #presentation-attribute-css-value), so an invalid value,
+    /// `!important` included, contributes nothing. `fill` is not one on the
+    /// animation elements, whose `fill` is their own attribute; `width` and
+    /// `height` are the geometry hints `cascade_winners` maps itself.
+    fn svg_presentation_attributes(&self, id: NodeId, mut declaration: impl FnMut(&str, &str)) {
+        let tag = self.tag_name(id).unwrap_or("");
+        let animation = matches!(
+            tag,
+            "animate" | "animateMotion" | "animateTransform" | "animateColor" | "set"
+        );
+        for (name, value) in self.nodes.attrs_in_no_namespace(id) {
+            if !SVG_PRESENTATION_ATTRIBUTES.contains(&name) || animation && name == "fill" {
+                continue;
+            }
+            let value = value.trim();
+            if value.is_empty() || find_var_function(value).is_some() {
+                continue;
+            }
+            let value = if SVG_LENGTH_PRESENTATION_ATTRIBUTES.contains(&name)
+                && is_bare_nonzero_css_number(value)
+            {
+                Cow::Owned(format!("{value}px"))
+            } else {
+                Cow::Borrowed(value)
+            };
+            // The property's grammar, as CSS.supports() checks it.
+            if !cssom::supports(name, &value) {
+                continue;
+            }
+            let Some((property, value, false)) = parse_decl(&format!("{name}:{value}")) else {
+                continue;
+            };
+            for (longhand, value) in expand_box_shorthand(&property, &value) {
+                if is_tracked(&longhand) {
+                    declaration(&longhand, &value);
+                }
+            }
+        }
+    }
+
     /// ONE pass over the element's author sources: its HTML presentational
     /// hints, its inline `style`, its matched rules (each rule's declarations
     /// land in the map for the box it targets: the element, or a
@@ -20663,6 +20797,31 @@ impl StyleView<'_> {
                     );
                 }
             }
+        }
+        // SVG 2 styling.html #PresentationAttributes: an SVG element's
+        // presentation attributes enter the author origin before every
+        // author style sheet, with specificity zero, so any author
+        // declaration of the property wins over them.
+        if self.namespace_uri(id) == Some("http://www.w3.org/2000/svg") {
+            self.svg_presentation_attributes(id, |property, value| {
+                if !elem.contains_key(property) {
+                    consider_into(
+                        &mut elem,
+                        property,
+                        (
+                            false,
+                            true,
+                            own(false),
+                            false,
+                            encode_layer(&[], false),
+                            (0, 0, 0),
+                            0,
+                            0,
+                        ),
+                        value,
+                    );
+                }
+            });
         }
         // SVG 2 §6.6 / §7.8: geometry presentation attributes participate
         // below all author stylesheets. HTML attributes and <use>/<symbol>
@@ -22327,6 +22486,90 @@ fn is_bare_nonzero_css_number(value: &str) -> bool {
             .is_ok_and(|number| number.is_finite() && number != 0.0)
 }
 
+/// CSSOM #serialize-a-string and #serialize-a-url applied to the <string>
+/// and <url> components of a CSS value: each string becomes a double-quoted
+/// string with `"`, `\` and control characters escaped, and each URL (a
+/// url-token or a `url()` function with a string) becomes `url("…")`, any
+/// URL modifiers following it. Everything else, comments and bad tokens
+/// included, is kept as written. Borrowed when nothing changes.
+pub(crate) fn serialize_css_strings(value: &str) -> Cow<'_, str> {
+    let bytes = value.as_bytes();
+    if !bytes.iter().any(|b| matches!(b, b'"' | b'\'' | b'(')) {
+        return Cow::Borrowed(value);
+    }
+    fn walk(parser: &mut cssparser::Parser<'_>, out: &mut String) {
+        loop {
+            let start = parser.state();
+            let token = match parser.next_including_whitespace_and_comments() {
+                Ok(token) => token.clone(),
+                Err(_) => return,
+            };
+            match token {
+                cssparser::Token::QuotedString(text) => {
+                    let _ = cssparser::serialize_string(&text, out);
+                }
+                cssparser::Token::UnquotedUrl(url) => {
+                    out.push_str("url(");
+                    let _ = cssparser::serialize_string(&url, out);
+                    out.push(')');
+                }
+                cssparser::Token::Function(ref name) if name.eq_ignore_ascii_case("url") => {
+                    // `url( <string> <url-modifier>* )`; any other content
+                    // is not a <url> and is copied as written.
+                    let mut inner = String::new();
+                    let mut url = false;
+                    let _ = parser.parse_nested_block(|nested| {
+                        nested.skip_whitespace();
+                        if let Ok(text) = nested.try_parse(|p| p.expect_string_cloned()) {
+                            url = true;
+                            let _ = cssparser::serialize_string(&text, &mut inner);
+                            let mut rest = String::new();
+                            walk(nested, &mut rest);
+                            let rest = rest.trim();
+                            if !rest.is_empty() {
+                                inner.push(' ');
+                                inner.push_str(rest);
+                            }
+                        }
+                        Ok::<_, cssparser::ParseError<()>>(())
+                    });
+                    if url {
+                        out.push_str("url(");
+                        out.push_str(&inner);
+                        out.push(')');
+                    } else {
+                        out.push_str(parser.slice_from(start.position()));
+                    }
+                }
+                cssparser::Token::Function(_)
+                | cssparser::Token::ParenthesisBlock
+                | cssparser::Token::SquareBracketBlock
+                | cssparser::Token::CurlyBracketBlock => {
+                    out.push_str(parser.slice_from(start.position()));
+                    let mut end = None;
+                    let _ = parser.parse_nested_block(|nested| {
+                        walk(nested, out);
+                        end = Some(nested.position());
+                        Ok::<_, cssparser::ParseError<()>>(())
+                    });
+                    // The closing bracket, absent at the end of the input.
+                    if let Some(end) = end {
+                        out.push_str(parser.slice(end..parser.position()));
+                    }
+                }
+                _ => out.push_str(parser.slice_from(start.position())),
+            }
+        }
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    walk(&mut cssparser::Parser::new(value), &mut out);
+    if out == value {
+        Cow::Borrowed(value)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
 fn normalize_css_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut quote = None;
@@ -22487,8 +22730,21 @@ fn normalize_font_shorthand(value: &str) -> String {
     }
     let tokens = split_top_level_ws(value);
     let mut family_start = None;
+    let mut oblique = false;
     for (index, token) in tokens.iter().enumerate() {
         let size = split_top_level_slash(token).map_or(*token, |(size, _)| size);
+        // An oblique angle and a numeric weight precede the size, as the
+        // shorthand's expansion reads them.
+        let angle = std::mem::take(&mut oblique)
+            && size.ends_with(|c: char| c.is_ascii_alphabetic())
+            && crate::text::typography::parse_angle_deg(size).is_some();
+        oblique = size.eq_ignore_ascii_case("oblique");
+        let weight = size
+            .parse::<f32>()
+            .is_ok_and(|n| (1.0..=1000.0).contains(&n));
+        if angle || weight {
+            continue;
+        }
         if font_size_token(&size.to_ascii_lowercase()) {
             let mut next = index + 1;
             if split_top_level_slash(token).is_none()
@@ -24765,6 +25021,70 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_strings_and_urls_serialize_as_cssom_makes_them() {
+        // CSSOM #serialize-a-string and #serialize-a-url: double quotes,
+        // `"` and `\` escaped, control characters as code points, NUL as
+        // U+FFFD; everything else, comments and bad tokens included, as is.
+        let cases = [
+            ("'a\"b'", "\"a\\\"b\""),
+            ("\"x\\\\y\"", "\"x\\\\y\""),
+            ("'\\9'", "\"\\9 \""),
+            ("url(a.png)", "url(\"a.png\")"),
+            ("URL( 'b c.png' )", "url(\"b c.png\")"),
+            (
+                "url(\"x\" crossorigin(anonymous))",
+                "url(\"x\" crossorigin(anonymous))",
+            ),
+            (
+                "image-set(url(a.png) 1x, 'b.png' 2x)",
+                "image-set(url(\"a.png\") 1x, \"b.png\" 2x)",
+            ),
+            (
+                "counter(x) ' - ' /* 'c' */ attr(y)",
+                "counter(x) \" - \" /* 'c' */ attr(y)",
+            ),
+            ("calc(1px + 2px)", "calc(1px + 2px)"),
+            ("'open", "\"open\""),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(serialize_css_strings(value), expected, "{value}");
+        }
+        assert!(matches!(
+            serialize_css_strings("10px solid red"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn svg_presentation_attributes_cascade_below_author_rules() {
+        // SVG 2 styling.html #PresentationAttributes.
+        let dom = Dom::parse_document(
+            r#"<style>.c { fill: green }</style><svg id=s font-size="20" fill="red"><rect id=a
+            class=c fill="blue" stroke-width="2"/><rect id=b fill="purple" style="fill:orange"/>
+            <rect id=n fill="bogus" opacity="2 !important"/><set id=set fill="freeze"/></svg>
+            <div fill="red" id=h></div>"#,
+        );
+        let id = |name: &str| dom.get_by_id(name).unwrap();
+        let value = |name: &str, property: &str| dom.computed_value_resolved(id(name), property);
+        assert_eq!(value("s", "font-size").as_deref(), Some("20px"));
+        assert_eq!(value("a", "fill").as_deref(), Some("green"));
+        assert_eq!(value("a", "stroke-width").as_deref(), Some("2px"));
+        assert_eq!(value("b", "fill").as_deref(), Some("orange"));
+        assert_eq!(
+            value("n", "fill").as_deref(),
+            Some("red"),
+            "invalid: inherited"
+        );
+        assert_eq!(value("n", "opacity"), None, "`!important` is invalid");
+        assert_ne!(value("set", "fill").as_deref(), Some("freeze"));
+        assert_ne!(
+            value("h", "fill").as_deref(),
+            Some("red"),
+            "HTML elements have none"
+        );
+    }
 
     #[test]
     fn font_family_declared_values_keep_the_authors_names() {

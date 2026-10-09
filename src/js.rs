@@ -334,10 +334,16 @@ pub enum PageCmd {
         url: String,
         delta: i32,
     },
-    /// The number of entries in the top-level traversable's session history,
-    /// which the frontend owns; it reports the number whenever it changes
-    /// (HTML #script-closable, for `window.close()`).
-    SessionHistorySize(usize),
+    /// The top-level traversable's session history, which the frontend owns:
+    /// the current entry's `index` and the number of entries (`length`),
+    /// after the frontend applied `applied` of this page's
+    /// `PageEvt::HistoryUpdate`s. The frontend reports it whenever it changes
+    /// (HTML #dom-history-length and #script-closable).
+    SessionHistory {
+        index: usize,
+        length: usize,
+        applied: u64,
+    },
     PointerLockResult {
         request: u64,
         error: Option<String>,
