@@ -3,7 +3,7 @@
 //! https://github.com/jgoerzen/pygopherd/blob/master/doc/standards/Gopher%2B.txt
 //! RFC Editor snapshot 2026-09-06: RFC 4266 §2; RFC 2045 §5.1.
 //! Replies are unframed here exactly once, including binary downloads. ASK
-//! items expose their information without ever submitting answers.
+//! forms (§2.8) are presented and submitted by `ask.rs`.
 
 use super::*;
 use std::{collections::VecDeque, io};
@@ -316,21 +316,20 @@ pub(super) fn information_lines(url: &GopherUrl, body: &[u8], encoding: Encoding
                 b"ADMIN" => "Details".into(),
                 b"ABSTRACT" => "Description".into(),
                 b"VIEWS" => "Available formats".into(),
-                b"ASK" => {
-                    "This item requires a Gopher+ form. Form submission is not supported yet."
-                        .into()
-                }
+                b"ASK" => "Form questions".into(),
                 _ => decode(block, encoding),
             };
-            lines.push(line(
-                if block == b"ASK" {
-                    Kind::Info
-                } else {
-                    Kind::Heading(2)
-                },
-                title,
-                None,
-            ));
+            lines.push(line(Kind::Heading(2), title, None));
+            // UMN §2.8 / RFC 4266 §2.5: the item is retrieved by answering
+            // these questions; its `?` address presents the form.
+            if block == b"ASK" {
+                let item = target.clone().unwrap_or_else(|| url.clone());
+                lines.push(line(
+                    Kind::Search,
+                    "Fill in the form".into(),
+                    Some(Link::Gopher(item.with_plus(b"?"))),
+                ));
+            }
             // Referenced attributes are followed only on an explicit click.
             let rest = raw[colon + 1..]
                 .strip_prefix(b" ")
@@ -390,12 +389,13 @@ pub(super) fn information_lines(url: &GopherUrl, body: &[u8], encoding: Encoding
             None,
         ));
     }
-    if url.gopher_plus.as_deref() == Some(b"?") && !body.windows(5).any(|s| s == b"+ASK:") {
+    if url.is_ask() && !body.windows(5).any(|s| s == b"+ASK:") {
         lines.insert(
             0,
             line(
-                Kind::Info,
-                "This item requires a Gopher+ form. Form submission is not supported yet.".into(),
+                Kind::Error,
+                "This item is marked as a Gopher+ form, but the server returned no +ASK questions."
+                    .into(),
                 None,
             ),
         );
@@ -514,31 +514,102 @@ mod tests {
     }
 
     #[test]
-    fn gopher_plus_ask_and_multimedia_open_information_without_submission() {
+    fn gopher_plus_ask_items_present_their_form_and_information_links_to_it() {
         for kind in ['0', '7', '9', ':', ';', '<'] {
+            let body =
+                format!("+INFO: {kind}Item\t/item\te\t70\t?\r\n+ASK:\r\n AskP: Password\r\n")
+                    .into_bytes();
             let url = GopherUrl::new("e".into(), 70, kind, b"/item".to_vec()).with_plus(b"?");
-            assert!(url.is_metadata());
+            assert!(url.is_metadata() && url.is_ask());
             assert!(!url.is_download());
             assert!(!url.needs_query());
             assert!(url.request().unwrap().ends_with(b"\t!\r\n"));
-            let doc = parse(
-                &url,
-                b"+INFO: 0Item\t/item\te\t70\t?\r\n+ASK:\r\n AskP: Password\r\n".to_vec(),
-                false,
-                100,
-            );
+            let doc = parse(&url, body.clone(), false, 100);
+            assert!(doc.lines.iter().any(|line| line.text == "Password: []"));
             assert!(
                 doc.lines
                     .iter()
-                    .any(|line| line.text.contains("Form submission is not supported"))
+                    .any(|line| line.link == Some(ask::Action::Submit.link()))
             );
+            assert!(doc.gopher.as_ref().unwrap().ask.is_some());
+            assert_eq!(doc.url, Link::Gopher(url.clone()));
+            // The information page explains the form and links to it.
+            let info = parse(&url.with_plus(b"!"), body.clone(), false, 100);
+            assert!(info.lines.iter().any(|line| {
+                line.text == "Fill in the form" && line.link == Some(Link::Gopher(url.clone()))
+            }));
+            assert!(info.gopher.as_ref().unwrap().ask.is_none());
         }
+        // An incomplete attribute reply never becomes a form.
+        let url = GopherUrl::new("e".into(), 70, '0', b"/item".to_vec()).with_plus(b"?");
+        let mut page =
+            Page::from(b"+INFO: 0Item\t/item\te\t70\t?\r\n+ASK:\r\n AskP: Password\r\n".to_vec());
+        page.reply.notice = Some("Incomplete Gopher reply: server timed out".into());
+        assert!(render(&url, page, 100).gopher.unwrap().ask.is_none());
+        let doc = parse(
+            &url,
+            b"+INFO: 0Item\t/item\te\t70\t?\r\n".to_vec(),
+            false,
+            100,
+        );
+        assert!(doc.lines[0].text.contains("no +ASK questions"));
         let url = GopherUrl::parse("gopher://e/:/image%09%09+").unwrap();
         assert!(url.is_metadata());
         assert_eq!(url.request().unwrap(), b"/image\t!\r\n");
         let view = url.with_plus(b"+image/webp");
         assert!(view.is_image());
         assert_eq!(view.request().unwrap(), b"/image\t+image/webp\r\n");
+    }
+
+    #[tokio::test]
+    async fn gopher_plus_form_submission_sends_answers_once_and_reads_the_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let item = GopherUrl::new("127.0.0.1".into(), port, '1', b"/vote".to_vec()).with_plus(b"?");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n.\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"+-1\r\niThanks for voting\tfake\t(NULL)\t0\r\n.\r\n")
+                .await
+                .unwrap();
+            drop(stream);
+            // A replay attempt connects, but must send nothing.
+            let (mut again, _) = listener.accept().await.unwrap();
+            let mut replay = Vec::new();
+            let _ = again.read_to_end(&mut replay).await;
+            (request, replay)
+        });
+        let mut form = AskForm::parse(
+            &item,
+            b"+INFO: 1Vote\t/vote\t127.0.0.1\t70\t?\r\n+ASK:\r\n Ask: Name\r\n AskP: PIN\r\n",
+        )
+        .unwrap();
+        form.set_text(0, None, "Ruby").unwrap();
+        form.set_text(1, None, "1234").unwrap();
+        let submission = form.submission(Encoding::Auto).unwrap();
+        let page = timeout(Duration::from_secs(2), fetch(&submission.url))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(page.view.form_reply);
+        let mut doc = render(&submission.url, page, 80);
+        // The reply is a menu at the form's public address: reload or a
+        // bookmark shows the form again instead of resending the PIN.
+        assert_eq!(doc.url, Link::Gopher(item.clone()));
+        assert_eq!(doc.lines[0].text, "Thanks for voting");
+        doc.rerender_reply(60);
+        assert_eq!(doc.lines[0].text, "Thanks for voting");
+        assert!(!format!("{doc:?}").contains("1234"));
+        // A second transmission of the same submission is refused.
+        let replay = fetch(&submission.url).await.unwrap_err();
+        assert!(replay.contains("already submitted"), "{replay}");
+        let (request, replayed) = server.await.unwrap();
+        assert_eq!(request, b"/vote\t+\t1\r\n+-1\r\nRuby\r\n1234\r\n.\r\n");
+        assert!(replayed.is_empty(), "a refused replay sends no bytes");
     }
 
     #[test]
@@ -720,6 +791,54 @@ mod tests {
         assert_eq!(updates, [b"First\r\n".to_vec()]);
         assert_eq!(reply.body, b"First\r\n.Second\r\n");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gopher_plus_form_file_replies_save_from_their_own_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut body = b"PK\x03\x04".to_vec();
+        body.resize(3 * 1024 * 1024, 7);
+        let reply = [format!("+{}\r\n", body.len()).into_bytes(), body.clone()].concat();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n.\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream.write_all(&reply).await.unwrap();
+            stream.shutdown().await.unwrap();
+            request
+        });
+        let item =
+            GopherUrl::new("127.0.0.1".into(), port, '9', b"/export".to_vec()).with_plus(b"?");
+        let form = AskForm::parse(&item, b"+ASK:\r\n Ask: Year\t2026\r\n").unwrap();
+        let submission = form.submission(Encoding::Auto).unwrap();
+        let FileResponse::Download(offer) = fetch_file(&submission.url).await.unwrap() else {
+            panic!("an archive is offered for saving")
+        };
+        assert!(
+            offer.transfer.is_some(),
+            "the reply stays on its connection"
+        );
+        assert_eq!(offer.content_type, "application/zip");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.zip");
+        assert_eq!(
+            crate::download::save(&offer, &path).await.unwrap(),
+            body.len() as u64
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(
+            server.await.unwrap(),
+            b"/export\t+\t1\r\n+-1\r\n2026\r\n.\r\n"
+        );
+        // Saving again would need a second submission: refused.
+        assert!(
+            crate::download::save(&offer, &dir.path().join("again.zip"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

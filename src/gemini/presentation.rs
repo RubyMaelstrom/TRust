@@ -23,6 +23,8 @@ pub struct View {
     pub show_alt: bool,
     pub outline: bool,
     pub reading_columns: usize,
+    /// A certificate decision this page asks for (see `security.rs`).
+    pub security: Option<super::security::Security>,
 }
 impl Default for View {
     fn default() -> Self {
@@ -37,6 +39,7 @@ impl Default for View {
             show_alt: false,
             outline: false,
             reading_columns: 96,
+            security: None,
         }
     }
 }
@@ -50,6 +53,9 @@ impl Response {
         // transport diagnostics to the received document. Rendering below
         // supplies its own display-limit notices.
         view.controls.notice = None;
+        if view.security.is_some() {
+            return security_page(&self.url.public_url(), view, width);
+        }
         if (20..30).contains(&self.status) {
             return render(
                 Link::Gemini(self.url.public_url()),
@@ -96,7 +102,54 @@ impl Response {
     }
 }
 
+/// A security page keeps its decision across re-wrapping: `render` and
+/// `Response::document` both produce it from the view.
+fn security_page(url: &super::GeminiUrl, mut view: View, width: usize) -> Doc {
+    let Some(security) = view.security.clone() else {
+        return Doc::from_lines(
+            Link::Gemini(url.clone()),
+            Vec::new(),
+            Vec::new(),
+            width,
+            false,
+            None,
+        );
+    };
+    let columns = if width > MAX_COLUMNS {
+        width
+    } else {
+        width.max(10).min(view.reading_columns)
+    };
+    view.owners.clear();
+    view.sources.clear();
+    view.headings.clear();
+    let mut lines = Vec::new();
+    for (source, line) in super::security::lines(&security).into_iter().enumerate() {
+        let start = lines.len();
+        push_wrapped(&mut lines, line.kind, line.text, line.link, columns);
+        view.owners
+            .extend(std::iter::repeat_n(start, lines.len() - start));
+        view.sources
+            .extend(std::iter::repeat_n(source, lines.len() - start));
+    }
+    let mut doc = Doc::from_lines(
+        Link::Gemini(url.clone()),
+        lines,
+        Vec::new(),
+        width,
+        false,
+        None,
+    );
+    doc.gemini = Some(view);
+    doc
+}
+
 pub fn render(url: Link, meta: &str, body: &[u8], width: usize, mut view: View) -> Doc {
+    if view.security.is_some()
+        && let Link::Gemini(url) = &url
+    {
+        return security_page(url, view, width);
+    }
     let result = MediaType::parse(meta).and_then(|media| {
         if !media.is_text() {
             return Err(format!("Save or open this {meta} response."));

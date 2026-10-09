@@ -625,7 +625,8 @@ current behavior and limits; consult the governing standards before changing it.
 - Windows defaults: config/bookmarks/site data in `%APPDATA%\trust`, state/cache
   in `%LOCALAPPDATA%\trust\state` and `\cache`, downloads in
   `%USERPROFILE%\Downloads`. Absolute XDG overrides and explicit
-  `TRUST_KNOWN_HOSTS`/`TRUST_IDENTITIES` overrides take precedence.
+  `TRUST_KNOWN_HOSTS`/`TRUST_GEMINI_KNOWN_HOSTS`/`TRUST_IDENTITIES`/
+  `TRUST_DICT_CREDENTIALS` overrides take precedence.
 
 ### Telnet and small-net protocols
 
@@ -658,8 +659,22 @@ current behavior and limits; consult the governing standards before changing it.
 - Gopher/Gopher+ page bodies are capped at 2 MiB; downloads stream to disk with
   a 2 GiB ceiling. A dot terminator or declared byte count completes the reply
   without waiting for socket close. Strip Gopher+ framing before display/save.
-  Fetch item information/formats on demand; ASK submission is unimplemented.
-  Binary items use bounded format detection before display or Save/Open offers.
+  Fetch item information/formats on demand. Binary items use bounded format
+  detection before display or Save/Open offers.
+- Gopher+ ASK forms (`?` items, UMN Gopher+ §2.8; local copy of the memo in
+  the standards library) render as line-model forms in both frontends; their
+  answers live in `gopher::View::ask` (the core keeps it on the page, so
+  `gopher::prepare_form` runs when a page is committed). Answer encoding
+  follows the UMN reference client: AskL sends a count line then its lines,
+  Select sends 1/0, Choose its option text, ChooseF one file as the data
+  block's remainder (`+<length>` framing; otherwise `+-1` with dot-stuffing).
+  Answers are single bounded lines (4 KiB each, 64 KiB total, 16 MiB file)
+  in the page's display encoding; untouched defaults keep the server's bytes.
+  A submission's data block rides beside the URL (`GopherUrl::ask`), is sent
+  at most once, and never reaches Display/history/bookmarks (`public()` is
+  the form's `?` address, whose reload shows the form again). Typed AskP
+  answers are cleared on submit. An AskF answer, or a download item type,
+  turns the reply into a Save/Open offer that sends the form when chosen.
 - Gopher views preserve authored spacing, bounded reading history, and decoding
   independent of selectors (automatic UTF-8, otherwise Latin-1; explicit CP437
   is available). Desktop ANSI SGR colors are bounded; discard terminal movement
@@ -667,18 +682,36 @@ current behavior and limits; consult the governing standards before changing it.
   keyboard stop and remain clickable across rows.
 - Gemini defaults to a 96-character column (configurable 20–240); local `.gmi`,
   `.gemini`, `.gemtext`, and `.gmni` files preview Gemtext. Sensitive input is
-  masked and excluded from history/stored addresses. Client-certificate consent
-  covers host, port, and path subtree, including existing PEM identities. Binary
+  masked and excluded from history/stored addresses. Client identities
+  (`gemini::identity`) are PEM files with `.scopes` files; a request sends
+  the identity whose explicit scope (host, port, path subtree) is the most
+  specific match, so different paths may use different identities, redirects
+  and links never carry one outside its scope, and existing PEM files need an
+  explicit first choice. A 6x answer renders a page that names the identity
+  sent, warns on TLS 1.2, and lets the user choose the scope (the request's
+  path subtree by default, any parent, or the whole capsule, for capsules
+  that ask on one page such as `/join` and recognize the certificate
+  everywhere) and create or pick an identity; 61/62 choices supersede the
+  rejected identity for that exact scope. `identity [capsule|page|revoke]`
+  shows, widens, narrows or withdraws the identity for the current page, and
+  `about:certificates` lists identities, scopes and pins. New identity names
+  are never prefilled from the local account; key files are published
+  atomically (0600). Binary
   saving consumes the original response connection without resubmitting input.
   Cross-protocol redirects show a link. Text decodes in its MIME `charset`
   (`src/gemini/media.rs`): IANA names through the WHATWG label table, except
   that US-ASCII/ISO-8859 keep C1 controls and unmarked UTF-16/UTF-32 follow
   the BOM, else big-endian. Unknown or WHATWG "replacement" charsets produce
   an explicit notice.
-- Gophers/Gemini currently encrypt without CA, hostname, expiry, or server-pin
-  validation, including replacement certificates; Gemini server pins are
-  ignored. Client identities require explicit scope consent. HTTPS uses WebPKI;
-  Telnet TLS retains `known_hosts` pinning.
+- Gemini uses trust on first use (`gemini::tofu`): the SHA-256 fingerprint
+  and notAfter of a capsule's certificate are pinned per host:port in
+  `gemini_known_hosts` (0600) once a handshake succeeds. A different
+  certificate before the pin expires stops the request before anything is
+  sent and shows both certificates with an explicit "trust the new one"
+  choice; after expiry the replacement is pinned with a notice. Gophers still
+  encrypts without CA, hostname, expiry, or pin validation, including
+  replacement certificates. HTTPS uses WebPKI; Telnet TLS retains
+  `known_hosts` pinning.
 - Finger preserves columns, blank lines, eight-cell tabs, URL links, and the
   previous successful reply for comparisons. WHOIS retains raw answers and
   provenance alongside parsed summaries; unrecognized formats use a transcript.
@@ -694,7 +727,19 @@ current behavior and limits; consult the governing standards before changing it.
   `$XDG_CONFIG_HOME/trust/dict.json` (default `~/.config/trust/dict.json`). Explicit
   URLs override preferences; an omitted URL database means `!` (first match).
   DICT/WHOIS URLs decode once, accept bracketed IPv6, and keep fragments local.
-  DICT authentication and MIME attachments are unimplemented.
+- DICT pipelines CLIENT and OPTION MIME (RFC 2229 §§3.10, 4). With MIME on,
+  each text response's header is parsed (RFC 2045/2046: charsets, base64,
+  quoted-printable, multipart); text is shown and other parts become saveable
+  attachments; 500 to OPTION means a pre-MIME server. AUTH (§3.11) uses
+  per-server credentials in `$XDG_CONFIG_HOME/trust/dict-credentials.json`
+  (0600, beside `dict.json`; the secret is stored unencrypted because AUTH
+  needs it each session and is never shown or logged). With credentials the
+  lookup waits for the banner's msg-id and sends `AUTH user md5(msg-id
+  secret)` first; 230/531/5xx are reported and the lookup proceeds either
+  way. `dict://user;AUTH@host/…` asks for the secret before connecting;
+  SASLAUTH is rejected explicitly. `dict-auth [server] [user]` and
+  `dict-auth --forget` manage credentials. Reply codes must start with 1–5
+  (§2.4.1).
 
 ## Documentation Notes
 

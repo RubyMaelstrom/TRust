@@ -94,19 +94,67 @@ fn header(bytes: &[u8]) -> Result<(u8, String), String> {
     Ok((status, meta.to_string()))
 }
 
-async fn open(url: &GeminiUrl) -> Result<(Stream, Response), String> {
+/// A connection that answered, or a handshake TOFU stopped before sending.
+enum Opened {
+    Answered(Box<Stream>, Box<Response>),
+    Stopped(Box<Response>),
+}
+
+async fn open(url: &GeminiUrl) -> Result<Opened, String> {
+    use super::{security, tofu};
     let request = url.request()?; // validate before DNS, TLS, or identity access
     let sock = TcpStream::connect((url.host.as_str(), url.port))
         .await
         .map_err(|e| e.to_string())?;
     let _ = sock.set_nodelay(true);
-    let configured =
-        tls::identity_authorized(url) && tls::identity_path(&url.host).is_some_and(|p| p.exists());
-    let (connector, presented) = tls::gemini_connector(url)?;
-    let mut stream = connector
+    let tls = tls::gemini_connector(url)?;
+    let handshake = tls
+        .connector
         .connect(tls::server_name(&url.host)?, sock)
-        .await
-        .map_err(|e| format!("TLS: {e}"))?;
+        .await;
+    let observed = tls.observation();
+    let stream = match handshake {
+        Ok(stream) => stream,
+        Err(error) => {
+            // Gemini §TLS Server certificate validation: a different
+            // certificate before the pinned one expires is potential MITM
+            // evidence. Stop, send nothing, and let the user decide.
+            if let Some((presented, tofu::Verdict::Changed(pinned))) = observed {
+                let mut response = Response::new(url.clone(), 0, String::new());
+                response.view.security = Some(security::Security::Changed(Box::new(
+                    security::TrustWarning { presented, pinned },
+                )));
+                return Ok(Opened::Stopped(Box::new(response)));
+            }
+            return Err(format!("TLS: {error}"));
+        }
+    };
+    let mut notices = Vec::new();
+    // The handshake proved possession of the certificate's key (RFC 8446
+    // §4.4.3); only now may a first use or renewal become the pin.
+    let now = crate::tls::x509::now();
+    match observed {
+        Some((presented, tofu::Verdict::First)) => {
+            if let Err(error) = tofu::trust(&presented, now) {
+                notices.push(error);
+            }
+        }
+        Some((presented, tofu::Verdict::Renewed(old))) => {
+            notices.push(format!(
+                "The capsule's certificate changed after the pinned one expired{}; the new certificate is now pinned.",
+                old.not_after
+                    .map_or_else(String::new, |t| format!(" on {}", crate::tls::x509::date(t)))
+            ));
+            if let Err(error) = tofu::trust(&presented, now) {
+                notices.push(error);
+            }
+        }
+        Some((_, tofu::Verdict::Known)) => {}
+        _ => return Err("TLS: the capsule's certificate was not checked.".into()),
+    }
+    let tls12 = stream.get_ref().1.protocol_version()
+        == Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_2);
+    let mut stream = stream;
     stream
         .write_all(&request)
         .await
@@ -127,13 +175,41 @@ async fn open(url: &GeminiUrl) -> Result<(Stream, Response), String> {
         bytes.push(byte);
     }
     let (status, meta) = header(&bytes[..bytes.len() - 2])?;
+    let presented = tls.presented.load(std::sync::atomic::Ordering::Relaxed);
+    let configured = tls.identity.is_some();
     let mut response = Response::new(url.clone(), status, meta);
-    response.identity = presented.load(std::sync::atomic::Ordering::Relaxed);
+    response.identity = presented;
     response.identity_configured = configured;
-    if configured && !response.identity && status / 10 == 6 {
-        response.notice = Some("The authorized identity was not requested during TLS authentication; the capsule cannot authenticate this connection.".into());
+    response.identity_name = tls
+        .identity
+        .as_ref()
+        .filter(|_| presented)
+        .map(|identity| identity.name.clone());
+    response.tls12 = tls12;
+    if presented && tls12 {
+        notices.push(
+            "Your client certificate was sent over TLS 1.2, which does not encrypt it.".into(),
+        );
     }
-    Ok((stream, response))
+    if status / 10 == 6 {
+        response.view.security = Some(security::Security::Certificate(Box::new(
+            security::CertificateRequest::new(
+                &response.url,
+                status,
+                &response.meta,
+                tls.identity.as_ref().filter(|_| presented),
+                configured && !presented,
+                tls12,
+            ),
+        )));
+        if configured && !presented {
+            notices.push("The chosen identity was not requested during TLS authentication; the capsule cannot authenticate this connection.".into());
+        }
+    }
+    if !notices.is_empty() {
+        response.notice = Some(notices.join(" "));
+    }
+    Ok(Opened::Answered(Box::new(stream), Box::new(response)))
 }
 
 pub async fn fetch(url: &GeminiUrl) -> Result<Response, String> {
@@ -149,9 +225,13 @@ where
     let deadline = Instant::now() + Duration::from_secs(180);
     for redirects in 0..=5 {
         let initial = deadline.min(Instant::now() + Duration::from_secs(15));
-        let (mut stream, mut response) = timeout_at(initial, open(&url))
+        let (mut stream, mut response) = match timeout_at(initial, open(&url))
             .await
-            .map_err(|_| "Gemini connection or header timed out")??;
+            .map_err(|_| "Gemini connection or header timed out")??
+        {
+            Opened::Answered(stream, response) => (*stream, *response),
+            Opened::Stopped(response) => return Ok(*response),
+        };
         if (30..40).contains(&response.status) {
             if let Link::Gemini(next) = resolve_reference(&url, &response.meta, true) {
                 next.request()?;
@@ -263,24 +343,123 @@ mod tests {
     }
 
     #[tokio::test]
+    // The lock serializes tests that share the identity directory; each
+    // test owns its runtime, so holding it across awaits cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn configured_identity_is_distinct_from_certificate_actually_requested_by_tls() {
-        unsafe {
-            std::env::set_var(
-                "TRUST_IDENTITIES",
-                std::env::temp_dir().join(format!("trust-test-ids-{}", std::process::id())),
-            );
-        }
+        let _lock = crate::gemini::identity::test_lock();
         let (url, server) = serve(b"60 Certificate required\r\n".to_vec(), vec![], false).await;
-        tls::authorize_identity(&url, "scoped").unwrap();
+        let scoped = crate::gemini::identity::create(&url, "scoped").unwrap();
         let response = fetch(&url).await.unwrap();
         assert!(response.identity_configured);
         assert!(!response.identity);
-        assert!(
-            !response.certificate_prompt(),
-            "do not repeatedly offer an identity which TLS never requests"
-        );
+        let Some(crate::gemini::security::Security::Certificate(request)) = &response.view.security
+        else {
+            panic!()
+        };
+        assert!(request.unrequested, "explain why no certificate was sent");
         assert!(response.notice.unwrap().contains("TLS"));
         server.await.unwrap();
+        crate::gemini::identity::delete(&scoped.fingerprint).unwrap();
+    }
+
+    fn certificate(not_after: i32) -> (Vec<u8>, Vec<u8>) {
+        let mut params = rcgen::CertificateParams::new(vec!["capsule.test".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(not_after, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.der().to_vec(), key.serialize_der())
+    }
+
+    fn acceptor(
+        (cert, key): &(Vec<u8>, Vec<u8>),
+        versions: &[&'static tokio_rustls::rustls::SupportedProtocolVersion],
+    ) -> tokio_rustls::TlsAcceptor {
+        tls::ensure_provider();
+        let config = tokio_rustls::rustls::ServerConfig::builder_with_protocol_versions(versions)
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone().into()], key.clone().try_into().unwrap())
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config))
+    }
+
+    #[tokio::test]
+    async fn tofu_pins_first_use_stops_on_change_and_continues_after_explicit_trust() {
+        use crate::gemini::{security, tofu};
+        let first = certificate(2100);
+        let second = certificate(2101);
+        let listener = tokio::net::TcpListener::bind("127.0.0.4:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Connection n presents certificate `order[n]` and reports whether a
+        // request arrived.
+        let order = [first.clone(), first.clone(), second.clone(), second.clone()];
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for cert in order {
+                let (socket, _) = listener.accept().await.unwrap();
+                let Ok(mut stream) = acceptor(&cert, tokio_rustls::rustls::ALL_VERSIONS)
+                    .accept(socket)
+                    .await
+                else {
+                    requests.push(false);
+                    continue;
+                };
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => request.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                requests.push(!request.is_empty());
+                let _ = stream.write_all(b"20 text/plain\r\nok").await;
+                let _ = stream.shutdown().await;
+            }
+            requests
+        });
+        let url = GeminiUrl::new("127.0.0.4", port, "/");
+        // First use pins the certificate; using it again is quiet.
+        for _ in 0..2 {
+            let response = fetch(&url).await.unwrap();
+            assert_eq!(
+                (response.status, response.body.as_slice()),
+                (20, &b"ok"[..])
+            );
+            assert!(response.notice.is_none());
+        }
+        // A different, unexpired certificate: stop before sending anything.
+        let response = fetch(&url).await.unwrap();
+        let Some(security::Security::Changed(warning)) = &response.view.security else {
+            panic!(
+                "expected a certificate-change decision, got {}",
+                response.status_text()
+            )
+        };
+        assert_eq!(
+            warning.pinned.fingerprint,
+            tofu::Presented::new("127.0.0.4", port, &first.0).fingerprint
+        );
+        assert!(response.status_text().contains("certificate changed"));
+        let page = response.document(100);
+        assert!(
+            page.lines
+                .iter()
+                .any(|l| l.link == Some(security::Action::TrustChanged.link()))
+        );
+        // The user's explicit choice trusts exactly the certificate shown.
+        let outcome = security::apply(
+            &security::Action::TrustChanged,
+            &security::Context {
+                address: &crate::doc::Link::Gemini(url.clone()),
+                security: response.view.security.as_ref(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, security::Outcome::Navigate(_)));
+        let response = fetch(&url).await.unwrap();
+        assert_eq!(response.body, b"ok");
+        assert_eq!(server.await.unwrap(), [true, true, false, true]);
     }
 
     #[tokio::test]

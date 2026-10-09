@@ -77,6 +77,7 @@ pub mod media;
 pub mod oneshot;
 mod pattern_regexp;
 mod performance;
+pub mod prompt;
 pub mod telnet;
 pub mod terminal;
 mod terminal_tui;

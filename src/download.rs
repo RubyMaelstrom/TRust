@@ -29,7 +29,27 @@ pub struct DownloadOffer {
     pub referrer: Option<Url>,
     pub(crate) fetch_body: bool,
     pub(crate) gopher: Option<crate::gopher::GopherUrl>,
-    pub(crate) gemini: Option<std::sync::Arc<tokio::sync::Mutex<Option<crate::gemini::Transfer>>>>,
+    /// A body still on the response's own connection; see [`Retained`].
+    pub(crate) transfer: Option<std::sync::Arc<tokio::sync::Mutex<Option<Retained>>>>,
+}
+
+/// A response body that remains on its original connection. Saving consumes
+/// it: a Gemini transaction (whose query may be an input submission) and a
+/// Gopher+ form submission (UMN Gopher+ §2.8) may change server state, so
+/// neither is ever repeated merely to fetch the file.
+#[derive(Debug)]
+pub(crate) enum Retained {
+    Gemini(Box<crate::gemini::Transfer>),
+    Gopher(Box<crate::gopher::Retained>),
+}
+
+impl Retained {
+    async fn save(self, path: &Path) -> Result<u64, String> {
+        match self {
+            Self::Gemini(transfer) => transfer.save(path).await,
+            Self::Gopher(transfer) => transfer.save(path).await,
+        }
+    }
 }
 
 impl DownloadOffer {
@@ -45,7 +65,7 @@ impl DownloadOffer {
             referrer: None,
             fetch_body: false,
             gopher: None,
-            gemini: None,
+            transfer: None,
         }
     }
 
@@ -74,8 +94,41 @@ impl DownloadOffer {
             referrer: None,
             fetch_body: true,
             gopher: Some(target),
-            gemini: None,
+            transfer: None,
         })
+    }
+
+    /// Offer the reply to a Gopher+ form whose `AskF:` question named a
+    /// local file for it (UMN Gopher+ §2.8). Choosing Save or Open sends the
+    /// submission, once; cancelling sends nothing.
+    pub fn from_gopher_submission(
+        submission: &crate::gopher::AskSubmission,
+    ) -> Result<Self, String> {
+        let mut offer = Self::from_gopher(submission.url.clone())?;
+        if let Some(name) = &submission.save_as {
+            offer.suggested_filename = sanitize_filename(name, &offer.content_type);
+        }
+        Ok(offer)
+    }
+
+    /// Offer the rest of a Gopher reply whose request may not be repeated
+    /// (a Gopher+ form submission): its connection is kept for one save.
+    pub(crate) fn from_gopher_transfer(
+        target: &crate::gopher::GopherUrl,
+        content_type: &str,
+        suggested_filename: Option<&str>,
+        transfer: crate::gopher::Retained,
+    ) -> Result<Self, String> {
+        let mut offer = Self::from_gopher(target.public())?;
+        offer.content_type = content_type.into();
+        if let Some(name) = suggested_filename {
+            offer.suggested_filename = sanitize_filename(name, content_type);
+        }
+        offer.gopher = None;
+        offer.transfer = Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(
+            Retained::Gopher(Box::new(transfer)),
+        ))));
+        Ok(offer)
     }
 
     pub(crate) fn from_gemini(
@@ -95,7 +148,9 @@ impl DownloadOffer {
             referrer: None,
             fetch_body: true,
             gopher: None,
-            gemini: Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(transfer)))),
+            transfer: Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(
+                Retained::Gemini(Box::new(transfer)),
+            )))),
         })
     }
 
@@ -118,7 +173,7 @@ impl DownloadOffer {
             referrer,
             fetch_body,
             gopher: None,
-            gemini: None,
+            transfer: None,
         }
     }
 
@@ -714,10 +769,10 @@ pub async fn save(offer: &DownloadOffer, destination: &Path) -> Result<u64, Stri
         std::process::id()
     ));
     let result = if offer.fetch_body {
-        if let Some(transfer) = &offer.gemini {
+        if let Some(transfer) = &offer.transfer {
             match transfer.lock().await.take() {
                 Some(transfer) => transfer.save(&partial).await,
-                None => Err("This Gemini response has already been saved or its transfer attempted. Reload to request it again.".into()),
+                None => Err("This response has already been saved or its transfer attempted. Reload to request it again.".into()),
             }
         } else if let Some(target) = &offer.gopher {
             stream_gopher(target, &partial).await
@@ -1244,7 +1299,7 @@ mod tests {
             referrer: None,
             fetch_body: true,
             gopher: None,
-            gemini: None,
+            transfer: None,
         };
 
         assert_eq!(save(&offer, &destination).await.unwrap(), 8);
@@ -1266,7 +1321,7 @@ mod tests {
             referrer: None,
             fetch_body: false,
             gopher: None,
-            gemini: None,
+            transfer: None,
         };
 
         assert!(save(&offer, &destination).await.is_err());

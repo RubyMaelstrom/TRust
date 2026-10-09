@@ -3,10 +3,12 @@
 //! RFC 4266 §2; RFC 3986 §§2.1, 2.4, 3.1, 3.2.2 and 3.5.
 
 pub(crate) mod ansi;
+mod ask;
 mod plus;
 #[cfg(test)]
 pub(crate) mod tls_tests;
 mod transport;
+pub use ask::{Action as AskAction, Edit as AskEdit, Form as AskForm, Submission as AskSubmission};
 pub use plus::information_target;
 pub(crate) use plus::open;
 pub(crate) use transport::connect;
@@ -39,6 +41,60 @@ pub struct GopherUrl {
     pub selector: Vec<u8>,
     pub query: Option<Vec<u8>>,
     pub gopher_plus: Option<Vec<u8>>,
+    /// UMN Gopher+ §2.4 data block answering an ASK form (§2.8). It travels
+    /// beside the URL, never in it: Display, history and bookmarks use
+    /// [`GopherUrl::public`], and the block is sent at most once.
+    pub(crate) ask: Option<AskData>,
+}
+
+/// The answers of one submitted Gopher+ form. Equality is identity: two
+/// submissions with equal answers are still two requests.
+#[derive(Clone)]
+pub(crate) struct AskData(std::sync::Arc<AskBlock>);
+
+struct AskBlock {
+    bytes: Vec<u8>,
+    sent: std::sync::atomic::AtomicBool,
+}
+
+impl AskData {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(std::sync::Arc::new(AskBlock {
+            bytes,
+            sent: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    /// A form submission may change server state: never replay one. A
+    /// second transmission needs the user to submit the form again.
+    fn claim(&self) -> Result<(), String> {
+        if self.0.sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            Err(
+                "This Gopher+ form was already submitted; submit the form again to resend it."
+                    .into(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.bytes.len()
+    }
+}
+
+impl PartialEq for AskData {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for AskData {}
+
+impl fmt::Debug for AskData {
+    // Answers can be passwords: only their size is ever formatted.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AskData({} bytes)", self.0.bytes.len())
+    }
 }
 
 impl GopherUrl {
@@ -51,6 +107,7 @@ impl GopherUrl {
             selector,
             query: None,
             gopher_plus: None,
+            ask: None,
         }
     }
 
@@ -138,8 +195,44 @@ impl GopherUrl {
             request.push(b'\t');
             request.extend_from_slice(&plus::request_command(self, command)?);
         }
+        // UMN Gopher+ §2.4 / Appendix II: `selector TAB + TAB 1` announces
+        // the client data block that follows the request line (§2.8).
+        if self.ask.is_some() {
+            if self.gopher_plus.as_deref() != Some(b"+") || self.is_metadata() {
+                return Err("A Gopher+ form answers the item's default view.".into());
+            }
+            request.extend_from_slice(b"\t1");
+        }
         request.extend_from_slice(b"\r\n");
+        if let Some(ask) = &self.ask {
+            request.extend_from_slice(&ask.0.bytes);
+        }
         Ok(request)
+    }
+
+    /// Mark an ASK submission as sent; called once the connection is ready.
+    pub(crate) fn claim_request(&self) -> Result<(), String> {
+        self.ask.as_ref().map_or(Ok(()), AskData::claim)
+    }
+
+    /// The destination without form answers. A submission becomes its `?`
+    /// item, so reloading or bookmarking it shows the form instead of
+    /// silently sending the answers again.
+    pub fn public(&self) -> Self {
+        let mut url = self.clone();
+        if url.ask.take().is_some() {
+            url.gopher_plus = Some(b"?".to_vec());
+        }
+        url
+    }
+
+    /// RFC 4266 §2.5: a `?` item has a +ASK form to fill in first.
+    pub fn is_ask(&self) -> bool {
+        self.ask.is_none() && self.gopher_plus.as_deref() == Some(b"?")
+    }
+
+    pub(crate) fn has_answers(&self) -> bool {
+        self.ask.is_some()
     }
 
     pub fn with_query(&self, query: &str) -> Result<Self, String> {
@@ -362,6 +455,11 @@ pub struct View {
     /// Desktop-only, indexed by unwrapped DocLine. Terminal parsing leaves
     /// this empty and continues to use its fixed semantic palette.
     pub(crate) colors: Vec<Vec<ansi::Span>>,
+    /// The ASK form shown for a `?` item, with the user's answers.
+    pub ask: Option<Box<AskForm>>,
+    /// This page is the reply to a submitted form: read it as the item's
+    /// default view, although its address is the form's `?` item.
+    pub form_reply: bool,
 }
 
 impl View {
@@ -390,6 +488,8 @@ impl Default for View {
             owners: Vec::new(),
             source_columns: 0,
             colors: Vec::new(),
+            ask: None,
+            form_reply: false,
         }
     }
 }
@@ -404,6 +504,14 @@ impl Page {
             reply,
             view: View::default(),
         }
+    }
+
+    /// A reply fetched from `url`; a form submission's reply remembers that
+    /// it answers the form (see [`View::form_reply`]).
+    pub fn for_url(url: &GopherUrl, reply: text_reply::Reply) -> Self {
+        let mut page = Self::new(reply);
+        page.view.form_reply = url.has_answers();
+        page
     }
 }
 impl From<Vec<u8>> for Page {
@@ -466,7 +574,9 @@ async fn connect_addresses(host: &str, port: u16) -> std::io::Result<TcpStream> 
 }
 
 pub async fn fetch(url: &GopherUrl) -> Result<Page, String> {
-    fetch_updates(url, |_| async { true }).await.map(Page::new)
+    fetch_updates(url, |_| async { true })
+        .await
+        .map(|reply| Page::for_url(url, reply))
 }
 
 pub enum FileResponse {
@@ -561,7 +671,20 @@ pub async fn fetch_file(url: &GopherUrl) -> Result<FileResponse, String> {
             return response(url, body, mime).map(|r| FileResponse::Document(Box::new(r)));
         }
     }
-    let mut offer = crate::download::DownloadOffer::from_gopher(url.clone())?;
+    if url.has_answers() && !finished {
+        // UMN Gopher+ §2.8: the reply to a form is never fetched twice.
+        let offer = crate::download::DownloadOffer::from_gopher_transfer(
+            url,
+            mime,
+            None,
+            Retained {
+                stream,
+                prefix: body,
+            },
+        )?;
+        return Ok(FileResponse::Download(Box::new(offer)));
+    }
+    let mut offer = crate::download::DownloadOffer::from_gopher(url.public())?;
     offer.content_type = mime.into();
     if finished {
         offer.content_length = Some(body.len() as u64);
@@ -569,6 +692,57 @@ pub async fn fetch_file(url: &GopherUrl) -> Result<FileResponse, String> {
         offer.fetch_body = false;
     }
     Ok(FileResponse::Download(Box::new(offer)))
+}
+
+/// The unread rest of a Gopher reply, kept for one Save/Open choice.
+pub(crate) struct Retained {
+    stream: plus::Transfer,
+    prefix: Vec<u8>,
+}
+
+impl fmt::Debug for Retained {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Gopher response body")
+    }
+}
+
+impl Retained {
+    /// RFC 1436 appendix / UMN Gopher+ §2.3: the body is already unframed.
+    pub(crate) async fn save(mut self, path: &std::path::Path) -> Result<u64, String> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await
+            .map_err(|e| e.to_string())?;
+        file.write_all(&self.prefix)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut count = self.prefix.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(1800);
+        let mut bytes = [0; 65536];
+        loop {
+            let idle = Instant::now() + Duration::from_secs(30);
+            let n = tokio::time::timeout_at(deadline.min(idle), self.stream.read(&mut bytes))
+                .await
+                .map_err(|_| "Gopher download timed out")?
+                .map_err(|e| format!("Incomplete Gopher download: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            if count > 2 * 1024 * 1024 * 1024 {
+                return Err("Download exceeds 2 GiB limit".into());
+            }
+            file.write_all(&bytes[..n])
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        file.flush().await.map_err(|e| e.to_string())?;
+        file.sync_all().await.map_err(|e| e.to_string())?;
+        Ok(count)
+    }
 }
 
 pub async fn fetch_updates<F, Fut>(
@@ -821,6 +995,21 @@ pub fn text_body(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// RFC 4266 §2.5 / UMN Gopher+ §2.8: a `?` item presents its +ASK form once
+/// its complete attribute reply has arrived. Frontends that keep the page
+/// (rather than a rendered document) call this when they commit it, so the
+/// answers live with the page.
+pub fn prepare_form(url: &GopherUrl, page: &mut Page) {
+    if url.is_ask()
+        && !page.view.form_reply
+        && page.reply.finished
+        && page.reply.notice.is_none()
+        && page.view.ask.as_ref().is_none_or(|form| form.item() != url)
+    {
+        page.view.ask = AskForm::parse(url, &page.reply.body).map(Box::new);
+    }
+}
+
 pub fn parse(url: &GopherUrl, raw: Vec<u8>, cp437: bool, width: usize) -> Doc {
     let mut page = Page::from(raw);
     if cp437 {
@@ -839,6 +1028,19 @@ pub(crate) fn render_desktop(url: &GopherUrl, page: Page) -> Doc {
 }
 
 fn render_impl(url: &GopherUrl, mut page: Page, width: usize, colors: bool) -> Doc {
+    if url.has_answers() {
+        page.view.form_reply = true;
+    }
+    let public = url.public();
+    // UMN Gopher+ §2.8: a form's reply is the item's default view, read as
+    // such, while its document keeps the form's `?` address.
+    let reply_view;
+    let url = if page.view.form_reply && public.is_ask() {
+        reply_view = public.with_plus(b"+");
+        &reply_view
+    } else {
+        &public
+    };
     let width = width.max(10);
     let wrap = if page.view.controls.wrap {
         width
@@ -882,7 +1084,11 @@ fn render_impl(url: &GopherUrl, mut page: Page, width: usize, colors: bool) -> D
             bounded.push(b'\n');
         }
         let logical = if metadata {
-            plus::information_lines(url, &bounded, page.view.encoding)
+            prepare_form(url, &mut page);
+            match &page.view.ask {
+                Some(form) if url.is_ask() => form.lines(page.view.encoding),
+                _ => plus::information_lines(url, &bounded, page.view.encoding),
+            }
         } else {
             gemini::parse_gemtext(&bounded, usize::MAX / 4, &|target| resolve_gmi(url, target))
         };
@@ -1011,7 +1217,7 @@ fn render_impl(url: &GopherUrl, mut page: Page, width: usize, colors: bool) -> D
             .min(page.view.source_columns.saturating_sub(width))
     };
     let mut doc = Doc::from_lines(
-        Link::Gopher(url.clone()),
+        Link::Gopher(public),
         lines,
         page.reply.body,
         width,

@@ -268,6 +268,11 @@ dict --match strategy <word>  matching words (e.g. prefix)
 dict --databases          browse dictionaries (--server selects server)
 dict --strategies         browse available search modes
 dict-filter <text>        filter the current dictionary/source list
+dict-auth [server] [user] save DICT AUTH credentials (secret is asked for)
+dict-auth --forget [server]  forget them
+certificates              Gemini identities, their scopes, and capsule pins
+identity [capsule|page|revoke]  identity sent to this Gemini page; widen
+                          it to the whole capsule, narrow it, or stop it
 bookmark [add|link] [title]  save current destination or selected link
 bookmarks [filter]        view bookmarks for every protocol
 bookmark rename <id> <title>
@@ -334,11 +339,15 @@ Images, HTML and supported generic files open inside TRust.
 Unsupported files offer Save / Open / Cancel.
 Gopher+ pages and alternate formats open here too. I or gopher-info shows
 the selected item's information; gopher-info page shows the current page's.
-Choose a format link to open it. ASK forms are displayed but cannot submit.
+Choose a format link to open it. Gopher+ forms (items marked ?) open as a
+form: Enter edits an answer (passwords are masked), picks a choice or toggles
+a check box; AskL questions add lines; a file question sends one file.
+Submit sends the answers once; reload or Back shows the form again rather
+than resending them. A filename question offers the reply for saving.
 Recent pages stay in bounded RAM history; reload fetches a fresh copy.
 Use gophers:// for TLS (default port 70); same-server links retain TLS.
-Gophers and Gemini accept server certificates, including replacements,
-without pinning or server-identity checks. Gemini client identities still work.
+Gophers accepts server certificates, including replacements, without
+pinning or server-identity checks.
 
 ## Gemini
 
@@ -348,6 +357,11 @@ Use gemini-width 20..240, outline, heading next|previous|N, and gemini-alt
 [on|off] to adjust reading. Local .gmi files open as Gemtext previews.
 Gemini prompts submit with Enter and cancel with Escape. Sensitive input is
 masked and excluded from command history and stored page addresses.
+Capsule certificates are pinned on first use; a changed one stops the
+connection and asks before trusting it. When a capsule asks for a client
+certificate, choose where the identity is sent (that page and below, a
+parent, or the whole capsule) and create or pick one. identity shows the
+identity sent to the current page; certificates manages them all.
 => about:gemini Gemini guide (also gemini-help)
 
 ## Bookmarks
@@ -388,6 +402,9 @@ No-definition replies offer spelling suggestions. References are selectable.
 W wraps, S saves exact original text, and Esc stops while retaining received data.
 Use a dictionary by default remembers it for future commands on that server.
 Look up another word opens the command editor with the current lookup settings.
+Sign in (or dict-auth) saves AUTH credentials; later lookups on that server
+authenticate. dict://user;AUTH@server/… addresses ask for the secret first.
+MIME text in any charset is shown; pictures and other parts can be saved.
 
 ## Telnet sessions
 

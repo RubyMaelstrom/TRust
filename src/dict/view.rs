@@ -24,6 +24,12 @@ pub enum Action {
     LookupMode(String),
     Filter,
     Save,
+    /// RFC 2229 §3.11: collect AUTH credentials for this server.
+    SignIn,
+    /// Forget this server's saved AUTH credentials.
+    SignOut,
+    /// Save one MIME attachment of the shown definition (§3.10.1).
+    Attachment(usize),
 }
 
 impl Action {
@@ -39,6 +45,9 @@ impl Action {
             Self::Lookup => "lookup".into(),
             Self::Filter => "filter".into(),
             Self::Save => "save".into(),
+            Self::SignIn => "sign-in".into(),
+            Self::SignOut => "sign-out".into(),
+            Self::Attachment(n) => format!("attachment/{n}"),
         };
         Link::External(format!("about:dict/{action}"))
     }
@@ -54,6 +63,8 @@ impl Action {
             "lookup" => Self::Lookup,
             "filter" => Self::Filter,
             "save" => Self::Save,
+            "sign-in" => Self::SignIn,
+            "sign-out" => Self::SignOut,
             _ => {
                 let (name, value) = value.split_once('/')?;
                 match name {
@@ -61,6 +72,7 @@ impl Action {
                     "remember" => Self::Remember(decode(value).ok()?),
                     "lookup" => Self::LookupIn(decode(value).ok()?),
                     "mode" => Self::LookupMode(decode(value).ok()?),
+                    "attachment" => Self::Attachment(value.parse().ok()?),
                     _ => return None,
                 }
             }
@@ -150,7 +162,40 @@ impl Page {
             Operation::Strategies => format!("{} search modes", self.reply.entries.len()),
             Operation::Info => "dictionary information".into(),
         };
-        format!("{} · {count} · {state}", self.target.server())
+        let auth = match &self.reply.auth {
+            super::Auth::Accepted(user) => format!(" · signed in as {user}"),
+            super::Auth::Denied { .. } => " · sign-in refused".into(),
+            _ => String::new(),
+        };
+        format!("{} · {count} · {state}{auth}", self.target.server())
+    }
+
+    /// RFC 2229 §3.11: ask for this server's AUTH user, then its secret.
+    pub fn sign_in_prompt(&self) -> crate::prompt::Prompt {
+        let server = self.target.server();
+        let current = super::credentials::lookup(&server).map(|c| c.user);
+        crate::prompt::Prompt::dict_user(&server, current.as_deref())
+    }
+
+    /// A download offer for an attachment of the shown definition.
+    pub fn attachment_offer(&self, index: usize) -> Option<crate::download::DownloadOffer> {
+        let definition = self.reply.definitions.get(self.selected)?;
+        let attachment = definition.attachments.get(index)?;
+        let name = attachment.filename.clone().unwrap_or_else(|| {
+            format!(
+                "{}-{}.{}",
+                definition.word,
+                index + 1,
+                attachment.content_type.rsplit('/').next().unwrap_or("bin")
+            )
+        });
+        let mut offer = crate::download::DownloadOffer::from_bytes(
+            url::Url::parse(&self.target.to_string()).ok()?,
+            name,
+            attachment.bytes.as_ref().clone(),
+        );
+        offer.content_type = attachment.content_type.clone();
+        Some(offer)
     }
     pub fn view_action(
         &mut self,
@@ -170,6 +215,13 @@ impl Page {
             Action::Select(n) if *n < self.reply.definitions.len() => {
                 self.selected = *n;
                 self.section = Section::Definition;
+            }
+            Action::SignOut => {
+                let server = self.target.server();
+                super::credentials::forget(&server)?;
+                self.view.notice = Some(format!(
+                    "Forgot the DICT credentials for {server}; later lookups there do not authenticate."
+                ));
             }
             Action::Remember(db)
                 if db == "*"
@@ -389,6 +441,61 @@ pub fn render(page: Page, width: usize) -> Doc {
     }
     if let Some(notice) = &page.view.notice {
         line(&mut lines, Kind::Info, notice, None, width);
+    }
+    // RFC 2229 §3.11.2: AUTH's outcome, and how to change it.
+    let server = page.target.server();
+    match &page.reply.auth {
+        super::Auth::Accepted(_) => {
+            button(
+                &mut lines,
+                &format!("Sign out of {server}"),
+                Action::SignOut,
+                width,
+            );
+        }
+        super::Auth::Denied { user, message } => {
+            line(
+                &mut lines,
+                Kind::Error,
+                &format!(
+                    "{server} refused the sign-in for {user} ({message}); results exclude private dictionaries."
+                ),
+                None,
+                width,
+            );
+            button(&mut lines, "Sign in again…", Action::SignIn, width);
+        }
+        super::Auth::Unsupported(message) => line(
+            &mut lines,
+            Kind::Info,
+            &format!("{server} does not support AUTH ({message})."),
+            None,
+            width,
+        ),
+        super::Auth::Unavailable(reason) => {
+            line(
+                &mut lines,
+                Kind::Info,
+                &format!("Not signed in: {reason}"),
+                None,
+                width,
+            );
+            button(
+                &mut lines,
+                &format!("Sign in to {server}…"),
+                Action::SignIn,
+                width,
+            );
+        }
+        super::Auth::None if page.reply.capabilities.iter().any(|c| c == "auth") => {
+            button(
+                &mut lines,
+                &format!("Sign in to {server}…"),
+                Action::SignIn,
+                width,
+            );
+        }
+        super::Auth::None => {}
     }
     button(&mut lines, "Look up another word", Action::Lookup, width);
     if page.section == Section::Sources {
@@ -672,7 +779,42 @@ pub fn render(page: Page, width: usize) -> Doc {
             None,
             width,
         );
+        if let Some(content_type) = &definition.content_type {
+            line(
+                &mut lines,
+                Kind::Info,
+                &format!("MIME content: {content_type}"),
+                None,
+                width,
+            );
+        }
         body(&mut lines, definition.body.as_bytes(), &page, width);
+        // RFC 2229 §3.10.1: parts that are not text are offered to save.
+        if !definition.attachments.is_empty() {
+            line(&mut lines, Kind::Heading(2), "Attachments", None, width);
+            for (index, attachment) in definition.attachments.iter().enumerate() {
+                button(
+                    &mut lines,
+                    &format!(
+                        "Save {} ({}, {})",
+                        attachment.filename.as_deref().unwrap_or("attachment"),
+                        attachment.content_type,
+                        crate::download::human_bytes(attachment.bytes.len() as u64)
+                    ),
+                    Action::Attachment(index),
+                    width,
+                );
+            }
+        }
+        for skipped in &definition.skipped {
+            line(
+                &mut lines,
+                Kind::Info,
+                &format!("Skipped a part TRust cannot show: {skipped}"),
+                None,
+                width,
+            );
+        }
         if !definition.complete && page.reply.finished {
             line(
                 &mut lines,
@@ -775,6 +917,9 @@ mod tests {
                 "    n 1: a colorless element in the atmosphere\n\x1b[31mred\x1b[0m\0\n".into(),
             ),
             complete: true,
+            content_type: None,
+            attachments: Vec::new(),
+            skipped: Vec::new(),
         });
         let page = Page::new(target, reply);
         assert_eq!(page.export().body, raw);

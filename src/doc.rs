@@ -60,7 +60,8 @@ impl Link {
                     .capacity()
                     .saturating_add(url.selector.capacity())
                     .saturating_add(url.query.as_ref().map_or(0, Vec::capacity))
-                    .saturating_add(url.gopher_plus.as_ref().map_or(0, Vec::capacity)),
+                    .saturating_add(url.gopher_plus.as_ref().map_or(0, Vec::capacity))
+                    .saturating_add(url.ask.as_ref().map_or(0, crate::gopher::AskData::len)),
                 false,
             ),
             Link::Gemini(url) => (

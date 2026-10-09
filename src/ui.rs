@@ -1591,8 +1591,12 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
     // The search prompt doubles as the form-field editor, the identity-name
     // prompt for capsules that ask for a certificate, and the masked secret
     // prompt (gemini status 11, HTML password fields).
-    let editing_field = matches!(app.search_target, Some(Link::Form { .. }));
-    let minting_identity = app.cert_for.is_some();
+    let editing_field =
+        matches!(app.search_target, Some(Link::Form { .. })) || app.prompt.is_some();
+    let minting_identity = app
+        .prompt
+        .as_ref()
+        .is_some_and(|p| matches!(p.purpose, crate::prompt::Purpose::IdentityName { .. }));
     let masked = (app.mode == Mode::Search && app.masked_input)
         || (app.mode == Mode::Session && app.browser.is_none() && app.vt.remote_echo());
     let (prompt, accent) = match app.mode {
@@ -1656,6 +1660,12 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
                 " SECRET "
             } else if minting_identity {
                 " IDENTITY "
+            } else if app
+                .prompt
+                .as_ref()
+                .is_some_and(|p| matches!(p.purpose, crate::prompt::Purpose::DictUser { .. }))
+            {
+                " LOGIN "
             } else if editing_field {
                 " INPUT "
             } else {
@@ -1718,9 +1728,14 @@ fn status_bar(app: &App) -> Paragraph<'_> {
             (Mode::Search, ..) if app.masked_input => {
                 "· Enter send · Esc cancel · typing is hidden"
             }
-            (Mode::Search, ..) if app.cert_for.is_some() => {
-                "· Enter mints the identity · Esc cancel"
+            (Mode::Search, ..)
+                if app.prompt.as_ref().is_some_and(|p| {
+                    matches!(p.purpose, crate::prompt::Purpose::IdentityName { .. })
+                }) =>
+            {
+                "· Enter creates the identity · Esc cancel"
             }
+            (Mode::Search, ..) if app.prompt.is_some() => "· Enter set · Esc cancel",
             (Mode::Search, ..) if matches!(app.search_target, Some(Link::Form { .. })) => {
                 "· Enter set · Esc cancel"
             }

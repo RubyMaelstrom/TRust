@@ -8,11 +8,15 @@
 use crate::doc::Link;
 use std::fmt;
 
+pub mod credentials;
+mod md5;
+mod mime;
 mod view;
 mod wire;
+pub use mime::Attachment;
 pub use view::hanging_indent;
 pub use view::{Action, Page, SavedView, Section, render};
-pub use wire::{Definition, Entry, Reply, fetch, fetch_updates};
+pub use wire::{Auth, Definition, Entry, Reply, fetch, fetch_updates};
 
 pub const DEFAULT_SERVER: &str = "dict.org";
 pub const USAGE: &str =
@@ -36,6 +40,9 @@ pub struct Target {
     pub strategy: String,
     pub number: Option<usize>,
     pub operation: Operation,
+    /// §5 `<user>;AUTH@`: authenticate as this user (§3.11). Lookups on a
+    /// server with saved credentials authenticate without it.
+    pub user: Option<String>,
 }
 
 impl Target {
@@ -78,9 +85,33 @@ impl Target {
         if url.scheme() != "dict" || url.query().is_some() {
             return Err("Invalid DICT address.".into());
         }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err("Authenticated DICT addresses are not supported.".into());
+        // §5: "clear text passwords are not permitted in the URL".
+        if url.password().is_some() {
+            return Err(
+                "DICT addresses never carry passwords; TRust asks for the shared secret.".into(),
+            );
         }
+        let user = if url.username().is_empty() {
+            None
+        } else {
+            let userinfo = decode(url.username())?;
+            let (user, auth) = userinfo
+                .split_once(';')
+                .ok_or("A DICT address names a user as user;AUTH@server.")?;
+            if auth.eq_ignore_ascii_case("AUTH") {
+                Some(credentials::validate_user(user)?)
+            } else if auth
+                .get(..9)
+                .is_some_and(|s| s.eq_ignore_ascii_case("SASLAUTH="))
+            {
+                return Err(
+                    "SASL authentication (RFC 2229 §3.12) is not available; use user;AUTH@server."
+                        .into(),
+                );
+            } else {
+                return Err("Unknown DICT authentication; use user;AUTH@server.".into());
+            }
+        };
         let host = match url.host().ok_or("Missing dictionary server.")? {
             url::Host::Ipv6(ip) => ip.to_string(),
             url::Host::Ipv4(ip) => ip.to_string(),
@@ -155,6 +186,7 @@ impl Target {
             },
             number,
             operation,
+            user,
         };
         target.command()?;
         Ok(target)
@@ -245,7 +277,10 @@ impl fmt::Display for Target {
         }
         write!(
             f,
-            "dict://{}/{}:{}:{}",
+            "dict://{}{}/{}:{}:{}",
+            self.user
+                .as_ref()
+                .map_or_else(String::new, |user| format!("{};AUTH@", encode(user))),
             self.server(),
             if self.operation == Operation::Match {
                 "m"
@@ -401,6 +436,56 @@ pub(crate) fn remember(target: &Target, database: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// What `dict-auth` asks for.
+pub enum AuthCommand {
+    Prompt(Box<crate::prompt::Prompt>),
+    Forgot(String),
+}
+
+pub const AUTH_USAGE: &str =
+    "usage: dict-auth [server[:port]] [user] · dict-auth --forget [server[:port]]";
+
+/// `dict-auth [server] [user]` saves RFC 2229 §3.11 AUTH credentials (the
+/// secret is asked for, never typed on the command line); `--forget`
+/// removes them. The server defaults to the current DICT page's.
+pub fn auth_command(arguments: &str, current: Option<&Target>) -> Result<AuthCommand, String> {
+    let words = crate::command::word_arguments(arguments)?;
+    let (forget, words): (bool, Vec<String>) = match words.split_first() {
+        Some((first, rest)) if first == "--forget" => (true, rest.to_vec()),
+        _ => (false, words),
+    };
+    if words.len() > 2 || (forget && words.len() > 1) {
+        return Err(AUTH_USAGE.into());
+    }
+    let server = match words.first() {
+        Some(server) => {
+            if server.contains(['/', '?', '#', '@']) {
+                return Err("Use a dictionary server name or [IPv6]:port.".into());
+            }
+            Target::parse(&format!("dict://{server}/d:"))?.server()
+        }
+        None => current
+            .map(Target::server)
+            .unwrap_or_else(|| DEFAULT_SERVER.into()),
+    };
+    if forget {
+        return Ok(AuthCommand::Forgot(if credentials::forget(&server)? {
+            format!("Forgot the DICT credentials for {server}.")
+        } else {
+            format!("No DICT credentials are saved for {server}.")
+        }));
+    }
+    Ok(AuthCommand::Prompt(Box::new(match words.get(1) {
+        Some(user) => {
+            crate::prompt::Prompt::dict_secret(&server, &credentials::validate_user(user)?)
+        }
+        None => {
+            let saved = credentials::lookup(&server).map(|c| c.user);
+            crate::prompt::Prompt::dict_user(&server, saved.as_deref())
+        }
+    })))
+}
+
 pub fn command_seed(target: &Target) -> String {
     format!(
         "dict --server {} --database {} ",
@@ -483,6 +568,21 @@ mod tests {
             assert_eq!(Target::parse(&target.to_string()).unwrap(), target);
         }
         assert_eq!(Target::parse("dict://[::1]/d:x").unwrap().host, "::1");
+        // §5: a named AUTH user is kept, and only its name.
+        let target = Target::parse("dict://joe;AUTH@dict.org:2629/d:shortcake:wn").unwrap();
+        assert_eq!(target.user.as_deref(), Some("joe"));
+        assert_eq!(
+            target.to_string(),
+            "dict://joe;AUTH@dict.org:2629/d:shortcake:wn"
+        );
+        assert_eq!(Target::parse(&target.to_string()).unwrap(), target);
+        assert_eq!(
+            Target::parse("dict://Joe;auth@dict.org/d:x")
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("Joe")
+        );
         let target = Target::parse("dict://bücher.example/d:x").unwrap();
         assert_eq!(target.host, "xn--bcher-kva.example");
         for operation in [Operation::Databases, Operation::Strategies, Operation::Info] {
@@ -505,7 +605,10 @@ mod tests {
             "dict://dict.org/d:x:wn:1:ignored",
             "dict://dict.org/m:x:wn:prefix:-1",
             "dict://dict.org/d:x?query",
-            "dict://user;AUTH@dict.org/d:x",
+            "dict://user@dict.org/d:x",
+            "dict://user:secret@dict.org/d:x",
+            "dict://user;SASLAUTH=*@dict.org/d:x",
+            "dict://two%20words;AUTH@dict.org/d:x",
             "dict://dict.org:0/d:x",
         ] {
             assert!(Target::parse(input).is_err(), "{input}");
@@ -521,6 +624,42 @@ mod tests {
         assert!(target.command().is_ok());
         target.word = "\\".repeat(1011);
         assert!(target.command().is_err(), "count after escaping");
+    }
+
+    #[test]
+    fn dict_auth_command_asks_for_secrets_and_defaults_to_the_page_server() {
+        let current = Target::parse("dict://dict-auth-cmd.test:2629/d:x").unwrap();
+        let AuthCommand::Prompt(prompt) = auth_command("", Some(&current)).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            &prompt.purpose,
+            crate::prompt::Purpose::DictUser { server } if server == "dict-auth-cmd.test:2629"
+        ));
+        let crate::prompt::Outcome::Next(secret) = prompt.submit("joe").unwrap() else {
+            panic!()
+        };
+        assert!(secret.sensitive && secret.initial.is_empty());
+        assert!(secret.submit("a\nb").is_err());
+        let crate::prompt::Outcome::DictCredentials { server, .. } =
+            secret.submit("passphrase").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(credentials::lookup(&server).unwrap().user, "joe");
+        let AuthCommand::Prompt(prompt) =
+            auth_command("dict-auth-cmd.test:2629 ann", None).unwrap()
+        else {
+            panic!()
+        };
+        assert!(prompt.sensitive);
+        let AuthCommand::Forgot(status) = auth_command("--forget", Some(&current)).unwrap() else {
+            panic!()
+        };
+        assert!(status.starts_with("Forgot"));
+        assert!(credentials::lookup(&server).is_none());
+        assert!(auth_command("a b c", None).is_err());
+        assert!(auth_command("x/y", None).is_err());
     }
 
     #[test]

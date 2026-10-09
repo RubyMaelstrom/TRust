@@ -1223,8 +1223,10 @@ included here because they are part of TRust's `TRUST_*` environment surface.
 
 | Input | Value | Effect and default |
 |---|---|---|
-| `TRUST_KNOWN_HOSTS` | file path | Overrides the default `~/.config/trust/known_hosts` file used for TLS trust-on-first-use pins. |
-| `TRUST_IDENTITIES` | directory path | Overrides the default `~/.config/trust/identities` directory containing per-host client identity PEM files. |
+| `TRUST_KNOWN_HOSTS` | file path | Overrides the default `~/.config/trust/known_hosts` file used for Telnet TLS trust-on-first-use pins. |
+| `TRUST_GEMINI_KNOWN_HOSTS` | file path | Overrides the default `~/.config/trust/gemini_known_hosts` file of Gemini trust-on-first-use pins (fingerprint and expiry per host:port). |
+| `TRUST_IDENTITIES` | directory path | Overrides the default `~/.config/trust/identities` directory of Gemini client identity PEM files and their `.scopes` files. |
+| `TRUST_DICT_CREDENTIALS` | file path | Overrides the default `$XDG_CONFIG_HOME/trust/dict-credentials.json` file of DICT AUTH credentials. |
 
 ## Inputs that are not active controls
 

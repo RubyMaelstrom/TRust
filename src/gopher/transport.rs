@@ -103,7 +103,9 @@ async fn connect_before(url: &GopherUrl, deadline: Instant) -> Result<Connection
         runtime: Handle::current(),
     };
     // Complete TLS before sending any selector/query. An explicit gophers
-    // request never retries as plaintext after a failed handshake.
+    // request never retries as plaintext after a failed handshake. A form's
+    // answers are claimed only now, so a failed connection can be retried.
+    url.claim_request()?;
     timeout(CONNECT_TIMEOUT, async {
         connection.write_all(&request).await?;
         connection.flush().await

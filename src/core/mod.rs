@@ -433,6 +433,9 @@ impl HistoryEntry {
     }
 }
 
+/// The file-picker request id reserved for a Gopher+ form's `ChooseF:`.
+const ASK_FILE_REQUEST: u64 = u64::MAX;
+
 /// Raw protocol result retained by the shared controller. HTTP responses feed
 /// the canonical DOM/CSS-pixel graphical layout path; the other protocol
 /// presentation models can be added without changing navigation or wakeups.
@@ -692,7 +695,12 @@ pub struct BrowserController {
     pending_file_pickers: VecDeque<crate::js::FilePickerRequest>,
     external_media: VecDeque<(url::Url, Option<url::Url>)>,
     download_offer: Option<crate::download::DownloadOffer>,
-    gemini_prompt: Option<crate::gemini::Prompt>,
+    prompt: Option<crate::prompt::Prompt>,
+    /// The Gopher+ form file question awaiting the frontend's file picker:
+    /// (document generation, question).
+    ask_file: Option<(u64, usize)>,
+    /// A DICT lookup waiting for the user to supply its AUTH secret.
+    pending_dict: Option<crate::dict::Target>,
     storage: crate::js::WebStorage,
     external_address: Option<String>,
     generation: u64,
@@ -777,7 +785,9 @@ impl BrowserController {
             pending_clipboard_writes: VecDeque::new(),
             external_media: VecDeque::new(),
             download_offer: None,
-            gemini_prompt: None,
+            prompt: None,
+            ask_file: None,
+            pending_dict: None,
             storage: crate::site_storage::web_storage(),
             external_address: None,
             generation: 0,
@@ -800,25 +810,269 @@ impl BrowserController {
         }
     }
 
-    pub fn gemini_prompt(&self) -> Option<&crate::gemini::Prompt> {
-        self.gemini_prompt.as_ref()
+    /// The one-line input the frontend should collect in its command editor.
+    pub fn prompt(&self) -> Option<&crate::prompt::Prompt> {
+        self.prompt.as_ref()
     }
-    pub fn cancel_gemini_prompt(&mut self) {
-        self.gemini_prompt = None;
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+        self.pending_dict = None;
     }
-    pub fn submit_gemini_prompt(&mut self, text: &str) -> bool {
-        let Some(prompt) = self.gemini_prompt.take() else {
+    pub fn submit_prompt(&mut self, text: &str) -> bool {
+        use crate::prompt::Outcome;
+        let Some(prompt) = self.prompt.take() else {
             return false;
         };
         match prompt.submit(text) {
-            Ok(url) => self.begin_fetch(Link::Gemini(url), false, NavigationIntent::New),
+            Ok(Outcome::Navigate(link)) => {
+                // A new identity's retry replaces the page that asked for it.
+                let intent =
+                    if matches!(prompt.purpose, crate::prompt::Purpose::IdentityName { .. }) {
+                        NavigationIntent::Replace
+                    } else {
+                        NavigationIntent::New
+                    };
+                self.begin_fetch(link, false, intent);
+            }
+            Ok(Outcome::Next(next)) => {
+                self.status = next.label();
+                self.prompt = Some(next);
+            }
+            Ok(Outcome::Answer {
+                item,
+                control,
+                line,
+                text,
+            }) => match self.with_ask_form(&item, |form| form.set_text(control, line, &text)) {
+                Ok(()) => self.status = String::from("Answer set."),
+                Err(error) => {
+                    self.status = error;
+                    self.prompt = Some(prompt);
+                }
+            },
+            Ok(Outcome::DictCredentials { server, status }) => {
+                self.status = status;
+                if let Some(target) = self
+                    .pending_dict
+                    .take()
+                    .filter(|target| target.server() == server)
+                {
+                    self.begin_fetch(Link::Dict(target), false, NavigationIntent::New);
+                } else if let Some(page) = &self.current
+                    && let FetchedDocument::Dict(dict) = &page.document
+                    && dict.target.server() == server
+                {
+                    let target = page.target.clone();
+                    self.begin_fetch(target, false, NavigationIntent::Reload);
+                }
+            }
             Err(error) => {
                 self.status = error;
-                self.gemini_prompt = Some(prompt);
+                self.prompt = Some(prompt);
             }
         }
         self.invalidation.request_redraw();
         true
+    }
+
+    /// Change the current page's Gopher+ form, provided it is still `item`.
+    fn with_ask_form<T>(
+        &mut self,
+        item: &gopher::GopherUrl,
+        edit: impl FnOnce(&mut gopher::AskForm) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let page = self
+            .current
+            .as_mut()
+            .ok_or("The Gopher+ form is no longer open.")?;
+        let FetchedDocument::Gopher(gopher) = &mut page.document else {
+            return Err("The Gopher+ form is no longer open.".into());
+        };
+        let form = gopher
+            .view
+            .ask
+            .as_deref_mut()
+            .filter(|form| form.item() == item)
+            .ok_or("The Gopher+ form is no longer open.")?;
+        let result = edit(form)?;
+        page.revision = page.revision.wrapping_add(1);
+        Ok(result)
+    }
+
+    /// UMN Gopher+ §2.8: act on one of the current form's controls. Only the
+    /// form's own page honors these links.
+    fn ask_action(&mut self, action: gopher::AskAction) -> bool {
+        use gopher::AskAction;
+        let Some(page) = &self.current else {
+            return false;
+        };
+        let (FetchedDocument::Gopher(gopher), Link::Gopher(target)) =
+            (&page.document, &page.target)
+        else {
+            return false;
+        };
+        let Some(form) = gopher
+            .view
+            .ask
+            .as_deref()
+            .filter(|form| form.item() == target)
+        else {
+            return false;
+        };
+        let item = form.item().clone();
+        match action {
+            AskAction::Edit(_) | AskAction::EditLine(..) | AskAction::AddLine(_) => {
+                match form.edit_for(action, gopher.view.encoding) {
+                    Some(edit) => {
+                        let prompt = crate::prompt::Prompt::gopher_answer(&item, edit);
+                        self.status = prompt.label();
+                        self.prompt = Some(prompt);
+                    }
+                    None => self.status = String::from("This question cannot be edited."),
+                }
+            }
+            AskAction::File(control) => {
+                if !form.accepts_file(control) {
+                    self.status = String::from("This file question is not part of the form.");
+                } else if !self.file_picker_available {
+                    self.status = String::from("Choosing files is not available here.");
+                } else {
+                    self.ask_file = Some((self.document_generation, control));
+                    self.pending_file_pickers
+                        .push_back(crate::js::FilePickerRequest {
+                            request: ASK_FILE_REQUEST,
+                            accept: String::new(),
+                            multiple: false,
+                            directory: false,
+                        });
+                }
+            }
+            AskAction::Submit => self.submit_ask(),
+            other => {
+                if let Err(error) = self.with_ask_form(&item, |form| form.apply(other)) {
+                    self.status = error;
+                }
+            }
+        }
+        self.invalidation.request_redraw();
+        true
+    }
+
+    fn submit_ask(&mut self) {
+        let Some(page) = &mut self.current else {
+            return;
+        };
+        let FetchedDocument::Gopher(gopher) = &mut page.document else {
+            return;
+        };
+        let encoding = gopher.view.encoding;
+        let Some(form) = gopher.view.ask.as_deref_mut() else {
+            return;
+        };
+        let submission = match form.submission(encoding) {
+            Ok(submission) => submission,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        // The page goes into history; a typed password must not.
+        form.clear_secrets();
+        page.revision = page.revision.wrapping_add(1);
+        if submission.save_as.is_some() || submission.url.is_download() {
+            match crate::download::DownloadOffer::from_gopher_submission(&submission) {
+                Ok(offer) => {
+                    self.status = format!("Gopher+ form reply · {}", offer.summary());
+                    self.download_offer = Some(offer);
+                }
+                Err(error) => self.status = error,
+            }
+            return;
+        }
+        self.begin_page_fetch(Link::Gopher(submission.url), false, NavigationIntent::New);
+    }
+
+    fn security_action(&mut self, action: gemini::security::Action) -> bool {
+        use gemini::security::{Context, Outcome};
+        let address = self
+            .current
+            .as_ref()
+            .map_or_else(|| Link::External(String::new()), |page| page.target.clone());
+        let security = match self.current.as_ref().map(|page| &page.document) {
+            Some(FetchedDocument::Gemini(response)) => response.view.security.clone(),
+            _ => None,
+        };
+        match gemini::security::apply(
+            &action,
+            &Context {
+                address: &address,
+                security: security.as_ref(),
+            },
+        ) {
+            Ok(Outcome::Navigate(link)) => self.begin_fetch(link, false, NavigationIntent::Replace),
+            Ok(Outcome::Scope(index)) => {
+                if let Some(page) = &mut self.current
+                    && let FetchedDocument::Gemini(response) = &mut page.document
+                    && let Some(security) = response.view.security.as_mut()
+                    && gemini::security::choose_scope(security, index)
+                {
+                    page.revision = page.revision.wrapping_add(1);
+                }
+            }
+            Ok(Outcome::Prompt(prompt)) => {
+                self.status = prompt.label();
+                self.prompt = Some(prompt);
+            }
+            Ok(Outcome::Manager(address)) => self.open_certificates(&address),
+            Err(error) => self.status = error,
+        }
+        self.invalidation.request_redraw();
+        true
+    }
+
+    /// The `identity` command for the current page (see
+    /// `gemini::security::identity_command`).
+    pub fn identity_command(&mut self, arguments: &str) {
+        let current = match self.current.as_ref().map(|page| &page.target) {
+            Some(Link::Gemini(url)) => Some(url.clone()),
+            _ => None,
+        };
+        match gemini::security::identity_command(arguments, current.as_ref()) {
+            Ok(result) => {
+                if result.reload
+                    && let Some(page) = &self.current
+                {
+                    let target = page.target.clone();
+                    self.begin_fetch(target, false, NavigationIntent::Reload);
+                }
+                self.status = result.status;
+            }
+            Err(error) => self.status = error,
+        }
+        self.invalidation.request_redraw();
+    }
+
+    /// `dict-auth`: RFC 2229 §3.11 credentials for a DICT server.
+    pub fn dict_auth_command(&mut self, arguments: &str) {
+        let current = match self.current.as_ref().map(|page| &page.document) {
+            Some(FetchedDocument::Dict(dict)) => Some(dict.target.clone()),
+            _ => None,
+        };
+        match crate::dict::auth_command(arguments, current.as_ref()) {
+            Ok(crate::dict::AuthCommand::Prompt(prompt)) => {
+                self.status = prompt.label();
+                self.prompt = Some(*prompt);
+            }
+            Ok(crate::dict::AuthCommand::Forgot(status)) => self.status = status,
+            Err(error) => self.status = error,
+        }
+        self.invalidation.request_redraw();
+    }
+
+    /// `about:certificates`: Gemini identities, their scopes, and pins.
+    pub fn open_certificates(&mut self, address: &str) {
+        let source = gemini::security::manager(address);
+        let _ = self.open_internal_gemtext(address.to_string(), source);
     }
 
     pub fn snapshot(&self) -> BrowserSnapshot {
@@ -1050,7 +1304,7 @@ impl BrowserController {
     }
 
     fn begin_internal_gemtext(&mut self, target: Link, source: Vec<u8>, intent: NavigationIntent) {
-        self.gemini_prompt = None;
+        self.prompt = None;
         self.download_offer = None;
         if let Some(task) = self.task.take() {
             task.abort();
@@ -1193,6 +1447,29 @@ impl BrowserController {
                 self.send_user(crate::js::PageCmd::ClipboardResult { request, ok });
                 false
             }
+            UserAction::FilePickerResult { request, files }
+                if request == ASK_FILE_REQUEST && self.ask_file.is_some() =>
+            {
+                let (generation, control) = self.ask_file.take().expect("checked above");
+                // Files chosen for a page the user has since left stay unused.
+                if let Some(path) = files.as_ref().and_then(|files| files.first())
+                    && generation == self.document_generation
+                {
+                    let item = match self.current.as_ref().map(|p| &p.document) {
+                        Some(FetchedDocument::Gopher(gopher)) => {
+                            gopher.view.ask.as_ref().map(|form| form.item().clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(item) = item {
+                        match self.with_ask_form(&item, |form| form.set_file(control, path)) {
+                            Ok(name) => self.status = format!("Selected {name}"),
+                            Err(error) => self.status = error,
+                        }
+                    }
+                }
+                true
+            }
             UserAction::FilePickerResult { request, files } => {
                 self.send_user(crate::js::PageCmd::FilePickerResult { request, files });
                 false
@@ -1253,10 +1530,7 @@ impl BrowserController {
             UserAction::Stop => self.stop_loading(),
             UserAction::Kill => self.stop(),
             UserAction::CloseRequest(modifiers) => {
-                if self.live_page.is_some()
-                    && self.pending.is_none()
-                    && self.gemini_prompt.is_none()
-                {
+                if self.live_page.is_some() && self.pending.is_none() && self.prompt.is_none() {
                     self.close_requests_in_flight = self.close_requests_in_flight.saturating_add(1);
                     self.send_user(crate::js::PageCmd::CloseRequest { modifiers });
                     false
@@ -1720,7 +1994,7 @@ impl BrowserController {
     fn begin_history_delta(&mut self, delta: i32) -> bool {
         let forward = delta > 0;
         let entry = crate::history::entry(&self.back, &self.forward, delta);
-        self.gemini_prompt = None;
+        self.prompt = None;
         let Some(entry) = entry.cloned() else {
             self.status = if forward {
                 String::from("Nothing forward in history.")
@@ -1801,7 +2075,29 @@ impl BrowserController {
             return;
         }
         self.pending_fragment = None;
-        self.gemini_prompt = None;
+        self.prompt = None;
+        // The certificate manager is regenerated, so it always shows the
+        // current identities and pins (also on reload).
+        if let Link::External(address) = &target
+            && (address == gemini::security::MANAGER
+                || address.starts_with(&format!("{}?", gemini::security::MANAGER)))
+        {
+            let source = gemini::security::manager(address).into_bytes();
+            self.begin_internal_gemtext(target, source, intent);
+            return;
+        }
+        // RFC 2229 §5: ask for a named AUTH user's secret before the lookup.
+        if let Link::Dict(dict) = &target
+            && let Some(user) = &dict.user
+            && crate::dict::credentials::needs_secret(dict)
+        {
+            let prompt = crate::prompt::Prompt::dict_secret(&dict.server(), user);
+            self.status = prompt.label();
+            self.prompt = Some(prompt);
+            self.pending_dict = Some(dict.clone());
+            self.invalidation.request_redraw();
+            return;
+        }
         let target = if intent == NavigationIntent::Reload
             && let Some(page) = &self.current
             && let FetchedDocument::Rdap(rdap) = &page.document
@@ -1820,7 +2116,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        self.gemini_prompt = None;
+        self.prompt = None;
         self.retire_query("Incomplete reply: request replaced");
         self.abort_declarative_refresh();
         self.drop_live_page();
@@ -2029,7 +2325,7 @@ impl BrowserController {
             if let Some(task) = self.task.take() {
                 task.abort();
             }
-            self.gemini_prompt = None;
+            self.prompt = None;
             self.retire_query("Incomplete reply: request replaced");
             self.render_is_final = self.live_page.is_none();
             // Ignore a completion already queued by the superseded fetch.
@@ -2403,12 +2699,12 @@ impl BrowserController {
             self.download_offer = Some(offer);
             return true;
         }
-        if let Some(prompt) = gemini::Prompt::from_response(&response) {
+        if let Some(prompt) = crate::prompt::Prompt::gemini_input(&response) {
             self.pending = None;
             self.task = None;
             self.render_is_final = true;
             self.status = prompt.label();
-            self.gemini_prompt = Some(prompt);
+            self.prompt = Some(prompt);
             return true;
         }
         pending.target = Link::Gemini(response.url.public_url());
@@ -2417,7 +2713,9 @@ impl BrowserController {
             && let Some(page) = &mut self.current
             && let FetchedDocument::Gemini(old) = &page.document
         {
+            let security = response.view.security.take();
             response.view = old.view.clone();
+            response.view.security = security;
             page.document = FetchedDocument::Gemini(Box::new(response));
             page.status = fetched_status(&page.target, &page.document);
             self.status = page.status.clone();
@@ -2428,7 +2726,9 @@ impl BrowserController {
                 && page.target == pending.target
                 && let FetchedDocument::Gemini(old) = &page.document
             {
+                let security = response.view.security.take();
                 response.view = old.view.clone();
+                response.view.security = security;
             }
             let task = self.task.take();
             let scroll = self.interaction.scroll;
@@ -2462,17 +2762,26 @@ impl BrowserController {
             && let FetchedDocument::Gopher(finger) = &mut page.document
         {
             finger.reply = reply;
+            if let Link::Gopher(url) = &page.target {
+                gopher::prepare_form(url, finger);
+            }
             page.status = fetched_status(&page.target, &page.document);
             self.status = page.status.clone();
             page.revision = page.revision.wrapping_add(1);
         } else {
-            let mut finger = crate::gopher::Page::new(reply);
+            let mut finger = match &pending.target {
+                Link::Gopher(url) => crate::gopher::Page::for_url(url, reply),
+                _ => crate::gopher::Page::new(reply),
+            };
             if pending.intent == NavigationIntent::Reload
                 && let Some(old) = &self.current
                 && old.target == pending.target
                 && let FetchedDocument::Gopher(old) = &old.document
             {
+                let form_reply = finger.view.form_reply;
                 finger.view = old.view.clone();
+                // Reloading a form's reply fetches the form again.
+                finger.view.form_reply = form_reply;
             }
             // Commit history once, at the first published chunk. Later chunks
             // update that document while the same cancellable task stays live.
@@ -2560,6 +2869,14 @@ impl BrowserController {
                 }
                 if let FetchedDocument::Gemini(response) = &document {
                     pending.target = Link::Gemini(response.url.public_url());
+                }
+                // UMN Gopher+ §2.8: history and the address keep a form's
+                // reply at the form, never with its answers.
+                if let Link::Gopher(url) = &pending.target {
+                    if let FetchedDocument::Gopher(page) = &mut document {
+                        gopher::prepare_form(url, page);
+                    }
+                    pending.target = Link::Gopher(url.public());
                 }
                 if let FetchedDocument::Dict(dict) = &mut document {
                     let entry = match pending.intent {
@@ -2666,7 +2983,7 @@ impl BrowserController {
     }
 
     fn stop(&mut self) -> bool {
-        if self.gemini_prompt.take().is_some() {
+        if self.prompt.take().is_some() {
             self.status = "Gemini input cancelled".into();
             return true;
         }
@@ -2699,7 +3016,7 @@ impl BrowserController {
     /// [`Self::stop`], a resident page and its scripts keep running. This is
     /// also the alternative processing of an unconsumed close request.
     fn stop_loading(&mut self) -> bool {
-        if self.gemini_prompt.take().is_some() {
+        if self.prompt.take().is_some() {
             self.status = "Gemini input cancelled".into();
             return true;
         }
@@ -2928,9 +3245,41 @@ impl BrowserController {
     }
 
     fn activate(&mut self, link: Link) -> bool {
+        if let Some(action) = gopher::AskAction::from_link(&link)
+            && self.ask_action(action)
+        {
+            return true;
+        }
+        if let Some(action) = gemini::security::Action::from_link(&link) {
+            return self.security_action(action);
+        }
+        if matches!(&link, Link::External(address) if address == gemini::security::MANAGER) {
+            self.open_certificates(gemini::security::MANAGER);
+            return true;
+        }
         if let Some(action) = crate::dict::Action::from_link(&link) {
             if action == crate::dict::Action::Save {
                 return self.offer_whois_export(None);
+            }
+            if let Some(FetchedDocument::Dict(dict)) = self.current.as_ref().map(|p| &p.document) {
+                if action == crate::dict::Action::SignIn {
+                    let prompt = dict.sign_in_prompt();
+                    self.status = prompt.label();
+                    self.prompt = Some(prompt);
+                    self.invalidation.request_redraw();
+                    return true;
+                }
+                if let crate::dict::Action::Attachment(index) = action {
+                    match dict.attachment_offer(index) {
+                        Some(offer) => {
+                            self.status = format!("DICT attachment · {}", offer.summary());
+                            self.download_offer = Some(offer);
+                        }
+                        None => self.status = String::from("That attachment is not on this page."),
+                    }
+                    self.invalidation.request_redraw();
+                    return true;
+                }
             }
             let Some(page) = &mut self.current else {
                 return false;
@@ -3751,6 +4100,7 @@ pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
                 item_type: '1',
                 query: None,
                 gopher_plus: None,
+                ask: None,
                 selector: Vec::new(),
             }),
             false,
@@ -4200,6 +4550,85 @@ mod tests {
                 "returning to the menu must not refetch it"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn gopher_plus_forms_are_answered_with_prompts_and_submitted_once() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n.\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"+-1\r\niThanks for voting\tx\tx\t0\r\n.\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let item = gopher::GopherUrl::new("127.0.0.1".into(), port, '1', b"/vote".to_vec())
+            .with_plus(b"?");
+        let mut browser = BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            CssSize::new(800.0, 600.0),
+        );
+        browser.pending = Some(PendingNavigation {
+            generation: 0,
+            target: Link::Gopher(item.clone()),
+            fallback_http: false,
+            intent: NavigationIntent::New,
+        });
+        let body = b"+INFO: 1Vote\t/vote\t127.0.0.1\t70\t?\r\n+ASK:\r\n Ask: Name\r\n AskP: PIN\r\n Choose: Colour\tred\tblue\r\n";
+        assert!(browser.finish_fetch(0, Ok(FetchedDocument::Gopher(body.to_vec().into()))));
+        let rendered = crate::render::documents::document(browser.current_page().unwrap()).unwrap();
+        assert!(rendered.lines.iter().any(|l| l.text == "Name: []"));
+        // Text answers go through the shared prompt; the PIN is masked and
+        // never prefilled.
+        browser.handle_action(UserAction::Activate(gopher::AskAction::Edit(0).link()));
+        assert_eq!(browser.prompt().unwrap().tag(), "GOPHER:FORM");
+        browser.submit_prompt("Ruby");
+        browser.handle_action(UserAction::Activate(gopher::AskAction::Edit(1).link()));
+        assert!(browser.prompt().unwrap().sensitive);
+        browser.submit_prompt("1234");
+        browser.handle_action(UserAction::Activate(gopher::AskAction::Choose(2, 1).link()));
+        let rendered = crate::render::documents::document(browser.current_page().unwrap()).unwrap();
+        assert!(rendered.lines.iter().any(|l| l.text == "Name: [Ruby]"));
+        assert!(rendered.lines.iter().any(|l| l.text == "PIN: [••••]"));
+        browser.handle_action(UserAction::Activate(gopher::AskAction::Submit.link()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            browser.task.take().expect("submission started"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        browser.process_async_events();
+        assert_eq!(
+            server.await.unwrap(),
+            b"/vote\t+\t1\r\n+-1\r\nRuby\r\n1234\r\nblue\r\n.\r\n"
+        );
+        // The reply is shown at the form's address; the answers never enter
+        // the address, history or a debug dump.
+        let page = browser.current_page().unwrap();
+        assert_eq!(page.target(), &Link::Gopher(item.clone()));
+        let rendered = crate::render::documents::document(page).unwrap();
+        assert_eq!(rendered.lines[0].text, "Thanks for voting");
+        assert!(!format!("{:?}", browser.back).contains("1234"));
+        // Back restores the form with its answers, but not the PIN.
+        browser.handle_action(UserAction::Back);
+        let page = browser.current_page().unwrap();
+        let FetchedDocument::Gopher(form_page) = &page.document else {
+            panic!()
+        };
+        let form = form_page.view.ask.as_ref().unwrap();
+        let resubmission = form.submission(gopher::Encoding::Auto).unwrap();
+        let request = resubmission.url.request().unwrap();
+        assert!(request.windows(4).any(|w| w == b"Ruby"));
+        assert!(!request.windows(4).any(|w| w == b"1234"));
     }
 
     #[tokio::test]
@@ -5826,6 +6255,7 @@ mod tests {
                 item_type: '1',
                 query: None,
                 gopher_plus: None,
+                ask: None,
                 selector: Vec::new(),
             })
         };
@@ -5957,8 +6387,8 @@ mod tests {
             browser.generation,
             gemini::Response::new(original.clone(), 11, "Password".into()),
         );
-        assert!(browser.gemini_prompt().unwrap().sensitive);
-        browser.submit_gemini_prompt("private value");
+        assert!(browser.prompt().unwrap().sensitive);
+        browser.submit_prompt("private value");
         browser.task.take().unwrap().abort();
         assert!(!browser.snapshot().address.contains("private"));
         let secret = original.with_input("private value", true).unwrap();
@@ -5966,7 +6396,7 @@ mod tests {
             browser.generation,
             gemini::Response::new(secret, 51, "Not found".into()),
         );
-        assert!(browser.gemini_prompt().is_none());
+        assert!(browser.prompt().is_none());
         let doc = crate::render::documents::document(browser.current_page().unwrap()).unwrap();
         assert_eq!(doc.lines[0].text, "Not found");
         assert!(!browser.snapshot().address.contains('?'));
@@ -6024,6 +6454,7 @@ mod tests {
                 item_type: '1',
                 query: None,
                 gopher_plus: None,
+                ask: None,
                 selector: Vec::new(),
             })
         };
@@ -6362,6 +6793,9 @@ mod dict_tests {
                 description: db.into(),
                 body: std::sync::Arc::new(format!("{db} definition\n")),
                 complete: true,
+                content_type: None,
+                attachments: Vec::new(),
+                skipped: Vec::new(),
             });
         }
         reply

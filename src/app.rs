@@ -25,7 +25,6 @@ use crate::http;
 use crate::img;
 use crate::oneshot;
 use crate::telnet;
-use crate::tls;
 use crate::ui;
 
 const RESIZE_WRAP_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -863,9 +862,14 @@ pub struct App {
     /// in place of the typed text. Set by EVERY site that enters
     /// `Mode::Search` — it is only read while that mode is active.
     pub(crate) masked_input: bool,
-    /// A capsule that answered status 60: the prompt is asking for a
-    /// name to mint a client identity under.
-    pub(crate) cert_for: Option<GeminiUrl>,
+    /// A shared one-line prompt (Gemini identity name, Gopher+ ASK answer,
+    /// DICT credentials) while `mode == Mode::Search`.
+    pub(crate) prompt: Option<crate::prompt::Prompt>,
+    /// The Gopher+ `ChooseF:` question the file chooser is answering:
+    /// (document generation, question).
+    ask_file: Option<(u64, usize)>,
+    /// A DICT lookup waiting for the user to supply its AUTH secret.
+    pending_dict: Option<crate::dict::Target>,
     /// An open `<select>` dropdown, modal over the browser: it captures
     /// keys/mouse until the user picks an option or cancels.
     pub(crate) select_menu: Option<SelectMenu>,
@@ -1083,7 +1087,9 @@ impl App {
             enc_epoch: 0,
             search_target: None,
             masked_input: false,
-            cert_for: None,
+            prompt: None,
+            ask_file: None,
+            pending_dict: None,
             select_menu: None,
             file_picker: None,
             pending_file_pickers: std::collections::VecDeque::new(),
@@ -1769,15 +1775,29 @@ impl App {
     fn clear_gemini_input(&mut self) {
         if self.masked_input
             || matches!(self.search_target, Some(Link::Gemini(_)))
-            || self.cert_for.is_some()
+            || self.prompt.is_some()
         {
             self.input.clear();
             self.cursor = 0;
             self.select_anchor = None;
             self.search_target = None;
-            self.cert_for = None;
+            self.prompt = None;
+            self.pending_dict = None;
             self.masked_input = false;
         }
+    }
+
+    /// Collect one line for a shared prompt in the Search editor.
+    fn open_prompt(&mut self, prompt: crate::prompt::Prompt) {
+        self.clear_gemini_input();
+        self.input = prompt.initial.clone();
+        self.cursor = self.input.chars().count();
+        self.select_anchor = None;
+        self.masked_input = prompt.sensitive;
+        self.status = prompt.label();
+        self.notice = true;
+        self.prompt = Some(prompt);
+        self.mode = Mode::Search;
     }
 
     fn open_command(&mut self) {
@@ -1799,7 +1819,7 @@ impl App {
         // transfer already moved into background ownership.
         self.file_dialog = None;
         self.mode = Mode::Command;
-        self.cert_for = None;
+        self.prompt = None;
         self.select_menu = None;
     }
 
@@ -1847,7 +1867,7 @@ impl App {
         } else {
             self.open_command();
         }
-        self.cert_for = None;
+        self.prompt = None;
         self.select_menu = None;
     }
 
@@ -2198,7 +2218,8 @@ impl App {
                 self.select_anchor = None;
                 self.restore_terminal_draft();
                 self.search_target = None;
-                self.cert_for = None;
+                self.prompt = None;
+                self.pending_dict = None;
             }
             // Esc in a line-mode session opens command mode, like
             // Ctrl-]. (Char-mode sessions never reach here — their Esc
@@ -3142,6 +3163,49 @@ impl App {
                     .map_or("", |(_, s)| s);
                 self.dict_filter(filter);
             }
+            Some("certificates" | "identities") => self.open_about("certificates"),
+            Some("dict-auth") => {
+                let arguments = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                let current = self
+                    .browser
+                    .as_ref()
+                    .and_then(|g| g.doc.dict.as_ref())
+                    .map(|p| p.target.clone());
+                match crate::dict::auth_command(arguments, current.as_ref()) {
+                    Ok(crate::dict::AuthCommand::Prompt(prompt)) => self.open_prompt(*prompt),
+                    Ok(crate::dict::AuthCommand::Forgot(status)) => {
+                        self.status = status;
+                        self.notice = true;
+                    }
+                    Err(error) => {
+                        self.status = error;
+                        self.notice = true;
+                    }
+                }
+            }
+            Some("identity") => {
+                let current = match self.browser.as_ref().map(|g| &g.doc.url) {
+                    Some(Link::Gemini(url)) => Some(url.clone()),
+                    _ => None,
+                };
+                let arguments = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                match gemini::security::identity_command(arguments, current.as_ref()) {
+                    Ok(result) => {
+                        if result.reload {
+                            self.reload();
+                        }
+                        self.status = result.status;
+                    }
+                    Err(error) => self.status = error,
+                }
+                self.notice = true;
+            }
             // A bare URL — or a bare hostname/IP — opens directly, as if
             // `open` had been typed (the address-bar habit). A schemeless
             // host with no port becomes https (falling back to http).
@@ -3353,6 +3417,10 @@ impl App {
         match page {
             "help" => Some(String::from(HELP_PAGE)),
             "gemini" => Some(String::from(gemini::HELP)),
+            "certificates" => Some(gemini::security::manager(gemini::security::MANAGER)),
+            _ if page.starts_with("certificates?delete=") => {
+                Some(gemini::security::manager(&format!("about:{page}")))
+            }
             "status" => Some(format!("# TRust status\n\n{}\n", self.status_report())),
             _ => None,
         }
@@ -3515,6 +3583,7 @@ impl App {
                     item_type: '1',
                     query: None,
                     gopher_plus: None,
+                    ask: None,
                     selector: Vec::new(),
                 })),
                 Some(1965) => {
@@ -3667,6 +3736,18 @@ impl App {
         if matches!(&target, Link::External(address) if address == "about:bookmarks") {
             self.retire_fetch("Incomplete reply: bookmarks opened");
             self.bookmark_command("bookmarks");
+            return;
+        }
+        // RFC 2229 §5: "Whenever authentication is required, the client
+        // SHOULD request additional information (e.g., a passphrase)".
+        if let Link::Dict(dict) = &target
+            && let Some(user) = dict.user.clone()
+            && crate::dict::credentials::needs_secret(dict)
+        {
+            let prompt = crate::prompt::Prompt::dict_secret(&dict.server(), &user);
+            let pending = dict.clone();
+            self.open_prompt(prompt);
+            self.pending_dict = Some(pending);
             return;
         }
         if let Link::Gopher(url) = &target {
@@ -4956,7 +5037,7 @@ impl App {
                     self.status = error;
                     self.notice = true;
                 } else {
-                    self.open_image(Link::Gopher(url), reply.body);
+                    self.open_image(Link::Gopher(url.public()), reply.body);
                 }
             }
             return;
@@ -4974,6 +5055,8 @@ impl App {
             && let Some(view) = &g.doc.gopher
         {
             page.view = view.clone();
+            // Reloading a form's reply fetches the form again.
+            page.view.form_reply = url.has_answers();
         }
         let doc = gopher::render(&url, page, (self.last_inner.0 as usize).max(10));
         self.on_streamed_document(doc, finished);
@@ -5300,7 +5383,10 @@ impl App {
                     && (self.query_fetch_started || self.replace_nav)
                     && let Some(view) = &g.doc.gemini
                 {
+                    // Keep reading choices, never an earlier security page.
+                    let security = response.view.security.take();
                     response.view = view.clone();
+                    response.view.security = security;
                 }
                 let doc = response.document(width);
                 self.on_streamed_document(doc, response.finished);
@@ -5314,30 +5400,6 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
                 self.select_anchor = None;
-            }
-            _ if response.certificate_prompt() => {
-                self.clear_gemini_input();
-                let existing = tls::identity_path(&response.url.host).is_some_and(|p| p.exists());
-                self.input = if existing {
-                    String::new()
-                } else {
-                    std::env::var("USER").unwrap_or_default()
-                };
-                self.cursor = self.input.chars().count();
-                self.select_anchor = None;
-                self.cert_for = Some(response.url.clone());
-                self.masked_input = false;
-                self.mode = Mode::Search;
-                self.status = format!(
-                    "{} — {}. Enter {} for this path and its descendants.",
-                    response.url,
-                    response.meta,
-                    if existing {
-                        "authorizes the existing identity"
-                    } else {
-                        "creates and authorizes an identity with this name"
-                    }
-                );
             }
             _ => {
                 self.navigate_to(response.document(width));
@@ -8988,6 +9050,19 @@ impl App {
         if !self.allow_page_file_navigation(&link) {
             return;
         }
+        if let Some(action) = gopher::AskAction::from_link(&link)
+            && self.ask_action(action)
+        {
+            return;
+        }
+        if let Some(action) = gemini::security::Action::from_link(&link) {
+            self.security_action(action);
+            return;
+        }
+        if matches!(&link, Link::External(address) if address == gemini::security::MANAGER) {
+            self.open_about("certificates");
+            return;
+        }
         if let Some(action) = crate::dict::Action::from_link(&link) {
             let Some(g) = &mut self.browser else {
                 return;
@@ -9004,6 +9079,23 @@ impl App {
             }
             if action == crate::dict::Action::Save {
                 self.save_whois(None);
+                return;
+            }
+            if action == crate::dict::Action::SignIn {
+                let prompt = page.sign_in_prompt();
+                self.open_prompt(prompt);
+                return;
+            }
+            if let crate::dict::Action::Attachment(index) = action {
+                match page.attachment_offer(index) {
+                    Some(offer) => {
+                        self.status = format!("DICT attachment · {}", offer.summary());
+                        self.file_dialog = Some(FileDialog { offer, selected: 0 });
+                        self.mode = Mode::Session;
+                    }
+                    None => self.status = String::from("That attachment is not on this page."),
+                }
+                self.notice = true;
                 return;
             }
             match page.apply(&action) {
@@ -9365,7 +9457,27 @@ impl App {
         };
         self.notice = true;
         self.file_picker_dir = Some(picker.dir.clone());
-        if let Some((form, field, generation)) = self.file_picker_static.take() {
+        if let Some((generation, control)) = self.ask_file.take() {
+            // A file chosen for a page the user has since left stays unused.
+            if let Some(path) = files.as_ref().and_then(|files| files.first())
+                && generation == self.document_generation
+            {
+                let item = self.browser.as_ref().and_then(|g| {
+                    g.doc
+                        .gopher
+                        .as_ref()?
+                        .ask
+                        .as_ref()
+                        .map(|form| form.item().clone())
+                });
+                if let Some(item) = item {
+                    match self.with_ask_form(&item, |form| form.set_file(control, path)) {
+                        Ok(name) => self.status = format!("Selected {name}"),
+                        Err(error) => self.status = error,
+                    }
+                }
+            }
+        } else if let Some((form, field, generation)) = self.file_picker_static.take() {
             // Files chosen for a document the user has since left stay unused.
             if let Some(files) = files
                 && generation == self.document_generation
@@ -9969,24 +10081,221 @@ impl App {
         self.image_sizes.retain(|u, _| keep.contains(u.as_str()));
     }
 
-    /// Run a query the page asked for: gopher type-7 search (RFC 1436:
-    /// selector TAB query) or a gemini 1x input (percent-encoded ?query).
-    fn run_search(&mut self, query: &str) {
-        // A pending status-60 prompt: mint the identity, then retry
-        // the page that asked for it.
-        if let Some(url) = self.cert_for.take() {
-            let name = query.trim();
-            let name = if name.is_empty() { "anonymous" } else { name };
-            match tls::authorize_identity(&url, name) {
-                Ok(path) => {
-                    self.status = format!("Identity '{name}' saved to {}.", path.display());
-                    self.start_fetch(Link::Gemini(url));
+    fn submit_prompt(&mut self, prompt: crate::prompt::Prompt, text: &str) {
+        use crate::prompt::Outcome;
+        let reopen = |app: &mut Self, prompt: crate::prompt::Prompt, error: String| {
+            let sensitive = prompt.sensitive;
+            app.open_prompt(prompt);
+            // Keep what was typed, except a secret.
+            if !sensitive {
+                app.input = text.to_string();
+                app.cursor = app.input.chars().count();
+            }
+            app.status = error;
+            app.notice = true;
+        };
+        match prompt.submit(text) {
+            Ok(Outcome::Navigate(link)) => {
+                // A new identity's retry replaces the page that asked for it.
+                if matches!(prompt.purpose, crate::prompt::Purpose::IdentityName { .. }) {
+                    self.replace_nav = true;
                 }
-                Err(err) => {
-                    self.status = err;
+                self.start_fetch(link);
+            }
+            Ok(Outcome::Next(next)) => self.open_prompt(next),
+            Ok(Outcome::Answer {
+                item,
+                control,
+                line,
+                text: answer,
+            }) => match self.with_ask_form(&item, |form| form.set_text(control, line, &answer)) {
+                Ok(()) => self.status = String::from("Answer set."),
+                Err(error) => reopen(self, prompt, error),
+            },
+            Ok(Outcome::DictCredentials { server, status }) => {
+                self.status = status;
+                self.notice = true;
+                if let Some(target) = self
+                    .pending_dict
+                    .take()
+                    .filter(|target| target.server() == server)
+                {
+                    self.start_fetch(Link::Dict(target));
+                } else if let Some(g) = &self.browser
+                    && let Some(page) = &g.doc.dict
+                    && page.target.server() == server
+                {
+                    self.reload();
+                }
+            }
+            Err(error) => reopen(self, prompt, error),
+        }
+    }
+
+    /// Change the current page's Gopher+ form, provided it is still `item`;
+    /// the page re-renders with the answer.
+    fn with_ask_form<T>(
+        &mut self,
+        item: &GopherUrl,
+        edit: impl FnOnce(&mut gopher::AskForm) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let width = (self.last_inner.0 as usize).max(10);
+        let g = self
+            .browser
+            .as_mut()
+            .ok_or("The Gopher+ form is no longer open.")?;
+        let form = g
+            .doc
+            .gopher
+            .as_mut()
+            .and_then(|view| view.ask.as_deref_mut())
+            .filter(|form| form.item() == item)
+            .ok_or("The Gopher+ form is no longer open.")?;
+        let result = edit(form)?;
+        let selected = g.selected;
+        g.doc.rerender_reply(width);
+        g.selected = selected.filter(|row| *row < g.doc.lines.len());
+        Ok(result)
+    }
+
+    /// UMN Gopher+ §2.8: act on one of the current form's controls. Only the
+    /// form's own page honors these links.
+    fn ask_action(&mut self, action: gopher::AskAction) -> bool {
+        use gopher::AskAction;
+        let Some(g) = &self.browser else {
+            return false;
+        };
+        let Link::Gopher(target) = &g.doc.url else {
+            return false;
+        };
+        let Some(view) = &g.doc.gopher else {
+            return false;
+        };
+        let Some(form) = view.ask.as_deref().filter(|form| form.item() == target) else {
+            return false;
+        };
+        let item = form.item().clone();
+        match action {
+            AskAction::Edit(_) | AskAction::EditLine(..) | AskAction::AddLine(_) => {
+                match form.edit_for(action, view.encoding) {
+                    Some(edit) => {
+                        let prompt = crate::prompt::Prompt::gopher_answer(&item, edit);
+                        self.open_prompt(prompt);
+                    }
+                    None => self.status = String::from("This question cannot be edited."),
+                }
+            }
+            AskAction::File(control) => {
+                if form.accepts_file(control) {
+                    self.ask_file = Some((self.document_generation, control));
+                    self.open_file_picker(crate::js::FilePickerRequest {
+                        request: 0,
+                        accept: String::new(),
+                        multiple: false,
+                        directory: false,
+                    });
+                } else {
+                    self.status = String::from("This file question is not part of the form.");
+                }
+            }
+            AskAction::Submit => self.submit_ask(),
+            other => {
+                if let Err(error) = self.with_ask_form(&item, |form| form.apply(other)) {
+                    self.status = error;
                     self.notice = true;
                 }
             }
+        }
+        true
+    }
+
+    fn submit_ask(&mut self) {
+        let Some(g) = &mut self.browser else {
+            return;
+        };
+        let Some(view) = &mut g.doc.gopher else {
+            return;
+        };
+        let encoding = view.encoding;
+        let Some(form) = view.ask.as_deref_mut() else {
+            return;
+        };
+        let submission = match form.submission(encoding) {
+            Ok(submission) => submission,
+            Err(error) => {
+                self.status = error;
+                self.notice = true;
+                return;
+            }
+        };
+        // The form page goes into history; a typed password must not.
+        form.clear_secrets();
+        let width = (self.last_inner.0 as usize).max(10);
+        g.doc.rerender_reply(width);
+        if submission.save_as.is_some() || submission.url.is_download() {
+            match crate::download::DownloadOffer::from_gopher_submission(&submission) {
+                Ok(offer) => {
+                    self.status = format!(
+                        "Gopher+ form reply · {} · Save / Open / Cancel",
+                        offer.summary()
+                    );
+                    self.file_dialog = Some(FileDialog { offer, selected: 0 });
+                    self.mode = Mode::Session;
+                }
+                Err(error) => self.status = error,
+            }
+            self.notice = true;
+            return;
+        }
+        self.start_fetch(Link::Gopher(submission.url));
+    }
+
+    fn security_action(&mut self, action: gemini::security::Action) {
+        use gemini::security::{Context, Outcome};
+        let Some(g) = &self.browser else {
+            return;
+        };
+        let address = g.doc.url.clone();
+        let security = g.doc.gemini.as_ref().and_then(|view| view.security.clone());
+        match gemini::security::apply(
+            &action,
+            &Context {
+                address: &address,
+                security: security.as_ref(),
+            },
+        ) {
+            Ok(Outcome::Navigate(link)) => {
+                self.replace_nav = true;
+                self.start_fetch(link);
+            }
+            Ok(Outcome::Prompt(prompt)) => self.open_prompt(prompt),
+            Ok(Outcome::Scope(index)) => {
+                let width = (self.last_inner.0 as usize).max(10);
+                if let Some(g) = &mut self.browser
+                    && let Some(security) = g.doc.gemini.as_mut().and_then(|v| v.security.as_mut())
+                    && gemini::security::choose_scope(security, index)
+                {
+                    let selected = g.selected;
+                    g.doc.rerender_reply(width);
+                    g.selected = selected.filter(|row| *row < g.doc.lines.len());
+                }
+            }
+            Ok(Outcome::Manager(address)) => {
+                self.open_about(address.strip_prefix("about:").unwrap_or("certificates"));
+            }
+            Err(error) => {
+                self.status = error;
+                self.notice = true;
+            }
+        }
+    }
+
+    /// Run a query the page asked for: gopher type-7 search (RFC 1436:
+    /// selector TAB query) or a gemini 1x input (percent-encoded ?query).
+    fn run_search(&mut self, query: &str) {
+        if let Some(prompt) = self.prompt.take() {
+            self.masked_input = false;
+            self.submit_prompt(prompt, query);
             return;
         }
         match self.search_target.take() {
@@ -10580,7 +10889,7 @@ mod tests {
             referrer: None,
             fetch_body: false,
             gopher: None,
-            gemini: None,
+            transfer: None,
         }
     }
 
@@ -11376,6 +11685,7 @@ mod tests {
                         item_type: '1',
                         query: None,
                         gopher_plus: None,
+                        ask: None,
                         selector: format!("/{i}").into_bytes(),
                     })
                 }),
@@ -15440,6 +15750,8 @@ mod tests {
                 body: Vec::new(),
                 identity: false,
                 identity_configured: false,
+                identity_name: None,
+                tls12: false,
                 finished: true,
                 notice: None,
                 download: None,
@@ -15475,6 +15787,8 @@ mod tests {
                 body: Vec::new(),
                 identity: false,
                 identity_configured: false,
+                identity_name: None,
+                tls12: false,
                 finished: true,
                 notice: None,
                 download: None,
@@ -17208,6 +17522,7 @@ mod tests {
             item_type: 'p',
             query: None,
             gopher_plus: None,
+            ask: None,
             selector: b"/cat.png".to_vec(),
         }));
         app.navigate_to(doc);
@@ -17730,53 +18045,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_60_prompts_for_and_mints_an_identity() {
-        unsafe {
-            std::env::set_var(
-                "TRUST_IDENTITIES",
-                std::env::temp_dir().join(format!("trust-test-ids-{}", std::process::id())),
-            );
-        }
+    async fn gopher_plus_form_answers_toggles_and_submits_from_the_terminal() {
+        use crate::doc::Link;
+        use crate::gopher::{self, GopherUrl};
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 20);
+        app.mode = super::Mode::Session;
+        // Port 9 (discard) is closed locally: the submission fails fast.
+        let item = GopherUrl::new("127.0.0.1".into(), 9, '0', b"/form".to_vec()).with_plus(b"?");
+        let body = b"+INFO: 0Form\t/form\t127.0.0.1\t9\t?\r\n+ASK:\r\n Ask: Name\r\n Select: Subscribe:0\r\n AskL: Comments\r\n".to_vec();
+        app.navigate_to(gopher::render(&item, gopher::Page::from(body), 80));
+        let link = |action: gopher::AskAction| action.link();
+        app.browser_follow_link(link(gopher::AskAction::Edit(0)));
+        assert_eq!(app.mode, super::Mode::Search);
+        assert!(app.prompt.is_some());
+        app.mode = super::Mode::Session; // as Enter does
+        app.run_search("Ruby");
+        app.browser_follow_link(link(gopher::AskAction::Toggle(1)));
+        app.browser_follow_link(link(gopher::AskAction::AddLine(2)));
+        app.mode = super::Mode::Session;
+        app.run_search("first line");
+        let lines: Vec<String> = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        assert!(lines.contains(&"Name: [Ruby]".to_string()), "{lines:?}");
+        assert!(lines.contains(&"[x] Subscribe".to_string()));
+        assert!(lines.contains(&"  1│ first line".to_string()));
+        // A line break cannot be smuggled into an answer.
+        app.browser_follow_link(link(gopher::AskAction::Edit(0)));
+        app.mode = super::Mode::Session;
+        app.run_search("a\r\nb");
+        assert_eq!(app.mode, super::Mode::Search, "the prompt stays open");
+        app.prompt = None;
+        app.mode = super::Mode::Session;
+        app.browser_follow_link(link(gopher::AskAction::Submit));
+        assert!(
+            app.status
+                .starts_with("Fetching gopher://127.0.0.1:9/0/form"),
+            "{}",
+            app.status
+        );
+        // Spoofed actions on another page are ignored.
+        app.navigate_to(crate::doc::Doc::from_lines(
+            Link::Gopher(GopherUrl::new("127.0.0.1".into(), 9, '1', b"/".to_vec())),
+            Vec::new(),
+            Vec::new(),
+            80,
+            false,
+            None,
+        ));
+        app.browser_follow_link(link(gopher::AskAction::Edit(0)));
+        assert!(app.prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_60_offers_identities_and_names_a_new_one_only_when_asked() {
+        let _lock = crate::gemini::identity::test_lock();
         let mut app = super::App::new(None, 23);
         app.last_inner = (80, 10);
+        app.mode = super::Mode::Session;
         let url = crate::gemini::GeminiUrl::parse("gemini://astro.test/app").unwrap();
-        app.on_gemini_response(
-            crate::gemini::Response {
-                url: url.clone(),
-                status: 60,
-                meta: String::from("Certificate required"),
-                body: Vec::new(),
-                identity: false,
-                identity_configured: false,
-                finished: true,
-                notice: None,
-                download: None,
-                view: Default::default(),
-            },
-            80,
-        );
+        let mut response =
+            crate::gemini::Response::new(url.clone(), 60, "Certificate required".into());
+        response.view.security = Some(crate::gemini::security::Security::Certificate(Box::new(
+            crate::gemini::security::CertificateRequest::new(
+                &url,
+                60,
+                "Certificate required",
+                None,
+                false,
+                false,
+            ),
+        )));
+        app.on_gemini_response(response, 80);
+        // The page explains the request; nothing is created automatically.
+        assert_eq!(app.mode, super::Mode::Session);
+        let doc = &app.browser.as_ref().unwrap().doc;
+        assert!(doc.lines.iter().any(|l| l.text == "Certificate required"));
+        let new = crate::gemini::security::Action::NewIdentity.link();
+        assert!(doc.lines.iter().any(|l| l.link.as_ref() == Some(&new)));
 
-        // The amber prompt opens, prefilled with the system username.
+        // Choosing to create one asks for its name, which the capsule will
+        // see: never prefilled from the local account.
+        app.browser_follow_link(new.clone());
         assert_eq!(app.mode, super::Mode::Search);
-        assert_eq!(app.cert_for, Some(url));
-        assert_eq!(app.input, std::env::var("USER").unwrap_or_default());
-
-        // Naming it mints the file and retries the capsule.
+        assert!(app.input.is_empty());
+        assert!(matches!(
+            app.prompt.as_ref().unwrap().purpose,
+            crate::prompt::Purpose::IdentityName { .. }
+        ));
+        app.mode = super::Mode::Session; // as Enter does
         app.run_search("neon-ruby");
-        let path = crate::tls::identity_path("astro.test").unwrap();
-        let pem = std::fs::read_to_string(&path).expect("identity written");
-        assert!(pem.contains("BEGIN CERTIFICATE"));
-        assert!(app.cert_for.is_none());
+        assert!(app.prompt.is_none());
+        let created = crate::gemini::identity::select(&url)
+            .unwrap()
+            .expect("scoped identity");
+        assert_eq!(created.name, "neon-ruby");
         assert!(
             app.status.starts_with("Fetching gemini://astro.test"),
             "retries the page: {}",
             app.status
         );
+        crate::gemini::identity::delete(&created.fingerprint).unwrap();
 
-        // A second 60 for the same host (cert now exists but the
-        // server rejected it, say) must NOT offer to overwrite.
-        app.run_search("x"); // no pending prompt: routes nowhere
-        assert!(!app.status.contains("saved"), "{}", app.status);
+        // The same link on an ordinary page does nothing.
+        app.navigate_to(crate::doc::Doc::from_lines(
+            Link::Gemini(url.clone()),
+            vec![crate::doc::DocLine {
+                kind: crate::doc::Kind::GemLink,
+                text: String::from("Spoofed"),
+                link: Some(new.clone()),
+            }],
+            Vec::new(),
+            80,
+            false,
+            None,
+        ));
+        app.browser_follow_link(new);
+        assert!(app.prompt.is_none());
+        assert_eq!(app.mode, super::Mode::Session);
     }
 
     #[test]
@@ -18585,6 +18978,9 @@ mod dict_tests {
                 description: db.into(),
                 body: std::sync::Arc::new(format!("{db} definition\n")),
                 complete: true,
+                content_type: None,
+                attachments: Vec::new(),
+                skipped: Vec::new(),
             });
         }
         app.on_dict_reply(target.clone(), reply.clone());

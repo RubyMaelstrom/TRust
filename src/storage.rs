@@ -36,14 +36,33 @@ impl Paths {
         self.data.join("bookmarks.json")
     }
     pub fn report(&self) -> String {
+        let show = |path: Option<PathBuf>| {
+            path.map_or_else(|| String::from("unavailable"), |p| p.display().to_string())
+        };
+        let dict_servers = crate::dict::credentials::servers();
         format!(
-            "Bookmarks: {}\nSite data: {}\nConfig: {}\nData: {}\nState (reserved): {}\nCache (reserved): {}",
+            "Bookmarks: {}\nSite data: {}\nConfig: {}\nData: {}\nState (reserved): {}\nCache (reserved): {}\nGemini identities: {}\nGemini capsule pins: {}\nDICT credentials: {}{}",
             self.bookmarks().display(),
             self.data.join("site-data").display(),
             self.config.display(),
             self.data.display(),
             self.state.display(),
-            self.cache.display()
+            self.cache.display(),
+            show(crate::gemini::identity::directory()),
+            show(crate::gemini::tofu::store_path()),
+            show(crate::dict::credentials::store_path()),
+            if dict_servers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    dict_servers
+                        .iter()
+                        .map(|(server, user)| format!("{user}@{server}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
         )
     }
 }
@@ -120,9 +139,59 @@ pub(crate) fn private_file() -> std::fs::OpenOptions {
     }
     options
 }
+/// Replace `path` with `bytes`, readable only by the user. A private
+/// temporary file beside it is synced and then renamed over the old file,
+/// so a reader sees the old or the new contents, never a partial file.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no directory")
+    })?;
+    create_private_dir(directory)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let temporary = directory.join(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = private_file().create_new(true).open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_atomic_writes_replace_contents_with_owner_only_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("secret.txt");
+        write_private_atomic(&path, b"first").unwrap();
+        write_private_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
     #[test]
     fn explicit_data_home_does_not_require_other_directories() {
         let root = std::env::temp_dir().join("trust-path-test");

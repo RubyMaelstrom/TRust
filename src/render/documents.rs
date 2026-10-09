@@ -872,6 +872,9 @@ mod tests {
                 "    n 1: a colorless element in the atmosphere with examples\n".into(),
             ),
             complete: true,
+            content_type: None,
+            attachments: Vec::new(),
+            skipped: Vec::new(),
         });
         let page = crate::dict::Page::new(target, reply);
         let doc = crate::dict::render(page.clone(), usize::MAX / 4);

@@ -2834,12 +2834,15 @@ impl DesktopApp {
         if self.focus == FocusTarget::Download && self.browser.download_offer().is_none() {
             self.set_focus(FocusTarget::Page);
         }
-        if self.browser.gemini_prompt().is_some() && !self.gemini_input {
+        if let Some(prompt) = self.browser.prompt()
+            && !self.gemini_input
+        {
+            let initial = prompt.initial.clone();
             self.gopher_query = None;
             self.gemini_input = true;
-            self.command.set_text("");
+            self.command.set_text(&initial);
             self.set_focus(FocusTarget::Command);
-        } else if self.browser.gemini_prompt().is_none() && self.gemini_input {
+        } else if self.browser.prompt().is_none() && self.gemini_input {
             self.gemini_input = false;
             self.command.set_text("");
             self.set_focus(FocusTarget::Page);
@@ -3062,7 +3065,7 @@ impl DesktopApp {
         let command = (self.focus == FocusTarget::Command).then(|| {
             Self::editor_visual(
                 &mut self.command,
-                self.browser.gemini_prompt().is_some_and(|p| p.sensitive),
+                self.browser.prompt().is_some_and(|p| p.sensitive),
             )
         });
         let download = (self.focus == FocusTarget::Download)
@@ -3105,15 +3108,8 @@ impl DesktopApp {
     }
 
     fn status_label(&self, snapshot: &trust::core::BrowserSnapshot) -> String {
-        if let Some(prompt) = self.browser.gemini_prompt() {
-            return if prompt.sensitive {
-                "GEMINI:SECRET"
-            } else if prompt.certificate {
-                "GEMINI:IDENTITY"
-            } else {
-                "GEMINI:INPUT"
-            }
-            .into();
+        if let Some(prompt) = self.browser.prompt() {
+            return prompt.tag().into();
         }
         if self.terminal.is_some() {
             return if snapshot.loading {
@@ -3132,6 +3128,14 @@ impl DesktopApp {
                 format!("FILE:{}", response.status)
             }
             Some(FetchedDocument::Http(response)) => format!("HTTP:{}", response.status),
+            Some(FetchedDocument::Gemini(response))
+                if matches!(
+                    response.view.security,
+                    Some(trust::gemini::security::Security::Changed(_))
+                ) =>
+            {
+                String::from("GEMINI:CERT CHANGED")
+            }
             Some(FetchedDocument::Gemini(response)) => format!("GEMINI:{}", response.status),
             Some(FetchedDocument::Gopher(_)) => {
                 String::from(if snapshot.address.starts_with("gophers:") {
@@ -4020,7 +4024,7 @@ impl DesktopApp {
             self.gemini_input = false;
             self.command.set_text("");
             self.composing = false;
-            self.browser.cancel_gemini_prompt();
+            self.browser.cancel_prompt();
         }
     }
 
@@ -4062,9 +4066,7 @@ impl DesktopApp {
                 .is_some_and(|terminal| terminal.connected),
         };
         if let Some(window) = &self.window {
-            window.set_ime_allowed(
-                editable && !self.browser.gemini_prompt().is_some_and(|p| p.sensitive),
-            );
+            window.set_ime_allowed(editable && !self.browser.prompt().is_some_and(|p| p.sensitive));
         }
         let new_viewport = self.browser_viewport();
         if new_viewport != old_viewport {
@@ -4408,7 +4410,7 @@ impl DesktopApp {
     }
 
     fn copy(&mut self, cut: bool) {
-        if self.gemini_input && self.browser.gemini_prompt().is_some_and(|p| p.sensitive) {
+        if self.gemini_input && self.browser.prompt().is_some_and(|p| p.sensitive) {
             return;
         }
         if self.focus == FocusTarget::Page
@@ -5530,8 +5532,19 @@ impl DesktopApp {
         let line = self.command.text();
         if self.gemini_input {
             self.command.set_text("");
-            self.browser.submit_gemini_prompt(&line);
-            if self.browser.gemini_prompt().is_none() {
+            let asked = self.browser.prompt().cloned();
+            self.browser.submit_prompt(&line);
+            if let Some(prompt) = self.browser.prompt() {
+                // The next question starts from its own prefill; a refused
+                // answer stays for correction, unless it was a secret.
+                if Some(prompt) != asked.as_ref() {
+                    let initial = prompt.initial.clone();
+                    self.command.set_text(&initial);
+                } else if !prompt.sensitive {
+                    self.command.set_text(&line);
+                }
+            }
+            if self.browser.prompt().is_none() {
                 self.gemini_input = false;
                 self.set_focus(FocusTarget::Page);
             }
@@ -5749,6 +5762,28 @@ impl DesktopApp {
             "gemini-help" => {
                 self.close_command();
                 self.open_internal_page("about:gemini", trust::gemini::HELP.as_bytes().to_vec());
+            }
+            "certificates" | "identities" => {
+                self.close_command();
+                self.browser
+                    .open_certificates(trust::gemini::security::MANAGER);
+                self.request_redraw();
+            }
+            "dict-auth" => {
+                let arguments = command
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                self.close_command();
+                self.browser.dict_auth_command(arguments);
+                self.request_redraw();
+            }
+            "identity" => {
+                let arguments = command
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, s)| s);
+                self.close_command();
+                self.browser.identity_command(arguments);
+                self.request_redraw();
             }
             "outline" => {
                 self.close_command();
@@ -7736,10 +7771,10 @@ impl DesktopApp {
                     content_viewport: viewport,
                     scroll,
                     keyboard_node: self.keyboard_target.as_ref().map(|target| target.node),
-                    command_prompt: self.browser.gemini_prompt(),
+                    command_prompt: self.browser.prompt(),
                     command_value: (self.focus == FocusTarget::Command).then(|| {
-                        if self.browser.gemini_prompt().is_some_and(|p| p.sensitive) {
-                            "Sensitive Gemini input"
+                        if self.browser.prompt().is_some_and(|p| p.sensitive) {
+                            "Sensitive input"
                         } else {
                             self.command.raw_text()
                         }
@@ -8420,7 +8455,7 @@ struct AccessibilityFrame<'a> {
     scroll: CssPoint,
     keyboard_node: Option<usize>,
     command_value: Option<&'a str>,
-    command_prompt: Option<&'a trust::gemini::Prompt>,
+    command_prompt: Option<&'a trust::prompt::Prompt>,
     find_value: Option<&'a str>,
     terminal_text: Option<String>,
     terminal_input: Option<(String, bool)>,
@@ -10264,12 +10299,12 @@ mod tests {
 
     #[test]
     fn gemini_sensitive_prompt_masks_visual_and_accessibility_values() {
-        let prompt = trust::gemini::Prompt {
-            url: trust::gemini::GeminiUrl::new("example.org", 1965, "/login"),
-            meta: "Password".into(),
-            certificate: false,
-            sensitive: true,
-        };
+        let prompt = trust::prompt::Prompt::gemini_input(&trust::gemini::Response::new(
+            trust::gemini::GeminiUrl::new("example.org", 1965, "/login"),
+            11,
+            "Password".into(),
+        ))
+        .unwrap();
         let mut editor = TextEditor::new("private value", &TextStyle::default(), 640.0, false);
         let visual = DesktopApp::editor_visual(&mut editor, true);
         assert_eq!(visual.text, "•".repeat(13));

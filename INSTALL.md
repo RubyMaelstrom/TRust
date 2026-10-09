@@ -27,6 +27,16 @@ Portal on Linux: run `xdg-desktop-portal` with a backend such as
 WebGL needs an EGL/OpenGL ES driver. Add `--no-default-features` to the build
 command if you want the system allocator instead of mimalloc.
 
+TRust keeps small-net credentials with owner-only permissions: Gemini client
+identities (PEM certificate and key, plus `.scopes` files) in
+`~/.config/trust/identities/`, Gemini capsule certificate pins in
+`~/.config/trust/gemini_known_hosts`, and DICT AUTH credentials in
+`$XDG_CONFIG_HOME/trust/dict-credentials.json` (default
+`~/.config/trust/`). On Windows they live in `%APPDATA%\trust`. These files are
+not encrypted; back them up like SSH keys. To reuse an existing Gemini
+identity, copy its PEM file (certificate and key in any order) into the
+identities directory; TRust offers it the next time a capsule asks.
+
 For Windows x64 builds from Linux, install the `x86_64-pc-windows-msvc` Rust
 target, [cargo-xwin](https://github.com/rust-cross/cargo-xwin), Clang/LLD, LLVM
 tools, and Ninja, then run:
