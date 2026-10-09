@@ -155,6 +155,8 @@ impl Dom {
         self.cssom_sheets.remove(&id);
         let version = self.cssom_sheet_versions.entry(id).or_default();
         *version = version.wrapping_add(1);
+        // HTML #update-a-style-block (see `style_load`).
+        self.note_style_block_update(id);
     }
     pub(super) fn note_cssom_sheet_attribute(&mut self, id: NodeId, name: &str) {
         let media = self.attr(id, "media").unwrap_or("").to_string();
@@ -366,7 +368,7 @@ impl Dom {
 }
 
 /// Whether a sheet's text names `@import` at all (ASCII case-insensitive).
-fn contains_import(css: &str) -> bool {
+pub(super) fn contains_import(css: &str) -> bool {
     css.as_bytes()
         .windows(7)
         .any(|window| window.eq_ignore_ascii_case(b"@import"))

@@ -433,6 +433,14 @@ impl Dom {
     pub fn option_selectedness(&self, id: NodeId) -> bool {
         self.style_view().option_selectedness(id)
     }
+    /// HTML #concept-option-disabled.
+    pub fn option_is_disabled(&self, id: NodeId) -> bool {
+        self.style_view().option_disabled(id)
+    }
+    /// HTML #concept-select-size.
+    pub fn select_size(&self, select: NodeId) -> usize {
+        self.style_view().select_display_size(select)
+    }
     pub fn option_dirtiness(&self, id: NodeId) -> bool {
         self.element_states
             .get(&id)
@@ -820,10 +828,28 @@ impl Dom {
             self.input_values.remove(&id);
         }
         self.clamp_control_selection(id);
-        if (self.input_type(id) == "range"
-            && ["min", "max", "step"]
+        // HTML #color-state-(type=color): a change of the alpha or
+        // colorspace attribute runs "update a color well control color",
+        // which reads the value content attribute while the dirty value
+        // flag is false (and the value derives from it again).
+        if self.input_type(id) == "color"
+            && ["alpha", "colorspace"]
                 .iter()
-                .any(|name| attr.eq_ignore_ascii_case(name)))
+                .any(|name| attr.eq_ignore_ascii_case(name))
+            && !self.input_values.get(&id).is_some_and(|s| s.dirty)
+        {
+            self.input_values.remove(&id);
+            return;
+        }
+        let color_well = self.input_type(id) == "color"
+            && ["alpha", "colorspace"]
+                .iter()
+                .any(|name| attr.eq_ignore_ascii_case(name));
+        if (color_well
+            || (self.input_type(id) == "range"
+                && ["min", "max", "step"]
+                    .iter()
+                    .any(|name| attr.eq_ignore_ascii_case(name))))
             && let Some((_, old_value)) = before
         {
             let dirty = self.input_values.get(&id).is_some_and(|s| s.dirty);
@@ -1219,6 +1245,13 @@ impl<'a> StyleView<'a> {
                 tokens.join(",")
             }
             "email" => strip(&value),
+            // HTML #color-state-(type=color): "update a color well control
+            // color".
+            "color" => super::color_well::sanitize(
+                &value,
+                self.attr(id, "alpha").is_some(),
+                super::color_well::ColorSpace::from_attribute(self.attr(id, "colorspace")),
+            ),
             _ => value,
         }
     }
@@ -1339,5 +1372,52 @@ mod tests {
         assert_eq!(dom.input_value(id), "71");
         dom.remove_attr(id, "min");
         assert_eq!(dom.input_value(id), "70");
+    }
+
+    #[test]
+    fn color_inputs_sanitize_through_the_color_well_algorithm() {
+        // HTML #color-state-(type=color) (local whatwg/html e5071a20): the
+        // value sanitization algorithm runs "update a color well control
+        // color", also when `alpha` or `colorspace` changes; while the dirty
+        // value flag is false it reads the value content attribute.
+        let mut dom = Dom::parse_document(
+            "<input type=color id=a><input type=color id=b value=' RED '>\
+             <input type=color id=c value='rgb(0 255 0 / 0.5)'><input id=d value='#ABCDEF'>",
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        let c = dom.get_by_id("c").unwrap();
+        let d = dom.get_by_id("d").unwrap();
+        assert_eq!(dom.input_value(a), "#000000");
+        assert_eq!(dom.input_value(b), "#ff0000");
+        assert_eq!(dom.input_value(c), "#00ff00");
+        dom.set_attr(c, "alpha", "");
+        assert_eq!(dom.input_value(c), "color(srgb 0 1 0 / 0.5)");
+        dom.set_attr(c, "colorspace", "display-p3");
+        assert!(
+            dom.input_value(c).starts_with("color(display-p3 "),
+            "{}",
+            dom.input_value(c)
+        );
+        dom.remove_attr(c, "colorspace");
+        dom.remove_attr(c, "alpha");
+        assert_eq!(dom.input_value(c), "#00ff00");
+        // The value setter sanitizes and sets the dirty value flag.
+        dom.set_input_value(a, "Blue", false);
+        assert_eq!(dom.input_value(a), "#0000ff");
+        dom.set_input_value(a, "not a color", false);
+        assert_eq!(dom.input_value(a), "#000000");
+        dom.set_input_value(a, "rgb(255 0 0 / 0.25)", false);
+        assert_eq!(dom.input_value(a), "#ff0000");
+        // A dirty value is updated from the value itself, not the attribute.
+        dom.set_attr(a, "value", "blue");
+        dom.set_attr(a, "alpha", "");
+        assert_eq!(dom.input_value(a), "color(srgb 1 0 0)");
+        // Type changes run the new state's value sanitization algorithm.
+        dom.set_attr(d, "type", "color");
+        assert_eq!(dom.input_value(d), "#abcdef");
+        dom.set_input_value(d, "lime", false);
+        dom.set_attr(d, "type", "text");
+        assert_eq!(dom.input_value(d), "#00ff00");
     }
 }

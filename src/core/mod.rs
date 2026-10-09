@@ -331,6 +331,19 @@ pub enum UserAction {
         value: String,
         checked: Option<bool>,
     },
+    /// HTML #selector-open: the frontend's drop-down box of a live select
+    /// opened or closed.
+    PickerOpen {
+        node: usize,
+        open: bool,
+    },
+    /// HTML #concept-select-pick / #concept-select-toggle of a live select's
+    /// option through the frontend's drop-down box.
+    PickSelectOption {
+        select: usize,
+        option: usize,
+        toggle: bool,
+    },
     EditFormText {
         node: usize,
         value: String,
@@ -1705,6 +1718,24 @@ impl BrowserController {
                     })
                 {
                     *self.pending_form_values.entry(node).or_default() += 1;
+                }
+                true
+            }
+            UserAction::PickerOpen { node, open } => {
+                self.send_user(crate::js::PageCmd::PickerOpen { node, open });
+                false
+            }
+            UserAction::PickSelectOption {
+                select,
+                option,
+                toggle,
+            } => {
+                if self.send_user(crate::js::PageCmd::SelectPick {
+                    select,
+                    option,
+                    toggle,
+                }) {
+                    *self.pending_form_values.entry(select).or_default() += 1;
                 }
                 true
             }
@@ -3646,22 +3677,39 @@ impl BrowserController {
         }
     }
 
+    /// HTML #form-submission-algorithm for a static form: the submitter's
+    /// method, action and enctype (a submit button's formmethod,
+    /// formaction and formenctype override the form's); an action that
+    /// fails to parse submits nothing. Its target (formtarget, else the
+    /// form's or the base element's) chooses the one top-level traversable
+    /// TRust presents: a static page has no child navigables, and `_blank`
+    /// or an unknown name, which would create a new top-level traversable,
+    /// degrades to it as hyperlinks do. The presentation runs interactive
+    /// constraint validation first (`form_validation`, unless the
+    /// no-validate state is true) and handles the dialog method, which
+    /// closes the dialog and never navigates.
     fn submit_static(&mut self, form: crate::doc::Form, submitter: Option<usize>) {
         use crate::doc::FormMethod;
-        match form.method {
+        let Some(submission) = form.submission(submitter) else {
+            return;
+        };
+        match submission.method {
             FormMethod::Get => {
+                // HTML #submit-mutate-action: the query becomes the
+                // urlencoded entry list, even when that is empty.
                 let body = form.encode(submitter);
-                let mut target = form.action;
-                target.set_query((!body.is_empty()).then_some(body.as_str()));
+                let mut target = submission.action;
+                target.set_query(Some(body.as_str()));
                 self.begin_page_fetch(Link::Http(target), false, NavigationIntent::New);
             }
             // HTML #submit-body: the enctype's entity body.
             FormMethod::Post => match form.entity_body(submitter) {
                 Ok((content_type, body)) => {
-                    self.begin_form_post_body(form.action, content_type, body)
+                    self.begin_form_post_body(submission.action, content_type, body)
                 }
                 Err(error) => self.status = format!("Form submission failed: {error}"),
             },
+            FormMethod::Dialog => {}
         }
     }
 

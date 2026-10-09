@@ -9781,13 +9781,61 @@ impl App {
     /// POST goes form-urlencoded through the existing post plumbing.
     fn submit_form_static(&mut self, form: usize, submitter: Option<usize>) {
         use crate::doc::FormMethod;
+        let form_index = form;
         let Some(form) = self.browser.as_ref().and_then(|g| g.doc.forms.get(form)) else {
             return;
         };
-        let query = form.encode(submitter);
-        // HTML #submit-body: a POST carries the enctype's entity body; a
-        // multipart body reads the chosen files now.
-        let body = match form.method {
+        // HTML #form-submission-algorithm: the submitter's method, action
+        // and enctype (a submit button's formmethod, formaction and
+        // formenctype override the form's); an action that fails to parse
+        // submits nothing. Its target (formtarget, else the form's or the
+        // base element's) chooses the one top-level traversable TRust
+        // presents: a static page has no child navigables, and `_blank` or
+        // an unknown name, which would create a new top-level traversable,
+        // degrades to it as hyperlinks do.
+        let Some(submission) = form.submission(submitter) else {
+            return;
+        };
+        // Unless the submitter's no-validate state (formnovalidate, else
+        // novalidate) is true, an invalid form is not submitted and the
+        // first invalid control's problem is reported
+        // (#interactively-validate-the-constraints).
+        if !submission.no_validate
+            && let Some(g) = self.browser.as_ref()
+            && let Link::Http(url) = &g.doc.url
+            && let Some((field, message)) = crate::form_validation::first_invalid_control(
+                url,
+                g.doc.meta.as_deref().unwrap_or("text/html"),
+                &g.doc.raw,
+                &g.doc.forms,
+                form_index,
+            )
+        {
+            let name = g.doc.forms[form_index].fields[field].name.clone();
+            self.status = if name.is_empty() {
+                message
+            } else {
+                format!("{message} ({name})")
+            };
+            self.notice = true;
+            return;
+        }
+        let Some(form) = self
+            .browser
+            .as_ref()
+            .and_then(|g| g.doc.forms.get(form_index))
+        else {
+            return;
+        };
+        let body = match submission.method {
+            // The dialog method closes the form's nearest ancestor dialog
+            // and never navigates.
+            FormMethod::Dialog => {
+                self.close_static_form_dialog(form_index);
+                return;
+            }
+            // HTML #submit-body: a POST carries the enctype's entity body; a
+            // multipart body reads the chosen files now.
             FormMethod::Post => match form.entity_body(submitter) {
                 Ok(body) => Some(body),
                 Err(error) => {
@@ -9798,21 +9846,43 @@ impl App {
             },
             FormMethod::Get => None,
         };
-        let action = form.action.clone();
+        let query = form.encode(submitter);
+        let action = submission.action;
         if !self.allow_page_file_navigation(&Link::Http(action.clone())) {
             return;
         }
         let referrer = self.http_referrer();
         match body {
             None => {
+                // HTML #submit-mutate-action: the query becomes the
+                // urlencoded entry list, even when that is empty.
                 let mut url = action;
-                url.set_query((!query.is_empty()).then_some(query.as_str()));
+                url.set_query(Some(query.as_str()));
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
             Some((content_type, body)) => {
                 self.start_post_body(action, content_type, body, referrer)
             }
         }
+    }
+
+    /// HTML #form-submission-algorithm's dialog method for a static form:
+    /// without an ancestor dialog nothing happens; otherwise #close-the-dialog
+    /// removes the dialog's `open` attribute, which the static presentation
+    /// keeps across its re-parses of the document.
+    fn close_static_form_dialog(&mut self, form: usize) {
+        let Some(form) = self
+            .browser
+            .as_mut()
+            .and_then(|g| g.doc.forms.get_mut(form))
+        else {
+            return;
+        };
+        if form.dialog.is_none() {
+            return;
+        }
+        form.dialog_closed = true;
+        self.refresh_forms();
     }
 
     /// Navigate a page-driven form entry list constructed in the resident JS

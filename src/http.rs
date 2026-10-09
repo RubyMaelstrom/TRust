@@ -926,6 +926,7 @@ pub fn render_html_for_environment(
     let html = decode_document_body(&response.url, &response.content_type, &response.body).text;
     let base = base_with_doc_base(&html, &response.url);
     let mut dom = crate::dom::Dom::parse_document(&html);
+    close_static_dialogs(&mut dom, seed);
     dom.set_doc_url(Some(base.clone()));
     dom.set_fragment_target(response.url.fragment());
     dom.set_viewport_px(viewport.width, viewport.height);
@@ -6721,8 +6722,8 @@ impl StylesheetResponseExt for Response {
 pub(crate) struct CssImport {
     start: usize,
     end: usize,
-    url: String,
-    condition: String,
+    pub(crate) url: String,
+    pub(crate) condition: String,
 }
 
 /// CSS Values 4 #relative-urls: a fetched style sheet's own URL, after
@@ -6906,7 +6907,7 @@ pub(crate) fn import_condition_parts(condition: &str) -> (Option<String>, Option
 
 /// Whether an import's `supports()` condition, if any, is true (CSS Cascade
 /// 5 #conditional-import): a bare declaration is a `<supports-decl>`.
-fn import_supports_holds(condition: &str) -> bool {
+pub(crate) fn import_supports_holds(condition: &str) -> bool {
     match import_condition_parts(condition).1 {
         Some(supports) => crate::dom::import_supports_condition(&supports),
         None => true,
@@ -8824,6 +8825,7 @@ pub fn parse_seeded(
         let diag = std::env::var_os("TRUST_DIAG_FRAME").is_some();
         let t0 = std::time::Instant::now();
         let mut dom = crate::dom::Dom::parse_document(&html);
+        close_static_dialogs(&mut dom, seed);
         let terminal_viewport =
             crate::layout2::TerminalViewport::from_font_pixels(width, viewport_h, cell_px);
         let css_viewport = terminal_viewport.css_viewport();
@@ -9563,6 +9565,9 @@ pub fn extract_forms_arena(
     // re-parses must not lose what was entered), shape permitting.
     if let Some(seed) = seed {
         for (new, old) in forms.iter_mut().zip(seed) {
+            if new.dialog == old.dialog {
+                new.dialog_closed = old.dialog_closed;
+            }
             if new.fields.len() == old.fields.len()
                 && new
                     .fields
@@ -9602,31 +9607,26 @@ fn walk_forms_arena(
     for child in dom.flat_children(id) {
         match dom.tag_name(child) {
             Some("form") => {
-                let method = match dom.attr(child, "method") {
-                    Some(m) if m.eq_ignore_ascii_case("post") => FormMethod::Post,
-                    _ => FormMethod::Get,
-                };
-                // HTML #form-submission-algorithm: encoding-parse the action
-                // relative to the node document, and submit in the encoding
-                // #picking-an-encoding-for-the-form selects.
+                let method = FormMethod::from_attribute(dom.attr(child, "method"));
+                // HTML #form-submission-algorithm: an empty action is the
+                // form document's URL; otherwise encoding-parse it relative
+                // to the node document (its base URL), and submit in the
+                // encoding #picking-an-encoding-for-the-form selects.
                 let document_encoding = dom.node_document_encoding(child);
-                let action = crate::form_encoding::encoding_parse_url(
-                    dom.attr(child, "action").unwrap_or(""),
-                    Some(base),
-                    document_encoding,
-                )
-                .unwrap_or_else(|_| base.clone());
-                // HTML #attr-fs-enctype: an enumerated attribute whose
-                // missing and invalid value default is urlencoded.
-                let enctype = dom
-                    .attr(child, "enctype")
-                    .map(|value| value.trim().to_ascii_lowercase())
-                    .filter(|value| matches!(value.as_str(), "multipart/form-data" | "text/plain"))
-                    .unwrap_or_else(|| String::from(crate::js::FORM_URLENCODED));
+                let (action, action_failed) =
+                    match form_action_url(dom, child, dom.attr(child, "action"), base) {
+                        Some(action) => (action, false),
+                        None => (base.clone(), true),
+                    };
                 forms.push(Form {
                     method,
                     action,
-                    enctype,
+                    action_failed,
+                    enctype: crate::doc::form_enctype(dom.attr(child, "enctype")),
+                    target: element_target(dom, child),
+                    no_validate: dom.attr(child, "novalidate").is_some(),
+                    dialog: nearest_ancestor_dialog(dom, child),
+                    dialog_closed: false,
                     fields: Vec::new(),
                     live_node: live_node(dom, child),
                     encoding: crate::form_encoding::form_submission_encoding(
@@ -9643,7 +9643,7 @@ fn walk_forms_arena(
                 // visible `[ Submit ]` flex item.
             }
             Some(tag @ ("input" | "button" | "select" | "textarea")) => {
-                let Some(mut field) = field_from_arena(dom, child, tag) else {
+                let Some(mut field) = field_from_arena(dom, child, tag, base) else {
                     continue;
                 };
                 // WHATWG HTML §4.10.6 says that a <button> is labeled by
@@ -9676,7 +9676,12 @@ fn walk_forms_arena(
                         forms.push(Form {
                             method: FormMethod::Get,
                             action: base.clone(),
+                            action_failed: false,
                             enctype: String::from(crate::js::FORM_URLENCODED),
+                            target: String::new(),
+                            no_validate: false,
+                            dialog: None,
+                            dialog_closed: false,
                             fields: Vec::new(),
                             live_node: None,
                             encoding: encoding_rs::UTF_8,
@@ -9705,7 +9710,12 @@ fn walk_forms_arena(
                         forms.push(Form {
                             method: FormMethod::Get,
                             action: base.clone(),
+                            action_failed: false,
                             enctype: String::from(crate::js::FORM_URLENCODED),
+                            target: String::new(),
+                            no_validate: false,
+                            dialog: None,
+                            dialog_closed: false,
                             fields: Vec::new(),
                             live_node: None,
                             encoding: encoding_rs::UTF_8,
@@ -9734,6 +9744,9 @@ fn walk_forms_arena(
                     number: None,
                     selection: None,
                     live_node: live_node(dom, child),
+                    submit: None,
+                    select: None,
+                    disabled: false,
                 });
                 map.insert(child, (form, forms[form].fields.len() - 1));
             }
@@ -9782,7 +9795,157 @@ fn live_node(dom: &crate::dom::Dom, id: usize) -> Option<usize> {
     }
 }
 
-fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field> {
+/// HTML #form-submission-algorithm's action steps for `form` (whose node
+/// document's URL is `document_url`): the empty string is the document's
+/// URL; anything else is encoding-parsed relative to the node document,
+/// with its document base URL. `None` when parsing fails.
+fn form_action_url(
+    dom: &crate::dom::Dom,
+    element: usize,
+    action: Option<&str>,
+    document_url: &Url,
+) -> Option<Url> {
+    let action = action.unwrap_or("");
+    if action.is_empty() {
+        return Some(document_url.clone());
+    }
+    let base = dom.resource_base_url(element, document_url);
+    crate::form_encoding::encoding_parse_url(
+        action,
+        Some(&base),
+        dom.node_document_encoding(element),
+    )
+    .ok()
+}
+
+/// The nearest ancestor `dialog` element of `element`.
+fn nearest_ancestor_dialog(dom: &crate::dom::Dom, element: usize) -> Option<usize> {
+    let mut current = dom.node(element).parent;
+    while let Some(node) = current {
+        if dom.tag_name(node) == Some("dialog") {
+            return Some(node);
+        }
+        current = dom.node(node).parent;
+    }
+    None
+}
+
+/// HTML #form-submission-algorithm's dialog method in a static
+/// presentation: a submission closed its form's nearest ancestor dialog
+/// (HTML #close-the-dialog removes the `open` attribute), which each
+/// re-parse of the same document applies again before forms are extracted.
+fn close_static_dialogs(dom: &mut crate::dom::Dom, seed: Option<&[Form]>) {
+    for form in seed.into_iter().flatten() {
+        if form.dialog_closed
+            && let Some(dialog) = form.dialog
+            && dom.is_valid(dialog)
+            && dom.tag_name(dialog) == Some("dialog")
+        {
+            dom.remove_attr(dialog, "open");
+        }
+    }
+}
+
+/// HTML #get-an-element's-target with a null target: the element's
+/// `target` attribute, else the first `base` element's in its node
+/// document, else the empty string.
+fn element_target(dom: &crate::dom::Dom, element: usize) -> String {
+    if let Some(target) = dom.attr(element, "target") {
+        return target.to_string();
+    }
+    let owner = dom.frame_owner(element);
+    let root = owner.unwrap_or(crate::dom::DOCUMENT);
+    dom.descendants(root)
+        .find(|&node| {
+            dom.tag_name(node) == Some("base")
+                && dom.attr(node, "target").is_some()
+                && dom.frame_owner(node) == owner
+        })
+        .and_then(|node| dom.attr(node, "target"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// HTML #concept-submit-button's form submission attributes
+/// (#attributes-for-form-submission) for a submit button `id`.
+fn submit_button_from_arena(
+    dom: &crate::dom::Dom,
+    id: usize,
+    image: bool,
+    document_url: &Url,
+) -> crate::doc::SubmitButton {
+    crate::doc::SubmitButton {
+        action: dom
+            .attr(id, "formaction")
+            .map(|action| form_action_url(dom, id, Some(action), document_url)),
+        // #attr-fs-formenctype and #attr-fs-formmethod have no missing
+        // value default; their invalid value defaults are urlencoded and GET.
+        enctype: dom
+            .attr(id, "formenctype")
+            .map(|value| crate::doc::form_enctype(Some(value))),
+        method: dom
+            .attr(id, "formmethod")
+            .map(|value| FormMethod::from_attribute(Some(value))),
+        no_validate: dom.attr(id, "formnovalidate").is_some(),
+        target: dom.attr(id, "formtarget").map(str::to_owned),
+        optional_value: dom.attr(id, "value").map(str::to_owned),
+        image,
+    }
+}
+
+/// HTML #strip-and-collapse-ascii-whitespace.
+fn strip_and_collapse_ascii_whitespace(text: &str) -> String {
+    text.split(['\t', '\n', '\x0c', '\r', ' '])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// HTML #the-select-element: the select's list of options with each
+/// option's label (#concept-option-label: a non-empty `label` attribute,
+/// else its text), value (#concept-option-value), disabled state, current
+/// selectedness and optgroup label, for a frontend's drop-down box.
+fn select_control_from_arena(dom: &crate::dom::Dom, id: usize) -> crate::doc::SelectControl {
+    let options = dom
+        .select_options(id)
+        .into_iter()
+        .map(|option| {
+            // HTML #dom-option-text: the descendant text, stripped and
+            // collapsed.
+            let text = strip_and_collapse_ascii_whitespace(&dom.text_content(option));
+            let label = dom
+                .attr(option, "label")
+                .filter(|label| !label.is_empty())
+                .map_or_else(|| text.clone(), str::to_owned);
+            let group = dom
+                .node(option)
+                .parent
+                .filter(|&parent| dom.tag_name(parent) == Some("optgroup"))
+                .map(|parent| dom.attr(parent, "label").unwrap_or("").to_string());
+            crate::doc::SelectOption {
+                label,
+                value: dom.attr(option, "value").map_or(text, str::to_owned),
+                disabled: dom.option_is_disabled(option),
+                selected: dom.option_selectedness(option),
+                group,
+                live_node: live_node(dom, option),
+            }
+        })
+        .collect();
+    crate::doc::SelectControl {
+        multiple: dom.attr(id, "multiple").is_some(),
+        size: dom.select_size(id),
+        disabled: dom.actually_disabled(id, "select"),
+        options,
+    }
+}
+
+fn field_from_arena(
+    dom: &crate::dom::Dom,
+    id: usize,
+    tag: &str,
+    document_url: &Url,
+) -> Option<Field> {
     let name = dom.attr(id, "name").unwrap_or("").to_string();
     let value = if tag == "input" {
         dom.input_value(id)
@@ -9792,6 +9955,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
     let checked = tag == "input" && dom.checkedness(id);
     let default_checked = dom.attr(id, "checked").is_some();
     let mut label = String::new();
+    let mut submit = None;
     let kind = match tag {
         "input" => {
             let ty = dom.attr(id, "type").unwrap_or("").to_ascii_lowercase();
@@ -9815,6 +9979,12 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                     } else {
                         value.clone()
                     };
+                    submit = Some(Box::new(submit_button_from_arena(
+                        dom,
+                        id,
+                        ty == "image",
+                        document_url,
+                    )));
                     FieldKind::Submit
                 }
                 "button" => {
@@ -9859,11 +10029,20 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                     _ => String::from("Submit"),
                 }
             };
+            // HTML #attr-button-type: the missing and invalid value default
+            // is the Submit Button state.
             match ty.as_str() {
                 "reset" => FieldKind::Reset,
                 "button" => FieldKind::Button,
-                "" | "submit" => FieldKind::Submit,
-                _ => return None,
+                _ => {
+                    submit = Some(Box::new(submit_button_from_arena(
+                        dom,
+                        id,
+                        false,
+                        document_url,
+                    )));
+                    FieldKind::Submit
+                }
             }
         }
         "textarea" => {
@@ -9885,6 +10064,9 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 number: None,
                 selection: dom.control_selection(id),
                 live_node: live_node(dom, id),
+                submit: None,
+                select: None,
+                disabled: dom.actually_disabled(id, tag),
             });
         }
         "select" => {
@@ -9906,6 +10088,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 return None;
             }
             let value = options[selected.unwrap_or(0)].1.clone();
+            let select = select_control_from_arena(dom, id);
             return Some(Field {
                 name,
                 default_value: value.clone(),
@@ -9917,6 +10100,9 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 number: None,
                 selection: None,
                 live_node: live_node(dom, id),
+                submit: None,
+                disabled: select.disabled,
+                select: Some(Box::new(select)),
             });
         }
         _ => return None,
@@ -9950,6 +10136,9 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
         number,
         selection: dom.control_selection(id),
         live_node: live_node(dom, id),
+        submit,
+        select: None,
+        disabled: dom.actually_disabled(id, tag),
     })
 }
 
@@ -20807,6 +20996,193 @@ customElements.define('lit-counter', LitCounter);
         let button = item(&doc, "[ Send ]");
         assert_eq!(button.kind, crate::layout2::ItemKind::Form);
         assert_eq!(button.link, Some(Link::Form { form: 0, field: 2 }));
+    }
+
+    #[test]
+    fn static_submitters_override_the_form_submission_attributes() {
+        // HTML #form-submission-algorithm (local whatwg/html e5071a20): a submit button's
+        // formaction, formenctype, formmethod, formtarget and formnovalidate override its form
+        // owner's action, enctype, method, target and no-validate state; an empty action is the
+        // document's URL, others parse against the document base URL; enumerated values use
+        // their invalid value defaults; a button with an invalid type is a submit button.
+        let base = Url::parse("https://example.com/dir/page.html?old=1").unwrap();
+        let html = r#"<base href="https://cdn.example/root/" target="frame">
+            <form action="" method="post" enctype="text/plain" novalidate>
+              <input name="q" value="a b">
+              <button name="plain">Plain</button>
+              <button name="over" value="v" formaction="search?x=1" formmethod="GET"
+                formenctype="multipart/form-data" formtarget="_blank" formnovalidate>Over</button>
+              <input type="submit" name="bogus" formmethod="put" formenctype="bogus">
+              <button type="nonsense" name="odd" formaction="">Odd</button>
+              <input type="image" name="pic" formaction="/img" alt="go">
+              <button name="bad" formaction="https://[bad">Bad</button>
+            </form>
+            <dialog open><form action="next" target="named">
+              <button name="d" value="r" formmethod="dialog">Close</button></form></dialog>"#;
+        let doc = parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            80,
+            0,
+            &Default::default(),
+        );
+        let form = &doc.forms[0];
+        assert_eq!(form.action.as_str(), base.as_str());
+        let plain = form.submission(Some(1)).unwrap();
+        assert_eq!(
+            (
+                plain.method,
+                plain.action.as_str(),
+                plain.enctype.as_str(),
+                plain.target.as_str()
+            ),
+            (FormMethod::Post, base.as_str(), "text/plain", "frame")
+        );
+        assert!(plain.no_validate);
+        let over = form.submission(Some(2)).unwrap();
+        assert_eq!(
+            (
+                over.method,
+                over.action.as_str(),
+                over.enctype.as_str(),
+                over.target.as_str()
+            ),
+            (
+                FormMethod::Get,
+                "https://cdn.example/root/search?x=1",
+                "multipart/form-data",
+                "_blank"
+            )
+        );
+        let bogus = form.submission(Some(3)).unwrap();
+        assert_eq!(
+            (bogus.method, bogus.enctype.as_str()),
+            (FormMethod::Get, crate::js::FORM_URLENCODED)
+        );
+        assert_eq!(form.fields[4].kind, FieldKind::Submit);
+        assert_eq!(
+            form.submission(Some(4)).unwrap().action.as_str(),
+            base.as_str()
+        );
+        // The Image Button submitter contributes its (0, 0) coordinate.
+        let image = form.submission(Some(5)).unwrap();
+        assert_eq!(image.action.as_str(), "https://cdn.example/img");
+        assert_eq!(form.encode(Some(5)), "q=a+b&pic.x=0&pic.y=0");
+        assert_eq!(form.encode(Some(2)), "q=a+b&over=v");
+        // An action that fails to parse submits nothing.
+        assert_eq!(form.submission(Some(6)), None);
+        // The submitter's enctype selects the entity body.
+        let (content_type, _) = form.entity_body(Some(2)).unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        assert_eq!(form.entity_body(Some(1)).unwrap().0, "text/plain");
+        // The dialog method closes the nearest ancestor dialog with the optional value.
+        let outer = &doc.forms[1];
+        assert_eq!(outer.target, "named");
+        let dialog = outer
+            .submission(outer.fields.iter().position(|f| f.name == "d"))
+            .unwrap();
+        assert_eq!(
+            (dialog.method, dialog.dialog_result.as_deref()),
+            (FormMethod::Dialog, Some("r"))
+        );
+    }
+
+    #[test]
+    fn static_selects_carry_their_list_of_options() {
+        // HTML #concept-select-option-list, #concept-option-label (a non-empty label attribute,
+        // else the stripped and collapsed text), #concept-option-value, #concept-option-disabled
+        // (an optgroup's disabled attribute too), #concept-select-size and selectedness.
+        let base = Url::parse("https://example.com/").unwrap();
+        let html = r#"<form><select name=s>
+              <option value=1 label="One">ignored</option>
+              <optgroup label="Group" disabled><option>  two
+                  words </option></optgroup>
+              <option selected disabled>Three</option>
+            </select>
+            <select name=m multiple><option selected>x</option><option selected>y</option></select>
+            <select name=d disabled size=3><option>z</option></select></form>"#;
+        let doc = parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            80,
+            0,
+            &Default::default(),
+        );
+        let fields = &doc.forms[0].fields;
+        let single = fields[0].select.as_deref().unwrap();
+        assert_eq!(
+            (single.multiple, single.size, single.disabled),
+            (false, 1, false)
+        );
+        let summary: Vec<_> = single
+            .options
+            .iter()
+            .map(|o| {
+                (
+                    o.label.as_str(),
+                    o.value.as_str(),
+                    o.disabled,
+                    o.selected,
+                    o.group.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("One", "1", false, false, None),
+                ("two words", "two words", true, false, Some("Group")),
+                ("Three", "Three", true, true, None),
+            ]
+        );
+        let multiple = fields[1].select.as_deref().unwrap();
+        assert_eq!((multiple.multiple, multiple.size), (true, 4));
+        // The disabled selected option and the disabled select are not submitted.
+        assert_eq!(doc.forms[0].encode(None), "m=x&m=y");
+        let disabled = fields[2].select.as_deref().unwrap();
+        assert_eq!((disabled.disabled, disabled.size), (true, 3));
+    }
+
+    #[test]
+    fn static_dialog_method_submission_closes_the_dialog_across_reparses() {
+        // HTML #form-submission-algorithm's dialog method and #close-the-dialog: the static
+        // presentation removes the dialog's `open` attribute and keeps it removed when it
+        // re-parses the document with its form state.
+        let base = Url::parse("https://example.com/").unwrap();
+        let html = r#"<dialog open><p>Dialog text</p><form method="dialog">
+            <button>Done</button></form></dialog><p>After</p>"#;
+        let doc = parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            0,
+            &Default::default(),
+        );
+        assert!(has_item(&doc, "Dialog text"));
+        let mut forms = doc.forms.clone();
+        assert!(forms[0].dialog.is_some());
+        assert_eq!(
+            forms[0].submission(Some(0)).unwrap().method,
+            FormMethod::Dialog
+        );
+        forms[0].dialog_closed = true;
+        let closed = parse_seeded(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            0,
+            (8, 16),
+            Some(&forms),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(!has_item(&closed, "Dialog text"));
+        assert!(has_item(&closed, "After"));
+        assert!(closed.forms[0].dialog_closed);
     }
 
     #[test]

@@ -580,6 +580,9 @@ current behavior and limits; consult the governing standards before changing it.
 - Input stepping and `valueAsNumber` are shared DOM behavior for number, range,
   date, month, week, time, and datetime-local. Preserve step/bounds validation
   and separate current/default values; desktop number inputs add spin controls.
+  trust-desktop shows a select's options in its own drop-down box (a toggling
+  list box for `multiple`), reported open through `PageCmd::PickerOpen`; picks
+  and toggles reach the page as `PageCmd::SelectPick`.
 - `<input type=file>`: activation (or `showPicker()`) with transient
   activation asks the frontend for one prompt at a time (`PageEvt::FilePicker`
   → `PageCmd::FilePickerResult`); a dismissal fires `cancel`, a choice fires
@@ -595,10 +598,13 @@ current behavior and limits; consult the governing standards before changing it.
   bounded by the 512 MiB body limit. Form navigations send multipart bodies
   assembled from those ranges; a changed file fails the submission.
   `webkitdirectory` expands at most 10,000 files, 64 levels deep, with
-  `webkitRelativePath`; `webkitEntries`/`webkitGetAsEntry` (FileSystemEntry)
-  are not exposed. Without page scripts (`set js off`) the terminal picker
-  fills the painted control, and static POSTs encode the form's enctype
-  (multipart reads the files at submission).
+  `webkitRelativePath`. `webkitEntries` and `webkitGetAsEntry()` expose the
+  Entries API over the same registry: a dropped directory's members are
+  listed through the host by path (at most 10,000 per listing), registering
+  each as it is listed. Without page scripts (`set js off`) the terminal picker
+  fills the painted control, and static submissions apply the submitter's
+  form* overrides, run constraint validation (`form_validation`) and encode
+  the enctype (multipart reads the files at submission).
 - trust-desktop runs HTML drag-and-drop for files dragged in from other
   applications: dragenter/dragover/dragleave/drop with `DataTransfer` in
   protected mode until the drop, and a mutable file input takes dropped files

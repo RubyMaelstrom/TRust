@@ -21,9 +21,11 @@ use style_view::{ClassMemo, StyleView};
 #[cfg(feature = "architecture-diagnostics")]
 pub(crate) mod architecture_diagnostics;
 pub(crate) mod arena;
+mod autofocus;
 mod child_collections;
 mod class_tokens;
 pub(crate) mod color_scheme;
+mod color_well;
 mod compute;
 mod computed_cache;
 mod container_queries;
@@ -43,12 +45,15 @@ mod parallel_match;
 mod parallel_style;
 mod properties;
 mod query_collections;
+mod style_load;
 mod style_pool;
 mod style_records;
 mod style_sharing;
 mod style_view;
 pub(crate) use query_collections::CollectionQuery;
+pub(crate) use style_load::{CriticalSubresources, ImportState};
 pub(crate) use style_records::BoxContext;
+pub(crate) use validity::ValidityFlags;
 
 pub(crate) fn css_transform_number(text: &str, angle: bool, percentage: bool) -> Option<f32> {
     properties::transform_number(text, angle, percentage)
@@ -630,6 +635,12 @@ pub struct Dom {
     /// HTML #sourcing-out-of-band-text-tracks: track element parent changes
     /// awaiting the platform (see `media_tracks`).
     media_tracks: media_tracks::State,
+    /// HTML #the-autofocus-attribute: autofocus elements inserted into a
+    /// document, awaiting the platform (see `autofocus`).
+    autofocus: autofocus::State,
+    /// HTML #update-a-style-block: style block updates awaiting the
+    /// platform's load processing (see `style_load`).
+    style_load: style_load::State,
     /// Set by every tree/attribute mutation; the living page takes it
     /// to decide whether a dispatch warrants re-extraction at all.
     dirty: bool,
@@ -1151,6 +1162,8 @@ impl Dom {
             slot_signals: _,
             ce_registries,
             media_tracks,
+            autofocus,
+            style_load,
             dirty,
             epoch,
             window_names_epoch,
@@ -1376,6 +1389,8 @@ impl Dom {
         bytes = bytes.saturating_add(self.slotting_retained_bytes());
         bytes = bytes.saturating_add(ce_registries.retained_bytes());
         bytes = bytes.saturating_add(media_tracks.retained_bytes());
+        bytes = bytes.saturating_add(autofocus.retained_bytes());
+        bytes = bytes.saturating_add(style_load.retained_bytes());
         fixed_map!(geometry_dirty_nodes, (NodeId, DirtyKind));
         fixed_map!(adopted_styles, (NodeId, String));
         for text in adopted_styles.values() {
@@ -1712,6 +1727,8 @@ impl Dom {
             slot_signals: slotting::SlotSignals::default(),
             ce_registries: custom_registry::State::default(),
             media_tracks: media_tracks::State::default(),
+            autofocus: autofocus::State::default(),
+            style_load: style_load::State::default(),
             dirty: false,
             epoch: 0,
             window_names_epoch: 0,
@@ -4084,6 +4101,7 @@ impl Dom {
         self.child_collection_changed(parent, child, true);
         self.note_picture_child_change(parent, child);
         self.note_track_parent_change(parent, child, true);
+        self.note_autofocus_insertion(child);
     }
 
     /// Link a newly-created, detached node while constructing another detached
@@ -4306,6 +4324,7 @@ impl Dom {
             self.registries_after_insertion(child, registry_context);
             self.invalidate_style_subtree(child, true);
             self.note_track_parent_change(parent, child, true);
+            self.note_autofocus_insertion(child);
             previous = Some(child);
         }
         self.nodes[parent].last_child = previous;
@@ -4375,6 +4394,7 @@ impl Dom {
         self.child_collection_changed(parent, child, true);
         self.note_picture_child_change(parent, child);
         self.note_track_parent_change(parent, child, true);
+        self.note_autofocus_insertion(child);
     }
 
     /// Implement the DOM Standard's adopt algorithm (DOM §4.5): remove the
@@ -4685,7 +4705,7 @@ impl Dom {
             .eq_ignore_ascii_case("class")
             .then(|| self.attr(id, "class").unwrap_or("").to_owned());
         let old_input_type = (self.tag_name(id) == Some("input")
-            && ["type", "min", "max", "step"]
+            && ["type", "min", "max", "step", "alpha", "colorspace"]
                 .iter()
                 .any(|attr| name.eq_ignore_ascii_case(attr)))
         .then(|| (self.input_type(id), self.input_value(id)));
@@ -4788,7 +4808,7 @@ impl Dom {
             .eq_ignore_ascii_case("class")
             .then(|| self.attr(id, "class").unwrap_or("").to_owned());
         let old_input_type = (self.tag_name(id) == Some("input")
-            && ["type", "min", "max", "step"]
+            && ["type", "min", "max", "step", "alpha", "colorspace"]
                 .iter()
                 .any(|attr| name.eq_ignore_ascii_case(attr)))
         .then(|| (self.input_type(id), self.input_value(id)));

@@ -1619,6 +1619,200 @@ struct NativePointerLock {
     confined: bool,
 }
 
+/// The most option rows a select's drop-down box shows before it scrolls.
+const SELECT_POPUP_MAX_ROWS: usize = 20;
+/// How long typed characters accumulate into one typeahead search.
+const SELECT_TYPEAHEAD_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// A row of a select's drop-down box: an optgroup's label, or an option of
+/// the select's list of options (HTML #the-optgroup-element).
+#[derive(Clone, Debug, PartialEq)]
+enum SelectPopupRow {
+    Group(String),
+    Option(usize),
+}
+
+/// Where the drop-down box was last painted, for hit testing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SelectPopupGeometry {
+    rect: CssRect,
+    row_height: f32,
+    visible: usize,
+}
+
+/// HTML #the-select-element: the desktop's drop-down box of a select (a
+/// list box whose options toggle, for `multiple`), which the presentation
+/// layer paints above the page. Pointer, keyboard and typeahead choose an
+/// option; picking one runs the page's #concept-select-pick (toggling runs
+/// #concept-select-toggle) through the controller, or updates a static
+/// form's model. While it is shown, the page's `:open` matches the select
+/// (#selector-open, `PageCmd::PickerOpen`).
+#[derive(Debug)]
+struct SelectPopup {
+    form: usize,
+    field: usize,
+    /// The select element in the living page.
+    node: Option<usize>,
+    control: trust::doc::SelectControl,
+    rows: Vec<SelectPopupRow>,
+    /// The highlighted option.
+    highlight: Option<usize>,
+    /// The first row shown.
+    scroll: usize,
+    /// The select's box in window CSS pixels.
+    anchor: CssRect,
+    typeahead: String,
+    typeahead_at: Option<Instant>,
+    painted: Option<SelectPopupGeometry>,
+    /// The option a pointer press inside the box landed on.
+    pressed: Option<usize>,
+}
+
+impl SelectPopup {
+    fn new(
+        form: usize,
+        field: usize,
+        node: Option<usize>,
+        control: trust::doc::SelectControl,
+        anchor: CssRect,
+    ) -> Self {
+        let mut rows = Vec::new();
+        let mut group: Option<&str> = None;
+        for (index, option) in control.options.iter().enumerate() {
+            if option.group.as_deref() != group {
+                group = option.group.as_deref();
+                if let Some(label) = group {
+                    rows.push(SelectPopupRow::Group(label.to_string()));
+                }
+            }
+            rows.push(SelectPopupRow::Option(index));
+        }
+        let highlight = control
+            .selected_index()
+            .filter(|&index| !control.options[index].disabled)
+            .or_else(|| control.options.iter().position(|option| !option.disabled));
+        let mut popup = Self {
+            form,
+            field,
+            node,
+            control,
+            rows,
+            highlight,
+            scroll: 0,
+            anchor,
+            typeahead: String::new(),
+            typeahead_at: None,
+            painted: None,
+            pressed: None,
+        };
+        popup.reveal_highlight(SELECT_POPUP_MAX_ROWS);
+        popup
+    }
+
+    fn row_of(&self, option: usize) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|row| *row == SelectPopupRow::Option(option))
+    }
+
+    /// Scroll so the highlighted option's row is among `visible` rows.
+    fn reveal_highlight(&mut self, visible: usize) {
+        let Some(row) = self.highlight.and_then(|option| self.row_of(option)) else {
+            return;
+        };
+        let visible = visible.max(1);
+        if row < self.scroll {
+            self.scroll = row;
+        } else if row >= self.scroll + visible {
+            self.scroll = row + 1 - visible;
+        }
+    }
+
+    fn visible_rows(&self) -> usize {
+        self.painted
+            .map_or(SELECT_POPUP_MAX_ROWS, |geometry| geometry.visible)
+    }
+
+    /// The enabled option `steps` options away from the highlight (from the
+    /// first or last option without one), stopping at the ends.
+    fn step(&self, steps: isize) -> Option<usize> {
+        let enabled: Vec<usize> = (0..self.control.options.len())
+            .filter(|&index| !self.control.options[index].disabled)
+            .collect();
+        if enabled.is_empty() {
+            return None;
+        }
+        let current = self
+            .highlight
+            .and_then(|option| enabled.iter().position(|&index| index == option));
+        let target = match current {
+            Some(position) => (position as isize + steps).clamp(0, enabled.len() as isize - 1),
+            None if steps < 0 => enabled.len() as isize - 1,
+            None => 0,
+        };
+        enabled.get(target as usize).copied()
+    }
+
+    /// HTML leaves typeahead to the user agent: the next enabled option
+    /// after the highlight whose label starts with the typed text (ASCII
+    /// case-insensitively); repeating one character cycles through the
+    /// options it starts.
+    fn typeahead(&mut self, text: &str, now: Instant) -> Option<usize> {
+        if self
+            .typeahead_at
+            .is_none_or(|at| now.duration_since(at) > SELECT_TYPEAHEAD_TIMEOUT)
+        {
+            self.typeahead.clear();
+        }
+        self.typeahead_at = Some(now);
+        self.typeahead.push_str(&text.to_lowercase());
+        let first = self.typeahead.chars().next()?;
+        let repeated = self.typeahead.chars().all(|c| c == first);
+        let needle = if repeated {
+            first.to_string()
+        } else {
+            self.typeahead.clone()
+        };
+        let count = self.control.options.len();
+        let start = self.highlight.map_or(0, |index| {
+            if repeated || self.typeahead.chars().count() == 1 {
+                index + 1
+            } else {
+                index
+            }
+        });
+        (0..count)
+            .map(|offset| (start + offset) % count)
+            .find(|&index| {
+                let option = &self.control.options[index];
+                !option.disabled
+                    && option
+                        .label
+                        .trim_start()
+                        .to_lowercase()
+                        .starts_with(&needle)
+            })
+    }
+
+    /// The option under `point`, in the painted box.
+    fn option_at(&self, point: CssPoint) -> Option<Option<usize>> {
+        let geometry = self.painted?;
+        let rect = geometry.rect;
+        if point.x < rect.x
+            || point.y < rect.y
+            || point.x >= rect.x + rect.width
+            || point.y >= rect.y + rect.height
+        {
+            return None;
+        }
+        let row = self.scroll + ((point.y - rect.y - 1.0).max(0.0) / geometry.row_height) as usize;
+        Some(match self.rows.get(row) {
+            Some(SelectPopupRow::Option(index)) => Some(*index),
+            _ => None,
+        })
+    }
+}
+
 struct DesktopApp {
     browser: BrowserController,
     /// A page's file prompt is showing in the native dialog (one at a time),
@@ -1669,6 +1863,10 @@ struct DesktopApp {
     downloads_in_flight: usize,
     form_editor: Option<TextEditor>,
     form_scroll_x: f32,
+    /// A select's open drop-down box.
+    select_popup: Option<SelectPopup>,
+    /// A press outside the drop-down box closed it; its release is consumed.
+    select_popup_swallow_release: bool,
     composing: bool,
     page_layout: Option<PageLayoutCache>,
     protocol_page: Option<ProtocolPageCache>,
@@ -2036,6 +2234,8 @@ impl DesktopApp {
             downloads_in_flight: 0,
             form_editor: None,
             form_scroll_x: 0.0,
+            select_popup: None,
+            select_popup_swallow_release: false,
             composing: false,
             page_layout: None,
             protocol_page: None,
@@ -2726,6 +2926,9 @@ impl DesktopApp {
                 .and_then(|form| form.fields.get(field))
                 .map(|field| field.kind.clone());
             match kind {
+                Some(FieldKind::Select(_)) => {
+                    self.select_key_default(form, field, &pending.input);
+                }
                 Some(FieldKind::Number)
                     if matches!(pending.input.key, Key::ArrowUp | Key::ArrowDown) =>
                 {
@@ -3732,6 +3935,7 @@ impl DesktopApp {
             );
         }
         self.paint_keyboard_focus(&mut scene);
+        self.paint_select_popup(&mut scene);
         chrome.heart = self.heart_visual(&scene, &snapshot);
         paint_desktop_overlay(&mut scene, &snapshot, &chrome);
         if self.focus == FocusTarget::Command
@@ -4029,6 +4233,16 @@ impl DesktopApp {
     }
 
     fn set_focus(&mut self, focus: FocusTarget) {
+        // The drop-down box belongs to its focused select (closes on blur).
+        if self.select_popup.as_ref().is_some_and(|popup| {
+            focus
+                != (FocusTarget::Form {
+                    form: popup.form,
+                    field: popup.field,
+                })
+        }) {
+            self.close_select_popup();
+        }
         if focus != FocusTarget::Page {
             self.release_native_pointer_lock(true);
         }
@@ -4853,6 +5067,9 @@ impl DesktopApp {
             self.dispatch(UserAction::Key(input));
             return;
         }
+        if self.select_popup.is_some() && self.select_popup_key(&input, event.text.as_deref()) {
+            return;
+        }
         // UI Events §3.5.6.1 routes keydown to the focused element and makes
         // Tab's default action focus transfer. HTML §6.6.5 explicitly allows
         // that transfer to enter UA controls after the document. TRust uses
@@ -5002,6 +5219,18 @@ impl DesktopApp {
                     }
                     self.request_redraw();
                     return;
+                }
+                (FocusTarget::Form { form, field }, _)
+                    if self
+                        .page_layout
+                        .as_ref()
+                        .and_then(|page| page.document.forms.get(form))
+                        .and_then(|form| form.fields.get(field))
+                        .is_some_and(|control| matches!(control.kind, FieldKind::Select(_))) =>
+                {
+                    if self.select_key_default(form, field, &input) {
+                        return;
+                    }
                 }
                 (FocusTarget::Form { form, field }, Key::ArrowUp | Key::ArrowDown)
                     if self
@@ -6258,14 +6487,18 @@ impl DesktopApp {
             }
             FieldKind::Checkbox => self.toggle_check(form, field, !control.checked),
             FieldKind::Radio => self.toggle_radio(form, field),
-            FieldKind::Select(options) => {
-                if !options.is_empty() {
-                    let index = options
-                        .iter()
-                        .position(|(_, value)| *value == control.value)
-                        .map_or(0, |index| (index + 1) % options.len());
-                    self.set_field_value(form, field, options[index].1.clone(), None);
+            // HTML #the-select-element: a live select receives the click of
+            // its activation, and the drop-down box shows its options.
+            FieldKind::Select(_) => {
+                if self.browser.page_is_live()
+                    && let Some(node) = control.live_node
+                {
+                    self.dispatch(UserAction::Activate(Link::JsClick {
+                        node,
+                        href: String::new(),
+                    }));
                 }
+                self.open_select_popup(form, field);
             }
             FieldKind::Submit => self.submit_form(form, Some(field)),
             FieldKind::Button => {
@@ -6292,6 +6525,500 @@ impl DesktopApp {
             }
             FieldKind::Hidden => {}
         }
+    }
+
+    /// A form control's box in window CSS pixels: its painted hit region
+    /// when there is one (transformed and nested-scrolled), else its layout
+    /// box under the viewport scroll.
+    fn form_control_rect(&self, form: usize, field: usize) -> Option<CssRect> {
+        let scene = self.scene.as_ref()?;
+        let cache = self.page_layout.as_ref()?;
+        let (&node, _) = cache
+            .document
+            .controls
+            .iter()
+            .find(|(_, indices)| **indices == (form, field))?;
+        if let Some(hit) = scene.interactive_hits().into_iter().rev().find(|hit| {
+            hit.node == node
+                || matches!(hit.link, Some(Link::Form { form: f, field: g }) if f == form && g == field)
+        }) {
+            return Some(hit.rect);
+        }
+        let bounds = cache.layout.boxes.get(&node)?;
+        Some(CssRect::new(
+            scene.content_viewport.x + bounds.left as f32 - self.browser.interaction().scroll.x,
+            scene.content_viewport.y + bounds.top as f32 - self.browser.interaction().scroll.y,
+            bounds.width as f32,
+            bounds.height as f32,
+        ))
+    }
+
+    /// Show a select's drop-down box below (or above) it. A disabled select
+    /// is not mutable and shows none.
+    fn open_select_popup(&mut self, form: usize, field: usize) {
+        let Some((control, node)) = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+            .and_then(|field| Some((field.select.as_deref()?.clone(), field.live_node)))
+        else {
+            return;
+        };
+        if control.disabled || control.options.is_empty() {
+            return;
+        }
+        let Some(anchor) = self.form_control_rect(form, field) else {
+            return;
+        };
+        self.close_select_popup();
+        self.select_popup = Some(SelectPopup::new(form, field, node, control, anchor));
+        // HTML #selector-open: the select's picker is showing.
+        if self.browser.page_is_live()
+            && let Some(node) = node
+        {
+            self.dispatch(UserAction::PickerOpen { node, open: true });
+        }
+        self.request_redraw();
+    }
+
+    fn close_select_popup(&mut self) {
+        let Some(popup) = self.select_popup.take() else {
+            return;
+        };
+        if self.browser.page_is_live()
+            && let Some(node) = popup.node
+        {
+            self.dispatch(UserAction::PickerOpen { node, open: false });
+        }
+        self.request_redraw();
+    }
+
+    /// The user picked `option` in the open drop-down box: a single select
+    /// selects it and closes; a multiple select toggles it and stays open.
+    fn select_popup_pick(&mut self, option: usize) {
+        let Some(popup) = self.select_popup.as_mut() else {
+            return;
+        };
+        if popup.control.pick(option).is_none() {
+            return;
+        }
+        popup.highlight = Some(option);
+        let (form, field, node, control) =
+            (popup.form, popup.field, popup.node, popup.control.clone());
+        let multiple = control.multiple;
+        self.apply_select_pick(form, field, node, option, control);
+        if !multiple {
+            self.close_select_popup();
+        }
+        self.request_redraw();
+    }
+
+    /// Apply a pick of `option` (already applied to `control`) to the page:
+    /// a living page's select runs #concept-select-pick or
+    /// #concept-select-toggle in the page actor, which then lays the page out
+    /// again; a static form's model takes the new selection at once.
+    fn apply_select_pick(
+        &mut self,
+        form: usize,
+        field: usize,
+        node: Option<usize>,
+        option: usize,
+        control: trust::doc::SelectControl,
+    ) {
+        let option_node = control.options.get(option).and_then(|o| o.live_node);
+        let toggle = control.multiple;
+        let value = control
+            .selected_index()
+            .map(|index| control.options[index].value.clone())
+            .unwrap_or_default();
+        if let Some(page) = &mut self.page_layout
+            && let Some(control_field) = page
+                .document
+                .forms
+                .get_mut(form)
+                .and_then(|form| form.fields.get_mut(field))
+        {
+            control_field.value = value;
+            control_field.select = Some(Box::new(control));
+        }
+        if self.browser.page_is_live() {
+            if let (Some(select), Some(option)) = (node, option_node) {
+                self.dispatch(UserAction::PickSelectOption {
+                    select,
+                    option,
+                    toggle,
+                });
+            }
+        } else {
+            self.relayout_cached_page();
+        }
+    }
+
+    /// Keys at a focused select whose drop-down box is closed: Enter, Space,
+    /// F4 or Alt+ArrowDown/Up show it; the arrows, Home and End pick the
+    /// adjacent, first or last enabled option of a single select directly.
+    fn select_key_default(&mut self, form: usize, field: usize, input: &KeyInput) -> bool {
+        let opens = match &input.key {
+            Key::Enter => true,
+            Key::Character(text) => text == " ",
+            Key::Other(name) => name == "F4",
+            Key::ArrowDown | Key::ArrowUp => input.modifiers.alt,
+            _ => false,
+        };
+        if opens {
+            self.open_select_popup(form, field);
+            return true;
+        }
+        let steps: isize = match &input.key {
+            Key::ArrowUp => -1,
+            Key::ArrowDown => 1,
+            Key::Home => isize::MIN / 2,
+            Key::End => isize::MAX / 2,
+            _ => return false,
+        };
+        let Some((mut control, node)) = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+            .and_then(|field| Some((field.select.as_deref()?.clone(), field.live_node)))
+        else {
+            return false;
+        };
+        if control.multiple || control.disabled {
+            return true;
+        }
+        let probe = SelectPopup::new(
+            form,
+            field,
+            node,
+            control.clone(),
+            CssRect::new(0., 0., 0., 0.),
+        );
+        let Some(option) = probe.step(steps) else {
+            return true;
+        };
+        if control.selected_index() == Some(option) || control.pick(option).is_none() {
+            return true;
+        }
+        self.apply_select_pick(form, field, node, option, control);
+        self.request_redraw();
+        true
+    }
+
+    /// Keys while the drop-down box is open; true when consumed.
+    fn select_popup_key(&mut self, input: &KeyInput, text: Option<&str>) -> bool {
+        let Some(popup) = self.select_popup.as_mut() else {
+            return false;
+        };
+        if input.state != KeyState::Pressed {
+            return true;
+        }
+        let visible = popup.visible_rows() as isize;
+        let typing = popup
+            .typeahead_at
+            .is_some_and(|at| at.elapsed() <= SELECT_TYPEAHEAD_TIMEOUT)
+            && !popup.typeahead.is_empty();
+        let mut highlight = None;
+        let mut pick = None;
+        match &input.key {
+            Key::Escape => {
+                self.close_select_popup();
+                return true;
+            }
+            // Focus navigation closes the box and moves on.
+            Key::Tab => {
+                self.close_select_popup();
+                return false;
+            }
+            Key::ArrowUp | Key::ArrowDown if input.modifiers.alt => {
+                self.close_select_popup();
+                return true;
+            }
+            Key::ArrowUp => highlight = popup.step(-1),
+            Key::ArrowDown => highlight = popup.step(1),
+            Key::PageUp => highlight = popup.step(-(visible - 1).max(1)),
+            Key::PageDown => highlight = popup.step((visible - 1).max(1)),
+            Key::Home => highlight = popup.step(isize::MIN / 2),
+            Key::End => highlight = popup.step(isize::MAX / 2),
+            Key::Enter => {
+                if popup.control.multiple {
+                    self.close_select_popup();
+                    return true;
+                }
+                pick = popup.highlight;
+            }
+            Key::Character(space) if space == " " && !typing => pick = popup.highlight,
+            Key::Character(_)
+                if !input.modifiers.control && !input.modifiers.meta && !input.composing =>
+            {
+                if let Some(typed) = text.filter(|typed| !typed.is_empty()) {
+                    highlight = popup.typeahead(typed, Instant::now());
+                }
+            }
+            _ => {}
+        }
+        if let Some(option) = highlight {
+            popup.highlight = Some(option);
+            popup.reveal_highlight(visible as usize);
+            self.request_redraw();
+        }
+        if let Some(option) = pick {
+            self.select_popup_pick(option);
+        }
+        true
+    }
+
+    /// A pointer button while the drop-down box is open; true when consumed.
+    /// A press inside it picks the option under it on release; a press
+    /// elsewhere (the select included) closes it, and its release is
+    /// consumed too.
+    fn select_popup_pointer_button(&mut self, pressed: bool, primary: bool) -> bool {
+        if !pressed && std::mem::take(&mut self.select_popup_swallow_release) {
+            return true;
+        }
+        let point = self.pointer;
+        let Some(popup) = self.select_popup.as_mut() else {
+            return false;
+        };
+        match popup.option_at(point) {
+            Some(option) => {
+                if pressed {
+                    popup.pressed = option.filter(|_| primary);
+                } else if primary
+                    && let Some(chosen) = popup.pressed.take()
+                    && option == Some(chosen)
+                {
+                    self.select_popup_pick(chosen);
+                }
+                true
+            }
+            None => {
+                if pressed {
+                    self.close_select_popup();
+                    self.select_popup_swallow_release = true;
+                }
+                true
+            }
+        }
+    }
+
+    /// The pointer moved over the open drop-down box: highlight the enabled
+    /// option under it. True when the box owns the pointer.
+    fn select_popup_hover(&mut self, point: CssPoint) -> bool {
+        let Some(popup) = self.select_popup.as_mut() else {
+            return false;
+        };
+        let Some(option) = popup.option_at(point) else {
+            return false;
+        };
+        if let Some(option) = option
+            && !popup.control.options[option].disabled
+            && popup.highlight != Some(option)
+        {
+            popup.highlight = Some(option);
+            self.request_redraw();
+        }
+        self.apply_cursor_icon(CursorIcon::Default);
+        true
+    }
+
+    /// A wheel over the open drop-down box scrolls its rows; elsewhere it
+    /// closes the box. True when consumed.
+    fn select_popup_scroll(&mut self, delta: MouseScrollDelta) -> bool {
+        let point = self.pointer;
+        let Some(popup) = self.select_popup.as_mut() else {
+            return false;
+        };
+        if popup.option_at(point).is_none() {
+            self.close_select_popup();
+            return false;
+        }
+        let row_height = popup.painted.map_or(20.0, |geometry| geometry.row_height);
+        let rows = match delta {
+            MouseScrollDelta::LineDelta(_, y) => -(y * 3.0),
+            MouseScrollDelta::PixelDelta(position) => {
+                -(position.y / self.metrics.scale_factor.get()) as f32 / row_height
+            }
+        }
+        .round() as isize;
+        let visible = popup.visible_rows();
+        let max = popup.rows.len().saturating_sub(visible) as isize;
+        popup.scroll = (popup.scroll as isize + rows).clamp(0, max.max(0)) as usize;
+        self.request_redraw();
+        true
+    }
+
+    /// Paint the open drop-down box above the page: the option rows with
+    /// their optgroup labels, the highlight, a check beside each selected
+    /// option, dimmed disabled options, and a scroll indicator. A box whose
+    /// select left the presentation closes.
+    fn paint_select_popup(&mut self, scene: &mut Scene) {
+        let Some(popup) = &self.select_popup else {
+            return;
+        };
+        let present = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(popup.form))
+            .and_then(|form| form.fields.get(popup.field))
+            .is_some_and(|field| field.select.is_some() && field.live_node == popup.node);
+        if !present {
+            self.close_select_popup();
+            return;
+        }
+        let anchor = self
+            .form_control_rect(popup.form, popup.field)
+            .unwrap_or(popup.anchor);
+        let viewport = scene.content_viewport;
+        let style = TextStyle {
+            size: 14.0,
+            ..TextStyle::default()
+        };
+        let group_style = TextStyle {
+            weight: 700.0,
+            ..style.clone()
+        };
+        let line_height = trust::text::shape("Xg", &style).line_height.max(14.0);
+        let row_height = line_height + 6.0;
+        let Some(popup) = self.select_popup.as_mut() else {
+            return;
+        };
+        popup.anchor = anchor;
+        let rows = popup.rows.len();
+        let fit = |space: f32| ((space - 2.0) / row_height).floor().max(0.0) as usize;
+        let wanted = rows.clamp(1, SELECT_POPUP_MAX_ROWS);
+        let below = viewport.y + viewport.height - (anchor.y + anchor.height);
+        let above = anchor.y - viewport.y;
+        let (visible, top) = if fit(below) >= wanted || fit(below) >= fit(above) {
+            let visible = wanted.min(fit(below).max(1));
+            (visible, anchor.y + anchor.height)
+        } else {
+            let visible = wanted.min(fit(above).max(1));
+            (visible, anchor.y - visible as f32 * row_height - 2.0)
+        };
+        let check = 18.0;
+        let label_width = popup
+            .control
+            .options
+            .iter()
+            .map(|option| trust::text::shape(&option.label, &style).advance)
+            .chain(popup.rows.iter().filter_map(|row| match row {
+                SelectPopupRow::Group(label) => {
+                    Some(trust::text::shape(label, &group_style).advance)
+                }
+                SelectPopupRow::Option(_) => None,
+            }))
+            .fold(0.0_f32, f32::max);
+        let width = (label_width + check + 24.0)
+            .max(anchor.width)
+            .min(viewport.width.max(1.0));
+        let x = anchor
+            .x
+            .min(viewport.x + viewport.width - width)
+            .max(viewport.x);
+        let rect = CssRect::new(x, top, width, visible as f32 * row_height + 2.0);
+        popup.scroll = popup.scroll.min(rows.saturating_sub(visible));
+        popup.painted = Some(SelectPopupGeometry {
+            rect,
+            row_height,
+            visible,
+        });
+        let text =
+            |origin: CssPoint, label: &str, style: &TextStyle, color: PaintColor, clip: CssRect| {
+                DisplayCommand::GlyphRun {
+                    origin,
+                    shaped: trust::text::shape(label, style),
+                    color,
+                    decoration: trust::render::TextDecorationPaint {
+                        color,
+                        style: trust::render::DecorationStyle::Solid,
+                        thickness: None,
+                        underline_offset: None,
+                    },
+                    shadows: Vec::new(),
+                    clip: Some(clip),
+                    node: 0,
+                    link: None,
+                }
+            };
+        scene.primitives.push(DisplayCommand::FillRect {
+            rect,
+            color: PaintColor::Rgba(255, 255, 255, 255),
+        });
+        for (slot, row) in popup
+            .rows
+            .iter()
+            .skip(popup.scroll)
+            .take(visible)
+            .enumerate()
+        {
+            let row_rect = CssRect::new(
+                rect.x + 1.0,
+                rect.y + 1.0 + slot as f32 * row_height,
+                rect.width - 2.0,
+                row_height,
+            );
+            let baseline = CssPoint::new(row_rect.x + check, row_rect.y + 3.0);
+            match row {
+                SelectPopupRow::Group(label) => scene.primitives.push(text(
+                    CssPoint::new(row_rect.x + 6.0, row_rect.y + 3.0),
+                    label,
+                    &group_style,
+                    PaintColor::Rgba(70, 70, 70, 255),
+                    row_rect,
+                )),
+                SelectPopupRow::Option(index) => {
+                    let option = &popup.control.options[*index];
+                    let highlighted = popup.highlight == Some(*index);
+                    if highlighted {
+                        scene.primitives.push(DisplayCommand::FillRect {
+                            rect: row_rect,
+                            color: PaintColor::Accent,
+                        });
+                    }
+                    let color = if option.disabled {
+                        PaintColor::Rgba(150, 150, 150, 255)
+                    } else if highlighted {
+                        PaintColor::Rgba(255, 255, 255, 255)
+                    } else {
+                        PaintColor::Rgba(20, 20, 20, 255)
+                    };
+                    if option.selected {
+                        scene.primitives.push(text(
+                            CssPoint::new(row_rect.x + 4.0, row_rect.y + 3.0),
+                            "\u{2713}",
+                            &style,
+                            color,
+                            row_rect,
+                        ));
+                    }
+                    let indent = if option.group.is_some() { 10.0 } else { 0.0 };
+                    scene.primitives.push(text(
+                        CssPoint::new(baseline.x + indent, baseline.y),
+                        &option.label,
+                        &style,
+                        color,
+                        row_rect,
+                    ));
+                }
+            }
+        }
+        if rows > visible {
+            let track = rect.height - 2.0;
+            let thumb = (track * visible as f32 / rows as f32).max(12.0);
+            let offset = (track - thumb) * popup.scroll as f32 / (rows - visible) as f32;
+            scene.primitives.push(DisplayCommand::FillRect {
+                rect: CssRect::new(rect.x + rect.width - 5.0, rect.y + 1.0 + offset, 4.0, thumb),
+                color: PaintColor::Rgba(160, 160, 160, 255),
+            });
+        }
+        scene.primitives.push(DisplayCommand::Stroke {
+            shape: PaintShape::Rect(rect),
+            brush: PaintBrush::Solid(PaintColor::Rgba(118, 118, 118, 255)),
+            style: StrokeStyle::solid(1.0),
+        });
     }
 
     fn position_form_caret(&mut self, form: usize, field: usize) {
@@ -6507,6 +7234,7 @@ impl DesktopApp {
     }
 
     fn submit_form(&mut self, form: usize, submitter: Option<usize>) {
+        let index = form;
         let Some(form) = self
             .page_layout
             .as_ref()
@@ -6515,6 +7243,53 @@ impl DesktopApp {
         else {
             return;
         };
+        // HTML #form-submission-algorithm for a static form: unless the
+        // submitter's no-validate state (formnovalidate, else novalidate) is
+        // true, an invalid form is not submitted and the first invalid
+        // control's problem is reported (#interactively-validate-the-constraints).
+        if !self.browser.page_is_live()
+            && form
+                .submission(submitter)
+                .is_some_and(|submission| !submission.no_validate)
+            && let Some((field, message)) = self.page_layout.as_ref().and_then(|layout| {
+                let page = self.browser.current_page()?;
+                let FetchedDocument::Http(response) = &page.document else {
+                    return None;
+                };
+                trust::form_validation::first_invalid_control(
+                    &response.url,
+                    &response.content_type,
+                    &response.body,
+                    &layout.document.forms,
+                    index,
+                )
+            })
+        {
+            self.set_focus(FocusTarget::Form { form: index, field });
+            self.scroll_control_into_view(index, field);
+            self.browser.set_status(message);
+            self.request_redraw();
+            return;
+        }
+        // HTML #form-submission-algorithm's dialog method for a static form:
+        // #close-the-dialog removes its nearest ancestor dialog's `open`
+        // attribute (nothing happens without one), and it never navigates.
+        // The static presentation keeps the dialog closed across re-layouts.
+        if !self.browser.page_is_live()
+            && form
+                .submission(submitter)
+                .is_some_and(|submission| submission.method == trust::doc::FormMethod::Dialog)
+        {
+            if form.dialog.is_some()
+                && let Some(page) = &mut self.page_layout
+                && let Some(form) = page.document.forms.get_mut(index)
+            {
+                form.dialog_closed = true;
+                self.relayout_cached_page();
+            }
+            self.set_focus(FocusTarget::Page);
+            return;
+        }
         self.dispatch(UserAction::SubmitForm { form, submitter });
         self.set_focus(FocusTarget::Page);
     }
@@ -7101,6 +7876,9 @@ impl DesktopApp {
             self.protocol_pointer_selection = true;
         }
         self.pointer = point;
+        if self.select_popup_hover(point) {
+            return;
+        }
         let dragging_input = self
             .terminal
             .as_ref()
@@ -7305,6 +8083,14 @@ impl DesktopApp {
     }
 
     fn handle_pointer_button(&mut self, state: ElementState, button: MouseButton) {
+        if (self.select_popup.is_some() || self.select_popup_swallow_release)
+            && self.select_popup_pointer_button(
+                state == ElementState::Pressed,
+                button == MouseButton::Left,
+            )
+        {
+            return;
+        }
         if self.pointer_lock.is_some() {
             let button = match button {
                 MouseButton::Left => 0,
@@ -7611,6 +8397,9 @@ impl DesktopApp {
                 ),
             };
             self.dispatch(UserAction::LockedWheel { dx, dy });
+            return;
+        }
+        if self.select_popup_scroll(delta) {
             return;
         }
         if self
@@ -8345,6 +9134,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 if !focused {
+                    self.close_select_popup();
                     self.release_native_pointer_lock(true);
                     self.page_pointer_buttons = 0;
                     self.composing = false;
@@ -9205,6 +9995,88 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use trust::render::scene_damage;
+
+    fn select_option(
+        label: &str,
+        group: Option<&str>,
+        disabled: bool,
+        selected: bool,
+    ) -> trust::doc::SelectOption {
+        trust::doc::SelectOption {
+            label: label.into(),
+            value: label.to_lowercase(),
+            disabled,
+            selected,
+            group: group.map(str::to_owned),
+            live_node: None,
+        }
+    }
+
+    #[test]
+    fn select_popup_rows_navigation_and_typeahead() {
+        // HTML #the-select-element and #the-optgroup-element: optgroup labels head their
+        // options; navigation and typeahead skip disabled options (#concept-option-disabled).
+        let control = trust::doc::SelectControl {
+            multiple: false,
+            size: 1,
+            disabled: false,
+            options: vec![
+                select_option("Apple", None, false, false),
+                select_option("Avocado", Some("Green"), true, false),
+                select_option("Asparagus", Some("Green"), false, true),
+                select_option("Banana", Some("Yellow"), false, false),
+                select_option("Blueberry", None, false, false),
+            ],
+        };
+        let mut popup = SelectPopup::new(0, 0, None, control, CssRect::new(10., 10., 100., 20.));
+        assert_eq!(
+            popup.rows,
+            [
+                SelectPopupRow::Option(0),
+                SelectPopupRow::Group("Green".into()),
+                SelectPopupRow::Option(1),
+                SelectPopupRow::Option(2),
+                SelectPopupRow::Group("Yellow".into()),
+                SelectPopupRow::Option(3),
+                SelectPopupRow::Option(4),
+            ]
+        );
+        // The selected option is highlighted; steps skip the disabled one.
+        assert_eq!(popup.highlight, Some(2));
+        assert_eq!(popup.step(-1), Some(0));
+        assert_eq!(popup.step(1), Some(3));
+        assert_eq!(popup.step(isize::MAX / 2), Some(4));
+        assert_eq!(popup.step(isize::MIN / 2), Some(0));
+        // Typeahead: one repeated letter cycles, more letters search.
+        let now = Instant::now();
+        popup.highlight = Some(0);
+        assert_eq!(popup.typeahead("a", now), Some(2));
+        popup.highlight = Some(2);
+        assert_eq!(popup.typeahead("a", now), Some(0));
+        popup.highlight = Some(0);
+        popup.typeahead.clear();
+        assert_eq!(popup.typeahead("b", now), Some(3));
+        popup.highlight = Some(3);
+        assert_eq!(popup.typeahead("l", now), Some(4));
+        assert_eq!(
+            popup.typeahead("z", now + SELECT_TYPEAHEAD_TIMEOUT * 2),
+            None
+        );
+        // Hit testing follows the painted rows and the scroll position.
+        popup.painted = Some(SelectPopupGeometry {
+            rect: CssRect::new(10., 30., 100., 62.),
+            row_height: 20.,
+            visible: 3,
+        });
+        popup.scroll = 1;
+        assert_eq!(popup.option_at(CssPoint::new(20., 35.)), Some(None));
+        assert_eq!(popup.option_at(CssPoint::new(20., 55.)), Some(Some(1)));
+        assert_eq!(popup.option_at(CssPoint::new(20., 75.)), Some(Some(2)));
+        assert_eq!(popup.option_at(CssPoint::new(5., 75.)), None);
+        popup.highlight = Some(4);
+        popup.reveal_highlight(3);
+        assert_eq!(popup.scroll, 4);
+    }
 
     #[test]
     fn native_file_drag_events_collect_one_burst_per_drag() {

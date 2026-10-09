@@ -115,11 +115,127 @@ impl fmt::Display for Link {
     }
 }
 
-/// How an HTML form submits.
+/// How an HTML form submits: HTML #attr-fs-method's states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormMethod {
     Get,
     Post,
+    /// The form closes its nearest ancestor `dialog` and never navigates.
+    Dialog,
+}
+
+impl FormMethod {
+    /// HTML #attr-fs-method: an enumerated attribute (ASCII
+    /// case-insensitive) whose missing and invalid value default is GET.
+    pub fn from_attribute(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("post") => Self::Post,
+            Some(value) if value.eq_ignore_ascii_case("dialog") => Self::Dialog,
+            _ => Self::Get,
+        }
+    }
+}
+
+/// HTML #attr-fs-enctype: an enumerated attribute whose missing and
+/// invalid value default is `application/x-www-form-urlencoded`.
+pub fn form_enctype(value: Option<&str>) -> String {
+    value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "multipart/form-data" | "text/plain"))
+        .unwrap_or_else(|| String::from(crate::js::FORM_URLENCODED))
+}
+
+/// HTML #concept-submit-button and #attributes-for-form-submission: a
+/// submit button's `formaction`, `formenctype`, `formmethod`,
+/// `formnovalidate` and `formtarget` attributes, which override its form
+/// owner's `action`, `enctype`, `method`, `novalidate` and `target` when it
+/// is the submitter (`None` where the attribute is absent).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubmitButton {
+    /// The encoding-parsed `formaction`: `Some(None)` when it failed to
+    /// parse, which makes a submission from this button do nothing.
+    pub action: Option<Option<url::Url>>,
+    pub enctype: Option<String>,
+    pub method: Option<FormMethod>,
+    pub no_validate: bool,
+    pub target: Option<String>,
+    /// HTML #concept-fe-optional-value: the `value` attribute, which a
+    /// dialog-method submission returns.
+    pub optional_value: Option<String>,
+    /// An `input` in the Image Button state: as the submitter it
+    /// contributes its selected coordinate, (0, 0) when activated without a
+    /// pointing device (#concept-input-type-image-coordinate).
+    pub image: bool,
+}
+
+/// HTML #the-select-element: a select's list of options as a frontend's
+/// drop-down box or list box presents them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectControl {
+    /// HTML #attr-select-multiple.
+    pub multiple: bool,
+    /// HTML #concept-select-size: the display size.
+    pub size: usize,
+    /// HTML #concept-fe-disabled: a disabled select is not mutable.
+    pub disabled: bool,
+    pub options: Vec<SelectOption>,
+}
+
+/// One option of a select's list of options (HTML #the-option-element).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectOption {
+    /// HTML #concept-option-label.
+    pub label: String,
+    /// HTML #concept-option-value.
+    pub value: String,
+    /// HTML #concept-option-disabled.
+    pub disabled: bool,
+    /// HTML #concept-option-selectedness.
+    pub selected: bool,
+    /// The label of the optgroup holding the option (#the-optgroup-element).
+    pub group: Option<String>,
+    /// The option's node in the living page.
+    pub live_node: Option<usize>,
+}
+
+impl SelectControl {
+    /// HTML #concept-select-pick for a single select, or #concept-select-toggle
+    /// for a multiple one, applied to this model of the options: `None` when
+    /// the user may not change that option.
+    pub fn pick(&mut self, index: usize) -> Option<()> {
+        if self.disabled || self.options.get(index)?.disabled {
+            return None;
+        }
+        if self.multiple {
+            let option = &mut self.options[index];
+            option.selected = !option.selected;
+        } else {
+            for (i, option) in self.options.iter_mut().enumerate() {
+                option.selected = i == index;
+            }
+        }
+        Some(())
+    }
+
+    /// The first selected option (HTML #dom-select-selectedindex).
+    pub fn selected_index(&self) -> Option<usize> {
+        self.options.iter().position(|option| option.selected)
+    }
+}
+
+/// What a submission from one submitter does (HTML #form-submission-algorithm).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub method: FormMethod,
+    /// The parsed action URL.
+    pub action: url::Url,
+    pub enctype: String,
+    /// HTML #get-an-element's-target given the form owner and `formtarget`.
+    pub target: String,
+    /// HTML #concept-fs-novalidate.
+    pub no_validate: bool,
+    /// The result a dialog-method submission closes its dialog with.
+    pub dialog_result: Option<String>,
 }
 
 /// What sort of control a form field is, and how Enter acts on it.
@@ -235,6 +351,12 @@ pub struct Field {
     /// Original DOM node id inside the living page actor, when this
     /// field came from a live JS render.
     pub live_node: Option<usize>,
+    /// A submit button's form submission attributes.
+    pub submit: Option<Box<SubmitButton>>,
+    /// A select's options.
+    pub select: Option<Box<SelectControl>>,
+    /// HTML #concept-fe-disabled: a disabled control is not submitted.
+    pub disabled: bool,
 }
 
 impl Field {
@@ -398,16 +520,43 @@ pub fn file_selection_summary(names: &[String]) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Form {
     pub method: FormMethod,
+    /// The encoding-parsed action URL: the document's URL when the
+    /// `action` attribute is absent or empty.
     pub action: url::Url,
+    /// The `action` attribute failed to parse, so a submission that uses
+    /// it does nothing (HTML #form-submission-algorithm).
+    pub action_failed: bool,
     /// HTML #concept-fs-enctype: `application/x-www-form-urlencoded`,
     /// `multipart/form-data` or `text/plain`.
     pub enctype: String,
+    /// HTML #get-an-element's-target with a null target: the `target`
+    /// attribute, else the first `base` element's.
+    pub target: String,
+    /// HTML #attr-fs-novalidate.
+    pub no_validate: bool,
+    /// The form's nearest ancestor `dialog` element (an arena node id of the
+    /// static presentation, which re-parses the same document identically).
+    pub dialog: Option<usize>,
+    /// A dialog-method submission closed that dialog (HTML #close-the-dialog
+    /// removes its `open` attribute); re-parses keep it closed.
+    pub dialog_closed: bool,
     pub fields: Vec<Field>,
     /// Original `<form>` DOM node id inside the living page actor.
     pub live_node: Option<usize>,
     /// HTML #picking-an-encoding-for-the-form: the output encoding its
     /// submission uses (accept-charset, else the document's encoding).
     pub encoding: &'static encoding_rs::Encoding,
+}
+
+/// HTML #convert-to-a-list-of-name-value-pairs: an entry name with its
+/// newlines normalized to CRLF.
+fn normalized_name(name: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> {
+    match name {
+        std::borrow::Cow::Borrowed(name) => crate::form_encoding::normalize_newlines(name),
+        std::borrow::Cow::Owned(name) => {
+            std::borrow::Cow::Owned(crate::form_encoding::normalize_newlines(&name).into_owned())
+        }
+    }
 }
 
 /// One entry of a static form's entry list (HTML #constructing-the-form-data-set).
@@ -418,30 +567,127 @@ enum EntryValue<'a> {
 }
 
 impl Form {
-    /// HTML #constructing-the-form-data-set over the painted controls. The
-    /// static model never holds disabled, datalist or nameless-image
+    /// HTML #form-submission-algorithm: the submitter's method, action,
+    /// enctype, target and no-validate state (#concept-fs-method,
+    /// #concept-fs-action, #concept-fs-enctype, #concept-fs-novalidate), a
+    /// submit button's form* attributes overriding the form's own; `None`
+    /// when the action URL failed to parse, so nothing is submitted.
+    /// `submitter` is the submit control's field index (`None` is the form
+    /// itself, as `requestSubmit()` without a submitter).
+    pub fn submission(&self, submitter: Option<usize>) -> Option<Submission> {
+        let button = submitter
+            .and_then(|index| self.fields.get(index))
+            .and_then(|field| field.submit.as_deref());
+        let action = match button.and_then(|button| button.action.clone()) {
+            Some(action) => action?,
+            None if self.action_failed => return None,
+            None => self.action.clone(),
+        };
+        let method = button
+            .and_then(|button| button.method)
+            .unwrap_or(self.method);
+        Some(Submission {
+            method,
+            action,
+            enctype: button
+                .and_then(|button| button.enctype.clone())
+                .unwrap_or_else(|| self.enctype.clone()),
+            // HTML #get-an-element's-target: formtarget, else the form's;
+            // a target holding an ASCII tab or newline and "<" is "_blank".
+            target: {
+                let target = button
+                    .and_then(|button| button.target.clone())
+                    .unwrap_or_else(|| self.target.clone());
+                if target.contains(['\t', '\n', '\r']) && target.contains('<') {
+                    String::from("_blank")
+                } else {
+                    target
+                }
+            },
+            no_validate: button.is_some_and(|button| button.no_validate) || self.no_validate,
+            // HTML #form-submission-algorithm's dialog steps: an Image
+            // Button's selected coordinate, else a submit button's optional
+            // value.
+            dialog_result: button.and_then(|button| {
+                if button.image {
+                    Some(String::from("0,0"))
+                } else {
+                    button.optional_value.clone()
+                }
+            }),
+        })
+    }
+
+    /// HTML #constructing-the-form-data-set over the painted controls,
+    /// skipping disabled ones. The static model never holds datalist
     /// controls; `submitter` is the index of the submit control that fired
     /// (`None` is `requestSubmit()` without a submitter).
-    fn entry_list(&self, submitter: Option<usize>) -> Vec<(&str, EntryValue<'_>)> {
+    fn entry_list(
+        &self,
+        submitter: Option<usize>,
+    ) -> Vec<(std::borrow::Cow<'_, str>, EntryValue<'_>)> {
         let mut entries = Vec::new();
         for (i, field) in self.fields.iter().enumerate() {
+            // HTML #constructing-the-form-data-set skips disabled controls.
+            if field.disabled {
+                continue;
+            }
+            // HTML #constructing-the-form-data-set: an Image Button
+            // submitter appends its selected coordinate as name.x and
+            // name.y (or x and y without a name), (0, 0) without a pointing
+            // device; it contributes nothing otherwise.
+            if field.submit.as_ref().is_some_and(|button| button.image) {
+                if Some(i) == submitter {
+                    let (x, y) = if field.name.is_empty() {
+                        (String::from("x"), String::from("y"))
+                    } else {
+                        (format!("{}.x", field.name), format!("{}.y", field.name))
+                    };
+                    entries.push((x.into(), EntryValue::Text("0")));
+                    entries.push((y.into(), EntryValue::Text("0")));
+                }
+                continue;
+            }
             if field.name.is_empty() {
                 continue;
             }
             match &field.kind {
                 FieldKind::Submit => {
                     if Some(i) == submitter {
-                        entries.push((field.name.as_str(), EntryValue::Text(&field.value)));
+                        entries.push((field.name.as_str().into(), EntryValue::Text(&field.value)));
                     }
                 }
                 FieldKind::Button | FieldKind::Reset => {}
                 // An empty selection submits one empty File.
                 FieldKind::File(control) => {
                     if control.files.is_empty() {
-                        entries.push((field.name.as_str(), EntryValue::File(None)));
+                        entries.push((field.name.as_str().into(), EntryValue::File(None)));
                     }
                     for file in &control.files {
-                        entries.push((field.name.as_str(), EntryValue::File(Some(file))));
+                        entries.push((field.name.as_str().into(), EntryValue::File(Some(file))));
+                    }
+                }
+                // HTML #constructing-the-form-data-set: each selected option
+                // of a select's list of options that is not disabled. A
+                // single select's selection is its value.
+                FieldKind::Select(_) if field.select.is_some() => {
+                    let select = field.select.as_deref().expect("checked");
+                    if select.multiple {
+                        for option in &select.options {
+                            if option.selected && !option.disabled {
+                                entries.push((
+                                    field.name.as_str().into(),
+                                    EntryValue::Text(&option.value),
+                                ));
+                            }
+                        }
+                    } else if !select
+                        .options
+                        .iter()
+                        .find(|option| option.value == field.value)
+                        .is_some_and(|option| option.disabled)
+                    {
+                        entries.push((field.name.as_str().into(), EntryValue::Text(&field.value)));
                     }
                 }
                 FieldKind::Checkbox | FieldKind::Radio => {
@@ -452,10 +698,10 @@ impl Form {
                         } else {
                             &field.value
                         };
-                        entries.push((field.name.as_str(), EntryValue::Text(value)));
+                        entries.push((field.name.as_str().into(), EntryValue::Text(value)));
                     }
                 }
-                _ => entries.push((field.name.as_str(), EntryValue::Text(&field.value))),
+                _ => entries.push((field.name.as_str().into(), EntryValue::Text(&field.value))),
             }
         }
         entries
@@ -477,7 +723,7 @@ impl Form {
                     EntryValue::File(file) => file.map_or("", |file| file.name.as_str()),
                 };
                 (
-                    crate::form_encoding::normalize_newlines(name),
+                    normalized_name(name),
                     crate::form_encoding::normalize_newlines(value),
                 )
             })
@@ -497,7 +743,10 @@ impl Form {
     /// when one changed since it was selected (File API #snapshot-state) or
     /// the body would exceed the request body limit.
     pub fn entity_body(&self, submitter: Option<usize>) -> Result<(String, Vec<u8>), String> {
-        match self.enctype.as_str() {
+        let enctype = self
+            .submission(submitter)
+            .map_or_else(|| self.enctype.clone(), |submission| submission.enctype);
+        match enctype.as_str() {
             "multipart/form-data" => self.multipart_body(submitter),
             // HTML #text/plain-encoding-algorithm, encoded in the form's
             // encoding (numeric character references for the unencodable).
@@ -508,7 +757,7 @@ impl Form {
                         EntryValue::Text(text) => text,
                         EntryValue::File(file) => file.map_or("", |file| file.name.as_str()),
                     };
-                    body.push_str(&crate::form_encoding::normalize_newlines(name));
+                    body.push_str(&crate::form_encoding::normalize_newlines(&name));
                     body.push('=');
                     body.push_str(&crate::form_encoding::normalize_newlines(value));
                     body.push_str("\r\n");
@@ -544,7 +793,7 @@ impl Form {
         let encoded =
             |text: &str| crate::form_encoding::encode_html(text, self.encoding).into_owned();
         for (name, value) in self.entry_list(submitter) {
-            let name = escape(&crate::form_encoding::normalize_newlines(name));
+            let name = escape(&crate::form_encoding::normalize_newlines(&name));
             body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
             match value {
                 EntryValue::Text(text) => {
@@ -992,7 +1241,79 @@ mod tests {
             number: None,
             selection: None,
             live_node: None,
+            submit: None,
+            select: None,
+            disabled: false,
         }
+    }
+
+    #[test]
+    fn select_controls_pick_toggle_and_submit_their_selected_options() {
+        // HTML #concept-select-pick, #concept-select-toggle and
+        // #constructing-the-form-data-set: a single select keeps one selected
+        // option, a multiple one toggles each; disabled options and a
+        // disabled select do not change; each selected, enabled option of a
+        // multiple select is an entry.
+        let option = |value: &str, disabled: bool, selected: bool| SelectOption {
+            label: value.to_uppercase(),
+            value: value.into(),
+            disabled,
+            selected,
+            group: None,
+            live_node: None,
+        };
+        let mut single = SelectControl {
+            multiple: false,
+            size: 1,
+            disabled: false,
+            options: vec![
+                option("a", false, true),
+                option("b", false, false),
+                option("c", true, false),
+            ],
+        };
+        assert_eq!(single.pick(1), Some(()));
+        assert_eq!(single.selected_index(), Some(1));
+        assert!(!single.options[0].selected);
+        assert_eq!(single.pick(2), None);
+        let mut multiple = SelectControl {
+            multiple: true,
+            size: 4,
+            disabled: false,
+            options: vec![
+                option("a", false, true),
+                option("b", false, false),
+                option("c", true, true),
+            ],
+        };
+        assert_eq!(multiple.pick(1), Some(()));
+        assert_eq!(multiple.pick(0), Some(()));
+        assert_eq!(
+            multiple
+                .options
+                .iter()
+                .map(|o| o.selected)
+                .collect::<Vec<_>>(),
+            [false, true, true]
+        );
+        let mut field = field("pick", "", FieldKind::Select(Vec::new()));
+        field.select = Some(Box::new(multiple.clone()));
+        let form = Form {
+            method: FormMethod::Get,
+            action: url::Url::parse("https://example.com/").unwrap(),
+            action_failed: false,
+            target: String::new(),
+            no_validate: false,
+            dialog: None,
+            dialog_closed: false,
+            enctype: String::from(crate::js::FORM_URLENCODED),
+            fields: vec![field],
+            live_node: None,
+            encoding: encoding_rs::UTF_8,
+        };
+        assert_eq!(form.encode(None), "pick=b");
+        multiple.disabled = true;
+        assert_eq!(multiple.pick(0), None);
     }
 
     #[test]
@@ -1000,6 +1321,11 @@ mod tests {
         let mut form = Form {
             method: FormMethod::Post,
             action: url::Url::parse("https://example.com/chat").unwrap(),
+            action_failed: false,
+            target: String::new(),
+            no_validate: false,
+            dialog: None,
+            dialog_closed: false,
             enctype: String::from(crate::js::FORM_URLENCODED),
             fields: vec![
                 field("session", "cafe123", FieldKind::Hidden),
@@ -1055,6 +1381,11 @@ mod tests {
         let mut form = Form {
             method: FormMethod::Post,
             action: url::Url::parse("https://example.com/up").unwrap(),
+            action_failed: false,
+            target: String::new(),
+            no_validate: false,
+            dialog: None,
+            dialog_closed: false,
             enctype: String::from("multipart/form-data"),
             fields: vec![
                 field("no\nte", "x\ny", FieldKind::Text),
@@ -1107,6 +1438,11 @@ mod tests {
         let form = Form {
             method: FormMethod::Get,
             action: url::Url::parse("https://example.com/q").unwrap(),
+            action_failed: false,
+            target: String::new(),
+            no_validate: false,
+            dialog: None,
+            dialog_closed: false,
             fields: vec![
                 field("q", "caf\u{e9} \u{3042}", FieldKind::Text),
                 field("t", "a\nb\rc", FieldKind::Textarea),

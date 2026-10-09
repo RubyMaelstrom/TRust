@@ -1536,17 +1536,23 @@ fn form_status(g: &BrowserView, form: usize, field: usize) -> String {
     let Some(f) = g.doc.forms.get(form) else {
         return String::from(" form ");
     };
+    let field_index = field;
     let Some(field) = f.fields.get(field) else {
         return String::from(" form ");
     };
     match &field.kind {
-        FieldKind::Submit => {
-            let method = match f.method {
-                FormMethod::Get => "GET",
-                FormMethod::Post => "POST",
-            };
-            format!(" {method} {} — Enter submits ", f.action)
-        }
+        // The submitter's method and action (HTML #form-submission-algorithm).
+        FieldKind::Submit => match f.submission(Some(field_index)) {
+            Some(submission) => {
+                let method = match submission.method {
+                    FormMethod::Get => "GET",
+                    FormMethod::Post => "POST",
+                    FormMethod::Dialog => return String::from(" Enter closes the dialog "),
+                };
+                format!(" {method} {} — Enter submits ", submission.action)
+            }
+            None => String::from(" invalid form action "),
+        },
         FieldKind::Checkbox => format!(" {} — Enter toggles ", field.name),
         FieldKind::Radio => format!(" {} — Enter selects ", field.name),
         FieldKind::Select(_) => format!(" {} — Enter cycles options ", field.name),

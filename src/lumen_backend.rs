@@ -191,8 +191,10 @@ enum LumenHostTask {
     },
     /// Style sheets fetched for `@import` rules a sheet gained after the
     /// document was fetched, with the sheets their own imports reached
-    /// (CSS Cascade 4 #fetch-an-import).
+    /// (CSS Cascade 4 #fetch-an-import). `url` is the import whose fetch
+    /// completed; no sheets means it failed.
     StyleImportsDone {
+        url: String,
         sheets: Vec<crate::http::PageSheet>,
     },
     ParserResourceTiming(LumenResourceTiming),
@@ -767,6 +769,9 @@ struct HostState {
     next_file_picker_request: u64,
     /// The files this page's user selected or dropped: the only files the page can read.
     user_files: crate::file_select::UserFiles,
+    /// `@import` URLs whose fetch started and has not completed (HTML
+    /// #critical-subresources; see `dom::style_load`).
+    in_flight_imports: std::collections::HashSet<String>,
     audio_context_slots: Option<Value>,
     history_slots: Option<Value>,
     history_traversals: Vec<(u64, i32)>,
@@ -901,6 +906,7 @@ impl HostState {
             file_picker_settlers: HashMap::new(),
             next_file_picker_request: 1,
             user_files: Default::default(),
+            in_flight_imports: Default::default(),
             audio_context_slots: None,
             history_slots: None,
             history_traversals: Vec::new(),
@@ -1177,6 +1183,7 @@ impl RetainedMemory for HostState {
             file_picker_settlers,
             next_file_picker_request: _,
             user_files,
+            in_flight_imports,
             audio_context_slots,
             history_slots,
             history_traversals,
@@ -1605,6 +1612,13 @@ impl RetainedMemory for HostState {
                 "trust.user-files",
                 user_files as *const _ as usize,
                 user_files.retained_bytes(),
+            ));
+        }
+        if !in_flight_imports.is_empty() {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.in-flight-imports",
+                in_flight_imports as *const _ as usize,
+                in_flight_imports.iter().map(String::capacity).sum(),
             ));
         }
         let clipboard_bytes: usize = clipboard_requests
@@ -3725,10 +3739,12 @@ mod desktop {
         ) = {
             let dom = page.dom.borrow();
             let subtree = dom.shadow_including_subtree(DOCUMENT);
+            // HTML #the-style-element: the parser's style elements run
+            // "update a style block" when popped, in token order too.
             let mut links: Vec<_> = subtree
                 .iter()
                 .copied()
-                .filter(|&node| dom.tag_name(node) == Some("link"))
+                .filter(|&node| matches!(dom.tag_name(node), Some("link" | "style")))
                 .collect();
             links.sort_unstable();
             let mut images: Vec<_> = subtree
@@ -4067,6 +4083,13 @@ mod desktop {
     /// task that delays the load event. A preload link starts its fetch
     /// (#link-type-preload). An earlier script may have detached the link.
     fn process_parser_link(page: &mut LumenPage, node: usize) {
+        // HTML #update-a-style-block for a parser-inserted style element: the
+        // platform fires its load event once its critical subresources (the
+        // imports navigation already fetched) are obtained.
+        if page.dom.borrow().tag_name(node) == Some("style") {
+            page.dom.borrow_mut().note_parser_style_block(node);
+            return;
+        }
         let (sheet, preload, href) = {
             let dom = page.dom.borrow();
             if dom.tag_name(node) != Some("link") || !dom.is_connected(node) {
@@ -5078,8 +5101,10 @@ mod desktop {
         else {
             return;
         };
-        for (owner, url) in requests {
-            let Ok(url) = url::Url::parse(&url) else {
+        for (owner, key) in requests {
+            // A request that cannot be fetched completes now, without a
+            // sheet (HTML #critical-subresources: the attempt failed).
+            let Ok(url) = url::Url::parse(&key) else {
                 continue;
             };
             let (owner, encoding) = {
@@ -5093,13 +5118,14 @@ mod desktop {
             {
                 continue;
             }
+            if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                state.in_flight_imports.insert(key.clone());
+            }
             let events = events.clone();
             cache.spawn(&handle, async move {
                 let sheets =
                     crate::http::fetch_imported_sheet(url, client, Vec::new(), encoding).await;
-                if !sheets.is_empty() {
-                    let _ = events.send(LumenHostTask::StyleImportsDone { sheets });
-                }
+                let _ = events.send(LumenHostTask::StyleImportsDone { url: key, sheets });
             });
         }
     }
@@ -5686,6 +5712,27 @@ mod desktop {
             }
             PageCmd::EditKey { node, input, text } => {
                 dispatch_key_command(page, events, interrupt, Some(node), input, Some(text))
+            }
+            PageCmd::SelectPick {
+                select,
+                option,
+                toggle,
+            } => {
+                prepare_interaction(page, interrupt);
+                let _ = call_trust(
+                    page,
+                    "formPickOption",
+                    &[
+                        Value::Num(select as f64),
+                        Value::Num(option as f64),
+                        Value::Bool(toggle),
+                    ],
+                    "select pick",
+                );
+                checkpoint(page, "select pick");
+                page.pending_form_acknowledgements.push(select);
+                page.render_pending = true;
+                finish_internal_task(page, events)
             }
             PageCmd::SetValue {
                 node,
@@ -10753,6 +10800,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_slot_check", 2, guarded_slot_check),
     ("__dom_slot_signals", 1, host_slot_signals),
     ("__dom_track_changes", 0, host_track_changes),
+    ("__dom_autofocus", 2, host_autofocus),
     ("__dom_editable_model", 5, guarded_editable_model),
     ("__dom_move_before", 5, guarded_move_before),
     ("__dom_custom_registry", 3, guarded_custom_registry),
@@ -10875,6 +10923,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__file_picker", 4, host_file_picker),
     ("__file_read", 3, host_file_read),
     ("__file_expand", 1, host_file_expand),
+    ("__file_list", 1, host_file_list),
     ("__blob_url", 4, host_blob_url),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
     ("__crypto_digest", 2, host_crypto_digest),
@@ -17532,13 +17581,15 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .clone();
             dom.borrow_mut().install_downloaded_font(&url, bytes);
         }
-        LumenHostTask::StyleImportsDone { sheets } => {
-            let dom = engine
-                .ctx()
-                .host_mut::<HostState>()
-                .expect("HostState installed before host tasks")
-                .dom
-                .clone();
+        LumenHostTask::StyleImportsDone { url, sheets } => {
+            let dom = {
+                let state = engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .expect("HostState installed before host tasks");
+                state.in_flight_imports.remove(&url);
+                state.dom.clone()
+            };
             // Decoded CSS is Rust text; CSSOM strings are DOM engine text.
             let sheets = sheets
                 .into_iter()
@@ -18774,6 +18825,65 @@ fn host_editable_model(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
 /// HTML #sourcing-out-of-band-text-tracks: take the calling Realm's
 /// recorded track element parent changes as a flat
 /// `[track, media, entered (1 or 0), …]` array, or null when there are none.
+/// HTML #the-autofocus-attribute (local whatwg/html e5071a20), the arena
+/// side of the autofocus insertion steps (see `dom::autofocus`):
+/// `("record", recording)` starts or stops recording autofocus elements
+/// inserted into a document; `("take")` returns the recorded elements whose
+/// Document belongs to the calling Window Realm, in insertion order, or
+/// null; `("parsed", document)` returns the autofocus elements in the
+/// accessible Document's document tree in tree order (those its parser
+/// inserted before its Realm ran).
+fn host_autofocus(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    let caller = ctx.host_job_context();
+    let state = ctx.host_mut::<HostState>().expect("DOM host");
+    let handle = state.dom.clone();
+    let ids = match op.as_str() {
+        "record" => {
+            let recording = matches!(args.get(1), Some(Value::Bool(true)));
+            handle.borrow_mut().set_autofocus_recording(recording);
+            return Ok(Value::Undefined);
+        }
+        "take" => {
+            let mut dom = handle.borrow_mut();
+            if !dom.has_autofocus_insertions() {
+                return Ok(Value::Null);
+            }
+            let all = dom.take_autofocus_insertions();
+            if state.window_realms.is_empty() {
+                all
+            } else {
+                let (mine, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|&element| {
+                    node_window_context(state, &dom, element).is_none_or(|owner| owner == caller)
+                });
+                dom.restore_autofocus_insertions(others);
+                mine
+            }
+        }
+        "parsed" => {
+            let dom = handle.borrow();
+            let Some(document) = host_arg_node(&dom, args, 1) else {
+                return Ok(Value::Null);
+            };
+            if !node_accessible(state, &dom, caller, document) {
+                return Ok(Value::Null);
+            }
+            dom.document_autofocus_elements(document)
+        }
+        _ => return Ok(Value::Undefined),
+    };
+    if ids.is_empty() {
+        return Ok(Value::Null);
+    }
+    let array = ctx.make_array(ids.iter().map(|&id| Value::Num(id as f64)).collect());
+    if let Some(state) = ctx.host_mut::<HostState>() {
+        state
+            .dom_gc
+            .retain(array.clone(), ids, DomGcOwnerKind::IdArray);
+    }
+    Ok(array)
+}
+
 fn host_track_changes(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let caller = ctx.host_job_context();
     let state = ctx.host_mut::<HostState>().expect("DOM host");
@@ -20284,6 +20394,72 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     if op == "import-sheet" {
         let source = host_dom(ctx).borrow().imported_sheet_source(&text);
         return Ok(source.map_or_else(|| Value::from_engine_text("null"), Value::from_string));
+    }
+    // HTML #critical-subresources (see `dom::style_load`): how far
+    // obtaining the sheet of import URL `text` got.
+    if op == "import-state" {
+        let in_flight = ctx
+            .host_mut::<HostState>()
+            .map(|state| state.in_flight_imports.clone())
+            .unwrap_or_default();
+        let state = host_dom(ctx)
+            .borrow()
+            .import_state(&text, &|url| in_flight.contains(url));
+        let keyword = match state {
+            crate::dom::ImportState::Obtained => "obtained",
+            crate::dom::ImportState::Pending => "pending",
+            crate::dom::ImportState::Failed => "failed",
+            crate::dom::ImportState::Unrequested => "unrequested",
+        };
+        return Ok(Value::from_string(format!("\"{keyword}\"")));
+    }
+    // Whether the critical subresources of the style sheet that element
+    // `extra` (a style or link element) has from its source are complete:
+    // "pending", "failed" or "done".
+    if op == "critical-imports" {
+        let in_flight = ctx
+            .host_mut::<HostState>()
+            .map(|state| state.in_flight_imports.clone())
+            .unwrap_or_default();
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let state = extra
+            .parse::<usize>()
+            .ok()
+            .filter(|&id| dom.is_valid(id))
+            .map_or(crate::dom::CriticalSubresources::Complete, |owner| {
+                dom.critical_subresources(owner, &|url| in_flight.contains(url))
+            });
+        return Ok(Value::from_string(format!("\"{}\"", state.keyword())));
+    }
+    // HTML #update-a-style-block: `text` "on" starts recording style block
+    // updates; otherwise the calling Realm takes those of its Documents'
+    // style elements, in order.
+    if op == "style-updates" {
+        let caller = ctx.host_job_context();
+        let state = ctx.host_mut::<HostState>().expect("DOM host");
+        let handle = state.dom.clone();
+        let mut dom = handle.borrow_mut();
+        if text == "on" {
+            dom.set_style_load_recording(true);
+            return Ok(Value::from_engine_text("null"));
+        }
+        if !dom.has_style_block_updates() {
+            return Ok(Value::from_engine_text("[]"));
+        }
+        let all = dom.take_style_block_updates();
+        let mine = if state.window_realms.is_empty() {
+            all
+        } else {
+            let (mine, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|&element| {
+                node_window_context(state, &dom, element).is_none_or(|owner| owner == caller)
+            });
+            dom.restore_style_block_updates(others);
+            mine
+        };
+        return Ok(Value::from_string(
+            serde_json::to_string(&mine).unwrap_or_else(|_| String::from("[]")),
+        ));
     }
     // A CSSOM-inserted @import whose sheet no fetch obtained yet: `text` is
     // the absolute URL and `extra` the owner node of the importing sheet.
@@ -21980,6 +22156,32 @@ fn host_file_expand(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         Ok(records) => Ok(records),
         Err(error) => Ok(ctx.make_array(vec![
             Value::from_string(String::from("NotReadableError")),
+            Value::from_string(error),
+        ])),
+    }
+}
+
+/// File and Directory Entries API #api-directoryreader and #evaluate-a-path: the current members
+/// of a directory the user dropped (or of one listed below it), each registered as readable and
+/// described as a file record; `[DOMException name, message]` when the directory is gone or was
+/// never selected. Only directories already registered can be listed.
+fn host_file_list(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = args
+        .first()
+        .and_then(|value| value.as_num_opt())
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map_or(0, |value| value as u64);
+    let path = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.user_files.directory_path(id));
+    let result = match path {
+        Some(path) => crate::file_select::directory_members(&path),
+        None => Err(String::from("not a selected directory")),
+    };
+    match result.and_then(|files| user_file_records(ctx, &files)) {
+        Ok(records) => Ok(records),
+        Err(error) => Ok(ctx.make_array(vec![
+            Value::from_string(String::from("NotFoundError")),
             Value::from_string(error),
         ])),
     }
@@ -30389,6 +30591,149 @@ mod tests {
     }
 
     #[test]
+    fn autofocus_candidates_flush_at_the_rendering_update() {
+        // HTML #the-autofocus-attribute and #flush-autofocus-candidates (local whatwg/html
+        // e5071a20): parser- and script-inserted autofocus elements become the top-level
+        // Document's candidates; the rendering update focuses the first that is a focusable
+        // area and sets the autofocus processed flag, after which insertions are ignored.
+        let mut engine = top_layer_engine(
+            "<body><input id=hidden autofocus style='display:none'>\
+             <input id=first autofocus><input id=second autofocus></body>",
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const log = [];
+            log.push(document.activeElement === document.body, __trust.hasRenderingUpdate());
+            __trust.runRenderingFrame(performance.now());
+            log.push(document.activeElement.id, __trust.hasRenderingUpdate());
+            const late = document.createElement("input");
+            late.autofocus = true;
+            document.body.append(late);
+            log.push(__trust.hasRenderingUpdate());
+            __trust.runRenderingFrame(performance.now());
+            log.push(document.activeElement.id);
+            log.join("|");
+        "#
+            ),
+            "true|true|first|false|false|first"
+        );
+    }
+
+    #[test]
+    fn autofocus_insertion_steps_follow_insertion_into_a_document() {
+        // HTML #the-autofocus-attribute: only insertion into a document tree adds a candidate
+        // (an attribute set on a connected element, a detached or shadow tree, a moveBefore()
+        // move or a Document without a browsing context does not); the latest insertion of an
+        // element moves it to the end, and innerHTML insertion counts.
+        let mut engine = top_layer_engine("<body><div id=box></div><div id=host></div></body>");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const log = [];
+            const box = document.getElementById("box");
+            const flush = () => {
+                const pending = __trust.hasRenderingUpdate();
+                __trust.runRenderingFrame(performance.now());
+                return pending;
+            };
+            const connected = document.createElement("button");
+            document.body.append(connected);
+            connected.autofocus = true;
+            const detached = document.createElement("div");
+            detached.innerHTML = "<input autofocus>";
+            const root = document.getElementById("host").attachShadow({ mode: "open" });
+            root.innerHTML = "<input autofocus>";
+            new DOMParser().parseFromString("<input autofocus>", "text/html");
+            const other = document.implementation.createHTMLDocument("");
+            other.body.innerHTML = "<input autofocus>";
+            box.moveBefore(connected, null);
+            log.push(flush(), document.activeElement === document.body);
+            box.innerHTML = "<textarea id=a autofocus></textarea><select id=b autofocus><option>x</option></select>";
+            const a = document.getElementById("a");
+            document.body.append(a);
+            log.push(flush(), document.activeElement.id);
+            log.join("|");
+        "#
+            ),
+            "false|true|true|b"
+        );
+    }
+
+    #[test]
+    fn autofocus_is_skipped_once_focus_or_a_dialog_has_moved_it() {
+        // HTML #flush-autofocus-candidates step 4: a focused area other than the Document
+        // empties the candidates; the dialog focusing steps set the autofocus processed flag
+        // (#dialog-focusing-steps steps 7-10).
+        let mut engine = top_layer_engine(
+            "<body><input id=auto autofocus><button id=other>o</button>\
+             <dialog id=d><input id=inner autofocus></dialog></body>",
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const log = [];
+            document.getElementById("other").focus();
+            __trust.runRenderingFrame(performance.now());
+            log.push(document.activeElement.id);
+            document.getElementById("other").blur();
+            const late = document.createElement("input");
+            late.id = "late";
+            late.autofocus = true;
+            document.body.append(late);
+            log.push(__trust.hasRenderingUpdate());
+            log.join("|");
+        "#
+            ),
+            "other|false"
+        );
+        let mut engine = top_layer_engine(
+            "<body><input id=auto autofocus><dialog id=d><input id=inner autofocus></dialog></body>",
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const d = document.getElementById("d");
+            d.show();
+            const focused = document.activeElement.id;
+            __trust.runRenderingFrame(performance.now());
+            [focused, document.activeElement.id, __trust.hasRenderingUpdate()].join("|");
+        "#
+            ),
+            "inner|inner|false"
+        );
+    }
+
+    #[test]
+    fn autofocus_yields_to_the_target_element() {
+        // HTML #flush-autofocus-candidates step 4: a Document with a target element (the one
+        // its URL's fragment indicates, #find-a-potential-indicated-element) keeps focus.
+        let mut engine = configured_engine(
+            HostState::new(
+                Rc::new(RefCell::new(Dom::parse_document(
+                    "<body><input id=auto autofocus><p id=goal>goal</p></body>",
+                ))),
+                Rc::new(RealmClock::new()),
+            ),
+            "https://example.com/page#goal",
+        );
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            __trust.runRenderingFrame(performance.now());
+            [document.activeElement === document.body, __trust.hasRenderingUpdate()].join("|");
+        "#
+            ),
+            "true|false"
+        );
+    }
+
+    #[test]
     fn popover_stack_nests_hides_unrelated_and_light_dismisses() {
         // HTML #the-popover-attribute: a nested auto popover keeps its
         // ancestor open (#topmost-popover-ancestor), an unrelated one hides
@@ -31199,7 +31544,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 240, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 242, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -31210,7 +31555,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 240);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 242);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -32444,6 +32789,111 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn style_sheets_load_after_their_critical_subresources() {
+        // HTML #the-style-element, #update-a-style-block, #critical-subresources and
+        // #delay-the-load-event (local whatwg/html e5071a20): a style element fires load (or
+        // error, when an @import failed) once the sheets its @import rules import are obtained
+        // and delays the document's load event meanwhile; an @import CSSOM inserts into an
+        // already loaded sheet only delays the load event.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            "<!doctype html><head></head><body><p id=target>t</p></body>",
+        )));
+        dom.borrow_mut()
+            .set_doc_url(Some(url::Url::parse(DEFAULT_URL).unwrap()));
+        let mut engine = configured_engine(
+            HostState::new(dom.clone(), Rc::new(RealmClock::new())),
+            DEFAULT_URL,
+        );
+        let settle = "__trust.hasRenderingUpdate();\n\
+                      while (__trust.hasPlatformTask()) __trust.runPlatformTask();";
+        let sheet = |url: &str, text: &str| crate::http::PageSheet {
+            link_href: None,
+            url: url.into(),
+            base: url.into(),
+            text: text.into(),
+            cors_same_origin: true,
+        };
+        assert_eq!(
+            string_value(
+                &mut engine,
+                &format!(
+                    r#"
+            globalThis.log = [];
+            const add = (name, css, type) => {{
+                const style = document.createElement('style');
+                if (type) style.setAttribute('type', type);
+                style.textContent = css;
+                style.onload = () => log.push(name + ' load');
+                style.onerror = () => log.push(name + ' error');
+                document.head.append(style);
+                return style;
+            }};
+            globalThis.plain = add('plain', 'p {{}}');
+            add('imported', '@import url(a.css); p {{}}');
+            add('missing', '@import url(missing.css);');
+            add('other', '@import url(z.css);', 'text/plain');
+            {settle}
+            log.push('delayed ' + __trust.loadEventDelayed());
+            log.join('|');
+        "#
+                )
+            ),
+            "plain load|delayed true"
+        );
+        // The import fetches complete: a.css arrives, missing.css fails.
+        let requests = dom.borrow().take_import_requests();
+        let mut urls: Vec<_> = requests.iter().map(|(_, url)| url.as_str()).collect();
+        urls.sort_unstable();
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/a.css",
+                "https://example.com/missing.css"
+            ]
+        );
+        dom.borrow_mut()
+            .attach_imported_sheets(vec![sheet("https://example.com/a.css", "p {}")]);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                &format!(
+                    "log.length = 0; __trust.styleImportsArrived();\n{settle}\n\
+                     log.push('delayed ' + __trust.loadEventDelayed()); log.join('|')"
+                )
+            ),
+            "imported load|missing error|delayed false"
+        );
+        // A loaded sheet that gains an @import delays the load event only; a
+        // children change updates the style block, which loads again.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                &format!(
+                    "log.length = 0; plain.sheet.insertRule('@import url(late.css);', 0);\n{settle}\n\
+                     log.push('delayed ' + __trust.loadEventDelayed()); log.join('|')"
+                )
+            ),
+            "delayed true"
+        );
+        dom.borrow().take_import_requests();
+        dom.borrow_mut()
+            .attach_imported_sheets(vec![sheet("https://example.com/late.css", "p {}")]);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                &format!(
+                    "log.length = 0; __trust.styleImportsArrived();\n{settle}\n\
+                     log.push('delayed ' + __trust.loadEventDelayed());\n\
+                     plain.textContent = 'p {{ color: red }}';\n{settle}\n\
+                     plain.remove();\n{settle}\n\
+                     log.join('|')"
+                )
+            ),
+            "delayed false|plain load"
+        );
     }
 
     #[test]
@@ -35132,6 +35582,123 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn webassembly_interfaces_and_namespace_follow_web_idl() {
+        // WebAssembly JS API #webassembly-namespace, #modules, #instances, #memories, #tables,
+        // #globals and #error-objects, and Web API #serialization (local spec repository
+        // 37d6b059), with Web IDL #namespace-object, #legacy-namespace, #interface-object,
+        // #js-operations, #js-attributes, #dfn-qualified-name and #js-dictionary, and HTML
+        // #structuredserializeinternal for the non-[Serializable] interfaces.
+        let mut engine = platform_engine();
+        install_wasm_test_fixture(
+            &mut engine,
+            r#"
+            (module
+              (memory (export "m") 1)
+              (table (export "t") 1 funcref)
+              (global (export "g") (mut i32) (i32.const 7))
+              (func (export "f") (result i32) (i32.const 1)))
+            "#,
+        );
+        eval(
+            &mut engine,
+            r#"
+            const failures = [];
+            const check = (name, condition) => { if (!condition) failures.push(name); };
+            const throws = (Ctor, f) => {
+                try { f(); return false; }
+                catch (e) { return e instanceof Ctor; }
+            };
+            const W = WebAssembly, desc = Object.getOwnPropertyDescriptor;
+            const global = desc(globalThis, 'WebAssembly');
+            check('global property', global.writable && !global.enumerable && global.configurable);
+            check('namespace tag', Object.prototype.toString.call(W) === '[object WebAssembly]');
+            for (const [name, length] of [['validate', 1], ['compile', 1], ['instantiate', 1],
+                    ['compileStreaming', 1], ['instantiateStreaming', 1]]) {
+                const d = desc(W, name);
+                check(name + ' operation', d.writable && d.enumerable && d.configurable &&
+                    d.value.name === name && d.value.length === length &&
+                    !('prototype' in d.value));
+                check(name + ' not a constructor', throws(TypeError, () => new d.value(wasmFixture)));
+                check(name + ' arguments', throws(TypeError, () => d.value()));
+            }
+            for (const name of ['Module', 'Instance', 'Memory', 'Table', 'Global', 'Tag', 'Exception',
+                    'CompileError', 'LinkError', 'RuntimeError']) {
+                const d = desc(W, name);
+                check(name + ' property', d.writable && !d.enumerable && d.configurable);
+            }
+            check('enumerable keys', Object.keys(W).join() ===
+                'validate,compile,instantiate,compileStreaming,instantiateStreaming,JSTag');
+            const module = new W.Module(wasmFixture);
+            const instance = new W.Instance(module, {});
+            const memory = new W.Memory({ initial: 1 });
+            const table = new W.Table({ element: 'anyfunc', initial: 1 });
+            const value = new W.Global({ value: 'i32', mutable: true }, 3);
+            const objects = { Module: module, Instance: instance, Memory: memory, Table: table, Global: value };
+            const lengths = { Module: 1, Instance: 1, Memory: 1, Table: 1, Global: 1 };
+            const members = {
+                Module: [], Instance: ['exports'],
+                Memory: ['grow', 'toFixedLengthBuffer', 'toResizableBuffer', 'buffer'],
+                Table: ['grow', 'get', 'set', 'length'], Global: ['valueOf', 'value'],
+            };
+            for (const name of Object.keys(objects)) {
+                const I = W[name];
+                check(name + ' class string', Object.prototype.toString.call(objects[name]) ===
+                    '[object WebAssembly.' + name + ']' &&
+                    desc(I.prototype, Symbol.toStringTag).value === 'WebAssembly.' + name &&
+                    !desc(I.prototype, Symbol.toStringTag).enumerable);
+                check(name + ' interface object', I.name === name && I.length === lengths[name] &&
+                    Object.getPrototypeOf(I) === Function.prototype &&
+                    Object.getPrototypeOf(I.prototype) === Object.prototype &&
+                    I.prototype.constructor === I);
+                check(name + ' called', throws(TypeError, () => I()));
+                for (const member of members[name]) {
+                    const d = desc(I.prototype, member);
+                    check(name + '.' + member + ' enumerable', d && d.enumerable && d.configurable);
+                    const steps = d.get || d.value;
+                    check(name + '.' + member + ' brand', throws(TypeError, () => steps.call({})));
+                }
+                check(name + ' no own properties', Reflect.ownKeys(objects[name]).length === 0);
+            }
+            for (const name of ['exports', 'imports', 'customSections']) {
+                const d = desc(W.Module, name);
+                check('Module.' + name, d.enumerable && d.writable && d.configurable);
+            }
+            check('Module.customSections arguments',
+                throws(TypeError, () => W.Module.customSections(module)));
+            check('Table lengths', W.Table.prototype.grow.length === 1 &&
+                W.Table.prototype.set.length === 1 && W.Table.prototype.get.length === 1);
+            check('Instance exports', instance.exports === instance.exports &&
+                Object.isFrozen(instance.exports) && instance.exports.f() === 1 &&
+                instance.exports.g.value === 7);
+            check('Table.set result', table.set(0, null) === undefined);
+            // Dictionary members convert once each, in lexicographic order.
+            const order = [];
+            const recorder = (values) => new Proxy(values, {
+                get(target, key) { if (typeof key === 'string') order.push(key); return target[key]; }
+            });
+            new W.Table(recorder({ element: 'externref', initial: 1, maximum: 2 }));
+            new W.Global(recorder({ value: 'i32', mutable: false }));
+            new W.Memory(recorder({ initial: 1, maximum: 2 }));
+            check('dictionary order ' + order.join(), order.join() ===
+                'address,element,initial,maximum,mutable,value,address,initial,maximum');
+            check('TableKind', throws(TypeError, () => new W.Table({ element: 'i32', initial: 1 })));
+            check('ValueType', throws(TypeError, () => new W.Global({ value: 'i16' })));
+            // Only WebAssembly.Module is serializable.
+            check('Module clone', structuredClone(module) instanceof W.Module);
+            for (const name of ['Instance', 'Memory', 'Table', 'Global']) {
+                let error = null;
+                try { structuredClone(objects[name]); } catch (e) { error = e; }
+                check(name + ' clone', error instanceof DOMException && error.name === 'DataCloneError');
+            }
+            globalThis.wasmInterfaceResult = failures.join(',') || 'ok';
+            "#,
+            "WebAssembly interfaces",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "wasmInterfaceResult"), "ok");
     }
 
     const WASM_EXCEPTION_BOUNDARY_FIXTURE: &str = r#"
@@ -51391,6 +51958,213 @@ mod tests {
              dragover@zone:true:true:Files:0:1:file:false:copy \
              dragleave@zone:true:false:Files:0:1:file:false:none \
              input@fi:dropped.txt change@fi:dropped.txt|C:\\fakepath\\dropped.txt"
+        );
+    }
+
+    #[test]
+    fn entries_api_traverses_dropped_directories_and_selected_files() {
+        // File and Directory Entries API (local WICG entries-api 3d02b953): webkitGetAsEntry()
+        // in the drop event's read-only store, FileSystemDirectoryReader, getFile/getDirectory
+        // path resolution and errors, getParent, file(), FileSystem, and webkitEntries of a
+        // File Upload control. Only the dropped directory's members are reachable, by path,
+        // evaluated against the directory as it is now.
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("top");
+        std::fs::create_dir_all(top.join("sub")).unwrap();
+        std::fs::write(top.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(top.join("sub").join("b.txt"), b"bee").unwrap();
+        let mut engine = platform_engine_with_body();
+        let dropped = crate::file_select::SelectedFile::from_path(&top, String::new()).unwrap();
+        let id = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .user_files
+            .register(&dropped)
+            .unwrap();
+        eval(
+            &mut engine,
+            &format!(
+                r#"
+            globalThis.record = [{id}, 'top', '', 0, 0, '', true];
+            document.body.innerHTML = '<div id=zone>zone</div><input type=file id=fi><input id=text>';
+            globalThis.zone = document.getElementById('zone');
+            globalThis.log = [];
+            globalThis.fail = (label) => (error) => log.push(label + ':' + error.name);
+            // HTML #drag-and-drop-processing-model: a canceled dragenter makes
+            // the zone the current target element, a canceled dragover lets it drop.
+            zone.addEventListener('dragenter', e => e.preventDefault());
+            zone.addEventListener('dragover', e => e.preventDefault());
+            zone.addEventListener('drop', e => {{
+                e.preventDefault();
+                const item = e.dataTransfer.items[0];
+                globalThis.item = item;
+                const entry = item.webkitGetAsEntry();
+                globalThis.entry = entry;
+                log.push([entry instanceof FileSystemDirectoryEntry, entry.isDirectory, entry.isFile,
+                    entry.name, entry.fullPath, entry.filesystem === entry.filesystem,
+                    entry.filesystem.root.fullPath, entry.filesystem.root.name === '',
+                    Object.prototype.toString.call(entry)].join(','));
+                const reader = entry.createReader();
+                reader.readEntries(entries => {{
+                    log.push('batch:' + entries.map(e => e.fullPath + (e.isDirectory ? '/' : '')).join('+'));
+                    reader.readEntries(rest => log.push('rest:' + rest.length));
+                }}, fail('read'));
+                reader.readEntries(() => log.push('overlap'), fail('overlap'));
+                entry.getFile('sub/../sub/./b.txt', {{}}, file => {{
+                    log.push('file:' + file.fullPath);
+                    file.file(f => f.text().then(t => log.push('text:' + f.name + '=' + t)), fail('file'));
+                    file.getParent(parent => log.push('parent:' + parent.fullPath + ':' + parent.isDirectory));
+                }}, fail('getFile'));
+                entry.getDirectory('sub', null, d => log.push('dir:' + d.fullPath), fail('getDirectory'));
+                entry.getFile('sub', {{}}, () => log.push('wrong'), fail('sub as file'));
+                entry.getFile('missing.txt', {{}}, () => log.push('wrong'), fail('missing'));
+                entry.getFile('a.txt', {{create: true}}, () => log.push('wrong'), fail('create'));
+                entry.getFile('a\\b', {{}}, () => log.push('wrong'), fail('backslash'));
+                entry.getFile('/top/a.txt', undefined, f => log.push('absolute:' + f.name));
+            }});
+            "#
+            ),
+            "entries setup",
+        )
+        .unwrap();
+        eval(
+            &mut engine,
+            r#"
+            __trust.fileDrag('enter', ['Files']);
+            __trust.fileDrag('over', zone.__id, 5, 5, 5, 5, 0);
+            __trust.fileDrag('drop', zone.__id, 5, 5, 5, 5, 0, [record]);
+            "#,
+            "drop a directory",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "__trust");
+        // Callbacks run from queued tasks; compare the outcomes in sorted order.
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "log.slice().sort().join(' | ') + __trust.takeErrors()"
+            ),
+            "absolute:a.txt | backslash:TypeMismatchError | batch:/top/a.txt+/top/sub/ | \
+             create:SecurityError | dir:/top/sub | file:/top/sub/b.txt | missing:NotFoundError | \
+             overlap:InvalidStateError | parent:/top/sub:true | rest:0 | sub as file:TypeMismatchError | \
+             text:b.txt=bee | true,true,false,top,/top,true,/,true,[object FileSystemDirectoryEntry]"
+        );
+        // The directory is evaluated as it is now; outside the drop the item is disabled.
+        std::fs::write(top.join("c.txt"), b"sea").unwrap();
+        eval(
+            &mut engine,
+            r#"
+            log.length = 0;
+            entry.getFile('c.txt', {}, f => log.push('late:' + f.fullPath), fail('late'));
+            log.push('after:' + item.webkitGetAsEntry());
+            let constructed;
+            try { new FileSystemEntry(); constructed = 'yes'; } catch (e) { constructed = e.name; }
+            log.push(constructed, typeof FileSystem, Object.keys(FileSystemEntry.prototype).join('+'));
+            log.push(String(document.getElementById('text').webkitEntries));
+            const fi = document.getElementById('fi');
+            log.push(fi.webkitEntries.length, fi.webkitEntries === fi.webkitEntries, Object.isFrozen(fi.webkitEntries));
+            const dt = new DataTransfer();
+            dt.items.add(new File(['x'], 'made.txt'));
+            fi.files = dt.files;
+            const own = dt.items[0].webkitGetAsEntry();
+            log.push(own.isFile + ':' + own.fullPath);
+            const entries = fi.webkitEntries;
+            log.push(entries.length + ':' + entries[0].fullPath + ':' + entries[0].filesystem.name.startsWith('trust-input'));
+            entries[0].file(f => f.text().then(t => log.push('made=' + t)));
+            "#,
+            "live evaluation",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "__trust");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                "log.slice().sort().join(' | ') + __trust.takeErrors()"
+            ),
+            "0 | 1:/made.txt:true | TypeError | after:null | function | \
+             isFile+isDirectory+name+fullPath+filesystem+getParent | late:/top/c.txt | made=x | null | \
+             true | true | true:/made.txt"
+        );
+        // A webkitdirectory control's selection (the dropped directory's files, with their
+        // relative paths) is one directory entry whose members are the selected files.
+        eval(
+            &mut engine,
+            r#"
+            log.length = 0;
+            globalThis.wd = document.createElement('input');
+            wd.type = 'file';
+            wd.webkitdirectory = true;
+            wd.multiple = true;
+            document.body.append(wd);
+            __trust.fileDrag('enter', ['Files']);
+            __trust.fileDrag('over', wd.__id, 1, 1, 1, 1, 0);
+            __trust.fileDrag('drop', wd.__id, 1, 1, 1, 1, 0, [record]);
+            "#,
+            "drop on a webkitdirectory control",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "__trust");
+        eval(
+            &mut engine,
+            r#"
+            const selected = wd.webkitEntries;
+            log.push(selected.length + ':' + selected[0].fullPath + ':' + selected[0].isDirectory + ':' + wd.files.length);
+            selected[0].createReader().readEntries(list => log.push(list.map(e => e.fullPath).join('+')));
+            selected[0].getFile('sub/b.txt', {}, f => f.file(file => log.push(file.webkitRelativePath)));
+            "#,
+            "webkitEntries of a directory selection",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "__trust");
+        assert_eq!(
+            string_value(&mut engine, "log.join(' | ') + __trust.takeErrors()"),
+            "1:/top:true:3 | /top/a.txt+/top/c.txt+/top/sub | top/sub/b.txt"
+        );
+    }
+
+    #[test]
+    fn frontend_select_picks_and_toggles_send_update_notifications() {
+        // HTML #the-select-element (local whatwg/html e5071a20): picking an option of a single
+        // select (#concept-select-pick) and toggling one of a multiple select
+        // (#concept-select-toggle) set its selectedness and dirtiness, then send select update
+        // notifications (user validity, input bubbling and composed, change bubbling).
+        // Disabled options, disabled selects and the other mode's command change nothing.
+        let mut engine = platform_engine_with_body();
+        eval(
+            &mut engine,
+            r#"
+            document.body.innerHTML = '<select id=s><option>a</option><option>b</option>' +
+                '<optgroup disabled><option>c</option></optgroup></select>' +
+                '<select id=m multiple><option>x</option><option selected>y</option></select>' +
+                '<select id=d disabled><option>q</option><option>r</option></select>';
+            globalThis.log = [];
+            for (const id of ['s', 'm', 'd']) {
+                const el = document.getElementById(id);
+                el.addEventListener('input', e => log.push(id + ':input:' + e.bubbles + ':' + e.composed));
+                el.addEventListener('change', e => log.push(id + ':change:' + e.bubbles + ':' + e.composed));
+            }
+            const option = (id, i) => document.getElementById(id).options[i].__id;
+            const pick = (id, i, toggle) => __trust.formPickOption(document.getElementById(id).__id, option(id, i), toggle);
+            log.push([pick('s', 1, false), pick('s', 2, false), pick('s', 0, true), pick('m', 0, true),
+                pick('m', 1, true), pick('m', 0, false), pick('d', 1, false)].join(','));
+            "#,
+            "select picks",
+        )
+        .unwrap();
+        drain_platform_tasks(&mut engine, "__trust");
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            const s = document.getElementById('s'), m = document.getElementById('m');
+            log.push(s.value, [...m.selectedOptions].map(o => o.value).join('+'),
+                document.getElementById('d').value, s.matches(':user-valid'));
+            log.join(' ');
+        "#
+            ),
+            "true,false,false,true,true,false,false s:input:true:true s:change:true:false \
+             m:input:true:true m:change:true:false m:input:true:true m:change:true:false b x q true"
         );
     }
 

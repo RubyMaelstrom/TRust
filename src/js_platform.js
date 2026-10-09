@@ -7344,6 +7344,37 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const caret = selection[0] + text.length;
         return trust.formSet(id, next, null, "insertText", text, caret, caret, 0, false);
     };
+    // HTML #the-select-element: the user picks an option through the
+    // frontend's drop-down box (#concept-select-pick), or toggles one of a
+    // select with `multiple` (#concept-select-toggle). Only an option of the
+    // select's list of options that is not disabled, of a select that is not
+    // disabled, can change; then the select sends update notifications.
+    trust.formPickOption = function (selectId, optionId, toggle) {
+        const frame = nativeInputChildFrame(selectId);
+        if (frame) return trustOf(internalsOf(frame).contentRealmWindow).formPickOption(selectId, optionId, toggle);
+        const select = wrap(Number(selectId)), option = wrap(Number(optionId));
+        if (!select || !option || htmlElementName(select) !== "select" || htmlElementName(option) !== "option")
+            return false;
+        if (isActuallyDisabled(select) || optionDisabled(option) || !selectOptionList(select).includes(option))
+            return false;
+        const multiple = select.hasAttribute("multiple");
+        // #concept-select-pick step 1 / #concept-select-toggle.
+        if (multiple !== !!toggle) return false;
+        setOptionSelectedness(select, option, multiple ? !optionSelectedness(option) : true, true);
+        sendSelectUpdateNotifications(select);
+        return true;
+    };
+    // HTML #send-select-update-notifications: an element task on the user
+    // interaction task source sets user validity and fires input (bubbles,
+    // composed) and change (bubbles). TRust's select has no selectedcontent
+    // element or base appearance button to update.
+    function sendSelectUpdateNotifications(select) {
+        __queue_dom_task(() => {
+            setUserValidity(select, true);
+            dispatch(select, createTrustedEvent(Event, "input", {bubbles: true, composed: true}), false);
+            dispatch(select, createTrustedEvent(Event, "change", {bubbles: true}), false);
+        });
+    }
     trust.formSet = function (id, value, checked, inputType, data, start, end, direction, composing = false) {
         const frame = nativeInputChildFrame(id);
         if (frame) return trustOf(internalsOf(frame).contentRealmWindow).formSet(id,value,checked,inputType,data,start,end,direction,composing);
@@ -15383,7 +15414,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (imageLoadDelays > 0) imageLoadIdle.push(fn); else fn();
     }
     trust.loadEventDelayed = function () {
-        return trust.hasInitialFramesPending() || imageLoadDelays > 0;
+        // HTML #delay-the-load-event: also style sheets whose critical
+        // subresources are being obtained (#the-style-element).
+        return trust.hasInitialFramesPending() || imageLoadDelays > 0 || styleSheetWaits.size > 0;
     };
     // HTML #lazy-loading-attributes: this Document's lazy load intersection
     // observer. Its targets resume their requests from a task on the
@@ -20052,7 +20085,111 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             pendingImportRules.delete(rule);
             if (internalsOf(rule).sheet) cssChanged(rule);
         }
+        checkStyleSheetWaits();
     };
+    // ---- Style sheet loads (HTML #the-style-element, #link-type-stylesheet
+    // and #critical-subresources; local whatwg/html e5071a20) ----
+    // A style element whose style block was updated fires `load` (`error`
+    // when one failed) once the attempts to obtain its style sheet's
+    // critical subresources, the sheets its @import rules import
+    // transitively, are complete; until then it delays its Document's load
+    // event, as a style or link element whose sheet gained an @import
+    // through CSSOM does. The arena records style block updates
+    // (`dom::style_load`); each Realm takes those of its Documents.
+    const styleSheetWaits = new Map();
+    cssOp("style-updates", "on");
+    // HTML #update-a-style-block steps 2-4 for the elements the arena
+    // recorded: a removed sheet's load is not fired; a connected text/css
+    // style element of this Document waits for its new sheet's critical
+    // subresources.
+    function takeStyleBlockUpdates() {
+        const ids = cssOp("style-updates", "");
+        for (let i = 0; i < ids.length; i++) {
+            const element = wrap(ids[i]);
+            if (!element) continue;
+            const type = messageApply(elementGetAttribute, element, ["type"]);
+            if (!element.isConnected || element.ownerDocument !== g.document ||
+                    (type !== null && type !== "" &&
+                        type.replace(/[A-Z]/g, (c) => c.toLowerCase()) !== "text/css")) {
+                styleSheetWaits.delete(element);
+                continue;
+            }
+            styleSheetWaits.set(element, { fire: true, queued: false });
+        }
+    }
+    // CSSOM's model of a sheet whose object exists (its rules may have
+    // changed): "pending", "failed" or "done".
+    function sheetCriticalState(sheet, seen) {
+        let failed = false;
+        const rules = internalsFor(sheet).children;
+        for (let i = 0; i < rules.length; i++) {
+            const rule = rules[i];
+            if (!(rule instanceof CSSImportRule)) continue;
+            const slots = internalsFor(rule);
+            // CSS Cascade 5 #fetch-an-import: a false supports() condition
+            // or an unparsable URL fetches nothing.
+            if (slots.supports !== null && !cssOp("condition", slots.supports)) continue;
+            let url = null;
+            try { url = new URL(slots.href, internalsOf(sheet).importBase || undefined).href; }
+            catch (_) { continue; }
+            if (seen.has(url)) continue;
+            seen.add(url);
+            const imported = importRuleSheet(rule);
+            if (imported) {
+                const state = sheetCriticalState(imported, seen);
+                if (state === "pending") return state;
+                if (state === "failed") failed = true;
+                continue;
+            }
+            const state = cssOp("import-state", url);
+            if (state === "pending" || state === "unrequested") return "pending";
+            if (state === "failed") failed = true;
+        }
+        return failed ? "failed" : "done";
+    }
+    function criticalSubresourceState(element) {
+        const record = internalsOf(element);
+        if (record && record.sheet) {
+            const sheet = elementSheet(element);
+            return sheet ? sheetCriticalState(sheet, new Set()) : "done";
+        }
+        return cssOp("critical-imports", "", String(nodeIds.get(element)));
+    }
+    // Queue the load or error event of each style element whose critical
+    // subresources are now complete (#the-style-element: an element task on
+    // the networking task source), and release the load event delay of
+    // elements that only delay it.
+    function checkStyleSheetWaits() {
+        if (!styleSheetWaits.size) return;
+        for (const [element, wait] of Array.from(styleSheetWaits)) {
+            if (wait.queued) continue;
+            const state = criticalSubresourceState(element);
+            if (state === "pending") continue;
+            if (!wait.fire) { styleSheetWaits.delete(element); continue; }
+            wait.queued = true;
+            __queue_network_task(function () {
+                if (styleSheetWaits.get(element) !== wait) return;
+                styleSheetWaits.delete(element);
+                dispatch(element, createTrustedEvent(Event, state === "failed" ? "error" : "load"), false);
+            });
+        }
+    }
+    // A sheet gained an @import through CSSOM: its owner element (a style
+    // or link element of this Document) delays the load event until the
+    // import's critical subresources are obtained; a style element's
+    // pending load event waits for them too.
+    function styleSheetGainedImport(sheet) {
+        let root = sheet;
+        while (internalsOf(root).parentSheet) root = internalsOf(root).parentSheet;
+        const owner = internalsOf(root).ownerNode;
+        if (!owner || owner.ownerDocument !== g.document) return;
+        if (!styleSheetWaits.has(owner)) styleSheetWaits.set(owner, { fire: false, queued: false });
+        checkStyleSheetWaits();
+    }
+    function styleLoadTask() {
+        takeStyleBlockUpdates();
+        checkStyleSheetWaits();
+    }
     function importRuleSheet(rule) {
         const slots = internalsFor(rule);
         if (slots.styleSheet !== undefined) return slots.styleSheet;
@@ -20282,7 +20419,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             text = domString(text); index = Number(index) >>> 0;
             const rule = singleCssRule(text);
             if (rule.type === 3 && internalsFor(this).constructed) throw new DOMException("Constructed sheets cannot import", "SyntaxError");
-            return insertCssRule(this, text, index);
+            const inserted = insertCssRule(this, text, index);
+            if (rule.type === 3) styleSheetGainedImport(this);
+            return inserted;
         }
         deleteRule(index) {
             requireStyleSheet(this);
@@ -24605,6 +24744,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
         enumerable: true, configurable: true,
     });
+    // File and Directory Entries API #html-forms: webkitEntries is a
+    // FrozenArray of the entries for the selected files (null unless the
+    // control is a File Upload control); one array per selection.
+    Object.defineProperty(g.HTMLInputElement.prototype, "webkitEntries", {
+        get() {
+            requireHTMLInterface(this, ["input"]);
+            if (inputTypeOf(this) !== "file") return null;
+            const slots = internalsFor(this);
+            if (!slots.webkitEntries || slots.webkitEntriesFiles !== slots.selectedFiles) {
+                slots.webkitEntries = inputEntries(inputSelectedFiles(this));
+                slots.webkitEntriesFiles = slots.selectedFiles;
+            }
+            return slots.webkitEntries;
+        },
+        enumerable: true, configurable: true,
+    });
     // File and Directory Entries API #html-forms: webkitdirectory is a
     // reflected boolean attribute; the picker then selects a directory.
     Object.defineProperty(g.HTMLInputElement.prototype, "webkitdirectory", {
@@ -24922,6 +25077,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (item.kind !== "file" || !item.data) return null;
             return fileAPI.copyFile(dataTransferFile(record.transfer, item));
         }
+        // File and Directory Entries API #dom-datatransferitem-webkitgetasentry:
+        // in read/write or read-only mode, a File item's entry in the root
+        // directory unique to the drag data store.
+        webkitGetAsEntry() {
+            const mode = dataTransferItemMode(this);
+            if (mode !== "rw" && mode !== "ro") return null;
+            const record = internalsOf(this).dataTransferItem, item = record.item;
+            if (item.kind !== "file" || !item.data) return null;
+            return dragItemEntry(record.transfer.store, item);
+        }
     }
     for (const C of [DataTransfer, DataTransferItemList, DataTransferItem]) {
         for (const name of Object.getOwnPropertyNames(C.prototype)) {
@@ -24930,6 +25095,339 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         Object.defineProperty(C.prototype, Symbol.toStringTag, {value: C.name, configurable: true});
         g[C.name] = C;
+    }
+
+    // ---- File and Directory Entries API (WICG entries-api, local 3d02b953) ----
+    // An entry names a file or directory by its full path in a file system
+    // whose root directory is virtual: its members are the files a File
+    // Upload control selected (#html-forms, with the directories a
+    // webkitdirectory selection's relative paths name), or the File items of
+    // a drag data store (#html-data). A directory the user dropped is listed
+    // through the host each time a path is evaluated (`__file_list`), which
+    // makes each member readable by an opaque id; nothing else on disk is
+    // reachable, and File bodies are read lazily against their snapshots.
+    let entryFileSystems = 0;
+    // A file system node: a virtual or host directory, or a file holding a
+    // File or a host file record.
+    function entriesVirtualDirectory(name, parent) {
+        return {directory: true, name, parent, members: new Map(), hostId: null};
+    }
+    function entriesNodeFromRecord(record, parent) {
+        return record[6]
+            ? {directory: true, name: `${record[1]}`, parent, members: null, hostId: record[0]}
+            : {directory: false, name: `${record[1]}`, parent, record, file: null};
+    }
+    // The members of a directory node now: a host directory is listed again.
+    function entriesMembers(node) {
+        if (node.hostId === null) return node.members;
+        const records = __file_list(node.hostId);
+        if (records.length && typeof records[0] === "string")
+            throw new DOMException(`${records[1]}`, `${records[0]}`);
+        const members = new Map();
+        for (let i = 0; i < records.length; i++) {
+            const member = entriesNodeFromRecord(records[i], node);
+            if (!members.has(member.name)) members.set(member.name, member);
+        }
+        return members;
+    }
+    function newEntryFileSystem(prefix, root) {
+        return {name: prefix + "-" + (++entryFileSystems), root, object: null, rootEntry: null};
+    }
+    // #names-paths: a valid path holds no NUL or REVERSE SOLIDUS (its
+    // segments are names, "." or "..").
+    function validEntryPath(path) { return !/[\0\\]/.test(path); }
+    // #resolve-a-relative-path.
+    function resolveEntryPath(abspath, path) {
+        if (path.startsWith("/")) return path;
+        const segments = abspath === "/" ? [""] : abspath.split("/");
+        for (const segment of path.split("/")) {
+            if (segment === "" || segment === ".") continue;
+            if (segment === "..") { if (segments.length > 1) segments.pop(); continue; }
+            segments.push(segment);
+        }
+        return segments.length > 1 ? segments.join("/") : "/";
+    }
+    // #evaluate-a-path: the node `path` names under `root`, or null.
+    function evaluateEntryPath(root, path) {
+        const segments = path.split("/");
+        segments.shift();
+        let directory = root;
+        for (let i = 0; i < segments.length; i++) {
+            const segment = segments[i];
+            if (segment === "" || segment === ".") continue;
+            if (segment === "..") { directory = directory.parent || directory; continue; }
+            let item;
+            try { item = entriesMembers(directory).get(segment); }
+            catch (_) { return null; }
+            if (!item) return null;
+            if (i === segments.length - 1) return item;
+            if (!item.directory) return null;
+            directory = item;
+        }
+        return directory;
+    }
+    // The File an entry's file node represents: a new File object each time.
+    function entryNodeFile(node) {
+        return node.file ? fileAPI.copyFile(node.file) : fileAPI.createUserFile(node.record);
+    }
+    function makeEntry(fs, name, fullPath, directory) {
+        const entry = Object.create((directory ? FileSystemDirectoryEntry : FileSystemFileEntry).prototype);
+        internalsFor(entry).fileSystemEntry = {fs, name, fullPath, directory};
+        return entry;
+    }
+    function entryState(value, directory) {
+        const state = value !== null && (typeof value === "object" || typeof value === "function")
+            ? internalsOf(value).fileSystemEntry : undefined;
+        if (!state || (directory !== undefined && state.directory !== directory))
+            throw new TypeError("Illegal invocation");
+        return state;
+    }
+    // Web IDL callback function arguments (optional unless `required`).
+    function entryCallback(value, what, required) {
+        if (value === undefined && !required) return null;
+        if (typeof value !== "function") throw new TypeError(what + " is not a function");
+        return value;
+    }
+    // Queue a task to invoke a callback with "report" (the DOM manipulation
+    // task source, as Chromium uses; the specification leaves it open).
+    function queueEntryCallback(callback, argument) {
+        if (!callback) return;
+        __queue_dom_task(() => {
+            try { messageApply(callback, undefined, [argument]); }
+            catch (error) { reportException(error, "Entries API callback"); }
+        });
+    }
+    // Web IDL dictionary FileSystemFlags {create, exclusive}, in order.
+    function entryFlags(options) {
+        if (options === undefined || options === null) return {create: false, exclusive: false};
+        if (typeof options !== "object" && typeof options !== "function")
+            throw new TypeError("FileSystemFlags must be an object");
+        const create = options.create, exclusive = options.exclusive;
+        return {create: create === undefined ? false : !!create, exclusive: exclusive === undefined ? false : !!exclusive};
+    }
+    class FileSystemEntry {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get isFile() { return !entryState(this).directory; }
+        get isDirectory() { return entryState(this).directory; }
+        get name() { return entryState(this).name; }
+        get fullPath() { return entryState(this).fullPath; }
+        get filesystem() {
+            const fs = entryState(this).fs;
+            if (!fs.object) {
+                fs.object = Object.create(FileSystem.prototype);
+                internalsFor(fs.object).entriesFileSystem = fs;
+            }
+            return fs.object;
+        }
+        // #dom-filesystementry-getparent.
+        getParent(successCallback, errorCallback) {
+            const state = entryState(this);
+            successCallback = entryCallback(successCallback, "successCallback", false);
+            errorCallback = entryCallback(errorCallback, "errorCallback", false);
+            const path = resolveEntryPath(state.fullPath, "..");
+            const item = evaluateEntryPath(state.fs.root, path);
+            if (!item || !item.directory) {
+                queueEntryCallback(errorCallback, new DOMException("The parent no longer exists", "NotFoundError"));
+                return;
+            }
+            queueEntryCallback(successCallback, makeEntry(state.fs, item.name, path, true));
+        }
+    }
+    class FileSystemDirectoryEntry extends FileSystemEntry {
+        // #dom-filesystemdirectoryentry-createreader.
+        createReader() {
+            const state = entryState(this, true);
+            const reader = Object.create(FileSystemDirectoryReader.prototype);
+            internalsFor(reader).directoryReader = {entry: state, directory: null, members: null,
+                reading: false, done: false, error: null};
+            return reader;
+        }
+        getFile(path, options, successCallback, errorCallback) {
+            return entryLookup(this, path, options, successCallback, errorCallback, false);
+        }
+        getDirectory(path, options, successCallback, errorCallback) {
+            return entryLookup(this, path, options, successCallback, errorCallback, true);
+        }
+    }
+    // #dom-filesystemdirectoryentry-getfile and -getdirectory.
+    function entryLookup(entry, path, options, successCallback, errorCallback, directory) {
+        const state = entryState(entry, true);
+        path = path === undefined || path === null ? "" : idlUSVString(path);
+        const flags = entryFlags(options);
+        successCallback = entryCallback(successCallback, "successCallback", false);
+        errorCallback = entryCallback(errorCallback, "errorCallback", false);
+        if (!validEntryPath(path)) {
+            queueEntryCallback(errorCallback, new DOMException("The path is not valid", "TypeMismatchError"));
+            return;
+        }
+        if (flags.create) {
+            queueEntryCallback(errorCallback, new DOMException("Entries cannot be created", "SecurityError"));
+            return;
+        }
+        const resolved = resolveEntryPath(state.fullPath, path);
+        const item = evaluateEntryPath(state.fs.root, resolved);
+        if (!item) {
+            queueEntryCallback(errorCallback, new DOMException("No entry has that path", "NotFoundError"));
+            return;
+        }
+        if (item.directory !== directory) {
+            queueEntryCallback(errorCallback, new DOMException(directory ? "The entry is not a directory"
+                : "The entry is not a file", "TypeMismatchError"));
+            return;
+        }
+        queueEntryCallback(successCallback, makeEntry(state.fs, item.name, resolved, directory));
+    }
+    // #api-directoryreader: entries are produced in batches of this many.
+    const DIRECTORY_READER_BATCH = 100;
+    class FileSystemDirectoryReader {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        // #dom-filesystemdirectoryentry-readentries.
+        readEntries(successCallback, errorCallback) {
+            const reader = internalsOf(this).directoryReader;
+            if (!reader) throw new TypeError("Illegal invocation");
+            successCallback = entryCallback(successCallback, "successCallback", true);
+            errorCallback = entryCallback(errorCallback, "errorCallback", false);
+            if (reader.reading) {
+                queueEntryCallback(errorCallback, new DOMException("A read is in progress", "InvalidStateError"));
+                return;
+            }
+            if (reader.error !== null) { queueEntryCallback(errorCallback, reader.error); return; }
+            if (reader.done) { queueEntryCallback(successCallback, []); return; }
+            reader.reading = true;
+            const fail = (error) => __queue_dom_task(() => {
+                reader.error = error;
+                reader.reading = false;
+                if (errorCallback) {
+                    try { messageApply(errorCallback, undefined, [error]); }
+                    catch (thrown) { reportException(thrown, "Entries API callback"); }
+                }
+            });
+            if (reader.directory === null) {
+                const directory = evaluateEntryPath(reader.entry.fs.root, reader.entry.fullPath);
+                if (!directory || !directory.directory) {
+                    fail(new DOMException("The directory no longer exists", "NotFoundError"));
+                    return;
+                }
+                reader.directory = directory;
+                try { reader.members = Array.from(entriesMembers(directory).values()); }
+                catch (error) { fail(error); return; }
+            }
+            const batch = reader.members.splice(0, DIRECTORY_READER_BATCH);
+            const base = reader.entry.fullPath === "/" ? "" : reader.entry.fullPath;
+            const entries = batch.map((node) => makeEntry(reader.entry.fs, node.name, base + "/" + node.name, node.directory));
+            __queue_dom_task(() => {
+                if (!entries.length) reader.done = true;
+                reader.reading = false;
+                try { messageApply(successCallback, undefined, [entries]); }
+                catch (error) { reportException(error, "Entries API callback"); }
+            });
+        }
+    }
+    class FileSystemFileEntry extends FileSystemEntry {
+        // #dom-filesystemfileentry-file.
+        file(successCallback, errorCallback) {
+            const state = entryState(this, false);
+            successCallback = entryCallback(successCallback, "successCallback", true);
+            errorCallback = entryCallback(errorCallback, "errorCallback", false);
+            const item = evaluateEntryPath(state.fs.root, state.fullPath);
+            if (!item) {
+                queueEntryCallback(errorCallback, new DOMException("The file no longer exists", "NotFoundError"));
+                return;
+            }
+            if (item.directory) {
+                queueEntryCallback(errorCallback, new DOMException("The entry is a directory", "TypeMismatchError"));
+                return;
+            }
+            queueEntryCallback(successCallback, entryNodeFile(item));
+        }
+    }
+    class FileSystem {
+        constructor() { throw new TypeError("Illegal constructor"); }
+        get name() {
+            const fs = internalsOf(this).entriesFileSystem;
+            if (!fs) throw new TypeError("Illegal invocation");
+            return fs.name;
+        }
+        get root() {
+            const fs = internalsOf(this).entriesFileSystem;
+            if (!fs) throw new TypeError("Illegal invocation");
+            if (!fs.rootEntry) fs.rootEntry = makeEntry(fs, "", "/", true);
+            return fs.rootEntry;
+        }
+    }
+    for (const C of [FileSystemEntry, FileSystemDirectoryEntry, FileSystemFileEntry, FileSystemDirectoryReader, FileSystem]) {
+        for (const name of Object.getOwnPropertyNames(C.prototype)) {
+            if (name === "constructor") continue;
+            Object.defineProperty(C.prototype, name, {...Object.getOwnPropertyDescriptor(C.prototype, name), enumerable: true});
+        }
+        Object.defineProperty(C.prototype, Symbol.toStringTag, {value: C.name, configurable: true});
+        Object.defineProperty(g, C.name, {value: C, writable: true, configurable: true});
+    }
+    // Web IDL #js-operations: lengths count required arguments.
+    for (const [C, name, length] of [[FileSystemEntry, "getParent", 0], [FileSystemDirectoryEntry, "getFile", 0],
+            [FileSystemDirectoryEntry, "getDirectory", 0], [FileSystemDirectoryReader, "readEntries", 1],
+            [FileSystemFileEntry, "file", 1]])
+        Object.defineProperty(C.prototype[name], "length", {value: length, configurable: true});
+    // #html-data: the drag data store's root directory holds its File
+    // items; each File item's entry is its member's.
+    function dragItemEntry(store, item) {
+        if (!store.entriesFileSystem) {
+            const root = entriesVirtualDirectory("", null);
+            const fs = newEntryFileSystem("trust-drag", root);
+            // The members follow the store's current File items.
+            root.hostId = null;
+            Object.defineProperty(root, "members", {get() {
+                const members = new Map();
+                for (const entry of store.items) {
+                    if (entry.kind !== "file" || !entry.data) continue;
+                    const node = fileAPI.isBlob(entry.data)
+                        ? {directory: false, name: fileAPI.name(entry.data), parent: root, record: null, file: entry.data}
+                        : entriesNodeFromRecord(entry.data, root);
+                    if (!members.has(node.name)) members.set(node.name, node);
+                }
+                return members;
+            }});
+            store.entriesFileSystem = fs;
+        }
+        const fs = store.entriesFileSystem;
+        const directory = fileAPI.isBlob(item.data) ? false : !!item.data[6];
+        const name = fileAPI.isBlob(item.data) ? fileAPI.name(item.data) : `${item.data[1]}`;
+        return makeEntry(fs, name, "/" + name, directory);
+    }
+    // #html-forms: an input's selected files as entries of a file system of
+    // their own. A webkitdirectory selection's relative paths name the
+    // selected directories (its entries); other files are members of the
+    // root directory.
+    function inputEntries(files) {
+        const root = entriesVirtualDirectory("", null);
+        const fs = newEntryFileSystem("trust-input", root);
+        const entries = [];
+        for (const file of files) {
+            const relative = fileAPI.relativePath(file);
+            const segments = relative ? relative.split("/").filter((segment) => segment !== "") : [];
+            if (segments.length > 1) {
+                let directory = root;
+                for (let i = 0; i < segments.length - 1; i++) {
+                    let next = directory.members.get(segments[i]);
+                    if (!next) {
+                        next = entriesVirtualDirectory(segments[i], directory);
+                        directory.members.set(segments[i], next);
+                        if (directory === root) entries.push(makeEntry(fs, segments[i], "/" + segments[i], true));
+                    }
+                    if (!next.directory) break;
+                    directory = next;
+                }
+                const name = segments[segments.length - 1];
+                if (!directory.members.has(name))
+                    directory.members.set(name, {directory: false, name, parent: directory, record: null, file});
+                continue;
+            }
+            const name = fileAPI.name(file);
+            if (root.members.has(name)) continue;
+            root.members.set(name, {directory: false, name, parent: root, record: null, file});
+            entries.push(makeEntry(fs, name, "/" + name, false));
+        }
+        return Object.freeze(entries);
     }
 
     // HTML #fire-a-dnd-event at an element of this Realm. `pointer` holds the
@@ -28270,11 +28768,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // measurement and renders too few cards.
     const RO = [];
     let roInitialUpdatePending = false;
+    // Called after every task: each Realm also takes the arena's records of
+    // its autofocus insertions and style block updates here.
     trust.hasRenderingUpdate = function () {
-        if (ioInitialUpdatePending || roInitialUpdatePending || lazyImageUpdatePending ||
-            PENDING_ELEMENT_SCROLLS.size > 0 || viewportScrollRequest !== null) return true;
-        for (const child of renderingChildren()) if (child.hasRenderingUpdate()) return true;
-        return false;
+        styleLoadTask();
+        let pending = autofocusRenderingUpdate() || ioInitialUpdatePending || roInitialUpdatePending ||
+            lazyImageUpdatePending || PENDING_ELEMENT_SCROLLS.size > 0 || viewportScrollRequest !== null;
+        for (const child of renderingChildren()) if (child.hasRenderingUpdate()) pending = true;
+        // A child's insertion steps append to this Document's candidates.
+        return pending || autofocusRenderingUpdate();
     };
     trust.hasResizeObserver = function () {
         if (RO.length) return true;
@@ -30962,6 +31464,186 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (__dom_inert(nodeIds.get(area))) return;
         focusElement(area, options || {preventScroll: true});
     }
+    // ---- Autofocus (HTML #the-autofocus-attribute, local whatwg/html e5071a20) ----
+    // The top-level Document's autofocus candidates and autofocus processed
+    // flag belong to the top-level Realm; a child Realm's insertion steps
+    // append to them. The arena records the autofocus elements each
+    // insertion into a document inserted, parser-inserted ones included,
+    // while the flag is false (`dom::autofocus`); each Realm takes its own
+    // at the end of a task and runs the remaining insertion steps.
+    const autofocusState = { candidates: [], processed: false, parsed: null };
+    if (!cfg.parentWindow) __dom_autofocus("record", true);
+    // The native parse inserted this Document's elements before its Realm
+    // ran: snapshot those with the attribute now, before any author script
+    // can add or remove one.
+    {
+        const parsed = g.document ? __dom_autofocus("parsed", nodeIds.get(g.document)) : null;
+        autofocusState.parsed = parsed === null ? [] : Array.from(parsed, (id) => wrap(id));
+    }
+    trust.autofocusTop = function () {
+        const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
+        return parent ? parent.autofocusTop() : trust;
+    };
+    // Set the top-level Document's autofocus processed flag, emptying its
+    // autofocus candidates; nothing is recorded any longer.
+    trust.setAutofocusProcessed = function () {
+        autofocusState.candidates.length = 0;
+        if (autofocusState.processed) return;
+        autofocusState.processed = true;
+        __dom_autofocus("record", false);
+    };
+    // Insertion steps 6-7 at the top-level Document: remove the element
+    // from the candidates and append it, unless the flag is set.
+    trust.addAutofocusCandidate = function (element, owner) {
+        if (autofocusState.processed) return;
+        const candidates = autofocusState.candidates;
+        for (let i = 0; i < candidates.length; i++) {
+            if (candidates[i][0] === element) { candidates.splice(i, 1); break; }
+        }
+        candidates.push([element, owner]);
+    };
+    // HTML #sandboxed-automatic-features-browsing-context-flag: a sandbox
+    // attribute without allow-scripts (#parse-a-sandboxing-directive) on
+    // this navigable's container or an ancestor navigable's.
+    trust.sandboxedAutomaticFeatures = function () {
+        if (!realmRootFrame) return false;
+        const sandbox = __dom_get_attr(nodeIds.get(realmRootFrame), "sandbox");
+        if (sandbox !== null && !sandbox.replace(/[A-Z]/g, (c) => c.toLowerCase())
+                .split(/[\t\n\f\r ]+/).includes("allow-scripts"))
+            return true;
+        const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
+        return !!parent && parent.sandboxedAutomaticFeatures();
+    };
+    // The steps run when an element with the autofocus attribute is
+    // inserted into a document (step 1, the user's indication, is not
+    // modeled).
+    function autofocusInsertionSteps(element) {
+        // Steps 2-3. Documents without a browsing context (DOMParser,
+        // createHTMLDocument) are never fully active.
+        const target = element.ownerDocument;
+        if (target !== g.document || !documentFullyActive(target)) return;
+        // Step 4.
+        if (trust.sandboxedAutomaticFeatures()) return;
+        // Step 5.
+        if (!allowFocusSteps(target)) return;
+        // Steps 6-7.
+        trust.autofocusTop().addAutofocusCandidate(element, trust);
+    }
+    // Run the insertion steps for this Realm's recorded insertions: first
+    // those of the native parse, which inserted its Document's elements in
+    // tree order before this Realm ran, then those since.
+    function takeAutofocusInsertions() {
+        if (autofocusState.parsed !== null) {
+            const parsed = autofocusState.parsed;
+            autofocusState.parsed = null;
+            if (!trust.autofocusTop().autofocusProcessed()) {
+                for (let i = 0; i < parsed.length; i++)
+                    if (parsed[i]) autofocusInsertionSteps(parsed[i]);
+            }
+        }
+        const ids = __dom_autofocus("take");
+        if (ids === null) return;
+        for (let i = 0; i < ids.length; i++) {
+            const element = wrap(ids[i]);
+            if (element) autofocusInsertionSteps(element);
+        }
+    }
+    trust.takeAutofocusInsertions = takeAutofocusInsertions;
+    trust.autofocusProcessed = function () { return autofocusState.processed; };
+    // HTML #target-element of this Realm's Document: the element `:target`
+    // matches, or the one a fragment the Document still has to scroll to
+    // indicates (#find-a-potential-indicated-element): the native parse is
+    // complete, so "try to scroll to the fragment" would already have found
+    // it.
+    function documentTargetElement() {
+        const current = g.document.querySelector(":target");
+        if (current) return current;
+        const fragment = trust.scrollFragment;
+        if (typeof fragment !== "string" || fragment === "") return null;
+        const find = (name) => {
+            const byId = g.document.getElementById(name);
+            if (byId) return byId;
+            const anchors = g.document.getElementsByTagName("a");
+            for (let i = 0; i < anchors.length; i++)
+                if (anchors[i].getAttribute("name") === name) return anchors[i];
+            return null;
+        };
+        let found = find(fragment);
+        if (!found) {
+            let decoded = null;
+            try { decoded = decodeURIComponent(fragment); } catch (_) {}
+            if (decoded !== null && decoded !== fragment) found = find(decoded);
+        }
+        return found;
+    }
+    // Flush steps 5.2-5.4 for a candidate this Realm appended: its node
+    // document is fully active and its navigable's top-level traversable
+    // is the flushing Document's.
+    trust.autofocusDocumentActive = function (element, top) {
+        return element.ownerDocument === g.document && documentFullyActive(g.document)
+            && trust.autofocusTop() === top;
+    };
+    // Steps 5.7-5.8: a Document of the inclusive ancestor navigables has a
+    // target element.
+    trust.autofocusAncestorTarget = function () {
+        if (documentTargetElement() !== null) return true;
+        const parent = cfg.parentWindow && trustOf(cfg.parentWindow);
+        return !!parent && parent.autofocusAncestorTarget();
+    };
+    // Steps 5.9-5.10.3.
+    trust.autofocusFocus = function (element) {
+        const target = elementCanFocus(element) ? element : focusableAreaFor(element, "other");
+        if (target === null) return false;
+        trust.autofocusTop().setAutofocusProcessed();
+        focusingSteps(target);
+        return true;
+    };
+    // HTML #flush-autofocus-candidates for this top-level Document, at the
+    // rendering update (#update-the-rendering, before the resize steps).
+    function flushAutofocusCandidates() {
+        const state = autofocusState;
+        // Steps 1-3.
+        if (state.processed) return;
+        const candidates = state.candidates;
+        if (!candidates.length) return;
+        // Step 4: the focused area (after focus fixup) is not the Document
+        // itself, or the Document has a target element.
+        activeElementFor(g.document);
+        if (focusedArea !== null || documentTargetElement() !== null) {
+            trust.setAutofocusProcessed();
+            return;
+        }
+        // Step 5.
+        while (candidates.length && !state.processed) {
+            const [element, owner] = candidates[0];
+            let active = false;
+            try { active = owner.autofocusDocumentActive(element, trust); } catch (_) {}
+            if (!active) { candidates.shift(); continue; }
+            // Step 5.5: TRust obtains a Document's parser-inserted style
+            // sheets before its scripts run, so its script-blocking style
+            // sheet set is empty whenever this runs.
+            candidates.shift();
+            if (owner.autofocusAncestorTarget()) continue;
+            owner.autofocusFocus(element);
+        }
+    }
+    // Whether the next rendering update has autofocus work: this Realm's
+    // insertions are taken first.
+    function autofocusRenderingUpdate() {
+        takeAutofocusInsertions();
+        return !cfg.parentWindow && !autofocusState.processed && autofocusState.candidates.length > 0;
+    }
+    trust.flushAutofocusCandidates = function (records) {
+        for (const [documentTrust, active] of records)
+            if (active()) documentTrust.takeAutofocusInsertions();
+        if (!cfg.parentWindow) flushAutofocusCandidates();
+    };
+    // Dialog and popover focusing steps' final steps: when the focused
+    // control's origin is the top-level Document's, empty its autofocus
+    // candidates and set its autofocus processed flag.
+    function autofocusProcessedByFocusingSteps() {
+        if (sameOriginWithTopLevel()) trust.autofocusTop().setAutofocusProcessed();
+    }
     // The DOM anchor of `document`'s focused area of the document. This
     // reads the focused area as it is, before any focus fixup: a modal
     // dialog's previously focused element is the one focused when it became
@@ -31062,6 +31744,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (control === null) control = focusDelegate(subject);
         if (control === null) control = subject;
         focusingSteps(control);
+        // Steps 7-10.
+        autofocusProcessedByFocusingSteps();
     }
     // HTML #show-a-modal-dialog.
     function showModalDialog(subject, source) {
@@ -31310,6 +31994,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const control = subject.hasAttribute("autofocus") ? subject : autofocusDelegate(subject, "other");
         if (control === null) return;
         focusingSteps(control);
+        // Steps 7-10.
+        autofocusProcessedByFocusingSteps();
     }
     // HTML #show-popover.
     function showPopoverAlgorithm(element, throwExceptions, source) {
@@ -32984,6 +33670,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // after its timer-lane offset was sampled; that offset is not the
             // Window's eventual clock origin.
             const frameTime = __epoch0 + absMs - agentTimeOffset;
+            // HTML #update-the-rendering: flush autofocus candidates for the
+            // top-level Document, before the resize and scroll steps.
+            trust.flushAutofocusCandidates(records);
             trust.runScrollSteps();
             // HTML #update-the-rendering / Web Animations #animation-frame-loop:
             // sample effects and dispatch their events before invoking rAF.
@@ -38624,6 +39313,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         lastModified(value) { return slotsOf(value).file.lastModified; },
         // The selected-file id of a File the user chose, if any.
         userFile(value) { return slotsOf(value).file.userFile; },
+        // Entries API #dom-file-webkitrelativepath, and whether the File
+        // stands for a dropped directory (#html-data).
+        relativePath(value) { return slotsOf(value).file.relativePath; },
+        userDirectory(value) { return slotsOf(value).file.userDirectory; },
         createBlob(bytes, type) { return createBlob(bytes, normalizeType(type || "")); },
         createFile(bytes, name, type, lastModified) {
             return createFile(bytes, name, normalizeType(type || ""), lastModified === undefined ? apply(dateNow, Date, []) : lastModified);
@@ -44392,11 +45085,20 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     platformSlots.timeRanges || platformSlots.mediaQueryList ||
                     platformSlots.mediaQueryListEvent || platformSlots.locationObject))
                 throw dce("A platform object");
-            // WebAssembly.Tag and WebAssembly.Exception are not [Serializable] (JS API
-            // #tags, #exceptions); their store addresses may be 0.
+            // Of the WebAssembly interfaces only Module is [Serializable]
+            // (Web API #serialization); Instance, Memory, Table, Global, Tag
+            // and Exception are not (JS API), so HTML
+            // #structuredserializeinternal throws a DataCloneError. Their
+            // store addresses may be 0.
             if (platformSlots && (platformSlots.wasmTag !== undefined ||
-                    platformSlots.wasmExn !== undefined))
-                throw dce("A WebAssembly.Tag or WebAssembly.Exception");
+                    platformSlots.wasmExn !== undefined || platformSlots.wasmGlobal !== undefined ||
+                    platformSlots.wasmMemory !== undefined || platformSlots.wasmTable !== undefined ||
+                    platformSlots.wasmInstanceExports !== undefined))
+                throw dce("A WebAssembly." + (platformSlots.wasmTag !== undefined ? "Tag"
+                    : platformSlots.wasmExn !== undefined ? "Exception"
+                    : platformSlots.wasmGlobal !== undefined ? "Global"
+                    : platformSlots.wasmMemory !== undefined ? "Memory"
+                    : platformSlots.wasmTable !== undefined ? "Table" : "Instance"));
             // Streams #rs-transfer, #ws-transfer and #ts-transfer: streams are
             // transferable, not serializable. Outside the transfer list they,
             // like their readers, writers, controllers and strategies, are
@@ -47101,7 +47803,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return out;
         }
         static customSections(module, sectionName) {
-            return __wasm_module_custom_sections(moduleId(module), String(sectionName));
+            const id = moduleId(module);
+            if (arguments.length < 2) {
+                throw new TypeError("WebAssembly.Module.customSections: 2 arguments required");
+            }
+            return __wasm_module_custom_sections(id, `${sectionName}`);
         }
     }
 
@@ -47176,6 +47882,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             apply(weakSet, wasmSlots, [value, record]);
         }
         record[kind] = address;
+    }
+    // Web IDL #js-operations / #js-attributes: an operation or attribute
+    // of an interface checks that `this` implements it (the internal slot
+    // [[Global]], [[Memory]], [[Table]] or [[Exports]] is present).
+    function brandAddress(value, kind, name) {
+        const address = wasmAddress(value, kind);
+        if (address === undefined) {
+            throw new TypeError("Illegal invocation: not a WebAssembly." + name);
+        }
+        return address;
     }
     const functionCache = g.__wasm_function_cache;
     delete g.__wasm_function_cache;
@@ -47265,23 +47981,32 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     class Global {
         constructor(descriptor, v) {
-            if (typeof descriptor !== "object" || descriptor === null) {
+            // Web IDL #js-dictionary: GlobalDescriptor's members convert
+            // once each, in lexicographic order (mutable, then the required
+            // ValueType enumeration value).
+            if (descriptor !== undefined && descriptor !== null && !isObject(descriptor)) {
                 throw new TypeError("WebAssembly.Global: descriptor must be an object");
             }
-            const type = String(descriptor.value);
+            const mutableValue = descriptor == null ? undefined : descriptor.mutable;
+            const mutable = mutableValue === undefined ? false : !!mutableValue;
+            const typeValue = descriptor == null ? undefined : descriptor.value;
+            if (typeValue === undefined) {
+                throw new TypeError("WebAssembly.Global: value is required");
+            }
+            const type = toValueTypeString(typeValue);
             const value = arguments.length < 2 ? defaultWasmValue(type) : v;
-            const id = __wasm_global_new(type, !!descriptor.mutable, value);
+            const id = __wasm_global_new(type, mutable, value);
             setWasmAddress(this, "wasmGlobal", id);
             globalWrappers.set(id, this);
         }
         get value() {
-            return __wasm_global_get(wasmAddress(this, "wasmGlobal"));
+            return __wasm_global_get(brandAddress(this, "wasmGlobal", "Global"));
         }
         set value(v) {
-            __wasm_global_set(wasmAddress(this, "wasmGlobal"), v);
+            __wasm_global_set(brandAddress(this, "wasmGlobal", "Global"), v);
         }
         valueOf() {
-            return __wasm_global_get(wasmAddress(this, "wasmGlobal"));
+            return __wasm_global_get(brandAddress(this, "wasmGlobal", "Global"));
         }
     }
 
@@ -47331,15 +48056,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             memoryWrappers.set(id, this);
         }
         get buffer() {
-            return __wasm_memory_buffer(wasmAddress(this, "wasmMemory"));
+            return __wasm_memory_buffer(brandAddress(this, "wasmMemory", "Memory"));
         }
         grow(delta) {
-            return __wasm_memory_grow(wasmAddress(this, "wasmMemory"), addressU32(delta));
+            const address = brandAddress(this, "wasmMemory", "Memory");
+            if (arguments.length < 1) throw new TypeError("WebAssembly.Memory.grow: 1 argument required");
+            return __wasm_memory_grow(address, addressU32(delta));
         }
         toFixedLengthBuffer() {
-            return this.buffer;
+            return __wasm_memory_buffer(brandAddress(this, "wasmMemory", "Memory"));
         }
         toResizableBuffer() {
+            brandAddress(this, "wasmMemory", "Memory");
             throw new TypeError("WebAssembly.Memory: resizable buffers are not supported");
         }
     }
@@ -47360,19 +48088,30 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     class Table {
         constructor(descriptor, value) {
-            if (typeof descriptor !== "object" || descriptor === null) {
+            // Web IDL #js-dictionary: TableDescriptor's members convert once
+            // each, in lexicographic order: address, element, initial,
+            // maximum.
+            if (descriptor !== undefined && descriptor !== null && !isObject(descriptor)) {
                 throw new TypeError("WebAssembly.Table: descriptor must be an object");
             }
-            if (descriptor.initial === undefined) {
-                throw new TypeError("WebAssembly.Table: initial is required");
-            }
-            if (descriptor.address !== undefined && descriptor.address !== "i32") {
+            const member = (name) => (descriptor == null ? undefined : descriptor[name]);
+            const address = member("address");
+            if (address !== undefined && `${address}` !== "i32") {
                 throw new TypeError("WebAssembly.Table: unsupported address type");
             }
-            const element = String(descriptor.element);
-            const initial = addressU32(descriptor.initial);
-            const maximum =
-                descriptor.maximum === undefined ? -1 : addressU32(descriptor.maximum);
+            const elementValue = member("element");
+            if (elementValue === undefined) throw new TypeError("WebAssembly.Table: element is required");
+            const element = `${elementValue}`;
+            if (element !== "externref" && element !== "anyfunc") {
+                throw new TypeError("WebAssembly.Table: '" + element + "' is not a valid TableKind");
+            }
+            const initialValue = member("initial");
+            if (initialValue === undefined) {
+                throw new TypeError("WebAssembly.Table: initial is required");
+            }
+            const initial = addressU32(initialValue);
+            const maximumValue = member("maximum");
+            const maximum = maximumValue === undefined ? -1 : addressU32(maximumValue);
             if (arguments.length < 2) value = defaultWasmValue(element);
             const id = __wasm_table_new(element, initial, maximum, value);
             setWasmAddress(this, "wasmTable", id);
@@ -47380,25 +48119,34 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             tableWrappers.set(id, this);
         }
         get length() {
-            return __wasm_table_length(wasmAddress(this, "wasmTable"));
+            return __wasm_table_length(brandAddress(this, "wasmTable", "Table"));
         }
         get(index) {
+            const address = brandAddress(this, "wasmTable", "Table");
+            if (arguments.length < 1) throw new TypeError("WebAssembly.Table.get: 1 argument required");
+            const position = addressU32(index);
             // js-api Table.get step 4: exnref elements never reach JavaScript.
             if (wasmAddress(this, "tableElement") === "exnref") {
                 throw new TypeError("WebAssembly.Table.get: exnref elements cannot be read");
             }
-            return __wasm_table_get(wasmAddress(this, "wasmTable"), addressU32(index));
+            return __wasm_table_get(address, position);
         }
         set(index, value) {
+            const address = brandAddress(this, "wasmTable", "Table");
+            if (arguments.length < 1) throw new TypeError("WebAssembly.Table.set: 1 argument required");
+            const position = addressU32(index);
             if (wasmAddress(this, "tableElement") === "exnref") {
                 throw new TypeError("WebAssembly.Table.set: exnref elements cannot be written");
             }
             if (arguments.length < 2) value = defaultWasmValue(wasmAddress(this, "tableElement"));
-            return __wasm_table_set(wasmAddress(this, "wasmTable"), addressU32(index), value);
+            __wasm_table_set(address, position, value);
         }
         grow(delta, value) {
+            const address = brandAddress(this, "wasmTable", "Table");
+            if (arguments.length < 1) throw new TypeError("WebAssembly.Table.grow: 1 argument required");
+            const count = addressU32(delta);
             if (arguments.length < 2) value = defaultWasmValue(wasmAddress(this, "tableElement"));
-            return __wasm_table_grow(wasmAddress(this, "wasmTable"), addressU32(delta), value);
+            return __wasm_table_grow(address, count, value);
         }
     }
 
@@ -47759,10 +48507,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // imported table. Its imports must survive even when no Instance is returned.
             const moduleIndex = moduleId(module);
             const id = unwrap(__wasm_instantiate(moduleIndex, binding.token, binding.descriptor, binding.references));
-            Object.defineProperty(this, "exports", {
-                value: buildExports(id, moduleIndex),
-                enumerable: true,
-            });
+            // JS API "initialize an instance object": the exports object is
+            // the [[Exports]] internal slot the `exports` attribute returns.
+            setWasmAddress(this, "wasmInstanceExports", buildExports(id, moduleIndex));
+        }
+        get exports() {
+            return brandAddress(this, "wasmInstanceExports", "Instance");
         }
     }
 
@@ -47823,31 +48573,73 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         });
     }
 
-    const WebAssembly = {
-        Module: Module,
-        Instance: Instance,
-        Global: Global,
-        Memory: Memory,
-        Table: Table,
-        CompileError: CompileError,
-        LinkError: LinkError,
-        RuntimeError: RuntimeError,
-        validate: validate,
-        compile: compile,
-        compileStreaming: compileStreaming,
-        instantiate: instantiate,
-        instantiateStreaming: instantiateStreaming,
+    // Web IDL #namespace-object (JS API #webassembly-namespace and the Web
+    // API's partial namespace, local spec repository 37d6b059): the
+    // namespace's regular operations are writable, enumerable, configurable
+    // built-in functions that are not constructors, with the length of
+    // their shortest overload.
+    const operations = {
+        validate(bytes) { return validate(bytes); },
+        compile(bytes) { return compile(bytes); },
+        instantiate(bytes) { return apply(instantiate, undefined, [bytes, arguments[1]]); },
+        compileStreaming(source) { return compileStreaming(source); },
+        instantiateStreaming(source) {
+            return apply(instantiateStreaming, undefined, [source, arguments[1]]);
+        },
     };
+    const WebAssembly = {};
+    for (const name of ["validate", "compile", "instantiate", "compileStreaming", "instantiateStreaming"]) {
+        const operation = operations[name];
+        const required = operation.length;
+        const checked = {
+            [name]() {
+                if (arguments.length < required) {
+                    throw new TypeError("WebAssembly." + name + ": " + required + " argument required");
+                }
+                return apply(operation, undefined, arguments);
+            },
+        }[name];
+        defineProperty(checked, "length", { value: required, configurable: true });
+        defineProperty(WebAssembly, name, {
+            value: checked, writable: true, enumerable: true, configurable: true
+        });
+    }
     Object.defineProperty(WebAssembly, Symbol.toStringTag, {
         value: "WebAssembly",
         configurable: true,
     });
     // [LegacyNamespace=WebAssembly] interfaces are writable, configurable,
-    // non-enumerable properties of the namespace (Web IDL #legacy-namespace).
-    defineProperty(WebAssembly, "Tag", { value: Tag, writable: true, configurable: true });
-    defineProperty(WebAssembly, "Exception", {
-        value: Exception, writable: true, configurable: true
-    });
+    // non-enumerable properties of the namespace (Web IDL #legacy-namespace),
+    // and JS API #error-objects defines each NativeError-structured error
+    // constructor with DefineMethodProperty(namespace, name, constructor,
+    // false): writable, configurable and not enumerable.
+    for (const [name, value] of [["Module", Module], ["Instance", Instance], ["Memory", Memory],
+            ["Table", Table], ["Global", Global], ["Tag", Tag], ["Exception", Exception],
+            ["CompileError", CompileError], ["LinkError", LinkError], ["RuntimeError", RuntimeError]])
+        defineProperty(WebAssembly, name, { value, writable: true, configurable: true });
+    // Web IDL #interface-object, #interface-prototype-object, #js-operations
+    // and #js-attributes for the interfaces: the constructor's length is its
+    // shortest argument list, static and regular operations and attributes
+    // are enumerable, and @@toStringTag is the qualified name
+    // ("WebAssembly." + identifier, Web IDL #dfn-qualified-name).
+    for (const [Interface, length] of [[Module, 1], [Instance, 1], [Memory, 1], [Table, 1], [Global, 1]]) {
+        defineProperty(Interface, "length", { value: length, configurable: true });
+        for (const target of [Interface, Interface.prototype]) {
+            for (const key of Object.getOwnPropertyNames(target)) {
+                if (key === "constructor" || key === "prototype" || key === "length" || key === "name") continue;
+                const descriptor = Object.getOwnPropertyDescriptor(target, key);
+                descriptor.enumerable = true;
+                defineProperty(target, key, descriptor);
+            }
+        }
+        defineProperty(Interface.prototype, Symbol.toStringTag, {
+            value: "WebAssembly." + Interface.name, configurable: true
+        });
+    }
+    // Operations whose trailing arguments are optional have the length of
+    // their required arguments.
+    for (const [target, name, length] of [[Table.prototype, "grow", 1], [Table.prototype, "set", 1]])
+        defineProperty(target[name], "length", { value: length, configurable: true });
     // The JSTag namespace attribute: an enumerable, configurable accessor
     // without a setter whose getter is named "get JSTag".
     defineProperty(WebAssembly, "JSTag", {
@@ -47859,7 +48651,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         enumerable: true,
         configurable: true,
     });
-    g.WebAssembly = WebAssembly;
+    // Web IDL #namespace-object: the namespace is a writable, configurable,
+    // non-enumerable property of the global object.
+    defineProperty(g, "WebAssembly", { value: WebAssembly, writable: true, configurable: true });
     // The native Wasm bridge reaches these operations through this Realm's
     // private control object (Window or worker), never through the global.
     const bridge = Object.create(null);

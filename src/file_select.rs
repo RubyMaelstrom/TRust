@@ -160,6 +160,47 @@ pub fn selection_from_paths(
     Ok(out)
 }
 
+/// File and Directory Entries API #api-directoryreader and #evaluate-a-path
+/// over a directory the user dropped: its current members, files and real
+/// directories (a symbolic link to a directory could form a cycle and is
+/// left out), in name order, without their relative paths. At most
+/// `MAX_DIRECTORY_FILES` members are listed.
+pub fn directory_members(dir: &Path) -> Result<Vec<SelectedFile>, String> {
+    let metadata = std::fs::metadata(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot list {}: {error}", dir.display()))?
+        .filter_map(Result::ok)
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let Ok(link) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if (metadata.is_dir() && link.file_type().is_symlink())
+            || !(metadata.is_dir() || metadata.is_file())
+        {
+            continue;
+        }
+        if out.len() >= MAX_DIRECTORY_FILES {
+            return Err(format!(
+                "{} holds more than {MAX_DIRECTORY_FILES} entries",
+                dir.display()
+            ));
+        }
+        out.push(SelectedFile::from_path(&path, String::new())?);
+    }
+    Ok(out)
+}
+
 fn expand_directory(
     dir: &Path,
     relative: &str,
@@ -703,6 +744,24 @@ impl UserFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_members_list_files_and_directories_in_name_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"bee").unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a").join("inner.txt"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("loop")).unwrap();
+        let members = directory_members(dir.path()).unwrap();
+        let names: Vec<_> = members
+            .iter()
+            .map(|file| (file.name.as_str(), file.directory, file.size))
+            .collect();
+        assert_eq!(names, [("a", true, 0), ("b.txt", false, 3)]);
+        assert!(directory_members(&dir.path().join("b.txt")).is_err());
+        assert!(directory_members(&dir.path().join("missing")).is_err());
+    }
 
     #[test]
     fn accept_tokens_follow_the_html_grammar() {

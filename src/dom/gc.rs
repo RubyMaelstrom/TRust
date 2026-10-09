@@ -228,6 +228,8 @@ impl Dom {
         self.top_layer_removed.retain(|id| !dead.contains(id));
         self.dirty_nodes.retain(|(id, _)| !dead.contains(id));
         self.created_images.retain(|(id, _)| !dead.contains(id));
+        self.autofocus.retain(|id| !dead.contains(&id));
+        self.style_load.retain(|id| !dead.contains(&id));
         self.import_requests
             .get_mut()
             .0
@@ -466,6 +468,8 @@ impl Dom {
         if self.fragment_target.is_some_and(|id| !valid(id)) {
             self.fragment_target = None;
         }
+        self.autofocus.retain(valid);
+        self.style_load.retain(valid);
         if self
             .resource_base_element_cache
             .get()

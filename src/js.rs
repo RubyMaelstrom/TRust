@@ -446,6 +446,14 @@ pub enum PageCmd {
         node: usize,
         open: bool,
     },
+    /// HTML #the-select-element: the user picked `option` of `select`
+    /// (#concept-select-pick), or toggled it (#concept-select-toggle) in a
+    /// select with `multiple`, through the frontend's drop-down box.
+    SelectPick {
+        select: usize,
+        option: usize,
+        toggle: bool,
+    },
     Submit {
         form: usize,
         submitter: Option<usize>,
@@ -641,10 +649,10 @@ pub struct FormSubmission {
 
 impl FormSubmission {
     /// The GET query, which the page's urlencoded serializer keeps ASCII.
+    /// HTML #submit-mutate-action sets the action URL's query to it even
+    /// when the entry list is empty.
     pub fn query(&self) -> Option<&str> {
-        std::str::from_utf8(&self.body)
-            .ok()
-            .filter(|query| !query.is_empty())
+        std::str::from_utf8(&self.body).ok()
     }
 }
 
