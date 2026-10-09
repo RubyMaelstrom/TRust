@@ -33,12 +33,14 @@ use wgpu::{CurrentSurfaceTexture, SurfaceConfiguration, TextureFormat, TextureVi
 use winit::window::Window;
 
 use super::vello_cpu::{
-    ImageCacheKey, MAX_REGISTERED_IMAGES, OwnedRgbaFrame, RasterClips, conic_transform,
-    decoration_strokes, erase_blend, gradient_extend, inset_shadow_hole, inset_shadow_ring,
-    offset_shape, outside_shape_path, point_bounds, premultiplied_pixmap, premultiply_rgba,
-    radial_aspect_transform, radial_gradient, rect_is_visible, rect_path, shadow_blur, shape_fill,
-    shape_is_visible, shape_path, simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend,
-    vello_color, vello_css_filter, vello_rect, vello_stops, vello_stroke,
+    BackdropPaint, EffectImage, EncodeBase, ImageCacheKey, MAX_REGISTERED_IMAGES, OpenLayer,
+    OwnedRgbaFrame, RasterClips, VelloCpuRenderer, conic_transform, decoration_strokes,
+    destination_in, erase_blend, gradient_extend, inset_shadow_hole, inset_shadow_ring,
+    native_clip_path, native_filter, offset_shape, outside_shape_path, point_bounds,
+    premultiplied_pixmap, premultiply_rgba, radial_aspect_transform, radial_gradient,
+    rect_is_visible, rect_path, shadow_blur, shape_fill, shape_is_visible, shape_path,
+    simple_rounded_rect, text_shadow_blur, vello_affine, vello_blend, vello_color,
+    vello_css_filter, vello_rect, vello_stops, vello_stroke,
 };
 use super::{
     Affine2d, CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling,
@@ -113,6 +115,10 @@ pub struct VelloHybridRenderer {
     presented: Vec<u32>,
     device_failure: Arc<Mutex<Option<String>>>,
     adapter_name: String,
+    /// The CPU reference renderer that rasterizes effects the GPU path does
+    /// not run (SVG filter graphs, Backdrop Root Images), created only while
+    /// scenes use them, so both backends filter identical pixels.
+    effects: Option<Box<VelloCpuRenderer>>,
 }
 
 impl VelloHybridRenderer {
@@ -251,6 +257,7 @@ impl VelloHybridRenderer {
             presented: Vec::new(),
             device_failure: failure,
             adapter_name,
+            effects: None,
         })
     }
 
@@ -766,8 +773,31 @@ impl VelloHybridRenderer {
             scene.viewport.css.height,
         ));
         target.set_transform(device_transform);
-        let mut layer_filters = Vec::new();
-        let mut filter_clip_layers = Vec::new();
+        let mut open_layers: Vec<OpenLayer> = Vec::new();
+        let base = EncodeBase {
+            device: device_transform,
+            logical: Affine2d::IDENTITY,
+            bounds: CssRect::new(
+                0.0,
+                0.0,
+                scene.viewport.css.width,
+                scene.viewport.css.height,
+            ),
+            target: (u32::from(width), u32::from(height)),
+        };
+        // Effects run on the CPU reference renderer; keep it only while the
+        // scene uses them.
+        let uses_effects = scene.primitives.iter().any(|command| {
+            matches!(command, DisplayCommand::PushLayer(layer)
+                if layer.backdrop.is_some() || layer.needs_offscreen_filters())
+        });
+        if uses_effects {
+            self.effects
+                .get_or_insert_with(|| Box::new(VelloCpuRenderer::new()))
+                .begin_effects_frame();
+        } else {
+            self.effects = None;
+        }
 
         let mut skip_until = 0;
         for (index, command) in scene.primitives.iter().enumerate() {
@@ -816,8 +846,8 @@ impl VelloHybridRenderer {
                     );
                 }
                 DisplayCommand::PopClip => {
-                    if clips.pop() {
-                        target.pop_clip();
+                    if let Some((shape, at)) = clips.pop_applied() {
+                        pop_clip_gpu(&mut target, shape, at, *transforms.last().unwrap());
                     }
                 }
                 DisplayCommand::PushTransform(transform) => {
@@ -846,25 +876,107 @@ impl VelloHybridRenderer {
                                 clips.bounds(),
                             )
                         });
-                    if hidden && let Some(end) = super::clipped_layer_end(&scene.primitives, index)
-                    {
+                    let end = (hidden || layer.needs_offscreen_filters())
+                        .then(|| super::clipped_layer_end(&scene.primitives, index))
+                        .flatten();
+                    if hidden && let Some(end) = end {
                         skip_until = end + 1;
                         continue;
                     }
                     apply_clips(&mut target, &mut clips, *transforms.last().unwrap());
+                    let layer_device = *transforms.last().unwrap();
+                    let layer_logical = *logical_transforms.last().unwrap();
+                    // Mirrors the CPU reference, which also renders these
+                    // effect pixels for this backend.
+                    let backdrop = match (&layer.backdrop, self.effects.as_mut()) {
+                        (Some(backdrop), Some(effects)) => {
+                            let root = open_layers.iter().rev().find(|open| open.backdrop_root);
+                            let (start, root_base, root_prelude) = match root {
+                                Some(open) => (
+                                    open.index + 1,
+                                    EncodeBase {
+                                        device: open.device,
+                                        logical: open.logical,
+                                        ..base
+                                    },
+                                    open.backdrop.clone(),
+                                ),
+                                None => (0, base, None),
+                            };
+                            effects
+                                .backdrop_paint(
+                                    scene,
+                                    &scene.primitives[start..index],
+                                    root_base,
+                                    root_prelude.as_deref(),
+                                    layer_device,
+                                    backdrop,
+                                    0,
+                                )
+                                .map(Arc::new)
+                        }
+                        _ => None,
+                    };
+                    if layer.needs_offscreen_filters()
+                        && let Some(end) = end
+                        && let Some(effects) = self.effects.as_mut()
+                        && effects.can_render_effect(0)
+                    {
+                        let background = open_layers.last().map_or((0, base), |open| {
+                            (
+                                open.index + 1,
+                                EncodeBase {
+                                    device: open.device,
+                                    logical: open.logical,
+                                    ..base
+                                },
+                            )
+                        });
+                        if let Some(image) = effects.filtered_layer_image(
+                            scene,
+                            &scene.primitives,
+                            (index, end),
+                            layer,
+                            (layer_device, layer_logical, base),
+                            backdrop.as_deref(),
+                            background,
+                            0,
+                        ) {
+                            target.set_transform(layer_device);
+                            target.push_layer(
+                                layer.clip.map(rect_path).as_ref(),
+                                Some(vello_blend(layer.blend, layer.compose)),
+                                Some(layer.opacity.clamp(0.0, 1.0)),
+                                None,
+                                None,
+                            );
+                            paint_effect_gpu(&mut target, &image);
+                            target.pop_layer();
+                        }
+                        skip_until = end + 1;
+                        continue;
+                    }
                     // Clip filter output to ancestor clips; see the CPU backend.
                     let mut clip_layers = 0;
+                    let native: Vec<&super::CssFilter> = layer
+                        .filters
+                        .iter()
+                        .filter(|filter| native_filter(filter))
+                        .collect();
                     // Only an isolated source-over group composites the same
                     // inside an extra layer; masks and blend modes need the
                     // real backdrop.
-                    if !layer.filters.is_empty()
+                    if !native.is_empty()
                         && layer.compose == super::CompositeOperator::SourceOver
                         && layer.blend == super::BlendMode::Normal
                     {
                         for (shape, at) in clips.active() {
+                            let Some(path) = native_clip_path(shape) else {
+                                continue;
+                            };
                             target.set_transform(at);
                             target.set_fill_rule(shape_fill(shape));
-                            target.push_layer(Some(&shape_path(shape)), None, None, None, None);
+                            target.push_layer(Some(&path), None, None, None, None);
                             clip_layers += 1;
                         }
                         if clip_layers > 0 {
@@ -872,7 +984,6 @@ impl VelloHybridRenderer {
                             target.set_transform(*transforms.last().unwrap());
                         }
                     }
-                    filter_clip_layers.push(clip_layers);
                     target.push_layer(
                         layer.clip.map(rect_path).as_ref(),
                         Some(vello_blend(layer.blend, layer.compose)),
@@ -880,17 +991,31 @@ impl VelloHybridRenderer {
                         None,
                         None,
                     );
-                    for filter in layer.filters.iter().rev() {
+                    for filter in native.iter().rev() {
                         target.push_layer(None, None, None, None, Some(vello_css_filter(filter)));
                     }
-                    layer_filters.push(layer.filters.len());
+                    if let Some(backdrop) = &backdrop {
+                        paint_backdrop_gpu(&mut target, backdrop, layer_device);
+                    }
+                    open_layers.push(OpenLayer {
+                        index,
+                        backdrop_root: layer.backdrop_root,
+                        device: layer_device,
+                        logical: layer_logical,
+                        backdrop,
+                        filter_layers: native.len(),
+                        clip_layers,
+                    });
                 }
                 DisplayCommand::PopLayer => {
-                    for _ in 0..layer_filters.pop().unwrap_or(0) {
+                    let Some(open) = open_layers.pop() else {
+                        continue;
+                    };
+                    for _ in 0..open.filter_layers {
                         target.pop_layer();
                     }
                     target.pop_layer();
-                    for _ in 0..filter_clip_layers.pop().unwrap_or(0) {
+                    for _ in 0..open.clip_layers {
                         target.pop_layer();
                     }
                 }
@@ -1535,11 +1660,98 @@ fn hybrid_image_pixels(image: &ImageResource, limit: u32) -> Option<(u16, u16, V
     ))
 }
 
+/// Mirrors `vello_cpu::paint_backdrop_cpu`.
+fn paint_backdrop_gpu(
+    target: &mut vello_gpu::Scene,
+    backdrop: &BackdropPaint,
+    layer_device: Affine,
+) {
+    target.set_transform(layer_device);
+    target.set_paint(ImageBrush {
+        image: ImageSource::Pixmap(Arc::clone(&backdrop.pixmap)),
+        sampler: ImageSampler::new().with_quality(ImageQuality::Medium),
+    });
+    target.set_paint_transform(backdrop.local_from_pixmap);
+    target.set_fill_rule(shape_fill(&backdrop.shape));
+    target.fill_path(&shape_path(&backdrop.shape));
+    target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+    target.reset_paint_transform();
+}
+
+/// Mirrors `vello_cpu::paint_effect_cpu`.
+fn paint_effect_gpu(target: &mut vello_gpu::Scene, image: &EffectImage) {
+    target.set_paint(ImageBrush {
+        image: ImageSource::Pixmap(Arc::clone(&image.pixmap)),
+        sampler: ImageSampler::new().with_quality(ImageQuality::Medium),
+    });
+    target.set_paint_transform(image.local_from_pixmap);
+    target.fill_rect(&image.local_rect);
+    target.reset_paint_transform();
+}
+
+/// Mirrors `vello_cpu::fill_coverage_cpu`.
+fn fill_coverage_gpu(target: &mut vello_gpu::Scene, geometry: &super::ClipGeometry) {
+    use super::ClipGeometry;
+    match geometry {
+        ClipGeometry::Path { elements, evenodd } => {
+            target.set_fill_rule(if *evenodd {
+                vello_common::peniko::Fill::EvenOdd
+            } else {
+                vello_common::peniko::Fill::NonZero
+            });
+            target.set_paint(vello_common::color::palette::css::BLACK);
+            target.fill_path(&shape_path(&super::PaintShape::Path(elements.clone())));
+        }
+        ClipGeometry::Union(parts) => {
+            for part in parts {
+                fill_coverage_gpu(target, part);
+            }
+        }
+        ClipGeometry::Intersection(parts) => {
+            let Some((first, rest)) = parts.split_first() else {
+                return;
+            };
+            target.push_layer(None, None, None, None, None);
+            fill_coverage_gpu(target, first);
+            for part in rest {
+                target.push_layer(None, Some(destination_in()), None, None, None);
+                fill_coverage_gpu(target, part);
+                target.pop_layer();
+            }
+            target.pop_layer();
+        }
+    }
+}
+
+/// Mirrors `vello_cpu::pop_clip_cpu`.
+fn pop_clip_gpu(
+    target: &mut vello_gpu::Scene,
+    shape: &super::PaintShape,
+    at: Affine,
+    current: Affine,
+) {
+    match shape {
+        super::PaintShape::Geometry(geometry) if geometry.single_path().is_none() => {
+            target.set_transform(at);
+            target.push_layer(None, Some(destination_in()), None, None, None);
+            fill_coverage_gpu(target, geometry);
+            target.pop_layer();
+            target.pop_layer();
+            target.set_fill_rule(vello_common::peniko::Fill::NonZero);
+            target.set_transform(current);
+        }
+        _ => target.pop_clip(),
+    }
+}
+
 fn apply_clips(target: &mut vello_gpu::Scene, clips: &mut RasterClips<'_>, transform: Affine) {
-    if clips.apply(|shape, at| {
-        target.set_transform(at);
-        target.set_fill_rule(shape_fill(shape));
-        target.push_clip_path(&shape_path(shape));
+    if clips.apply(|shape, at| match native_clip_path(shape) {
+        Some(path) => {
+            target.set_transform(at);
+            target.set_fill_rule(shape_fill(shape));
+            target.push_clip_path(&path);
+        }
+        None => target.push_layer(None, None, None, None, None),
     }) {
         target.set_fill_rule(vello_common::peniko::Fill::NonZero);
         target.set_transform(transform);

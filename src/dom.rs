@@ -68,6 +68,7 @@ mod slotting;
 mod svg_dependencies;
 pub(crate) mod svg_geometry;
 mod svg_references;
+mod svg_resources;
 mod transitions;
 mod validity;
 mod xml;
@@ -14382,11 +14383,18 @@ const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
     "shape-rendering",
     "stop-color",
     "stop-opacity",
+    "flood-color",
+    "flood-opacity",
+    "lighting-color",
+    "color-interpolation-filters",
+    "mask-type",
 ];
 
 /// The inherited members of `SVG_PRESENTATION_PROPERTIES` (SVG 2 property
-/// tables): `vector-effect`, `stop-color` and `stop-opacity` do not inherit.
+/// tables): `vector-effect`, `stop-color`, `stop-opacity`, `flood-color`,
+/// `flood-opacity`, `lighting-color` and `mask-type` do not inherit.
 const SVG_INHERITED_PRESENTATION_PROPERTIES: &[&str] = &[
+    "color-interpolation-filters",
     "fill",
     "fill-opacity",
     "fill-rule",
@@ -16760,6 +16768,15 @@ const PROPS: &[PropDef] = &[
     prop("shape-rendering", true, false),
     prop("stop-color", false, false),
     prop("stop-opacity", false, false),
+    // Filter Effects 1 #FloodColorProperty, #FloodOpacityProperty,
+    // #LightingColorProperty and #ColorInterpolationFiltersProperty, and CSS
+    // Masking 1 #the-mask-type: properties of filter primitives and masks,
+    // read when an SVG resource is resolved or serialized.
+    prop("flood-color", false, false),
+    prop("flood-opacity", false, false),
+    prop("lighting-color", false, false),
+    prop("color-interpolation-filters", true, false),
+    prop("mask-type", false, false),
     // CSS UI 4 §6.2/§6.3: both inherit and affect hit testing without
     // changing box generation. Bake them into live snapshots so the layout
     // arena sees the same interaction eligibility as the resident page DOM.
@@ -16929,6 +16946,8 @@ const PROPS: &[PropDef] = &[
     prop("background-blend-mode", false, true),
     prop("isolation", false, true),
     prop("filter", false, true),
+    // Filter Effects 2 #BackdropFilterProperty.
+    prop("backdrop-filter", false, true),
     prop("box-shadow", false, true),
     prop("z-index", false, true),
     prop("top", false, true),
@@ -27317,20 +27336,21 @@ mod tests {
         // A box type we don't lay out, and visual-only properties we don't
         // track, are unsupported → the page's fallback applies.
         assert!(!supports_condition("(display: ruby)"));
-        assert!(!supports_condition("(backdrop-filter: blur(1px))"));
         assert!(supports_condition(
             "(filter: blur(1px) drop-shadow(0 0 2px red))"
         ));
+        // Filter Effects 1 #FilterProperty `<url>` and Filter Effects 2
+        // #BackdropFilterProperty share the `<filter-value-list>` grammar.
+        assert!(supports_condition("(filter: url(#f) blur(1px))"));
+        assert!(supports_condition("(backdrop-filter: blur(1px))"));
+        assert!(supports_condition("(backdrop-filter: url(#f) saturate(2))"));
+        assert!(!supports_condition("(backdrop-filter: blur(-1px))"));
         // not / and / or / nesting.
         assert!(!supports_condition("not (display: grid)"));
-        assert!(supports_condition("not (backdrop-filter: blur(1px))"));
+        assert!(supports_condition("not (display: ruby)"));
         assert!(supports_condition("(display: grid) and (gap: 1rem)"));
-        assert!(!supports_condition(
-            "(display: grid) and (backdrop-filter: blur(1px))"
-        ));
-        assert!(supports_condition(
-            "(backdrop-filter: blur(1px)) or (display: grid)"
-        ));
+        assert!(!supports_condition("(display: grid) and (display: ruby)"));
+        assert!(supports_condition("(display: ruby) or (display: grid)"));
         assert!(supports_condition("((display: grid))"));
         assert!(supports_condition("selector(.a)"));
     }
@@ -27679,15 +27699,15 @@ mod tests {
     fn supports_feature_queries_gate_their_rules() {
         // We implement grid, so `@supports (display:grid)` applies (hiding
         // `.grid-only`); the old-browser `@supports not (display:grid)` fallback
-        // is dropped (`.no-grid` stays); a property we don't implement
-        // (`@supports (backdrop-filter:…)`) is dropped (`.fancy` stays). This is the
+        // is dropped (`.no-grid` stays); a value we don't implement
+        // (`@supports (display: ruby)`) is dropped (`.fancy` stays). This is the
         // progressive-enhancement pattern (the IA infinite-scroller serves a
         // flex fallback + `@supports (display:grid)` uniform-track grid).
         let dom = Dom::parse_document(
             "<head><style>
                 @supports (display: grid) { .grid-only { display: none } }
                 @supports not (display: grid) { .no-grid { display: none } }
-                @supports (backdrop-filter: blur(1px)) { .fancy { display: none } }
+                @supports (display: ruby) { .fancy { display: none } }
                 @supports (display: grid) and (gap: 1rem) { .both { display: none } }
              </style></head>
              <body>
@@ -27705,7 +27725,7 @@ mod tests {
         assert!(html.contains("nogrid kept"), "not(grid) dropped: {html}");
         assert!(
             html.contains("fancy kept"),
-            "@supports(backdrop-filter) dropped: {html}"
+            "@supports(display: ruby) dropped: {html}"
         );
         assert!(!html.contains("both gone"), "grid and gap applies: {html}");
     }

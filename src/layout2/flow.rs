@@ -262,6 +262,8 @@ pub(crate) struct PaintFlags {
     /// Exact group opacity retained from the typed box snapshot.
     pub opacity: f32,
     pub filters: std::sync::Arc<[crate::render::CssFilter]>,
+    /// A `backdrop-filter` other than `none` (Filter Effects 2).
+    pub backdrop: bool,
     pub transform: Option<std::sync::Arc<super::transform::Transform>>,
     pub child_viewport: bool,
     /// Paints a background over the border box in display-list order.
@@ -306,6 +308,7 @@ impl Default for PaintFlags {
             z: None,
             opacity: 1.0,
             filters: Default::default(),
+            backdrop: false,
             transform: None,
             child_viewport: false,
             bg: false,
@@ -340,6 +343,7 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         z: s.z_index,
         opacity: s.opacity,
         filters: s.filters.clone(),
+        backdrop: s.backdrop_filter,
         transform: s.transform.clone(),
         child_viewport: s.child_viewport,
         bg: s.bg,
@@ -350,11 +354,11 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
             || s.has_transform
             || s.contain_layout
             || s.contain_paint
-            || (s.filter_containing_block && !s.filters.is_empty()),
+            || (s.filter_containing_block && (!s.filters.is_empty() || s.backdrop_filter)),
         cb_fixed: s.has_transform
             || s.contain_layout
             || s.contain_paint
-            || (s.filter_containing_block && !s.filters.is_empty()),
+            || (s.filter_containing_block && (!s.filters.is_empty() || s.backdrop_filter)),
         // Set on the laid float fragment by `lay_inlines`, not from style
         // (positioning wins over `float`, so the style bit alone is ambiguous).
         float: false,

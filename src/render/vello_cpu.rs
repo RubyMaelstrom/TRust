@@ -26,6 +26,82 @@ use crate::core::{CssPoint, PhysicalSize};
 
 pub(super) const MAX_REGISTERED_IMAGES: usize = 256;
 
+/// Offscreen renders (SVG filter groups, Backdrop Root Images) one frame may
+/// perform; later effects degrade to their unfiltered content.
+pub(super) const MAX_EFFECT_RENDERS_PER_FRAME: usize = 64;
+/// Effects nested deeper than this (a backdrop inside a filtered group inside
+/// …) degrade the same way, bounding recursion.
+const MAX_EFFECT_DEPTH: usize = 4;
+/// Largest offscreen filter buffer. Filter Effects 1
+/// #FilterPrimitivesOverviewIntro lets user agents lower the resolution of
+/// filter primitives on limited resources; larger areas are filtered at a
+/// proportionally lower resolution. Each side also stays within the Vello GPU
+/// image atlas so both backends can draw the result.
+const MAX_EFFECT_PIXELS: f64 = 4_194_304.0;
+const MAX_EFFECT_SIDE: f64 = 4096.0;
+
+/// Where an [`VelloCpuRenderer::encode`] pass starts: the device and logical
+/// (viewport CSS px) transforms in force before its first command, the
+/// logical bounds outside which nothing needs painting, and the size of the
+/// pixel target.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EncodeBase {
+    pub device: Affine,
+    pub logical: Affine2d,
+    pub bounds: CssRect,
+    pub target: (u32, u32),
+}
+
+/// A compositing group still open in an encode pass.
+pub(super) struct OpenLayer {
+    pub index: usize,
+    pub backdrop_root: bool,
+    pub device: Affine,
+    pub logical: Affine2d,
+    pub backdrop: Option<Arc<BackdropPaint>>,
+    pub filter_layers: usize,
+    pub clip_layers: usize,
+}
+
+/// Filter Effects 2 #backdrop-filter-operation: a filtered Backdrop Root
+/// Image, placed in the element's local coordinates and drawn by filling
+/// its border box shape (step 4's clip).
+#[derive(Clone, Debug)]
+pub(super) struct BackdropPaint {
+    pub pixmap: Arc<Pixmap>,
+    /// Pixmap pixels to the element's local CSS px.
+    pub local_from_pixmap: Affine,
+    pub shape: PaintShape,
+}
+
+/// The filtered pixels of an offscreen group, drawn over `local_rect` (the
+/// group's local CSS px) with `local_from_pixmap` as the paint transform.
+#[derive(Clone, Debug)]
+pub(super) struct EffectImage {
+    pub pixmap: Arc<Pixmap>,
+    pub local_from_pixmap: Affine,
+    pub local_rect: Rect,
+}
+
+/// Whether Vello's native filter layers implement `filter` exactly.
+pub(super) fn native_filter(filter: &CssFilter) -> bool {
+    matches!(
+        filter,
+        CssFilter::ColorMatrix(_) | CssFilter::Blur(_) | CssFilter::DropShadow { .. }
+    )
+}
+
+/// The clip path of a shape both backends clip to natively, or `None` for
+/// clip geometry that is applied as coverage instead.
+pub(super) fn native_clip_path(shape: &PaintShape) -> Option<BezPath> {
+    match shape {
+        PaintShape::Geometry(geometry) => geometry
+            .single_path()
+            .map(|(elements, _)| shape_path(&PaintShape::Path(elements.to_vec()))),
+        shape => Some(shape_path(shape)),
+    }
+}
+
 /// CSS Images 3 §4.2 and SVG 2 §8.3 size each use of an SVG separately.
 /// A frame may reference several sizes of the same resource: replacing its
 /// registration while building that frame invalidates earlier image paints.
@@ -87,6 +163,10 @@ pub struct VelloCpuRenderer {
     size: PhysicalSize,
     images: HashMap<ImageCacheKey, CachedImage>,
     frame_id: u64,
+    /// Offscreen renders left in this frame (see `MAX_EFFECT_RENDERS_PER_FRAME`).
+    effect_budget: usize,
+    /// Render contexts reused across offscreen effect renders.
+    offscreen_contexts: Vec<RenderContext>,
     #[cfg(test)]
     eager_clips: bool,
     #[cfg(test)]
@@ -104,6 +184,8 @@ impl VelloCpuRenderer {
             size: PhysicalSize::new(1, 1),
             images: HashMap::new(),
             frame_id: 0,
+            effect_budget: MAX_EFFECT_RENDERS_PER_FRAME,
+            offscreen_contexts: Vec::new(),
             #[cfg(test)]
             eager_clips: false,
             #[cfg(test)]
@@ -172,19 +254,52 @@ impl VelloCpuRenderer {
             }
         }
         let device = Affine::scale(scene.viewport.scale_factor.get());
+        let base = EncodeBase {
+            device,
+            logical: Affine2d::IDENTITY,
+            bounds: CssRect::new(
+                0.0,
+                0.0,
+                scene.viewport.css.width,
+                scene.viewport.css.height,
+            ),
+            target: (
+                u32::from(self.pixmap.width()),
+                u32::from(self.pixmap.height()),
+            ),
+        };
+        self.effect_budget = MAX_EFFECT_RENDERS_PER_FRAME;
+        self.encode(scene, &scene.primitives, base, None, 0)?;
+        self.context.flush();
+        self.context.render(&mut self.pixmap, &mut self.resources);
+        self.present_pixmap();
+        Ok(())
+    }
+
+    /// Record `commands` into the current context. `base` gives the device
+    /// and logical transforms in force at the first command; `prelude` is a
+    /// backdrop image to paint before them (a Backdrop Root's own filtered
+    /// backdrop, which content inside it sees). Pushes left open at the end
+    /// (a backdrop prefix ends inside its ancestors' groups) are closed.
+    pub(super) fn encode(
+        &mut self,
+        scene: &Scene,
+        commands: &[DisplayCommand],
+        base: EncodeBase,
+        prelude: Option<&BackdropPaint>,
+        depth: usize,
+    ) -> Result<(), String> {
+        let device = base.device;
         let mut transforms = vec![device];
-        let mut logical_transforms = vec![Affine2d::IDENTITY];
-        let mut clips = RasterClips::new(CssRect::new(
-            0.0,
-            0.0,
-            scene.viewport.css.width,
-            scene.viewport.css.height,
-        ));
+        let mut logical_transforms = vec![base.logical];
+        let mut clips = RasterClips::new(base.bounds);
         self.context.set_transform(device);
-        let mut layer_filters = Vec::new();
-        let mut filter_clip_layers = Vec::new();
+        if let Some(prelude) = prelude {
+            paint_backdrop_cpu(&mut self.context, prelude, device);
+        }
+        let mut open_layers: Vec<OpenLayer> = Vec::new();
         let mut skip_until = 0;
-        for (index, command) in scene.primitives.iter().enumerate() {
+        for (index, command) in commands.iter().enumerate() {
             if index < skip_until {
                 continue;
             }
@@ -236,8 +351,8 @@ impl VelloCpuRenderer {
                     }
                 }
                 DisplayCommand::PopClip => {
-                    if clips.pop() {
-                        self.context.pop_clip();
+                    if let Some((shape, at)) = clips.pop_applied() {
+                        pop_clip_cpu(&mut self.context, shape, at, *transforms.last().unwrap());
                     }
                 }
                 DisplayCommand::PushTransform(transform) => {
@@ -278,14 +393,89 @@ impl VelloCpuRenderer {
                                 clips.bounds(),
                             )
                         });
+                    // Finding the group's end scans its content; only
+                    // culling and offscreen effects need it.
+                    let end = ((cull && hidden) || layer.needs_offscreen_filters())
+                        .then(|| super::clipped_layer_end(commands, index))
+                        .flatten();
                     if cull
                         && hidden
-                        && let Some(end) = super::clipped_layer_end(&scene.primitives, index)
+                        && let Some(end) = end
                     {
                         skip_until = end + 1;
                         continue;
                     }
                     apply_clips(&mut self.context, &mut clips, *transforms.last().unwrap());
+                    let layer_device = *transforms.last().unwrap();
+                    let layer_logical = *logical_transforms.last().unwrap();
+                    // Filter Effects 2 #backdrop-filter-operation steps 1-4:
+                    // the Backdrop Root Image behind this element, filtered
+                    // and clipped to its border box.
+                    let backdrop = layer.backdrop.as_ref().and_then(|backdrop| {
+                        let root = open_layers.iter().rev().find(|open| open.backdrop_root);
+                        let (start, root_base, root_prelude) = match root {
+                            Some(open) => (
+                                open.index + 1,
+                                EncodeBase {
+                                    device: open.device,
+                                    logical: open.logical,
+                                    ..base
+                                },
+                                open.backdrop.clone(),
+                            ),
+                            None => (0, base, prelude.cloned().map(Arc::new)),
+                        };
+                        self.backdrop_paint(
+                            scene,
+                            &commands[start..index],
+                            root_base,
+                            root_prelude.as_deref(),
+                            layer_device,
+                            backdrop,
+                            depth,
+                        )
+                        .map(Arc::new)
+                    });
+                    // Filter Effects 1 #FilterElement: an SVG filter
+                    // reference filters the group's pixels on the CPU.
+                    if layer.needs_offscreen_filters()
+                        && self.can_render_effect(depth)
+                        && let Some(end) = end
+                    {
+                        let background = open_layers.last().map_or((0, base), |open| {
+                            (
+                                open.index + 1,
+                                EncodeBase {
+                                    device: open.device,
+                                    logical: open.logical,
+                                    ..base
+                                },
+                            )
+                        });
+                        if let Some(image) = self.filtered_layer_image(
+                            scene,
+                            commands,
+                            (index, end),
+                            layer,
+                            (layer_device, layer_logical, base),
+                            backdrop.as_deref(),
+                            background,
+                            depth,
+                        ) {
+                            self.context.set_transform(layer_device);
+                            self.context.push_layer(
+                                layer.clip.map(rect_path).as_ref(),
+                                Some(vello_blend(layer.blend, layer.compose)),
+                                Some(layer.opacity.clamp(0.0, 1.0)),
+                                None,
+                                None,
+                            );
+                            paint_effect_cpu(&mut self.context, &image);
+                            self.context.pop_layer();
+                        }
+                        skip_until = end + 1;
+                        continue;
+                    }
                     // CSS Filter Effects 1 §4: a filter's output, including a
                     // blur spreading past the content, is clipped by ancestor
                     // overflow clips. Vello crops a filter layer's composite
@@ -295,20 +485,24 @@ impl VelloCpuRenderer {
                     // Only an isolated source-over group composites the same
                     // inside an extra layer; masks and blend modes need the
                     // real backdrop.
-                    if !layer.filters.is_empty()
+                    let native: Vec<&CssFilter> = layer
+                        .filters
+                        .iter()
+                        .filter(|filter| native_filter(filter))
+                        .collect();
+                    if !native.is_empty()
                         && layer.compose == CompositeOperator::SourceOver
                         && layer.blend == BlendMode::Normal
                     {
                         for (shape, at) in clips.active() {
+                            // Coverage-clipped geometry crops the filtered
+                            // group itself when its clip pops.
+                            let Some(path) = native_clip_path(shape) else {
+                                continue;
+                            };
                             self.context.set_transform(at);
                             self.context.set_fill_rule(shape_fill(shape));
-                            self.context.push_layer(
-                                Some(&shape_path(shape)),
-                                None,
-                                None,
-                                None,
-                                None,
-                            );
+                            self.context.push_layer(Some(&path), None, None, None, None);
                             clip_layers += 1;
                         }
                         if clip_layers > 0 {
@@ -316,7 +510,6 @@ impl VelloCpuRenderer {
                             self.context.set_transform(*transforms.last().unwrap());
                         }
                     }
-                    filter_clip_layers.push(clip_layers);
                     self.context.push_layer(
                         layer.clip.map(rect_path).as_ref(),
                         Some(vello_blend(layer.blend, layer.compose)),
@@ -326,7 +519,7 @@ impl VelloCpuRenderer {
                     );
                     // Nest in reverse so the first CSS function runs first.
                     // Each layer clamps separately before the next operation.
-                    for filter in layer.filters.iter().rev() {
+                    for filter in native.iter().rev() {
                         self.context.push_layer(
                             None,
                             None,
@@ -335,14 +528,28 @@ impl VelloCpuRenderer {
                             Some(vello_css_filter(filter)),
                         );
                     }
-                    layer_filters.push(layer.filters.len());
+                    if let Some(backdrop) = &backdrop {
+                        paint_backdrop_cpu(&mut self.context, backdrop, layer_device);
+                    }
+                    open_layers.push(OpenLayer {
+                        index,
+                        backdrop_root: layer.backdrop_root,
+                        device: layer_device,
+                        logical: layer_logical,
+                        backdrop,
+                        filter_layers: native.len(),
+                        clip_layers,
+                    });
                 }
                 DisplayCommand::PopLayer => {
-                    for _ in 0..layer_filters.pop().unwrap_or(0) {
+                    let Some(open) = open_layers.pop() else {
+                        continue;
+                    };
+                    for _ in 0..open.filter_layers {
                         self.context.pop_layer();
                     }
                     self.context.pop_layer();
-                    for _ in 0..filter_clip_layers.pop().unwrap_or(0) {
+                    for _ in 0..open.clip_layers {
                         self.context.pop_layer();
                     }
                 }
@@ -623,12 +830,24 @@ impl VelloCpuRenderer {
                 }
             }
         }
+        // A backdrop prefix stops inside its ancestors' groups and clips.
+        while let Some(open) = open_layers.pop() {
+            for _ in 0..open.filter_layers + 1 + open.clip_layers {
+                self.context.pop_layer();
+            }
+        }
+        while let Some((shape, at)) = clips.pop_applied() {
+            pop_clip_cpu(&mut self.context, shape, at, *transforms.last().unwrap());
+        }
         #[cfg(test)]
-        {
+        if depth == 0 {
             self.rasterized_clips = clips.applied_total;
         }
-        self.context.flush();
-        self.context.render(&mut self.pixmap, &mut self.resources);
+        let _ = depth;
+        Ok(())
+    }
+
+    fn present_pixmap(&mut self) {
         for ((target, rgba), source) in self
             .presented
             .iter_mut()
@@ -651,7 +870,238 @@ impl VelloCpuRenderer {
                 ]);
             }
         }
-        Ok(())
+    }
+
+    /// Start a frame of effect work on a renderer used as another backend's
+    /// offscreen helper: refresh its budget and image-cache clock.
+    pub(super) fn begin_effects_frame(&mut self) {
+        self.frame_id = self.frame_id.wrapping_add(1);
+        self.effect_budget = MAX_EFFECT_RENDERS_PER_FRAME;
+    }
+
+    /// Whether another offscreen effect render fits this frame's bounds.
+    pub(super) fn can_render_effect(&self, depth: usize) -> bool {
+        depth < MAX_EFFECT_DEPTH && self.effect_budget > 0
+    }
+
+    /// Rasterize `commands` into a new premultiplied pixmap of
+    /// `base.target`'s size, reusing pooled render contexts.
+    fn render_offscreen(
+        &mut self,
+        scene: &Scene,
+        commands: &[DisplayCommand],
+        base: EncodeBase,
+        prelude: Option<&BackdropPaint>,
+        depth: usize,
+    ) -> Option<Pixmap> {
+        let width = u16::try_from(base.target.0).ok().filter(|w| *w > 0)?;
+        let height = u16::try_from(base.target.1).ok().filter(|h| *h > 0)?;
+        self.effect_budget = self.effect_budget.saturating_sub(1);
+        let mut context = match self.offscreen_contexts.pop() {
+            Some(mut context) => {
+                context.reset_and_resize(width, height);
+                context
+            }
+            None => RenderContext::new(width, height),
+        };
+        std::mem::swap(&mut self.context, &mut context);
+        let result = self.encode(scene, commands, base, prelude, depth + 1);
+        std::mem::swap(&mut self.context, &mut context);
+        let mut pixmap = Pixmap::new(width, height);
+        if result.is_ok() {
+            context.flush();
+            context.render(&mut pixmap, &mut self.resources);
+        }
+        if self.offscreen_contexts.len() < 2 {
+            self.offscreen_contexts.push(context);
+        }
+        result.ok().map(|_| pixmap)
+    }
+
+    /// Filter Effects 2 #backdrop-filter-operation steps 1–4 and #BackdropRoot:
+    /// paint the content between the Backdrop Root and the element (`prefix`,
+    /// starting at `root`), flattened in screen space and clipped to the
+    /// element's transformed border box, then apply the backdrop filters in
+    /// sRGB with blur() mirroring at that edge. The result is placed in the
+    /// element's local coordinates, ready to fill its border box shape.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn backdrop_paint(
+        &mut self,
+        scene: &Scene,
+        prefix: &[DisplayCommand],
+        root: EncodeBase,
+        root_prelude: Option<&BackdropPaint>,
+        layer_device: Affine,
+        backdrop: &crate::render::BackdropFilter,
+        depth: usize,
+    ) -> Option<BackdropPaint> {
+        if !self.can_render_effect(depth) || layer_device.determinant().abs() < 1e-12 {
+            return None;
+        }
+        let shape = shape_bounds(&backdrop.shape)?;
+        let device = layer_device.transform_rect_bbox(vello_rect(shape));
+        let target = Rect::new(0.0, 0.0, f64::from(root.target.0), f64::from(root.target.1));
+        let region = device.intersect(target);
+        let region = Rect::new(
+            region.x0.floor(),
+            region.y0.floor(),
+            region.x1.ceil(),
+            region.y1.ceil(),
+        );
+        if region.width() < 1.0 || region.height() < 1.0 {
+            return None;
+        }
+        let (width, height) = (region.width() as u32, region.height() as u32);
+        let shift = Affine::translate((-region.x0, -region.y0));
+        let base = EncodeBase {
+            device: shift * root.device,
+            logical: root.logical,
+            bounds: logical_bounds(root, region),
+            target: (width, height),
+        };
+        let pixmap = self.render_offscreen(scene, prefix, base, root_prelude, depth)?;
+        let mut image = crate::render::filter_graph::FilterImage::from_premultiplied_rgba8(
+            width as usize,
+            height as usize,
+            pixmap.data_as_u8_slice(),
+        );
+        crate::render::filter_graph::apply_filters(
+            &mut image,
+            &backdrop.filters,
+            &crate::render::filter_graph::PixelSpace {
+                to_pixel: affine2d(shift * layer_device),
+            },
+            crate::render::filter_graph::FilterOptions {
+                blur_edge: crate::render::filter_graph::EdgeMode::Mirror,
+                background: None,
+            },
+        );
+        Some(BackdropPaint {
+            pixmap: Arc::new(premultiplied_pixmap(
+                image.to_premultiplied_rgba8(),
+                width as u16,
+                height as u16,
+                true,
+            )),
+            local_from_pixmap: layer_device.inverse() * Affine::translate((region.x0, region.y0)),
+            shape: backdrop.shape.clone(),
+        })
+    }
+
+    /// Filter Effects 1 #FilterProperty with SVG filter references: render
+    /// the group's content (`commands[index + 1..end]`) offscreen in the
+    /// operating coordinate space (#FilterPrimitivesOverviewIntro), apply its
+    /// filter list, and return pixels to draw in the group's local space.
+    /// The operating space is the device pixel grid when the group is not
+    /// rotated or skewed, otherwise the local coordinate system at the
+    /// group's scale, where filters are defined to apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn filtered_layer_image(
+        &mut self,
+        scene: &Scene,
+        commands: &[DisplayCommand],
+        (index, end): (usize, usize),
+        layer: &crate::render::CompositingLayer,
+        (device, logical, base): (Affine, Affine2d, EncodeBase),
+        backdrop: Option<&BackdropPaint>,
+        (background_start, background_base): (usize, EncodeBase),
+        depth: usize,
+    ) -> Option<EffectImage> {
+        if device.determinant().abs() < 1e-12 {
+            return None;
+        }
+        let device_inverse = device.inverse();
+        let target = Rect::new(0.0, 0.0, f64::from(base.target.0), f64::from(base.target.1));
+        let visible = device_inverse.transform_rect_bbox(target);
+        let reach = f64::from(crate::render::filter_graph::filters_reach(&layer.filters));
+        let work = visible.inflate(reach, reach);
+        let [a, b, c, d, ..] = device.as_coeffs();
+        let mut to_pixel = if b.abs() < 1e-9 && c.abs() < 1e-9 {
+            let pixels = device.transform_rect_bbox(work);
+            Affine::translate((-pixels.x0.floor(), -pixels.y0.floor())) * device
+        } else {
+            let scale = (a * d - b * c).abs().sqrt().max(1e-6);
+            Affine::scale(scale) * Affine::translate((-work.x0, -work.y0))
+        };
+        let mut pixels = to_pixel.transform_rect_bbox(work);
+        let area = pixels.x1.ceil().max(0.0) * pixels.y1.ceil().max(0.0);
+        if area > MAX_EFFECT_PIXELS || pixels.x1 > MAX_EFFECT_SIDE || pixels.y1 > MAX_EFFECT_SIDE {
+            let k = (MAX_EFFECT_PIXELS / area.max(1.0))
+                .sqrt()
+                .min(MAX_EFFECT_SIDE / pixels.x1.max(1.0))
+                .min(MAX_EFFECT_SIDE / pixels.y1.max(1.0));
+            to_pixel = Affine::scale(k) * to_pixel;
+            pixels = to_pixel.transform_rect_bbox(work);
+        }
+        let (width, height) = (
+            pixels.x1.ceil().clamp(0.0, MAX_EFFECT_SIDE) as u32,
+            pixels.y1.ceil().clamp(0.0, MAX_EFFECT_SIDE) as u32,
+        );
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let content = EncodeBase {
+            device: to_pixel,
+            logical,
+            bounds: transformed_bounds(css_rect(work), logical),
+            target: (width, height),
+        };
+        let pixmap =
+            self.render_offscreen(scene, &commands[index + 1..end], content, backdrop, depth)?;
+        // #BackgroundImage: the isolation group's backdrop behind the region.
+        let reads_background = layer
+            .filters
+            .iter()
+            .any(|filter| matches!(filter, CssFilter::Graph(graph) if graph.reads_background()));
+        let background = (reads_background && self.can_render_effect(depth))
+            .then(|| {
+                let base = EncodeBase {
+                    device: to_pixel * device_inverse * background_base.device,
+                    logical: background_base.logical,
+                    bounds: transformed_bounds(css_rect(work), logical),
+                    target: (width, height),
+                };
+                self.render_offscreen(scene, &commands[background_start..index], base, None, depth)
+            })
+            .flatten()
+            .map(|pixmap| {
+                crate::render::filter_graph::FilterImage::from_premultiplied_rgba8(
+                    width as usize,
+                    height as usize,
+                    pixmap.data_as_u8_slice(),
+                )
+            });
+        let mut image = crate::render::filter_graph::FilterImage::from_premultiplied_rgba8(
+            width as usize,
+            height as usize,
+            pixmap.data_as_u8_slice(),
+        );
+        crate::render::filter_graph::apply_filters(
+            &mut image,
+            &layer.filters,
+            &crate::render::filter_graph::PixelSpace {
+                to_pixel: affine2d(to_pixel),
+            },
+            crate::render::filter_graph::FilterOptions {
+                blur_edge: crate::render::filter_graph::EdgeMode::None,
+                background: background.as_ref(),
+            },
+        );
+        Some(EffectImage {
+            pixmap: Arc::new(premultiplied_pixmap(
+                image.to_premultiplied_rgba8(),
+                width as u16,
+                height as u16,
+                true,
+            )),
+            local_from_pixmap: to_pixel.inverse(),
+            local_rect: to_pixel.inverse().transform_rect_bbox(Rect::new(
+                0.0,
+                0.0,
+                f64::from(width),
+                f64::from(height),
+            )),
+        })
     }
 
     fn set_brush(&mut self, brush: &PaintBrush) {
@@ -1220,6 +1670,15 @@ pub(super) fn shadow_blur(blur_radius: f32) -> Option<vello_common::filter_effec
 pub(super) fn vello_css_filter(filter: &CssFilter) -> vello_common::filter_effects::Filter {
     use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
     Filter::from_primitive(match *filter {
+        // Only `native_filter` functions reach Vello filter layers; anything
+        // else is an identity matrix.
+        CssFilter::Graph(_) | CssFilter::Reference(_) => {
+            let mut matrix = [0.0; 20];
+            for i in [0, 6, 12, 18] {
+                matrix[i] = 1.0;
+            }
+            FilterPrimitive::ColorMatrix { matrix }
+        }
         CssFilter::ColorMatrix(matrix) => FilterPrimitive::ColorMatrix { matrix },
         CssFilter::Blur(std_deviation) => FilterPrimitive::GaussianBlur {
             std_deviation,
@@ -1344,8 +1803,126 @@ pub(super) fn radial_aspect_transform(center: CssPoint, aspect: f32) -> Affine {
         * Affine::translate((-x, -y))
 }
 
+/// Kurbo's coefficients as a TRust affine.
+pub(super) fn affine2d(affine: Affine) -> Affine2d {
+    Affine2d(affine.as_coeffs().map(|value| value as f32))
+}
+
+pub(super) fn css_rect(rect: Rect) -> CssRect {
+    CssRect::new(
+        rect.x0 as f32,
+        rect.y0 as f32,
+        rect.width() as f32,
+        rect.height() as f32,
+    )
+}
+
+/// The logical (viewport CSS px) bounds of `region`, given in the device
+/// pixels of `base`'s pass.
+pub(super) fn logical_bounds(base: EncodeBase, region: Rect) -> CssRect {
+    let logical = vello_affine(base.logical);
+    let device_from_logical = base.device * logical.inverse();
+    if device_from_logical.determinant().abs() < 1e-12 {
+        return base.bounds;
+    }
+    css_rect(device_from_logical.inverse().transform_rect_bbox(region))
+}
+
+/// Fill `backdrop`'s border box shape with its filtered image, in the
+/// element's coordinate system (`layer_device`).
+pub(super) fn paint_backdrop_cpu(
+    context: &mut RenderContext,
+    backdrop: &BackdropPaint,
+    layer_device: Affine,
+) {
+    context.set_transform(layer_device);
+    context.set_paint(ImageBrush {
+        image: ImageSource::Pixmap(Arc::clone(&backdrop.pixmap)),
+        sampler: ImageSampler::new().with_quality(ImageQuality::Medium),
+    });
+    context.set_paint_transform(backdrop.local_from_pixmap);
+    context.set_fill_rule(shape_fill(&backdrop.shape));
+    context.fill_path(&shape_path(&backdrop.shape));
+    context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+    context.reset_paint_transform();
+}
+
+/// Draw an offscreen group's filtered pixels in its local coordinates (the
+/// current transform).
+pub(super) fn paint_effect_cpu(context: &mut RenderContext, image: &EffectImage) {
+    context.set_paint(ImageBrush {
+        image: ImageSource::Pixmap(Arc::clone(&image.pixmap)),
+        sampler: ImageSampler::new().with_quality(ImageQuality::Medium),
+    });
+    context.set_paint_transform(image.local_from_pixmap);
+    context.fill_rect(&image.local_rect);
+    context.reset_paint_transform();
+}
+
+/// CSS Masking 1 #ClipPathElement: fill the coverage of clip `geometry`
+/// with opaque paint, unions as source-over and intersections in isolated
+/// destination-in groups.
+fn fill_coverage_cpu(context: &mut RenderContext, geometry: &crate::render::ClipGeometry) {
+    use crate::render::ClipGeometry;
+    match geometry {
+        ClipGeometry::Path { elements, evenodd } => {
+            context.set_fill_rule(if *evenodd {
+                vello_cpu::peniko::Fill::EvenOdd
+            } else {
+                vello_cpu::peniko::Fill::NonZero
+            });
+            context.set_paint(BLACK);
+            context.fill_path(&shape_path(&PaintShape::Path(elements.clone())));
+        }
+        ClipGeometry::Union(parts) => {
+            for part in parts {
+                fill_coverage_cpu(context, part);
+            }
+        }
+        ClipGeometry::Intersection(parts) => {
+            let Some((first, rest)) = parts.split_first() else {
+                return;
+            };
+            context.push_layer(None, None, None, None, None);
+            fill_coverage_cpu(context, first);
+            for part in rest {
+                context.push_layer(None, Some(destination_in()), None, None, None);
+                fill_coverage_cpu(context, part);
+                context.pop_layer();
+            }
+            context.pop_layer();
+        }
+    }
+}
+
+pub(super) fn destination_in() -> vello_cpu::peniko::BlendMode {
+    vello_cpu::peniko::BlendMode::new(Mix::Normal, Compose::DestIn)
+}
+
+/// Pop an applied clip: a native clip path, or a coverage-clipped group
+/// whose content is now multiplied by the geometry's coverage.
+fn pop_clip_cpu(context: &mut RenderContext, shape: &PaintShape, at: Affine, current: Affine) {
+    match shape {
+        PaintShape::Geometry(geometry) if geometry.single_path().is_none() => {
+            context.set_transform(at);
+            context.push_layer(None, Some(destination_in()), None, None, None);
+            fill_coverage_cpu(context, geometry);
+            context.pop_layer();
+            context.pop_layer();
+            context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
+            context.set_transform(current);
+        }
+        _ => context.pop_clip(),
+    }
+}
+
 pub(super) fn shape_fill(shape: &PaintShape) -> vello_cpu::peniko::Fill {
-    if matches!(shape, PaintShape::Polygon { evenodd: true, .. }) {
+    let evenodd = match shape {
+        PaintShape::Polygon { evenodd, .. } => *evenodd,
+        PaintShape::Geometry(geometry) => geometry.single_path().is_some_and(|(_, e)| e),
+        _ => false,
+    };
+    if evenodd {
         vello_cpu::peniko::Fill::EvenOdd
     } else {
         vello_cpu::peniko::Fill::NonZero
@@ -1378,6 +1955,26 @@ pub(super) fn shape_path(shape: &PaintShape) -> BezPath {
             path
         }
         PaintShape::RoundedRect { rect, radii } => rounded_rect_path(*rect, *radii),
+        // Every outline of the geometry; exact for a single path, and the
+        // conservative extent backends use for culling otherwise.
+        PaintShape::Geometry(geometry) => {
+            fn collect(geometry: &crate::render::ClipGeometry, path: &mut BezPath) {
+                match geometry {
+                    crate::render::ClipGeometry::Path { elements, .. } => {
+                        path.extend(shape_path(&PaintShape::Path(elements.clone())));
+                    }
+                    crate::render::ClipGeometry::Union(parts)
+                    | crate::render::ClipGeometry::Intersection(parts) => {
+                        for part in parts {
+                            collect(part, path);
+                        }
+                    }
+                }
+            }
+            let mut path = BezPath::new();
+            collect(geometry, &mut path);
+            path
+        }
         PaintShape::Path(elements) => {
             let mut path = BezPath::new();
             for element in elements {
@@ -1470,6 +2067,35 @@ pub(super) fn offset_shape(shape: &PaintShape, dx: f32, dy: f32, spread: f32) ->
                     .map(|(x, y)| ((x + spread).max(0.0), (y + spread).max(0.0))),
             },
         },
+        PaintShape::Geometry(geometry) => {
+            fn shift(
+                geometry: &crate::render::ClipGeometry,
+                dx: f32,
+                dy: f32,
+            ) -> crate::render::ClipGeometry {
+                use crate::render::ClipGeometry;
+                match geometry {
+                    ClipGeometry::Path { elements, evenodd } => {
+                        let PaintShape::Path(elements) =
+                            offset_shape(&PaintShape::Path(elements.clone()), dx, dy, 0.0)
+                        else {
+                            unreachable!()
+                        };
+                        ClipGeometry::Path {
+                            elements,
+                            evenodd: *evenodd,
+                        }
+                    }
+                    ClipGeometry::Union(parts) => {
+                        ClipGeometry::Union(parts.iter().map(|p| shift(p, dx, dy)).collect())
+                    }
+                    ClipGeometry::Intersection(parts) => {
+                        ClipGeometry::Intersection(parts.iter().map(|p| shift(p, dx, dy)).collect())
+                    }
+                }
+            }
+            PaintShape::Geometry(Arc::new(shift(geometry, dx, dy)))
+        }
         PaintShape::Path(elements) => PaintShape::Path(
             elements
                 .iter()
@@ -1563,14 +2189,14 @@ impl<'a> RasterClips<'a> {
         });
     }
 
-    /// Whether the backend must pop a mask; unapplied clips cost no raster work.
-    pub(super) fn pop(&mut self) -> bool {
-        self.entries.pop();
+    /// Pop the innermost clip, returning it when the backend applied it.
+    pub(super) fn pop_applied(&mut self) -> Option<(&'a PaintShape, Affine)> {
+        let clip = self.entries.pop()?;
         if self.applied > self.entries.len() {
             self.applied -= 1;
-            true
+            Some((clip.shape, clip.transform))
         } else {
-            false
+            None
         }
     }
 
@@ -1596,10 +2222,15 @@ impl<'a> RasterClips<'a> {
 }
 
 fn apply_clips(context: &mut RenderContext, clips: &mut RasterClips<'_>, transform: Affine) {
-    if clips.apply(|shape, at| {
-        context.set_transform(at);
-        context.set_fill_rule(shape_fill(shape));
-        context.push_clip_path(&shape_path(shape));
+    if clips.apply(|shape, at| match native_clip_path(shape) {
+        Some(path) => {
+            context.set_transform(at);
+            context.set_fill_rule(shape_fill(shape));
+            context.push_clip_path(&path);
+        }
+        // Coverage-clipped geometry: an isolated group that `pop_clip_cpu`
+        // multiplies by the geometry's coverage.
+        None => context.push_layer(None, None, None, None, None),
     }) {
         context.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
         context.set_transform(transform);
@@ -1687,6 +2318,7 @@ pub(super) fn erase_blend() -> vello_cpu::peniko::BlendMode {
 
 pub(super) fn shape_bounds(shape: &PaintShape) -> Option<CssRect> {
     match shape {
+        PaintShape::Geometry(geometry) => Some(geometry.bounds().unwrap_or_default()),
         PaintShape::Polygon { points, .. } => point_bounds(points.iter().copied()),
         PaintShape::Rect(rect) | PaintShape::RoundedRect { rect, .. } => Some(*rect),
         PaintShape::Path(elements) => point_bounds(elements.iter().flat_map(|element| {

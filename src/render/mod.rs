@@ -15,15 +15,19 @@ use crate::doc::Link;
 
 mod command_panel;
 pub mod documents;
+pub mod filter_graph;
 pub mod headless;
 mod hit_index;
 pub(crate) mod matrix3d;
 mod media_controls;
 pub use command_panel::{CommandPanelGeometry, CommandResponse};
+pub use filter_graph::FilterGraph;
 pub(crate) use hit_index::PageHitIndex;
 pub mod vello_cpu;
 pub mod vello_hybrid;
 
+#[cfg(test)]
+mod effect_raster_tests;
 #[cfg(test)]
 mod image_raster_tests;
 #[cfg(test)]
@@ -173,6 +177,171 @@ pub enum PaintShape {
         points: Vec<CssPoint>,
         evenodd: bool,
     },
+    /// Clip geometry beyond one nonzero outline (CSS Masking 1
+    /// #the-clip-path, #ClipPathElement): an even-odd path, the union of a
+    /// `clipPath`'s children, or its intersection with a nested clip.
+    Geometry(Arc<ClipGeometry>),
+}
+
+/// CSS Masking 1 #ClipPathElement: "the silhouettes of the child elements
+/// are logically OR'd together", each by its own `clip-rule`, and a clipping
+/// path referenced by the `clipPath` (or by one of its children) intersects
+/// it (or that child).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClipGeometry {
+    Path {
+        elements: Vec<PathElement>,
+        evenodd: bool,
+    },
+    Union(Vec<ClipGeometry>),
+    Intersection(Vec<ClipGeometry>),
+}
+
+impl ClipGeometry {
+    /// The outline when this geometry is one path, which backends clip to
+    /// natively; anything else is clipped by coverage.
+    pub fn single_path(&self) -> Option<(&[PathElement], bool)> {
+        match self {
+            Self::Path { elements, evenodd } => Some((elements, *evenodd)),
+            Self::Union(parts) | Self::Intersection(parts) if parts.len() == 1 => {
+                parts[0].single_path()
+            }
+            _ => None,
+        }
+    }
+
+    /// Conservative bounds: `None` when the geometry covers nothing.
+    pub fn bounds(&self) -> Option<CssRect> {
+        match self {
+            Self::Path { elements, .. } => path_bounds(elements),
+            Self::Union(parts) => parts.iter().filter_map(Self::bounds).reduce(union_rect),
+            Self::Intersection(parts) => {
+                let mut bounds = parts.first()?.bounds()?;
+                for part in &parts[1..] {
+                    bounds = intersect_css_rect(bounds, part.bounds()?)?;
+                }
+                Some(bounds)
+            }
+        }
+    }
+
+    /// Whether `point` is inside, evaluating each path's fill rule.
+    pub fn contains(&self, point: CssPoint) -> bool {
+        match self {
+            Self::Path { elements, evenodd } => {
+                let winding = path_winding(elements, point);
+                if *evenodd {
+                    winding % 2 != 0
+                } else {
+                    winding != 0
+                }
+            }
+            Self::Union(parts) => parts.iter().any(|part| part.contains(point)),
+            Self::Intersection(parts) => {
+                !parts.is_empty() && parts.iter().all(|part| part.contains(point))
+            }
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Path { elements, .. } => elements.capacity() * std::mem::size_of::<PathElement>(),
+            Self::Union(parts) | Self::Intersection(parts) => parts
+                .iter()
+                .map(Self::retained_bytes)
+                .sum::<usize>()
+                .saturating_add(parts.capacity() * std::mem::size_of::<Self>()),
+        }
+    }
+}
+
+fn path_bounds(elements: &[PathElement]) -> Option<CssRect> {
+    css_point_bounds(elements.iter().flat_map(|element| {
+        match element {
+            PathElement::MoveTo(point) | PathElement::LineTo(point) => [Some(*point), None, None],
+            PathElement::QuadTo(a, b) => [Some(*a), Some(*b), None],
+            PathElement::CurveTo(a, b, c) => [Some(*a), Some(*b), Some(*c)],
+            PathElement::Close => [None, None, None],
+        }
+        .into_iter()
+        .flatten()
+    }))
+}
+
+/// The winding number of `elements` around `point`, flattening curves and
+/// closing every subpath (a fill closes open subpaths implicitly).
+fn path_winding(elements: &[PathElement], point: CssPoint) -> i32 {
+    let mut winding = 0;
+    let mut edge = |a: CssPoint, b: CssPoint| {
+        let side = (b.x - a.x) * (point.y - a.y) - (point.x - a.x) * (b.y - a.y);
+        if a.y <= point.y && b.y > point.y && side > 0.0 {
+            winding += 1;
+        } else if a.y > point.y && b.y <= point.y && side < 0.0 {
+            winding -= 1;
+        }
+    };
+    let mut start = None;
+    let mut current = CssPoint::new(0.0, 0.0);
+    const STEPS: usize = 16;
+    for element in elements {
+        match *element {
+            PathElement::MoveTo(p) => {
+                if let Some(first) = start.replace(p) {
+                    edge(current, first);
+                }
+                current = p;
+            }
+            PathElement::LineTo(p) => {
+                start.get_or_insert(current);
+                edge(current, p);
+                current = p;
+            }
+            PathElement::QuadTo(c, p) => {
+                start.get_or_insert(current);
+                let p0 = current;
+                for step in 1..=STEPS {
+                    let t = step as f32 / STEPS as f32;
+                    let u = 1.0 - t;
+                    let next = CssPoint::new(
+                        u * u * p0.x + 2.0 * u * t * c.x + t * t * p.x,
+                        u * u * p0.y + 2.0 * u * t * c.y + t * t * p.y,
+                    );
+                    edge(current, next);
+                    current = next;
+                }
+            }
+            PathElement::CurveTo(c1, c2, p) => {
+                start.get_or_insert(current);
+                let p0 = current;
+                for step in 1..=STEPS {
+                    let t = step as f32 / STEPS as f32;
+                    let u = 1.0 - t;
+                    let next = CssPoint::new(
+                        u * u * u * p0.x
+                            + 3.0 * u * u * t * c1.x
+                            + 3.0 * u * t * t * c2.x
+                            + t * t * t * p.x,
+                        u * u * u * p0.y
+                            + 3.0 * u * u * t * c1.y
+                            + 3.0 * u * t * t * c2.y
+                            + t * t * t * p.y,
+                    );
+                    edge(current, next);
+                    current = next;
+                }
+            }
+            PathElement::Close => {
+                if let Some(first) = start.take() {
+                    edge(current, first);
+                    current = first;
+                }
+            }
+        }
+    }
+    if let Some(first) = start {
+        edge(current, first);
+    }
+    winding
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -332,6 +501,23 @@ pub struct CompositingLayer {
     /// testing, as CSS Masking 1 #the-mask-image-rendering-model requires
     /// for a mask (whose painting areas this bounds).
     pub clip: Option<CssRect>,
+    /// Filter Effects 2 #BackdropFilterProperty: the filtered Backdrop Root
+    /// Image, clipped to the element's border box, painted first inside this
+    /// group (and therefore under its filters, mask and opacity).
+    pub backdrop: Option<Arc<BackdropFilter>>,
+    /// Filter Effects 2 #BackdropRoot: this group's element is a Backdrop
+    /// Root, so backdrop filters inside it see only content painted within
+    /// the group.
+    pub backdrop_root: bool,
+}
+
+/// One element's `backdrop-filter` (Filter Effects 2 #backdrop-filter-operation).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackdropFilter {
+    /// The `<filter-value-list>`, resolved like `filter`.
+    pub filters: Arc<[CssFilter]>,
+    /// The border box, including border-radius, in the layer's coordinates.
+    pub shape: PaintShape,
 }
 
 impl CompositingLayer {
@@ -343,12 +529,23 @@ impl CompositingLayer {
             filters,
             compose: CompositeOperator::SourceOver,
             clip: None,
+            backdrop: None,
+            backdrop_root: false,
         }
+    }
+
+    /// Whether a backend must rasterize this group's content offscreen and
+    /// filter it on the CPU (an SVG filter reference) instead of using its
+    /// native filter layers.
+    pub fn needs_offscreen_filters(&self) -> bool {
+        self.filters
+            .iter()
+            .any(|filter| matches!(filter, CssFilter::Graph(_)))
     }
 }
 
 /// One CSS Filter Effects 1 filter function, in the element's local CSS px.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CssFilter {
     /// A straight-alpha sRGB color matrix, clamped after it applies.
     ColorMatrix([f32; 20]),
@@ -361,6 +558,12 @@ pub enum CssFilter {
         std_deviation: f32,
         color: PaintColor,
     },
+    /// A reference to an SVG `filter` element, resolved for the element
+    /// (Filter Effects 1 #FilterProperty `<url>`).
+    Graph(Arc<FilterGraph>),
+    /// An unresolved `<url>` filter reference (its fragment). Graphical
+    /// paint resolves it into `Graph`; backends ignore it.
+    Reference(Arc<str>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -566,6 +769,7 @@ impl PaintShape {
                 points.capacity() * std::mem::size_of::<CssPoint>()
             }
             PaintShape::Path(elements) => elements.capacity() * std::mem::size_of::<PathElement>(),
+            PaintShape::Geometry(geometry) => geometry.retained_bytes(),
             PaintShape::Rect(_) | PaintShape::RoundedRect { .. } => 0,
         }
     }
@@ -1910,6 +2114,18 @@ pub fn scene_damage_with_image_changes(
     if state_changed {
         return SceneDamage::Full;
     }
+    // Filter Effects 2 #BackdropRoot: a backdrop filter reads content
+    // painted anywhere behind it, and an SVG filter's output fills its
+    // filter region; neither is bounded by the changed commands.
+    let reads_beyond = |scene: &Scene| {
+        scene.primitives.iter().any(|command| {
+            matches!(command, DisplayCommand::PushLayer(layer)
+                if layer.backdrop.is_some() || layer.needs_offscreen_filters())
+        })
+    };
+    if reads_beyond(old) || reads_beyond(new) {
+        return SceneDamage::Full;
+    }
     let Some(old_bounds) =
         changed_command_bounds(old, old_changed, aligned.then_some(new), changed_images)
     else {
@@ -2042,12 +2258,18 @@ fn changed_command_bounds(
     let mut bounds = None;
     let mut changed_transforms = vec![false];
     let mut changed_layers = vec![false];
+    // Filter Effects 1 #FilterProperty: a filter (blur, drop-shadow, an SVG
+    // graph) spreads a change beyond its command's bounds.
+    let mut filtered_layers = vec![false];
     for (index, command) in scene.primitives.iter().enumerate() {
         let transform = *transforms.last()?;
         let clip = *clips.last()?;
         let differs = (changed.contains(&index)
             && aligned_other.is_none_or(|other| other.primitives[index] != *command))
             || matches!(command, DisplayCommand::Image { handle, .. } if changed_images.contains(handle));
+        if differs && *filtered_layers.last()? && leaf_command_bounds(command).is_some() {
+            return None;
+        }
         if (differs || *changed_transforms.last()? || *changed_layers.last()?)
             && let Some(command_bounds) = leaf_command_bounds(command)
         {
@@ -2079,7 +2301,8 @@ fn changed_command_bounds(
                 }
                 clips.pop();
             }
-            DisplayCommand::PushLayer(_) => {
+            DisplayCommand::PushLayer(layer) => {
+                filtered_layers.push(!layer.filters.is_empty() || *filtered_layers.last()?);
                 changed_layers.push(differs || *changed_layers.last()?);
             }
             DisplayCommand::PopLayer => {
@@ -2087,6 +2310,7 @@ fn changed_command_bounds(
                     return None;
                 }
                 changed_layers.pop();
+                filtered_layers.pop();
             }
             _ => {}
         }
@@ -2203,6 +2427,8 @@ pub(crate) fn shape_css_bounds(shape: &PaintShape) -> Option<CssRect> {
             .into_iter()
             .flatten()
         })),
+        // An empty clip geometry still clips: it covers no area.
+        PaintShape::Geometry(geometry) => Some(geometry.bounds().unwrap_or_default()),
     }
 }
 
@@ -2236,7 +2462,7 @@ fn transformed_css_bounds(rect: CssRect, transform: Affine2d) -> CssRect {
     .unwrap_or_default()
 }
 
-fn intersect_css_rect(a: CssRect, b: CssRect) -> Option<CssRect> {
+pub(crate) fn intersect_css_rect(a: CssRect, b: CssRect) -> Option<CssRect> {
     let left = a.x.max(b.x);
     let top = a.y.max(b.y);
     let right = (a.x + a.width).min(b.x + b.width);
@@ -3511,6 +3737,7 @@ fn shape_contains(shape: &PaintShape, point: CssPoint) -> bool {
             }
             CssRect::new(min_x, min_y, max_x - min_x, max_y - min_y).contains(point)
         }
+        PaintShape::Geometry(geometry) => geometry.contains(point),
     }
 }
 

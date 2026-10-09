@@ -194,6 +194,11 @@ impl Evaluation<'_, '_> {
             return Some(layer);
         };
         match last {
+            // `parse` keeps references as `Step::Reference`; a filter
+            // function never carries an element reference.
+            Resolved::Function(CssFilter::Graph(_) | CssFilter::Reference(_)) => {
+                self.eval(rest, region)
+            }
             Resolved::Function(CssFilter::ColorMatrix(matrix)) => {
                 let mut layer = self.eval(rest, region)?;
                 color_matrix(&mut layer, matrix);

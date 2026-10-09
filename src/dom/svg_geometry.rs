@@ -1612,6 +1612,356 @@ fn text_metrics(text: &usvg::Text, fontdb: &usvg::fontdb::Database) -> TextMetri
     }
 }
 
+/// The group a clip or mask document applies its resource to.
+const RESOURCE_TARGET_ID: &str = "trust-svg-resource-target";
+
+/// CSS Masking 1 #ClipPathElement: a `clipPath` element with its inherited
+/// context and the resources it references, ready to be resolved for any
+/// referencing box. It holds markup, not DOM references, so painting can
+/// resolve it without the document (the terminal adapter keeps it in its
+/// stylesheet-free paint model).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SvgClipSource {
+    defs: String,
+    id: String,
+    fonts: u64,
+}
+
+/// Whether `id` can be written in an unquoted `url(#…)`.
+fn plain_fragment(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+impl SvgClipSource {
+    /// The clipping region for a referencing box whose border box is
+    /// `bbox` (its object bounding box, and the origin of its user space),
+    /// in the box's coordinate system: the union of the `clipPath`
+    /// children's silhouettes, each by its own `clip-rule`, intersected
+    /// with any `clip-path` on the `clipPath` (#ClipPathElement). `None`
+    /// when the reference is invalid, which applies no clipping.
+    pub(crate) fn geometry(
+        &self,
+        bbox: crate::render::CssRect,
+    ) -> Option<crate::render::ClipGeometry> {
+        let (width, height) = (
+            f64::from(bbox.width).max(0.0),
+            f64::from(bbox.height).max(0.0),
+        );
+        let (view_width, view_height) = (width.max(1e-3), height.max(1e-3));
+        let markup = format!(
+            "<svg xmlns=\"{SVG_NS}\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+             width=\"{view_width}\" height=\"{view_height}\" \
+             viewBox=\"0 0 {view_width} {view_height}\"><defs>{}</defs>\
+             <g id=\"{RESOURCE_TARGET_ID}\" clip-path=\"url(#{})\">\
+             <rect width=\"{view_width}\" height=\"{view_height}\"/></g></svg>",
+            self.defs, self.id
+        );
+        let tree = crate::img::document_svg_geometry_tree(&markup, self.fonts)?;
+        // usvg does not render an element whose clipPath has no children
+        // (or is otherwise in error): "An empty clipping path will
+        // completely clip away the element that had the 'clip-path' property
+        // applied" (#ClipPathElement).
+        let Some(usvg::Node::Group(group)) = tree.node_by_id(RESOURCE_TARGET_ID) else {
+            return Some(crate::render::ClipGeometry::Union(Vec::new()));
+        };
+        let Some(clip) = group.clip_path() else {
+            return Some(crate::render::ClipGeometry::Union(Vec::new()));
+        };
+        Some(clip_geometry(
+            clip,
+            usvg::Transform::from_translate(bbox.x, bbox.y),
+        ))
+    }
+}
+
+/// resvg's clip-path rendering order: the clip's own transform (including
+/// `clipPathUnits="objectBoundingBox"`) maps its children, each child group
+/// its own transform and clip, and a `clip-path` on the `clipPath` itself
+/// intersects in the referencing element's space.
+fn clip_geometry(clip: &usvg::ClipPath, transform: usvg::Transform) -> crate::render::ClipGeometry {
+    use crate::render::ClipGeometry;
+    let content = clip_group_geometry(clip.root(), transform.pre_concat(clip.transform()));
+    match clip.clip_path() {
+        Some(nested) => ClipGeometry::Intersection(vec![content, clip_geometry(nested, transform)]),
+        None => content,
+    }
+}
+
+fn clip_group_geometry(
+    group: &usvg::Group,
+    transform: usvg::Transform,
+) -> crate::render::ClipGeometry {
+    use crate::render::{ClipGeometry, PathElement};
+    let mut parts = Vec::new();
+    for child in group.children() {
+        match child {
+            usvg::Node::Path(path) => {
+                let point = |p: usvg::tiny_skia_path::Point| {
+                    let mut p = p;
+                    transform.map_point(&mut p);
+                    crate::core::CssPoint::new(p.x, p.y)
+                };
+                let mut elements = Vec::new();
+                for segment in path.data().segments() {
+                    use usvg::tiny_skia_path::PathSegment;
+                    elements.push(match segment {
+                        PathSegment::MoveTo(p) => PathElement::MoveTo(point(p)),
+                        PathSegment::LineTo(p) => PathElement::LineTo(point(p)),
+                        PathSegment::QuadTo(c, p) => PathElement::QuadTo(point(c), point(p)),
+                        PathSegment::CubicTo(a, b, p) => {
+                            PathElement::CurveTo(point(a), point(b), point(p))
+                        }
+                        PathSegment::Close => PathElement::Close,
+                    });
+                }
+                // usvg carries a clip child's `clip-rule` as its fill rule.
+                let evenodd = path
+                    .fill()
+                    .is_some_and(|fill| fill.rule() == usvg::FillRule::EvenOdd);
+                parts.push(ClipGeometry::Path { elements, evenodd });
+            }
+            usvg::Node::Text(text) => {
+                if let ClipGeometry::Union(text_parts) =
+                    clip_group_geometry(text.flattened(), transform)
+                {
+                    parts.extend(text_parts);
+                }
+            }
+            usvg::Node::Group(child) => {
+                let transform = transform.pre_concat(child.transform());
+                let geometry = clip_group_geometry(child, transform);
+                parts.push(match child.clip_path() {
+                    // A clipped child is clipped before it is OR'ed in.
+                    Some(clip) => {
+                        ClipGeometry::Intersection(vec![geometry, clip_geometry(clip, transform)])
+                    }
+                    None => geometry,
+                });
+            }
+            usvg::Node::Image(_) => {}
+        }
+    }
+    ClipGeometry::Union(parts)
+}
+
+/// Which `mask-mode` the referencing element uses for a `<mask-source>`
+/// (CSS Masking 1 #the-mask-mode): `None` is `match-source`.
+pub(crate) type MaskModeOverride = Option<bool>;
+
+impl Dom {
+    /// The markup of `resource` (an SVG resource element) for a standalone
+    /// document: wrapped in groups carrying the inherited properties of its
+    /// SVG ancestors, followed by the resources it references.
+    fn svg_effect_resource_markup(
+        &self,
+        resource: NodeId,
+        images: &mut SvgImageRefs,
+    ) -> (String, String) {
+        let mut chain = Vec::new();
+        let mut current = self.svg_parent(resource);
+        while let Some(node) = current {
+            chain.push(node);
+            current = self.svg_parent(node);
+        }
+        chain.reverse();
+        let mut body = String::new();
+        for &ancestor in &chain {
+            body.push_str("<g");
+            self.write_svg_inherited_context(ancestor, Purpose::Path, &mut body);
+            body.push('>');
+        }
+        body.push_str(&self.serialize_svg_for_image_with(resource, images));
+        for _ in &chain {
+            body.push_str("</g>");
+        }
+        let defs = self.svg_geometry_resources(resource, &body);
+        (body, defs)
+    }
+
+    /// CSS Masking 1 #the-clip-path `<clip-source>`: `clip` (a `clipPath`
+    /// element) as a document fragment resolvable for any referencing box.
+    pub(crate) fn svg_clip_source(&self, clip: NodeId) -> Option<SvgClipSource> {
+        if !self.is_svg_element(clip) || self.tag_name(clip) != Some("clipPath") {
+            return None;
+        }
+        let id = self.attr(clip, "id")?.to_string();
+        if !plain_fragment(&id) {
+            return None;
+        }
+        let (body, defs) = self.svg_effect_resource_markup(clip, &mut SvgImageRefs::new(None));
+        Some(SvgClipSource {
+            defs: format!("{defs}{body}"),
+            id,
+            fonts: self.svg_geometry_fonts(clip),
+        })
+    }
+
+    /// CSS Masking 1 #the-mask-image `<mask-source>` and #MaskElement: an
+    /// image, as a document SVG `data:` URL, whose alpha channel is `mask`'s
+    /// mask values for a referencing box with border box `bbox` (its object
+    /// bounding box and user space origin) whose painted content lies within
+    /// `ink`. Returns the image and the rectangle (in the box's coordinate
+    /// system) it covers; outside it the mask is transparent black.
+    ///
+    /// The mask is applied by the SVG renderer to an opaque white shape whose
+    /// object bounding box is `bbox` and whose stroke covers the region, so
+    /// the mask's units, region, `mask-type` and content all follow SVG.
+    /// When none of the mask's x, y, width and height attributes is given,
+    /// its content is not clipped (#MaskElement); the region is then the
+    /// painted content's extent. `mode` overrides `mask-type`
+    /// (#the-mask-mode).
+    pub(crate) fn svg_mask_image(
+        &self,
+        mask: NodeId,
+        bbox: crate::render::CssRect,
+        ink: crate::render::CssRect,
+        mode: MaskModeOverride,
+        page: Option<&url::Url>,
+    ) -> Option<(String, crate::render::CssRect)> {
+        if !self.is_svg_element(mask) || self.tag_name(mask) != Some("mask") {
+            return None;
+        }
+        let id = self.attr(mask, "id")?.to_string();
+        if !plain_fragment(&id) {
+            return None;
+        }
+        let mut images = SvgImageRefs::new(page);
+        let (body, defs) = self.svg_effect_resource_markup(mask, &mut images);
+        // Ink and region in the box's user space (origin at its border box).
+        let local_ink =
+            crate::render::CssRect::new(ink.x - bbox.x, ink.y - bbox.y, ink.width, ink.height);
+        let unclipped = ["x", "y", "width", "height"]
+            .iter()
+            .all(|name| self.attr(mask, name).is_none());
+        let mut edits: Vec<(&str, Option<String>)> = Vec::new();
+        if unclipped {
+            edits.extend([
+                ("maskUnits", Some("userSpaceOnUse".to_string())),
+                ("x", Some(local_ink.x.to_string())),
+                ("y", Some(local_ink.y.to_string())),
+                ("width", Some(local_ink.width.max(0.0).to_string())),
+                ("height", Some(local_ink.height.max(0.0).to_string())),
+            ]);
+        }
+        let mask_type = mode.map(|luminance| if luminance { "luminance" } else { "alpha" });
+        if let Some(mask_type) = mask_type {
+            edits.push(("mask-type", Some(mask_type.to_string())));
+        }
+        let body = rewrite_first_start_tag(&body, "mask", &edits, mask_type)?;
+        let (width, height) = (
+            f64::from(bbox.width).max(1e-3),
+            f64::from(bbox.height).max(1e-3),
+        );
+        let document = |view: (f64, f64, f64, f64), stroke: f64| {
+            format!(
+                "<svg xmlns=\"{SVG_NS}\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+                 width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\"><defs>{defs}{body}</defs>\
+                 <g id=\"{RESOURCE_TARGET_ID}\" mask=\"url(#{id})\"><rect width=\"{width}\" \
+                 height=\"{height}\" fill=\"#fff\" stroke=\"#fff\" stroke-width=\"{stroke}\" \
+                 stroke-linejoin=\"miter\"/></g></svg>",
+                view.2, view.3, view.0, view.1, view.2, view.3
+            )
+        };
+        // Resolve the mask region as the SVG renderer does.
+        let probe = document((0.0, 0.0, width, height), 0.0);
+        let tree = crate::img::document_svg_geometry_tree(&probe, self.svg_geometry_fonts(mask))?;
+        let Some(usvg::Node::Group(group)) = tree.node_by_id(RESOURCE_TARGET_ID) else {
+            return None;
+        };
+        let region = group.mask()?.rect();
+        let region =
+            crate::render::CssRect::new(region.x(), region.y(), region.width(), region.height());
+        // Only painted content needs masking: bound the image by the ink.
+        let covered = crate::render::intersect_css_rect(region, local_ink)?;
+        let reach = [
+            -covered.x,
+            -covered.y,
+            covered.x + covered.width - bbox.width,
+            covered.y + covered.height - bbox.height,
+        ]
+        .into_iter()
+        .fold(0.0f32, f32::max);
+        let stroke = f64::from(reach) * 2.0 + 4.0;
+        let svg = document(
+            (
+                f64::from(covered.x),
+                f64::from(covered.y),
+                f64::from(covered.width),
+                f64::from(covered.height),
+            ),
+            stroke,
+        );
+        let url =
+            crate::img::document_svg_data_url(&svg, self.svg_geometry_fonts(mask), &images.urls);
+        Some((
+            url,
+            crate::render::CssRect::new(
+                covered.x + bbox.x,
+                covered.y + bbox.y,
+                covered.width,
+                covered.height,
+            ),
+        ))
+    }
+}
+
+/// Rewrite the first `<tag …>` start tag of serializer output: each edit
+/// replaces (or with `None` removes) an attribute, and `style_override`
+/// appends a winning `mask-type` declaration to a `style` attribute, which
+/// would otherwise outrank the presentation attribute. Attribute values in
+/// serializer output are double-quoted and escaped.
+fn rewrite_first_start_tag(
+    markup: &str,
+    tag: &str,
+    edits: &[(&str, Option<String>)],
+    style_override: Option<&str>,
+) -> Option<String> {
+    let start = markup.find(&format!("<{tag}"))?;
+    let after_name = start + 1 + tag.len();
+    let end = after_name + markup[after_name..].find('>')?;
+    let self_closing = markup[..end].ends_with('/');
+    let attributes_end = if self_closing { end - 1 } else { end };
+    let mut attributes: Vec<(String, String)> = Vec::new();
+    let mut rest = &markup[after_name..attributes_end];
+    loop {
+        rest = rest.trim_start();
+        let Some(eq) = rest.find('=') else {
+            break;
+        };
+        let name = rest[..eq].trim().to_string();
+        let value_start = rest[eq + 1..].find('"')? + eq + 2;
+        let value_end = value_start + rest[value_start..].find('"')?;
+        attributes.push((name, rest[value_start..value_end].to_string()));
+        rest = &rest[value_end + 1..];
+    }
+    for (name, value) in edits {
+        attributes.retain(|(existing, _)| existing != name);
+        if let Some(value) = value {
+            attributes.push((name.to_string(), escape_attr(value).into_owned()));
+        }
+    }
+    if let Some(mask_type) = style_override
+        && let Some((_, style)) = attributes.iter_mut().find(|(name, _)| name == "style")
+    {
+        style.push_str(";mask-type:");
+        style.push_str(mask_type);
+    }
+    let mut out = String::with_capacity(markup.len() + 64);
+    out.push_str(&markup[..after_name]);
+    for (name, value) in &attributes {
+        out.push(' ');
+        out.push_str(name);
+        out.push_str("=\"");
+        out.push_str(value);
+        out.push('"');
+    }
+    out.push_str(&markup[attributes_end..]);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

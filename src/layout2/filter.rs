@@ -1,4 +1,5 @@
-//! CSS Filter Effects 1 #FilterProperty / #ShorthandEquivalents.
+//! CSS Filter Effects 1 #FilterProperty / #ShorthandEquivalents, and the
+//! same `<filter-value-list>` for Filter Effects 2 #BackdropFilterProperty.
 //! Each matrix operates on straight-alpha sRGB and is clamped separately;
 //! combining matrices would incorrectly discard intermediate clipping.
 
@@ -22,6 +23,23 @@ pub(crate) fn filters(
     }
     let mut filters = Vec::new();
     while !parser.is_exhausted() {
+        // #FilterProperty `<url>`: a reference to a `filter` element,
+        // resolved by graphical paint against the document.
+        if let Ok(url) = parser.try_parse(|p| -> Result<String, Failure> {
+            match p.next()?.clone() {
+                cssparser::Token::UnquotedUrl(url) => Ok(url.to_string()),
+                cssparser::Token::Function(name) if name.eq_ignore_ascii_case("url") => p
+                    .parse_nested_block(|p| -> Result<String, Failure> {
+                        let url = p.expect_string()?.to_string();
+                        p.expect_exhausted()?;
+                        Ok(url)
+                    }),
+                _ => Err(cssparser::ParseError::custom(())),
+            }
+        }) {
+            filters.push(CssFilter::Reference(url.into()));
+            continue;
+        }
         let name = parser.expect_function().ok()?.to_ascii_lowercase();
         let filter = parser
             .parse_nested_block(|p| -> Result<CssFilter, cssparser::ParseError<()>> {
@@ -354,6 +372,21 @@ mod tests {
             ])
         );
         assert_eq!(parse("blur()"), Some(vec![CssFilter::Blur(0.)]));
+    }
+
+    #[test]
+    fn url_references_are_kept_in_list_order() {
+        // #FilterProperty: `<filter-value-list> = [ <filter-function> | <url> ]+`.
+        assert_eq!(
+            parse(r#"url(#a) blur(2px) url("b.svg#c")"#),
+            Some(vec![
+                CssFilter::Reference("#a".into()),
+                CssFilter::Blur(2.),
+                CssFilter::Reference("b.svg#c".into()),
+            ])
+        );
+        assert!(parse("url(#a) none").is_none());
+        assert!(parse("url(#a, #b)").is_none());
     }
 
     #[test]

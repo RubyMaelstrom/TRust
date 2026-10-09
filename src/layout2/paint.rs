@@ -255,6 +255,7 @@ impl TerminalPaintModel {
                                 super::Units::of(dom, node),
                                 super::value::Vp { w, h },
                             )
+                            .and_then(|clip| clip.resolve(dom, node, Some(base)))
                         }),
                     tag,
                     id: dom

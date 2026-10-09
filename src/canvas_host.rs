@@ -206,7 +206,7 @@ impl<'a> Environment<'a> {
         let mut chain = Vec::with_capacity(filter.steps.len());
         for step in &filter.steps {
             match step {
-                Step::Function(function) => chain.push(Resolved::Function(*function)),
+                Step::Function(function) => chain.push(Resolved::Function(function.clone())),
                 Step::Reference(reference) => {
                     let fragment = if let Some(fragment) = reference.strip_prefix('#') {
                         fragment.to_owned()

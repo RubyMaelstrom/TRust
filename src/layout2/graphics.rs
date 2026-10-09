@@ -124,6 +124,15 @@ struct Builder<'a> {
     /// ordinary fragment painter add only newly-entered scrollports.
     scroll_nodes: Vec<(NodeId, bool)>,
     scroll_indices: HashMap<NodeId, usize>,
+    /// Some box has a `backdrop-filter`: groups for every Backdrop Root
+    /// trigger are then emitted so backdrop filters stop at the right
+    /// element (Filter Effects 2 #BackdropRoot).
+    backdrop_filters: bool,
+}
+
+/// Whether `fragment` or a descendant has a `backdrop-filter`.
+fn has_backdrop_filter(fragment: &Frag) -> bool {
+    fragment.paint.backdrop || fragment.children.iter().any(has_backdrop_filter)
 }
 
 impl<'a> Builder<'a> {
@@ -191,6 +200,11 @@ impl<'a> Builder<'a> {
             transformed_clips: Vec::new(),
             scroll_nodes: Vec::new(),
             scroll_indices: HashMap::new(),
+            backdrop_filters: has_backdrop_filter(root)
+                || fixed.iter().any(has_backdrop_filter)
+                || top_layer
+                    .iter()
+                    .any(|top| has_backdrop_filter(&top.fragment)),
         };
         this.collect_legacy_clips(root);
         this.collect_scroll_containers(root, false);
@@ -1128,6 +1142,7 @@ fn build_sc(fragment: &Frag, builder: &mut Builder<'_>) {
                         h: builder.viewport_h,
                     },
                 )
+                .and_then(|clip| clip.resolve(builder.dom, style.node(), Some(builder.base)))
             })
         })
         .and_then(|inset| inset.shape_for(fragment));
@@ -3035,41 +3050,69 @@ fn push_layer(
     let isolate = style
         .value(builder.dom, "isolation")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("isolate"));
+    let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let filters =
+        resolve_filter_references(&fragment.paint.filters, style.node(), border_box, builder);
+    let backdrop = fragment
+        .paint
+        .backdrop
+        .then(|| backdrop_filter(fragment, style, builder))
+        .flatten();
+    // Filter Effects 2 #BackdropRoot: filter, opacity below 1, a mask or
+    // clip-path, a backdrop-filter, a blend mode, or will-change naming one
+    // of those. Only needed once some box uses a backdrop filter.
+    let backdrop_root = builder.backdrop_filters
+        && (opacity < 1.0
+            || !filters.is_empty()
+            || mask.is_some()
+            || backdrop.is_some()
+            || blend != BlendMode::Normal
+            || has_clip_path_value(builder.dom, style)
+            || will_change_backdrop_root(builder.dom, style));
     if let Some(clip) = mask {
         // Filters apply before the mask, which applies before opacity, so a
         // masked context's filters get their own group; the mask group then
         // composites onto the filtered result. Painting outside the mask's
         // painting areas is discarded either way, so bound the group there.
+        // The element's own backdrop is drawn in its innermost group, under
+        // its filters; that group is the Backdrop Root for its content.
+        let filtered = !filters.is_empty();
         builder
             .commands
             .push(DisplayCommand::PushLayer(CompositingLayer {
                 clip,
+                backdrop: (!filtered).then(|| backdrop.clone()).flatten(),
+                backdrop_root: !filtered && backdrop_root,
                 ..CompositingLayer::new(opacity, blend, std::sync::Arc::from([]))
             }));
-        let filtered = !fragment.paint.filters.is_empty();
         if filtered {
             builder
                 .commands
-                .push(DisplayCommand::PushLayer(CompositingLayer::new(
-                    1.0,
-                    BlendMode::Normal,
-                    fragment.paint.filters.clone(),
-                )));
+                .push(DisplayCommand::PushLayer(CompositingLayer {
+                    backdrop,
+                    backdrop_root,
+                    ..CompositingLayer::new(1.0, BlendMode::Normal, filters)
+                }));
         }
         return ContextLayers {
             outer: true,
             filtered,
         };
     }
-    if opacity < 1.0 || blend != BlendMode::Normal || isolate || !fragment.paint.filters.is_empty()
+    if opacity < 1.0
+        || blend != BlendMode::Normal
+        || isolate
+        || !filters.is_empty()
+        || backdrop.is_some()
+        || backdrop_root
     {
         builder
             .commands
-            .push(DisplayCommand::PushLayer(CompositingLayer::new(
-                opacity,
-                blend,
-                fragment.paint.filters.clone(),
-            )));
+            .push(DisplayCommand::PushLayer(CompositingLayer {
+                backdrop,
+                backdrop_root,
+                ..CompositingLayer::new(opacity, blend, filters)
+            }));
         ContextLayers {
             outer: true,
             filtered: false,
@@ -3077,6 +3120,97 @@ fn push_layer(
     } else {
         ContextLayers::default()
     }
+}
+
+/// Filter Effects 1 #FilterProperty `<url>`: resolve each reference to a
+/// same-document SVG `filter` element for the box whose border box is
+/// `border_box` (its object bounding box and user space origin). "If the
+/// filter references a non-existent object or the referenced object is not a
+/// filter element, then the whole filter chain is ignored."
+fn resolve_filter_references(
+    filters: &std::sync::Arc<[crate::render::CssFilter]>,
+    node: NodeId,
+    border_box: CssRect,
+    builder: &Builder<'_>,
+) -> std::sync::Arc<[crate::render::CssFilter]> {
+    use crate::render::CssFilter;
+    if !filters
+        .iter()
+        .any(|filter| matches!(filter, CssFilter::Reference(_)))
+    {
+        return filters.clone();
+    }
+    let resolved = filters
+        .iter()
+        .map(|filter| match filter {
+            CssFilter::Reference(url) => {
+                let target = builder
+                    .dom
+                    .svg_resource_target(node, url, Some(builder.base));
+                builder.dom.note_svg_resource_use(node, target);
+                let target = target.filter(|&target| {
+                    builder.dom.tag_name(target) == Some("filter")
+                        && builder.dom.namespace_uri(target) == Some("http://www.w3.org/2000/svg")
+                })?;
+                Some(CssFilter::Graph(std::sync::Arc::new(
+                    builder.dom.svg_filter_graph(target, node, border_box),
+                )))
+            }
+            other => Some(other.clone()),
+        })
+        .collect::<Option<Vec<_>>>();
+    resolved.map_or_else(|| std::sync::Arc::from([]), std::sync::Arc::from)
+}
+
+/// Filter Effects 2 #BackdropFilterProperty: the element's filter list and
+/// border box shape (#backdrop-filter-operation step 4), or `None` when the
+/// list is `none` or its references are invalid.
+fn backdrop_filter(
+    fragment: &Frag,
+    style: PaintStyle,
+    builder: &Builder<'_>,
+) -> Option<std::sync::Arc<crate::render::BackdropFilter>> {
+    let dom = builder.dom;
+    let value = style.value(dom, "backdrop-filter")?;
+    let units = Units::of(dom, style.node());
+    let viewport = builder.viewport();
+    let length = |text: &str| Len::parse(text, units, viewport)?.resolve(None);
+    let filters = super::filter::filters(&value, &length, text_color_for_style(dom, style))?;
+    let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let filters = resolve_filter_references(&filters.into(), style.node(), border_box, builder);
+    if filters.is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(crate::render::BackdropFilter {
+        filters,
+        shape: rounded_shape(border_box, border_radii(dom, style, border_box)),
+    }))
+}
+
+fn has_clip_path_value(dom: &Dom, style: PaintStyle) -> bool {
+    style
+        .value(dom, "clip-path")
+        .is_some_and(|value| !value.trim().eq_ignore_ascii_case("none"))
+}
+
+/// Filter Effects 2 #BackdropRoot: "a will-change value specifying any
+/// property that would create a Backdrop Root on non-initial value".
+fn will_change_backdrop_root(dom: &Dom, style: PaintStyle) -> bool {
+    style.value(dom, "will-change").is_some_and(|value| {
+        value.split(',').any(|token| {
+            matches!(
+                token.trim().to_ascii_lowercase().as_str(),
+                "filter"
+                    | "opacity"
+                    | "mask"
+                    | "mask-image"
+                    | "mask-border"
+                    | "clip-path"
+                    | "backdrop-filter"
+                    | "mix-blend-mode"
+            )
+        })
+    })
 }
 
 /// A stacking context's mask (CSS Masking 1 #positioned-masks): its layer
@@ -3109,18 +3243,6 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
         return None;
     }
     let images = split_top_level(&images, ',');
-    // #the-mask-image: a <url> may instead reference an SVG `mask` element
-    // (a <mask-source>, applied with the element's own geometry and its
-    // mask-type). TRust does not render those yet: leave the content
-    // unmasked rather than treat a supported reference as a failure.
-    if images.iter().any(|layer| {
-        css_url(layer.trim())
-            .and_then(|url| url.strip_prefix('#').map(str::to_string))
-            .and_then(|id| dom.get_by_id(&id))
-            .is_some_and(|node| dom.tag_name(node) == Some("mask"))
-    }) {
-        return None;
-    }
     let list = |property: &str, initial: &str| {
         style
             .value(dom, property)
@@ -3176,8 +3298,34 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
             "exclude" => CompositeOperator::Xor,
             _ => CompositeOperator::SourceOver,
         };
+        // #the-mask-image: a <url> naming an element of this document is a
+        // <mask-source>. One that is not a `mask` element counts as a
+        // transparent black layer. A `mask` element positions, sizes and
+        // clips its own layer (#layering, #the-mask-clip), and its mask values
+        // are rendered with its `mask-type` unless `mask-mode` overrides it
+        // (#the-mask-mode); its image is then used as an alpha mask.
+        let mode = layer_value(&modes, index, "match-source");
+        let mask_source = css_url(image.trim())
+            .filter(|url| local_reference(url, builder.base))
+            .map(|url| {
+                let target = dom.svg_resource_target(style.node(), &url, Some(builder.base));
+                dom.note_svg_resource_use(style.node(), target);
+                target.and_then(|mask| {
+                    dom.svg_mask_image(
+                        mask,
+                        border_box,
+                        subtree_bounds(fragment),
+                        match mode {
+                            "luminance" => Some(true),
+                            "alpha" => Some(false),
+                            _ => None,
+                        },
+                        Some(builder.base),
+                    )
+                })
+            });
         // #the-mask-mode: `match-source` is alpha for an <image>.
-        let luminance = layer_value(&modes, index, "match-source") == "luminance";
+        let luminance = mask_source.is_none() && mode == "luminance";
         let grouped = compose != CompositeOperator::SourceOver || luminance;
         let group_start = builder.commands.len();
         if grouped {
@@ -3189,13 +3337,14 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
                 }));
         }
         let clip_value = layer_value(&clips, index, "border-box");
-        let unclipped = clip_value == "no-clip";
-        let clip = if unclipped {
+        let mut unclipped = clip_value == "no-clip";
+        let mut clip = if unclipped {
             subtree_bounds(fragment)
         } else {
             mask_box(clip_value)
         };
-        let layer = ImageLayer {
+        let source_image;
+        let mut layer = ImageLayer {
             image: image.trim(),
             node: style.node(),
             positioning: mask_box(layer_value(&origins, index, "border-box")),
@@ -3212,8 +3361,26 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
             repeat: layer_value(&repeats, index, "repeat"),
             lengths,
         };
+        if let Some(Some((url, region))) = &mask_source {
+            source_image = format!("url(\"{url}\")");
+            unclipped = false;
+            clip = *region;
+            layer = ImageLayer {
+                image: &source_image,
+                positioning: *region,
+                clip,
+                clip_shape: PaintShape::Rect(clip),
+                size: "100% 100%",
+                position: "0% 0%",
+                repeat: "no-repeat",
+                ..layer
+            };
+        }
         let tiles = builder.commands.len();
-        let painted = paint_image_layer(builder, layer);
+        let painted = match &mask_source {
+            Some(None) => false,
+            _ => paint_image_layer(builder, layer),
+        };
         if painted && luminance {
             // #MaskValues: the luminance of the straight color, multiplied
             // by the alpha of the tiles just painted into this layer's group.
@@ -3262,6 +3429,25 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
         // With no painted layer the mask is transparent black everywhere.
         bounds: bounds.unwrap_or(Some(CssRect::new(border_box.x, border_box.y, 0.0, 0.0))),
     })
+}
+
+/// Whether a CSS `url()` names this document (a fragment-only URL, or the
+/// document's own URL with a fragment): CSS Values 4 #local-urls.
+fn local_reference(url: &str, base: &Url) -> bool {
+    let url = url.trim();
+    if url.starts_with('#') {
+        return true;
+    }
+    let Ok(mut resolved) = base.join(url) else {
+        return false;
+    };
+    if resolved.fragment().is_none() {
+        return false;
+    }
+    resolved.set_fragment(None);
+    let mut document = base.clone();
+    document.set_fragment(None);
+    resolved == document
 }
 
 /// The border boxes of `fragment` and its descendants: the area an

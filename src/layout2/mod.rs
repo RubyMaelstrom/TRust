@@ -211,6 +211,8 @@ pub(crate) fn svg_resource_dimension(
 }
 
 #[cfg(test)]
+mod svg_effect_tests;
+#[cfg(test)]
 mod visual_regression_tests;
 
 use std::collections::HashMap;
@@ -8003,7 +8005,9 @@ b</xmp></body>"#;
         let shape_rect = |shape: &crate::render::PaintShape| match shape {
             crate::render::PaintShape::Rect(rect)
             | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
-            crate::render::PaintShape::Path(_) | crate::render::PaintShape::Polygon { .. } => None,
+            crate::render::PaintShape::Path(_)
+            | crate::render::PaintShape::Polygon { .. }
+            | crate::render::PaintShape::Geometry(_) => None,
         };
         let painted = layout
             .paint
@@ -8116,7 +8120,9 @@ b</xmp></body>"#;
         let shape_rect = |shape: &crate::render::PaintShape| match shape {
             crate::render::PaintShape::Rect(rect)
             | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
-            crate::render::PaintShape::Path(_) | crate::render::PaintShape::Polygon { .. } => None,
+            crate::render::PaintShape::Path(_)
+            | crate::render::PaintShape::Polygon { .. }
+            | crate::render::PaintShape::Geometry(_) => None,
         };
         // The rectangles filled or stroked over the control's border box.
         let surfaces = |node| {
@@ -8208,7 +8214,9 @@ b</xmp></body>"#;
         let shape_rect = |shape: &crate::render::PaintShape| match shape {
             crate::render::PaintShape::Rect(rect)
             | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
-            crate::render::PaintShape::Path(_) | crate::render::PaintShape::Polygon { .. } => None,
+            crate::render::PaintShape::Path(_)
+            | crate::render::PaintShape::Polygon { .. }
+            | crate::render::PaintShape::Geometry(_) => None,
         };
         let authored_surfaces: Vec<_> = layout
             .paint

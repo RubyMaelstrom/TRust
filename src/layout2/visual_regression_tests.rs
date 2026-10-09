@@ -1290,7 +1290,7 @@ fn clip_path_inset_rounding_math_and_validation() {
         "border-box inset(0) border-box",
         "inset(0 round 1px / 2px / 3px)",
         "circle(-20px)",
-        "url(#clip)",
+        "url(#clip) border-box",
     ] {
         assert!(
             !super::clip_path::supports(invalid),

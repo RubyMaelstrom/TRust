@@ -284,6 +284,10 @@ pub(crate) struct BoxStyle {
     pub compositing_group: bool,
     pub filters: std::sync::Arc<[crate::render::CssFilter]>,
     pub filter_containing_block: bool,
+    /// Filter Effects 2 #BackdropFilterProperty: a value other than `none`
+    /// forms a stacking context and, except on the document root element, a
+    /// containing block for absolute and fixed descendants.
+    pub backdrop_filter: bool,
     /// Used `opacity`, clamped to the CSS `<alpha-value>` range. Retaining the
     /// number (rather than the old terminal-only boolean) lets graphical paint
     /// composite the entire stacking context as one group.
@@ -359,6 +363,7 @@ impl BoxStyle {
             compositing_group: false,
             filters: Default::default(),
             filter_containing_block: false,
+            backdrop_filter: false,
             opacity: 1.0,
             bg: false,
             float: None,
@@ -544,6 +549,7 @@ impl BoxStyle {
             compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
             filters: filters_of(&cv, u, vp),
             filter_containing_block: !dom.is_document_element(id),
+            backdrop_filter: has_backdrop_filter(cv("backdrop-filter")),
             opacity: dom.effective_opacity(id),
             bg: declares_background(dom, id),
             // §9.7: an out-of-flow box computes `float:none` (positioning wins).
@@ -710,6 +716,7 @@ impl BoxStyle {
             compositing_group: compositing_group(cv("mix-blend-mode"), cv("isolation")),
             filters: filters_of(&cv, u, vp),
             filter_containing_block: true,
+            backdrop_filter: has_backdrop_filter(cv("backdrop-filter")),
             opacity: cv("opacity")
                 .as_deref()
                 .and_then(|value| {
@@ -744,6 +751,7 @@ impl BoxStyle {
             || self.has_mask
             || self.compositing_group
             || !self.filters.is_empty()
+            || self.backdrop_filter
             || self.opacity < 1.0
             || (item && self.z_index.is_some())
     }
@@ -843,6 +851,15 @@ fn filters_of(
     super::filter::filters(&value, &length, current)
         .unwrap_or_default()
         .into()
+}
+
+/// Filter Effects 2 #BackdropFilterProperty: a valid value other than
+/// `none` (an invalid declaration never reaches the computed value).
+fn has_backdrop_filter(value: Option<String>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && !value.eq_ignore_ascii_case("none") && super::filter::valid(value)
+    })
 }
 
 /// Whether a computed `mask-image` list has a layer other than `none`

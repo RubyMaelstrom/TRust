@@ -958,7 +958,7 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
                 .split_ascii_whitespace()
                 .any(|m| m == mode.trim())
         }),
-        "filter" => crate::layout2::filter::valid(value),
+        "filter" | "backdrop-filter" => crate::layout2::filter::valid(value),
         "clip-path" => value == "none" || crate::layout2::clip_path::supports(value),
         "z-index" => value == "auto" || crate::dom::css_integer(value).is_some(),
         "order" => crate::dom::css_integer(value).is_some(),
