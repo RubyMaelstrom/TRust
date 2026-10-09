@@ -273,8 +273,14 @@ impl<'a> StyleBackend for Worker<'_, 'a> {
         }
         self.inputs.document_base.clone()
     }
-    fn slotted_rules<'r>(&self, index: &'r StyleIndex, _: NodeId) -> Vec<&'r StyleRule> {
+    fn slotted_rules<'r>(&self, index: &'r StyleIndex, _: NodeId) -> Vec<(&'r StyleRule, u16)> {
         if !index.slotted_rules.is_empty() {
+            self.poison();
+        }
+        Vec::new()
+    }
+    fn part_rules<'r>(&self, index: &'r StyleIndex, _: NodeId) -> Vec<PartMatch<'r>> {
+        if !index.part_rules.is_empty() {
             self.poison();
         }
         Vec::new()
@@ -315,6 +321,12 @@ impl<'a> StyleBackend for Worker<'_, 'a> {
             self.poison();
         }
         false
+    }
+    fn pseudo_origin(&self, id: NodeId, _: PseudoEl, _: &str) -> Option<String> {
+        if self.inputs.animated.contains(&id) {
+            self.poison();
+        }
+        None
     }
     #[inline]
     fn computed_cache(&self) -> &RefCell<ComputedCache> {

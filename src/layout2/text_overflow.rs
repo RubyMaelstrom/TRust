@@ -16,25 +16,31 @@ use super::overflow::Overflow;
 use super::style::{BoxStyle, InlineStyle};
 use crate::layout2::NO_NODE;
 
-/// Whether `style` ellipses its overflowing lines. The inline axis must
-/// clip: `hidden` or `clip`. A user-scrollable inline axis keeps every
-/// character reachable instead; the specification lets the UA treat
-/// `ellipsis` as `clip` while the user scrolls (#ellipsis-interaction), and
-/// TRust's scroll offsets are applied after paint, where a static ellipsis
-/// would hide the content scrolled into view.
+/// Whether `style` ellipses its overflowing lines: its inline axis is
+/// anything but `visible` (`hidden`, `clip`, or a scroll container's).
 pub(super) fn applies(style: &BoxStyle) -> bool {
     let inline_axis = usize::from(style.vertical.is_some());
-    style.text_overflow_ellipsis
-        && matches!(
-            style.overflow[inline_axis],
-            Overflow::Hidden | Overflow::Clip
-        )
+    style.text_overflow_ellipsis && style.overflow[inline_axis] != Overflow::Visible
+}
+
+/// Whether the ellipsis follows the scroll position: CSS Overflow 4
+/// #ellipsis-scrolling, for a user-scrollable inline axis. As more content
+/// scrolls into view it is shown, only the content the scrollport's end
+/// edge clips is ellipsed, and once the end of a line is in view it shows
+/// that content rather than an ellipsis. Layout ellipses against the
+/// scrollport at the current scroll offset (`scroll_offset`); a scroll of
+/// such a container relays it out (`Dom::set_scroll_pos`).
+pub(super) fn follows_scroll(style: &BoxStyle) -> bool {
+    let inline_axis = usize::from(style.vertical.is_some());
+    applies(style) && style.overflow[inline_axis].user_scrollable()
 }
 
 /// Ellipse the block's own line boxes among `children` (including those of
 /// its anonymous block boxes). `root` is the block's root inline style;
-/// `rtl` puts the end edge of its line boxes at their left.
-pub(super) fn apply(children: &mut [Frag], root: &InlineStyle, rtl: bool) {
+/// `rtl` puts the end edge of its line boxes at their left. `scroll` is the
+/// inline-axis scroll offset of a scroll container: the end edge it ellipses
+/// at is the scrollport's, moved by it from the line box's.
+pub(super) fn apply(children: &mut [Frag], root: &InlineStyle, rtl: bool, scroll: f32) {
     let mut hidden = Vec::new();
     for fragment in children.iter_mut() {
         if fragment.flow.hidden
@@ -49,13 +55,18 @@ pub(super) fn apply(children: &mut [Frag], root: &InlineStyle, rtl: bool) {
             && !fragment.flow.independent;
         match &mut fragment.kind {
             FragKind::Line(line) => {
-                if line.laid.is_none() && !overflows_end(line, rtl) {
+                if line.laid.is_none() && !overflows_end(line, rtl, scroll) {
                     continue;
                 }
                 let line = Arc::make_mut(line);
+                // Ellipse against the scrollport's edges, then restore the
+                // line box's own (the ellipsis changes rendering only).
+                let band = line.band;
+                line.band = [band[0] + scroll, band[1] + scroll];
                 hidden.extend(super::inline::text_overflow_ellipsis(line, root, rtl));
+                line.band = band;
             }
-            FragKind::Block if anonymous => apply(&mut fragment.children, root, rtl),
+            FragKind::Block if anonymous => apply(&mut fragment.children, root, rtl, scroll),
             _ => {}
         }
     }
@@ -66,12 +77,12 @@ pub(super) fn apply(children: &mut [Frag], root: &InlineStyle, rtl: bool) {
     }
 }
 
-fn overflows_end(line: &super::flow::LineFrag, rtl: bool) -> bool {
+fn overflows_end(line: &super::flow::LineFrag, rtl: bool, scroll: f32) -> bool {
     line.pieces.iter().chain(&line.atom_boxes).any(|piece| {
         if rtl {
-            piece.x < line.band[0] - 0.01
+            piece.x < line.band[0] + scroll - 0.01
         } else {
-            piece.x + piece.box_width > line.band[1] + 0.01
+            piece.x + piece.box_width > line.band[1] + scroll + 0.01
         }
     })
 }
@@ -167,9 +178,10 @@ mod tests {
             ("overflow:visible", false),
             ("overflow:clip", true),
             ("overflow-x:hidden", true),
-            // A scroll container keeps its content reachable.
-            ("overflow:auto", false),
-            ("overflow:scroll", false),
+            // CSS Overflow 4 #ellipsis-scrolling: a scroll container
+            // ellipses at its scrollport.
+            ("overflow:auto", true),
+            ("overflow:scroll", true),
             ("overflow:hidden;width:auto", false),
         ] {
             let (_, layout) = layout(&format!(
@@ -181,6 +193,63 @@ mod tests {
                 "{style}"
             );
         }
+    }
+
+    /// CSS Overflow 4 #ellipsis-scrolling: as content scrolls into view it
+    /// is shown, the ellipsis stays at the scrollport's end edge, and once
+    /// the end of the line is in view no ellipsis is drawn. Scrolling the
+    /// container relays it out at the new position.
+    #[test]
+    fn the_ellipsis_follows_the_scroll_position() {
+        let html = format!(
+            "{STYLE}<div class=t id=t style='overflow-x:auto'>abcdefghijklmnopqrstuvwxyz</div>"
+        );
+        let mut dom = Dom::parse_document(&html);
+        let t = by_id(&dom, "t");
+        let lay = |dom: &Dom| {
+            lay_out_graphical(
+                dom,
+                &Url::parse("https://example.test/").unwrap(),
+                Viewport::new(640.0, 480.0),
+                &[],
+                &Default::default(),
+                &Default::default(),
+            )
+        };
+        let shown = |layout: &crate::layout2::GraphicalLayout| {
+            let runs = runs(layout);
+            let text = runs
+                .iter()
+                .find(|(text, ..)| text.starts_with("abc"))
+                .map(|(text, x, w)| (text.chars().count(), *x, *w));
+            let ellipsis = runs
+                .iter()
+                .find(|(text, ..)| text == "…")
+                .map(|(_, x, w)| (*x, *w));
+            (text, ellipsis)
+        };
+        let (Some((before, ..)), Some((x0, _))) = shown(&lay(&dom)) else {
+            panic!("an ellipsis at the scrollport end");
+        };
+        assert!(before < 26);
+        assert!(dom.set_scroll_pos(t, 0.0, 60.0, false));
+        assert!(dom.take_dirty(), "the scroll relays out the container");
+        let (Some((after, ..)), Some((x1, w1))) = shown(&lay(&dom)) else {
+            panic!("still ellipsed partway");
+        };
+        // More content shows, and the ellipsis moves by the scroll offset
+        // (paint then translates the scrolled content back by it).
+        assert!(after > before, "{after} > {before}");
+        assert!(x1 > x0 + 40.0 && x1 + w1 <= 160.5, "{x0} {x1}");
+        // Scrolled to the end: the end of the line shows, without ellipsis.
+        dom.set_scroll_pos(t, 0.0, 400.0, false);
+        let (Some((all, ..)), None) = shown(&lay(&dom)) else {
+            panic!("no ellipsis at the end");
+        };
+        assert_eq!(all, 26);
+        // CSSOM geometry is the laid line's.
+        let layout = lay(&dom);
+        assert!(layout.boxes[&t].width <= 100.5);
     }
 
     #[test]

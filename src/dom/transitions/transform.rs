@@ -5,13 +5,31 @@
 //! longer list. Pairs sharing a primitive interpolate numerically (rotations
 //! keep their authored turns); from the first pair that does not, the rest of
 //! each list composes into a 4x4 matrix and interpolates by decomposition.
-use super::{Len, Length, Linear, NodeId, Vp};
+//!
+//! A remainder holding a percentage translation cannot be composed until
+//! layout knows the reference box (CSS Transforms 1 #transform-box): its
+//! interpolation is deferred. The computed value keeps both remainders and
+//! the progress (`-trust-interpolate-matrix()`, an internal function author
+//! style sheets cannot declare), and `layout2::transform` composes,
+//! decomposes and interpolates them against the box, as Gecko's
+//! `interpolatematrix()` does.
+use std::sync::Arc;
+
+use super::{Len, Length, Linear, Vp};
 use crate::render::matrix3d::{self, Matrix3d};
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Transform(Vec<Primitive>);
+pub(in crate::dom) struct Transform(Vec<Primitive>);
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A matrix interpolation deferred until the reference box is known.
+#[derive(Clone, Debug, PartialEq)]
+struct Deferred {
+    from: Vec<Primitive>,
+    to: Vec<Primitive>,
+    progress: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum Primitive {
     Translate(Linear, Linear),
     /// `translate3d()`; the z component is an absolute length in px.
@@ -27,6 +45,9 @@ enum Primitive {
     Perspective(f32),
     /// `matrix()`/`matrix3d()`, and interpolated matrix remainders.
     Matrix(Matrix3d),
+    /// An interpolated matrix remainder whose composition needs the
+    /// reference box.
+    Deferred(Arc<Deferred>),
 }
 
 /// Transforms 2 #transform-primitives.
@@ -40,7 +61,7 @@ enum Family {
 }
 
 impl Primitive {
-    fn family(self) -> Family {
+    fn family(&self) -> Family {
         match self {
             Self::Translate(..) | Self::Translate3d(..) => Family::Translate,
             Self::Scale(..) | Self::Scale3d(..) => Family::Scale,
@@ -48,11 +69,11 @@ impl Primitive {
             Self::Skew(..) => Family::Skew,
             // `matrix()`, `matrix3d()` and `perspective()` interpolate as
             // matrices.
-            Self::Perspective(_) | Self::Matrix(_) => Family::Matrix,
+            Self::Perspective(_) | Self::Matrix(_) | Self::Deferred(_) => Family::Matrix,
         }
     }
 
-    fn identity(self) -> Self {
+    fn identity(&self) -> Self {
         let zero = Linear { px: 0., pct: 0. };
         match self {
             Self::Translate(..) => Self::Translate(zero, zero),
@@ -60,49 +81,50 @@ impl Primitive {
             Self::Scale(..) => Self::Scale(1., 1.),
             Self::Scale3d(..) => Self::Scale3d(1., 1., 1.),
             Self::Rotate(_) => Self::Rotate(0.),
-            Self::Rotate3d(axis, _) => Self::Rotate3d(axis, 0.),
+            Self::Rotate3d(axis, _) => Self::Rotate3d(*axis, 0.),
             Self::Skew(..) => Self::Skew(0., 0.),
             Self::Perspective(_) => Self::Perspective(f32::INFINITY),
-            Self::Matrix(_) => Self::Matrix(matrix3d::IDENTITY),
+            Self::Matrix(_) | Self::Deferred(_) => Self::Matrix(matrix3d::IDENTITY),
         }
     }
 
     /// The 4x4 matrix, when no percentage needs a reference box.
-    fn matrix(self) -> Option<Matrix3d> {
+    fn matrix(&self) -> Option<Matrix3d> {
         let absolute = |l: Linear| (l.pct == 0.).then_some(l.px);
         Some(match self {
-            Self::Translate(x, y) => matrix3d::translate(absolute(x)?, absolute(y)?, 0.),
-            Self::Translate3d(x, y, z) => matrix3d::translate(absolute(x)?, absolute(y)?, z),
-            Self::Scale(x, y) => matrix3d::scale(x, y, 1.),
-            Self::Scale3d(x, y, z) => matrix3d::scale(x, y, z),
+            Self::Translate(x, y) => matrix3d::translate(absolute(*x)?, absolute(*y)?, 0.),
+            Self::Translate3d(x, y, z) => matrix3d::translate(absolute(*x)?, absolute(*y)?, *z),
+            Self::Scale(x, y) => matrix3d::scale(*x, *y, 1.),
+            Self::Scale3d(x, y, z) => matrix3d::scale(*x, *y, *z),
             Self::Rotate(a) => matrix3d::rotate(0., 0., 1., a.to_radians()),
-            Self::Rotate3d([x, y, z], a) => matrix3d::rotate(x, y, z, a.to_radians()),
+            Self::Rotate3d([x, y, z], a) => matrix3d::rotate(*x, *y, *z, a.to_radians()),
             Self::Skew(x, y) => {
                 let mut m = matrix3d::IDENTITY;
                 m[4] = x.to_radians().tan();
                 m[1] = y.to_radians().tan();
                 m
             }
-            Self::Perspective(depth) => matrix3d::perspective(depth),
-            Self::Matrix(m) => m,
+            Self::Perspective(depth) => matrix3d::perspective(*depth),
+            Self::Matrix(m) => *m,
+            Self::Deferred(_) => return None,
         })
     }
 
     /// Interpolate a pair sharing a primitive (Transforms 2
     /// #interpolation-of-transform-functions); `None` for other pairs and
     /// for matrices that cannot be composed or decomposed.
-    fn mix(self, end: Self, t: f32) -> Option<Self> {
+    fn mix(&self, end: &Self, t: f32) -> Option<Self> {
         if self.family() != end.family() {
             return None;
         }
         let mix = |a: f32, b: f32| a + (b - a) * t;
         Some(match (self, end) {
             (Self::Translate(x, y), Self::Translate(u, v)) => {
-                Self::Translate(x.mix(u, t), y.mix(v, t))
+                Self::Translate(x.mix(*u, t), y.mix(*v, t))
             }
-            (Self::Scale(x, y), Self::Scale(u, v)) => Self::Scale(mix(x, u), mix(y, v)),
-            (Self::Rotate(x), Self::Rotate(y)) => Self::Rotate(mix(x, y)),
-            (Self::Skew(x, y), Self::Skew(u, v)) => Self::Skew(mix(x, u), mix(y, v)),
+            (Self::Scale(x, y), Self::Scale(u, v)) => Self::Scale(mix(*x, *u), mix(*y, *v)),
+            (Self::Rotate(x), Self::Rotate(y)) => Self::Rotate(mix(*x, *y)),
+            (Self::Skew(x, y), Self::Skew(u, v)) => Self::Skew(mix(*x, *u), mix(*y, *v)),
             // A 2D and a 3D function share the 3D primitive.
             _ if self.family() == Family::Translate => {
                 let (x0, y0, z0) = self.translation3d();
@@ -147,31 +169,31 @@ impl Primitive {
         })
     }
 
-    fn translation3d(self) -> (Linear, Linear, f32) {
-        match self {
+    fn translation3d(&self) -> (Linear, Linear, f32) {
+        match *self {
             Self::Translate(x, y) => (x, y, 0.),
             Self::Translate3d(x, y, z) => (x, y, z),
             _ => unreachable!("translate primitive"),
         }
     }
 
-    fn scale3d(self) -> [f32; 3] {
-        match self {
+    fn scale3d(&self) -> [f32; 3] {
+        match *self {
             Self::Scale(x, y) => [x, y, 1.],
             Self::Scale3d(x, y, z) => [x, y, z],
             _ => unreachable!("scale primitive"),
         }
     }
 
-    fn rotation3d(self) -> ([f32; 3], f32) {
-        match self {
+    fn rotation3d(&self) -> ([f32; 3], f32) {
+        match *self {
             Self::Rotate(a) => ([0., 0., 1.], a),
             Self::Rotate3d(axis, a) => (axis, a),
             _ => unreachable!("rotate primitive"),
         }
     }
 
-    fn css(self) -> String {
+    fn css(&self) -> String {
         let number = |v: f32| {
             let text = format!("{v:.6}");
             let text = text.trim_end_matches('0').trim_end_matches('.');
@@ -181,7 +203,7 @@ impl Primitive {
                 text.to_string()
             }
         };
-        match self {
+        match *self {
             Self::Translate(x, y) => format!("translate({}, {})", x.css(0), y.css(0)),
             Self::Translate3d(x, y, z) => {
                 format!("translate3d({}, {}, {}px)", x.css(0), y.css(0), number(z))
@@ -206,6 +228,27 @@ impl Primitive {
                 "matrix3d({})",
                 m.iter().map(|v| number(*v)).collect::<Vec<_>>().join(", ")
             ),
+            // `layout2::transform` resolves the remainders against the
+            // reference box; an empty remainder is `none`.
+            Self::Deferred(ref deferred) => {
+                let list = |list: &[Primitive]| {
+                    if list.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        list.iter()
+                            .map(Primitive::css)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
+                };
+                format!(
+                    "{}({}, {}, {})",
+                    crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION,
+                    number(deferred.progress),
+                    list(&deferred.from),
+                    list(&deferred.to)
+                )
+            }
         }
     }
 }
@@ -225,18 +268,14 @@ fn interpolate_matrices(a: &Matrix3d, b: &Matrix3d, t: f32) -> Option<Matrix3d> 
 }
 
 impl Transform {
-    pub(super) fn parse<D: crate::layout2::UnitSource + ?Sized>(
-        value: &str,
-        dom: &D,
-        id: NodeId,
-        vp: Vp,
-    ) -> Option<Self> {
+    /// Parse a computed `transform` with the target's font-relative
+    /// `units`.
+    pub(in crate::dom) fn parse(value: &str, units: crate::layout2::Units, vp: Vp) -> Option<Self> {
         if value.eq_ignore_ascii_case("none") {
             return Some(Self(Vec::new()));
         }
         let mut result = Vec::new();
         let mut rest = value.trim();
-        let units = crate::layout2::Units::of(dom, id);
         let length = |v: &str| match Len::parse(v, units, vp)? {
             Len::Val(Length::Lin { k, b }) => Some(Linear { px: b, pct: k }),
             _ => None,
@@ -348,17 +387,17 @@ impl Transform {
     /// a remainder needs matrix interpolation but cannot be composed (a
     /// percentage translation, whose reference box only layout knows) or
     /// decomposed (a singular matrix).
-    fn interpolate(&self, end: &Self, t: f32) -> Option<Self> {
+    pub(in crate::dom) fn interpolate(&self, end: &Self, t: f32) -> Option<Self> {
         let length = self.0.len().max(end.0.len());
         let pad = |list: &[Primitive], other: &[Primitive]| -> Vec<Primitive> {
             (0..length)
-                .map(|i| list.get(i).copied().unwrap_or_else(|| other[i].identity()))
+                .map(|i| list.get(i).cloned().unwrap_or_else(|| other[i].identity()))
                 .collect()
         };
         let (a, b) = (pad(&self.0, &end.0), pad(&end.0, &self.0));
         let mut result = Vec::with_capacity(length);
         for index in 0..length {
-            if let Some(primitive) = a[index].mix(b[index], t) {
+            if let Some(primitive) = a[index].mix(&b[index], t) {
                 result.push(primitive);
                 continue;
             }
@@ -368,31 +407,59 @@ impl Transform {
                         Some(matrix3d::multiply(&matrix, &primitive.matrix()?))
                     })
             };
-            let matrix = interpolate_matrices(&compose(&a[index..])?, &compose(&b[index..])?, t)?;
-            result.push(Primitive::Matrix(matrix));
+            match (compose(&a[index..]), compose(&b[index..])) {
+                (Some(from), Some(to)) => {
+                    result.push(Primitive::Matrix(interpolate_matrices(&from, &to, t)?));
+                }
+                // A percentage translation (or an earlier deferred
+                // remainder) needs the reference box: defer to layout.
+                _ => result.push(Primitive::Deferred(Arc::new(Deferred {
+                    from: a[index..].to_vec(),
+                    to: b[index..].to_vec(),
+                    progress: t,
+                }))),
+            }
             break;
         }
         Some(Self(result))
     }
 
-    /// CSS Transitions 1 #transitionable.
-    pub(super) fn compatible(&self, other: &Self) -> bool {
+    /// CSS Transitions 1 #transitionable. A deferred remainder is
+    /// transitionable; a singular matrix there animates discretely when
+    /// layout resolves it.
+    pub(in crate::dom) fn compatible(&self, other: &Self) -> bool {
         self.interpolate(other, 0.5).is_some()
     }
 
-    pub(super) fn mix(&self, end: &Self, t: f32) -> Self {
+    pub(in crate::dom) fn mix(&self, end: &Self, t: f32) -> Self {
         self.interpolate(end, t)
             .unwrap_or_else(|| if t < 0.5 { self.clone() } else { end.clone() })
     }
 
-    pub(super) fn css(&self) -> String {
+    pub(in crate::dom) fn css(&self) -> String {
         if self.0.is_empty() {
             return "none".into();
         }
         self.0.iter().map(|p| p.css()).collect::<Vec<_>>().join(" ")
     }
 
-    pub(super) fn retained_bytes(&self) -> usize {
-        self.0.capacity() * std::mem::size_of::<Primitive>()
+    pub(in crate::dom) fn retained_bytes(&self) -> usize {
+        fn list(primitives: &[Primitive]) -> usize {
+            primitives
+                .iter()
+                .map(|primitive| {
+                    std::mem::size_of::<Primitive>()
+                        + match primitive {
+                            Primitive::Deferred(deferred) => {
+                                std::mem::size_of::<Deferred>()
+                                    + list(&deferred.from)
+                                    + list(&deferred.to)
+                            }
+                            _ => 0,
+                        }
+                })
+                .sum()
+        }
+        list(&self.0) + (self.0.capacity() - self.0.len()) * std::mem::size_of::<Primitive>()
     }
 }

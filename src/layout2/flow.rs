@@ -885,11 +885,7 @@ impl Flow<'_> {
         // Anchors recorded inside this box shift with its §9.4.3/transform
         // paint offset.
         let a0 = cur.anchors.len();
-        let inl = if b.node == NO_NODE {
-            parent_inl.with_pseudo(self.dom, s.pseudo)
-        } else {
-            InlineStyle::derive(self.dom, b.node, parent_inl, self.base)
-        };
+        let inl = InlineStyle::for_box(self.dom, b.node, s, parent_inl, self.base);
         // Anonymous boxes inherit the text properties of their parent
         // element (§9.2.1.1) — alignment/indent read from it.
         let style_node = if b.node == NO_NODE { inl.node } else { b.node };
@@ -1524,7 +1520,8 @@ impl Flow<'_> {
         }
         if super::text_overflow::applies(s) {
             let rtl = super::style::right_to_left(self.dom, inl.node);
-            super::text_overflow::apply(&mut children, &inl, rtl);
+            let scroll = self.ellipsis_scroll(b.node, s);
+            super::text_overflow::apply(&mut children, &inl, rtl, scroll);
         }
 
         // ---- the ::marker (outside position) ----
@@ -2680,6 +2677,8 @@ impl Flow<'_> {
 /// and its final placement (content-relative until the single translation
 /// at the end).
 struct FItem<'t> {
+    /// A collapsed flex item in the second #algo-visibility round.
+    collapsed: bool,
     b: &'t BoxNode,
     /// Resolved margins TRBL (`auto` → 0 — §9.5/§9.6 hand autos their
     /// share separately) and the auto flags.
@@ -2701,10 +2700,68 @@ struct FItem<'t> {
     border_y: f32,
 }
 
+/// Which round of CSS Flexbox 1 #algo-visibility a flex layout performs.
+pub(super) enum Collapse<'a> {
+    /// No item is collapsed.
+    None,
+    /// The first round, with every item uncollapsed: record each collapsed
+    /// item's strut size, the cross size of its line. The fragments are
+    /// discarded.
+    Measure {
+        collapsed: &'a [bool],
+        struts: &'a mut [Option<f32>],
+    },
+    /// The second round: items with a strut size are collapsed.
+    Struts(&'a [Option<f32>]),
+}
+
+impl Collapse<'_> {
+    fn collapsed(&self, item: usize) -> bool {
+        matches!(self, Collapse::Struts(struts) if struts.get(item).copied().flatten().is_some())
+    }
+
+    /// The second round's adjustment after the line cross sizes: a line is
+    /// at least as large as the largest strut among its collapsed items.
+    fn strut(&self, line: std::ops::Range<usize>) -> f32 {
+        match self {
+            Collapse::Struts(struts) => struts[line]
+                .iter()
+                .flatten()
+                .copied()
+                .fold(0.0f32, f32::max),
+            _ => 0.0,
+        }
+    }
+
+    /// The first round's record of each collapsed item's line cross size.
+    fn note(&mut self, lines: &[std::ops::Range<usize>], line_cross: &[f32]) {
+        if let Collapse::Measure { collapsed, struts } = self {
+            for (line, &cross) in lines.iter().zip(line_cross) {
+                for item in line.clone() {
+                    if collapsed[item] {
+                        struts[item] = Some(cross);
+                    }
+                }
+            }
+        }
+    }
+
+    fn measuring(&self) -> bool {
+        matches!(self, Collapse::Measure { .. })
+    }
+}
+
 /// §9.3 greedy line collection over outer hypothetical main sizes. The
 /// first item of a line always fits (spec: "If the very first uncollected
-/// item wouldn’t fit, collect just it").
-fn collect_lines(outer: &[f32], wrap: bool, avail: f32, gap: f32) -> Vec<std::ops::Range<usize>> {
+/// item wouldn’t fit, collect just it"). Collapsed items (#algo-visibility)
+/// have a zero main size and, like `display: none` boxes, no gutter.
+fn collect_lines(
+    outer: &[f32],
+    collapsed: &dyn Fn(usize) -> bool,
+    wrap: bool,
+    avail: f32,
+    gap: f32,
+) -> Vec<std::ops::Range<usize>> {
     let mut lines = Vec::new();
     if !wrap || outer.len() <= 1 {
         lines.push(0..outer.len());
@@ -2712,17 +2769,28 @@ fn collect_lines(outer: &[f32], wrap: bool, avail: f32, gap: f32) -> Vec<std::op
     }
     let mut start = 0usize;
     let mut sum = 0.0f32;
+    // Whether the current line holds an uncollapsed item yet.
+    let mut occupied = false;
     for (i, &oh) in outer.iter().enumerate() {
+        let collapsed = collapsed(i);
+        let (oh, gap) = match (collapsed, occupied) {
+            (true, _) => (0.0, 0.0),
+            (false, false) => (oh, 0.0),
+            (false, true) => (oh, gap),
+        };
         if i == start {
             sum = oh;
+            occupied = !collapsed;
             continue;
         }
         if sum + gap + oh > avail + 1e-3 {
             lines.push(start..i);
             start = i;
             sum = oh;
+            occupied = !collapsed;
         } else {
             sum += gap + oh;
+            occupied |= !collapsed;
         }
     }
     lines.push(start..outer.len());
@@ -2828,38 +2896,93 @@ impl Flow<'_> {
         let mut idx: Vec<usize> = (0..items.len()).collect();
         idx.sort_by_key(|&i| self.order_of(items[i].node));
         let ordered: Vec<&BoxNode> = idx.iter().map(|&i| items[i].as_ref()).collect();
-        if fs.row {
-            self.flex_row(
-                &fs,
-                &ordered,
-                gap_main,
-                gap_cross,
-                content_x,
-                content_top,
-                content_w,
-                def_ch,
-                cross_clamp,
-                inl,
-                anchors,
-            )
-        } else {
-            // For a column, the block axis IS the main axis, so the same
-            // (min_h, max_h) the row path treats as its cross clamp is this
-            // container's own main-size clamp.
-            self.flex_col(
-                &fs,
-                &ordered,
-                gap_main,
-                gap_cross,
-                content_x,
-                content_top,
-                content_w,
-                def_ch,
-                cross_clamp,
-                inl,
-                anchors,
-            )
+        let run = |round: Collapse<'_>, anchors: &mut Vec<(NodeId, f32)>| {
+            if fs.row {
+                self.flex_row(
+                    &fs,
+                    &ordered,
+                    gap_main,
+                    gap_cross,
+                    content_x,
+                    content_top,
+                    content_w,
+                    def_ch,
+                    cross_clamp,
+                    inl,
+                    anchors,
+                    round,
+                )
+            } else {
+                // For a column, the block axis IS the main axis, so the same
+                // (min_h, max_h) the row path treats as its cross clamp is
+                // this container's own main-size clamp.
+                self.flex_col(
+                    &fs,
+                    &ordered,
+                    gap_main,
+                    gap_cross,
+                    content_x,
+                    content_top,
+                    content_w,
+                    def_ch,
+                    cross_clamp,
+                    inl,
+                    anchors,
+                    round,
+                )
+            }
+        };
+        // CSS Flexbox 1 #algo-visibility: with any `visibility: collapse`
+        // item, lay out once with every item uncollapsed to note each
+        // collapsed item's strut size (its line's cross size), then restart
+        // with those items collapsed.
+        let collapsed: Vec<bool> = ordered
+            .iter()
+            .map(|item| self.collapsed_flex_item(item.node))
+            .collect();
+        if !collapsed.contains(&true) {
+            return run(Collapse::None, anchors);
         }
+        let mut struts = vec![None; ordered.len()];
+        run(
+            Collapse::Measure {
+                collapsed: &collapsed,
+                struts: &mut struts,
+            },
+            &mut Vec::new(),
+        );
+        run(Collapse::Struts(&struts), anchors)
+    }
+
+    /// The inline-axis scroll offset the ellipsis of a scroll container
+    /// follows (`text_overflow::follows_scroll`): the live offset, or the one
+    /// a presentation snapshot baked.
+    fn ellipsis_scroll(&self, node: NodeId, style: &BoxStyle) -> f32 {
+        if node == NO_NODE || !super::text_overflow::follows_scroll(style) {
+            return 0.0;
+        }
+        let axis = if style.vertical.is_some() { 0 } else { 1 };
+        let marker = if axis == 0 {
+            "data-trust-scroll-top"
+        } else {
+            "data-trust-scroll-left"
+        };
+        self.dom
+            .internal_marker(node, marker)
+            .and_then(|value| value.parse::<f32>().ok())
+            .or_else(|| self.dom.scroll_metric(node, axis).map(|value| value as f32))
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+    }
+
+    /// CSS Flexbox 1 #visibility-collapse: a flex item with
+    /// `visibility: collapse` is a collapsed flex item.
+    pub(super) fn collapsed_flex_item(&self, node: NodeId) -> bool {
+        node != NO_NODE
+            && self
+                .dom
+                .computed_value_resolved(node, "visibility")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("collapse"))
     }
 
     /// Row-direction flex layout: §9.2 base sizes → §9.3 lines → §9.7
@@ -2878,11 +3001,13 @@ impl Flow<'_> {
         cross_clamp: (f32, f32),
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
+        mut round: Collapse<'_>,
     ) -> (Vec<Frag>, f32) {
         // ---- §9.2: flex base size and hypothetical main size ----
         let mut fi: Vec<FItem> = Vec::with_capacity(items.len());
         let mut calcs: Vec<FlexCalc> = Vec::with_capacity(items.len());
-        for it in items {
+        for (index, it) in items.iter().enumerate() {
+            let collapsed = round.collapsed(index);
             let s = &it.style;
             let (m, auto) = self.margins_of(s, content_w);
             let bp_l = s.border[LEFT] + self.pad(s, LEFT, content_w);
@@ -2972,15 +3097,21 @@ impl Flow<'_> {
                 .map(to_content_v)
                 .map(|v| v.clamp(hmin, hmax));
             let align = self.item_align(it.node, fs.align_items);
-            calcs.push(FlexCalc::new(
-                base,
-                min_main,
-                max_main.max(min_main),
-                grow,
-                shrink,
-                bp_main + m[LEFT] + m[RIGHT],
-            ));
+            // #algo-visibility: a collapsed item has a zero main size.
+            calcs.push(if collapsed {
+                FlexCalc::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                FlexCalc::new(
+                    base,
+                    min_main,
+                    max_main.max(min_main),
+                    grow,
+                    shrink,
+                    bp_main + m[LEFT] + m[RIGHT],
+                )
+            });
             fi.push(FItem {
+                collapsed,
                 b: it,
                 m,
                 auto,
@@ -2998,11 +3129,11 @@ impl Flow<'_> {
 
         // ---- §9.3 lines, §9.7 per line, item layout, line cross sizes ----
         let outer: Vec<f32> = calcs.iter().map(FlexCalc::outer_hypo).collect();
-        let lines = collect_lines(&outer, fs.wrap, content_w, gap_main);
+        let lines = collect_lines(&outer, &|i| fi[i].collapsed, fs.wrap, content_w, gap_main);
         let mut line_cross: Vec<f32> = Vec::with_capacity(lines.len());
         let mut line_baseline: Vec<Option<f32>> = Vec::with_capacity(lines.len());
         for r in &lines {
-            let n = r.len();
+            let n = r.clone().filter(|&i| !fi[i].collapsed).count();
             let inner = content_w - gap_main * n.saturating_sub(1) as f32;
             resolve_flexible_lengths(inner, &mut calcs[r.clone()]);
             let mut cross = 0.0f32;
@@ -3010,6 +3141,13 @@ impl Flow<'_> {
                 let used = calcs[i].target.max(0.0);
                 let (mut frag, mut anc) =
                     self.item_frag(fi[i].b, used, content_w, fi[i].def_h, inl);
+                // #algo-visibility: the rest of the algorithm ignores a
+                // collapsed item; its fragment keeps only CSSOM geometry.
+                if fi[i].collapsed {
+                    fi[i].frag = Some(frag);
+                    fi[i].anchors = anc;
+                    continue;
+                }
                 // Flexbox §9.4's hypothetical cross size comes from ordinary
                 // block layout, which includes the item's own min/max-height
                 // constraints (CSS Sizing 3 §3.1). `item_frag` receives an
@@ -3052,7 +3190,11 @@ impl Flow<'_> {
             let mut below = 0.0f32;
             let mut has_baseline = false;
             for i in r.clone() {
-                if fi[i].align != AlignItem::Baseline || fi[i].auto[TOP] || fi[i].auto[BOTTOM] {
+                if fi[i].collapsed
+                    || fi[i].align != AlignItem::Baseline
+                    || fi[i].auto[TOP]
+                    || fi[i].auto[BOTTOM]
+                {
                     continue;
                 }
                 let frag = fi[i].frag.as_ref().expect("laid above");
@@ -3067,7 +3209,9 @@ impl Flow<'_> {
             } else {
                 line_baseline.push(None);
             }
-            line_cross.push(cross);
+            // #algo-visibility, second round: a line is at least as large as
+            // the struts of its collapsed items.
+            line_cross.push(cross.max(round.strut(r.clone())));
         }
         // §9.4: single-line + definite container cross → the line IS the
         // container's inner cross, clamped by the container's min/max.
@@ -3087,10 +3231,15 @@ impl Flow<'_> {
                 }
             }
         }
+        // #algo-visibility: the first round only notes the strut sizes.
+        round.note(&lines, &line_cross);
+        if round.measuring() {
+            return (Vec::new(), 0.0);
+        }
 
         // ---- §9.5 main-axis: auto margins, then justify-content ----
         for r in &lines {
-            let n = r.len();
+            let n = r.clone().filter(|&i| !fi[i].collapsed).count();
             let gaps = gap_main * n.saturating_sub(1) as f32;
             let used_sum: f32 = r
                 .clone()
@@ -3099,6 +3248,7 @@ impl Flow<'_> {
             let mut free = content_w - gaps - used_sum;
             let autos: usize = r
                 .clone()
+                .filter(|&i| !fi[i].collapsed)
                 .map(|i| usize::from(fi[i].auto[LEFT]) + usize::from(fi[i].auto[RIGHT]))
                 .sum();
             let share = if free > 0.0 && autos > 0 {
@@ -3110,13 +3260,19 @@ impl Flow<'_> {
             };
             let (lead, between) = justify_offsets(fs.justify, free, n);
             let mut run = lead;
-            for (k, i) in r.clone().enumerate() {
+            let mut k = 0;
+            for i in r.clone() {
+                if fi[i].collapsed {
+                    fi[i].border_x = if fs.reverse { content_w - run } else { run };
+                    continue;
+                }
+                k += 1;
                 let ml = fi[i].m[LEFT] + if fi[i].auto[LEFT] { share } else { 0.0 };
                 let mr = fi[i].m[RIGHT] + if fi[i].auto[RIGHT] { share } else { 0.0 };
                 let outer_full = calcs[i].target.max(0.0) + fi[i].bp_main + ml + mr;
                 let margin_x = run;
                 run += outer_full;
-                if k + 1 < n {
+                if k < n {
                     run += between + gap_main;
                 }
                 // CSS Flexbox 1 #flex-direction-property: reversing swaps
@@ -3147,6 +3303,10 @@ impl Flow<'_> {
         for &li in &order {
             let cross = line_cross[li];
             for i in lines[li].clone() {
+                if fi[i].collapsed {
+                    fi[i].border_y = top;
+                    continue;
+                }
                 // §9.4 step 11: stretch sets the item's used cross size to the
                 // line's cross size (cross-size auto, no auto cross margins).
                 // The item was laid at its HYPOTHETICAL size in the first pass
@@ -3208,6 +3368,9 @@ impl Flow<'_> {
         }
         for it in &mut fi {
             let mut frag = it.frag.take().expect("laid above");
+            // A collapsed flex item is removed from rendering entirely
+            // (#visibility-collapse): no paint, hit testing or overflow.
+            frag.flow.hidden |= it.collapsed;
             // §9.4.3 relative offset + transform translation — a flex item's
             // containing block is the container's content box.
             let (rx, ry) = self.paint_offset(&it.b.style, content_w, def_ch, &mut frag);
@@ -3242,11 +3405,13 @@ impl Flow<'_> {
         main_clamp: (f32, f32),
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
+        mut round: Collapse<'_>,
     ) -> (Vec<Frag>, f32) {
         let mut fi: Vec<FItem> = Vec::with_capacity(items.len());
         let mut calcs: Vec<FlexCalc> = Vec::with_capacity(items.len());
         let mut post_flex_main_definite: Vec<bool> = Vec::with_capacity(items.len());
-        for it in items {
+        for (index, it) in items.iter().enumerate() {
+            let collapsed = round.collapsed(index);
             let s = &it.style;
             let (m, auto) = self.margins_of(s, content_w);
             let bp_l = s.border[LEFT] + self.pad(s, LEFT, content_w);
@@ -3372,15 +3537,21 @@ impl Flow<'_> {
                     .map(|v| to_content_v(v).max(0.0))
                     .unwrap_or(0.0),
             };
-            calcs.push(FlexCalc::new(
-                base,
-                min_main,
-                max_main.max(min_main),
-                grow,
-                shrink,
-                bp_main + m[TOP] + m[BOTTOM],
-            ));
+            // #algo-visibility: a collapsed item has a zero main size.
+            calcs.push(if collapsed {
+                FlexCalc::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                FlexCalc::new(
+                    base,
+                    min_main,
+                    max_main.max(min_main),
+                    grow,
+                    shrink,
+                    bp_main + m[TOP] + m[BOTTOM],
+                )
+            });
             fi.push(FItem {
+                collapsed,
                 b: it,
                 m,
                 auto,
@@ -3400,6 +3571,7 @@ impl Flow<'_> {
         let outer: Vec<f32> = calcs.iter().map(FlexCalc::outer_hypo).collect();
         let lines = collect_lines(
             &outer,
+            &|i| fi[i].collapsed,
             fs.wrap && def_ch.is_some(),
             def_ch.unwrap_or(f32::INFINITY),
             gap_main,
@@ -3408,7 +3580,7 @@ impl Flow<'_> {
         let mut line_main: Vec<f32> = Vec::with_capacity(lines.len());
         let mut line_cross: Vec<f32> = Vec::with_capacity(lines.len());
         for r in &lines {
-            let n = r.len();
+            let n = r.clone().filter(|&i| !fi[i].collapsed).count();
             let gaps = gap_main * n.saturating_sub(1) as f32;
             // §9.2/§9.7: flexing distributes the container's INNER MAIN SIZE —
             // its used height. When `height` is auto but `min-height` is definite
@@ -3454,6 +3626,10 @@ impl Flow<'_> {
             resolve_flexible_lengths(inner, &mut calcs[r.clone()]);
             let mut cross = 0.0f32;
             for i in r.clone() {
+                if fi[i].collapsed {
+                    // #algo-visibility: ignored by the rest of the algorithm.
+                    continue;
+                }
                 let used = calcs[i].target.max(0.0);
                 let bp_main = fi[i].bp_main;
                 let (ml, mr) = (fi[i].m[LEFT], fi[i].m[RIGHT]);
@@ -3505,12 +3681,14 @@ impl Flow<'_> {
                 cross = cross.max(frag.w + ml + mr);
             }
             line_main.push(inner + gaps);
-            line_cross.push(cross);
+            // #algo-visibility, second round: a line is at least as large
+            // as the struts of its collapsed items.
+            line_cross.push(cross.max(round.strut(r.clone())));
         }
 
         // ---- §9.5 main (vertical): auto margins then justify ----
         for (li, r) in lines.iter().enumerate() {
-            let n = r.len();
+            let n = r.clone().filter(|&i| !fi[i].collapsed).count();
             let gaps = gap_main * n.saturating_sub(1) as f32;
             let used_sum: f32 = r
                 .clone()
@@ -3520,6 +3698,7 @@ impl Flow<'_> {
             let mut free = main_size - gaps - used_sum;
             let autos: usize = r
                 .clone()
+                .filter(|&i| !fi[i].collapsed)
                 .map(|i| usize::from(fi[i].auto[TOP]) + usize::from(fi[i].auto[BOTTOM]))
                 .sum();
             let share = if free > 0.0 && autos > 0 {
@@ -3531,13 +3710,19 @@ impl Flow<'_> {
             };
             let (lead, between) = justify_offsets(fs.justify, free, n);
             let mut run = lead;
-            for (k, i) in r.clone().enumerate() {
+            let mut k = 0;
+            for i in r.clone() {
+                if fi[i].collapsed {
+                    fi[i].border_y = if fs.reverse { main_size - run } else { run };
+                    continue;
+                }
+                k += 1;
                 let mt = fi[i].m[TOP] + if fi[i].auto[TOP] { share } else { 0.0 };
                 let mb = fi[i].m[BOTTOM] + if fi[i].auto[BOTTOM] { share } else { 0.0 };
                 let outer_full = calcs[i].target.max(0.0) + fi[i].bp_main + mt + mb;
                 let margin_y = run;
                 run += outer_full;
-                if k + 1 < n {
+                if k < n {
                     run += between + gap_main;
                 }
                 // As for rows: the top margin stays on the item's top side.
@@ -3564,6 +3749,11 @@ impl Flow<'_> {
                 }
             }
         }
+        // #algo-visibility: the first round only notes the strut sizes.
+        round.note(&lines, &line_cross);
+        if round.measuring() {
+            return (Vec::new(), 0.0);
+        }
 
         // ---- columns across (cross axis is the definite content width) ----
         let total_cross: f32 =
@@ -3580,6 +3770,10 @@ impl Flow<'_> {
             let cross = line_cross[li];
             for i in lines[li].clone() {
                 let it = &mut fi[i];
+                if it.collapsed {
+                    it.border_x = left;
+                    continue;
+                }
                 let frag = it.frag.as_mut().expect("laid above");
                 let extra = cross - (frag.w + it.m[LEFT] + it.m[RIGHT]);
                 let shift = cross_shift(extra, it.auto[LEFT], it.auto[RIGHT], it.align);
@@ -3590,6 +3784,12 @@ impl Flow<'_> {
         let mut frags: Vec<Frag> = Vec::with_capacity(fi.len());
         for it in &mut fi {
             let mut frag = it.frag.take().expect("laid above");
+            // A collapsed flex item is removed from rendering entirely
+            // (#visibility-collapse): no paint, hit testing or overflow.
+            if it.collapsed {
+                frag.h = it.bp_main;
+                frag.flow.hidden = true;
+            }
             let (rx, ry) = self.paint_offset(&it.b.style, content_w, def_ch, &mut frag);
             let dx = content_x + it.border_x + rx;
             let dy = content_top + it.border_y + ry;
@@ -3752,11 +3952,7 @@ impl Flow<'_> {
     ) -> (Frag, Vec<(NodeId, f32)>) {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::ItemCompute);
         let s = &b.style;
-        let inl = if b.node == NO_NODE {
-            parent_inl.with_pseudo(self.dom, s.pseudo)
-        } else {
-            InlineStyle::derive(self.dom, b.node, parent_inl, self.base)
-        };
+        let inl = InlineStyle::for_box(self.dom, b.node, s, parent_inl, self.base);
         let style_node = if b.node == NO_NODE { inl.node } else { b.node };
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, pct_basis);
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, pct_basis);
@@ -4048,7 +4244,8 @@ impl Flow<'_> {
         }
         if super::text_overflow::applies(s) {
             let rtl = super::style::right_to_left(self.dom, inl.node);
-            super::text_overflow::apply(&mut children, &inl, rtl);
+            let scroll = self.ellipsis_scroll(b.node, s);
+            super::text_overflow::apply(&mut children, &inl, rtl, scroll);
         }
         // The marker hangs outside the item's content box, before its first
         // child in painting order.
@@ -4828,11 +5025,7 @@ impl Flow<'_> {
                 (Some(l), Some(w), None) => (l, w, ml0),
             }
         };
-        let vertical_inl = if b.node == NO_NODE {
-            ctx.with_pseudo(self.dom, s.pseudo)
-        } else {
-            InlineStyle::derive(self.dom, b.node, ctx, self.base)
-        };
+        let vertical_inl = InlineStyle::for_box(self.dom, b.node, s, ctx, self.base);
         let vertical = self.vertical_lines(
             b,
             self.height_px(&s.height, s, bp_t, bp_b, Some(cb.h)),
@@ -5395,6 +5588,7 @@ impl Flow<'_> {
                 ifc.set_align_last(align_last);
             }
             ifc.set_rtl(rtl);
+            ifc.enable_bidi(inl.node);
             ifc.set_first_line_ascent(first_line_ascent);
             ifc.inside_marker(marker, marker_image, inl);
             ifc.set_break_inset(inset, from);

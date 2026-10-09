@@ -709,9 +709,16 @@ mod tests {
             ("object-fit:cover;object-position:right", (-100.0, 0.0)),
             ("object-fit:cover;object-position:25% 0", (-25.0, 0.0)),
             ("object-fit:cover;object-position:10px 2em", (10.0, 20.0)),
+            // CSS Values 4 #position: `<position>` has no three-value form
+            // (only background-position does), so this keeps the previous
+            // declaration.
             (
-                "object-fit:cover;object-position:right 10px top",
+                "object-fit:cover;object-position:right 10px top 0px",
                 (-110.0, 0.0),
+            ),
+            (
+                "object-fit:cover;object-position:right;object-position:right 10px top",
+                (-100.0, 0.0),
             ),
             (
                 "object-fit:contain;object-position:left 5px bottom 10%",

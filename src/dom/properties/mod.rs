@@ -8,6 +8,7 @@
 //! names. Its multi-name CSSOM issue (#14227) is still unresolved.
 pub(super) mod fonts;
 mod gradients;
+pub(super) mod grammar;
 mod math;
 mod matrix;
 pub(super) mod numeric;

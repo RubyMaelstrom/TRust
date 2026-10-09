@@ -6,15 +6,19 @@
 //! #the-effect-value-of-a-keyframe-animation-effect; CSS Cascade 5
 //! #cascade-origin. CSSWG snapshot 81c27f686901 (2026-09-06).
 //!
-//! `top`, `transform` and `opacity` keep the retained-display-list path
-//! (`layout2::graphics::paint_animation_scope`), sampled by the frontend
-//! renderer without the page actor. Every other animated property is sampled
-//! here, on the page actor's document timeline, into an animation-origin
-//! value that `computed_value` returns ahead of normal author declarations
-//! but behind `!important` ones and transitions. Like Gecko's animation-only
-//! restyle, a frame never re-runs selector matching: it re-samples the
-//! retained keyframes and evicts only the changed properties of the animated
-//! elements and their inheriting descendants. Paint-only changes repaint the
+//! `top`, `transform` and `opacity` of an element keep the retained-display-
+//! list path (`layout2::graphics::paint_animation_scope`), sampled by the
+//! frontend renderer without the page actor. Every other animated property,
+//! and every property of a pseudo-element's animations (which that path
+//! does not sample), is sampled here, on the page actor's document
+//! timeline, into an animation-origin value that `computed_value` (or, for
+//! a pseudo-element, `pseudo_layout_value`) returns ahead of normal author
+//! declarations but behind `!important` ones and transitions. Animations
+//! are keyed by their target, an element or one of its pseudo-elements.
+//! Like Gecko's animation-only restyle, a frame never re-runs selector
+//! matching: it re-samples the retained keyframes and evicts only the
+//! changed properties of the animated elements and their inheriting
+//! descendants. Paint-only changes repaint the
 //! retained fragments; anything else takes the ordinary relayout path.
 use super::*;
 use crate::layout2::value::Vp;
@@ -35,12 +39,14 @@ pub(super) fn keyframe_property(property: &str) -> bool {
         || property.starts_with("--"))
 }
 
-/// Properties whose animation the style origin applies. Web Animations
-/// #animating-properties: `display`, `direction`, `unicode-bidi` and the
-/// animation/transition properties are not animatable.
-fn sampled_property(property: &str) -> bool {
+/// Properties whose animation the style origin applies on an element, or
+/// (`pseudo`) a pseudo-element, whose compositor properties it samples too.
+/// Web Animations #animating-properties: `display`, `direction`,
+/// `unicode-bidi` and the animation/transition properties are not
+/// animatable.
+fn sampled_property(property: &str, pseudo: bool) -> bool {
     keyframe_property(property)
-        && !COMPOSITOR.contains(&property)
+        && (pseudo || !COMPOSITOR.contains(&property))
         && !matches!(
             property,
             "display"
@@ -83,7 +89,8 @@ fn svg_dependent(property: &str) -> bool {
     matches!(property, "color" | "caret-color")
 }
 
-pub(crate) type AnimationEvent = (NodeId, String, &'static str, f64);
+/// (element, animationName, type, elapsedTime, pseudoElement).
+pub(crate) type AnimationEvent = (NodeId, String, &'static str, f64, &'static str);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
@@ -431,9 +438,9 @@ struct PendingEvent {
 
 #[derive(Default)]
 pub(super) struct State {
-    elements: FxHashMap<NodeId, Element>,
-    /// Animation-origin values by element, then `PROPS` index.
-    values: FxHashMap<NodeId, Vec<(u16, String)>>,
+    elements: FxHashMap<StyleTarget, Element>,
+    /// Animation-origin values by target, then `PROPS` index.
+    values: FxHashMap<StyleTarget, Vec<(u16, String)>>,
     /// Animated elements compute their own (unshared) style rows.
     private: FxHashSet<NodeId>,
     invalid: RefCell<FxHashSet<NodeId>>,
@@ -450,8 +457,8 @@ pub(super) struct State {
     /// timeline as this actor.
     origin_ms: Option<f64>,
     events: Vec<PendingEvent>,
-    /// The element whose underlying (non-animated) values are being read.
-    excluded: Cell<Option<NodeId>>,
+    /// The target whose underlying (non-animated) values are being read.
+    excluded: Cell<Option<StyleTarget>>,
     /// Changes of the animation set, for frame scheduling caches.
     generation: u64,
     /// Animation-origin changes that only need the retained paint redone.
@@ -479,11 +486,21 @@ impl State {
 
     /// The animation-origin value of `name` on `id`, if any.
     pub(super) fn value(&self, id: NodeId, name: &str) -> Option<String> {
+        self.target_value((id, None), name)
+    }
+
+    /// The animation-origin value of `name` on `id`'s `which`
+    /// pseudo-element, if any.
+    pub(super) fn pseudo_value(&self, id: NodeId, which: PseudoEl, name: &str) -> Option<String> {
+        self.target_value((id, Some(which)), name)
+    }
+
+    fn target_value(&self, target: StyleTarget, name: &str) -> Option<String> {
         if self.values.is_empty() {
             return None;
         }
-        let values = self.values.get(&id)?;
-        if self.excluded.get() == Some(id) {
+        let values = self.values.get(&target)?;
+        if self.excluded.get() == Some(target) {
             return None;
         }
         let index = prop_index(name)? as u16;
@@ -493,12 +510,13 @@ impl State {
             .map(|(_, value)| value.clone())
     }
 
-    /// Elements with animation-origin values or private rows.
+    /// Elements with animation-origin values (on themselves or a
+    /// pseudo-element) or private rows.
     pub(super) fn origin_elements(&self) -> FxHashSet<NodeId> {
         self.values
             .keys()
-            .chain(self.private.iter())
-            .copied()
+            .map(|&(id, _)| id)
+            .chain(self.private.iter().copied())
             .collect()
     }
 
@@ -510,8 +528,13 @@ impl State {
 
     pub(super) fn remove_node(&mut self, node: NodeId) {
         self.invalid.get_mut().remove(&node);
-        self.elements.remove(&node);
-        self.values.remove(&node);
+        for target in std::iter::once(None)
+            .chain(PseudoEl::ALL.map(Some))
+            .map(|pseudo| (node, pseudo))
+        {
+            self.elements.remove(&target);
+            self.values.remove(&target);
+        }
         self.private.remove(&node);
     }
 
@@ -524,8 +547,8 @@ impl State {
 
     pub(super) fn retain_nodes(&mut self, live: &dyn Fn(NodeId) -> bool) {
         self.invalid.get_mut().retain(|&id| live(id));
-        self.elements.retain(|&id, _| live(id));
-        self.values.retain(|&id, _| live(id));
+        self.elements.retain(|&(id, _), _| live(id));
+        self.values.retain(|&(id, _), _| live(id));
         self.private.retain(|&id| live(id));
         self.events.retain(|event| live(event.event.0));
     }
@@ -535,10 +558,11 @@ impl State {
             Value::Shadows(shadows) => shadows.capacity() * std::mem::size_of::<values::Shadow>(),
             Value::Filters(filters) => filters.capacity() * std::mem::size_of::<values::Filter>(),
             Value::Positions(positions) => positions.capacity() * 8,
+            Value::Transform(transform) => transform.retained_bytes(),
             Value::Other(text) => text.capacity(),
             _ => 0,
         };
-        self.elements.capacity() * std::mem::size_of::<(NodeId, Element)>()
+        self.elements.capacity() * std::mem::size_of::<(StyleTarget, Element)>()
             + self
                 .elements
                 .values()
@@ -564,7 +588,7 @@ impl State {
                             .sum::<usize>()
                 })
                 .sum::<usize>()
-            + self.values.capacity() * std::mem::size_of::<(NodeId, Vec<(u16, String)>)>()
+            + self.values.capacity() * std::mem::size_of::<(StyleTarget, Vec<(u16, String)>)>()
             + self
                 .values
                 .values()
@@ -588,13 +612,30 @@ pub(crate) struct FrameTarget {
 }
 
 impl Dom {
+    /// The `animation-*` declaration of `target` with `var()` substituted:
+    /// the element's cascade, or its pseudo-element's (the animation
+    /// properties are not inherited).
+    fn animation_declaration(&self, target: StyleTarget, property: &str) -> Option<String> {
+        match target {
+            (id, None) => self
+                .cascaded(id, property)
+                .map(|value| self.resolve_vars_owned(id, value)),
+            (id, Some(which)) => self
+                .pseudo_style(id, which, property)
+                .map(|value| self.resolve_pseudo_vars(id, which, &value)),
+        }
+    }
+
+    /// Whether `id`'s `which` pseudo-element declares animations.
+    fn pseudo_declares_animation(&self, id: NodeId, which: PseudoEl) -> bool {
+        self.pseudo_style(id, which, "animation-name").is_some()
+            || self.pseudo_style(id, which, "animation").is_some()
+    }
+
     /// CSS Animations 1 #animation-name: the coordinated animation list,
     /// with shorter longhand lists repeated (CSS Values 4 #linked-properties).
-    fn animation_specs(&self, id: NodeId) -> Vec<Spec> {
-        let read = |property: &str| {
-            self.cascaded(id, property)
-                .map(|value| self.resolve_vars_owned(id, value))
-        };
+    fn animation_specs(&self, target: StyleTarget) -> Vec<Spec> {
+        let read = |property: &str| self.animation_declaration(target, property);
         let shorthand = read("animation");
         let names = read("animation-name");
         if shorthand.is_none() && names.is_none() {
@@ -710,9 +751,12 @@ impl Dom {
 
     /// CSS Cascade 5 #cascade-origin: important author (and inline)
     /// declarations outrank the animation origin.
-    fn important_properties(&self, id: NodeId) -> FxHashSet<String> {
+    fn important_properties(&self, target: StyleTarget) -> FxHashSet<String> {
+        let (id, pseudo) = target;
         let mut out = FxHashSet::default();
-        if let Some(style) = self.attr(id, "style") {
+        if pseudo.is_none()
+            && let Some(style) = self.attr(id, "style")
+        {
             let parsed;
             let declarations = match self.cssom_inline.get(&id) {
                 Some(declarations) => declarations,
@@ -735,7 +779,7 @@ impl Dom {
         if let Some(rules) = index.scopes.get(&self.tree_scope(id)) {
             for &rule in self.matched_rules(id).iter() {
                 let rule = &rules[rule as usize];
-                if rule_pseudo(rule).is_some() {
+                if rule_pseudo(rule) != pseudo {
                     continue;
                 }
                 for (name, (important, _)) in &rule.decls {
@@ -752,28 +796,36 @@ impl Dom {
     /// 1 #keyframes: keyframe values compute in the element's context),
     /// with `var()` substituted and CSS-wide keywords resolved. `None` means
     /// the underlying value.
-    fn keyframe_value(&self, id: NodeId, property: &str, raw: &str) -> Option<String> {
-        let raw = if pending_shorthand(raw).is_some() {
-            self.resolve_pending_shorthand(id, property, raw)
-        } else {
-            Some(raw.to_owned())
+    fn keyframe_value(&self, target: StyleTarget, property: &str, raw: &str) -> Option<String> {
+        let (id, pseudo) = target;
+        let raw = match pseudo {
+            _ if pending_shorthand(raw).is_none() => Some(raw.to_owned()),
+            None => self.resolve_pending_shorthand(id, property, raw),
+            Some(which) => self.resolve_pseudo_pending_shorthand(id, which, property, raw),
         };
         // CSS Variables 1 #invalid-at-computed-value-time: an invalid
         // substitution computes as `unset`.
         let value = raw
             .and_then(|raw| {
-                if needs_var_substitution(&raw) {
+                if !needs_var_substitution(&raw) {
+                    Some(raw)
+                } else if pseudo.is_none() {
                     self.substitute_vars(id, &raw, &mut Vec::new())
                 } else {
-                    Some(raw)
+                    ComputeView(self).substitute_vars_for(id, pseudo, &raw, &mut Vec::new())
                 }
             })
             .unwrap_or_else(|| "unset".into());
         let inherited = prop_index(property).is_some_and(|index| PROPS[index].inherited);
+        // A tree-abiding pseudo-element inherits from its originating
+        // element (CSS Pseudo 4 #treelike).
         let parent = || {
-            self.style_parent(id)
-                .and_then(|parent| self.computed_value_resolved(parent, property))
-                .or_else(|| initial_value(property).map(str::to_owned))
+            match pseudo {
+                None => self.style_parent(id),
+                Some(_) => Some(id),
+            }
+            .and_then(|parent| self.computed_value_resolved(parent, property))
+            .or_else(|| initial_value(property).map(str::to_owned))
         };
         match wide_keyword(&value) {
             Some(WideKeyword::Inherit) => parent(),
@@ -788,16 +840,18 @@ impl Dom {
             }
             // CSS Fonts 4 #font-size-prop: relative sizes compute against the
             // parent's font size, never the element's own (animated) one.
-            None if property == "font-size" => Some(self.font_size_keyframe(id, &value)),
+            None if property == "font-size" => Some(self.font_size_keyframe(target, &value)),
             None => Some(value),
         }
     }
 
-    fn font_size_keyframe(&self, id: NodeId, value: &str) -> String {
-        let parent = self
-            .style_parent(id)
-            .filter(|&parent| parent != DOCUMENT)
-            .map_or(FONT_SIZE_INITIAL, |parent| self.font_px(parent));
+    fn font_size_keyframe(&self, (id, pseudo): StyleTarget, value: &str) -> String {
+        let parent = match pseudo {
+            None => self.style_parent(id),
+            Some(_) => Some(id),
+        }
+        .filter(|&parent| parent != DOCUMENT)
+        .map_or(FONT_SIZE_INITIAL, |parent| self.font_px(parent));
         let root = self
             .style_scope_root_element(id)
             .filter(|&root| root != id)
@@ -806,13 +860,24 @@ impl Dom {
             .map_or_else(|| value.to_owned(), |px| format!("{px}px"))
     }
 
-    /// The element's computed value without its own animations.
-    fn underlying_value(&self, id: NodeId, property: &str) -> String {
-        let previous = self.animations.excluded.replace(Some(id));
-        let value = if property == "font-size" {
-            Some(format!("{}px", self.font_px(id)))
-        } else {
-            self.computed_value_resolved(id, property)
+    /// The target's computed value without its own animations.
+    fn underlying_value(&self, target: StyleTarget, property: &str) -> String {
+        let previous = self.animations.excluded.replace(Some(target));
+        let value = match target {
+            (id, None) if property == "font-size" => Some(format!("{}px", self.font_px(id))),
+            (id, None) => self.computed_value_resolved(id, property),
+            (id, Some(which)) if property == "font-size" => {
+                let parent = self.font_px(id);
+                Some(format!(
+                    "{}px",
+                    self.pseudo_layout_value(id, which, property)
+                        .and_then(|value| {
+                            font_size_px_at(&value, parent, self.root_font_px(), self.viewport_px)
+                        })
+                        .unwrap_or(parent)
+                ))
+            }
+            (id, Some(which)) => self.pseudo_layout_value(id, which, property),
         };
         self.animations.excluded.set(previous);
         value
@@ -822,10 +887,11 @@ impl Dom {
 
     fn animation_tracks(
         &self,
-        id: NodeId,
+        target: StyleTarget,
         name: &str,
         important: &FxHashSet<String>,
     ) -> Vec<Track> {
+        let (id, pseudo) = target;
         let index = self.style_index();
         let Some(rule) = index.keyframes.get(name) else {
             return Vec::new();
@@ -845,9 +911,9 @@ impl Dom {
         names.sort();
         for name in names {
             let physical = self
-                .logical_property(id, None, name)
+                .logical_property(id, pseudo, name)
                 .unwrap_or_else(|| name.clone());
-            if !sampled_property(&physical) || important.contains(&physical) {
+            if !sampled_property(&physical, pseudo.is_some()) || important.contains(&physical) {
                 continue;
             }
             let Some(property) = prop_index(&physical) else {
@@ -859,7 +925,7 @@ impl Dom {
                 .map(|frame| Frame {
                     offset: f64::from(frame.offset),
                     value: self
-                        .keyframe_value(id, &physical, &frame.value)
+                        .keyframe_value(target, &physical, &frame.value)
                         .map(|value| Value::parse(self, id, kind, &value, vp)),
                     // A timing function on the 100% keyframe is ignored
                     // (#timing-functions); no interval starts there.
@@ -886,7 +952,13 @@ impl Dom {
                 });
             }
             let underlying = if frames.iter().any(|frame| frame.value.is_none()) {
-                Value::parse(self, id, kind, &self.underlying_value(id, &physical), vp)
+                Value::parse(
+                    self,
+                    id,
+                    kind,
+                    &self.underlying_value(target, &physical),
+                    vp,
+                )
             } else {
                 Value::Other(String::new())
             };
@@ -940,23 +1012,42 @@ impl Dom {
     /// before its first rendering update (and therefore before any sample).
     pub(crate) fn css_animations_declared(&self) -> bool {
         let index = self.style_index();
-        if !index.keyframes.values().any(|rule| {
-            rule.properties
-                .keys()
-                .any(|property| sampled_property(property))
-        }) {
+        let sampled = |name: &str, pseudo: bool| {
+            index.keyframes.get(name).is_some_and(|rule| {
+                rule.properties
+                    .keys()
+                    .any(|property| sampled_property(property, pseudo))
+            })
+        };
+        if !index.keyframes.keys().any(|name| sampled(name, true)) {
             return false;
         }
         self.composed_descendants(DOCUMENT).into_iter().any(|id| {
             self.tag_name(id).is_some()
-                && self.animation_specs(id).iter().any(|spec| {
-                    index.keyframes.get(&spec.name).is_some_and(|rule| {
-                        rule.properties
-                            .keys()
-                            .any(|property| sampled_property(property))
-                    })
+                && self.animation_targets(id).into_iter().any(|target| {
+                    self.animation_specs(target)
+                        .iter()
+                        .any(|spec| sampled(&spec.name, target.1.is_some()))
                 })
         })
+    }
+
+    /// `id` and those of its pseudo-elements that are generated and declare
+    /// animations (CSS Animations 1 #animations applies to both).
+    fn animation_targets(&self, id: NodeId) -> Vec<StyleTarget> {
+        let mut targets = vec![(id, None)];
+        if self.tag_name(id).is_some() {
+            targets.extend(
+                PseudoEl::ALL
+                    .into_iter()
+                    .filter(|&which| {
+                        self.pseudo_declares_animation(id, which)
+                            && self.pseudo_generated(id, which)
+                    })
+                    .map(|which| (id, Some(which))),
+            );
+        }
+        targets
     }
 
     /// The elements whose style-origin animations change with time, for
@@ -965,7 +1056,7 @@ impl Dom {
         self.animations
             .elements
             .iter()
-            .filter_map(|(&node, element)| {
+            .filter_map(|(&(node, pseudo), element)| {
                 let mut active = element
                     .animations
                     .iter()
@@ -976,13 +1067,15 @@ impl Dom {
                     })
                     .peekable();
                 active.peek()?;
-                let paint_only = active.all(|animation| {
-                    animation.tracks.iter().all(|track| {
-                        paint_only(PROPS[usize::from(track.property)].name)
-                            && !(element.svg
-                                && svg_dependent(PROPS[usize::from(track.property)].name))
-                    })
-                });
+                // A pseudo-element's box style is rebuilt by layout.
+                let paint_only = pseudo.is_none()
+                    && active.all(|animation| {
+                        animation.tracks.iter().all(|track| {
+                            paint_only(PROPS[usize::from(track.property)].name)
+                                && !(element.svg
+                                    && svg_dependent(PROPS[usize::from(track.property)].name))
+                        })
+                    });
                 Some(FrameTarget { node, paint_only })
             })
             .collect()
@@ -1108,7 +1201,7 @@ impl Dom {
     ) -> Option<(f64, Option<f64>)> {
         self.animations
             .elements
-            .get(&id)?
+            .get(&(id, None))?
             .animations
             .iter()
             .filter(|animation| animation.name == name)
@@ -1207,7 +1300,7 @@ impl Dom {
                 } else {
                     Vec::new()
                 };
-                candidates.extend(elements.keys().copied());
+                candidates.extend(elements.keys().map(|&(id, _)| id));
                 candidates.sort_unstable();
                 candidates.dedup();
                 candidates
@@ -1217,8 +1310,8 @@ impl Dom {
             self.rescan_animations(&mut elements, &mut events, candidates, keyframes, now);
             self.animations.stamp = Some(stamp);
         }
-        for (&id, element) in elements.iter_mut() {
-            if element.svg_epoch != self.epoch {
+        for (&(id, pseudo), element) in elements.iter_mut() {
+            if pseudo.is_none() && element.svg_epoch != self.epoch {
                 element.svg = self.subtree_has_svg(id);
                 element.svg_epoch = self.epoch;
             }
@@ -1241,12 +1334,13 @@ impl Dom {
         }
     }
 
-    /// CSS Animations 1 #animations: (re)build the animations of elements
-    /// whose style may have changed. Existing animations are matched by name
-    /// from the end of the new list and keep their start time.
+    /// CSS Animations 1 #animations: (re)build the animations of the
+    /// elements whose style may have changed, and of their pseudo-elements.
+    /// Existing animations are matched by name from the end of the new list
+    /// and keep their start time.
     fn rescan_animations(
         &mut self,
-        elements: &mut FxHashMap<NodeId, Element>,
+        elements: &mut FxHashMap<StyleTarget, Element>,
         events: &mut Vec<PendingEvent>,
         candidates: Vec<NodeId>,
         keyframes: bool,
@@ -1255,122 +1349,158 @@ impl Dom {
         let mut participation = FxHashMap::default();
         let mut tree_order: Option<FxHashMap<NodeId, usize>> = None;
         for id in candidates {
-            let mut specs = Vec::new();
-            if keyframes && self.is_valid(id) && self.tag_name(id).is_some() {
-                let index = self.style_index();
-                specs = self
-                    .animation_specs(id)
-                    .into_iter()
-                    .filter(|spec| index.keyframes.contains_key(&spec.name))
-                    .collect::<Vec<_>>();
-                // CSS Animations 1 #animations: `display: none` on the
-                // element or an ancestor terminates its animations.
-                if !specs.is_empty()
-                    && !transitions::participates(ComputeView(&*self), id, &mut participation)
+            let element = keyframes && self.is_valid(id) && self.tag_name(id).is_some();
+            let mut targets = if element {
+                self.animation_targets(id)
+            } else {
+                vec![(id, None)]
+            };
+            // A pseudo-element whose animations stop (or which is no longer
+            // generated) cancels them.
+            for pseudo in PseudoEl::ALL {
+                if elements.contains_key(&(id, Some(pseudo)))
+                    && !targets.contains(&(id, Some(pseudo)))
                 {
-                    specs.clear();
+                    targets.push((id, Some(pseudo)));
                 }
             }
-            let previous = elements.remove(&id);
-            let order = previous.as_ref().map_or(0, |element| element.tree_order);
-            let mut old = previous.map(|element| element.animations);
-            if specs.is_empty() {
-                if let Some(old) = old {
-                    self.animations.generation += 1;
-                    for (index, animation) in old.iter().enumerate() {
-                        cancel(events, id, animation, now, order, index);
-                    }
-                }
-                if self.animations.private.remove(&id) {
-                    self.computed_cache.borrow_mut().1.remove_node(id);
-                }
-                continue;
-            }
-            let order = *tree_order
-                .get_or_insert_with(|| {
-                    self.composed_descendants(DOCUMENT)
+            for target in targets {
+                let generated = target.1.is_none_or(|which| {
+                    self.pseudo_declares_animation(id, which) && self.pseudo_generated(id, which)
+                });
+                let mut specs = Vec::new();
+                if element && generated {
+                    let index = self.style_index();
+                    specs = self
+                        .animation_specs(target)
                         .into_iter()
-                        .enumerate()
-                        .map(|(order, node)| (node, order))
-                        .collect()
-                })
-                .get(&id)
-                .unwrap_or(&usize::MAX);
-            // Animated values must not be shared with equal cascades: retire
-            // the element's (possibly shared) rows before its first sample.
-            if self.animations.private.insert(id) {
-                let mut cache = self.computed_cache.borrow_mut();
-                let mut stack = vec![id];
-                while let Some(node) = stack.pop() {
-                    cache.1.remove_node(node);
-                    self.push_composed_children(node, &mut stack);
+                        .filter(|spec| index.keyframes.contains_key(&spec.name))
+                        .collect::<Vec<_>>();
+                    // CSS Animations 1 #animations: `display: none` on the
+                    // element or an ancestor terminates its animations.
+                    if !specs.is_empty()
+                        && !transitions::participates(ComputeView(&*self), id, &mut participation)
+                    {
+                        specs.clear();
+                    }
+                }
+                self.rescan_target(elements, events, target, specs, &mut tree_order, now);
+            }
+        }
+    }
+
+    /// Rebuild one target's animations from its current `specs`.
+    fn rescan_target(
+        &mut self,
+        elements: &mut FxHashMap<StyleTarget, Element>,
+        events: &mut Vec<PendingEvent>,
+        target: StyleTarget,
+        specs: Vec<Spec>,
+        tree_order: &mut Option<FxHashMap<NodeId, usize>>,
+        now: f64,
+    ) {
+        let (id, pseudo) = target;
+        let previous = elements.remove(&target);
+        let order = previous.as_ref().map_or(0, |element| element.tree_order);
+        let mut old = previous.map(|element| element.animations);
+        if specs.is_empty() {
+            if let Some(old) = old {
+                self.animations.generation += 1;
+                for (index, animation) in old.iter().enumerate() {
+                    cancel(events, target, animation, now, order, index);
                 }
             }
-            let important = self.important_properties(id);
-            let mut built: Vec<Option<Animation>> = (0..specs.len()).map(|_| None).collect();
-            for (index, spec) in specs.iter().enumerate().rev() {
-                let existing = old.as_mut().and_then(|old| {
-                    old.iter()
-                        .rposition(|animation| animation.name == spec.name)
-                        .map(|position| old.remove(position))
-                });
-                let tracks = self.animation_tracks(id, &spec.name, &important);
-                built[index] = Some(match existing {
-                    Some(mut animation) => {
-                        // Changed animation properties apply as if they had
-                        // been specified from the start; the play state
-                        // pauses or resumes the current time.
-                        match (animation.hold, spec.timing.running) {
-                            (None, false) => animation.hold = Some(now - animation.start),
-                            (Some(hold), true) => {
-                                animation.start = now - hold;
-                                animation.hold = None;
-                            }
-                            _ => {}
-                        }
-                        animation.timing = spec.timing;
-                        animation.tracks = tracks;
-                        animation
-                    }
-                    None => {
-                        self.animations.generation += 1;
-                        Animation {
-                            name: spec.name.clone(),
-                            timing: spec.timing,
-                            start: now,
-                            hold: (!spec.timing.running).then_some(0.0),
-                            phase: Phase::Idle,
-                            iteration: 0.0,
-                            tracks,
-                        }
-                    }
-                });
+            if pseudo.is_none() && self.animations.private.remove(&id) {
+                self.computed_cache.borrow_mut().1.remove_node(id);
             }
-            for (index, animation) in old.unwrap_or_default().iter().enumerate() {
-                self.animations.generation += 1;
-                cancel(events, id, animation, now, order, index);
-            }
-            elements.insert(
-                id,
-                Element {
-                    animations: built.into_iter().flatten().collect(),
-                    tree_order: order,
-                    svg: false,
-                    svg_epoch: u64::MAX,
-                },
-            );
+            return;
         }
+        let order = *tree_order
+            .get_or_insert_with(|| {
+                self.composed_descendants(DOCUMENT)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(order, node)| (node, order))
+                    .collect()
+            })
+            .get(&id)
+            .unwrap_or(&usize::MAX);
+        // Animated values must not be shared with equal cascades: retire
+        // the element's (possibly shared) rows before its first sample. A
+        // pseudo-element's style is computed for its own box, never shared.
+        if pseudo.is_none() && self.animations.private.insert(id) {
+            let mut cache = self.computed_cache.borrow_mut();
+            let mut stack = vec![id];
+            while let Some(node) = stack.pop() {
+                cache.1.remove_node(node);
+                self.push_composed_children(node, &mut stack);
+            }
+        }
+        let important = self.important_properties(target);
+        let mut built: Vec<Option<Animation>> = (0..specs.len()).map(|_| None).collect();
+        for (index, spec) in specs.iter().enumerate().rev() {
+            let existing = old.as_mut().and_then(|old| {
+                old.iter()
+                    .rposition(|animation| animation.name == spec.name)
+                    .map(|position| old.remove(position))
+            });
+            let tracks = self.animation_tracks(target, &spec.name, &important);
+            built[index] = Some(match existing {
+                Some(mut animation) => {
+                    // Changed animation properties apply as if they had
+                    // been specified from the start; the play state
+                    // pauses or resumes the current time.
+                    match (animation.hold, spec.timing.running) {
+                        (None, false) => animation.hold = Some(now - animation.start),
+                        (Some(hold), true) => {
+                            animation.start = now - hold;
+                            animation.hold = None;
+                        }
+                        _ => {}
+                    }
+                    animation.timing = spec.timing;
+                    animation.tracks = tracks;
+                    animation
+                }
+                None => {
+                    self.animations.generation += 1;
+                    Animation {
+                        name: spec.name.clone(),
+                        timing: spec.timing,
+                        start: now,
+                        hold: (!spec.timing.running).then_some(0.0),
+                        phase: Phase::Idle,
+                        iteration: 0.0,
+                        tracks,
+                    }
+                }
+            });
+        }
+        for (index, animation) in old.unwrap_or_default().iter().enumerate() {
+            self.animations.generation += 1;
+            cancel(events, target, animation, now, order, index);
+        }
+        elements.insert(
+            target,
+            Element {
+                animations: built.into_iter().flatten().collect(),
+                tree_order: order,
+                svg: false,
+                svg_epoch: u64::MAX,
+            },
+        );
     }
 
     /// CSS Animations 2 #event-dispatch: compare each animation's phase and
     /// current iteration with the previous frame's.
     fn advance_animations(
         &mut self,
-        elements: &mut FxHashMap<NodeId, Element>,
+        elements: &mut FxHashMap<StyleTarget, Element>,
         events: &mut Vec<PendingEvent>,
         now: f64,
     ) {
-        for (&id, element) in elements.iter_mut() {
+        for (&target, element) in elements.iter_mut() {
+            let (id, _) = target;
             for (index, animation) in element.animations.iter_mut().enumerate() {
                 let local = animation.current(now);
                 let timing = animation.timing;
@@ -1388,7 +1518,13 @@ impl Dom {
                 };
                 let mut push = |kind: &'static str, elapsed: f64, time: f64| {
                     events.push(PendingEvent {
-                        event: (id, animation.name.clone(), kind, elapsed),
+                        event: (
+                            id,
+                            animation.name.clone(),
+                            kind,
+                            elapsed,
+                            pseudo_selector(target),
+                        ),
                         time,
                         tree_order: element.tree_order,
                         index,
@@ -1443,12 +1579,13 @@ impl Dom {
     /// that has an effect on a property wins.
     fn sample_animations(
         &self,
-        elements: &FxHashMap<NodeId, Element>,
+        elements: &FxHashMap<StyleTarget, Element>,
         now: f64,
-    ) -> FxHashMap<NodeId, Vec<(u16, String)>> {
+    ) -> FxHashMap<StyleTarget, Vec<(u16, String)>> {
         let color = prop_index("color").expect("color is tracked") as u16;
         let mut out = FxHashMap::default();
-        for (&id, element) in elements {
+        for (&target, element) in elements {
+            let (id, pseudo) = target;
             let mut properties = element
                 .animations
                 .iter()
@@ -1477,7 +1614,10 @@ impl Dom {
                             .iter()
                             .find(|(property, _)| *property == color)
                             .map(|(_, value)| value.clone())
-                            .or_else(|| self.computed_value_resolved(id, "color"))?;
+                            .or_else(|| match pseudo {
+                                None => self.computed_value_resolved(id, "color"),
+                                Some(which) => self.pseudo_layout_value(id, which, "color"),
+                            })?;
                         Color::parse(self, id, &text)
                     };
                     Some(values::interpolate(track.kind, start, end, t, &current))
@@ -1489,7 +1629,7 @@ impl Dom {
                 }
             }
             if !values.is_empty() {
-                out.insert(id, values);
+                out.insert(target, values);
             }
         }
         out
@@ -1498,23 +1638,31 @@ impl Dom {
     /// Publish a new animation origin and invalidate exactly what it can
     /// affect (Gecko's animation-only restyle; Stylo
     /// `replace_rules_internal`): no selector matching, no cascade.
-    fn apply_animation_values(&mut self, values: FxHashMap<NodeId, Vec<(u16, String)>>) {
+    fn apply_animation_values(&mut self, values: FxHashMap<StyleTarget, Vec<(u16, String)>>) {
         let old = std::mem::take(&mut self.animations.values);
         let mut paint: Vec<(NodeId, usize)> = Vec::new();
         let mut layout: Vec<NodeId> = Vec::new();
+        // Originating elements of changed pseudo-element values: layout
+        // rebuilds the pseudo-element's box style from them.
+        let mut pseudo_layout: Vec<NodeId> = Vec::new();
         let background = prop_index("background-color").expect("background-color is tracked");
-        let mut ids = old.keys().chain(values.keys()).copied().collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids.dedup();
-        for id in ids {
-            let (before, after) = (old.get(&id), values.get(&id));
+        let mut targets = old.keys().chain(values.keys()).copied().collect::<Vec<_>>();
+        targets.sort_unstable_by_key(|&(id, pseudo)| (id, pseudo.map(PseudoEl::content_slot)));
+        targets.dedup();
+        for target in targets {
+            let (before, after) = (old.get(&target), values.get(&target));
             if before == after {
+                continue;
+            }
+            let (id, pseudo) = target;
+            if pseudo.is_some() {
+                pseudo_layout.push(id);
                 continue;
             }
             let svg = self
                 .animations
                 .elements
-                .get(&id)
+                .get(&target)
                 .is_some_and(|element| element.svg);
             fn lookup(values: Option<&Vec<(u16, String)>>, property: u16) -> Option<&str> {
                 values?
@@ -1563,7 +1711,15 @@ impl Dom {
         #[cfg(test)]
         {
             self.animations.last_paint_changes = paint.len();
-            self.animations.last_layout_changes = layout.len();
+            self.animations.last_layout_changes = layout.len() + pseudo_layout.len();
+        }
+        if !pseudo_layout.is_empty() {
+            pseudo_layout.dedup();
+            self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+            self.invalidate_transition_layout(&pseudo_layout);
+            self.unattributed_geometry_change();
+            self.dirty_attributed = false;
+            self.animations.layout_pending = true;
         }
         if !paint.is_empty() {
             for &(id, property) in &paint {
@@ -1646,7 +1802,7 @@ impl Dom {
 /// fill mode of both.
 fn cancel(
     events: &mut Vec<PendingEvent>,
-    id: NodeId,
+    target: StyleTarget,
     animation: &Animation,
     now: f64,
     tree_order: usize,
@@ -1664,7 +1820,13 @@ fn cancel(
         .active_time(local, timing.phase(local))
         .unwrap_or(0.0);
     events.push(PendingEvent {
-        event: (id, animation.name.clone(), "animationcancel", elapsed),
+        event: (
+            target.0,
+            animation.name.clone(),
+            "animationcancel",
+            elapsed,
+            pseudo_selector(target),
+        ),
         time: now,
         tree_order,
         index,

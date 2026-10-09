@@ -96,6 +96,9 @@ The project favors:
   - `style.rs` and `value.rs`: typed style snapshots and CSS value resolution.
   - `flow.rs`, `inline.rs`, `flex.rs`, `grid.rs`, `table.rs`, `float.rs`,
     `replaced.rs`, and `intrinsic.rs`: layout in floating-point CSS pixels.
+  - `inline/bidi.rs`: UAX #9 bidi paragraphs of an inline formatting
+    context (CSS Writing Modes 4 `unicode-bidi` controls, HL1/P2-P3 base
+    levels) and visual line reordering; `LineOut::pieces` stays logical.
   - `measure.rs`: fragment geometry for CSSOM View and observers.
   - `boundary.rs`: safe incremental-layout boundaries.
   - `paint.rs`: CSS painting order, cell compositor, clipping, fixed layers,

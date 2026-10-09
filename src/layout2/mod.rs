@@ -54,6 +54,7 @@ mod flow;
 mod graphics;
 mod grid;
 pub(crate) use grid::serialize_subgrid_rows;
+pub(crate) use grid::valid_areas as valid_grid_areas;
 mod inline;
 pub(crate) use inline::media_target;
 mod intrinsic;
@@ -100,7 +101,16 @@ pub(crate) fn stable_global_layout_inputs() -> std::sync::RwLockReadGuard<'stati
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 pub(crate) use memo::box_style_bytes;
-pub(crate) use style::{BoxStyle, InlineStyle, StyleSource};
+
+/// The internal computed-value function for a transition's matrix
+/// interpolation that waits for the reference box (CSS Transforms 1
+/// #interpolation-of-transforms with a percentage translation in the
+/// composed remainder): `-trust-interpolate-matrix(<progress>, <from-list>,
+/// <to-list>)`. Author style sheets cannot declare it: `<transform-list>`
+/// has no such function.
+pub(crate) const DEFERRED_TRANSFORM_INTERPOLATION: &str = "-trust-interpolate-matrix";
+pub(crate) use style::{BoxStyle, InlineStyle, StyleSource, pseudo_units};
+pub(crate) use transform::serialize_list as serialize_transform_list;
 pub(crate) use tree_cache::BoxTreeCache;
 
 pub(crate) fn container_query_length(dom: &Dom, node: NodeId, text: &str) -> Option<f32> {
@@ -9153,6 +9163,106 @@ b</xmp></body>"#;
         assert_eq!(raf, 3, "container height = tallest item (3 lines)");
     }
 
+    /// CSS 2 §9.2.1.1: an inline box holding a block is broken around it.
+    /// Its first part stays on the line before (with the start border), the
+    /// block is a sibling of the anonymous blocks around the parts, and the
+    /// last part (with the end border) starts the line after.
+    #[test]
+    fn inline_boxes_split_around_their_block_children() {
+        let html = r#"<body style="margin:0;font:16px/20px monospace">
+            <div id=p style="width:300px">Hello <span id=s style="border:0 solid;border-width:0 4px;padding:0 6px;color:rgb(1,2,3)">world<div id=d style="height:30px">block</div><div id=e style="height:10px"></div> <i>more</i></span> end</div>
+            <div id=rel>x<span style="position:relative;top:7px"><div id=moved style="height:5px"></div></span></div>
+            <div><a href="/to" id=a><div id=linked>link block</div></a></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let (boxes, _, _) = measure_boxes_css(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &ControlMap::new(),
+            &HashMap::new(),
+        );
+        let r = |id: &str| boxes[&dom.get_by_id(id).unwrap()];
+        // "world" shares the first line with "Hello": the block starts below
+        // that single 20px line, full width, and both blocks stack.
+        assert_eq!((r("d").top, r("d").width), (20.0, 300.0));
+        assert_eq!(r("e").top, 50.0);
+        // The paragraph: one line, the blocks, then "more end" on one line.
+        assert_eq!(r("p").height, 80.0);
+        // The split inline's fragments span from its first part to its last.
+        // (Inline box fragments cover their font's content area.)
+        let span = r("s");
+        assert!(span.top < 1.0 && span.top + span.height > 78.0, "{span:?}");
+        // A relative offset on the inline moves its blocks too.
+        assert_eq!(r("moved").top - r("rel").top, 20.0 + 7.0);
+        // The graphical paint keeps the start edge on the first part and the
+        // end edge on the last: "world" follows "Hello " and the 4px border
+        // and 6px padding; "more" begins at the line start.
+        let layout = lay_graphical(html, 800.0, &HashMap::new());
+        let (world_x, world_y, _) = graphical_text(&layout, "world");
+        let (hello_x, hello_y, _) = graphical_text(&layout, "Hello");
+        assert_eq!(world_y, hello_y);
+        assert!(
+            (world_x - (hello_x + 6.0 * 9.6 + 10.0)).abs() < 1.0,
+            "{hello_x} {world_x}"
+        );
+        let (more_x, more_y, _) = graphical_text(&layout, "more");
+        assert!(more_x < 1.0 && more_y > world_y + 40.0, "{more_x} {more_y}");
+        // The block inherits the inline context: it is part of the link.
+        let out = lay(html, 80);
+        let (_, linked) = find(&out, "link block");
+        assert!(linked.link.is_some(), "{linked:?}");
+    }
+
+    /// CSS 2 §9.2.1.1: the parts of a split inline box keep only their
+    /// outer edges — the first is open at its end, the last at its start.
+    #[test]
+    fn split_inline_parts_are_open_on_their_inner_sides() {
+        let html = r#"<body style="margin:0;font:16px/20px monospace">
+            <div style="width:300px">a <span id=s style="border:2px solid;padding:0 4px">b<div>x</div>c</span></div>
+            <div style="width:300px"><span id=t><div>y</div>z</span></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("http://e.com/").unwrap();
+        fn collect(frag: &flow::Frag, out: &mut Vec<std::sync::Arc<flow::LineFrag>>) {
+            if let flow::FragKind::Line(line) = &frag.kind {
+                out.push(line.clone());
+            }
+            for child in &frag.children {
+                collect(child, out);
+            }
+        }
+        let lines = session::with_layout(
+            &dom,
+            &base,
+            Viewport::new(400.0, 600.0),
+            &[],
+            &Default::default(),
+            &Default::default(),
+            |layout| {
+                let mut out = Vec::new();
+                collect(&layout.expect("layout").root, &mut out);
+                out
+            },
+        );
+        let edges = |node: NodeId| {
+            lines
+                .iter()
+                .flat_map(|line| {
+                    inline::line_box_fragments(line.pieces.iter(), &line.empty_boxes, |entry| {
+                        entry.key == (node, None)
+                    })
+                })
+                .map(|fragment| (fragment.left_edge, fragment.right_edge))
+                .collect::<Vec<_>>()
+        };
+        let s = dom.get_by_id("s").unwrap();
+        assert_eq!(edges(s), [(true, false), (false, true)]);
+        // `t` starts with its block: its last part alone has the end edge.
+        let t = dom.get_by_id("t").unwrap();
+        assert_eq!(edges(t), [(false, true)]);
+    }
+
     #[test]
     fn inline_blocks_sit_side_by_side_on_one_line() {
         // CSS-Display-3 §2.5: an atomic inline box flows on its parent's line at
@@ -10169,6 +10279,62 @@ b</xmp></body>"#;
         assert_eq!((ra, a.col), (0, 0));
         assert_eq!((rb, b.col), (0, 32), "240px + 16px gap = 32 cells");
         assert_eq!((rc, c.col), (2, 0), "wrapped; 16px row-gap = 1 blank row");
+    }
+
+    /// CSS Flexbox 1 #visibility-collapse and #algo-visibility: a collapsed
+    /// item leaves the main axis (with its gutter) but its strut keeps the
+    /// line's cross size; it is not rendered.
+    #[test]
+    fn collapsed_flex_items_keep_their_strut_and_leave_the_main_axis() {
+        let html = r#"<body style="margin:0">
+            <div id=row style="display:flex;width:300px;gap:10px;align-items:flex-start">
+              <div id=a style="width:50px;height:20px"></div>
+              <div id=b style="width:60px;height:80px;visibility:collapse"></div>
+              <div id=c style="width:70px;height:30px"></div></div>
+            <div id=col style="display:inline-flex;flex-direction:column">
+              <div id=d style="width:40px;height:10px"></div>
+              <div id=e style="width:120px;height:50px;visibility:collapse"></div></div>
+            <div id=wrap style="display:flex;flex-wrap:wrap;width:100px">
+              <div id=f style="width:60px;height:10px"></div>
+              <div id=g style="width:60px;height:40px;visibility:collapse"></div>
+              <div id=h style="width:60px;height:10px"></div></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let (boxes, _, _) = measure_boxes_css(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &ControlMap::new(),
+            &HashMap::new(),
+        );
+        let r = |id: &str| boxes[&dom.get_by_id(id).unwrap()];
+        // The strut: the line keeps the collapsed item's 80px cross size.
+        assert_eq!(r("row").height, 80.0);
+        // `c` follows `a` and one gutter, as if `b` were display:none.
+        assert_eq!((r("a").left, r("c").left), (0.0, 60.0));
+        assert_eq!(r("b").width, 0.0);
+        // A column's cross size (its width) keeps the collapsed item's.
+        assert_eq!((r("col").width, r("col").height), (120.0, 10.0));
+        // Wrapping is redone with the collapsed item at zero main size: `g`
+        // joins the first line and its 40px strut sizes that line, so `h`
+        // wraps below it.
+        assert_eq!(r("wrap").height, 50.0);
+        assert_eq!(r("h").top - r("wrap").top, 40.0);
+        // Collapsed items are removed from rendering.
+        let layout = lay_graphical(
+            "<div style='display:flex'><span>shown</span>\
+             <span style='visibility:collapse'><b style='visibility:visible'>gone</b></span></div>",
+            800.0,
+            &HashMap::new(),
+        );
+        let glyphs = |needle: &str| {
+            layout.paint.primitives.iter().any(|p| {
+                matches!(p, crate::render::Primitive::GlyphRun { shaped, .. }
+                    if shaped.text.contains(needle))
+            })
+        };
+        assert!(glyphs("shown") && !glyphs("gone"));
     }
 
     #[test]

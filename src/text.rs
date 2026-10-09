@@ -365,6 +365,48 @@ impl ShapedText {
         }
     }
 
+    /// This cell-font text (logical clusters, no glyph runs) laid out right
+    /// to left: each cluster's position mirrored within the advance, listed
+    /// in visual order.
+    fn mirrored_cells(mut self) -> ShapedText {
+        let advance = self.advance;
+        for cluster in &mut self.clusters {
+            cluster.x = advance - cluster.x - cluster.advance;
+            cluster.rtl = true;
+        }
+        self.clusters.reverse();
+        self
+    }
+
+    /// This text, shaped behind a leading `len`-byte directional control,
+    /// without that control: `text` with its clusters and runs. The control
+    /// has no advance; its zero-width glyph is dropped with it.
+    fn without_leading_control(mut self, len: usize, text: &str) -> ShapedText {
+        self.clusters
+            .retain(|cluster| cluster.text_range.start >= len);
+        for cluster in &mut self.clusters {
+            cluster.text_range = cluster.text_range.start - len..cluster.text_range.end - len;
+        }
+        self.runs.retain(|run| run.text_range.end > len);
+        for run in &mut self.runs {
+            if run.text_range.start < len {
+                // The control's glyph is the run's logically first one: the
+                // visually last of a right-to-left run.
+                let control = if run.rtl {
+                    run.glyphs.len().checked_sub(1)
+                } else {
+                    (!run.glyphs.is_empty()).then_some(0)
+                };
+                if let Some(index) = control.filter(|&index| run.glyphs[index].advance == 0.0) {
+                    run.glyphs.remove(index);
+                }
+            }
+            run.text_range = run.text_range.start.saturating_sub(len)..run.text_range.end - len;
+        }
+        self.text = text.to_string();
+        self
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         let ShapedText {
             text,
@@ -2240,6 +2282,53 @@ pub fn shape(text: &str, style: &TextStyle) -> ShapedText {
         Some(cells) => cells::shape(text, style, cells),
         None => system.shape(text, style),
     })
+}
+
+/// Shape `text`, all of whose characters the paragraph's Unicode
+/// Bidirectional Algorithm resolved to one embedding level, in that level's
+/// direction (`rtl` for an odd level): UAX #9 L2 reverses an odd-level run,
+/// and L4 mirrors its Bidi_Mirrored characters.
+///
+/// Parley resolves a shaped run's bidi levels itself, from its first strong
+/// character (P2/P3). That agrees with the paragraph's resolution for every
+/// level-uniform run except one with no strong character of its level's
+/// direction: neutrals alone, or text under a directional override. Those
+/// are reshaped behind LRO/RLO (U+202D/U+202E), which forces every character
+/// to the requested direction, and the control is removed from the result.
+/// In the terminal's cell font clusters are laid in logical order; an odd
+/// level mirrors their positions, and the cell adapter paints the text in
+/// visual order (`visual_text`).
+pub(crate) fn shape_directed(text: &str, style: &TextStyle, rtl: bool) -> ShapedText {
+    let shaped = shape(text, style);
+    if cell_metrics().is_some() {
+        return if rtl { shaped.mirrored_cells() } else { shaped };
+    }
+    if text.is_empty() || shaped.runs.iter().all(|run| run.rtl == rtl) {
+        return shaped;
+    }
+    let control = if rtl { '\u{202E}' } else { '\u{202D}' };
+    let mut forced = String::with_capacity(text.len() + control.len_utf8());
+    forced.push(control);
+    forced.push_str(text);
+    let forced = shape(&forced, style);
+    forced.without_leading_control(control.len_utf8(), text)
+}
+
+/// UAX #9 L2/L4 for a character-cell painter: `text`, all at one odd
+/// embedding level, in visual order. Grapheme clusters are reversed as
+/// units (L3's combining marks stay after their bases) and characters with
+/// a Bidi_Mirroring_Glyph are mirrored.
+pub(crate) fn visual_text(text: &str) -> String {
+    use icu_properties::CodePointMapData;
+    use icu_properties::props::BidiMirroringGlyph;
+    let mirror = CodePointMapData::<BidiMirroringGlyph>::new();
+    let mut visual = String::with_capacity(text.len());
+    for grapheme in text.graphemes(true).rev() {
+        for character in grapheme.chars() {
+            visual.push(mirror.get(character).mirroring_glyph.unwrap_or(character));
+        }
+    }
+    visual
 }
 
 /// Lay this thread's text out in the terminal's cell font (`Some`), or in

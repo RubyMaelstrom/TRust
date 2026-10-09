@@ -87,6 +87,32 @@ fn changes(value: &str, property: &str) -> Option<Vec<Change>> {
 pub(super) fn valid_changes(value: &str, property: &str) -> bool {
     changes(value, property).is_some()
 }
+
+/// CSS Content 3 #content-property as this engine generates it: `normal |
+/// none | <content-list> [ / [ <string> | <counter> | <attr()> ]+ ]?`, where
+/// the content list holds strings, `url()` images, quotes, `attr()` and
+/// counters, and the alternative text after `/` has no images or quotes.
+pub(super) fn valid_content(value: &str) -> bool {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("normal") {
+        return true;
+    }
+    if content(value).is_none() {
+        return false;
+    }
+    match split_top_level_slash(value) {
+        None => true,
+        Some((_, alt)) => {
+            let alt = alt.trim();
+            !alt.is_empty()
+                && content(alt).is_some_and(|tokens| {
+                    tokens
+                        .iter()
+                        .all(|token| !matches!(token, Token::Image(_) | Token::Quote { .. }))
+                })
+        }
+    }
+}
 #[derive(Clone)]
 enum Token {
     Text(String),

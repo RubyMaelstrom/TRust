@@ -1685,6 +1685,36 @@ impl TransformStep {
     }
 }
 
+/// CSS Transforms 1 #interpolation-of-transforms for two remainders that
+/// interpolate as matrices: each composes into a 4x4 matrix, and the two
+/// interpolate by decomposition (two 2D matrices in two dimensions,
+/// #decomposing-a-2d-matrix); a matrix that cannot be decomposed animates
+/// discretely.
+pub(crate) fn interpolate_composed(
+    a: &matrix3d::Matrix3d,
+    b: &matrix3d::Matrix3d,
+    t: f32,
+) -> matrix3d::Matrix3d {
+    let rest = if matrix3d::is_2d(a) && matrix3d::is_2d(b) {
+        let flat = |m: &matrix3d::Matrix3d| Affine2d([m[0], m[1], m[4], m[5], m[12], m[13]]);
+        Some(matrix3d::from_affine(interpolate_matrices(
+            flat(a),
+            flat(b),
+            t,
+        )))
+    } else {
+        matrix3d::interpolate(a, b, t)
+    };
+    rest.unwrap_or(if t < 0.5 { *a } else { *b })
+}
+
+/// The 4x4 matrix of a list of resolved transform steps.
+pub(crate) fn compose_transform_steps(steps: &[TransformStep]) -> matrix3d::Matrix3d {
+    steps.iter().fold(matrix3d::IDENTITY, |matrix, step| {
+        matrix3d::multiply(&matrix, &step.matrix3d())
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn interpolate_transform_steps_for_test(
     from: &[TransformStep],
@@ -1713,27 +1743,11 @@ fn interpolate_transform_steps(from: &[TransformStep], to: &[TransformStep], t: 
         match from[index].interpolate(to[index], t) {
             Some(step) => matrix = matrix3d::multiply(&matrix, &step),
             None => {
-                let compose = |steps: &[TransformStep]| {
-                    steps.iter().fold(matrix3d::IDENTITY, |matrix, step| {
-                        matrix3d::multiply(&matrix, &step.matrix3d())
-                    })
-                };
-                let (a, b) = (compose(&from[index..]), compose(&to[index..]));
-                let rest = if matrix3d::is_2d(&a) && matrix3d::is_2d(&b) {
-                    // Two 2D matrices decompose in two dimensions
-                    // (Transforms 1 #decomposing-a-2d-matrix).
-                    let flat =
-                        |m: &matrix3d::Matrix3d| Affine2d([m[0], m[1], m[4], m[5], m[12], m[13]]);
-                    Some(matrix3d::from_affine(interpolate_matrices(
-                        flat(&a),
-                        flat(&b),
-                        t,
-                    )))
-                } else {
-                    matrix3d::interpolate(&a, &b, t)
-                };
-                // A matrix that cannot be decomposed animates discretely.
-                let rest = rest.unwrap_or(if t < 0.5 { a } else { b });
+                let rest = interpolate_composed(
+                    &compose_transform_steps(&from[index..]),
+                    &compose_transform_steps(&to[index..]),
+                    t,
+                );
                 matrix = matrix3d::multiply(&matrix, &rest);
                 break;
             }
@@ -4756,6 +4770,73 @@ impl RendererKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// UAX #9 reorders a line's pieces visually, but they stay in logical
+    /// paint order, so hit testing finds the piece under the pointer and a
+    /// selection between two points is logical text (CSS Writing Modes 4
+    /// #bidi-algo: reordering is presentation only).
+    #[test]
+    fn selection_over_a_reordered_line_is_logical() {
+        let dom = crate::dom::Dom::parse_document(
+            "<body style='margin:0;font:16px sans-serif'><p style='margin:0'>abc <b>\u{5d0}\u{5d1}\u{5d2}</b> <i>\u{5d3}\u{5d4}\u{5d5}</i> xyz</p>",
+        );
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &url::Url::parse("http://e.com/").unwrap(),
+            crate::layout2::Viewport::new(600.0, 400.0),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        let scene = chromeless_scene(
+            &layout.paint,
+            CssSize::new(600.0, 400.0),
+            CssPoint::default(),
+        );
+        let run = |text: &str| {
+            scene
+                .primitives
+                .iter()
+                .enumerate()
+                .find_map(|(index, primitive)| match primitive {
+                    DisplayCommand::GlyphRun { origin, shaped, .. }
+                        if shaped.text.trim() == text =>
+                    {
+                        Some((index, *origin, shaped.advance))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no glyph run {text:?}"))
+        };
+        let (abc, abc_origin, _) = run("abc");
+        let (first, first_origin, _) = run("\u{5d0}\u{5d1}\u{5d2}");
+        let (second, second_origin, second_width) = run("\u{5d3}\u{5d4}\u{5d5}");
+        // Painted logically, placed visually: the second Hebrew word is left
+        // of the first.
+        assert!(abc < first && first < second);
+        assert!(second_origin.x < first_origin.x);
+        // A point on the right half of the visually left word is in its
+        // logically first character.
+        let point = CssPoint::new(second_origin.x + second_width * 0.9, second_origin.y + 4.0);
+        let hit = scene
+            .text_position_at(point)
+            .expect("text under the pointer");
+        assert_eq!(hit.command, second);
+        assert!(hit.byte <= "\u{5d3}".len());
+        let selection = TextSelection {
+            anchor: TextPosition {
+                command: abc,
+                byte: 0,
+            },
+            focus: hit,
+        };
+        let text = scene.selected_text(selection);
+        assert!(text.starts_with("abc"), "{text:?}");
+        assert!(text.contains("\u{5d0}\u{5d1}\u{5d2}"), "{text:?}");
+        assert!(!text.contains("xyz"), "{text:?}");
+        let _ = abc_origin;
+        assert!(!scene.selection_rects(selection).is_empty());
+    }
     use crate::core::{BrowserSnapshot, CssSize, ScaleFactor};
 
     #[test]

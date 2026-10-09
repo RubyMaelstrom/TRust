@@ -127,6 +127,9 @@ struct ComputationInput {
     /// The UA `direction` rule an element's `dir` attribute (or `bdi`,
     /// `input[type=tel]`) selects (`ComputeView::ua_direction`).
     direction: Option<bool>,
+    /// The UA `unicode-bidi` its tag, `dir` attribute, input type and
+    /// document encoding select (`ComputeView::ua_unicode_bidi`).
+    bidi: Option<&'static str>,
 }
 
 /// HTML Rendering, Phrasing content / Lists / Tables / Form controls / Details
@@ -318,6 +321,11 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 .attr(id, "style")
                 .is_some_and(super::mentions_container_unit)
             && index.slotted_rules.is_empty()
+            // CSS Shadow 1 #part: an element's part names (and exported
+            // pseudo-elements) select `::part()` rules beyond its matched
+            // rules.
+            && (index.part_rules.is_empty()
+                || (self.attr(id, "part").is_none() && self.attr(id, "exportparts").is_none()))
             && !self
                 .attr(id, "style")
                 .is_some_and(|text| text.to_ascii_lowercase().contains("revert-layer"))
@@ -498,6 +506,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             tag: tag.to_owned(),
             ua: UaContext::of(self, id, tag),
             direction: self.ua_direction(id, tag),
+            bidi: self.ua_unicode_bidi(id, tag),
         };
         // Cascading/parent preparation may settle a lazy dependency or observe
         // a newly installed font set. It can retire the provisional row. Only

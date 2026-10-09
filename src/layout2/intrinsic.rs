@@ -169,11 +169,7 @@ impl Flow<'_> {
         basis: Option<f32>,
     ) -> f32 {
         let _profile = super::diagnostics::enter(super::diagnostics::Op::IntrinsicCompute);
-        let here = if b.node == NO_NODE {
-            inl.with_pseudo(self.dom, b.style.pseudo)
-        } else {
-            InlineStyle::derive(self.dom, b.node, inl, self.base)
-        };
+        let here = InlineStyle::for_box(self.dom, b.node, &b.style, inl, self.base);
         if let Some((_, width, _)) = self.vertical_lines(b, None, None, &here) {
             return width;
         }
@@ -293,21 +289,29 @@ impl Flow<'_> {
                 let u = Units::of(self.dom, b.node);
                 let fs = super::flex::container_style(self.dom, b.node, u, self.vp);
                 let gap = fs.gap_main.resolve(None).unwrap_or(0.0).max(0.0);
-                let contributions = items
-                    .iter()
-                    .map(|it| self.contribution(it, mode, &here, basis));
                 if fs.row {
+                    // CSS Flexbox 1 #algo-visibility: a collapsed item has a
+                    // zero main size and, like `display: none`, no gutter.
+                    let contributions = items
+                        .iter()
+                        .filter(|it| !self.collapsed_flex_item(it.node))
+                        .map(|it| self.contribution(it, mode, &here, basis))
+                        .collect::<Vec<_>>();
                     // §9.9.1 shape: a row container's max-content is the sum
                     // of its items' max-content contributions; its
                     // min-content is the largest item contribution when it
                     // can wrap, else the sum (nowrap can't break the row).
                     if mode == IMode::Min && fs.wrap {
-                        contributions.fold(0.0f32, f32::max)
+                        contributions.into_iter().fold(0.0f32, f32::max)
                     } else {
-                        let n = items.len();
-                        contributions.sum::<f32>() + gap * n.saturating_sub(1) as f32
+                        let n = contributions.len();
+                        contributions.into_iter().sum::<f32>() + gap * n.saturating_sub(1) as f32
                     }
                 } else {
+                    // A collapsed item's strut keeps its cross size.
+                    let contributions = items
+                        .iter()
+                        .map(|it| self.contribution(it, mode, &here, basis));
                     // Column: the widest item governs both modes.
                     contributions.fold(0.0f32, f32::max)
                 }

@@ -42030,6 +42030,32 @@ mod tests {
     }
 
     #[test]
+    fn element_part_reflects_the_part_attribute_as_a_token_list() {
+        // CSS Shadow 1 #idl: Element.part is a [SameObject,
+        // PutForwards=value] DOMTokenList for the `part` attribute, with no
+        // supported tokens.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                const el = document.createElement('span');
+                const list = el.part, results = [list instanceof DOMTokenList, list === el.part];
+                el.setAttribute('part', 'label  label icon');
+                results.push(list.length, list.value);
+                list.add('active');
+                results.push(el.getAttribute('part'));
+                el.part = 'x y';
+                results.push(el.getAttribute('part'), list.contains('y'));
+                try { list.supports('x'); results.push('none'); } catch (e) { results.push(e.name); }
+                return results.join('|');
+            })()"#
+            ),
+            "true|true|2|label  label icon|label icon active|x y|true|TypeError"
+        );
+    }
+
+    #[test]
     fn documents_create_processing_instructions() {
         // DOM #dom-document-createprocessinginstruction and
         // #concept-pi-initialize (local whatwg/dom@a2331a4).

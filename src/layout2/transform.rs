@@ -24,6 +24,62 @@ enum Operation {
     /// A three-dimensional transform function (CSS Transforms 2
     /// #three-d-transform-functions) as its 4x4 matrix.
     Matrix3d(crate::render::matrix3d::Matrix3d),
+    /// A transition's deferred matrix interpolation
+    /// (`dom::transitions::transform`): two remainders whose percentages
+    /// resolve against the reference box before CSS Transforms 1
+    /// #interpolation-of-transforms composes and decomposes them.
+    Interpolate(Box<Interpolation>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Interpolation {
+    from: Vec<Operation>,
+    to: Vec<Operation>,
+    progress: f32,
+}
+
+impl Operation {
+    /// The function's 4x4 matrix with percentages resolved against the
+    /// `reference` box.
+    fn matrix3d(&self, reference: CssRect) -> m3::Matrix3d {
+        match self {
+            Operation::Translate([x, y]) => m3::translate(
+                x.resolve(Some(reference.width)).unwrap_or(0.),
+                y.resolve(Some(reference.height)).unwrap_or(0.),
+                0.,
+            ),
+            Operation::Matrix(matrix) => m3::from_affine(*matrix),
+            Operation::Matrix3d(matrix) => *matrix,
+            Operation::Interpolate(interpolation) => {
+                let compose = |list: &[Operation]| {
+                    list.iter().fold(m3::IDENTITY, |matrix, op| {
+                        m3::multiply(&matrix, &op.matrix3d(reference))
+                    })
+                };
+                crate::render::interpolate_composed(
+                    &compose(&interpolation.from),
+                    &compose(&interpolation.to),
+                    interpolation.progress,
+                )
+            }
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Operation::Translate(values) => values.iter().map(super::memo::len_bytes).sum(),
+            Operation::Matrix(_) | Operation::Matrix3d(_) => 0,
+            Operation::Interpolate(interpolation) => {
+                std::mem::size_of::<Interpolation>()
+                    + interpolation
+                        .from
+                        .iter()
+                        .chain(&interpolation.to)
+                        .map(|op| std::mem::size_of::<Operation>() + op.retained_bytes())
+                        .sum::<usize>()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,22 +186,14 @@ impl Transform {
         if self
             .operations
             .iter()
-            .any(|op| matches!(op, Operation::Matrix3d(_)))
+            .any(|op| matches!(op, Operation::Matrix3d(_) | Operation::Interpolate(_)))
         {
             // CSS Transforms 2 #ctm: compose in three dimensions, about the
             // origin's depth too, then flatten the box into its parent's
             // plane (`transform-style: flat`).
             let mut matrix = m3::translate(origin.x, origin.y, self.origin_z);
             for op in &self.operations {
-                let factor = match op {
-                    Operation::Translate(lengths) => {
-                        let (x, y) = translation(lengths);
-                        m3::translate(x, y, 0.)
-                    }
-                    Operation::Matrix(matrix) => m3::from_affine(*matrix),
-                    Operation::Matrix3d(matrix) => *matrix,
-                };
-                matrix = m3::multiply(&matrix, &factor);
+                matrix = m3::multiply(&matrix, &op.matrix3d(reference));
             }
             let matrix = m3::multiply(
                 &matrix,
@@ -161,7 +209,9 @@ impl Transform {
                     Affine2d::translate(x, y)
                 }
                 Operation::Matrix(matrix) => *matrix,
-                Operation::Matrix3d(_) => unreachable!("composed in three dimensions above"),
+                Operation::Matrix3d(_) | Operation::Interpolate(_) => {
+                    unreachable!("composed in three dimensions above")
+                }
             });
         }
         matrix.then(Affine2d::translate(-origin.x, -origin.y))
@@ -179,12 +229,51 @@ impl Transform {
             + self
                 .operations
                 .iter()
-                .map(|op| match op {
-                    Operation::Translate(values) => values.iter().map(super::memo::len_bytes).sum(),
-                    Operation::Matrix(_) | Operation::Matrix3d(_) => 0,
-                })
+                .map(Operation::retained_bytes)
                 .sum::<usize>()
     }
+}
+
+/// CSS Transforms 1 #serialization-of-the-computed-value: `text` (a
+/// `<transform-list>`, possibly with a deferred interpolation) post-
+/// multiplied into one matrix against a reference box of `size`, as
+/// `matrix()` when it is 2D and `matrix3d()` otherwise.
+pub(crate) fn serialize_list(
+    text: &str,
+    units: Units,
+    viewport: Vp,
+    size: [f32; 2],
+) -> Option<String> {
+    let operations = if none(text) {
+        Vec::new()
+    } else {
+        functions(text, units, viewport)?
+    };
+    let reference = CssRect::new(0., 0., size[0], size[1]);
+    let matrix = operations.iter().fold(m3::IDENTITY, |matrix, op| {
+        m3::multiply(&matrix, &op.matrix3d(reference))
+    });
+    let number = |v: f32| crate::dom::cssom::css_number(f64::from(v));
+    Some(if m3::is_2d(&matrix) {
+        format!(
+            "matrix({}, {}, {}, {}, {}, {})",
+            number(matrix[0]),
+            number(matrix[1]),
+            number(matrix[4]),
+            number(matrix[5]),
+            number(matrix[12]),
+            number(matrix[13])
+        )
+    } else {
+        format!(
+            "matrix3d({})",
+            matrix
+                .iter()
+                .map(|v| number(*v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 pub(super) fn matrix(fragment: &Frag) -> Affine2d {
@@ -467,6 +556,21 @@ fn functions(text: &str, units: Units, viewport: Vp) -> Option<Vec<Operation>> {
             ("skewx", [a]) | ("skew", [a]) => Affine2d([1., 0., angle(a)?.tan(), 1., 0., 0.]),
             ("skewy", [a]) => Affine2d([1., angle(a)?.tan(), 0., 1., 0., 0.]),
             ("skew", [x, y]) => Affine2d([1., angle(y)?.tan(), angle(x)?.tan(), 1., 0., 0.]),
+            (name, [progress, from, to]) if name == super::DEFERRED_TRANSFORM_INTERPOLATION => {
+                let list = |text: &str| {
+                    if none(text) {
+                        Some(Vec::new())
+                    } else {
+                        functions(text, units, viewport)
+                    }
+                };
+                operations.push(Operation::Interpolate(Box::new(Interpolation {
+                    from: list(from)?,
+                    to: list(to)?,
+                    progress: progress.parse().ok().filter(|t: &f32| t.is_finite())?,
+                })));
+                continue;
+            }
             _ => return None,
         };
         operations.push(Operation::Matrix(matrix));
@@ -554,6 +658,16 @@ pub(super) fn animation_steps(
                 } else {
                     absolute_length(depth, units, viewport).filter(|d| *d >= 0.)?
                 })
+            }
+            // An underlying value holding a transition's deferred matrix
+            // interpolation, resolved against this reference box.
+            (name, [progress, from, to]) if name == super::DEFERRED_TRANSFORM_INTERPOLATION => {
+                let list = |text: &str| animation_steps(text, units, viewport, reference);
+                TransformStep::Matrix3d(crate::render::interpolate_composed(
+                    &crate::render::compose_transform_steps(&list(from)?),
+                    &crate::render::compose_transform_steps(&list(to)?),
+                    progress.parse().ok().filter(|t: &f32| t.is_finite())?,
+                ))
             }
             _ => return None,
         });
@@ -643,6 +757,47 @@ mod tests {
         let p = t.matrix(&f).map_point(CssPoint::new(43., 47.));
         assert!((p.x - 73.).abs() < 0.0001, "{p:?}");
         assert!((p.y - 68.).abs() < 0.0001, "{p:?}");
+    }
+
+    /// CSS Transforms 1 #interpolation-of-transforms: a transition's
+    /// deferred matrix interpolation resolves its remainders' percentages
+    /// against the reference box, then interpolates the decomposed matrices.
+    #[test]
+    fn deferred_matrix_interpolation_resolves_against_the_reference_box() {
+        let mut f = fragment();
+        let t = transform(&[
+            (
+                "transform",
+                "scale(1) -trust-interpolate-matrix(0.5, translate(50%, 0px), \
+                 rotate(90deg) translate(10px, 0px))",
+            ),
+            ("transform-origin", "0 0"),
+        ]);
+        // From translate(70px) to rotate(90deg) translate(10px) = matrix(0,
+        // 1, -1, 0, 0, 10): halfway is a 45deg rotation and translate(35px,
+        // 5px).
+        let origin = t.matrix(&f).map_point(CssPoint::new(f.x, f.y));
+        assert!((origin.x - 48.).abs() < 1e-4 && (origin.y - 22.).abs() < 1e-4);
+        let unit = t.matrix(&f).map_point(CssPoint::new(f.x + 1., f.y));
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((unit.x - 48. - half).abs() < 1e-4 && (unit.y - 22. - half).abs() < 1e-4);
+        // The same value follows a resized box.
+        f.w = 300.;
+        let origin = t.matrix(&f).map_point(CssPoint::new(f.x, f.y));
+        assert!((origin.x - 13. - 75.).abs() < 1e-4, "{origin:?}");
+        // The compositor's steps resolve it identically.
+        let steps = animation_steps(
+            "-trust-interpolate-matrix(0.5, translate(50%, 0px), rotate(90deg) translate(10px, 0px))",
+            Units::default(),
+            Vp { w: 800., h: 600. },
+            CssRect::new(0., 0., 140., 100.),
+        )
+        .unwrap();
+        let m = crate::render::compose_transform_steps(&steps);
+        assert!(
+            (m[12] - 35.).abs() < 1e-4 && (m[13] - 5.).abs() < 1e-4,
+            "{m:?}"
+        );
     }
 
     #[test]

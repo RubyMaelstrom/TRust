@@ -2034,6 +2034,27 @@ fn terminal_piece_text_with_space(piece: &super::inline::Piece) -> String {
     text
 }
 
+/// UAX #9 L2/L4 at the cell adapter: a reordered line's pieces from left to
+/// right, with the text of right-to-left (odd-level) pieces spelled in visual
+/// order, since a terminal paints a cell row's characters in the order it
+/// receives them. Canonical layout keeps `pieces` logical; a line holding
+/// only level-0 pieces is already in visual order and returned as is.
+fn terminal_visual_pieces(
+    pieces: &[super::inline::Piece],
+) -> std::borrow::Cow<'_, [super::inline::Piece]> {
+    if pieces.iter().all(|piece| piece.bidi_level == 0) {
+        return std::borrow::Cow::Borrowed(pieces);
+    }
+    let mut visual = pieces.to_vec();
+    visual.sort_by(|a, b| a.x.total_cmp(&b.x));
+    for piece in &mut visual {
+        if piece.bidi_level % 2 == 1 && piece.is_text() && piece.item.terminal_text.is_none() {
+            piece.item.terminal_text = Some(crate::text::visual_text(&piece.item.text));
+        }
+    }
+    std::borrow::Cow::Owned(visual)
+}
+
 /// Splitting a text run at a paint-style boundary must not manufacture a
 /// whitespace cell. Keep contiguous canonical glyph runs adjacent in the
 /// terminal too; real CSS gaps, replaced boxes, and baseline shifts retain
@@ -2179,7 +2200,8 @@ fn terminal_line_extent(
     let mut span = 1i64;
     let mut pen = start_col;
     let mut restore_soft_gap = joins_previous;
-    for (index, piece) in line_fragment.pieces.iter().enumerate() {
+    let pieces = terminal_visual_pieces(&line_fragment.pieces);
+    for (index, piece) in pieces.iter().enumerate() {
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
         if piece.space_before
             && piece.item.image.is_none()
@@ -2206,7 +2228,7 @@ fn terminal_line_extent(
             || terminal_piece_width(piece, cell_w, cell_h),
             display_width,
         );
-        let mut col = if abuts_previous_text(&line_fragment.pieces, index) {
+        let mut col = if abuts_previous_text(&pieces, index) {
             pen
         } else {
             preferred.max(pen)
@@ -2267,6 +2289,7 @@ fn terminal_line_span(
     let FragKind::Line(line_fragment) = &line.kind else {
         return 1;
     };
+    let pieces = terminal_visual_pieces(&line_fragment.pieces);
 
     // A line that fits its containing block but whose quantized edge remains
     // beyond the viewport is clipped by the compositor, not wrapped. This is
@@ -2282,7 +2305,7 @@ fn terminal_line_span(
         let mut row_offset = 0i64;
         let mut span = 1i64;
         let mut pen = continuation_col;
-        for (index, piece) in line_fragment.pieces.iter().enumerate() {
+        for (index, piece) in pieces.iter().enumerate() {
             let width = terminal_piece_width(piece, cell_w, cell_h) as i64;
             let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
             if piece.space_before
@@ -2291,7 +2314,7 @@ fn terminal_line_span(
             {
                 preferred -= 1;
             }
-            let col = if abuts_previous_text(&line_fragment.pieces, index) {
+            let col = if abuts_previous_text(&pieces, index) {
                 pen
             } else {
                 preferred.max(pen)
@@ -2310,7 +2333,7 @@ fn terminal_line_span(
     let mut row_offset = 0i64;
     let mut span = 1i64;
     let mut pen = continuation_col;
-    for (index, piece) in line_fragment.pieces.iter().enumerate() {
+    for (index, piece) in pieces.iter().enumerate() {
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
         if piece.space_before
             && piece.item.image.is_none()
@@ -2325,7 +2348,7 @@ fn terminal_line_span(
             || terminal_piece_width(piece, cell_w, cell_h),
             display_width,
         );
-        let mut col = if abuts_previous_text(&line_fragment.pieces, index) {
+        let mut col = if abuts_previous_text(&pieces, index) {
             pen
         } else if row_offset > 0 {
             continuation_col
@@ -2654,7 +2677,8 @@ fn inflow_content(
             if !placement.joins_previous {
                 row_pens.clear();
             }
-            for (index, p) in line.pieces.iter().enumerate() {
+            let pieces = terminal_visual_pieces(&line.pieces);
+            for (index, p) in pieces.iter().enumerate() {
                 let canonical_text_origin = c.x + p.x;
                 let text_clip_resolved = p.item.image.is_none()
                     && p.item.terminal_text.is_none()
@@ -2767,7 +2791,7 @@ fn inflow_content(
                 let mut row = placement.row + baseline_offset + (paint_y / ch).round() as i64;
                 let mut preferred_col = ((item_x - ox) / cw).round() as i64;
                 if text_x_offset <= 0.01
-                    && abuts_previous_text(&line.pieces, index)
+                    && abuts_previous_text(&pieces, index)
                     && let Some(&pen) = row_pens.get(&row)
                 {
                     preferred_col = pen;

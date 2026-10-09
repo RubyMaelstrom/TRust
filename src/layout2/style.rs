@@ -209,6 +209,23 @@ pub(crate) fn display_of(dom: &Dom, id: NodeId) -> Disp {
     }
 }
 
+/// CSS Values 4 #font-relative-lengths: `em` on a pseudo-element's own box
+/// is its own font size, which it resolves against the originating
+/// element's (as `with_pseudo` does for its text).
+pub(crate) fn pseudo_units(dom: &Dom, id: NodeId, which: PseudoEl) -> Units {
+    let mut u = Units::of(dom, id);
+    if dom.pseudo_declares(id, which, "font-size") {
+        let fs = dom
+            .pseudo_layout_value(id, which, "font-size")
+            .as_deref()
+            .and_then(|value| crate::dom::font_size_px_at(value, u.fs, u.root, dom.viewport_px()))
+            .unwrap_or(u.fs);
+        u.ch *= fs / u.fs.max(f32::EPSILON);
+        u.fs = fs;
+    }
+    u
+}
+
 /// The box-model snapshot of one element, in parse-once [`Len`]s (percentages
 /// resolve against the containing block at layout). Border widths are already
 /// used values in px (0 when the side's style is `none`/`hidden`); whether
@@ -232,6 +249,15 @@ pub(crate) struct BoxStyle {
     /// and pseudo identity so graphical paint reads that style rather than
     /// treating the fragment as an unstyled anonymous box.
     pub pseudo: Option<(NodeId, PseudoEl)>,
+    /// An anonymous block box holding the block-level boxes split out of an
+    /// inline box (CSS 2 §9.2.1.1): the inline element whose inline context
+    /// (link, text style) its contents still inherit, since inheritance
+    /// follows the element tree.
+    pub inline_context: Option<NodeId>,
+    /// Whether this inline box has its start and end edges (margin, border
+    /// and padding): false for the inner sides of the parts an inline box is
+    /// broken into around block-level boxes (CSS 2 §9.2.1.1).
+    pub inline_edges: [bool; 2],
     /// CSS Conditional 5 / CSS Containment 2 #containment-size: inline-size
     /// (1) or two-axis (2) size containment, from `container-type` or
     /// `contain`.
@@ -301,6 +327,76 @@ pub(crate) struct BoxStyle {
     pub float: Option<super::float::Side>,
     /// `clear` (§9.5.2): which sides may not be adjacent to an earlier float.
     pub clear: super::float::Clear,
+    /// CSS Writing Modes 4 #direction: the box's inline base direction is
+    /// right-to-left. An inline box's start edge is then its right edge
+    /// (#bidi-box-model), and its embedding or isolate is right-to-left.
+    pub rtl: bool,
+    /// CSS Writing Modes 4 #unicode-bidi.
+    pub unicode_bidi: UnicodeBidi,
+}
+
+/// CSS Writing Modes 4 #unicode-bidi: how an inline box takes part in the
+/// Unicode Bidirectional Algorithm, by the controls it injects
+/// (#bidi-control-codes-injection-table), and for a block container how its
+/// bidi paragraphs' base levels are chosen (#bidi-para-direction).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UnicodeBidi {
+    #[default]
+    Normal,
+    Embed,
+    Isolate,
+    BidiOverride,
+    IsolateOverride,
+    Plaintext,
+}
+
+impl UnicodeBidi {
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("embed") => Self::Embed,
+            Some("isolate") => Self::Isolate,
+            Some("bidi-override") => Self::BidiOverride,
+            Some("isolate-override") => Self::IsolateOverride,
+            Some("plaintext") => Self::Plaintext,
+            _ => Self::Normal,
+        }
+    }
+
+    /// The controls HL3 inserts at the start and end of an inline box with
+    /// this value and the given `direction` (CSS Writing Modes 4
+    /// #bidi-control-codes-injection-table).
+    pub(crate) fn controls(self, rtl: bool) -> Option<(&'static str, &'static str)> {
+        const LRE: &str = "\u{202A}";
+        const RLE: &str = "\u{202B}";
+        const PDF: &str = "\u{202C}";
+        const LRO: &str = "\u{202D}";
+        const RLO: &str = "\u{202E}";
+        const LRI: &str = "\u{2066}";
+        const RLI: &str = "\u{2067}";
+        const PDI: &str = "\u{2069}";
+        match (self, rtl) {
+            (Self::Normal, _) => None,
+            (Self::Embed, false) => Some((LRE, PDF)),
+            (Self::Embed, true) => Some((RLE, PDF)),
+            (Self::Isolate, false) => Some((LRI, PDI)),
+            (Self::Isolate, true) => Some((RLI, PDI)),
+            (Self::BidiOverride, false) => Some((LRO, PDF)),
+            (Self::BidiOverride, true) => Some((RLO, PDF)),
+            (Self::IsolateOverride, false) => Some(("\u{2068}\u{202D}", "\u{202C}\u{2069}")),
+            (Self::IsolateOverride, true) => Some(("\u{2068}\u{202E}", "\u{202C}\u{2069}")),
+            (Self::Plaintext, _) => Some(("\u{2068}", PDI)),
+        }
+    }
+
+    /// The override a block container with this value applies to its root
+    /// inline box (the table's footnote): LRO/RLO and PDF.
+    pub(crate) fn root_override(self, rtl: bool) -> Option<&'static str> {
+        matches!(self, Self::BidiOverride | Self::IsolateOverride).then_some(if rtl {
+            "\u{202E}"
+        } else {
+            "\u{202D}"
+        })
+    }
 }
 
 impl BoxStyle {
@@ -337,6 +433,8 @@ impl BoxStyle {
             vertical: None,
             sideways_text: Some(false),
             pseudo: None,
+            inline_context: None,
+            inline_edges: [true; 2],
             size_container: 0,
             contain_layout: false,
             contain_paint: false,
@@ -368,6 +466,8 @@ impl BoxStyle {
             bg: false,
             float: None,
             clear: super::float::Clear::default(),
+            rtl: false,
+            unicode_bidi: UnicodeBidi::Normal,
         }
     }
 
@@ -501,6 +601,8 @@ impl BoxStyle {
                 cv("text-orientation").as_deref(),
             ),
             pseudo: None,
+            inline_context: None,
+            inline_edges: [true; 2],
             size_container: dom.size_container_kind(id).max(containment.size),
             contain_layout: containment.layout,
             contain_paint: containment.paint,
@@ -559,6 +661,8 @@ impl BoxStyle {
                 super::float::float_side(dom, id)
             },
             clear: super::float::clear_of(dom, id),
+            rtl: cv("direction").is_some_and(|value| value.trim().eq_ignore_ascii_case("rtl")),
+            unicode_bidi: UnicodeBidi::parse(cv("unicode-bidi").as_deref()),
         }
     }
 
@@ -569,22 +673,7 @@ impl BoxStyle {
     /// live snapshot.
     pub fn of_pseudo(dom: &Dom, id: NodeId, which: PseudoEl, vp: Vp) -> BoxStyle {
         let cv = |prop: &str| dom.pseudo_layout_value(id, which, prop);
-        // CSS Values 4 #font-relative-lengths: `em` on the pseudo's own box
-        // is its own font size, which it resolves against the originating
-        // element's (as `with_pseudo` does for its text).
-        let mut u = Units::of(dom, id);
-        if dom.pseudo_style(id, which, "font-size").is_some()
-            || dom.baked_pseudo_value(id, which, "font-size").is_some()
-        {
-            let fs = cv("font-size")
-                .as_deref()
-                .and_then(|value| {
-                    crate::dom::font_size_px_at(value, u.fs, u.root, dom.viewport_px())
-                })
-                .unwrap_or(u.fs);
-            u.ch *= fs / u.fs.max(f32::EPSILON);
-            u.fs = fs;
-        }
+        let u = pseudo_units(dom, id, which);
         let len = |prop: &str, default: Len| Len::parse_or(cv(prop).as_deref(), u, vp, default);
         let border = |side: &str| match cv(&format!("border-{side}-style"))
             .as_deref()
@@ -666,6 +755,8 @@ impl BoxStyle {
                 cv("text-orientation").as_deref(),
             ),
             pseudo: Some((id, which)),
+            inline_context: None,
+            inline_edges: [true; 2],
             size_container: containment.size,
             contain_layout: containment.layout,
             contain_paint: containment.paint,
@@ -732,6 +823,8 @@ impl BoxStyle {
             bg: bg("background-color") || bg("background-image"),
             float,
             clear,
+            rtl: cv("direction").is_some_and(|value| value.trim().eq_ignore_ascii_case("rtl")),
+            unicode_bidi: UnicodeBidi::parse(cv("unicode-bidi").as_deref()),
         }
     }
 
@@ -1547,6 +1640,26 @@ impl InlineStyle {
     }
 
     /// The context inside element `id`, derived from the parent's.
+    /// The inline context a box's contents inherit: an element's own,
+    /// derived from its parent's; an anonymous box's parent context (or
+    /// that of the inline box it was split out of, CSS 2 §9.2.1.1); a
+    /// generated box's pseudo-element style.
+    pub fn for_box(
+        dom: &Dom,
+        node: NodeId,
+        style: &BoxStyle,
+        parent: &InlineStyle,
+        base: &Url,
+    ) -> InlineStyle {
+        if node != NO_NODE {
+            return Self::derive(dom, node, parent, base);
+        }
+        match style.inline_context {
+            Some(inline) => Self::derive(dom, inline, parent, base),
+            None => parent.with_pseudo(dom, style.pseudo),
+        }
+    }
+
     pub fn derive<D: StyleSource + ?Sized>(
         dom: &D,
         id: NodeId,
@@ -1769,10 +1882,7 @@ impl InlineStyle {
         s.pseudo = pseudo;
         // CSS Pseudo 4: generated boxes inherit computed text metrics from
         // their originating element, then apply their own declarations.
-        let declared = |p| {
-            dom.pseudo_style(id, which, p).is_some()
-                || dom.baked_pseudo_value(id, which, p).is_some()
-        };
+        let declared = |p| dom.pseudo_declares(id, which, p);
         let value = |p| dom.pseudo_layout_value(id, which, p);
         if declared("font-size") {
             s.font_size = value("font-size")

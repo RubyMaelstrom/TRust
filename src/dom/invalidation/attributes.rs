@@ -110,7 +110,10 @@ impl Step {
                 Combinator::Descendant => Axis::Descendant,
                 Combinator::NextSibling => Axis::Next,
                 Combinator::SubsequentSibling => Axis::Following,
-                Combinator::None => Axis::SelfOnly,
+                // CSS Shadow 1 #part: the part elements are in the
+                // originating host's composed subtree, which restyling the
+                // host as a subject covers.
+                Combinator::None | Combinator::Part => Axis::SelfOnly,
             },
             compound,
         )
@@ -123,7 +126,7 @@ impl Step {
                 Combinator::Descendant => Axis::Ancestor,
                 Combinator::NextSibling => Axis::Previous,
                 Combinator::SubsequentSibling => Axis::Preceding,
-                Combinator::None => Axis::SelfOnly,
+                Combinator::None | Combinator::Part => Axis::SelfOnly,
             },
             compound,
         )
@@ -309,6 +312,8 @@ impl Dependencies {
             root: _,
             host,
             pseudo: _,
+            part: _,
+            part_follows: _,
             pseudos: _,
             relative_anchor: _,
         } = compound;

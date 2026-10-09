@@ -14,6 +14,8 @@
 //! forced breaks from `<br>`/preserved newlines, measured tab stops, and real
 //! baseline-aligned text and atomic inlines.
 
+mod bidi;
+
 use url::Url;
 
 use crate::doc::{Form, Link};
@@ -123,6 +125,15 @@ pub(crate) struct Piece {
     /// relatively positioned replaced element's own offset. The line box
     /// and the pieces after it are laid as if it were zero.
     pub(crate) shift: [f32; 2],
+    /// UAX #9 (CSS Writing Modes 4 #bidi-algo): the embedding level the
+    /// paragraph's bidi resolution gave this piece's characters. Text is
+    /// split where the level changes, so it is uniform; an odd level reads
+    /// right to left. Zero outside right-to-left content.
+    pub(crate) bidi_level: u8,
+    /// The byte offset of this piece's characters (an atomic inline's object
+    /// replacement character) in its bidi paragraph's text, `u32::MAX` when
+    /// no paragraph text is kept (intrinsic probes, sideways text).
+    pub(super) bidi_pos: u32,
 }
 
 /// The box of an inline-level replaced element or form control, as edge
@@ -262,12 +273,27 @@ pub(crate) struct ControlLine {
 pub(crate) struct InlineBoxes {
     /// Enclosing inline boxes, outermost first.
     pub chain: std::sync::Arc<[InlineBoxEntry]>,
-    /// Boxes beginning before this piece: (box, distance from the box's
-    /// border-box start edge to the piece).
-    pub opens: Vec<(InlineBoxKey, f32)>,
-    /// Boxes ending after this piece: (box, distance from the piece's end to
-    /// the box's border-box end edge).
-    pub closes: Vec<(InlineBoxKey, f32)>,
+    /// Box fragments whose left border edge precedes this piece, the
+    /// fragment's leftmost one. As laid in logical order these are the boxes
+    /// the piece begins (their start edge); the bidi pass rewrites them in
+    /// visual order (CSS Writing Modes 4 #bidi-box-model).
+    pub opens: Vec<BoxBound>,
+    /// Box fragments whose right border edge follows this piece, the
+    /// fragment's rightmost one; in logical order the boxes it ends.
+    pub closes: Vec<BoxBound>,
+}
+
+/// One side of an inline box's line fragment, relative to the piece at
+/// that side of it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoxBound {
+    pub key: InlineBoxKey,
+    /// The distance between the piece and the box's border edge on this
+    /// side.
+    pub distance: f32,
+    /// Whether the fragment has the box's margin, border and padding on this
+    /// side (CSS Backgrounds 3 #box-decoration-break, `slice`).
+    pub edge: bool,
 }
 
 /// A non-replaced inline box: an element's own, or one of the generated
@@ -299,6 +325,32 @@ pub(crate) struct InlineBoxEntry {
     /// Positioned Layout 3 #relpos-insets move a relatively positioned box
     /// and its descendants after line layout without changing the line.
     pub offset: [f32; 2],
+    /// The box's `direction` is `rtl`: its start edge is its right edge
+    /// (CSS Writing Modes 4 #bidi-box-model, CSS 2 §8.6).
+    pub rtl: bool,
+    /// Its horizontal edges: left margin, left border plus padding, right
+    /// border plus padding, right margin.
+    pub edges: [f32; 4],
+}
+
+impl InlineBoxEntry {
+    /// The margin, border and padding on the box's start side.
+    pub(crate) fn start_edge(&self) -> f32 {
+        if self.rtl {
+            self.edges[2] + self.edges[3]
+        } else {
+            self.edges[0] + self.edges[1]
+        }
+    }
+
+    /// The margin, border and padding on the box's end side.
+    pub(crate) fn end_edge(&self) -> f32 {
+        if self.rtl {
+            self.edges[0] + self.edges[1]
+        } else {
+            self.edges[2] + self.edges[3]
+        }
+    }
 }
 
 impl InlineBoxEntry {
@@ -346,30 +398,45 @@ pub(crate) struct EmptyInlineBox {
     /// box's relative offset.
     pub x0: f32,
     pub x1: f32,
+    /// Whether it has its left and right margin, border and padding (not
+    /// for the inner sides of a box split around blocks, CSS 2 §9.2.1.1).
+    pub edges: [bool; 2],
 }
 
 /// One line fragment of an inline box: its border-box horizontal extent from
-/// the line box origin, including its relative offset, and whether the box
-/// begins and ends on this line (CSS Backgrounds 3 #box-decoration-break,
-/// `slice`).
+/// the line box origin, including its relative offset, and whether it has
+/// the box's left and right margin, border and padding (CSS Backgrounds 3
+/// #box-decoration-break, `slice`; CSS Writing Modes 4 #bidi-box-model).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BoxFragment {
     pub entry: InlineBoxEntry,
     pub x0: f32,
     pub x1: f32,
-    pub starts: bool,
-    pub ends: bool,
+    pub left_edge: bool,
+    pub right_edge: bool,
 }
 
 /// The line fragments, on one line, of the inline boxes `keep` selects, in
-/// order of appearance. A box spans its pieces on the line, plus its start
-/// and end edges where it begins and ends; an empty box spans its edges.
+/// order of appearance. A box spans its pieces on the line, plus its edges
+/// where it begins and ends; an empty box spans its edges.
+///
+/// CSS Writing Modes 4 #bidi-fragmentation: on a line whose bidi
+/// reordering separated a box's pieces by intervening content, the box has
+/// one fragment per visually contiguous run, which the bidi pass delimits
+/// with the pieces' `opens`/`closes`; such lines are walked left to right.
 pub(crate) fn line_box_fragments<'p>(
     pieces: impl IntoIterator<Item = &'p Piece>,
     empty: &[EmptyInlineBox],
     mut keep: impl FnMut(&InlineBoxEntry) -> bool,
 ) -> Vec<BoxFragment> {
-    let mut runs: Vec<BoxFragment> = Vec::new();
+    let mut pieces: Vec<&Piece> = pieces.into_iter().collect();
+    let reordered = pieces.iter().any(|piece| piece.bidi_level != 0);
+    if reordered {
+        pieces.sort_by(|a, b| (a.x - a.shift[0]).total_cmp(&(b.x - b.shift[0])));
+    }
+    // A run is finished once a piece closes it; a later piece of the same
+    // box (only on a reordered line) begins another fragment.
+    let mut runs: Vec<(BoxFragment, bool)> = Vec::new();
     for piece in pieces {
         let Some(boxes) = &piece.boxes else {
             continue;
@@ -383,37 +450,42 @@ pub(crate) fn line_box_fragments<'p>(
                 entry: *entry,
                 x0: start,
                 x1: end,
-                starts: false,
-                ends: false,
+                left_edge: false,
+                right_edge: false,
             };
-            if let Some(&(_, distance)) = boxes.opens.iter().find(|(open, _)| *open == entry.key) {
-                run.x0 = start - distance;
-                run.starts = true;
+            if let Some(open) = boxes.opens.iter().find(|open| open.key == entry.key) {
+                run.x0 = start - open.distance;
+                run.left_edge = open.edge;
             }
-            if let Some(&(_, distance)) = boxes.closes.iter().find(|(close, _)| *close == entry.key)
+            let close = boxes.closes.iter().find(|close| close.key == entry.key);
+            if let Some(close) = close {
+                run.x1 = end + close.distance;
+                run.right_edge = close.edge;
+            }
+            match runs
+                .iter_mut()
+                .find(|(other, done)| other.entry.key == entry.key && !(reordered && *done))
             {
-                run.x1 = end + distance;
-                run.ends = true;
-            }
-            match runs.iter_mut().find(|other| other.entry.key == entry.key) {
-                Some(other) => {
+                Some((other, done)) => {
                     other.x0 = other.x0.min(run.x0);
                     other.x1 = other.x1.max(run.x1);
-                    other.starts |= run.starts;
-                    other.ends |= run.ends;
+                    other.left_edge |= run.left_edge;
+                    other.right_edge |= run.right_edge;
+                    *done |= close.is_some();
                 }
-                None => runs.push(run),
+                None => runs.push((run, close.is_some())),
             }
         }
     }
+    let mut runs: Vec<BoxFragment> = runs.into_iter().map(|(run, _)| run).collect();
     for empty in empty {
         if keep(&empty.entry) {
             runs.push(BoxFragment {
                 entry: empty.entry,
                 x0: empty.x0 + empty.entry.offset[0],
                 x1: empty.x1 + empty.entry.offset[0],
-                starts: true,
-                ends: true,
+                left_edge: empty.edges[0],
+                right_edge: empty.edges[1],
             });
         }
     }
@@ -490,6 +562,11 @@ pub(crate) struct InlineItem {
 }
 
 impl Piece {
+    /// Whether this piece is a run of text (not an atomic inline).
+    pub(crate) fn is_text(&self) -> bool {
+        self.text_style.is_some() && !self.atom_box
+    }
+
     fn layout_height(&self) -> f32 {
         self.box_height + self.vertical_edges[0] + self.vertical_edges[1]
     }
@@ -569,6 +646,8 @@ impl Piece {
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
+            bidi_level: 0,
+            bidi_pos: u32::MAX,
         }
     }
 
@@ -600,6 +679,8 @@ impl Piece {
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
+            bidi_level: 0,
+            bidi_pos: u32::MAX,
         }
     }
 }
@@ -770,7 +851,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     box_chain: Option<std::sync::Arc<[InlineBoxEntry]>>,
     /// Opened boxes awaiting their first piece: (box, the offset of the
     /// box's border-box start edge within `pending_gap_px`).
-    pending_opens: Vec<(InlineBoxKey, f32)>,
+    /// Boxes opening at the next piece: key, offset, and whether the box has
+    /// its start edge here (`BoxStyle::inline_edges`).
+    pending_opens: Vec<(InlineBoxKey, f32, bool)>,
     // ---- floats (§9.5) — inert when `fc` is None ----
     /// The BFC's float context: queried per line (`band`) and appended to when
     /// an inline float is met (`place`). `None` = no floats (intrinsic probe,
@@ -842,6 +925,10 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// The terminal frontend's cell font (`crate::text::cells`): line boxes
     /// are whole rows and text sits on its row. `None` for graphical layout.
     cells: Option<crate::text::CellMetrics>,
+    /// The current bidi paragraph's text and state (CSS Writing Modes 4
+    /// #bidi-algo), kept for a block container's laid content; `None` in
+    /// intrinsic probes and other formatting contexts.
+    bidi: Option<Box<bidi::BidiState>>,
 }
 
 impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
@@ -935,6 +1022,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             quirky_strut_root: None,
             line_budget: None,
             cells: crate::text::cell_metrics(),
+            bidi: None,
         };
         ifc.begin_line();
         ifc
@@ -1248,17 +1336,20 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // content-box geometry with border/padding carried as inline
                 // edges. Margins remain outside both representations.
                 let complete_border_box = matches!(&a.kind, AtomKind::Control { .. });
-                self.pending_gap_px += if complete_border_box {
-                    self.margin_px(&style, LEFT)
+                let edges = if complete_border_box {
+                    [self.margin_px(&style, LEFT), self.margin_px(&style, RIGHT)]
                 } else {
-                    self.edge_px(&style, LEFT)
+                    [self.edge_px(&style, LEFT), self.edge_px(&style, RIGHT)]
                 };
+                self.pending_gap_px += edges[0];
+                if let Some(bidi) = self.bidi.as_mut() {
+                    bidi.next_atom = Some(bidi::AtomBidi::replaced(&style, edges));
+                }
                 self.atom(a, &atom_context, ctx.ws.wraps());
-                self.pending_gap_px += if complete_border_box {
-                    self.margin_px(&style, RIGHT)
-                } else {
-                    self.edge_px(&style, RIGHT)
-                };
+                if let Some(bidi) = self.bidi.as_mut() {
+                    bidi.next_atom = None;
+                }
+                self.pending_gap_px += edges[1];
             }
             Inline::Atom(a) => self.atom(a, ctx, ctx.ws.wraps()),
             // A static-position mark, nothing more: the hypothetical box
@@ -1277,6 +1368,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // CSS 2 §9.4.3: the hypothetical box moves with the
                 // relatively positioned inline boxes enclosing it.
                 let offset = self.box_stack.last().map_or([0.0; 2], |entry| entry.offset);
+                if inline_level && let Some(bidi) = self.bidi.as_mut() {
+                    bidi.insert_static(self.oofs.len(), self.box_chain.clone());
+                }
                 self.oofs.push(OofMark {
                     b,
                     line: self.lines.len(),
@@ -1324,14 +1418,18 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 // Decorated boxes paint their line fragments; CSSOM View
                 // #dom-element-getclientrects also measures every element's
                 // non-replaced inline box. Intrinsic sizing needs neither.
+                // CSS Writing Modes 4 #bidi-box-model / CSS 2 §8.6: the
+                // box's start edge is its left edge, or its right edge when
+                // its direction is right-to-left. The logical pen lays the
+                // start edge first; the bidi pass places both physically.
+                let (start_side, end_side) = if style.rtl {
+                    (RIGHT, LEFT)
+                } else {
+                    (LEFT, RIGHT)
+                };
                 let tracked = key.filter(|_| !self.measuring).and_then(|key| {
                     let decorated = inline_box_decorated(self.dom, key, style);
-                    let edge = |side: usize| {
-                        style.border[side]
-                            + style.padding[side]
-                                .resolve(Some(self.cb_w_px))
-                                .unwrap_or(0.0)
-                    };
+                    let edge = |side: usize| self.bp_px(style, side);
                     (decorated || key.1.is_none() || positioned).then(|| {
                         // The box's own strut, like the block container's
                         // (CSS 2 #inline-non-replaced, #leading).
@@ -1356,6 +1454,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                             line_height: strut.line_height,
                             vertical_align: inner.vertical_align,
                             offset: [outer[0] + dx, outer[1] + dy],
+                            rtl: style.rtl,
+                            edges: [
+                                self.margin_px(style, LEFT),
+                                edge(LEFT),
+                                edge(RIGHT),
+                                self.margin_px(style, RIGHT),
+                            ],
                         }
                     })
                 });
@@ -1377,14 +1482,23 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.positioned_open.push(self.positioned.len() - 1);
                     self.relative_offsets |= entry.offset != [0.0; 2];
                 });
+                // HL3 (CSS Writing Modes 4 #unicode-bidi): the box's bidi
+                // controls precede its start edge in the paragraph text.
+                let controls = style.unicode_bidi.controls(style.rtl);
+                if let Some(bidi) = self.bidi.as_mut() {
+                    bidi.open_box(controls, style.rtl);
+                }
                 if let Some(entry) = tracked {
-                    self.pending_opens
-                        .push((entry.key, self.pending_gap_px + self.margin_px(style, LEFT)));
+                    self.pending_opens.push((
+                        entry.key,
+                        self.pending_gap_px + self.margin_px(style, start_side),
+                        style.inline_edges[0],
+                    ));
                     self.box_stack.push(entry);
                     self.box_chain = Some(self.box_stack.as_slice().into());
                 }
-                self.pending_gap_px += self.edge_px(style, LEFT);
-                let closing_edge = self.edge_px(style, RIGHT);
+                self.pending_gap_px += self.edge_px(style, start_side);
+                let closing_edge = self.edge_px(style, end_side);
                 for (index, k) in kids.iter().enumerate() {
                     let rest = Following {
                         rest: &kids[index + 1..],
@@ -1400,7 +1514,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 if positioned_index.is_some() {
                     self.positioned_open.pop();
                 }
-                self.pending_gap_px += self.edge_px(style, RIGHT);
+                self.pending_gap_px += self.edge_px(style, end_side);
+                if let Some(bidi) = self.bidi.as_mut() {
+                    bidi.close_box(controls, style.rtl);
+                }
             }
         }
     }
@@ -1422,6 +1539,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         style.margin[side]
             .resolve(Some(self.cb_w_px))
             .unwrap_or(0.0)
+    }
+
+    /// An inline box's border plus padding on `side`, in px.
+    fn bp_px(&self, style: &BoxStyle, side: usize) -> f32 {
+        style.border[side]
+            + style.padding[side]
+                .resolve(Some(self.cb_w_px))
+                .unwrap_or(0.0)
     }
 
     /// Emit a text run under `ctx`.
@@ -1469,6 +1594,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     } else {
                         if !self.pending_space {
                             self.pending_space_wraps = ctx.ws.wraps();
+                            // The collapsed space is one U+0020 of the bidi
+                            // paragraph, at its logical place among the
+                            // inline boxes' controls, whether or not it is
+                            // kept on the line.
+                            if let Some(bidi) = self.bidi.as_mut() {
+                                bidi.text.push(' ');
+                            }
                         }
                         self.pending_space = true;
                     }
@@ -1499,6 +1631,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     if j > 0 {
                         let tab = self.tab_advance(ctx);
                         if tab > 0.0 {
+                            // A preserved tab is a UAX #9 segment separator.
+                            // A zero tab renders nothing and leaves the
+                            // adjacent runs one piece.
+                            if let Some(bidi) = self.bidi.as_mut() {
+                                bidi.text.push('\t');
+                            }
                             if ctx.ws.breaks_spaces() {
                                 let advance =
                                     |pen: f32, start: f32| tab - (pen - start).max(0.0) % tab;
@@ -1675,11 +1813,18 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     } else {
                         self.form_context(*node, ctx)
                     };
-                    *width += self.edge_px(style, LEFT);
+                    // The box's start edge, then its end edge (in logical
+                    // order, as `walk` lays them).
+                    let (start_side, end_side) = if style.rtl {
+                        (RIGHT, LEFT)
+                    } else {
+                        (LEFT, RIGHT)
+                    };
+                    *width += self.edge_px(style, start_side);
                     if let Continues::Stopped = self.continuation_in(kids, &inner, end, width) {
                         return Continues::Stopped;
                     }
-                    *width += self.edge_px(style, RIGHT);
+                    *width += self.edge_px(style, end_side);
                 }
                 Inline::Float(_) | Inline::OutOfFlow(_) => {}
                 Inline::Atom(_) | Inline::AtomBox(_) | Inline::Br => return Continues::Stopped,
@@ -2043,11 +2188,18 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             && last.stretch == ctx.ws.collapses_spaces()
             && last.item.image.is_none()
             && (last.x + last.box_width - self.pen).abs() < 0.01
+            && self
+                .bidi
+                .as_ref()
+                .is_none_or(|bidi| bidi.continues(last.bidi_pos, last.item.text.len(), space))
         {
             if space {
                 last.item.text.push(' ');
             }
             last.item.text.push_str(seg);
+            if let Some(bidi) = self.bidi.as_mut() {
+                bidi.push_text(seg);
+            }
             // The advance of ordinary words separated by a collapsed U+0020
             // is additive. Keep the greedy line geometry now, then perform
             // one complete bidi/fallback shape in `flush_line`. Reshaping the
@@ -2063,6 +2215,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let x = self.pen + space_width + gap;
         let height = shaped.line_height;
         let ascent = shaped.baseline;
+        let bidi_pos = self
+            .bidi
+            .as_mut()
+            .map_or(u32::MAX, |bidi| bidi.push_text(seg));
         self.cur.push(Piece {
             x,
             y: 0.0,
@@ -2101,6 +2257,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
+            bidi_level: 0,
+            bidi_pos,
         });
         self.attach_boxes(gap);
         self.pen = x + w;
@@ -2879,6 +3037,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     )
             })
             .map(|text| vertical_edges[0] + geometry.paint_y + text.baseline);
+        let bidi_pos = self.bidi.as_mut().map_or(u32::MAX, |bidi| bidi.push_atom());
         self.cur.push(Piece {
             x,
             y: 0.0,
@@ -2903,6 +3062,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             control_text: None,
             boxes: None,
             shift: [0.0; 2],
+            bidi_level: 0,
+            bidi_pos,
         });
         self.attach_boxes(gap);
         self.pen = x + geometry.box_width;
@@ -2924,11 +3085,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // CSS 2 #propdef-vertical-align: the atomic inline's own alignment
         // positions its margin box on the surrounding line. Keep its outer
         // wrapping and inter-box spaces in the parent's text context.
-        let own = if node == NO_NODE {
-            ctx.with_pseudo(self.dom, b.style.pseudo)
-        } else {
-            InlineStyle::derive(self.dom, node, ctx, self.base)
-        };
+        let own = InlineStyle::for_box(self.dom, node, &b.style, ctx, self.base);
         self.place_atom(
             AtomGeometry {
                 box_width: sz.width,
@@ -2977,7 +3134,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let opens = self
             .pending_opens
             .drain(..)
-            .map(|(node, offset)| (node, gap - offset))
+            .map(|(key, offset, edge)| BoxBound {
+                key,
+                distance: gap - offset,
+                edge,
+            })
             .collect();
         if let Some(piece) = self.cur.last_mut() {
             piece.boxes = Some(Box::new(InlineBoxes {
@@ -2995,28 +3156,33 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// holding that space).
     fn close_box(&mut self, entry: InlineBoxEntry, style: &BoxStyle, ctx: &InlineStyle) {
         let node = entry.key;
-        let end = self.pending_gap_px
-            + style.border[RIGHT]
-            + style.padding[RIGHT]
-                .resolve(Some(self.cb_w_px))
-                .unwrap_or(0.0);
+        let end = self.pending_gap_px + self.bp_px(style, if style.rtl { LEFT } else { RIGHT });
         if let Some(index) = self
             .pending_opens
             .iter()
-            .position(|&(open, _)| open == node)
+            .position(|&(open, _, _)| open == node)
         {
-            let (_, start) = self.pending_opens.remove(index);
+            let (_, start, start_edge) = self.pending_opens.remove(index);
             let space = if self.pending_space && self.pen > self.line_start {
                 Self::space_advance(ctx)
             } else {
                 0.0
             };
             let origin = self.pen + space;
+            let (start_edge, end_edge) = (start_edge, style.inline_edges[1]);
             self.cur_empty.push(EmptyInlineBox {
                 entry,
                 x0: origin + start,
                 x1: origin + end,
+                edges: if style.rtl {
+                    [end_edge, start_edge]
+                } else {
+                    [start_edge, end_edge]
+                },
             });
+            if let Some(bidi) = self.bidi.as_mut() {
+                bidi.insert_empty(node, self.box_chain.clone());
+            }
             self.box_stack.pop();
             self.box_chain = (!self.box_stack.is_empty()).then(|| self.box_stack.as_slice().into());
             return;
@@ -3032,7 +3198,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .and_then(|piece| piece.boxes.as_mut())
             .filter(|boxes| boxes.chain.iter().any(|entry| entry.key == node))
         {
-            boxes.closes.push((node, end));
+            boxes.closes.push(BoxBound {
+                key: node,
+                distance: end,
+                edge: style.inline_edges[1],
+            });
         }
         self.box_stack.pop();
         self.box_chain = (!self.box_stack.is_empty()).then(|| self.box_stack.as_slice().into());
@@ -3058,6 +3228,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // its later pieces are continuation fragments.
         self.pending_opens.clear();
         self.flush_line(true);
+        // CSS Writing Modes 4 #bidi-algo: a forced break is a bidi type B
+        // paragraph break (HTML's `br` too, #bidi-rendering).
+        self.end_bidi_paragraph();
     }
 
     /// CSS Text 3 #text-align-last-property, for a block whose
@@ -3286,6 +3459,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.pen += self.take_gap();
         self.finishing = true;
         self.flush_line(false);
+        self.end_bidi_paragraph();
         if self.align == Align2::Justify || self.align_last == Align2::Justify {
             let n = self.lines.len();
             for (i, line) in self.lines.iter_mut().enumerate() {
@@ -3453,15 +3627,20 @@ impl Ifc<'_, '_, '_> {
                 .position(|&index| positioned[index].key == key)
         };
         // Per wanted box: the first fragment's start padding edges (x, top)
-        // and the last fragment's end padding edges (x, bottom).
+        // and the last fragment's end padding edges (x, bottom). The start
+        // is the right side of a right-to-left box (CSS Writing Modes 4
+        // #bidi-box-model), and bidi reordering can leave several fragments
+        // on a line, of which the start-most and end-most count.
         let mut first: Vec<Option<[f32; 2]>> = vec![None; wanted.len()];
         let mut last: Vec<Option<[f32; 2]>> = vec![None; wanted.len()];
+        let mut rtl = vec![false; wanted.len()];
         for (line, &top) in self.lines.iter().zip(&tops) {
             let fragments = line_box_fragments(
                 line.pieces.iter().chain(&line.atom_boxes),
                 &line.empty_boxes,
                 |entry| slot(entry.key).is_some(),
             );
+            let mut on_line: Vec<Option<[f32; 4]>> = vec![None; wanted.len()];
             for fragment in fragments {
                 let Some(at) = slot(fragment.entry.key) else {
                     continue;
@@ -3469,15 +3648,36 @@ impl Ifc<'_, '_, '_> {
                 let edges = &positioned[wanted[at]];
                 let (content_top, content_bottom) =
                     fragment.entry.content_area(top, line.height, line.baseline);
-                // A fragment has its start (end) border only where the box
-                // begins (ends).
+                // A fragment has its left (right) border only where the box
+                // begins or ends on that side.
                 let border = |present: bool, side: usize| {
                     if present { edges.border[side] } else { 0.0 }
                 };
-                let start = fragment.x0 + border(fragment.starts, LEFT);
-                let end = fragment.x1 - border(fragment.ends, RIGHT);
-                first[at].get_or_insert([start, content_top - edges.padding[TOP]]);
-                last[at] = Some([end, content_bottom + edges.padding[BOTTOM]]);
+                let left = fragment.x0 + border(fragment.left_edge, LEFT);
+                let right = fragment.x1 - border(fragment.right_edge, RIGHT);
+                rtl[at] = fragment.entry.rtl;
+                let (start, end) = if rtl[at] {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                let top = content_top - edges.padding[TOP];
+                let bottom = content_bottom + edges.padding[BOTTOM];
+                let extent = on_line[at].get_or_insert([start, top, end, bottom]);
+                if rtl[at] {
+                    extent[0] = extent[0].max(start);
+                    extent[2] = extent[2].min(end);
+                } else {
+                    extent[0] = extent[0].min(start);
+                    extent[2] = extent[2].max(end);
+                }
+            }
+            for (at, extent) in on_line.into_iter().enumerate() {
+                let Some([start, top, end, bottom]) = extent else {
+                    continue;
+                };
+                first[at].get_or_insert([start, top]);
+                last[at] = Some([end, bottom]);
             }
         }
         for (line, empty) in &self.unlined_empty {
@@ -3487,12 +3687,21 @@ impl Ifc<'_, '_, '_> {
             let edges = &positioned[wanted[at]];
             let top = tops[(*line).min(tops.len() - 1)] + empty.entry.offset[1];
             let [dx, _] = empty.entry.offset;
-            first[at] = Some([empty.x0 + dx + edges.border[LEFT], top]);
-            last[at] = Some([empty.x1 + dx - edges.border[RIGHT], top]);
+            let left = empty.x0 + dx + edges.border[LEFT];
+            let right = empty.x1 + dx - edges.border[RIGHT];
+            rtl[at] = empty.entry.rtl;
+            let (start, end) = if rtl[at] {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            first[at] = Some([start, top]);
+            last[at] = Some([end, top]);
         }
         let rect = |index: usize| {
             let at = wanted.binary_search(&index).ok()?;
-            let ([x0, y0], [x1, y1]) = (first[at]?, last[at]?);
+            let ([start, y0], [end, y1]) = (first[at]?, last[at]?);
+            let (x0, x1) = if rtl[at] { (end, start) } else { (start, end) };
             Some([x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)])
         };
         for mark in &mut self.oofs {

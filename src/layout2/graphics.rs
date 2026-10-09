@@ -4743,8 +4743,8 @@ fn paint_inline_box_decorations(
         right: f32,
         top: f32,
         bottom: f32,
-        starts: bool,
-        ends: bool,
+        left_edge: bool,
+        right_edge: bool,
     }
     if line.sideways {
         return;
@@ -4763,8 +4763,8 @@ fn paint_inline_box_decorations(
                 right: fragment.x + run.x1,
                 top,
                 bottom,
-                starts: run.starts,
-                ends: run.ends,
+                left_edge: run.left_edge,
+                right_edge: run.right_edge,
             }
         });
     for run in runs {
@@ -4794,9 +4794,9 @@ fn paint_inline_box_decorations(
         let [bt, br, bb, bl] = box_style.border;
         let border = [
             bt,
-            if run.ends { br } else { 0.0 },
+            if run.right_edge { br } else { 0.0 },
             bb,
-            if run.starts { bl } else { 0.0 },
+            if run.left_edge { bl } else { 0.0 },
         ];
         let y = top - pad(super::style::TOP) - bt;
         let rect = CssRect::new(
@@ -4829,11 +4829,11 @@ fn paint_inline_box_decorations(
                 .collect(),
         };
         let mut radii = border_radii(builder.dom, style, rect);
-        if !run.starts {
+        if !run.left_edge {
             radii.corners[0] = (0.0, 0.0);
             radii.corners[3] = (0.0, 0.0);
         }
-        if !run.ends {
+        if !run.right_edge {
             radii.corners[1] = (0.0, 0.0);
             radii.corners[2] = (0.0, 0.0);
         }
@@ -4849,7 +4849,7 @@ fn paint_inline_box_decorations(
             .flatten()
             .is_some_and(|clip| builder.push_hard_clip(clip));
         let shape = rounded_shape(rect, radii);
-        let slice = (run.starts, run.ends);
+        let slice = (run.left_edge, run.right_edge);
         paint_sliced_box_shadows(builder, style, rect, radii, border, slice, false);
         let isolated = begin_background_isolation(builder, style);
         if let Some(color) = background_color_for_style(builder.dom, style)
@@ -5669,8 +5669,7 @@ impl PlaceholderPaint {
             .filter(|color| !color.is_transparent());
         let mut units = Units::of(dom, node);
         if let PaintStyle::Pseudo(_, which) = style
-            && (dom.pseudo_style(node, which, "font-size").is_some()
-                || dom.baked_pseudo_value(node, which, "font-size").is_some())
+            && dom.pseudo_declares(node, which, "font-size")
             && let Some(size) = value("font-size").as_deref().and_then(|size| {
                 crate::dom::font_size_px_at(size, units.fs, dom.root_font_px(), dom.viewport_px())
             })

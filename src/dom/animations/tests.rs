@@ -269,10 +269,13 @@ fn display_none_cancels_and_events_follow_phases() {
     assert_eq!(dom.css_animation_next_change(), Some(0.5));
     dom.update_css_animations(0.6);
     let start = dom.take_css_animation_events();
-    assert_eq!(start, vec![(a, "w".into(), "animationstart", 0.)]);
+    assert_eq!(start, vec![(a, "w".into(), "animationstart", 0., "")]);
     dom.update_css_animations(1.6);
     let iteration = dom.take_css_animation_events();
-    assert_eq!(iteration, vec![(a, "w".into(), "animationiteration", 1.)]);
+    assert_eq!(
+        iteration,
+        vec![(a, "w".into(), "animationiteration", 1., "")]
+    );
     dom.set_attr(a, "class", "gone");
     dom.update_css_animations(1.75);
     let cancel = dom.take_css_animation_events();
@@ -394,4 +397,68 @@ fn inherited_colors_relayout_subtrees_that_rasterize_inline_svg() {
     dom.update_css_animations(0.5);
     assert_eq!(dom.animations.last_layout_changes, 2);
     assert_eq!(dom.animations.last_paint_changes, 0);
+}
+
+/// CSS Animations 1 #animations applies to pseudo-elements: an animation
+/// declared on `::before` samples into that pseudo-element's style only —
+/// including the compositor properties, which the frontend does not sample
+/// for pseudo-elements — for layout, the baked presentation snapshot and
+/// `getComputedStyle(el, "::before")`; its events name the pseudo-element.
+#[test]
+fn pseudo_element_animations_sample_into_the_pseudo_element_style() {
+    let mut dom = setup(
+        "@keyframes grow{from{width:0px;color:rgb(0, 0, 0);opacity:0}\
+         to{width:100px;color:rgb(200, 0, 0);opacity:1}}
+         #a{color:rgb(0, 0, 0)}
+         #a::before{content:'x';display:inline-block;animation:grow 1s linear}
+         #a::after{content:'y';display:inline-block}",
+        "<div id=a>t</div>",
+    );
+    let a = dom.get_by_id("a").unwrap();
+    dom.update_css_animations(0.);
+    dom.update_css_animations(0.5);
+    let before = |dom: &Dom, property: &str| dom.pseudo_layout_value(a, PseudoEl::Before, property);
+    assert_eq!(before(&dom, "width").as_deref(), Some("50px"));
+    assert_eq!(before(&dom, "color").as_deref(), Some("rgb(100, 0, 0)"));
+    assert_eq!(before(&dom, "opacity").as_deref(), Some("0.5"));
+    // The originating element and its other pseudo-element are untouched.
+    assert_eq!(value(&dom, "a", "color").as_deref(), Some("rgb(0, 0, 0)"));
+    assert_ne!(
+        dom.pseudo_layout_value(a, PseudoEl::After, "width")
+            .as_deref(),
+        Some("50px")
+    );
+    // Layout's box style and the stylesheet-free snapshot follow the sample.
+    let style = crate::layout2::BoxStyle::of_pseudo(
+        &dom,
+        a,
+        PseudoEl::Before,
+        crate::layout2::value::Vp { w: 800., h: 600. },
+    );
+    assert_eq!(style.width.resolve(Some(800.)), Some(50.));
+    assert!(
+        dom.baked_pseudo_style(a, PseudoEl::Before)
+            .contains("width:50px;"),
+        "{}",
+        dom.baked_pseudo_style(a, PseudoEl::Before)
+    );
+    assert_eq!(
+        dom.cssom_pseudo_resolved_value(a, PseudoEl::Before, "color")
+            .as_deref(),
+        Some("rgb(100, 0, 0)")
+    );
+    let events = dom.take_css_animation_events();
+    assert_eq!(
+        events,
+        vec![(a, "grow".into(), "animationstart", 0., "::before")]
+    );
+    // Removing the generated content removes the pseudo-element and cancels
+    // its animation.
+    dom.set_attr(a, "id", "b");
+    dom.update_css_animations(0.6);
+    assert_eq!(
+        dom.take_css_animation_events(),
+        vec![(a, "grow".into(), "animationcancel", 0.6, "::before")]
+    );
+    assert_eq!(dom.pseudo_layout_value(a, PseudoEl::Before, "width"), None);
 }

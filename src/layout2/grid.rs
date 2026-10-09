@@ -714,6 +714,21 @@ fn tokenize_area_row(row: &str) -> Option<Vec<String>> {
     (!cells.is_empty()).then_some(cells)
 }
 
+/// CSS Grid 2 #grid-template-areas-property: whether `value` is a valid
+/// `<string>+` template (equal-length rows whose named cells form filled
+/// rectangles).
+pub(crate) fn valid_areas(value: &str) -> bool {
+    let mut parser = cssparser::Parser::new(value);
+    let mut strings = 0;
+    while !parser.is_exhausted() {
+        match parser.next() {
+            Ok(cssparser::Token::QuotedString(_)) => strings += 1,
+            _ => return false,
+        }
+    }
+    strings > 0 && parse_areas(value).is_some()
+}
+
 fn parse_areas(value: &str) -> Option<(AreaMap, usize, usize)> {
     let v = value.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {

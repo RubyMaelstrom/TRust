@@ -35,6 +35,8 @@ pub(in crate::dom) enum Kind {
     Visibility,
     /// Filter Effects 1 `<filter-value-list>`.
     Filter,
+    /// CSS Transforms 1 #interpolation-of-transforms `<transform-list>`.
+    Transform,
     /// Every other animatable property.
     Discrete,
 }
@@ -89,7 +91,8 @@ impl Kind {
             | "outline-offset"
             | "vertical-align"
             | "text-underline-offset"
-            | "stroke-dashoffset" => Self::Length { negative: true },
+            | "stroke-dashoffset"
+            | "top" => Self::Length { negative: true },
             "letter-spacing" | "word-spacing" => Self::Spacing,
             "background-position-x" => Self::Position { vertical: false },
             "background-position-y" => Self::Position { vertical: true },
@@ -97,7 +100,7 @@ impl Kind {
                 unit: false,
                 integer: false,
             },
-            "fill-opacity" | "stroke-opacity" | "stop-opacity" => Self::Number {
+            "opacity" | "fill-opacity" | "stroke-opacity" | "stop-opacity" => Self::Number {
                 unit: true,
                 integer: false,
             },
@@ -108,6 +111,7 @@ impl Kind {
             "font-weight" => Self::FontWeight,
             "visibility" => Self::Visibility,
             "filter" => Self::Filter,
+            "transform" => Self::Transform,
             _ => Self::Discrete,
         }
     }
@@ -617,6 +621,7 @@ pub(in crate::dom) enum Value {
     Length(Linear),
     Positions(Vec<Linear>),
     Number(f32),
+    Transform(super::super::transitions::transform::Transform),
     /// Kept as specified (after substitution); animates discretely.
     Other(String),
 }
@@ -656,6 +661,12 @@ impl Value {
                     .map(Self::Number),
             },
             Kind::Filter => parse_filters(dom, id, trimmed, vp).map(Self::Filters),
+            Kind::Transform => super::super::transitions::transform::Transform::parse(
+                trimmed,
+                crate::layout2::Units::of(dom, id),
+                vp,
+            )
+            .map(Self::Transform),
             Kind::Visibility | Kind::Discrete => None,
         };
         parsed.unwrap_or_else(|| Self::Other(trimmed.to_string()))
@@ -686,6 +697,7 @@ impl Value {
                 .collect::<Vec<_>>()
                 .join(", "),
             Self::Number(value) => number(*value),
+            Self::Transform(transform) => transform.css(),
             Self::Other(text) => text.clone(),
         }
     }
@@ -804,6 +816,7 @@ pub(in crate::dom) fn mix_value(
             }
             Value::Number(value)
         }
+        (Value::Transform(a), Value::Transform(b)) => Value::Transform(a.interpolate(b, t)?),
         _ => return None,
     })
 }

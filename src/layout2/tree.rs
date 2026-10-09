@@ -15,10 +15,11 @@
 //! containers carry theirs separately (`BoxNode::oof` — they don't
 //! participate in flex/grid layout, css-flexbox §4.1).
 //!
-//! An inline-level element whose subtree holds block-level boxes is promoted to
-//! a block box (the §9.2.1.1 block-in-inline split, approximated
-//! structurally — the visual result for real-world markup like
-//! `<a><div>…</div></a>` is the same).
+//! An inline box holding in-flow block-level boxes is broken around them
+//! (CSS 2 §9.2.1.1): its parts before and after become inline boxes in the
+//! surrounding anonymous block boxes — the first keeps only the start edge's
+//! margin, border and padding, the last only the end edge's — and the
+//! block-level boxes become their siblings (`Builder::split_inline`).
 
 use std::sync::Arc;
 use url::Url;
@@ -224,6 +225,8 @@ mod table_contract_tests {
             vp: Vp { w: 800., h: 600. },
             lists: Vec::new(),
             reuse: false,
+            items_parent: false,
+            children_are_items: false,
         };
         let root = builder.table(dom.get_by_id("table").unwrap());
         let Content::Table(table) = &root.content else {
@@ -376,6 +379,8 @@ pub(super) fn build_document(
         vp,
         lists: Vec::new(),
         reuse,
+        items_parent: false,
+        children_are_items: false,
     };
     match b.element(root) {
         Built::Block(bx) => Some(bx),
@@ -414,9 +419,16 @@ pub(crate) fn build_at(
         vp,
         lists: Vec::new(),
         reuse: false,
+        items_parent: false,
+        children_are_items: false,
     };
     match b.element(boundary) {
         Built::Block(bx) => Some(Arc::unwrap_or_clone(bx)),
+        // An inline box split around blocks generates no box of its own;
+        // a relayout boundary needs one container for its parts.
+        Built::Hoist(parts) => {
+            Some(b.assemble(boundary, BoxStyle::anonymous(), parts, None, None, false))
+        }
         Built::Inline(inl) => Some(BoxNode {
             node: boundary,
             style: BoxStyle::of(dom, boundary, vp),
@@ -548,6 +560,11 @@ struct Builder<'a> {
     /// reversed>` counts down — HTML §4.4.5, through zero into negatives).
     lists: Vec<(i64, i64)>,
     reuse: bool,
+    /// The children being built are flex or grid items (blockified, so an
+    /// inline item holding blocks is not split).
+    items_parent: bool,
+    /// The next `children` call builds a flex or grid container's items.
+    children_are_items: bool,
 }
 
 impl Builder<'_> {
@@ -730,14 +747,19 @@ impl Builder<'_> {
                 Built::Block(Arc::new(self.container(id, disp)))
             }
             Disp::Inline => {
+                let items_parent = self.items_parent;
                 let kids = self.children(id);
+                if kids.iter().any(Built::is_block) && !items_parent {
+                    return self.split_inline(id, kids);
+                }
                 if kids.iter().any(Built::is_block) {
-                    // Block-in-inline: promote (see module docs). The element
-                    // is still a non-replaced inline box, to which the sizing
-                    // properties do not apply (CSS 2 §§10.2, 10.4, 10.5, 10.7;
-                    // css-sizing-4 #aspect-ratio): its blocks keep the full
-                    // width, as with an object's fallback whose dimension
-                    // attributes map to width/height (HTML #dimRendering).
+                    // A flex or grid item is blockified (CSS Display 3
+                    // #transformations): a block container of its blocks.
+                    // The sizing properties of the inline element's own
+                    // display do not apply to it here (CSS 2 §§10.2, 10.4,
+                    // 10.5, 10.7; css-sizing-4 #aspect-ratio), as with an
+                    // object's fallback whose dimension attributes map to
+                    // width/height (HTML #dimRendering).
                     let mut style = BoxStyle::of(self.dom, id, self.vp);
                     style.width = super::value::Len::Auto;
                     style.height = super::value::Len::Auto;
@@ -763,6 +785,127 @@ impl Builder<'_> {
             }
             Disp::None | Disp::Contents => unreachable!("handled above"),
         }
+    }
+
+    /// CSS 2 §9.2.1.1: an inline box containing in-flow block-level boxes is
+    /// broken around each run of them (consecutive or separated only by
+    /// collapsible white space and out-of-flow boxes) into inline boxes on
+    /// either side, which the parent wraps in anonymous block boxes; the
+    /// block-level boxes become their siblings. Properties set on the inline
+    /// element still apply: its parts keep its style, the first with the
+    /// start edge's margin, border and padding and the last with the end
+    /// edge's (CSS Break 3 #valdef-box-decoration-break-slice), and the
+    /// blocks inherit its inline context and its relative position offset.
+    /// A part with no content and no edge of its own generates nothing,
+    /// like the zero-height line box it would create (CSS 2 §9.4.2).
+    fn split_inline(&mut self, id: NodeId, kids: Vec<Built>) -> Built {
+        use super::style::{LEFT, RIGHT};
+        enum Segment {
+            Inlines(Vec<Inline>),
+            Blocks(Vec<Built>),
+        }
+        let mut segments: Vec<Segment> = vec![Segment::Inlines(Vec::new())];
+        for kid in kids {
+            match kid {
+                Built::Block(_) => {
+                    // A run of only collapsible white space and out-of-flow
+                    // boxes between two blocks belongs to the block run.
+                    let between = segments.len() >= 2
+                        && matches!(segments.last(), Some(Segment::Inlines(run))
+                        if run.iter().all(|inline| match inline {
+                            Inline::Text(text) => text.chars().all(is_collapsible_space),
+                            Inline::OutOfFlow(_) => true,
+                            _ => false,
+                        }));
+                    if between {
+                        let Some(Segment::Inlines(run)) = segments.pop() else {
+                            unreachable!("checked above");
+                        };
+                        let Some(Segment::Blocks(blocks)) = segments.last_mut() else {
+                            unreachable!("inline runs alternate with block runs");
+                        };
+                        blocks.extend(
+                            run.into_iter()
+                                .filter(|inline| matches!(inline, Inline::OutOfFlow(_)))
+                                .map(Built::Inline),
+                        );
+                        blocks.push(kid);
+                    } else {
+                        segments.push(Segment::Blocks(vec![kid]));
+                    }
+                }
+                Built::Inline(inline) => match segments.last_mut() {
+                    Some(Segment::Inlines(run)) => run.push(inline),
+                    _ => segments.push(Segment::Inlines(vec![inline])),
+                },
+                Built::Hoist(_) | Built::Skip => {}
+            }
+        }
+        if matches!(segments.last(), Some(Segment::Blocks(_))) {
+            segments.push(Segment::Inlines(Vec::new()));
+        }
+        let style = BoxStyle::of(self.dom, id, self.vp);
+        let zero = |len: &super::value::Len| len.resolve(Some(1000.0)) == Some(0.0);
+        let edge = |side: usize| {
+            style.border[side] > 0.0 || !zero(&style.margin[side]) || !zero(&style.padding[side])
+        };
+        // The start edge is the left side of an ltr box and the right side
+        // of an rtl one (CSS Writing Modes 4 #bidi-box-model).
+        let (start, end) = if style.rtl {
+            (RIGHT, LEFT)
+        } else {
+            (LEFT, RIGHT)
+        };
+        let last = segments.len() - 1;
+        let mut out = Vec::new();
+        for (index, segment) in segments.into_iter().enumerate() {
+            match segment {
+                Segment::Inlines(run) => {
+                    let (first, final_part) = (index == 0, index == last);
+                    if !run.iter().any(inline_has_content)
+                        && !(first && edge(start))
+                        && !(final_part && edge(end))
+                    {
+                        // Keep out-of-flow static positions.
+                        out.extend(run.into_iter().map(Built::Inline));
+                        continue;
+                    }
+                    let mut part = style.clone();
+                    part.inline_edges = [first, final_part];
+                    for (side, keep) in [(start, first), (end, final_part)] {
+                        if !keep {
+                            part.margin[side] = super::value::Len::px(0.0);
+                            part.padding[side] = super::value::Len::px(0.0);
+                            part.border[side] = 0.0;
+                        }
+                    }
+                    out.push(Built::Inline(Inline::Box {
+                        node: id,
+                        style: Arc::new(part),
+                        kids: run.into(),
+                    }));
+                }
+                Segment::Blocks(blocks) => {
+                    // The blocks' anonymous wrapper carries the inline
+                    // context, and the relative offset that also moves them.
+                    let mut wrapper = BoxStyle::anonymous();
+                    wrapper.inline_context = Some(id);
+                    if style.position == Pos::Relative {
+                        wrapper.position = Pos::Relative;
+                        wrapper.inset = style.inset.clone();
+                    }
+                    out.push(Built::Block(Arc::new(self.assemble(
+                        crate::layout2::NO_NODE,
+                        wrapper,
+                        blocks,
+                        None,
+                        None,
+                        false,
+                    ))));
+                }
+            }
+        }
+        Built::Hoist(out)
     }
 
     fn frame(&mut self, id: NodeId, disp: Disp) -> Built {
@@ -1069,6 +1212,7 @@ impl Builder<'_> {
         } else {
             (None, None, false)
         };
+        self.children_are_items = matches!(disp, Disp::Flex | Disp::Grid);
         let kids = self.children(id);
         if list {
             self.lists.pop();
@@ -1340,6 +1484,14 @@ impl Builder<'_> {
     /// main render is unaffected (`Doc.raw` has no shadow roots, so this reduces
     /// to the light children).
     fn children(&mut self, id: NodeId) -> Vec<Built> {
+        let items = std::mem::take(&mut self.children_are_items);
+        let outer = std::mem::replace(&mut self.items_parent, items);
+        let built = self.children_inner(id);
+        self.items_parent = outer;
+        built
+    }
+
+    fn children_inner(&mut self, id: NodeId) -> Vec<Built> {
         let closed_details =
             self.dom.tag_name(id) == Some("details") && self.dom.attr(id, "open").is_none();
         // CSS Shadow 1 #flattening precedes CSS Display 3 #box-generation:

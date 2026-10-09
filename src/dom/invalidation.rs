@@ -908,6 +908,8 @@ impl SelectorDependencies {
             host_inner,
             slotted,
             pseudo: _,
+            part: _,
+            part_follows: _,
             pseudos: _,
             relative_anchor: _,
         } = compound;
@@ -1086,6 +1088,19 @@ impl Dom {
         if self.shadow_style_dependencies(node)
             && (name.eq_ignore_ascii_case("slot")
                 || (name.eq_ignore_ascii_case("name") && self.tag_name(node) == Some("slot")))
+        {
+            self.selector_epoch = self.selector_epoch.wrapping_add(1);
+            return None;
+        }
+        // CSS Shadow 1 #part: `part` and `exportparts` change the part
+        // element maps of the shadow roots above `node`, whose `::part()`
+        // rules then select other elements of those trees.
+        if (name.eq_ignore_ascii_case("part") || name.eq_ignore_ascii_case("exportparts"))
+            && self
+                .style_cache
+                .borrow()
+                .as_ref()
+                .is_none_or(|(_, index)| !index.part_rules.is_empty())
         {
             self.selector_epoch = self.selector_epoch.wrapping_add(1);
             return None;

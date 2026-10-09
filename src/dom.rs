@@ -2464,9 +2464,33 @@ impl Dom {
             }
         }
 
+        // CSS Shadow 1 #part: `::part()` rules are matched across trees by
+        // the cascade, outside the hover buckets. A hover change on a part
+        // element (`::part(x):hover`) or on a shadow host (`x:hover::part(y)`)
+        // restyles that element's composed subtree.
+        let part_hover: Vec<NodeId> = if index.part_rules.iter().any(|&(scope, ri)| {
+            index.scopes[&scope]
+                .get(ri as usize)
+                .is_some_and(|rule| rule_affects_render(rule) && rule_uses_hover(rule))
+        }) {
+            chain
+                .symmetric_difference(&self.hover_chain)
+                .copied()
+                .filter(|&element| {
+                    self.shadow_roots.contains_key(&element)
+                        || self.attr(element, "part").is_some()
+                        || self.attr(element, "exportparts").is_some()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.hover_chain = chain;
 
         let mut changed: FxHashMap<NodeId, DirtyKind> = FxHashMap::default();
+        for element in part_hover {
+            changed.insert(element, DirtyKind::Attr);
+        }
         for (id, scope, prior) in old {
             let rules = &index.scopes[&scope];
             let mut kind = None;
@@ -3408,15 +3432,40 @@ impl Dom {
         }
         let sb = self.scroll_state.entry(id).or_default();
         let changed = sb.top != top || sb.left != left;
+        let moved = [sb.top != top, sb.left != left];
         sb.top = top;
         sb.left = left;
         if changed {
             self.scroll_epoch = self.scroll_epoch.wrapping_add(1);
+            // CSS Overflow 4 #ellipsis-scrolling: the ellipsis of a scroll
+            // container follows its inline-axis scroll position, which
+            // layout reads (`layout2::text_overflow::follows_scroll`).
+            if self.ellipsis_follows_scroll(id, moved) {
+                self.layout_presentation_epoch = self.layout_presentation_epoch.wrapping_add(1);
+                self.invalidate_transition_layout(&[id]);
+                self.dirty_attributed = false;
+                self.dirty = true;
+            }
         }
         if record && changed {
             self.scroll_changes.push((id, top, left));
         }
         changed
+    }
+
+    /// Whether `id` ellipses its lines at its scrollport, and `moved` (the
+    /// block and inline axis) includes its inline axis.
+    fn ellipsis_follows_scroll(&self, id: NodeId, moved: [bool; 2]) -> bool {
+        let vertical = self
+            .computed_value_resolved(id, "writing-mode")
+            .is_some_and(|mode| {
+                mode.trim().starts_with("vertical") || mode.trim().starts_with("sideways")
+            });
+        moved[usize::from(!vertical)]
+            && self
+                .computed_value_resolved(id, "text-overflow")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("ellipsis"))
+            && self.overflow_axes(id)[usize::from(vertical)].user_scrollable()
     }
 
     /// Store the app-measured CLIP box (px) for a scroll region — the viewport
@@ -6092,6 +6141,113 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         .then(|| self.style_view().direction_rtl(id))
     }
 
+    /// HTML Rendering #bidi-rendering (local HTML e5071a20): the UA sheet's
+    /// `unicode-bidi` for `id`, in its cascade order. Block-like elements,
+    /// `bdi`, `output` and a valid `dir` attribute isolate; `bdo` (also with
+    /// `dir`, through `bdo[dir]`'s higher specificity) is `isolate-override`;
+    /// `dir=auto` text inputs, `textarea` and `pre` are `plaintext`. In a
+    /// document whose encoding is ISO-8859-8 (visual Hebrew) the following
+    /// rules make everything else `bidi-override` and editable text controls
+    /// `normal`, where their specificity wins.
+    pub(super) fn ua_unicode_bidi(&self, id: NodeId, tag: &str) -> Option<&'static str> {
+        if self.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml") {
+            return None;
+        }
+        let dir = self.attr(id, "dir");
+        let is_dir = |value: &str| dir.is_some_and(|dir| dir.eq_ignore_ascii_case(value));
+        let text_input = tag == "input"
+            && matches!(
+                self.input_type(id).as_str(),
+                "text" | "search" | "tel" | "url" | "email"
+            );
+        let plaintext = is_dir("auto") && (text_input || matches!(tag, "textarea" | "pre"));
+        let isolate = matches!(
+            tag,
+            "address"
+                | "blockquote"
+                | "center"
+                | "div"
+                | "figure"
+                | "figcaption"
+                | "footer"
+                | "form"
+                | "header"
+                | "hr"
+                | "legend"
+                | "listing"
+                | "main"
+                | "p"
+                | "plaintext"
+                | "pre"
+                | "summary"
+                | "xmp"
+                | "article"
+                | "aside"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "hgroup"
+                | "nav"
+                | "search"
+                | "section"
+                | "table"
+                | "caption"
+                | "colgroup"
+                | "col"
+                | "thead"
+                | "tbody"
+                | "tfoot"
+                | "tr"
+                | "td"
+                | "th"
+                | "dir"
+                | "dd"
+                | "dl"
+                | "dt"
+                | "menu"
+                | "ol"
+                | "ul"
+                | "li"
+                | "bdi"
+                | "output"
+        ) || is_dir("ltr")
+            || is_dir("rtl")
+            || is_dir("auto");
+        let ordinary = if plaintext {
+            Some("plaintext")
+        } else if tag == "bdo" {
+            Some("isolate-override")
+        } else {
+            isolate.then_some("isolate")
+        };
+        if !self.style_view().visual_hebrew(id) {
+            return ordinary;
+        }
+        // `input:not([type=submit i]):not([type=reset i]):not([type=button i])`
+        // (0,3,1) outranks every earlier input selector, the plaintext ones
+        // included; `textarea` (0,0,1) loses to `textarea[dir=auto i]`.
+        if (tag == "textarea" && !plaintext)
+            || (tag == "input"
+                && !self.attr(id, "type").is_some_and(|ty| {
+                    ["submit", "reset", "button"]
+                        .iter()
+                        .any(|value| ty.eq_ignore_ascii_case(value))
+                }))
+        {
+            return Some("normal");
+        }
+        // `*|*` loses to the more specific `bdo`, `bdo[dir]`, `bdi`,
+        // `output` and `pre[dir=auto i]` rules; the listed element and `dir`
+        // selectors of equal specificity come later and win.
+        if plaintext || matches!(tag, "bdo" | "bdi" | "output") {
+            return ordinary;
+        }
+        Some("bidi-override")
+    }
+
     /// CSS Color 4 #currentcolor-color: in the `color` property, `currentcolor`
     /// is the inherited color (alone it acts as `inherit`), so a `color` that
     /// mentions it, as in Tailwind's `color-mix(in oklab, currentcolor 50%,
@@ -6437,6 +6593,13 @@ impl Dom {
     /// relatively, absolutely or fixed positioned one. Absolute lengths need
     /// no layout; `getComputedStyle` reads of them must not flush geometry.
     pub(crate) fn cssom_needs_used_value(&self, id: NodeId, name: &str) -> bool {
+        // A transition's deferred matrix interpolation resolves against the
+        // reference box (`cssom_deferred_transform`).
+        if name == "transform" {
+            return self.computed_value_resolved(id, name).is_some_and(|value| {
+                value.contains(crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION)
+            });
+        }
         let Some(longhands) = used_value_longhands(name) else {
             return false;
         };
@@ -6496,9 +6659,69 @@ impl Dom {
         if let Some(physical) = self.logical_property(id, None, name) {
             return self.cssom_used_value(id, &physical, layout);
         }
+        if name == "transform"
+            && let Some(value) = self.cssom_deferred_transform(id, layout)
+        {
+            return Some(value);
+        }
         layout
             .and_then(|layout| self.cssom_used_length(id, name, layout))
             .or_else(|| self.cssom_resolved_value(id, name))
+    }
+
+    /// The resolved `transform` of an element in the middle of a transition
+    /// whose matrix interpolation waits for the reference box (CSS
+    /// Transforms 1 #interpolation-of-transforms): CSS Transforms 1
+    /// #serialization-of-the-computed-value's `matrix()`/`matrix3d()`,
+    /// with percentages resolved against the element's untransformed
+    /// reference box (an element without a box has an empty one). The
+    /// internal deferred function never reaches script.
+    fn cssom_deferred_transform(
+        &self,
+        id: NodeId,
+        layout: Option<&crate::layout2::LayoutFragments>,
+    ) -> Option<String> {
+        let value = self.computed_value_resolved(id, "transform")?;
+        if !value.contains(crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION) {
+            return None;
+        }
+        let border_box = layout
+            .and_then(|layout| layout.layout_border_box(self, id))
+            .map_or([0.0; 2], |rect| [rect.width as f32, rect.height as f32]);
+        let content_box = self
+            .computed_value_resolved(id, "transform-box")
+            .is_some_and(|v| matches!(v.trim(), "content-box" | "fill-box"));
+        let size = if content_box {
+            let edge = |property: &str| {
+                self.computed_value_resolved(id, property)
+                    .and_then(|v| crate::layout2::absolute_css_length(self, id, &v))
+                    .unwrap_or(0.0)
+            };
+            let width = border_box[0]
+                - ["left", "right"]
+                    .iter()
+                    .map(|side| {
+                        edge(&format!("border-{side}-width")) + edge(&format!("padding-{side}"))
+                    })
+                    .sum::<f32>();
+            let height = border_box[1]
+                - ["top", "bottom"]
+                    .iter()
+                    .map(|side| {
+                        edge(&format!("border-{side}-width")) + edge(&format!("padding-{side}"))
+                    })
+                    .sum::<f32>();
+            [width.max(0.0), height.max(0.0)]
+        } else {
+            border_box
+        };
+        let (w, h) = self.viewport_px();
+        crate::layout2::serialize_transform_list(
+            &value,
+            crate::layout2::Units::of(self, id),
+            crate::layout2::value::Vp { w, h },
+            size,
+        )
     }
 
     fn cssom_used_length(
@@ -6676,7 +6899,8 @@ impl Dom {
         let direct = self
             .pseudo_style(id, which, name)
             .or_else(|| self.baked_pseudo_value(id, which, name));
-        let declared = direct.is_some();
+        let animated = self.pseudo_origin_value(id, which, name).is_some();
+        let declared = direct.is_some() || animated;
         if name == "font-size" {
             let parent = self.font_px(id);
             let size = declared
@@ -6694,13 +6918,14 @@ impl Dom {
             // Only the UA placeholder color sits between them.
             let ua = which == PseudoEl::Placeholder && name == "color";
             let inherited = prop_index(name).is_some_and(|i| PROPS[i].inherited);
-            let inherits = match direct.as_deref().and_then(wide_keyword) {
-                Some(WideKeyword::Inherit) => true,
-                Some(WideKeyword::Unset) => inherited,
-                Some(WideKeyword::Revert) => inherited && !ua,
-                Some(WideKeyword::Initial) => false,
-                None => !declared && inherited && !ua,
-            };
+            let inherits = !animated
+                && match direct.as_deref().and_then(wide_keyword) {
+                    Some(WideKeyword::Inherit) => true,
+                    Some(WideKeyword::Unset) => inherited,
+                    Some(WideKeyword::Revert) => inherited && !ua,
+                    Some(WideKeyword::Initial) => false,
+                    None => !declared && inherited && !ua,
+                };
             if inherits {
                 return self.cssom_resolved_value(id, name);
             }
@@ -7172,6 +7397,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                     "ltr"
                 }
             }
+            "unicode-bidi" if let Some(value) = self.ua_unicode_bidi(id, tag) => value,
             // HTML Rendering #phrasing-content-3, at the UA origin so
             // explicit none/initial can suppress an element's own decoration.
             "text-decoration-line" if matches!(tag, "u" | "ins") => "underline",
@@ -7628,14 +7854,18 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         type Winners = FxHashMap<String, CascadeWinner>;
         let index = self.style_index();
         let scope = self.tree_scope(id);
+        let depth = self.style_view().tree_depth(scope);
         let matched = self.matched_rules(id);
         let slotted = self.slotted_rules(&index, id);
+        let parts = self.part_rules(&index, id);
         let winners = self.style_view().cascade_winners(
             id,
             CascadeSources {
+                depth,
                 rules: index.scopes.get(&scope).map_or(&[], Vec::as_slice),
                 matched: &matched,
                 slotted: &slotted,
+                parts: &parts,
                 host_rules: self
                     .shadow_root(id)
                     .and_then(|sr| index.scopes.get(&sr))
@@ -7704,7 +7934,7 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                         (
                             *imp,
                             true,
-                            !*imp,
+                            cascade_context(depth, *imp),
                             false,
                             r.layer_key(*imp),
                             r.specificity,
@@ -7939,8 +8169,9 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
 }
 
 impl Dom {
-    /// The `::slotted()` rules matching a light-DOM element.
-    fn slotted_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<&'i StyleRule> {
+    /// The `::slotted()` rules matching a light-DOM element, with the tree
+    /// depth of the shadow tree each was written in.
+    fn slotted_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<(&'i StyleRule, u16)> {
         // CSS Shadow 1 §3.2.4: `::slotted()` is an alias for the flattened
         // element assigned to a slot; it does not create a box of its own.
         // The light-DOM element still receives the declaration in its own
@@ -7957,9 +8188,141 @@ impl Dom {
             .filter_map(|&(scope, ri)| {
                 let r = &index.scopes.get(&scope)?[ri as usize];
                 self.slotted_rule_matches(id, scope, r, &assigned_slots)
-                    .then_some(r)
+                    .then(|| (r, self.style_view().tree_depth(scope)))
             })
             .collect()
+    }
+
+    /// CSS Shadow 1 #part: the `::part()` rules matching `id` as an element
+    /// of the part element maps of the shadow roots above it. `id` is keyed
+    /// in its own tree's map by its part names (and, for the pseudo-elements
+    /// an `exportparts` mapping on it names, by those), then in each
+    /// enclosing shadow root's map by the names its host's `exportparts`
+    /// forwards (#calculate-the-part-element-map). A rule written in the
+    /// tree of the host whose shadow root holds the map, or in that shadow
+    /// root itself through `:host`, selects the map's elements by name.
+    fn part_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<PartMatch<'i>> {
+        if index.part_rules.is_empty() {
+            return Vec::new();
+        }
+        let tokens = |value: Option<&str>| {
+            let mut names: Vec<String> = Vec::new();
+            for token in value.unwrap_or("").split_ascii_whitespace() {
+                if !names.iter().any(|name| name == token) {
+                    names.push(token.to_owned());
+                }
+            }
+            names
+        };
+        // The boxes `id` contributes: itself under its part names, and the
+        // fully styleable pseudo-elements its own `exportparts` exposes.
+        let mut keyed: Vec<(Option<PseudoEl>, Vec<String>)> =
+            vec![(None, tokens(self.attr(id, "part")))];
+        if let Some(mappings) = self.attr(id, "exportparts") {
+            for (inner, outer) in part_mappings_with_pseudo(mappings) {
+                let pseudo = match inner {
+                    "::before" => PseudoEl::Before,
+                    "::after" => PseudoEl::After,
+                    _ => continue,
+                };
+                match keyed.iter_mut().find(|(p, _)| *p == Some(pseudo)) {
+                    Some((_, names)) if !names.iter().any(|n| n == outer) => {
+                        names.push(outer.to_owned())
+                    }
+                    Some(_) => {}
+                    None => keyed.push((Some(pseudo), vec![outer.to_owned()])),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut tree = self.tree_scope(id);
+        while keyed.iter().any(|(_, names)| !names.is_empty())
+            && let Some(&host) = self.shadow_hosts.get(&tree)
+        {
+            let outer = self.tree_scope(host);
+            for &(scope, ri) in &index.part_rules {
+                if scope != outer && scope != tree {
+                    continue;
+                }
+                let Some(rule) = index
+                    .scopes
+                    .get(&scope)
+                    .and_then(|rules| rules.get(ri as usize))
+                else {
+                    continue;
+                };
+                for (pseudo, names) in &keyed {
+                    if self.part_rule_matches(id, host, scope == tree, rule, names, *pseudo) {
+                        out.push(PartMatch {
+                            rule,
+                            depth: self.style_view().tree_depth(scope),
+                            pseudo: pseudo.or_else(|| rule_pseudo(rule)),
+                        });
+                    }
+                }
+            }
+            // #exportparts-attr: the host forwards inner names to the map of
+            // the shadow root enclosing it.
+            let mappings = self
+                .attr(host, "exportparts")
+                .map(part_mappings)
+                .unwrap_or_default();
+            for (_, names) in &mut keyed {
+                let mut forwarded: Vec<String> = Vec::new();
+                for &(inner, outer) in &mappings {
+                    if names.iter().any(|name| name == inner)
+                        && !forwarded.iter().any(|name| name == outer)
+                    {
+                        forwarded.push(outer.to_owned());
+                    }
+                }
+                *names = forwarded;
+            }
+            tree = outer;
+        }
+        out
+    }
+
+    /// Whether a `::part()` rule selects `id` (keyed by `names`, or its
+    /// `pseudo` exposed by `exportparts`) in the part element map of
+    /// `host`'s shadow root: every name the pseudo-element lists is a key,
+    /// the part element compound matches `id`, and the rest of the selector
+    /// matches `host` — in its own tree, or (`in_shadow`) through `:host` in
+    /// the shadow tree whose map it is.
+    fn part_rule_matches(
+        &self,
+        id: NodeId,
+        host: NodeId,
+        in_shadow: bool,
+        rule: &StyleRule,
+        names: &[String],
+        pseudo: Option<PseudoEl>,
+    ) -> bool {
+        let parts = &rule.selector.0;
+        let Some(((Combinator::Part, part), origin)) = parts.split_last() else {
+            return false;
+        };
+        let Some(wanted) = part.part.as_deref() else {
+            return false;
+        };
+        // A pseudo-element exposed as a part cannot take another one.
+        if pseudo.is_some() && part.pseudo.is_some() {
+            return false;
+        }
+        if !wanted.iter().all(|name| names.iter().any(|n| n == name))
+            || !self.matches_compound(id, part, None)
+        {
+            return false;
+        }
+        let context = SelectorContext {
+            shadow_host: if in_shadow {
+                Some(host)
+            } else {
+                self.selector_context(host, None).shadow_host
+            },
+            ..self.selector_context(host, None)
+        };
+        self.matches_complex_in(host, origin, context)
     }
 
     /// Match a `::slotted(<compound-selector>)` rule against a light-DOM
@@ -8320,6 +8683,48 @@ impl Dom {
                 && !self.cascaded_maps(id).first_letter.is_empty())
     }
 
+    /// Whether `id` generates its `which` pseudo-element box, which CSS
+    /// animations and transitions then target: `::before`/`::after` with
+    /// generated content (CSS Pseudo 4 #generated-content), a list item's
+    /// `::marker`, `::first-letter` with declarations, a text control's
+    /// `::placeholder` with a placeholder, and the `::backdrop` of a
+    /// top-layer element.
+    pub(crate) fn pseudo_generated(&self, id: NodeId, which: PseudoEl) -> bool {
+        match which {
+            PseudoEl::Before | PseudoEl::After => self.pseudo_content_items(id, which).is_some(),
+            PseudoEl::Marker => self.is_list_item(id),
+            PseudoEl::FirstLetter => self.has_first_letter_style(id),
+            PseudoEl::Placeholder => {
+                matches!(self.tag_name(id), Some("input" | "textarea"))
+                    && self.attr(id, "placeholder").is_some()
+            }
+            PseudoEl::Backdrop => self.in_top_layer(id),
+        }
+    }
+
+    /// Whether `which` on `id` sets `prop` itself (rather than inheriting
+    /// or taking its initial value): a declaration in the cascade or the
+    /// baked snapshot, or a transition or animation origin value.
+    pub(crate) fn pseudo_declares(&self, id: NodeId, which: PseudoEl, prop: &str) -> bool {
+        self.pseudo_style(id, which, prop).is_some()
+            || self.baked_pseudo_value(id, which, prop).is_some()
+            || self.pseudo_origin_value(id, which, prop).is_some()
+    }
+
+    /// CSS Transitions 1 #application and CSS Animations 1 #animations:
+    /// the transition- or animation-origin value of `prop` on `id`'s `which`
+    /// pseudo-element, if any.
+    pub(crate) fn pseudo_origin_value(
+        &self,
+        id: NodeId,
+        which: PseudoEl,
+        prop: &str,
+    ) -> Option<String> {
+        self.transitions
+            .pseudo_value(id, which, prop)
+            .or_else(|| self.animations.pseudo_value(id, which, prop))
+    }
+
     /// CSS Lists 3 #declaring-a-list-item: elements whose `display` includes
     /// `list-item` generate `::marker` pseudo-elements; no others do.
     fn is_list_item(&self, id: NodeId) -> bool {
@@ -8418,6 +8823,11 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
                 VarResult::Resolved(value) => Some(value),
                 _ => None,
             };
+        }
+        // CSS Cascade 5 #cascade-origin: transitions, then animations,
+        // override the pseudo-element's normal author declarations.
+        if let Some(value) = self.pseudo_origin(id, which, prop) {
+            return Some(value);
         }
         let Some(guard) = self.property_guard(id, Some(which), prop) else {
             return self.computed_value_resolved(id, prop);
@@ -9155,10 +9565,17 @@ impl Dom {
             .any(|rule| complex_has_boxless_content_dependency(&rule.selector));
         // Build the rightmost-key buckets so `matched_rules` tests only
         // candidate rules per element instead of the whole scope.
+        // CSS Shadow 1 #part: `::part()` rules select elements of other
+        // trees and are matched by `part_rules`, never by ordinary lookup.
         index.buckets = index
             .scopes
             .iter()
-            .map(|(scope, rules)| (*scope, RuleBuckets::build(rules)))
+            .map(|(scope, rules)| {
+                (
+                    *scope,
+                    RuleBuckets::build_where(rules, |rule| !is_part_rule(rule)),
+                )
+            })
             .collect();
         index.cursor_buckets = index
             .scopes
@@ -9188,6 +9605,17 @@ impl Dom {
                         .and_then(|(_, c)| c.slotted.as_ref())
                         .map(|_| (*scope, ri as u32))
                 })
+            })
+            .collect();
+        index.part_rules = index
+            .scopes
+            .iter()
+            .flat_map(|(scope, rules)| {
+                rules
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, rule)| is_part_rule(rule))
+                    .map(move |(ri, _)| (*scope, ri as u32))
             })
             .collect();
         index
@@ -12863,6 +13291,15 @@ impl Dom {
     fn baked_pseudo_style(&self, id: NodeId, which: PseudoEl) -> String {
         let mut out = String::new();
         for prop in PROPS.iter().filter(|p| p.baked).map(|p| p.name) {
+            // A transitioning or animating pseudo-element bakes its
+            // current origin value (CSS Cascade 5 #cascade-origin).
+            if let Some(value) = self.pseudo_origin_value(id, which, prop) {
+                out.push_str(prop);
+                out.push(':');
+                out.push_str(&value);
+                out.push(';');
+                continue;
+            }
             let Some(raw) = self.pseudo_style(id, which, prop) else {
                 continue;
             };
@@ -12878,7 +13315,10 @@ impl Dom {
             out.push_str(&value);
             out.push(';');
         }
-        if let Some(raw) = self.pseudo_style(id, which, "opacity") {
+        if let Some(raw) = self
+            .pseudo_origin_value(id, which, "opacity")
+            .or_else(|| self.pseudo_style(id, which, "opacity"))
+        {
             let value = self.resolve_pseudo_vars(id, which, &raw);
             if !value.trim().is_empty() {
                 out.push_str("opacity:");
@@ -13117,6 +13557,19 @@ impl<'a> StyleView<'a> {
 
     pub(super) fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
         self.state.shadow_roots.get(&host).copied()
+    }
+
+    /// The nesting depth of the tree rooted at `scope` in shadow-including
+    /// tree order: 0 for a document tree, one more for each shadow tree
+    /// (CSS Cascade 5 #cascade-context).
+    pub(super) fn tree_depth(&self, scope: NodeId) -> u16 {
+        let mut depth = 0u16;
+        let mut tree = scope;
+        while let Some(&host) = self.state.shadow_hosts.get(&tree) {
+            depth = depth.saturating_add(1);
+            tree = self.tree_scope(host);
+        }
+        depth
     }
 
     /// See `Dom::tree_scope`.
@@ -13377,6 +13830,17 @@ impl<'a> StyleView<'a> {
                 .is_some_and(|&mode| mode == QuirksMode::Quirks)
     }
 
+    /// HTML Rendering #bidi-rendering: the node document's character
+    /// encoding is ISO-8859-8, whose documents store Hebrew in visual order.
+    pub(super) fn visual_hebrew(&self, id: NodeId) -> bool {
+        self.nodes.contains(id)
+            && self
+                .state
+                .document_encodings
+                .get(&self.nodes.owner_document(id))
+                .is_some_and(|&encoding| encoding == encoding_rs::ISO_8859_8)
+    }
+
     /// See `Dom::frame_owner`.
     pub(super) fn frame_owner(&self, id: NodeId) -> Option<NodeId> {
         // Ownership does not depend on being inserted. A detached node created in a child
@@ -13494,6 +13958,9 @@ impl<'a> StyleView<'a> {
                 == 3;
         }
         match comb {
+            // CSS Shadow 1 #part: ordinary selector matching never reaches
+            // into a shadow tree's part element map.
+            Combinator::Part => false,
             Combinator::Child => self
                 .selector_parent_in(id, scope)
                 .is_some_and(|p| self.matches_complex_in(p, rest, scope)),
@@ -14791,6 +15258,11 @@ enum Combinator {
     NextSibling,
     /// `A ~ B`: some preceding element sibling of B is A.
     SubsequentSibling,
+    /// `A::part(…)` (CSS Shadow 1 #part): the compound after it (which
+    /// carries the part names) selects an element of the part element map
+    /// of A's shadow root. Ordinary matching never crosses it; the
+    /// shadow-aware cascade matches it (`Dom::part_rules`).
+    Part,
 }
 
 /// The `::before` / `::after` generated-content pseudo-elements, the
@@ -14847,6 +15319,31 @@ impl PseudoEl {
         }
     }
 
+    /// Every pseudo-element TRust generates boxes for.
+    pub(crate) const ALL: [PseudoEl; 6] = [
+        PseudoEl::Before,
+        PseudoEl::After,
+        PseudoEl::FirstLetter,
+        PseudoEl::Marker,
+        PseudoEl::Placeholder,
+        PseudoEl::Backdrop,
+    ];
+
+    /// The pseudo-element's selector, as the `pseudoElement` attribute of
+    /// its `AnimationEvent` and `TransitionEvent` (CSS Animations 1
+    /// #interface-animationevent-attributes, CSS Transitions 1
+    /// #interface-transitionevent-attributes).
+    pub(crate) fn selector(self) -> &'static str {
+        match self {
+            PseudoEl::Before => "::before",
+            PseudoEl::After => "::after",
+            PseudoEl::FirstLetter => "::first-letter",
+            PseudoEl::Marker => "::marker",
+            PseudoEl::Placeholder => "::placeholder",
+            PseudoEl::Backdrop => "::backdrop",
+        }
+    }
+
     /// The key of the pseudo's resolved generated content in
     /// `generated::Generated::content`.
     fn content_slot(self) -> u8 {
@@ -14859,6 +15356,16 @@ impl PseudoEl {
             PseudoEl::Backdrop => 5,
         }
     }
+}
+
+/// What a CSS animation or transition applies to: an element, or one of
+/// its pseudo-elements (CSS Animations 1 #animations and CSS Transitions 1
+/// #starting both apply to pseudo-elements).
+pub(crate) type StyleTarget = (NodeId, Option<PseudoEl>);
+
+/// The `pseudoElement` attribute of an event targeting `target`.
+pub(crate) fn pseudo_selector(target: StyleTarget) -> &'static str {
+    target.1.map_or("", PseudoEl::selector)
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -14944,6 +15451,12 @@ struct Compound {
     /// the matched element, NOT the element itself. The element-property
     /// cascade skips these; `pseudo_content` consults only these.
     pseudo: Option<PseudoEl>,
+    /// The `::part(<ident>+)` names (CSS Shadow 1 #part) of the compound
+    /// after a `Combinator::Part`: it represents the part element itself,
+    /// so its pseudo-classes and pseudo-elements apply to that element.
+    part: Option<Box<[String]>>,
+    /// While parsing: a `::part()` follows this compound's simple selectors.
+    part_follows: Option<Box<[String]>>,
     /// Pseudo-class count, for specificity only.
     pseudos: u32,
 }
@@ -15319,6 +15832,7 @@ impl Compound {
             && !self.scope
             && !self.root
             && self.slotted.is_none()
+            && self.part.is_none()
             && (self.host || !self.selects.is_empty() || !self.nots.is_empty())
             && self
                 .selects
@@ -15331,7 +15845,10 @@ impl Compound {
     }
 
     fn has_pseudo_element(&self) -> bool {
-        self.pseudo.is_some() || self.slotted.is_some() || self.inert_pseudo_element
+        self.pseudo.is_some()
+            || self.slotted.is_some()
+            || self.inert_pseudo_element
+            || self.part.is_some()
     }
 
     fn is_empty(&self) -> bool {
@@ -15353,6 +15870,7 @@ impl Compound {
             && self.structural.is_empty()
             && self.states.is_empty()
             && self.pseudo.is_none()
+            && self.part.is_none()
     }
 
     /// (ids, classes+attrs+pseudo-classes, tags+pseudo-elements). A
@@ -15366,7 +15884,8 @@ impl Compound {
             self.classes.len() as u32 + self.attrs.len() as u32 + self.pseudos,
             u32::from(matches!(&self.tag, Some(t) if t != "*"))
                 + u32::from(self.pseudo.is_some())
-                + u32::from(self.inert_pseudo_element),
+                + u32::from(self.inert_pseudo_element)
+                + u32::from(self.part.is_some()),
         );
         for group in &self.nots {
             if let Some(m) = group.iter().map(Complex::specificity).max() {
@@ -15887,7 +16406,17 @@ fn parse_complex(input: &str) -> Option<Complex> {
         if parts.last().is_some_and(|(_, c)| c.has_pseudo_element()) {
             return None;
         }
-        let compound = parse_compound(&mut chars)?;
+        let mut compound = parse_compound(&mut chars)?;
+        if let Some(names) = compound.part_follows.take() {
+            // CSS Shadow 1 #part: `A::part(n)` — A is the originating
+            // element (`*` when omitted); the part element compound follows.
+            if compound.is_empty() {
+                compound.tag = Some("*".into());
+            }
+            parts.push((std::mem::replace(&mut pending, Combinator::None), compound));
+            parts.push((Combinator::Part, parse_part_compound(&mut chars, names)?));
+            continue;
+        }
         if compound.is_empty() {
             return None;
         }
@@ -15898,6 +16427,48 @@ fn parse_complex(input: &str) -> Option<Complex> {
     } else {
         Some(Complex(parts))
     }
+}
+
+/// The compound representing a `::part(<ident>+)` pseudo-element: the
+/// pseudo-classes and pseudo-elements after it (CSS Pseudo 4
+/// #element-backed). Structural pseudo-classes, `:has()`, `:scope`, `:host`
+/// and a further `::part()` are allowed but never match.
+fn parse_part_compound(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    names: Box<[String]>,
+) -> Option<Compound> {
+    let mut after = if chars.peek() == Some(&':') {
+        parse_compound(chars)?
+    } else {
+        Compound::default()
+    };
+    // Selectors 4 #grammar: only pseudo-classes and pseudo-elements may
+    // follow a pseudo-element.
+    if after.tag.is_some()
+        || after.id.is_some()
+        || !after.classes.is_empty()
+        || !after.attrs.is_empty()
+    {
+        return None;
+    }
+    while let Some(nested) = after.part_follows.take() {
+        drop(nested);
+        let rest = parse_part_compound(chars, Box::new([]))?;
+        after.never = true;
+        after.pseudo = rest.pseudo;
+        after.pseudos += rest.pseudos;
+    }
+    if !after.structural.is_empty()
+        || !after.has.is_empty()
+        || after.scope
+        || after.root
+        || after.host
+        || after.slotted.is_some()
+    {
+        after.never = true;
+    }
+    after.part = Some(names);
+    Some(after)
 }
 
 fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Compound> {
@@ -15983,6 +16554,22 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         }
                         return None;
                     }
+                }
+                // CSS Shadow 1 #part: `::part( <ident>+ )` ends the
+                // originating element's compound; `parse_complex` continues
+                // with the part element's.
+                if double_colon && name == "part" && arg.is_some() && !after_pseudo_element {
+                    let raw = arg?;
+                    let mut parser = cssparser::Parser::new(&raw);
+                    let mut names = Vec::new();
+                    while !parser.is_exhausted() {
+                        names.push(parser.expect_ident_cloned().ok()?.to_string());
+                    }
+                    if names.is_empty() {
+                        return None;
+                    }
+                    compound.part_follows = Some(names.into_boxed_slice());
+                    return Some(compound);
                 }
                 // Selectors 4 #invalid / #compat (local snapshot 2026-09-06):
                 // unsupported pseudos invalidate a selector, except for the
@@ -16869,10 +17456,12 @@ const PROPS: &[PropDef] = &[
     prop("padding-left", false, true),
     prop("padding-right", false, true),
     prop("text-align", true, true),
-    // CSS Writing Modes 4: direction inherits. It is also observable through
-    // getComputedStyle (overlay-positioning libraries use it to mirror start/
-    // end alignment), even though layout2 does not yet reorder bidi boxes.
+    // CSS Writing Modes 4 #direction: direction inherits; layout2 resolves
+    // bidi paragraphs and reorders lines with it (`layout2::bidi`).
     prop("direction", true, true),
+    // CSS Writing Modes 4 #unicode-bidi: not inherited. Baked so the layout
+    // arena injects the same bidi controls as the live cascade computed.
+    prop("unicode-bidi", false, true),
     // CSS Text 3 #text-align-last-property.
     prop("text-align-last", true, true),
     // CSS Color Adjust 1 #color-scheme-prop.
@@ -19769,11 +20358,16 @@ struct CascadeWinners<'r> {
 
 /// The author sources of one element's cascade, gathered by the caller.
 struct CascadeSources<'r> {
+    /// The tree depth of the element's tree (`StyleView::tree_depth`).
+    depth: u16,
     /// The element's tree-scope rules, and the indices of those it matches.
     rules: &'r [StyleRule],
     matched: &'r [u32],
-    /// Matching `::slotted()` rules of the shadow trees it is assigned into.
-    slotted: &'r [&'r StyleRule],
+    /// Matching `::slotted()` rules of the shadow trees it is assigned into,
+    /// with the depth of the tree each was written in.
+    slotted: &'r [(&'r StyleRule, u16)],
+    /// Matching `::part()` rules of outer trees.
+    parts: &'r [PartMatch<'r>],
     /// The rules of its own shadow root's scope, for `:host`.
     host_rules: Option<&'r [StyleRule]>,
     /// Whether any sheet uses `revert-layer`.
@@ -19861,6 +20455,8 @@ impl StyleView<'_> {
         let mut placeholder = Winners::default();
         let mut backdrop = Winners::default();
         let mut conditional_pseudos = Vec::new();
+        // CSS Cascade 5 #cascade-context: the element's own tree context.
+        let own = |important: bool| cascade_context(sources.depth, important);
         // HTML rendering hints have their own origin below every author
         // layer. `revert` discards them, while `revert-layer` can reveal them
         // (CSS Cascade 5 #preshint and #revert-layer).
@@ -19868,7 +20464,7 @@ impl StyleView<'_> {
             consider_into(
                 &mut elem,
                 property,
-                (false, false, true, false, 0, (0, 0, 0), 0, 0),
+                (false, false, own(false), false, 0, (0, 0, 0), 0, 0),
                 &value,
             );
         });
@@ -19895,7 +20491,7 @@ impl StyleView<'_> {
                         (
                             important,
                             true,
-                            !important,
+                            own(important),
                             true,
                             encode_layer(&[], important),
                             (0, 0, 0),
@@ -19931,7 +20527,7 @@ impl StyleView<'_> {
                     (
                         *imp,
                         true,
-                        !*imp,
+                        own(*imp),
                         false,
                         r.layer_key(*imp),
                         r.specificity,
@@ -19943,8 +20539,8 @@ impl StyleView<'_> {
             }
         }
         // `::slotted()` declarations keep the shadow tree's encapsulation
-        // context (CSS Shadow 1 §3.2.4).
-        for r in sources.slotted {
+        // context (CSS Shadow 1 §3.2.4), an inner one.
+        for &(r, depth) in sources.slotted {
             for (pk, (imp, v)) in &r.decls {
                 consider_into(
                     &mut elem,
@@ -19952,7 +20548,40 @@ impl StyleView<'_> {
                     (
                         *imp,
                         true,
+                        cascade_context(depth, *imp),
+                        false,
+                        r.layer_key(*imp),
+                        r.specificity,
+                        r.order,
+                        0,
+                    ),
+                    v,
+                );
+            }
+        }
+        // `::part()` declarations keep the context of the tree they were
+        // written in (CSS Shadow 1 #part), an outer one; they land in the
+        // map of the box they target (the part element or its
+        // pseudo-element).
+        for part in sources.parts {
+            let target = match part.pseudo {
+                None => &mut elem,
+                Some(PseudoEl::Before) => &mut before,
+                Some(PseudoEl::After) => &mut after,
+                Some(PseudoEl::FirstLetter) => &mut first_letter,
+                Some(PseudoEl::Marker) => &mut marker,
+                Some(PseudoEl::Placeholder) => &mut placeholder,
+                Some(PseudoEl::Backdrop) => &mut backdrop,
+            };
+            let r = part.rule;
+            for (pk, (imp, v)) in &r.decls {
+                consider_into(
+                    target,
+                    pk,
+                    (
                         *imp,
+                        true,
+                        cascade_context(part.depth, *imp),
                         false,
                         r.layer_key(*imp),
                         r.specificity,
@@ -19980,7 +20609,7 @@ impl StyleView<'_> {
                         (
                             *imp,
                             true,
-                            *imp,
+                            cascade_context(sources.depth + 1, *imp),
                             false,
                             r.layer_key(*imp),
                             r.specificity,
@@ -20012,7 +20641,7 @@ impl StyleView<'_> {
                         (
                             false,
                             true,
-                            true,
+                            own(false),
                             false,
                             encode_layer(&[], false),
                             (0, 0, 0),
@@ -20039,18 +20668,38 @@ impl StyleView<'_> {
     }
 }
 
+/// A `::part()` rule matching an element (CSS Shadow 1 #part): the tree
+/// depth of its style sheet, and the box it targets — the part element, or
+/// one of its pseudo-elements (`::part(x)::before`, or a pseudo-element an
+/// `exportparts` mapping exposes as the part).
+struct PartMatch<'r> {
+    rule: &'r StyleRule,
+    depth: u16,
+    pseudo: Option<PseudoEl>,
+}
+
+/// CSS Cascade 5 #cascade-context with DOM tree contexts nested in
+/// shadow-including tree order: a declaration from a tree at `depth` (0
+/// for the document tree, one more per shadow tree) outranks one from a
+/// deeper (inner) tree when normal, and a shallower (outer) one when
+/// important.
+fn cascade_context(depth: u16, important: bool) -> u16 {
+    if important { depth } else { u16::MAX - depth }
+}
+
 /// (!important, author origin, context, inline, layer, specificity, source
 /// order): the cascade key; lexicographic max wins. HTML presentational hints
 /// sort below the author origin (CSS Cascade 5 #preshint); `revert-layer`
 /// can reach that origin, whereas `revert` discards it during defaulting.
 /// `context` implements CSS Cascade 5
-/// §6.1: outer wins for normal declarations, inner wins for important ones.
+/// §6.1: outer wins for normal declarations, inner wins for important ones,
+/// with the tree depth of each declaration's tree (`cascade_context`).
 /// `layer` is the importance-adjusted cascade-layer encoding (`encode_layer`);
 /// it sits AFTER context and the inline flag because encapsulation context is
 /// sorted before element-attached styles, and element-attached styles before
 /// layers (CSS Cascade 5 §6.1), and BEFORE specificity (layers beat
 /// specificity — the point of the feature).
-type CascadeKey = (bool, bool, bool, bool, u128, (u32, u32, u32), usize, usize);
+type CascadeKey = (bool, bool, u16, bool, u128, (u32, u32, u32), usize, usize);
 
 /// CSS Cascade 5 #revert-layer: keep the strongest declaration at each
 /// importance/context/inline/layer level when rollback occurs in the sheet.
@@ -20060,7 +20709,7 @@ enum CascadeWinner {
     Layers(Vec<(CascadeKey, String)>),
 }
 
-fn cascade_level(key: CascadeKey) -> (bool, bool, bool, bool, u128) {
+fn cascade_level(key: CascadeKey) -> (bool, bool, u16, bool, u128) {
     (key.0, key.1, key.2, key.3, key.4)
 }
 
@@ -20135,7 +20784,8 @@ impl CascadeWinner {
                         0xfffe - component
                     }) << shift;
                 }
-                below = Some((false, key.1, !key.2, false, normal_layer));
+                // The same context's normal level (`cascade_context`).
+                below = Some((false, key.1, u16::MAX - key.2, false, normal_layer));
             } else {
                 below = Some(cascade_level(*key));
             }
@@ -20174,6 +20824,10 @@ struct StyleIndex {
     /// rules are consulted while cascading a light-DOM element assigned to a
     /// slot in the corresponding shadow tree.
     slotted_rules: Vec<(NodeId, u32)>,
+    /// `(tree-scope, rule-index)` entries for `::part()` selectors (CSS
+    /// Shadow 1 #part), consulted while cascading the part elements of the
+    /// shadow trees below that scope.
+    part_rules: Vec<(NodeId, u32)>,
     /// The last `@keyframes` rule for each case-sensitive name. Animation
     /// declarations do not participate in the ordinary cascade; values are
     /// retained by property and sorted offset so paint can sample supported
@@ -20254,6 +20908,8 @@ impl Compound {
             host_inner,
             slotted,
             pseudo,
+            part,
+            part_follows,
             pseudos,
         } = self;
         let _ = (
@@ -20267,26 +20923,34 @@ impl Compound {
             pseudo,
             pseudos,
         );
-        let mut bytes = tag
-            .as_ref()
-            .map_or(0, String::capacity)
-            .saturating_add(id.as_ref().map_or(0, String::capacity))
-            .saturating_add(
-                classes
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
-            .saturating_add(
-                classes
-                    .iter()
-                    .map(String::capacity)
-                    .fold(0usize, usize::saturating_add),
-            )
-            .saturating_add(
-                attrs
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<AttrSel>()),
-            );
+        let mut bytes = [part, part_follows]
+            .into_iter()
+            .flatten()
+            .map(|names| {
+                names.len() * std::mem::size_of::<String>()
+                    + names.iter().map(String::capacity).sum::<usize>()
+            })
+            .sum::<usize>()
+            + tag
+                .as_ref()
+                .map_or(0, String::capacity)
+                .saturating_add(id.as_ref().map_or(0, String::capacity))
+                .saturating_add(
+                    classes
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(
+                    classes
+                        .iter()
+                        .map(String::capacity)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(
+                    attrs
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<AttrSel>()),
+                );
         for attr in attrs {
             bytes = bytes
                 .saturating_add(attr.name.capacity())
@@ -20444,6 +21108,7 @@ impl StyleIndex {
             scopes,
             buckets,
             slotted_rules,
+            part_rules,
             keyframes,
             counter_styles,
             properties,
@@ -20550,8 +21215,7 @@ impl StyleIndex {
             );
         }
         bytes = bytes.saturating_add(
-            slotted_rules
-                .capacity()
+            (slotted_rules.capacity() + part_rules.capacity())
                 .saturating_mul(std::mem::size_of::<(NodeId, u32)>()),
         );
         bytes = bytes.saturating_add(
@@ -20840,6 +21504,7 @@ impl AncestorRequirements {
 }
 
 impl RuleBuckets {
+    #[cfg(test)]
     fn build(rules: &[StyleRule]) -> Self {
         Self::build_where(rules, |_| true)
     }
@@ -21305,7 +21970,45 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     {
         return None;
     }
+    // CSS Syntax 3 #parse-a-declaration and CSS Cascade 5 #declared: a
+    // value that does not match its supported property's grammar (each
+    // longhand of a shorthand's expansion) invalidates the declaration while
+    // parsing, so an earlier valid declaration stays in force. Unsupported
+    // properties are left to the cascade, which does not store them.
+    if !custom && !declaration_valid(&k, &value) {
+        return None;
+    }
+    // CSS Display 3 #the-display-properties: a supported multi-keyword
+    // value is its legacy single keyword.
+    let value = if k == "display" && wide_keyword(&value).is_none() {
+        properties::grammar::normalize_display(&value).map_or(value, str::to_owned)
+    } else {
+        value
+    };
     Some((k, value, important))
+}
+
+/// Whether a declaration of a supported property matches its grammar: a
+/// shorthand must expand, and every supported longhand of the expansion
+/// must match. `var()` and CSS-wide keywords are checked at computed-value
+/// time instead (CSS Variables 1 #substitute-a-var).
+fn declaration_valid(name: &str, value: &str) -> bool {
+    if value.starts_with(PENDING_BOX_SHORTHAND)
+        || wide_keyword(value).is_some()
+        || find_var_function(value).is_some()
+    {
+        return true;
+    }
+    let expanded = expand_box_shorthand(name, value);
+    if expanded.is_empty() {
+        // An invalid shorthand of supported longhands, or an unsupported name.
+        return cssom::property_names(name).is_empty();
+    }
+    expanded.iter().all(|(longhand, value)| {
+        !is_tracked(longhand)
+            || value.starts_with(PENDING_BOX_SHORTHAND)
+            || cssom::accepts_longhand(longhand, &grammar_lengths(value))
+    })
 }
 
 /// `value` with every CSS Values 4 #lengths unit the declaration-time
@@ -21773,6 +22476,63 @@ fn normalize_font_shorthand(value: &str) -> String {
 /// The pseudo-element a rule's subject (last compound) targets, if any.
 fn rule_pseudo(rule: &StyleRule) -> Option<PseudoEl> {
     rule.selector.0.last().and_then(|(_, c)| c.pseudo)
+}
+
+/// Whether `rule` selects a `::part()` pseudo-element (CSS Shadow 1 #part).
+fn is_part_rule(rule: &StyleRule) -> bool {
+    rule.selector
+        .0
+        .last()
+        .is_some_and(|(combinator, _)| *combinator == Combinator::Part)
+}
+
+/// CSS Shadow 1 #parsing-mapping-list: the rules for parsing a list of
+/// part mappings, as `(inner, outer)` names, without pseudo-element
+/// mappings (which only an element's own `exportparts` uses).
+fn part_mappings(input: &str) -> Vec<(&str, &str)> {
+    part_mappings_with_pseudo(input)
+        .into_iter()
+        .filter(|(inner, _)| !inner.starts_with("::"))
+        .collect()
+}
+
+/// CSS Shadow 1 #parsing-mapping-list, including `::pseudo : name`
+/// mappings, which name only their outer ident (#exportparts-attr).
+fn part_mappings_with_pseudo(input: &str) -> Vec<(&str, &str)> {
+    let space = |c: char| c.is_ascii_whitespace();
+    input
+        .split(',')
+        .filter_map(|mapping| {
+            let mapping = mapping.trim_matches(space);
+            if mapping.is_empty() {
+                return None;
+            }
+            // #parsing-mapping: the first token runs to a space or colon;
+            // a `::pseudo-element` name (#exportparts-attr) keeps its colons.
+            let lead = if mapping.starts_with("::") { 2 } else { 0 };
+            let end = mapping[lead..]
+                .find(|c: char| space(c) || c == ':')
+                .map_or(mapping.len(), |end| lead + end);
+            let first = &mapping[..end];
+            if first.len() == lead {
+                return None;
+            }
+            let rest = mapping[end..].trim_start_matches(space);
+            if rest.is_empty() {
+                // `::ident` alone has no outer name.
+                return (!first.starts_with("::")).then_some((first, first));
+            }
+            let rest = rest.strip_prefix(':')?.trim_start_matches(space);
+            let end = rest
+                .find(|c: char| space(c) || c == ':')
+                .unwrap_or(rest.len());
+            let second = &rest[..end];
+            if second.is_empty() || !rest[end..].trim_start_matches(space).is_empty() {
+                return None;
+            }
+            Some((first, second))
+        })
+        .collect()
 }
 
 /// Strip the surrounding quotes from a CSS string and decode its escapes
@@ -22864,6 +23624,18 @@ pub(crate) fn legacy_font_size_value(value: &str) -> Option<&'static str> {
 pub(crate) fn supports_color_value(value: &str) -> bool {
     wide_keyword(value).is_some()
         || value.eq_ignore_ascii_case("currentcolor")
+        // The registry's `<color>` (CSS Color 4/5) and the color functions.
+        || properties::is_color(value)
+        // CSS Color 4 #css-system-colors and CSS Color 5 #light-dark: valid
+        // when they compute to a supported color in either color scheme.
+        || [color_scheme::ColorScheme::Light, color_scheme::ColorScheme::Dark]
+            .into_iter()
+            .all(|scheme| {
+                color_scheme::resolve(value, scheme).is_some_and(|resolved| {
+                    crate::render::PaintColor::parse_css(&resolved).is_some()
+                        || properties::is_color(&resolved)
+                })
+            })
         // Custom property substitution occurs at computed-value time.
         || find_var_function(value).is_some()
         || crate::render::PaintColor::parse_css(value).is_some()
@@ -24607,8 +25379,8 @@ mod tests {
         // resized element; the resulting panic was misreported as a
         // ResizeObserver failure.
         let (name, value, important) =
-            parse_decl("background: hello xyz” URL(Icon.PNG) !important").unwrap();
-        assert_eq!(name, "background");
+            parse_decl("-x-unsupported: hello xyz” URL(Icon.PNG) !important").unwrap();
+        assert_eq!(name, "-x-unsupported");
         assert_eq!(value, "hello xyz” URL(Icon.PNG)");
         assert!(important);
     }
@@ -26093,6 +26865,135 @@ mod tests {
             Some("20px"),
             "important inner-context declaration wins"
         );
+    }
+
+    /// CSS Shadow 1 #part, #exportparts-attr and #part-element-map with
+    /// CSS Cascade 5 #cascade-context: `::part()` rules of the host's tree
+    /// style the shadow tree's part elements (and, through `exportparts`,
+    /// those of nested shadow trees) from an OUTER context, so their normal
+    /// declarations beat the shadow tree's own while its important ones win.
+    #[test]
+    fn part_rules_style_exposed_and_forwarded_shadow_elements() {
+        let mut dom = Dom::parse_document(
+            "<head><style>\
+             x-panel::part(label){color:rgb(1,0,0);width:10px;height:5px !important}\
+             x-panel::part(label inner){margin-left:7px}\
+             x-panel.dark::part(label){background-color:rgb(0,0,9)}\
+             x-panel::part(deep){color:rgb(3,0,0)}\
+             x-panel::part(cap)::before{content:'*';color:rgb(4,0,0)}\
+             x-panel::part(lead){color:rgb(5,0,0)}\
+             x-panel::part(label):focus{color:rgb(6,0,0)}\
+             x-panel::part(label):first-child{color:rgb(7,0,0)}\
+             span::part(label){color:rgb(8,0,0)}\
+             </style></head><body><x-panel id=panel></x-panel></body>",
+        );
+        let panel = dom.get_by_id("panel").unwrap();
+        let root = dom.attach_shadow(panel);
+        let style = dom.create_element("style");
+        let css = dom.create_text(
+            "span{color:rgb(0,1,0);width:20px;height:6px !important}\
+             :host::part(own){color:rgb(0,2,0)}",
+        );
+        dom.append(style, css);
+        dom.append(root, style);
+        let label = dom.create_element("span");
+        dom.set_attr(label, "part", "inner label");
+        dom.append(root, label);
+        let own = dom.create_element("b");
+        dom.set_attr(own, "part", "own");
+        dom.append(root, own);
+        // A nested component forwards its `inner` part as `deep`, keeps
+        // `secret` private and exposes a paragraph's `::before` as `lead`.
+        let nested = dom.create_element("x-inner");
+        dom.set_attr(nested, "exportparts", "inner: deep, nope:, cap");
+        dom.append(root, nested);
+        let nested_root = dom.attach_shadow(nested);
+        let deep = dom.create_element("i");
+        dom.set_attr(deep, "part", "inner");
+        dom.append(nested_root, deep);
+        let secret = dom.create_element("u");
+        dom.set_attr(secret, "part", "secret");
+        dom.append(nested_root, secret);
+        let cap = dom.create_element("em");
+        dom.set_attr(cap, "part", "cap");
+        dom.append(nested_root, cap);
+        let lead = dom.create_element("p");
+        dom.set_attr(lead, "exportparts", "::before : lead");
+        dom.append(root, lead);
+        let lead_style = dom.create_element("style");
+        let lead_css = dom.create_text("p::before{content:'>'}");
+        dom.append(lead_style, lead_css);
+        dom.append(root, lead_style);
+
+        let value = |dom: &Dom, id, name: &str| dom.computed_value_resolved(id, name);
+        // Outer normal declarations win; inner important ones win.
+        assert_eq!(value(&dom, label, "color").as_deref(), Some("rgb(1,0,0)"));
+        assert_eq!(value(&dom, label, "width").as_deref(), Some("10px"));
+        assert_eq!(value(&dom, label, "height").as_deref(), Some("6px"));
+        // Every listed name must be a key; the originating compound must
+        // match the host; structural pseudo-classes never match.
+        assert_eq!(value(&dom, label, "margin-left").as_deref(), Some("7px"));
+        assert_eq!(value(&dom, label, "background-color"), None);
+        dom.set_attr(panel, "class", "dark");
+        assert_eq!(
+            value(&dom, label, "background-color").as_deref(),
+            Some("rgb(0,0,9)")
+        );
+        // `:host::part()` in the shadow tree styles its own parts.
+        assert_eq!(value(&dom, own, "color").as_deref(), Some("rgb(0,2,0)"));
+        // Forwarding through `exportparts`, and only what it names.
+        assert_eq!(value(&dom, deep, "color").as_deref(), Some("rgb(3,0,0)"));
+        assert_ne!(value(&dom, secret, "color").as_deref(), Some("rgb(3,0,0)"));
+        assert_eq!(
+            dom.pseudo_layout_value(cap, PseudoEl::Before, "color")
+                .as_deref(),
+            Some("rgb(4,0,0)")
+        );
+        assert_eq!(
+            dom.pseudo_layout_value(lead, PseudoEl::Before, "color")
+                .as_deref(),
+            Some("rgb(5,0,0)")
+        );
+        assert_ne!(value(&dom, lead, "color").as_deref(), Some("rgb(5,0,0)"));
+        // `::part(label):focus` follows the part element's own state, and
+        // `:hover` on it restyles it.
+        let hover = dom.create_element("style");
+        let hover_css = dom.create_text("x-panel::part(label):hover{color:rgb(9,0,0)}");
+        dom.append(hover, hover_css);
+        let head = dom
+            .descendants(DOCUMENT)
+            .find(|&n| dom.tag_name(n) == Some("head"))
+            .unwrap();
+        dom.append(head, hover);
+        assert_eq!(value(&dom, label, "color").as_deref(), Some("rgb(1,0,0)"));
+        dom.set_hover_chain(Some(label));
+        assert_eq!(value(&dom, label, "color").as_deref(), Some("rgb(9,0,0)"));
+        dom.set_hover_chain(None);
+        assert_eq!(value(&dom, label, "color").as_deref(), Some("rgb(1,0,0)"));
+        // Changing the part names restyles.
+        dom.set_attr(label, "part", "other");
+        assert_eq!(value(&dom, label, "color").as_deref(), Some("rgb(0,1,0)"));
+        dom.set_attr(nested, "exportparts", "");
+        assert_ne!(value(&dom, deep, "color").as_deref(), Some("rgb(3,0,0)"));
+        // `::part()` is a pseudo-element: never matched by DOM queries, and
+        // invalid where pseudo-elements are.
+        let list = SelectorList::parse("x-panel::part(label), ::part(inner)").unwrap();
+        assert!(dom.query(DOCUMENT, &list, false).is_empty());
+        assert!(dom.query(root, &list, false).is_empty());
+        assert!(selector_parses("x-panel::part(label):hover::before"));
+        assert!(!selector_parses("x-panel::part(label) span"));
+        assert!(!selector_parses("x-panel::part(label).x"));
+        assert!(!selector_parses("x-panel::part()"));
+        assert!(!selector_parses(":not(::part(label))"));
+    }
+
+    #[test]
+    fn part_mapping_lists_follow_the_microsyntax() {
+        assert_eq!(
+            part_mappings_with_pseudo(" a ,b:c, d : e ,, :x, f:g:h, i j, ::before : k, ::after"),
+            [("a", "a"), ("b", "c"), ("d", "e"), ("::before", "k")]
+        );
+        assert_eq!(part_mappings("a, ::before : k"), [("a", "a")]);
     }
 
     #[test]
@@ -27673,6 +28574,59 @@ mod tests {
         assert_eq!(direction("a").as_deref(), Some("rtl"));
         assert_ne!(direction("b").as_deref(), Some("rtl"));
         assert_eq!(direction("c").as_deref(), Some("ltr"));
+    }
+
+    /// HTML Rendering #bidi-rendering's `unicode-bidi` rules, under the
+    /// author cascade, and their ISO-8859-8 (visual Hebrew) additions.
+    #[test]
+    fn ua_unicode_bidi_follows_the_bidi_rendering_rules() {
+        let html = "<style>#author{unicode-bidi:embed}#bogus{unicode-bidi:sideways}</style>\
+             <div id=div>x</div><span id=span>x</span><span id=ltr dir=LTR>x</span>\
+             <span id=bad dir=up>x</span><bdi id=bdi>x</bdi><output id=output>x</output>\
+             <bdo id=bdo>x</bdo><bdo id=bdodir dir=rtl>x</bdo><pre id=pre dir=auto>x</pre>\
+             <textarea id=textarea dir=auto></textarea><input id=input dir=auto>\
+             <input id=button type=button dir=auto><span id=author dir=rtl>x</span>\
+             <p id=bogus>x</p>";
+        let value = |dom: &Dom, id: &str| {
+            // `None` is the initial value, `normal`.
+            dom.computed_value_resolved(dom.get_by_id(id).unwrap(), "unicode-bidi")
+                .unwrap_or_else(|| "normal".to_owned())
+        };
+        let dom = Dom::parse_document(html);
+        for (id, expected) in [
+            ("div", "isolate"),
+            ("span", "normal"),
+            ("ltr", "isolate"),
+            ("bad", "normal"),
+            ("bdi", "isolate"),
+            ("output", "isolate"),
+            ("bdo", "isolate-override"),
+            ("bdodir", "isolate-override"),
+            ("pre", "plaintext"),
+            ("textarea", "plaintext"),
+            ("input", "plaintext"),
+            ("button", "isolate"),
+            ("author", "embed"),
+            // An invalid declaration is dropped at parse time.
+            ("bogus", "isolate"),
+        ] {
+            assert_eq!(value(&dom, id), expected, "{id}");
+        }
+        let mut dom = Dom::parse_document(html);
+        dom.set_document_encoding(DOCUMENT, encoding_rs::ISO_8859_8);
+        for (id, expected) in [
+            ("div", "bidi-override"),
+            ("span", "bidi-override"),
+            ("ltr", "bidi-override"),
+            ("bdi", "isolate"),
+            ("bdo", "isolate-override"),
+            ("pre", "plaintext"),
+            ("textarea", "plaintext"),
+            ("input", "normal"),
+            ("button", "bidi-override"),
+        ] {
+            assert_eq!(value(&dom, id), expected, "visual Hebrew {id}");
+        }
     }
 
     #[test]

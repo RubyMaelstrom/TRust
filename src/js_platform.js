@@ -4563,20 +4563,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (phase && trust.performanceLifecycle) trust.performanceLifecycle(phase + 'End');
         }
     };
+    // CSS Transitions 1 #transition-events: a pseudo-element's transition
+    // fires at its originating element with `pseudoElement` naming it.
     trust.dispatchCssTransitionEvents = function (json) {
-        for (const [id, propertyName, type, elapsedTime] of JSON.parse(json)) {
+        for (const [id, propertyName, type, elapsedTime, pseudoElement] of JSON.parse(json)) {
             const target = wrap(id);
             if (target) dispatch(target, createTrustedEvent(TransitionEvent, type,
-                { bubbles: true, propertyName, elapsedTime, pseudoElement: "" }), false);
+                { bubbles: true, propertyName, elapsedTime, pseudoElement: pseudoElement || "" }), false);
         }
     };
     // CSS Animations 1 #events / CSS Animations 2 #event-dispatch: one
-    // AnimationEvent per animation-name item, at its owning element.
+    // AnimationEvent per animation-name item, at its owning element (the
+    // originating element of a pseudo-element's animation).
     trust.dispatchCssAnimationEvents = function (json) {
-        for (const [id, animationName, type, elapsedTime] of JSON.parse(json)) {
+        for (const [id, animationName, type, elapsedTime, pseudoElement] of JSON.parse(json)) {
             const target = wrap(id);
             if (target) dispatch(target, createTrustedEvent(AnimationEvent, type,
-                { bubbles: true, animationName, elapsedTime, pseudoElement: "" }), false);
+                { bubbles: true, animationName, elapsedTime, pseudoElement: pseudoElement || "" }), false);
         }
     };
     trust.updateCssTransitions = function () {
@@ -9682,6 +9685,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         // DOM #dom-element-classlist is [PutForwards=value].
         set classList(value) { this.classList.value = value; }
+        // CSS Shadow Parts #idl: the [SameObject, PutForwards=value]
+        // DOMTokenList of the `part` attribute (no supported tokens).
+        get part() {
+            if (!internalsFor(this).partList) internalsFor(this).partList = createDOMTokenList(this, "part");
+            return internalsFor(this).partList;
+        }
+        set part(value) { this.part.value = value; }
         matches(s) { return selectorMatchesResult(__dom_matches(nodeIds.get(this), String(s))); }
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }

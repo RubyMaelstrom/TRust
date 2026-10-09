@@ -887,6 +887,10 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
     if property == "anchor-name" {
         return anchor_name_value(value).is_some();
     }
+    // The supported properties without a dedicated check below.
+    if let Some(valid) = properties::grammar::valid(property, value) {
+        return valid;
+    }
     // CSS Values 4 #calc-type-checking: a math function must resolve to one
     // of the property's numeric productions (`parse_decl_in` checks whole
     // declarations; this also covers longhands expanded from shorthands).
@@ -901,21 +905,31 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "display" => one_of(
             "none contents block inline inline-block flow-root list-item flex inline-flex grid inline-grid table inline-table table-caption table-cell table-row table-row-group table-header-group table-footer-group table-column table-column-group -webkit-box -webkit-inline-box",
         ),
-        "position" => one_of("static relative absolute fixed sticky"),
-        "visibility" => one_of("visible hidden collapse"),
+        // WHATWG Compatibility #css-keyword-mappings: `-webkit-sticky`.
+        "position" => one_of("static relative absolute fixed sticky -webkit-sticky"),
+        // CSS Display 4 #visibility.
+        "visibility" => one_of("visible hidden force-hidden collapse"),
         "box-sizing" => one_of("content-box border-box"),
-        "float" => one_of("none left right"),
-        "clear" => one_of("none left right both"),
+        // CSS Logical 1 #float-clear adds the flow-relative values.
+        "float" => one_of("none left right inline-start inline-end"),
+        "clear" => one_of("none left right both inline-start inline-end"),
         "direction" => one_of("ltr rtl"),
+        // CSS Writing Modes 4 #unicode-bidi.
+        "unicode-bidi" => one_of("normal embed isolate bidi-override isolate-override plaintext"),
         "flex-direction" => one_of("row row-reverse column column-reverse"),
         "flex-wrap" => one_of("nowrap wrap wrap-reverse"),
+        // CSS Overflow 4 #overflow-control: `overlay` is a legacy alias of
+        // `auto`.
         "overflow" => {
             split_top_level_ws(value).len() <= 2
-                && split_top_level_ws(value)
-                    .iter()
-                    .all(|v| matches!(*v, "visible" | "hidden" | "clip" | "scroll" | "auto"))
+                && split_top_level_ws(value).iter().all(|v| {
+                    matches!(
+                        *v,
+                        "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"
+                    )
+                })
         }
-        "overflow-x" | "overflow-y" => one_of("visible hidden clip scroll auto"),
+        "overflow-x" | "overflow-y" => one_of("visible hidden clip scroll auto overlay"),
         "overscroll-behavior-x" | "overscroll-behavior-y" => one_of("auto contain none chain"),
         "overflow-wrap" => one_of("normal break-word anywhere"),
         "word-break" => one_of("normal break-all keep-all break-word"),
@@ -928,7 +942,12 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
         "writing-mode" => one_of("horizontal-tb vertical-rl vertical-lr sideways-rl sideways-lr"),
         "text-orientation" => one_of("mixed upright sideways"),
         "text-transform" => one_of("none uppercase lowercase capitalize"),
-        "text-align" => one_of("start end left right center justify match-parent"),
+        // CSS Text 3 #text-align-property, with the legacy -webkit-/-moz-
+        // descendant-alignment keywords layout implements.
+        "text-align" => one_of(
+            "start end left right center justify match-parent -webkit-match-parent \
+             -webkit-left -webkit-right -webkit-center -moz-left -moz-right -moz-center",
+        ),
         "text-overflow" => one_of("clip ellipsis"),
         "-webkit-line-clamp" => value == "none" || value.parse::<usize>().is_ok_and(|n| n > 0),
         "-webkit-box-orient" => one_of("horizontal vertical inline-axis block-axis"),
@@ -993,8 +1012,10 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
             one_of("none hidden solid double dotted dashed groove ridge inset outset")
                 || p == "outline-style" && value == "auto"
         }
+        // CSS UI 4 #caret-color and #outline-color take `auto` too.
         p if is_color_property(p) || p == "caret-color" => {
-            supports_color_value(value) || p == "caret-color" && value == "auto"
+            supports_color_value(value)
+                || matches!(p, "caret-color" | "outline-color") && value == "auto"
         }
         // The grammar's permitted keywords are distinct from its length arm.
         p if property_rejects_unitless_nonzero_length(p)
@@ -1023,9 +1044,10 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
                 "line-height" | "letter-spacing" | "word-spacing" | "row-gap" | "column-gap" => {
                     value == "normal"
                 }
-                "vertical-align" => {
-                    one_of("baseline sub super text-top text-bottom middle top bottom")
-                }
+                "vertical-align" => one_of(
+                    "baseline sub super text-top text-bottom middle top bottom \
+                     -webkit-baseline-middle",
+                ),
                 p if p.ends_with("-width")
                     && (p.starts_with("border-")
                         || p == "outline-width"

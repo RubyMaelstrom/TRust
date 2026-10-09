@@ -57,7 +57,9 @@ pub(super) trait StyleBackend {
     /// The node document's base URL for presentational hints.
     fn document_base(&self, id: NodeId) -> html_hints::DocumentBase;
     /// The `::slotted()` rules matching a light-DOM element.
-    fn slotted_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<&'i StyleRule>;
+    fn slotted_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<(&'i StyleRule, u16)>;
+    /// The `::part()` rules matching an element of a shadow tree.
+    fn part_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<PartMatch<'i>>;
     /// CSS Conditional 5 #container-rule: whether `query` holds for `subject`.
     fn container_matches(
         &self,
@@ -78,6 +80,9 @@ pub(super) trait StyleBackend {
     fn css_transitions_active(&self) -> bool;
     fn animation_value(&self, id: NodeId, name: &str) -> Option<String>;
     fn animation_private_row(&self, id: NodeId) -> bool;
+    /// The transition- or animation-origin value of `name` on `id`'s
+    /// `which` pseudo-element.
+    fn pseudo_origin(&self, id: NodeId, which: PseudoEl, name: &str) -> Option<String>;
 
     fn computed_cache(&self) -> &RefCell<ComputedCache>;
     fn cascaded_cache(&self) -> &RefCell<NodeCache<std::rc::Rc<CascadedMaps>>>;
@@ -213,8 +218,12 @@ impl StyleBackend for Dom {
         Dom::document_base(self, id)
     }
     #[inline]
-    fn slotted_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<&'i StyleRule> {
+    fn slotted_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<(&'i StyleRule, u16)> {
         Dom::slotted_rules(self, index, id)
+    }
+    #[inline]
+    fn part_rules<'i>(&self, index: &'i StyleIndex, id: NodeId) -> Vec<PartMatch<'i>> {
+        Dom::part_rules(self, index, id)
     }
     #[inline]
     fn container_matches(
@@ -256,6 +265,10 @@ impl StyleBackend for Dom {
     #[inline]
     fn animation_private_row(&self, id: NodeId) -> bool {
         self.animations.private_row(id)
+    }
+    #[inline]
+    fn pseudo_origin(&self, id: NodeId, which: PseudoEl, name: &str) -> Option<String> {
+        self.pseudo_origin_value(id, which, name)
     }
     #[inline]
     fn computed_cache(&self) -> &RefCell<ComputedCache> {
