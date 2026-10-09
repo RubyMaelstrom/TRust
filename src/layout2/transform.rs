@@ -253,7 +253,11 @@ pub(crate) fn serialize_list(
     let matrix = operations.iter().fold(m3::IDENTITY, |matrix, op| {
         m3::multiply(&matrix, &op.matrix3d(reference))
     });
-    let number = |v: f32| crate::dom::cssom::css_number(f64::from(v));
+    // Widened through the f32's shortest decimal form, so single-precision
+    // noise (1234.5677490234375) does not reach the serialization.
+    let number = |v: f32| {
+        crate::dom::cssom::css_number(v.to_string().parse::<f64>().unwrap_or(f64::from(v)))
+    };
     Some(if m3::is_2d(&matrix) {
         format!(
             "matrix({}, {}, {}, {}, {}, {})",
@@ -358,7 +362,7 @@ fn angle(text: &str) -> Option<f32> {
 }
 
 fn rotate(radians: f32) -> Affine2d {
-    let (sin, cos) = radians.sin_cos();
+    let (sin, cos) = m3::sin_cos(radians);
     Affine2d([cos, sin, -sin, cos, 0., 0.])
 }
 

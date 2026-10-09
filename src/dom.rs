@@ -6515,6 +6515,13 @@ impl Dom {
         if name == "font-size" {
             return Some(cssom::css_px(self.font_px(id)));
         }
+        // A transform list without percentages needs no reference box
+        // (`cssom_needs_used_value` routes the others through layout).
+        if name == "transform"
+            && let Some(matrix) = self.cssom_transform_matrix(id, None)
+        {
+            return Some(matrix);
+        }
         if name == "font-weight" {
             return Some(
                 self.computed_value_resolved(id, name)
@@ -6671,11 +6678,13 @@ impl Dom {
     /// relatively, absolutely or fixed positioned one. Absolute lengths need
     /// no layout; `getComputedStyle` reads of them must not flush geometry.
     pub(crate) fn cssom_needs_used_value(&self, id: NodeId, name: &str) -> bool {
-        // A transition's deferred matrix interpolation resolves against the
-        // reference box (`cssom_deferred_transform`).
+        // A transform list's percentages (and a transition's deferred matrix
+        // interpolation) resolve against the reference box
+        // (`cssom_transform_matrix`); any other list needs no layout.
         if name == "transform" {
             return self.computed_value_resolved(id, name).is_some_and(|value| {
-                value.contains(crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION)
+                value.contains('%')
+                    || value.contains(crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION)
             });
         }
         let Some(longhands) = used_value_longhands(name) else {
@@ -6738,7 +6747,7 @@ impl Dom {
             return self.cssom_used_value(id, &physical, layout);
         }
         if name == "transform"
-            && let Some(value) = self.cssom_deferred_transform(id, layout)
+            && let Some(value) = self.cssom_transform_matrix(id, layout)
         {
             return Some(value);
         }
@@ -6747,20 +6756,25 @@ impl Dom {
             .or_else(|| self.cssom_resolved_value(id, name))
     }
 
-    /// The resolved `transform` of an element in the middle of a transition
-    /// whose matrix interpolation waits for the reference box (CSS
-    /// Transforms 1 #interpolation-of-transforms): CSS Transforms 1
-    /// #serialization-of-the-computed-value's `matrix()`/`matrix3d()`,
-    /// with percentages resolved against the element's untransformed
-    /// reference box (an element without a box has an empty one). The
-    /// internal deferred function never reaches script.
-    fn cssom_deferred_transform(
+    /// The resolved `transform` (CSS Transforms 2
+    /// #serialization-of-the-computed-value, a resolved value special case
+    /// property): when the computed value is a <transform-list>, its
+    /// functions post-multiplied into one matrix, serialized as `matrix()`
+    /// when that is a 2D matrix and `matrix3d()` otherwise. Percentages
+    /// resolve against the element's untransformed reference box (CSS
+    /// Transforms 1 #transform-box; an element without a box, or one
+    /// measured without `layout`, has an empty one), and a transition's
+    /// deferred matrix interpolation (CSS Transforms 1
+    /// #interpolation-of-transforms) is composed first, so that internal
+    /// function never reaches script. `None` for `none`, whose resolved
+    /// value is the computed value.
+    fn cssom_transform_matrix(
         &self,
         id: NodeId,
         layout: Option<&crate::layout2::LayoutFragments>,
     ) -> Option<String> {
         let value = self.computed_value_resolved(id, "transform")?;
-        if !value.contains(crate::layout2::DEFERRED_TRANSFORM_INTERPOLATION) {
+        if value.trim().eq_ignore_ascii_case("none") {
             return None;
         }
         let border_box = layout
@@ -7030,6 +7044,24 @@ impl Dom {
                 };
             }
             return Some(self.cssom_color(id, name, color));
+        }
+        // CSS Transforms 2 #serialization-of-the-computed-value, as for the
+        // element (`cssom_transform_matrix`); the pseudo-element's own box is
+        // not measured, so its percentages resolve against an empty one.
+        if name == "transform"
+            && let Some(list) = value
+                .as_deref()
+                .filter(|list| !list.trim().eq_ignore_ascii_case("none"))
+        {
+            let (w, h) = self.viewport_px();
+            if let Some(matrix) = crate::layout2::serialize_transform_list(
+                list,
+                crate::layout2::pseudo_units(self, id, which),
+                crate::layout2::value::Vp { w, h },
+                [0.0; 2],
+            ) {
+                return Some(matrix);
+            }
         }
         if let Some(computed) = value
             .as_deref()

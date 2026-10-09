@@ -60,6 +60,25 @@ pub(crate) fn perspective(depth: f32) -> Matrix3d {
     m
 }
 
+/// The sine and cosine of a rotation angle, exact at quarter turns. CSS
+/// angles arrive as single-precision radians, whose quarter turns are not
+/// exact (`cos(90deg)` would be -4.4e-8, a sliver that scales with every
+/// following translation), so an angle within rounding of a multiple of 90°
+/// takes its exact values, as DOMMatrix's degree arithmetic does.
+pub(crate) fn sin_cos(radians: f32) -> (f32, f32) {
+    let quarters = radians / std::f32::consts::FRAC_PI_2;
+    let nearest = quarters.round();
+    if (quarters - nearest).abs() <= 4. * f32::EPSILON * nearest.abs().max(1.) {
+        return match (nearest as i64).rem_euclid(4) {
+            0 => (0., 1.),
+            1 => (1., 0.),
+            2 => (0., -1.),
+            _ => (-1., 0.),
+        };
+    }
+    radians.sin_cos()
+}
+
 /// Transforms 2 #Rotate3dDefined: `radians` about the normalized
 /// `[x, y, z]`; a vector that cannot be normalized applies no rotation.
 pub(crate) fn rotate(x: f32, y: f32, z: f32, radians: f32) -> Matrix3d {
@@ -68,7 +87,7 @@ pub(crate) fn rotate(x: f32, y: f32, z: f32, radians: f32) -> Matrix3d {
         return IDENTITY;
     }
     let (x, y, z) = (x / length, y / length, z / length);
-    let (s, c) = radians.sin_cos();
+    let (s, c) = sin_cos(radians);
     let t = 1. - c;
     [
         x * x * t + c,
@@ -382,6 +401,25 @@ mod tests {
 
     fn close(a: &Matrix3d, b: &Matrix3d) -> bool {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    #[test]
+    fn quarter_turns_are_exact() {
+        for (degrees, expected) in [
+            (0f32, (0., 1.)),
+            (90., (1., 0.)),
+            (180., (0., -1.)),
+            (270., (-1., 0.)),
+            (-90., (-1., 0.)),
+            (450., (1., 0.)),
+            (3600., (0., 1.)),
+        ] {
+            assert_eq!(sin_cos(degrees.to_radians()), expected, "{degrees}");
+        }
+        let (sin, cos) = sin_cos(45f32.to_radians());
+        assert!((sin - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6 && (sin - cos).abs() < 1e-6);
+        assert_ne!(sin_cos(90.01f32.to_radians()).1, 0.);
+        assert_eq!(rotate(1., 0., 0., 180f32.to_radians())[5], -1.);
     }
 
     #[test]

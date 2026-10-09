@@ -1532,7 +1532,7 @@ impl TransformStep {
         match self {
             Self::Translate(x, y) => Affine2d::translate(x, y),
             Self::Rotate(angle) => {
-                let (sin, cos) = angle.sin_cos();
+                let (sin, cos) = matrix3d::sin_cos(angle);
                 Affine2d([cos, sin, -sin, cos, 0., 0.])
             }
             Self::Scale(x, y) => Affine2d::scale(x, y),

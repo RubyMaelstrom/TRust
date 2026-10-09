@@ -52555,6 +52555,58 @@ mod tests {
     }
 
     #[test]
+    fn computed_transform_resolves_to_one_matrix() {
+        // CSS Transforms 2 #serialization-of-the-computed-value: a
+        // <transform-list> resolves to its post-multiplied matrix, matrix()
+        // when 2D and matrix3d() otherwise, with percentages of the reference
+        // box (CSS Transforms 1 #transform-box). GSAP parses this to find an
+        // element's current transform. The individual transform properties
+        // keep their computed values.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<!doctype html><style>body{margin:0}
+            #p::before{content:"x";display:block;font-size:20px;transform:rotate(90deg) translateX(1em)}
+            </style><div id=d style="width:200px;height:100px;font-size:10px"></div><div id=p></div>"#,
+        )));
+        let mut engine =
+            configured_engine(HostState::new(dom, Rc::new(RealmClock::new())), DEFAULT_URL);
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                const d = document.getElementById('d'), out = [];
+                const base = 'width:200px;height:100px;font-size:10px;';
+                for (const [value, extra] of [
+                    ['none'], ['translate(10px, 20px)'], ['translate(50%, 25%)'],
+                    ['translateX(2em) scale(.5)'],
+                    ['translate3d(-30PX, 0, 0) scale3d(1, 1, 1) rotateX(0) rotateY(0) rotateZ(0) skew(0, 0)'],
+                    ['rotate(45deg)'], ['translateZ(10px)'],
+                    ['perspective(100px) translateZ(10px)'],
+                    ['translate(calc(50% + 10px))'],
+                    ['translate(50%)', 'transform-box:content-box;padding:10px;box-sizing:border-box'],
+                    ['scale(2) translate(50%)', 'display:none'],
+                ]) {
+                    d.style.cssText = base + (extra || '');
+                    d.style.transform = value;
+                    out.push(getComputedStyle(d).transform);
+                }
+                out.push(getComputedStyle(document.getElementById('p'), '::before').transform);
+                d.style.cssText = base + 'translate: 10px 50%; rotate: 45deg; scale: .5';
+                const style = getComputedStyle(d);
+                out.push([style.translate, style.rotate, style.scale, style.transform].join(' '));
+                return out.join('|');
+            })()"#
+            ),
+            "none|matrix(1, 0, 0, 1, 10, 20)|matrix(1, 0, 0, 1, 100, 25)|\
+             matrix(0.5, 0, 0, 0.5, 20, 0)|matrix(1, 0, 0, 1, -30, 0)|\
+             matrix(0.707107, 0.707107, -0.707107, 0.707107, 0, 0)|\
+             matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 10, 1)|\
+             matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -0.01, 0, 0, 10, 0.9)|\
+             matrix(1, 0, 0, 1, 110, 0)|matrix(1, 0, 0, 1, 90, 0)|matrix(2, 0, 0, 2, 0, 0)|\
+             matrix(0, 1, -1, 0, 0, 20)|10px 50% 45deg 0.5 none"
+        );
+    }
+
+    #[test]
     fn visible_overflow_menu_is_not_misidentified_as_a_scroll_lock_target() {
         // CSS Overflow 3 #overflow-control: visible overflow is not a scroll
         // container, even when its scrolling area exceeds its border box.
