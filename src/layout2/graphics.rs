@@ -7850,6 +7850,16 @@ impl PaintColor {
         if let Ok(color) = svgtypes::Color::from_str(value) {
             return Some(Self::Rgba(color.red, color.green, color.blue, color.alpha));
         }
+        // CSS Color 4 #css-system-colors (and #deprecated-system-colors): a
+        // <color> whose value is the UA's own. Computed values carry the
+        // element's color scheme's (or the terminal's) color; without an
+        // element this is the light scheme's.
+        if let Some(system) = crate::dom::color_scheme::system_color(
+            value,
+            crate::dom::color_scheme::ColorScheme::Light,
+        ) {
+            return Self::parse_css(system);
+        }
         parse_modern_rgb(value)
             .or_else(|| parse_hsl(value))
             .or_else(|| parse_perceptual_or_p3(value))
@@ -7868,13 +7878,18 @@ impl PaintColor {
 fn parse_perceptual_or_p3(value: &str) -> Option<PaintColor> {
     use color::ColorSpaceTag::{Hwb, Lab, Lch, Oklab, Oklch};
     let origin = color::parse_color(value).ok()?;
-    let function = value.get(..value.find('(')?)?.trim();
-    let supported = if function.eq_ignore_ascii_case("color") {
-        true
-    } else if function.eq_ignore_ascii_case("hwb") {
-        origin.cs == Hwb
-    } else {
-        matches!(origin.cs, Lab | Lch | Oklab | Oklch)
+    let function = value.get(..value.find('(')?)?.trim().to_ascii_lowercase();
+    // The modern rgb() and hsl() syntax, which (unlike the legacy comma
+    // syntax) accepts `none` for a missing component (CSS Color 4
+    // #rgb-functions, #the-hsl-notation, #missing): the forms the plain
+    // parsers above leave to this one.
+    let modern = !function_body(value).is_some_and(|body| body.contains(','));
+    let supported = match function.as_str() {
+        "color" => true,
+        "hwb" => origin.cs == Hwb,
+        "rgb" | "rgba" => modern && origin.cs == color::ColorSpaceTag::Srgb,
+        "hsl" | "hsla" => modern && origin.cs == color::ColorSpaceTag::Hsl,
+        _ => matches!(origin.cs, Lab | Lch | Oklab | Oklch),
     };
     if !supported
         || !origin
@@ -11229,6 +11244,31 @@ mod tests {
         assert_eq!(
             PaintColor::parse_css("rebeccapurple"),
             Some(PaintColor::Rgba(102, 51, 153, 255))
+        );
+    }
+
+    #[test]
+    fn missing_components_and_system_colors_paint() {
+        // CSS Color 4 #missing: `none` is zero when painted, and valid only in
+        // the modern syntax. #css-system-colors: a system color paints as the
+        // UA's color (here the light scheme's; no terminal cell font).
+        assert_eq!(
+            PaintColor::parse_css("rgb(none 128 0)"),
+            Some(PaintColor::Rgba(0, 128, 0, 255))
+        );
+        assert_eq!(
+            PaintColor::parse_css("hsl(none 100% 50% / none)"),
+            Some(PaintColor::Rgba(255, 0, 0, 0))
+        );
+        assert_eq!(PaintColor::parse_css("rgba(none, 0, 0)"), None);
+        assert_eq!(PaintColor::parse_css("hsl(none, 100%, 50%)"), None);
+        assert_eq!(
+            PaintColor::parse_css("LinkText"),
+            Some(PaintColor::Rgba(0, 0, 238, 255))
+        );
+        assert_eq!(
+            PaintColor::parse_css("ThreeDDarkShadow"),
+            Some(PaintColor::Rgba(118, 118, 118, 255))
         );
     }
 

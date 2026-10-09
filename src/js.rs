@@ -334,6 +334,10 @@ pub enum PageCmd {
         url: String,
         delta: i32,
     },
+    /// The number of entries in the top-level traversable's session history,
+    /// which the frontend owns; it reports the number whenever it changes
+    /// (HTML #script-closable, for `window.close()`).
+    SessionHistorySize(usize),
     PointerLockResult {
         request: u64,
         error: Option<String>,

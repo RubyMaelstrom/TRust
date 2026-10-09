@@ -5342,6 +5342,15 @@ mod desktop {
                 checkpoint(page, method);
                 finish_task_with_ack(page, events, false)
             }
+            PageCmd::SessionHistorySize(size) => {
+                let _ = call_trust(
+                    page,
+                    "setSessionHistorySize",
+                    &[Value::Num(size as f64)],
+                    "session history size",
+                );
+                true
+            }
             PageCmd::InputModifiers(modifiers) => {
                 prepare_interaction(page, interrupt);
                 let metadata = crate::js::PointerMetadata {
@@ -26186,6 +26195,254 @@ mod tests {
             "#
                 ),
                 "false,false,false,false|true|true|false|true||get closed|TypeError",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_close_closes_only_a_script_closable_familiar_top_level_traversable() {
+        // HTML #dom-window-close (local whatwg/html e5071a20): only a
+        // top-level traversable closes, once (#is-closing), when it is
+        // script-closable (a session history of one entry, which the frontend
+        // reports), the incumbent is familiar with it and allowed by
+        // sandboxing to navigate it. A child navigable's WindowProxy returns
+        // at step 2, through the cross-origin surface too. TRust keeps its
+        // only top-level traversable open (tabs are deferred): the definitely
+        // close task logs a warning and clears "is closing".
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                globalThis.log = [];
+                const d = Object.getOwnPropertyDescriptor(window, 'close');
+                log.push([d.writable, d.enumerable, d.configurable, d.value.name, d.value.length].join());
+                close(); log.push('unknown:' + closed);
+                __trust.setSessionHistorySize(2); close(); log.push('two:' + closed);
+                __trust.setSessionHistorySize(1); window.close(); log.push('one:' + closed);
+                window.close(); log.push('again:' + closed + ':' + __trust.logs.length);
+                let illegal = 'none';
+                try { window.close.call({}); } catch (e) { illegal = e.name; }
+                log.push(illegal);
+                log.join('|')
+            "#
+                ),
+                "true,true,true,close,0|unknown:false|two:false|one:true|again:true:0|TypeError",
+                "{tier:?}"
+            );
+            settle_platform_tasks(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const warning = __trust.logs.filter(line => line.startsWith('warn: window.close()')).length;
+                const settled = closed;
+                const html = document.createElement('html'), body = document.createElement('body');
+                document.appendChild(html); html.appendChild(body);
+                const frame = document.createElement('iframe');
+                body.append(frame);
+                __trust.hydrateFrames();
+                const child = frame.contentWindow;
+                child.close();
+                const childClosed = [child.closed, closed].join();
+                child.Function('top.close()')();
+                [warning, settled, childClosed, closed].join('|')
+            "#
+                ),
+                "1|false|false,false|true",
+                "{tier:?}"
+            );
+            settle_platform_tasks(&mut engine);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const before = closed;
+                const opaque = document.createElement('iframe');
+                opaque.src = 'data:text/html,<script>window.close(); parent.close()</script>';
+                document.body.append(opaque);
+                __trust.hydrateFrames();
+                const foreign = opaque.contentWindow;
+                foreign.close();
+                [before, closed, foreign.closed, typeof foreign.close].join('|')
+            "#
+                ),
+                "false|true|false|function",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn html_svg_and_mathml_members_live_on_their_interfaces() {
+        // HTML #htmlelement and #htmlorsvgelement (local whatwg/html
+        // e5071a20), CSSOM #elementcssinlinestyle, CSSOM View
+        // #extensions-to-the-htmlelement-interface, and DOM #interface-node,
+        // #interface-parentnode and #interface-childnode (local whatwg/dom
+        // a2331a45): Element.prototype holds none of HTMLElement's members,
+        // the HTMLOrSVGOrMathMLElement mixin's members are on every including
+        // interface with their own function objects (Web IDL #es-operations),
+        // an Attr is no ChildNode, and the mixins' [Unscopable] members are
+        // listed on each including prototype.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const own = (C, name) => Object.prototype.hasOwnProperty.call(C.prototype, name);
+                const where = name => [Node, Element, HTMLElement, SVGElement, MathMLElement, CharacterData,
+                    DocumentType, Document, DocumentFragment, ShadowRoot].filter(C => own(C, name))
+                    .map(C => C.name).join('+');
+                const names = ['click', 'title', 'hidden', 'offsetTop', 'focus', 'blur', 'tabIndex', 'dataset',
+                    'autofocus', 'nonce', 'style', 'nodeType', 'nodeName', 'remove', 'append', 'tagName',
+                    'nodeValue', 'ownerDocument', 'baseURI', 'children', 'querySelector', 'getElementById'];
+                const out = names.map(name => name + ':' + where(name));
+                const other = document.createElementNS('urn:x', 'x');
+                const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                const math = document.createElementNS('http://www.w3.org/1998/Math/MathML', 'math');
+                out.push(['click', 'focus', 'style', 'dataset', 'tabIndex', 'title'].filter(name => name in other).join());
+                out.push([typeof svg.focus, typeof math.blur, typeof svg.click, svg.tabIndex, math.tabIndex].join());
+                svg.tabIndex = 2; svg.dataset.fooBar = 'x'; math.style.color = 'red';
+                out.push([svg.getAttribute('tabindex'), svg.getAttribute('data-foo-bar'), math.getAttribute('style')].join());
+                out.push([HTMLElement.prototype.focus !== SVGElement.prototype.focus,
+                    HTMLElement.prototype.focus.length, SVGElement.prototype.focus.name,
+                    Object.getOwnPropertyDescriptor(MathMLElement.prototype, 'tabIndex').get.name,
+                    Element.prototype.remove !== CharacterData.prototype.remove].join());
+                const host = document.createElement('div'), shadow = host.attachShadow({mode: 'open'});
+                shadow.innerHTML = '<b id=x></b>';
+                out.push([typeof document.createAttribute('a').remove, typeof document.createTextNode('t').append,
+                    typeof document.after, document.createComment('c').nodeName,
+                    document.createDocumentFragment().nodeType, document.ownerDocument,
+                    document.createTextNode('t').nodeValue, shadow.getElementById('x') === shadow.firstElementChild,
+                    shadow.querySelector('b').id, shadow.childElementCount].join());
+                out.push([Element, Document, DocumentFragment, CharacterData, DocumentType, Node].map(C => {
+                    const u = C.prototype[Symbol.unscopables];
+                    return u ? Object.keys(u).join(' ') + (Object.getPrototypeOf(u) === null ? '' : '!') : '-';
+                }).join('/'));
+                out.join('|')
+            "#
+                ),
+                "click:HTMLElement|title:HTMLElement+Document|hidden:HTMLElement+Document|\
+                 offsetTop:HTMLElement|focus:HTMLElement+SVGElement+MathMLElement|\
+                 blur:HTMLElement+SVGElement+MathMLElement|tabIndex:HTMLElement+SVGElement+MathMLElement|\
+                 dataset:HTMLElement+SVGElement+MathMLElement|autofocus:HTMLElement+SVGElement+MathMLElement|\
+                 nonce:HTMLElement+SVGElement+MathMLElement|style:HTMLElement+SVGElement+MathMLElement|\
+                 nodeType:Node|nodeName:Node|remove:Element+CharacterData+DocumentType|\
+                 append:Element+Document+DocumentFragment|tagName:Element|nodeValue:Node|\
+                 ownerDocument:Node|baseURI:Node|children:Element+Document+DocumentFragment|\
+                 querySelector:Element+Document+DocumentFragment|getElementById:Document+DocumentFragment||\
+                 function,function,undefined,-1,-1|2,x,color: red;|true,0,focus,get tabIndex,true|\
+                 undefined,undefined,undefined,#comment,11,,t,true,x,1|\
+                 slot prepend append replaceChildren before after replaceWith remove/\
+                 prepend append replaceChildren/prepend append replaceChildren/\
+                 before after replaceWith remove/before after replaceWith remove/-",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn css_color_4_missing_components_and_system_colors_parse_and_compute() {
+        // CSS Color 4 #missing, #css-system-colors, #deprecated-system-colors
+        // and #serializing-sRGB-values (local w3c/csswg-drafts 81c27f68):
+        // `none` is valid in the modern syntax of every color function, not
+        // the legacy comma syntax; an rgb() with a missing component
+        // serializes as color(srgb …) and hsl()/hwb() keep their own
+        // function. A system color is a <color> whose declared value is the
+        // lowercase keyword and whose computed value is the UA's color (here
+        // the light scheme's, and Canvas/CanvasText of the dark scheme).
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const values = ['rgb(none 0 0)', 'rgb(10% none 5% / none)', 'hsl(none 50% 50%)', 'hwb(20 none 30%)',
+                    'lab(none 0 0)', 'oklch(0.5 none 120)', 'color(display-p3 1 none 0)', 'rgba(none, 0, 0)',
+                    'hsl(none, 50%, 50%)', 'LinkText', 'Canvas', 'ThreeDFace', 'NotAColor'];
+                const out = values.map(value => {
+                    const el = document.createElement('div');
+                    el.style.color = value;
+                    return CSS.supports('color', value) + ':' + el.style.color;
+                });
+                const style = document.createElement('style');
+                style.textContent = '.a{color:LinkText;background-color:Canvas;border-top-color:ButtonBorder;' +
+                    'outline-color:VisitedText} .b{color:hsl(none 100% 50%)} .d{color-scheme:dark;color:CanvasText;' +
+                    'background-color:Canvas}';
+                document.head.append(style);
+                out.push(style.sheet.cssRules[0].style.cssText);
+                const computed = cls => {
+                    const el = document.createElement('div');
+                    el.className = cls;
+                    document.body.append(el);
+                    const cs = getComputedStyle(el);
+                    return [cs.color, cs.backgroundColor, cs.borderTopColor, cs.outlineColor].join(';');
+                };
+                out.push(computed('a'), computed('b'), computed('d'));
+                out.join('|')
+            "#
+                ),
+                "true:color(srgb none 0 0)|true:color(srgb 0.1 none 0.05 / none)|true:hsl(none 50% 50%)|\
+                 true:hwb(20 none 30%)|true:lab(none 0 0)|true:oklch(0.5 none 120)|\
+                 true:color(display-p3 1 none 0)|false:|false:|true:linktext|true:canvas|\
+                 true:threedface|false:|\
+                 color: linktext; background-color: canvas; border-top-color: buttonborder; \
+                 outline-color: visitedtext;|\
+                 rgb(0, 0, 238);rgb(255, 255, 255);rgb(118, 118, 118);rgb(85, 26, 139)|\
+                 hsl(none 100% 50%);rgba(0, 0, 0, 0);hsl(none 100% 50%);hsl(none 100% 50%)|\
+                 rgb(251, 251, 254);rgb(28, 27, 34);rgb(251, 251, 254);rgb(251, 251, 254)",
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn font_family_serialization_keeps_the_authors_family_names() {
+        // CSSOM #serialize-a-css-value and CSS Fonts 4 #family-name-syntax
+        // (local w3c/csswg-drafts 81c27f68): a family name is a string or a
+        // sequence of identifiers whose case is the author's (they match
+        // case-insensitively but are not keywords); generic families and
+        // CSS-wide keywords are keywords. Identifiers join with single
+        // spaces and strings serialize per CSSOM #serialize-a-string.
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = platform_engine_with_body();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                string_value(
+                    &mut engine,
+                    r#"
+                const el = document.createElement('div');
+                const out = [];
+                el.style.fontFamily = "  Times   New Roman ,MONOSPACE, 'Helvetica Neue', \"Serif\", System-UI";
+                out.push(el.style.fontFamily);
+                el.style.fontFamily = 'INHERIT';
+                out.push(el.style.fontFamily);
+                el.style.font = 'Italic Bold 12px/30px Georgia, SANS-SERIF';
+                out.push(el.style.fontFamily);
+                const style = document.createElement('style');
+                style.textContent = '.f{font-family:"A\\"b", My   Font, CURSIVE} .g{font:10px Courier New, Fantasy}';
+                document.head.append(style);
+                out.push(style.sheet.cssRules[0].style.fontFamily, style.sheet.cssRules[1].style.fontFamily);
+                const probe = document.createElement('p');
+                probe.className = 'f';
+                document.body.append(probe);
+                out.push(getComputedStyle(probe).fontFamily);
+                out.join('|')
+            "#
+                ),
+                "Times New Roman, monospace, \"Helvetica Neue\", \"Serif\", system-ui|inherit|\
+                 Georgia, sans-serif|\"A\\\"b\", My Font, cursive|Courier New, fantasy|\
+                 \"A\\\"b\", My Font, cursive",
                 "{tier:?}"
             );
         }

@@ -383,6 +383,17 @@ current behavior and limits; consult the governing standards before changing it.
   preserves the live page/scripts, updates the address, and restores scrolling
   through Back/Forward. Desktop pointer lock releases on Escape, focus loss, or
   navigation; the terminal frontend reports it unsupported.
+- `window.close()` runs HTML's checks on a top-level traversable: "is
+  closing", script-closable (the frontends report the session history size
+  with `PageCmd::SessionHistorySize`; until then it is not), familiar with,
+  and allowed by sandboxing to navigate. Child navigables' WindowProxies do
+  nothing. TRust has one top-level traversable and no tabs or pop-ups, so
+  actually closing it is deferred to the tabs design: rather than quit, the
+  definitely-close task logs a console warning and clears "is closing".
+- CSS system colors (`Canvas`, `LinkText`, …) compute to the colors the
+  frontend paints: the element's light or dark scheme palette graphically,
+  `crate::theme` on threads using the terminal cell font
+  (`dom::color_scheme::system_color`).
 - Escape on a live page is HTML's close request in both frontends
   (`PageCmd::CloseRequest`, answered by `PageEvt::CloseRequestHandled`): the
   actor exits fullscreen, else fires the Escape keydown (canceling it consumes

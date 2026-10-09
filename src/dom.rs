@@ -5965,7 +5965,11 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             Some(value) => {
                 Some(color_scheme::resolve(&value, self.color_scheme(id)).unwrap_or(value))
             }
-            None if name == "color" && self.color_scheme(id) == color_scheme::ColorScheme::Dark => {
+            // The terminal paints its own CanvasText whatever the scheme.
+            None if name == "color"
+                && (self.color_scheme(id) == color_scheme::ColorScheme::Dark
+                    || crate::text::cell_metrics().is_some()) =>
+            {
                 color_scheme::system_color("canvastext", color_scheme::ColorScheme::Dark)
                     .map(String::from)
             }
@@ -6667,7 +6671,7 @@ impl Dom {
 
     /// The resolved value of color property `name` whose computed value is
     /// `color`: `currentcolor` is the element's (for `color`, its parent's)
-    /// color, and system colors use the light palette TRust renders with.
+    /// color, and a system color is the one TRust paints for the element.
     fn cssom_color(&self, id: NodeId, name: &str, color: &str) -> String {
         // A color function that mentions `currentcolor` resolves with the
         // element's color (for `color` itself that was already its parent's).
@@ -6694,19 +6698,11 @@ impl Dom {
         if let Some(resolved) = properties::resolved_color(color) {
             return resolved;
         }
-        match color.trim().to_ascii_lowercase().as_str() {
-            "canvas" | "field" | "buttonface" => "rgb(255, 255, 255)".into(),
-            "canvastext" | "fieldtext" | "buttontext" | "highlighttext" | "selecteditemtext"
-            | "marktext" | "accentcolortext" => "rgb(0, 0, 0)".into(),
-            "linktext" => "rgb(0, 0, 238)".into(),
-            "visitedtext" => "rgb(85, 26, 139)".into(),
-            "activetext" => "rgb(255, 0, 0)".into(),
-            "graytext" => "rgb(109, 109, 109)".into(),
-            "buttonborder" => "rgb(118, 118, 118)".into(),
-            "highlight" | "selecteditem" | "accentcolor" => "rgb(0, 120, 215)".into(),
-            "mark" => "rgb(255, 255, 0)".into(),
-            _ => color.to_string(),
-        }
+        // CSS Color 4 #resolving-other-colors: a system color resolves to the
+        // color of the element's color scheme TRust paints with.
+        color_scheme::system_color(color, self.color_scheme(id))
+            .and_then(properties::resolved_color)
+            .unwrap_or_else(|| color.to_string())
     }
 }
 
@@ -21033,6 +21029,10 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
         )
     {
         v.to_string()
+    } else if k == "font-family" {
+        normalize_font_family(v)
+    } else if k == "font" {
+        normalize_font_shorthand(v)
     } else {
         normalize_css_value(v)
     };
@@ -21499,6 +21499,129 @@ fn normalize_css_value(value: &str) -> String {
         out.extend(c.to_lowercase());
     }
     out
+}
+
+/// CSS Fonts 4 #generic-family-name-syntax: the `<generic-font-complete>`
+/// and `<generic-font-incomplete>` keywords. Any other identifier sequence
+/// in a family list is a family name (the script-specific generics are the
+/// `generic()` function).
+fn is_generic_font_family(name: &str) -> bool {
+    [
+        "serif",
+        "sans-serif",
+        "system-ui",
+        "cursive",
+        "fantasy",
+        "math",
+        "monospace",
+        "ui-serif",
+        "ui-sans-serif",
+        "ui-monospace",
+        "ui-rounded",
+    ]
+    .iter()
+    .any(|generic| name.eq_ignore_ascii_case(generic))
+}
+
+/// A `font-family` value's declared form (CSS Fonts 4 #font-family-prop and
+/// #family-name-syntax, CSSOM #serialize-a-css-value): a family name is a
+/// string or a sequence of identifiers, whose case is the author's (family
+/// names match ASCII case-insensitively, but they are not keywords); only
+/// generic families and CSS-wide keywords are keywords, which serialize in
+/// lowercase. A quoted name serializes as CSSOM's #serialize-a-string; the
+/// identifiers of an unquoted name serialize as CSSOM's
+/// #serialize-an-identifier, joined by single spaces.
+fn normalize_font_family(value: &str) -> String {
+    let value = value.trim();
+    if wide_keyword(value).is_some() {
+        return value.to_ascii_lowercase();
+    }
+    if find_var_function(value).is_some() {
+        return normalize_css_value(value);
+    }
+    split_top_level(value, ',')
+        .into_iter()
+        .map(|family| {
+            let family = family.trim();
+            // A generic(...) family function keeps its keyword arguments'
+            // case-insensitivity through ordinary normalization.
+            if family.contains('(') {
+                return normalize_css_value(family);
+            }
+            serialize_family_name(family).unwrap_or_else(|| family.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One `<family-name>` or generic keyword of a family list, re-serialized
+/// from its tokens: a lone string, or a sequence of identifiers (of which a
+/// lone generic keyword is lowercased). `None` for anything else, which is
+/// kept as written.
+fn serialize_family_name(family: &str) -> Option<String> {
+    let mut parser = cssparser::Parser::new(family);
+    let mut out = String::new();
+    if let Ok(name) = parser.try_parse(|p| p.expect_string_cloned()) {
+        parser.expect_exhausted().ok()?;
+        cssparser::serialize_string(&name, &mut out).ok()?;
+        return Some(out);
+    }
+    let mut words = Vec::new();
+    while !parser.is_exhausted() {
+        words.push(parser.expect_ident_cloned().ok()?);
+    }
+    match words.as_slice() {
+        [] => None,
+        [word] if is_generic_font_family(word) => Some(word.to_ascii_lowercase()),
+        _ => {
+            for (index, word) in words.iter().enumerate() {
+                if index > 0 {
+                    out.push(' ');
+                }
+                cssparser::serialize_identifier(word, &mut out).ok()?;
+            }
+            Some(out)
+        }
+    }
+}
+
+/// The `font` shorthand's declared form: its keywords, size and line height
+/// in lowercase and its trailing family list as `normalize_font_family`
+/// keeps it (CSS Fonts 4 #font-prop). A value without a font size (a system
+/// font keyword, or invalid) is all keywords.
+fn normalize_font_shorthand(value: &str) -> String {
+    if wide_keyword(value).is_some() || find_var_function(value).is_some() {
+        return normalize_css_value(value);
+    }
+    let tokens = split_top_level_ws(value);
+    let mut family_start = None;
+    for (index, token) in tokens.iter().enumerate() {
+        let size = split_top_level_slash(token).map_or(*token, |(size, _)| size);
+        if font_size_token(&size.to_ascii_lowercase()) {
+            let mut next = index + 1;
+            if split_top_level_slash(token).is_none()
+                && let Some(following) = tokens.get(next)
+            {
+                if *following == "/" {
+                    next += 2;
+                } else if following.starts_with('/') {
+                    next += 1;
+                }
+            }
+            family_start = Some(next.min(tokens.len()));
+            break;
+        }
+    }
+    let Some(start) = family_start else {
+        return normalize_css_value(value);
+    };
+    let head = normalize_css_value(&tokens[..start].join(" "));
+    let family = tokens[start..].join(" ");
+    if family.is_empty() {
+        head
+    } else {
+        format!("{head} {}", normalize_font_family(&family))
+    }
 }
 
 /// The pseudo-element a rule's subject (last compound) targets, if any.
@@ -23668,6 +23791,36 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_family_declared_values_keep_the_authors_names() {
+        // CSS Fonts 4 #family-name-syntax and #generic-family-name-syntax,
+        // CSSOM #serialize-a-string and #serialize-an-identifier.
+        let cases = [
+            ("Arial,SANS-SERIF", "Arial, sans-serif"),
+            (
+                "  Times   New\tRoman , Monospace",
+                "Times New Roman, monospace",
+            ),
+            (
+                "'Helvetica Neue', \"Serif\"",
+                "\"Helvetica Neue\", \"Serif\"",
+            ),
+            ("'a\\'b\\\\c'", "\"a'b\\\\c\""),
+            ("\\31 23, UI-Rounded, Emoji", "\\31 23, ui-rounded, Emoji"),
+            ("Generic(FangSong), Math", "generic(fangsong), math"),
+            ("INHERIT", "inherit"),
+            ("var(--Fam), serif", "var(--Fam), serif"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(normalize_font_family(value), expected, "{value}");
+        }
+        assert_eq!(
+            normalize_font_shorthand("Italic Bold 12PX/30px  Georgia, SERIF"),
+            "italic bold 12px/30px Georgia, serif"
+        );
+        assert_eq!(normalize_font_shorthand("CAPTION"), "caption");
+    }
 
     #[test]
     fn css_urls_follow_css_syntax_token_values() {

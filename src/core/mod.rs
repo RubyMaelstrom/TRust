@@ -642,6 +642,10 @@ pub struct BrowserController {
     occluded: bool,
     back: Vec<HistoryEntry>,
     forward: Vec<HistoryEntry>,
+    /// The live page has not yet been told the current session history size
+    /// (`PageCmd::SessionHistorySize`, HTML #script-closable): set when a
+    /// page attaches and when its history grows.
+    session_history_unsent: bool,
     pending: Option<PendingNavigation>,
     task: Option<JoinHandle<()>>,
     declarative_refresh_task: Option<JoinHandle<()>>,
@@ -744,6 +748,7 @@ impl BrowserController {
             occluded: false,
             back: Vec::new(),
             forward: Vec::new(),
+            session_history_unsent: false,
             pending: None,
             task: None,
             declarative_refresh_task: None,
@@ -1616,6 +1621,7 @@ impl BrowserController {
                 break;
             }
         }
+        self.sync_session_history();
         self.rx.wake_if_pending();
         self.animation_frames_only =
             animation_frames == Some(true) && self.generation == generation_before;
@@ -2752,6 +2758,19 @@ impl BrowserController {
             .is_some_and(|handle| handle.cmds.try_send(command).is_ok())
     }
 
+    /// Report the session history size (the back and forward entries around
+    /// the current one) to the live page when it changed: its
+    /// `window.close()` needs it (HTML #script-closable). A full channel
+    /// leaves it unsent, so the next round retries.
+    fn sync_session_history(&mut self) {
+        let size = self.back.len() + 1 + self.forward.len();
+        if self.session_history_unsent
+            && self.send_live(crate::js::PageCmd::SessionHistorySize(size))
+        {
+            self.session_history_unsent = false;
+        }
+    }
+
     fn send_user(&mut self, command: crate::js::PageCmd) -> bool {
         self.queue_user_input(command, false)
     }
@@ -2875,6 +2894,7 @@ impl BrowserController {
 
     fn attach_live_page(&mut self, generation: u64, mut live: http::LivePage) {
         self.live_page = Some(live.handle);
+        self.session_history_unsent = true;
         let tx = self.tx.clone();
         self.live_task = Some(self.runtime.spawn(async move {
             while let Some(event) = live.events.recv().await {
@@ -3247,6 +3267,7 @@ impl BrowserController {
         if !replace {
             self.back.extend(self.same_document_history_entry());
             self.forward.clear();
+            self.session_history_unsent = true;
         }
         let live = self.live_page.is_some();
         let Some(page) = self.current.as_mut() else {
@@ -5582,6 +5603,47 @@ mod tests {
         let (video, referrer) = browser.take_external_media().unwrap();
         assert_eq!(video.as_str(), "https://www.youtube.com/watch?v=spa123");
         assert_eq!(referrer.as_ref(), Some(&source));
+    }
+
+    #[test]
+    fn the_live_page_learns_the_session_history_size() {
+        // HTML #script-closable: window.close() needs the top-level
+        // traversable's session history size, which only the frontend has.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        browser.current = Some(BrowserPage {
+            target: Link::Http(url::Url::parse("https://example.test/start").unwrap()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: "Ready".into(),
+            rendered: None,
+            rendered_revision: 0,
+            revision: 1,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        // As `attach_live_page` marks a newly attached page.
+        browser.session_history_unsent = true;
+        browser.process_async_events();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::SessionHistorySize(1))
+        ));
+        browser.process_async_events();
+        assert!(rx.try_recv().is_err(), "an unchanged size is not resent");
+        browser.handle_page_event(crate::js::PageEvt::HistoryUpdate {
+            url: String::from("https://example.test/pushed"),
+            replace: false,
+        });
+        browser.process_async_events();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::SessionHistorySize(2))
+        ));
     }
 
     #[test]

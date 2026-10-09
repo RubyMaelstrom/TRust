@@ -109,6 +109,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     function requireNodeReceiver(object) {
         if (nodeIds.get(object) === undefined) throw new TypeError("Illegal invocation");
     }
+    // DOM #dom-node-nodetype for a Node wrapper (an Attr has no arena node).
+    function nodeTypeOf(node) {
+        const record = internalSlots.get(node);
+        if (record !== undefined && record.nodeType !== undefined) return record.nodeType;
+        const id = nodeIds.get(node);
+        if (id !== undefined) return (internalsFor(node).nodeType = __dom_node_type(id));
+        if (internalsOf(node).attrNode) return 2;
+        throw new TypeError("Illegal invocation");
+    }
     function internalsOf(object) {
         return internalSlots.get(object) || noInternals;
     }
@@ -182,12 +191,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             renderingChildrenCache = [];
         }
     };
-    // HTML #dom-window-closed: this Window's navigable has been destroyed
-    // (its iframe removed). Navigation keeps the browsing context, so it
-    // does not close the Window it replaces; the record is the navigable's.
-    let navigableRecord = {closed: false};
+    // HTML #dom-window-closed: this Window's browsing context is null (its
+    // navigable was destroyed: its iframe removed) or its top-level
+    // traversable's "is closing" is true (#dom-window-close). Navigation
+    // keeps the browsing context, so it does not close the Window it
+    // replaces; the record is the navigable's.
+    let navigableRecord = {closed: false, closing: false};
     trust.adoptNavigableRecord = function (record) { navigableRecord = record; };
-    trust.navigableClosed = function () { return navigableRecord.closed; };
+    trust.navigableClosed = function () { return navigableRecord.closed || navigableRecord.closing === true; };
     trust.detachChildWindow = function (childWindow) {
         const childTrust = childWindow && trustOf(childWindow);
         if (childTrust) {
@@ -7857,21 +7868,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             nodeIds.set(this, id);
         }
         // An Attr has no arena node (DOM #interface-attr): nodeType 2.
-        get nodeType() {
-            const id = nodeIds.get(this);
-            if (id !== undefined) return __dom_node_type(id);
-            if (internalsOf(this).attrNode) return 2;
-            throw new TypeError("Illegal invocation");
-        }
+        // DOM #dom-node-nodetype and #dom-node-nodename are Node's alone
+        // (Web IDL: no inheriting interface redefines them). A node's type
+        // never changes, so its wrapper keeps it in an internal slot.
+        get nodeType() { return nodeTypeOf(this); }
         get nodeName() {
-            const t = __dom_tag(nodeIds.get(this));
-            if (t) return t.toUpperCase();
-            const n = this.nodeType;
-            // DOM #dom-node-nodename: a doctype's nodeName is its name and
-            // an Attr's its qualified name.
-            if (n === 10) return doctypeInfo(this)[0];
-            if (n === 2) return attrState(this).qualifiedName;
-            return n === 3 ? "#text" : n === 9 ? "#document" : n === 8 ? "#comment" : n === 11 ? "#document-fragment" : "#node";
+            switch (nodeTypeOf(this)) {
+                case 1: return elementTagName(this);
+                case 2: return attrState(this).qualifiedName;
+                case 3: return "#text";
+                case 4: return "#cdata-section";
+                case 7: return __dom_pi_target(nodeIds.get(this));
+                case 8: return "#comment";
+                case 9: return "#document";
+                case 10: return doctypeInfo(this)[0];
+                default: return "#document-fragment";
+            }
         }
         // DOM §4.4 Node.baseURI: every node reports the serialized document
         // base URL of its node document, even when another Window is the
@@ -7952,9 +7964,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (removed.length) processTrackChanges();
         }
         get nodeValue() {
-            const t = this.nodeType;
+            const t = nodeTypeOf(this);
             if (t === 2) return attrValue(attrState(this));
-            return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(nodeIds.get(this)) : null;
+            return t === 3 || t === 4 || t === 7 || t === 8 ? __dom_text(nodeIds.get(this)) || "" : null;
         }
         set nodeValue(v) {
             if (internalsOf(this).attrNode) setAttrValue(attrState(this), v == null ? "" : String(v));
@@ -7975,6 +7987,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // the live document for every node made cross-document adoption
         // indistinguishable from a no-op.
         get ownerDocument() {
+            // DOM #dom-node-ownerdocument: null for a document. ProseMirror's
+            // shadow-root getSelection shim (`n.ownerDocument.getSelection()`)
+            // recursed forever when `document.ownerDocument === document`.
+            if (nodeTypeOf(this) === 9) return null;
             const document = __dom_owner_document(this);
             // DOM #concept-node-adopt: an element's attributes share its node
             // document; a detached Attr keeps its own.
@@ -9169,7 +9185,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // `nodeName`/`tagName` getters were ~8% of Steam's settle phase; a
         // getter-hammering micro-bench runs ~25% faster). The Web IDL brand
         // check is one internal-slot lookup, still no syscall.
-        get nodeType() { requireNodeReceiver(this); return 1; }
         // Cached localName. NAMESPACED `__trustLN` (not the obvious `__ln`)
         // because page code writes its OWN expandos onto our node wrappers and a
         // 2-char name collides: YouTube/Polymer stores a MutationObserver
@@ -9188,7 +9203,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return slots.trustPrefix;
         }
         get tagName() { return elementTagName(this); }
-        get nodeName() { return elementTagName(this); }
         // DOM Slottable.assignedSlot: finding a slot with the `open` flag
         // hides slots whose root is closed, while event dispatch uses the
         // unfiltered internal relation above.
@@ -9648,7 +9662,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             try { activateClick(this, false, false); } catch (e) {}
             finally { internalsFor(this).trustClickInProgress = false; }
         }
-        focus(options) {
+        // `optional FocusOptions options = {}`: an optional argument, so
+        // the operation's length is 0 (Web IDL #es-operations).
+        focus(options = undefined) {
             // HTML #dom-focus: focusVisible decides whether to indicate focus;
             // without it, Selectors 4's heuristic carries the previous
             // focus's indication over to a focus move made by script.
@@ -16441,6 +16457,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                                     frameViewportDimension(frame, "height")];
                             });
                         },
+                        // HTML #dom-window-close: a child navigable is not a
+                        // top-level traversable, so close() returns at step 2.
+                        close() {},
                         focus() {}, blur() {},
                         addEventListener() {}, removeEventListener() {},
                     };
@@ -16527,8 +16546,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // Node's `textContent` (on a text node) all route here, so the
         // characterData MutationRecord is emitted from this one setter.
         set data(v) { this.replaceData(0, this.length, v === null ? "" : String(v)); }
-        get nodeValue() { return this.data; }
-        set nodeValue(v) { this.data = v; }
         get length() { return this.data.length; }
         // offset/count are WebIDL `unsigned long` — ToUint32 (`>>> 0`) maps a
         // negative like `-2**32 + 2` to 2; `offset > length` is an
@@ -16563,8 +16580,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super(id);
             rememberWrapper(id, this);
         }
-        get nodeType() { requireNodeReceiver(this); return 3; }
-        get nodeName() { requireNodeReceiver(this); return "#text"; }
         splitText(offset) {
             // DOM §4.10: split at a UTF-16 boundary, retaining the original
             // node for the prefix and inserting the new node after it.
@@ -16791,19 +16806,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 documentURLs.set(this, "about:blank");
             }
         }
-        get nodeType() { requireNodeReceiver(this); return 9; }
-        get nodeName() { requireNodeReceiver(this); return "#document"; }
         get [Symbol.toStringTag]() { return "Document"; }
         // HTML #dom-document-all: [SameObject] HTMLAllCollection, one per
         // Document (see documentAllCollection). The cache lookup never tests
         // the falsy [[IsHTMLDDA]] value's truthiness.
         get all() { return documentAllCollection(this); }
-        // A document has NO owner document (DOM §`Document` overrides Node's
-        // `ownerDocument` to null). Inheriting Node's "return the document" here
-        // made `document.ownerDocument === document`, which sent ProseMirror's
-        // shadow-root getSelection shim (`() => n.ownerDocument.getSelection()`)
-        // into infinite recursion when it patched a missing `document.getSelection`.
-        get ownerDocument() { return null; }
         // HTML §6.6.6 DocumentOrShadowRoot.activeElement getter. The viewport
         // focus fallback is body/documentElement, never JavaScript undefined.
         get activeElement() { return activeElementFor(this); }
@@ -16893,10 +16900,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (slot[2]) throw new DOMException("Cookie access requires a non-opaque origin.", "SecurityError");
             __cookie_set(slot[0], slot[1], slot[3], String(v));
         }
-        // HTML §2.4.3: the document base URL is used by relative URL APIs,
-        // including new URL("_framework/dotnet.js", document.baseURI).
-        // document.URL is the document URL and may differ when <base> exists.
-        get baseURI() { return nodeBaseHref(this); }
         // The document's origin domain. Spec returns the origin's effective
         // domain (the host); a terminal browser has no frames, so the host IS
         // the domain. The setter is the legacy same-origin relaxation — store
@@ -18161,8 +18164,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super(created);
             rememberWrapper(created, this);
         }
-        get nodeType() { requireNodeReceiver(this); return 11; }
-        get nodeName() { requireNodeReceiver(this); return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "DocumentFragment"; }
         querySelector(s) { return wrapQueryResult(__dom_query(nodeIds.get(this), String(s), true)); }
         querySelectorAll(s) { return wrapQueryResults(this, __dom_query(nodeIds.get(this), String(s), false)); }
@@ -18176,7 +18177,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super(id);
             rememberWrapper(id, this);
         }
-        get nodeType() { requireNodeReceiver(this); return 8; } get nodeName() { requireNodeReceiver(this); return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; }
+        get [Symbol.toStringTag]() { return "Comment"; }
     }
     // DOM #traversal (local whatwg/dom): NodeIterator and TreeWalker. Their
     // root, whatToShow, filter, is-active flag, reference and current node
@@ -18534,8 +18535,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
     }
     class ShadowRoot extends DocumentFragment {
-        get nodeType() { requireNodeReceiver(this); return 11; }
-        get nodeName() { requireNodeReceiver(this); return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "ShadowRoot"; }
         get host() { return internalsFor(this).host || null; }
         get mode() { return internalsFor(this).mode || "open"; }
@@ -18557,17 +18556,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         }
         get adoptedStyleSheets() { return adoptedArray(this); }
         set adoptedStyleSheets(v) { setAdoptedArray(this, v); }
-        getElementById(i) {
-            const id = String(i), nodes = this.querySelectorAll("[id]");
-            // HTMLFormElement's named getter can shadow .id. ID lookup uses
-            // the content attribute, not the element's JavaScript property.
-            for (const node of nodes) if (__dom_get_attr(nodeIds.get(node), "id") === id) return node;
-            return null;
-        }
-        querySelector(s) { return wrapQueryResult(__dom_query(nodeIds.get(this), String(s), true)); }
-        querySelectorAll(s) { return wrapQueryResults(this, __dom_query(nodeIds.get(this), String(s), false)); }
-
-
+        // getElementById, querySelector() and the other ParentNode and
+        // NonElementParentNode members are DocumentFragment's (DOM
+        // #interface-shadowroot inherits them).
     }
 
     // WHATWG DOM §4.2.2.3 "Finding slots and slottables". Direct assignment is
@@ -20335,14 +20326,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         },
     });
     class CDATASection extends Text {
-        get nodeType() { requireNodeReceiver(this); return 4; }
-        get nodeName() { requireNodeReceiver(this); return "#cdata-section"; }
         get [Symbol.toStringTag]() { return "CDATASection"; }
     }
     class ProcessingInstruction extends CharacterData {
         get target() { return __dom_pi_target(nodeIds.get(this)); }
-        get nodeType() { requireNodeReceiver(this); return 7; }
-        get nodeName() { return this.target; }
         get [Symbol.toStringTag]() { return "ProcessingInstruction"; }
     }
     // DOM #interface-documenttype: a doctype's name, public ID and system ID
@@ -20743,7 +20730,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (d) Object.defineProperty(proto, n, d);
             }
         };
-        for (const p of [Element.prototype, Document.prototype, DocumentFragment.prototype, ShadowRoot.prototype]) move(p, PARENT_NODE);
+        for (const p of [Element.prototype, Document.prototype, DocumentFragment.prototype]) move(p, PARENT_NODE);
         for (const p of [Element.prototype, CharacterData.prototype]) move(p, CHILD_NODE);
         for (const n of [...PARENT_NODE, ...CHILD_NODE]) delete Node.prototype[n];
     }
@@ -25118,8 +25105,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
 
     g.window = g; g.self = g;
-    // HTML #dom-window-closed. TRust never closes a top-level traversable for
-    // script, so only a destroyed child navigable reports true.
+    // HTML #dom-window-closed: a destroyed navigable, or a top-level
+    // traversable that window.close() is closing.
     Object.defineProperty(g, "closed", {configurable: true, enumerable: true,
         get: Object.getOwnPropertyDescriptor({get closed() {
             const target = this === undefined || this === null ? g : this;
@@ -26591,6 +26578,105 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     } }.focus;
     // HTML #dom-window-blur: "The blur() method steps are to do nothing."
     g.blur = { blur() {} }.blur;
+    // HTML #dom-window-close, run on the Window whose navigable is
+    // thisTraversable, with the caller's global as the incumbent.
+    g.close = makeCallbackAPI(function (source, receiver, args, incumbent) {
+        const target = receiver === undefined || receiver === null ? g : receiver;
+        const control = target === g ? trust : trustOf(target);
+        if (!control || typeof control.closeWindow !== "function")
+            throw new TypeError("Illegal Window invocation");
+        control.closeWindow(incumbent);
+    }, "close", 0);
+    // HTML #script-closable needs the top-level traversable's session history
+    // entries, which the frontend owns: it reports their number whenever it
+    // changes (`PageCmd::SessionHistorySize`). Until it has, the traversable
+    // is not known to be script-closable.
+    let sessionHistorySize = null;
+    trust.setSessionHistorySize = function (size) { sessionHistorySize = size; };
+    // The top-level Document's active sandboxing flag set, which a top-level
+    // Document only gets from a CSP `sandbox` directive (HTML
+    // #determining-the-creation-sandboxing-flags). TRust enforces no CSP, so
+    // the set is empty.
+    const topLevelSandboxingFlags = Object.freeze({
+        navigation: false, topLevelNavigationWithUserActivation: false,
+        topLevelNavigationWithoutUserActivation: false,
+    });
+    function windowCloseSteps(incumbent) {
+        // 1-2. thisTraversable is this's navigable; a child navigable (or
+        // none, once destroyed) is not a top-level traversable.
+        if (cfg.parentWindow || navigableRecord.closed) return;
+        // 3.
+        if (navigableRecord.closing) return;
+        // 5. HTML #snapshotting-source-snapshot-params of thisTraversable's
+        // active document.
+        const sourceSnapshotParams = {
+            hasTransientActivation: hasTransientActivation(topWindowState),
+            sandboxingFlags: topLevelSandboxingFlags,
+        };
+        // 6. HTML #script-closable: TRust creates no top-level traversable
+        // for web content (window.open() opens nothing), so only a session
+        // history of one entry qualifies.
+        if (sessionHistorySize !== 1) return;
+        const source = incumbentNavigable(incumbent);
+        if (!source || !familiarWithThisTraversable(source)) return;
+        if (!allowedBySandboxingToNavigateThis(source, sourceSnapshotParams)) return;
+        navigableRecord.closing = true;
+        __queue_dom_task(definitelyCloseThisTraversable);
+    }
+    trust.closeWindow = windowCloseSteps;
+    // The incumbent global object's Window state, or null when it is not a
+    // Window or its browsing context is null.
+    function incumbentNavigable(incumbent) {
+        const state = incumbent === undefined || incumbent === null ? null : windowMessageState(incumbent);
+        const control = state ? trustOf(state.window) : null;
+        if (!control || typeof control.navigableClosed !== "function" || control.navigableClosed()) return null;
+        return state;
+    }
+    function topOfWindowState(state) {
+        for (let next = state.parent(); next; next = next.parent()) state = next;
+        return state;
+    }
+    // HTML #familiar-with: whether the incumbent's browsing context A is
+    // familiar with this top-level browsing context B.
+    function familiarWithThisTraversable(a) {
+        // 1. Their active documents are same origin.
+        if (a.originKey === messageWindowState.originKey) return true;
+        // 2. A's top-level browsing context is B.
+        if (topOfWindowState(a).window === g) return true;
+        // 3. B is not an auxiliary browsing context (TRust creates none), and
+        // 4. a top-level B has no ancestor browsing context.
+        return false;
+    }
+    // HTML #allowed-to-navigate, with source the incumbent's navigable and
+    // target thisTraversable, a top-level traversable.
+    function allowedBySandboxingToNavigateThis(source, sourceSnapshotParams) {
+        const flags = sourceSnapshotParams.sandboxingFlags;
+        // 1. source is target. (2. A top-level target has no ancestor.)
+        if (source.window === g) return true;
+        // 3. target is an ancestor of source, and a top-level traversable.
+        if (topOfWindowState(source).window === g) {
+            if (sourceSnapshotParams.hasTransientActivation && flags.topLevelNavigationWithUserActivation)
+                return false;
+            if (!sourceSnapshotParams.hasTransientActivation && flags.topLevelNavigationWithoutUserActivation)
+                return false;
+            return true;
+        }
+        // 4. target is a top-level traversable: TRust has no one permitted
+        // sandboxed navigator (only an auxiliary browsing context's opener
+        // could be one).
+        return !flags.navigation;
+    }
+    // HTML #definitely-close-a-top-level-traversable would check whether
+    // unloading is canceled, then unload and destroy thisTraversable. TRust
+    // has a single top-level traversable and no tabs or pop-ups yet (they
+    // await the tabs design), and destroying it would quit the browser. So it
+    // stays open: the page log gets a warning, and since nothing is closing
+    // any more, "is closing" (and so `closed`) returns to false.
+    function definitelyCloseThisTraversable() {
+        navigableRecord.closing = false;
+        log("warn")("window.close(): TRust does not close its only top-level browsing context " +
+            "(closing it would quit the browser); the page stays open");
+    }
     // HTML #dom-window-moveto and siblings: each first returns unless the
     // browsing context is an auxiliary one created by script. TRust creates
     // no auxiliary browsing contexts, so these always end at that step.
@@ -30359,7 +30445,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (view) return view;
         const state = () => windowMessageState(target);
         const methods = {
-            close() {},
+            // HTML #dom-window-close through a cross-origin WindowProxy: the
+            // target Window's steps, with the caller as the incumbent.
+            close: makeCallbackAPI(function (source, receiver, args, incumbent) {
+                const control = trustOf(target);
+                if (control && typeof control.closeWindow === "function") control.closeWindow(incumbent);
+            }, "close", 0),
             focus() {},
             blur() {},
             postMessage(message, options, transfer) {
@@ -51238,6 +51329,72 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         ecExecCommand(ecNodeDocument(host), command, "");
         return true;
     }
+    // Members the node classes define once on a shared base prototype that
+    // Web IDL places on the interfaces that include them. From Element:
+    // HTMLElement's own (HTML #htmlelement: title, lang, dir, hidden,
+    // click() and the popover API; CSSOM View
+    // #extensions-to-the-htmlelement-interface: the offset* attributes), and
+    // those of the HTMLOrSVGOrMathMLElement mixin (HTML #htmlorsvgelement:
+    // dataset, tabIndex, focus(), blur()) and the ElementCSSInlineStyle
+    // mixin (CSSOM #elementcssinlinestyle: style), which HTMLElement,
+    // SVGElement and MathMLElement include; an Element of another namespace
+    // has none of them. From Node: the ChildNode mixin (DOM
+    // #interface-childnode), included by DocumentType, Element and
+    // CharacterData, and ParentNode's mutation methods (DOM
+    // #interface-parentnode), included by Document, DocumentFragment and
+    // Element; an Attr has neither. Each including interface gets its own
+    // function objects (Web IDL #es-operations, #es-attributes).
+    (function () {
+        const getOwn = Object.getOwnPropertyDescriptor, define = Object.defineProperty;
+        const hasOwn = Object.prototype.hasOwnProperty;
+        const copy = (fn) => {
+            if (typeof fn !== "function") return fn;
+            const name = fn.name;
+            const clone = {[name](...args) { return messageApply(fn, this, args); }}[name];
+            define(clone, "length", {value: fn.length, configurable: true});
+            define(clone, "name", {value: name, configurable: true});
+            return clone;
+        };
+        function relocate(from, names, interfaces) {
+            for (const name of names) {
+                const descriptor = getOwn(from.prototype, name);
+                if (!descriptor) continue;
+                interfaces.forEach((C, index) => {
+                    if (messageApply(hasOwn, C.prototype, [name])) return;
+                    const own = index === 0 ? descriptor : {
+                        get: copy(descriptor.get), set: copy(descriptor.set), value: copy(descriptor.value),
+                        writable: descriptor.writable, enumerable: descriptor.enumerable,
+                        configurable: descriptor.configurable,
+                    };
+                    for (const key of ["get", "set", "value", "writable"])
+                        if (own[key] === undefined && !(key in descriptor)) delete own[key];
+                    define(C.prototype, name, own);
+                });
+                delete from.prototype[name];
+            }
+        }
+        relocate(Element, ["title", "lang", "dir", "hidden", "click", "popover", "showPopover", "hidePopover",
+            "togglePopover", "offsetParent", "offsetTop", "offsetLeft", "offsetWidth", "offsetHeight"],
+            [HTMLElement]);
+        relocate(Element, ["dataset", "tabIndex", "focus", "blur", "style"],
+            [HTMLElement, SVGElement, MathMLElement]);
+        relocate(Node, ["before", "after", "replaceWith", "remove"], [Element, CharacterData, DocumentType]);
+        relocate(Node, ["prepend", "append", "replaceChildren"], [Element, Document, DocumentFragment]);
+        // Web IDL #interface-prototype-object: each interface prototype lists
+        // its [Unscopable] members, its mixins' included (DOM: ParentNode's
+        // and ChildNode's mutation methods, and Element's slot).
+        const unscopable = (C, names) => {
+            const object = Object.create(null);
+            for (const name of names) object[name] = true;
+            define(C.prototype, Symbol.unscopables, {value: object, writable: false, enumerable: false, configurable: true});
+        };
+        const parentNode = ["prepend", "append", "replaceChildren"], childNode = ["before", "after", "replaceWith", "remove"];
+        unscopable(Element, ["slot", ...parentNode, ...childNode]);
+        unscopable(Document, parentNode);
+        unscopable(DocumentFragment, parentNode);
+        unscopable(CharacterData, childNode);
+        unscopable(DocumentType, childNode);
+    })();
     /*__CLASS_STRINGS_BEGIN__*/
     // Web IDL #interface-prototype-object and #namespace-object: every
     // interface prototype object and namespace object has a @@toStringTag

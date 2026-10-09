@@ -631,6 +631,10 @@ pub struct App {
     /// (and on resize; it fires `resize` at the Window per CSSOM View §4.1).
     /// `None` = nothing sent yet (reset with the live page).
     viewport_sent: Option<(u16, u16)>,
+    /// The session history size last SENT to the live page
+    /// (`PageCmd::SessionHistorySize`, HTML #script-closable), diffed each
+    /// tick. `None` = nothing sent yet (reset with the live page).
+    session_history_sent: Option<usize>,
     /// The hover target last SENT to the live page (`PageCmd::Hover`): the
     /// actor node under the terminal's pointer, or `None` after a clear (or
     /// nothing ever sent — the two are equivalent: a clear is only worth
@@ -1002,6 +1006,7 @@ impl App {
             last_scroll_sent: None,
             image_sizes_sent: None,
             viewport_sent: None,
+            session_history_sent: None,
             hover_sent: None,
             pressed_js_link: None,
             hover_want: None,
@@ -1475,6 +1480,7 @@ impl App {
             self.sync_page_viewport();
             self.answer_fullscreen_request();
             self.sync_page_scroll();
+            self.sync_page_session_history();
             self.start_visible_lazy_image_loads();
             // And any freshly decoded image sizes, so the engine measures
             // images exactly like the app renders them (one geometry truth).
@@ -5453,6 +5459,8 @@ impl App {
             // And the true browser viewport (the engine only has the
             // fetch-time size until the first push).
             self.viewport_sent = None;
+            // And its top-level traversable's session history size.
+            self.session_history_sent = None;
             // A fresh engine holds no hover chain; start the app's view clean.
             self.hover_sent = None;
             self.pressed_js_link = None;
@@ -5501,6 +5509,7 @@ impl App {
         self.last_scroll_sent = None;
         self.image_sizes_sent = None;
         self.viewport_sent = None;
+        self.session_history_sent = None;
         self.hover_sent = None;
         self.pressed_js_link = None;
         self.hover_want = None;
@@ -5619,6 +5628,30 @@ impl App {
             .is_ok()
         {
             self.fullscreen_reply = None;
+        }
+    }
+
+    /// Push the browser's session history size (its back and forward entries
+    /// around the current one) to the live page when it changed since the
+    /// last send (`sync_page_scroll`'s send discipline). The page's
+    /// `window.close()` needs it (HTML #script-closable).
+    fn sync_page_session_history(&mut self) {
+        let Some(g) = self.browser.as_ref() else {
+            return;
+        };
+        let size = g.history.len() + 1 + g.forward.len();
+        if self.session_history_sent == Some(size) {
+            return;
+        }
+        let Some(handle) = self.live_page.as_ref() else {
+            return;
+        };
+        if handle
+            .cmds
+            .try_send(crate::js::PageCmd::SessionHistorySize(size))
+            .is_ok()
+        {
+            self.session_history_sent = Some(size);
         }
     }
 
@@ -17408,6 +17441,36 @@ mod tests {
         app.execute_command("kill").await;
         assert!(app.live_page.is_none(), "kill drops the page");
         assert!(app.browser.is_some(), "the browser stays open");
+    }
+
+    #[tokio::test]
+    async fn the_live_page_learns_the_session_history_size() {
+        // HTML #script-closable: window.close() needs the top-level
+        // traversable's session history size, which only the frontend has.
+        let mut app = app_browsing("text/html", "<p>hello</p>");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let size = |app: &super::App| {
+            let g = app.browser.as_ref().unwrap();
+            g.history.len() + 1 + g.forward.len()
+        };
+        let before = size(&app);
+        app.sync_page_session_history();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::SessionHistorySize(n)) if n == before
+        ));
+        app.sync_page_session_history();
+        assert!(rx.try_recv().is_err(), "an unchanged size is not resent");
+        app.on_page_evt(crate::js::PageEvt::HistoryUpdate {
+            url: String::from("http://example.test/pushed"),
+            replace: false,
+        });
+        app.sync_page_session_history();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::SessionHistorySize(n)) if n == before + 1
+        ));
     }
 
     #[tokio::test]

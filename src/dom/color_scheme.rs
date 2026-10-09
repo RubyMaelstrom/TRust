@@ -164,22 +164,20 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
 }
 
 /// CSS Color 4 #css-system-colors, with the deprecated colors mapped as
-/// #deprecated-system-colors lists. The light palette is TRust's own; the
-/// dark one follows Gecko's generic dark colors.
+/// #deprecated-system-colors lists: the UA colors TRust actually paints. The
+/// graphical frontends paint the element's color scheme: the light palette
+/// is TRust's own, the dark one follows Gecko's generic dark colors. The
+/// terminal frontend paints every document in its own theme whatever its
+/// color scheme (`terminal_system_color`); a thread that lays text out in
+/// the terminal's cell font (`crate::text::cell_metrics`, set for terminal
+/// page actors and terminal layouts) resolves system colors to it.
 pub(crate) fn system_color(name: &str, scheme: ColorScheme) -> Option<&'static str> {
-    let name = name.to_ascii_lowercase();
-    let name = match name.as_str() {
-        "activecaption" | "appworkspace" | "background" | "inactivecaption" | "infobackground"
-        | "menu" | "scrollbar" | "window" => "canvas",
-        "captiontext" | "infotext" | "menutext" | "windowtext" => "canvastext",
-        "buttonhighlight" | "buttonshadow" | "threedface" => "buttonface",
-        "activeborder" | "inactiveborder" | "threeddarkshadow" | "threedhighlight"
-        | "threedlightshadow" | "threedshadow" | "windowframe" => "buttonborder",
-        "inactivecaptiontext" => "graytext",
-        other => other,
-    };
+    if crate::text::cell_metrics().is_some() {
+        return terminal_system_color(name);
+    }
+    let name = canonical_system_color(name);
     let light = scheme == ColorScheme::Light;
-    Some(match name {
+    Some(match name.as_str() {
         "canvas" | "field" | "buttonface" if light => "#ffffff",
         "canvas" => "#1c1b22",
         "field" | "buttonface" => "#2b2a33",
@@ -205,6 +203,47 @@ pub(crate) fn system_color(name: &str, scheme: ColorScheme) -> Option<&'static s
         "mark" => "#ffff00",
         _ => return None,
     })
+}
+
+/// The terminal frontend's palette (`crate::theme`, as `ui::item_kind_style`
+/// paints document items): the canvas and fields are its background, text
+/// its text color, links (visited or active ones too) and the selected link
+/// its cyan, form controls and the accent its pastel green, and borders and
+/// disabled text its dim violet. Selection reverses the colors it selects,
+/// so a highlight is the text color behind background-colored text. Marked
+/// text paints as ordinary text.
+fn terminal_system_color(name: &str) -> Option<&'static str> {
+    const BG: &str = "#0b0221";
+    const TEXT: &str = "#c8c8dc";
+    const CYAN: &str = "#00fff9";
+    const GREEN: &str = "#a8e6a1";
+    const DIM: &str = "#6e4e9e";
+    Some(match canonical_system_color(name).as_str() {
+        "canvas" | "field" | "buttonface" | "mark" | "highlighttext" | "selecteditemtext"
+        | "accentcolortext" => BG,
+        "canvastext" | "marktext" | "highlight" => TEXT,
+        "linktext" | "visitedtext" | "activetext" | "selecteditem" => CYAN,
+        "fieldtext" | "buttontext" | "accentcolor" => GREEN,
+        "buttonborder" | "graytext" => DIM,
+        _ => return None,
+    })
+}
+
+/// A system color keyword's ASCII-lowercase name, with a deprecated system
+/// color replaced by the system color #deprecated-system-colors maps it to.
+fn canonical_system_color(name: &str) -> String {
+    let name = name.trim().to_ascii_lowercase();
+    let name = match name.as_str() {
+        "activecaption" | "appworkspace" | "background" | "inactivecaption" | "infobackground"
+        | "menu" | "scrollbar" | "window" => "canvas",
+        "captiontext" | "infotext" | "menutext" | "windowtext" => "canvastext",
+        "buttonhighlight" | "buttonshadow" | "threedface" => "buttonface",
+        "activeborder" | "inactiveborder" | "threeddarkshadow" | "threedhighlight"
+        | "threedlightshadow" | "threedshadow" | "windowframe" => "buttonborder",
+        "inactivecaptiontext" => "graytext",
+        other => other,
+    };
+    name.to_owned()
 }
 
 /// Properties whose values can hold a `<color>` (or a `light-dark()` image).
@@ -501,5 +540,73 @@ mod tests {
         );
         assert_eq!(resolve("#canvas 10px red", Light), None);
         assert_eq!(resolve("'Canvas'", Light), None);
+    }
+
+    #[test]
+    fn terminal_system_colors_are_the_theme_it_paints() {
+        // CSS Color 4 #css-system-colors: a system color is the color the UA
+        // paints for that role. The terminal paints documents in its own
+        // theme, whatever their color scheme.
+        use crate::theme;
+        use ColorScheme::{Dark, Light};
+        let hex = |rgb: theme::Rgb| format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+        let cells = crate::text::cell_metrics_scope(crate::text::CellMetrics::new(8.0, 16.0));
+        for scheme in [Light, Dark] {
+            let color = |name: &str| system_color(name, scheme).map(str::to_owned);
+            assert_eq!(color("Canvas"), Some(hex(theme::BG)));
+            assert_eq!(color("CanvasText"), Some(hex(theme::TEXT)));
+            assert_eq!(color("LinkText"), Some(hex(theme::NEON_CYAN)));
+            assert_eq!(color("visitedtext"), Some(hex(theme::NEON_CYAN)));
+            assert_eq!(color("Field"), Some(hex(theme::BG)));
+            assert_eq!(color("FieldText"), Some(hex(theme::PASTEL_GREEN)));
+            assert_eq!(color("ButtonText"), Some(hex(theme::PASTEL_GREEN)));
+            assert_eq!(color("ButtonBorder"), Some(hex(theme::DIM)));
+            assert_eq!(color("GrayText"), Some(hex(theme::DIM)));
+            assert_eq!(color("Highlight"), Some(hex(theme::TEXT)));
+            assert_eq!(color("HighlightText"), Some(hex(theme::BG)));
+            // #deprecated-system-colors map to their replacements.
+            assert_eq!(color("Window"), Some(hex(theme::BG)));
+            assert_eq!(color("ThreeDShadow"), Some(hex(theme::DIM)));
+            assert_eq!(color("transparent"), None);
+        }
+        let mut dom = Dom::parse_document(
+            r#"<body><a id=a href=x style="color:LinkText;background:Canvas">x</a>
+            <p id=p style="color-scheme:dark">y</p></body>"#,
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let p = dom.get_by_id("p").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(a, "color"),
+            Some(hex(theme::NEON_CYAN))
+        );
+        assert_eq!(
+            dom.computed_value_resolved(a, "background-color"),
+            Some(hex(theme::BG))
+        );
+        assert_eq!(
+            dom.computed_value_resolved(p, "color"),
+            Some(hex(theme::TEXT))
+        );
+        drop(cells);
+        // The graphical frontends paint the element's own scheme.
+        dom = Dom::parse_document(
+            r#"<body><a id=a href=x style="color:LinkText;background:Canvas">x</a>
+            <p id=p style="color-scheme:dark;color:LinkText">y</p></body>"#,
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let p = dom.get_by_id("p").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(a, "color").as_deref(),
+            Some("#0000ee")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(a, "background-color")
+                .as_deref(),
+            Some("#ffffff")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(p, "color").as_deref(),
+            Some("#00cadb")
+        );
     }
 }

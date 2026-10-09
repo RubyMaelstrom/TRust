@@ -313,27 +313,13 @@ pub(super) fn computed_color(text: &str) -> Option<String> {
     if text.eq_ignore_ascii_case("currentcolor") {
         return Some("currentcolor".into());
     }
-    // CSS Color 4 #css-system-colors permits a fixed UA palette. Keep each
-    // foreground/background pairing legible, including deprecated aliases.
-    let system = match text.to_ascii_lowercase().as_str() {
-        "canvas" | "field" | "activecaption" | "appworkspace" | "background"
-        | "inactivecaption" | "infobackground" | "menu" | "scrollbar" | "window" => Some("#000000"),
-        "canvastext" | "fieldtext" | "buttontext" | "captiontext" | "infotext" | "menutext"
-        | "windowtext" => Some("#ffffff"),
-        "buttonface" | "buttonhighlight" | "buttonshadow" | "threedface" => Some("#404040"),
-        "buttonborder" | "activeborder" | "inactiveborder" | "threeddarkshadow"
-        | "threedhighlight" | "threedlightshadow" | "threedshadow" | "windowframe" => {
-            Some("#c0c0c0")
-        }
-        "graytext" | "inactivecaptiontext" => Some("#808080"),
-        "highlight" | "selecteditem" | "accentcolor" => Some("#00ffff"),
-        "highlighttext" | "selecteditemtext" | "accentcolortext" | "marktext" => Some("#000000"),
-        "linktext" => Some("#80b0ff"),
-        "visitedtext" => Some("#d090ff"),
-        "activetext" => Some("#ff8080"),
-        "mark" => Some("#ffff00"),
-        _ => None,
-    };
+    // CSS Color 4 #css-system-colors: the UA color TRust paints (see
+    // `color_scheme::system_color`). Without an element this is the light
+    // scheme's; an element's computed value carries its own scheme's.
+    let system = super::super::color_scheme::system_color(
+        text,
+        super::super::color_scheme::ColorScheme::Light,
+    );
     if let Some(color) = system {
         return computed_color(color);
     }
