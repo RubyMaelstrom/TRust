@@ -7,7 +7,8 @@ left half, 100% cyan on the right half.
   by ImageMagick with -define jpeg:colorspace=5).
 - cmyk-straight.jpg: CMYK stored as ink values (0 = no ink) without an
   APP14 segment (cmyk-adobe's encoder output with its samples complemented
-  and the APP14 segment removed).
+  and the APP14 segment removed). Like Chromium and Firefox, TRust reads
+  every CMYK JPEG as Adobe-inverted, so this file renders nearly black.
 
 Each embeds CGATS001Compat-v2-micro.icc (8464 bytes, a compact CMYK profile
 from Clinton Ingram's compact-icc-profiles, as shipped with pdf.js),

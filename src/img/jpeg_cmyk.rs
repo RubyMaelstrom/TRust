@@ -11,12 +11,15 @@
 //! or YCCK when an Adobe APP14 segment's transform flag is 2 (Adobe
 //! Technical Note #5116): Y, Cb and Cr carry the first three channels through
 //! the JFIF YCbCr transform and K is stored as is. Adobe applications write
-//! the samples of the files they mark with APP14 inverted, 0 being full
-//! coverage (the libjpeg documentation's "CAUTION" on Photoshop CMYK files),
-//! while ICC device values make 0 no colorant, so the samples of a file with
-//! an Adobe segment are inverted before conversion. Without one they are
-//! taken as stored, libjpeg's "straight CMYK". None of these texts is in the
-//! local standards library; the libjpeg-turbo documentation is the source.
+//! CMYK samples inverted, 0 being full coverage (the libjpeg documentation's
+//! "CAUTION" on Photoshop CMYK files), while ICC device values make 0 no
+//! colorant. No specification says how to read a CMYK JPEG without an Adobe
+//! segment; libjpeg would take it as stored ("straight CMYK"), but Chromium
+//! (skcms) and Firefox invert every CMYK JPEG, since nearly all of them come
+//! from Adobe-convention encoders. TRust follows the browsers and inverts the
+//! samples of every CMYK and YCCK JPEG before conversion, which is also what
+//! the general decoder's fallback conversion does. None of these texts is in
+//! the local standards library; the libjpeg-turbo documentation is the source.
 //!
 //! Work is bounded like the other raster decoders: the frame dimensions and
 //! decode allocation are capped before decoding, and the profile by
@@ -69,12 +72,10 @@ pub(crate) fn decode(bytes: &[u8], max_dimension: u32, max_alloc: u64) -> Option
     if samples.len() != width * height * 4 {
         return None;
     }
-    let inverted = adobe_transform(bytes).is_some();
     to_rgb(
         &mut samples,
         width,
         input == ColorSpace::YCCK,
-        inverted,
         |cmyk, rgb| conversion.convert(cmyk, rgb),
     )?;
     RgbImage::from_raw(width32, height32, samples)
@@ -88,7 +89,6 @@ fn to_rgb(
     samples: &mut Vec<u8>,
     width: usize,
     ycck: bool,
-    inverted: bool,
     convert: impl Fn(&[u8], &mut [u8]) -> bool,
 ) -> Option<()> {
     let rows = samples.len() / (width * 4);
@@ -97,7 +97,7 @@ fn to_rgb(
     for row in 0..rows {
         cmyk.copy_from_slice(&samples[row * width * 4..(row + 1) * width * 4]);
         for pixel in cmyk.as_chunks_mut::<4>().0 {
-            *pixel = device_cmyk(*pixel, ycck, inverted);
+            *pixel = device_cmyk(*pixel, ycck);
         }
         if !convert(&cmyk, &mut rgb) {
             return None;
@@ -113,20 +113,17 @@ fn to_rgb(
 /// YCCK holds the first three channels as YCbCr, which libjpeg converts back
 /// with the JFIF transform and then complements (`ycck_cmyk_convert`):
 /// C = 255 − R(Y, Cb, Cr) and likewise M and Y, giving the channels as the
-/// file's CMYK would store them. Adobe's inverted storage then makes the
-/// coverage the complement of those values.
-fn device_cmyk([c, m, y, k]: [u8; 4], ycck: bool, inverted: bool) -> [u8; 4] {
+/// file's CMYK would store them. Adobe's inverted storage, which every CMYK
+/// JPEG is taken to use, then makes the coverage the complement of those
+/// values.
+fn device_cmyk([c, m, y, k]: [u8; 4], ycck: bool) -> [u8; 4] {
     let stored = if ycck {
         let [r, g, b] = ycc_to_rgb(c, m, y);
         [255 - r, 255 - g, 255 - b, k]
     } else {
         [c, m, y, k]
     };
-    if inverted {
-        stored.map(|value| 255 - value)
-    } else {
-        stored
-    }
+    stored.map(|value| 255 - value)
 }
 
 /// The JFIF YCbCr to RGB transform (ITU-T T.871), full range, rounded and
@@ -139,42 +136,6 @@ fn ycc_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
         channel(y - 0.344_136 * cb - 0.714_136 * cr),
         channel(y + 1.772 * cb),
     ]
-}
-
-/// The colour transform flag of an Adobe APP14 segment before the first scan,
-/// if the file has one. Markers are walked by their lengths (T.81 B.1.1.4) up
-/// to the first SOS.
-fn adobe_transform(bytes: &[u8]) -> Option<u8> {
-    if bytes.get(..2) != Some(&[0xFF, 0xD8][..]) {
-        return None;
-    }
-    let mut at = 2;
-    while at + 4 <= bytes.len() {
-        if bytes[at] != 0xFF {
-            return None;
-        }
-        let marker = bytes[at + 1];
-        match marker {
-            // Fill bytes before a marker, and markers without a segment.
-            0xFF => at += 1,
-            0x01 | 0xD0..=0xD8 => at += 2,
-            // Start of scan or end of image: no APP14 governs the frame.
-            0xDA | 0xD9 => return None,
-            _ => {
-                let length = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
-                if length < 2 {
-                    return None;
-                }
-                let segment = bytes.get(at + 4..at + 2 + length)?;
-                // "Adobe", version (2), flags0 (2), flags1 (2), transform (1).
-                if marker == 0xEE && segment.len() >= 12 && segment.starts_with(b"Adobe") {
-                    return Some(segment[11]);
-                }
-                at += 2 + length;
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -213,11 +174,39 @@ mod tests {
     /// converts them to sRGB (254, 255, 254) and (0, 173, 239); the naive
     /// conversion would give white and (0, 255, 255).
     #[test]
-    fn cmyk_profiles_convert_adobe_ycck_and_straight_samples() {
-        for name in ["cmyk-adobe.jpg", "ycck-adobe.jpg", "cmyk-straight.jpg"] {
-            let bytes = fixture(name);
+    fn cmyk_profiles_convert_inverted_samples_with_or_without_an_adobe_segment() {
+        let adobe = fixture("cmyk-adobe.jpg");
+        // The APP14 marker, its length, then the "Adobe" identifier.
+        let app14 = |bytes: &[u8]| {
+            bytes
+                .windows(9)
+                .position(|w| w[..2] == [0xFF, 0xEE] && &w[4..] == b"Adobe")
+        };
+        let at = app14(&adobe).unwrap();
+        let length = usize::from(u16::from_be_bytes([adobe[at + 2], adobe[at + 3]]));
+        let mut unmarked = adobe.clone();
+        unmarked.drain(at..at + 2 + length);
+        assert!(app14(&unmarked).is_none());
+        for (name, bytes) in [
+            ("cmyk-adobe.jpg", adobe.clone()),
+            ("ycck-adobe.jpg", fixture("ycck-adobe.jpg")),
+            ("cmyk-adobe.jpg without APP14", unmarked),
+        ] {
             assert_near(pixel(&bytes, 4, 4), [254, 255, 254], name);
             assert_near(pixel(&bytes, 20, 4), [0, 173, 239], name);
+        }
+    }
+
+    /// As in Chromium and Firefox, a CMYK JPEG without an Adobe segment is
+    /// still read as inverted: ink values stored as is ("straight CMYK") come
+    /// out as their complements, full coverage on the left and cyan-less
+    /// 100% M, Y and K on the right, both nearly black.
+    #[test]
+    fn straight_cmyk_reads_inverted_like_the_browsers() {
+        let bytes = fixture("cmyk-straight.jpg");
+        for x in [4, 20] {
+            let [r, g, b] = pixel(&bytes, x, 4);
+            assert!(r < 64 && g < 64 && b < 64, "{x}: {r} {g} {b}");
         }
     }
 
@@ -254,53 +243,25 @@ mod tests {
 
     #[test]
     fn device_values_follow_adobe_inversion_and_ycck() {
-        // Straight CMYK is used as stored; Adobe-marked CMYK is inverted.
-        assert_eq!(
-            device_cmyk([0, 64, 128, 255], false, false),
-            [0, 64, 128, 255]
-        );
-        assert_eq!(
-            device_cmyk([0, 64, 128, 255], false, true),
-            [255, 191, 127, 0]
-        );
+        // Every CMYK JPEG is read with Adobe's inverted storage.
+        assert_eq!(device_cmyk([0, 64, 128, 255], false), [255, 191, 127, 0]);
         // YCCK: Y 255 with neutral chroma is R = G = B = 255, so the stored
         // CMY are 0, which Adobe inversion turns into full coverage; K is
         // inverted alone.
-        assert_eq!(
-            device_cmyk([255, 128, 128, 200], true, true),
-            [255, 255, 255, 55]
-        );
+        assert_eq!(device_cmyk([255, 128, 128, 200], true), [255, 255, 255, 55]);
         // Y 0 is no coverage of C, M and Y.
-        assert_eq!(device_cmyk([0, 128, 128, 255], true, true), [0, 0, 0, 0]);
-        // Cr above neutral raises R, i.e. lowers the stored C.
-        let [c, m, _, _] = device_cmyk([128, 128, 200, 255], true, false);
-        assert!(c < 128 && m > 128, "{c} {m}");
-    }
-
-    #[test]
-    fn adobe_segment_is_found_before_the_first_scan() {
-        let app14 = [
-            0xFF, 0xEE, 0x00, 0x0E, b'A', b'd', b'o', b'b', b'e', 0, 100, 0, 0, 0, 0, 2,
-        ];
-        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0, 0];
-        jpeg.extend_from_slice(&app14);
-        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
-        assert_eq!(adobe_transform(&jpeg), Some(2));
-        // After SOS the segment no longer counts.
-        let mut late = vec![0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02];
-        late.extend_from_slice(&app14);
-        assert_eq!(adobe_transform(&late), None);
-        // Truncated or malformed segments end the walk.
-        assert_eq!(adobe_transform(&jpeg[..12]), None);
-        assert_eq!(adobe_transform(&[0xFF, 0xD8, 0xFF, 0xEE, 0x00, 0x01]), None);
-        assert_eq!(adobe_transform(b"not a jpeg"), None);
+        assert_eq!(device_cmyk([0, 128, 128, 255], true), [0, 0, 0, 0]);
+        // Cr above neutral raises R, i.e. lowers the stored C, so it raises
+        // the C coverage after inversion and lowers M's.
+        let [c, m, _, _] = device_cmyk([128, 128, 200, 255], true);
+        assert!(c > 128 && m < 128, "{c} {m}");
     }
 
     #[test]
     fn rows_shrink_in_place_to_rgb() {
         // Two rows of two pixels; the stand-in conversion writes C, M, Y.
         let mut samples = (0u8..16).collect::<Vec<_>>();
-        to_rgb(&mut samples, 2, false, false, |cmyk, rgb| {
+        to_rgb(&mut samples, 2, false, |cmyk, rgb| {
             for (out, pixel) in rgb
                 .as_chunks_mut::<3>()
                 .0
@@ -312,9 +273,13 @@ mod tests {
             true
         })
         .unwrap();
-        assert_eq!(samples, [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14]);
+        // The stand-in sees the inverted device values.
+        assert_eq!(
+            samples,
+            [255, 254, 253, 251, 250, 249, 247, 246, 245, 243, 242, 241]
+        );
         // A failing conversion fails the decode.
         let mut samples = vec![0u8; 8];
-        assert!(to_rgb(&mut samples, 2, false, false, |_, _| false).is_none());
+        assert!(to_rgb(&mut samples, 2, false, |_, _| false).is_none());
     }
 }
