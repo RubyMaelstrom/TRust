@@ -45443,7 +45443,7 @@ mod tests {
     }
 
     #[test]
-    fn challenge_cookie_partition_follows_nested_realms_and_worker_context() {
+    fn challenge_cookie_context_follows_nested_realms_and_worker_context() {
         let _guard = crate::http::COOKIE_TEST_LOCK.lock().unwrap();
         crate::http::set_cookies_enabled(true);
         let mut engine = configured_engine(
@@ -45475,7 +45475,7 @@ mod tests {
             `);
             globalThis.challengeCookieVisibility = third.cookieVisibility;
         "#,
-            "challenge partition inheritance",
+            "challenge cookie context inheritance",
         )
         .unwrap();
         assert_eq!(

@@ -758,12 +758,15 @@ current behavior and limits; consult the governing standards before changing it.
   a site immediately deletes saved state but preserves session memory; undo can
   save that live state again. Expiry and site-requested deletion still apply.
 - Third-party embedded/background requests cannot send/set cookies, except for
-  the user-approved HTTP challenge-cookie policy: HTTPS on the default port at
-  `challenges.cloudflare.com/cdn-cgi/challenge-platform/` may send/set
-  `cf_clearance` and `cf_chl_*` cookies with `Secure; SameSite=None`. These are
-  memory-only, partitioned by the owning top-level schemeful site, and kept
-  separate from first-party cookies even when `Partitioned` is absent. This is
-  a narrow policy exception, not general CHIPS support. Third-party frames still
+  the user-approved HTTP challenge-cookie policy: Cloudflare's `cf_clearance`
+  and `cf_chl_*` cookies of any HTTPS site are honored in every context. A
+  cross-site request (embedded frame, subresource, fetch, worker) sets and sends
+  them in the ordinary first-party jar, so one clearance serves the site at top
+  level and in every embed; they persist like that site's other cookies. Only
+  HTTP may use the exception, and SameSite still applies: cross-site responses
+  store them only as `Secure; SameSite=None`, and cross-site requests receive
+  only those. Every other cookie (including `__cf_bm`) stays blocked cross-site.
+  Third-party frames still
   cannot access document cookies or localStorage, even for bookmarked sites.
   Main navigation follows SameSite rules. `set cookies off` disables cookie access/capture
   without clearing saved cookies or localStorage; cookie deletion does not
