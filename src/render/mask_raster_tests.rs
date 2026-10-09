@@ -124,8 +124,8 @@ fn check_luminance_mask(mut render: impl FnMut(&Scene) -> OwnedRgbaFrame) {
         ),
     ];
     let luminance = CssFilter::ColorMatrix([
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2125, 0.7154,
-        0.0721, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2126, 0.7152,
+        0.0722, 0.0, 0.0,
     ]);
     let mut mask = vec![layer(CompositeOperator::SourceOver, None)];
     mask.extend(tiles.clone());

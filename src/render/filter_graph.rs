@@ -67,6 +67,17 @@ impl FilterGraph {
         })
     }
 
+    /// The `feImage` graphics of the primitives, whose images the paint
+    /// that uses this graph requests.
+    pub fn images(&self) -> impl Iterator<Item = &FeImage> {
+        self.primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.kind {
+                FilterPrimitiveKind::Image(image) => Some(&**image),
+                _ => None,
+            })
+    }
+
     /// How far (local px) any primitive can move content: the margin a
     /// caller adds around the visible area to render enough of the input.
     pub fn reach(&self) -> f32 {
@@ -302,9 +313,112 @@ pub enum FilterPrimitiveKind {
         input: FilterInput,
     },
     Turbulence(Turbulence),
+    /// #feImageElement: an image, or a referenced element rendered into
+    /// one, placed in the primitive's viewport.
+    Image(Box<FeImage>),
     /// A primitive whose result is transparent black: a primitive in error,
-    /// or an `feImage` whose resource TRust cannot use.
+    /// or an `feImage` whose reference is unusable.
     Transparent,
+}
+
+/// #feImageElement: the graphic an `feImage` primitive draws. An external
+/// image is rendered like an `image` element whose viewport is the
+/// primitive subregion; a referenced element is rendered (like `use`) into
+/// a document image covering the subregion exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeImage {
+    /// The image request: the external image's URL, or the document image
+    /// of the referenced element.
+    pub source: Arc<str>,
+    pub handle: super::ImageHandle,
+    /// The viewport the image is fitted into, in local CSS px.
+    pub viewport: CssRect,
+    /// `preserveAspectRatio`.
+    pub aspect: AspectRatio,
+}
+
+/// SVG 2 #PreserveAspectRatioAttribute: `none` (`align: None`) stretches to
+/// the viewport; otherwise the image keeps its aspect ratio, scaled to fit
+/// (`meet`) or cover (`slice`) the viewport and aligned by the fractions
+/// (0, ½ or 1 of the free space) of `align`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AspectRatio {
+    pub align: Option<(f32, f32)>,
+    pub slice: bool,
+}
+
+impl Default for AspectRatio {
+    /// `xMidYMid meet`, the initial value.
+    fn default() -> Self {
+        Self {
+            align: Some((0.5, 0.5)),
+            slice: false,
+        }
+    }
+}
+
+impl AspectRatio {
+    /// Parse `[defer] <align> [<meetOrSlice>]`; `None` when invalid.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut words = value.split_ascii_whitespace().peekable();
+        if words.peek() == Some(&"defer") {
+            words.next();
+        }
+        let align = match words.next()? {
+            "none" => None,
+            align => {
+                let fraction = |name: &str| match name {
+                    "Min" => Some(0.0),
+                    "Mid" => Some(0.5),
+                    "Max" => Some(1.0),
+                    _ => None,
+                };
+                let rest = align.strip_prefix('x')?;
+                let (x, y) = rest.split_at_checked(3)?;
+                Some((fraction(x)?, fraction(y.strip_prefix('Y')?)?))
+            }
+        };
+        let slice = match words.next() {
+            None | Some("meet") => false,
+            Some("slice") => true,
+            Some(_) => return None,
+        };
+        words.next().is_none().then_some(Self { align, slice })
+    }
+
+    /// The rectangle an image of `natural` size occupies in `viewport`.
+    pub fn place(self, natural: (f32, f32), viewport: CssRect) -> CssRect {
+        let Some((ax, ay)) = self.align else {
+            return viewport;
+        };
+        if !(natural.0 > 0.0 && natural.1 > 0.0) {
+            return CssRect::new(viewport.x, viewport.y, 0.0, 0.0);
+        }
+        let (sx, sy) = (viewport.width / natural.0, viewport.height / natural.1);
+        let scale = if self.slice { sx.max(sy) } else { sx.min(sy) };
+        let (width, height) = (natural.0 * scale, natural.1 * scale);
+        CssRect::new(
+            viewport.x + (viewport.width - width) * ax,
+            viewport.y + (viewport.height - height) * ay,
+            width,
+            height,
+        )
+    }
+}
+
+/// The pixels of `feImage` primitives' images, from the scene's image
+/// store. Both raster backends evaluate filters on CPU with the same source.
+pub trait FilterImageSource {
+    /// The natural size of the image, once it is available.
+    fn natural_size(&self, handle: super::ImageHandle) -> Option<(u32, u32)>;
+    /// The image as straight-alpha RGBA8 for drawing into `rect` (local
+    /// CSS px) under `to_pixel`: a vector image is rasterized at that size.
+    fn pixels(
+        &self,
+        handle: super::ImageHandle,
+        rect: CssRect,
+        to_pixel: Affine2d,
+    ) -> Option<super::ImageResource>;
 }
 
 impl FilterPrimitiveKind {
@@ -323,7 +437,9 @@ impl FilterPrimitiveKind {
             | Self::Offset { input, .. }
             | Self::Tile { input } => vec![*input],
             Self::Merge { inputs } => inputs.clone(),
-            Self::Flood { .. } | Self::Turbulence(_) | Self::Transparent => Vec::new(),
+            Self::Flood { .. } | Self::Turbulence(_) | Self::Image(_) | Self::Transparent => {
+                Vec::new()
+            }
         }
     }
 
@@ -523,13 +639,16 @@ impl PixelSpace {
 }
 
 /// Evaluation context beyond the source pixels.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct FilterOptions<'a> {
     /// Filter Effects 2 #BackdropFilterProperty: blur() samples mirrored
     /// pixels at the edge of the clipped border box instead of transparency.
     pub blur_edge: EdgeMode,
     /// The isolation group's backdrop (#BackgroundImage), when known.
     pub background: Option<&'a FilterImage>,
+    /// The images `feImage` primitives draw; without it they are
+    /// transparent black, as for an image that has not loaded.
+    pub images: Option<&'a dyn FilterImageSource>,
 }
 
 /// Apply a CSS `<filter-value-list>` in order (Filter Effects 1
@@ -731,6 +850,7 @@ fn evaluate_graph(
                 subregion,
                 linear,
                 (source.width, source.height),
+                options.images,
             )
         };
         // #FilterPrimitiveSubRegion: the subregion clips the result.
@@ -759,6 +879,7 @@ fn evaluate_graph(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_primitive(
     kind: &FilterPrimitiveKind,
     input: &dyn Fn(FilterInput) -> (FilterImage, PixelRect),
@@ -767,6 +888,7 @@ fn evaluate_primitive(
     subregion: PixelRect,
     linear: bool,
     size: (usize, usize),
+    images: Option<&dyn FilterImageSource>,
 ) -> FilterImage {
     let (sx, sy) = space.scale();
     match kind {
@@ -909,7 +1031,89 @@ fn evaluate_primitive(
         FilterPrimitiveKind::Turbulence(turbulence) => {
             turbulence_image(turbulence, graph, space, subregion, size)
         }
+        FilterPrimitiveKind::Image(image) => {
+            let mut result = FilterImage::new(size.0, size.1);
+            if let Some(images) = images {
+                draw_image(&mut result, image, images, space, subregion);
+            }
+            // The image's colors are sRGB.
+            if linear {
+                convert_space(&mut result, true);
+            }
+            result
+        }
         FilterPrimitiveKind::Transparent => FilterImage::new(size.0, size.1),
+    }
+}
+
+/// #feImageElement: draw `image` as an `image` element whose viewport is
+/// `image.viewport` (SVG 2 #ImageElement: placed by preserveAspectRatio and
+/// clipped to the viewport), resampled bilinearly into the buffer pixels of
+/// `subregion`.
+fn draw_image(
+    out: &mut FilterImage,
+    image: &FeImage,
+    images: &dyn FilterImageSource,
+    space: &PixelSpace,
+    subregion: PixelRect,
+) {
+    let Some((width, height)) = images.natural_size(image.handle) else {
+        return;
+    };
+    // An empty image fills the subregion with transparent black.
+    let placed = image
+        .aspect
+        .place((width as f32, height as f32), image.viewport);
+    let Some(visible) = super::intersect_css_rect(placed, image.viewport) else {
+        return;
+    };
+    let Some(inverse) = space.to_pixel.inverse() else {
+        return;
+    };
+    let Some(pixels) = images.pixels(image.handle, placed, space.to_pixel) else {
+        return;
+    };
+    let (iw, ih) = (pixels.width as usize, pixels.height as usize);
+    if iw == 0 || ih == 0 || pixels.rgba.len() != iw * ih * 4 {
+        return;
+    }
+    let texel = |x: usize, y: usize| -> [f32; 4] {
+        let at = (y * iw + x) * 4;
+        let [r, g, b, a] = [0, 1, 2, 3].map(|c| f32::from(pixels.rgba[at + c]) / 255.0);
+        [r * a, g * a, b * a, a]
+    };
+    let area = space
+        .rect(visible)
+        .intersect(subregion)
+        .intersect(out.full());
+    for y in area.y0..area.y1 {
+        for x in area.x0..area.x1 {
+            let point =
+                inverse.map_point(crate::core::CssPoint::new(x as f32 + 0.5, y as f32 + 0.5));
+            if point.x < visible.x
+                || point.y < visible.y
+                || point.x >= visible.x + visible.width
+                || point.y >= visible.y + visible.height
+            {
+                continue;
+            }
+            // Texel centers sit at half-integers; clamp at the image edge.
+            let u =
+                ((point.x - placed.x) / placed.width * iw as f32 - 0.5).clamp(0.0, (iw - 1) as f32);
+            let v = ((point.y - placed.y) / placed.height * ih as f32 - 0.5)
+                .clamp(0.0, (ih - 1) as f32);
+            let (x0, y0) = (u.floor() as usize, v.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(iw - 1), (y0 + 1).min(ih - 1));
+            let (fx, fy) = (u - x0 as f32, v - y0 as f32);
+            let [a, b, c, d] = [texel(x0, y0), texel(x1, y0), texel(x0, y1), texel(x1, y1)];
+            let mut pixel = [0.0; 4];
+            for channel in 0..4 {
+                let top = a[channel] + (b[channel] - a[channel]) * fx;
+                let bottom = c[channel] + (d[channel] - c[channel]) * fx;
+                pixel[channel] = top + (bottom - top) * fy;
+            }
+            out.data[y as usize * out.width + x as usize] = pixel;
+        }
     }
 }
 
@@ -2075,6 +2279,119 @@ pub type SharedFilterGraph = Arc<FilterGraph>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserve_aspect_ratio_places_images_like_svg() {
+        // SVG 2 #PreserveAspectRatioAttribute.
+        let viewport = CssRect::new(10.0, 20.0, 80.0, 40.0);
+        let parse = |value: &str| AspectRatio::parse(value);
+        assert_eq!(parse("xMidYMid meet"), Some(AspectRatio::default()));
+        assert_eq!(
+            parse("defer xMinYMax"),
+            Some(AspectRatio {
+                align: Some((0.0, 1.0)),
+                slice: false,
+            })
+        );
+        assert_eq!(parse("none slice").map(|ratio| ratio.align), Some(None));
+        for invalid in [
+            "",
+            "xMidYmid",
+            "xMidYMid meet slice",
+            "meet",
+            "xMaxYMax cover",
+        ] {
+            assert_eq!(parse(invalid), None, "{invalid}");
+        }
+        let natural = (10.0, 10.0);
+        assert_eq!(
+            AspectRatio::default().place(natural, viewport),
+            CssRect::new(30.0, 20.0, 40.0, 40.0)
+        );
+        assert_eq!(
+            parse("xMaxYMin slice").unwrap().place(natural, viewport),
+            CssRect::new(10.0, 20.0, 80.0, 80.0)
+        );
+        assert_eq!(parse("none").unwrap().place(natural, viewport), viewport);
+        // An empty image places nothing.
+        assert_eq!(
+            AspectRatio::default().place((0.0, 5.0), viewport).width,
+            0.0
+        );
+    }
+
+    struct OneImage(crate::render::ImageResource);
+
+    impl FilterImageSource for OneImage {
+        fn natural_size(&self, _: crate::render::ImageHandle) -> Option<(u32, u32)> {
+            Some((self.0.width, self.0.height))
+        }
+
+        fn pixels(
+            &self,
+            _: crate::render::ImageHandle,
+            _: CssRect,
+            _: Affine2d,
+        ) -> Option<crate::render::ImageResource> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn fe_image_results_are_clipped_to_their_subregion_and_converted() {
+        // #feImageElement in a linearRGB primitive: the sRGB image is
+        // converted like any input, and the subregion clips it.
+        let full = CssRect::new(0.0, 0.0, 8.0, 8.0);
+        let image = crate::render::ImageResource {
+            svg_source: None,
+            width: 2,
+            height: 2,
+            rgba: std::sync::Arc::from([128u8, 0, 0, 255].repeat(4)),
+            has_alpha: false,
+        };
+        let graph = FilterGraph {
+            region: full,
+            primitives: vec![FilterPrimitive {
+                subregion: CssRect::new(0.0, 0.0, 4.0, 8.0),
+                linear_rgb: true,
+                kind: FilterPrimitiveKind::Image(Box::new(FeImage {
+                    source: "image".into(),
+                    handle: crate::render::ImageHandle(1),
+                    viewport: full,
+                    aspect: AspectRatio {
+                        align: None,
+                        slice: false,
+                    },
+                })),
+            }],
+            primitive_space: Affine2d::IDENTITY,
+            fill_paint: [0.0; 4],
+            stroke_paint: [0.0; 4],
+        };
+        let mut out = FilterImage::new(8, 8);
+        let source = OneImage(image);
+        apply_filters(
+            &mut out,
+            &[CssFilter::Graph(std::sync::Arc::new(graph.clone()))],
+            &space(),
+            FilterOptions {
+                images: Some(&source),
+                ..FilterOptions::default()
+            },
+        );
+        let rgba = out.to_premultiplied_rgba8();
+        assert_eq!(&rgba[..4], &[128, 0, 0, 255]);
+        assert_eq!(&rgba[(4 * 8 + 6) * 4..(4 * 8 + 7) * 4], &[0, 0, 0, 0]);
+        // Without image access the primitive is transparent black.
+        let mut out = FilterImage::new(8, 8);
+        apply_filters(
+            &mut out,
+            &[CssFilter::Graph(std::sync::Arc::new(graph))],
+            &space(),
+            FilterOptions::default(),
+        );
+        assert!(out.to_premultiplied_rgba8().iter().all(|&c| c == 0));
+    }
 
     fn space() -> PixelSpace {
         PixelSpace {

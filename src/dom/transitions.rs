@@ -90,7 +90,7 @@ pub(super) const PROPERTIES: [&str; 20] = [
 ];
 /// The other interpolable properties: Web Animations 1 #animation-types
 /// other than discrete, by the animation value model (`values::Kind`).
-pub(super) const EXTENDED: [&str; 45] = [
+pub(super) const EXTENDED: [&str; 46] = [
     "color",
     "background-color",
     "border-top-color",
@@ -108,6 +108,9 @@ pub(super) const EXTENDED: [&str; 45] = [
     "box-shadow",
     "text-shadow",
     "filter",
+    // Filter Effects 2 #BackdropFilterProperty: "Animation type: see prose
+    // in [[filter-effects-1#animation-of-filters]]", as for `filter`.
+    "backdrop-filter",
     "border-top-width",
     "border-right-width",
     "border-bottom-width",
@@ -1636,6 +1639,36 @@ mod tests {
         dom.update_css_transitions(3.);
         assert_eq!(after(&dom, "width").as_deref(), Some("100px"));
         assert!(!dom.css_transitions_active());
+    }
+
+    #[test]
+    fn backdrop_filter_transitions_like_filter() {
+        // Filter Effects 2 #BackdropFilterProperty defers to Filter Effects 1
+        // #interpolation-of-filters: `none` becomes the other list at its
+        // initial values; a list with a <url> changes discretely.
+        let mut dom = Dom::parse_document(
+            "<!doctype html><style>#box{backdrop-filter:none;             transition:backdrop-filter 1s linear}             #box.on{backdrop-filter:blur(8px) saturate(3)}             #box.url{backdrop-filter:url(#f) blur(2px)}</style><div id=box></div>",
+        );
+        dom.set_viewport_px(640., 480.);
+        let id = dom.get_by_id("box").unwrap();
+        dom.update_css_transitions(0.);
+        dom.set_attr(id, "class", "on");
+        dom.update_css_transitions(1.);
+        dom.update_css_transitions(1.5);
+        assert_eq!(
+            dom.computed_value_resolved(id, "backdrop-filter")
+                .as_deref(),
+            Some("blur(4px) saturate(2)")
+        );
+        dom.update_css_transitions(2.);
+        dom.set_attr(id, "class", "url");
+        dom.update_css_transitions(2.);
+        dom.update_css_transitions(2.2);
+        assert_eq!(
+            dom.computed_value_resolved(id, "backdrop-filter")
+                .as_deref(),
+            Some("url(#f) blur(2px)")
+        );
     }
 
     /// CSS Transitions 1 #transitionable: a pair whose animation type is

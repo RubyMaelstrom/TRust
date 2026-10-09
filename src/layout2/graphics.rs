@@ -3122,16 +3122,17 @@ fn push_layer(
     }
 }
 
-/// Filter Effects 1 #FilterProperty `<url>`: resolve each reference to a
-/// same-document SVG `filter` element for the box whose border box is
-/// `border_box` (its object bounding box and user space origin). "If the
-/// filter references a non-existent object or the referenced object is not a
-/// filter element, then the whole filter chain is ignored."
+/// Filter Effects 1 #FilterProperty `<url>`: resolve each reference to an
+/// SVG `filter` element, of this document or an external resource document
+/// (`dom::svg_external`), for the box whose border box is `border_box` (its
+/// object bounding box and user space origin). "If the filter references a
+/// non-existent object or the referenced object is not a filter element,
+/// then the whole filter chain is ignored."
 fn resolve_filter_references(
     filters: &std::sync::Arc<[crate::render::CssFilter]>,
     node: NodeId,
     border_box: CssRect,
-    builder: &Builder<'_>,
+    builder: &mut Builder<'_>,
 ) -> std::sync::Arc<[crate::render::CssFilter]> {
     use crate::render::CssFilter;
     if !filters
@@ -3140,26 +3141,77 @@ fn resolve_filter_references(
     {
         return filters.clone();
     }
-    let resolved = filters
-        .iter()
-        .map(|filter| match filter {
-            CssFilter::Reference(url) => {
-                let target = builder
-                    .dom
-                    .svg_resource_target(node, url, Some(builder.base));
-                builder.dom.note_svg_resource_use(node, target);
-                let target = target.filter(|&target| {
-                    builder.dom.tag_name(target) == Some("filter")
-                        && builder.dom.namespace_uri(target) == Some("http://www.w3.org/2000/svg")
-                })?;
-                Some(CssFilter::Graph(std::sync::Arc::new(
-                    builder.dom.svg_filter_graph(target, node, border_box),
-                )))
-            }
-            other => Some(other.clone()),
-        })
-        .collect::<Option<Vec<_>>>();
-    resolved.map_or_else(|| std::sync::Arc::from([]), std::sync::Arc::from)
+    let dom = builder.dom;
+    let document_url = dom.style_resource_base(node, builder.base).into_owned();
+    let origin = document_url.origin();
+    let (fill_paint, stroke_paint) = dom.svg_filter_paints(node);
+    let is_filter = |dom: &Dom, target: NodeId| {
+        dom.tag_name(target) == Some("filter")
+            && dom.namespace_uri(target) == Some("http://www.w3.org/2000/svg")
+    };
+    let mut resolved = Vec::with_capacity(filters.len());
+    for filter in filters.iter() {
+        let CssFilter::Reference(url) = filter else {
+            resolved.push(filter.clone());
+            continue;
+        };
+        // A reference that does not resolve (yet), or names no `filter`
+        // element, makes the whole list ignored; so does a network error
+        // fetching its document (#origin-restrictions: as if `none`).
+        let graph = if local_reference(url, builder.base) {
+            let target = dom.svg_resource_target(node, url, Some(builder.base));
+            dom.note_svg_resource_use(node, target);
+            let Some(target) = target.filter(|&target| is_filter(dom, target)) else {
+                return std::sync::Arc::from([]);
+            };
+            dom.svg_filter_graph_for(
+                target,
+                border_box,
+                &crate::dom::FilterUse {
+                    fill_paint,
+                    stroke_paint,
+                    document_url: Some(&document_url),
+                    origin: Some(&origin),
+                },
+            )
+        } else {
+            let Some(absolute) = document_url
+                .join(url.trim())
+                .ok()
+                .filter(|absolute| absolute.fragment().is_some_and(|f| !f.is_empty()))
+            else {
+                return std::sync::Arc::from([]);
+            };
+            let crate::dom::ExternalSvg::Loaded(document) =
+                dom.external_svg_document(node, &absolute, &document_url)
+            else {
+                return std::sync::Arc::from([]);
+            };
+            let Some(target) = absolute
+                .fragment()
+                .and_then(|fragment| document.target(fragment))
+                .filter(|&target| is_filter(&document.dom, target))
+            else {
+                return std::sync::Arc::from([]);
+            };
+            document.dom.svg_filter_graph_for(
+                target,
+                border_box,
+                &crate::dom::FilterUse {
+                    fill_paint,
+                    stroke_paint,
+                    document_url: Some(&document.url),
+                    origin: Some(&origin),
+                },
+            )
+        };
+        // #feImageElement: the images the primitives draw are page images.
+        for image in graph.images() {
+            builder.image(image.source.to_string());
+        }
+        resolved.push(CssFilter::Graph(std::sync::Arc::new(graph)));
+    }
+    std::sync::Arc::from(resolved)
 }
 
 /// Filter Effects 2 #BackdropFilterProperty: the element's filter list and
@@ -3168,7 +3220,7 @@ fn resolve_filter_references(
 fn backdrop_filter(
     fragment: &Frag,
     style: PaintStyle,
-    builder: &Builder<'_>,
+    builder: &mut Builder<'_>,
 ) -> Option<std::sync::Arc<crate::render::BackdropFilter>> {
     let dom = builder.dom;
     let value = style.value(dom, "backdrop-filter")?;
@@ -3222,13 +3274,17 @@ struct MaskPaint {
     bounds: Option<CssRect>,
 }
 
-/// CSS Masking 1 #MaskValues: luminanceToAlpha's coefficients (SVG 1.1
-/// #feColorMatrixElement) give a luminance mask's alpha from straight sRGB.
+/// CSS Masking 1 #MaskValues: "apply the luminance-to-alpha coefficients
+/// (as defined in the feColorMatrix filter primitive)" to the straight
+/// color. Filter Effects 1 #feColorMatrixElement `luminanceToAlpha` uses the
+/// sRGB/BT.709 coefficients 0.2126, 0.7152, 0.0722 (SVG 1.1's rounded
+/// 0.2125/0.7154/0.0721 were superseded). An `<image>` mask layer has no
+/// `mask` element, so no `color-interpolation` applies: sRGB values are used.
 const LUMINANCE_TO_ALPHA: [f32; 20] = [
     0.0, 0.0, 0.0, 0.0, 0.0, //
     0.0, 0.0, 0.0, 0.0, 0.0, //
     0.0, 0.0, 0.0, 0.0, 0.0, //
-    0.2125, 0.7154, 0.0721, 0.0, 0.0,
+    0.2126, 0.7152, 0.0722, 0.0, 0.0,
 ];
 
 /// Build the mask of a stacking context from its `mask-*` layers (CSS
@@ -3305,25 +3361,54 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
         // are rendered with its `mask-type` unless `mask-mode` overrides it
         // (#the-mask-mode); its image is then used as an alpha mask.
         let mode = layer_value(&modes, index, "match-source");
-        let mask_source = css_url(image.trim())
-            .filter(|url| local_reference(url, builder.base))
-            .map(|url| {
+        let mode_override = match mode {
+            "luminance" => Some(true),
+            "alpha" => Some(false),
+            _ => None,
+        };
+        let mask_source = css_url(image.trim()).and_then(|url| {
+            if local_reference(&url, builder.base) {
                 let target = dom.svg_resource_target(style.node(), &url, Some(builder.base));
                 dom.note_svg_resource_use(style.node(), target);
-                target.and_then(|mask| {
+                return Some(target.and_then(|mask| {
                     dom.svg_mask_image(
                         mask,
                         border_box,
                         subtree_bounds(fragment),
-                        match mode {
-                            "luminance" => Some(true),
-                            "alpha" => Some(false),
-                            _ => None,
-                        },
+                        mode_override,
                         Some(builder.base),
                     )
-                })
-            });
+                }));
+            }
+            // A URL with a fragment may name a `mask` element of another
+            // document (#the-mask-image `<url>`): until that document has
+            // loaded, or after a network error (#priv-sec: as if `none`),
+            // the layer is transparent black. A loaded document whose
+            // fragment names no `mask` element, or a response that is no
+            // document, makes the URL a CSS image.
+            let document_url = dom.style_resource_base(style.node(), builder.base);
+            let absolute = document_url.join(url.trim()).ok()?;
+            absolute
+                .fragment()
+                .filter(|fragment| !fragment.is_empty())?;
+            match dom.external_svg_document(style.node(), &absolute, &document_url) {
+                crate::dom::ExternalSvg::Loaded(document) => {
+                    let mask = absolute
+                        .fragment()
+                        .and_then(|fragment| document.target(fragment))?;
+                    (document.dom.tag_name(mask) == Some("mask")).then_some(())?;
+                    Some(document.dom.svg_mask_image(
+                        mask,
+                        border_box,
+                        subtree_bounds(fragment),
+                        mode_override,
+                        Some(&document.url),
+                    ))
+                }
+                crate::dom::ExternalSvg::NotDocument => None,
+                crate::dom::ExternalSvg::Pending | crate::dom::ExternalSvg::Failed => Some(None),
+            }
+        });
         // #the-mask-mode: `match-source` is alpha for an <image>.
         let luminance = mask_source.is_none() && mode == "luminance";
         let grouped = compose != CompositeOperator::SourceOver || luminance;
@@ -3360,6 +3445,7 @@ fn mask_paint(fragment: &Frag, builder: &mut Builder<'_>) -> Option<MaskPaint> {
             position: layer_value(&positions, index, "0% 0%"),
             repeat: layer_value(&repeats, index, "repeat"),
             lengths,
+            cors: true,
         };
         if let Some(Some((url, region))) = &mask_source {
             source_image = format!("url(\"{url}\")");
@@ -3844,6 +3930,7 @@ fn paint_background_images_for_style(
                 position: layer_value(&position_layers, index, "0% 0%"),
                 repeat: layer_value(&repeat_layers, index, "repeat"),
                 lengths,
+                cors: false,
             },
         );
         if let Some(depth) = local_depth {
@@ -3870,6 +3957,9 @@ struct ImageLayer<'a> {
     position: &'a str,
     repeat: &'a str,
     lengths: LengthBasis,
+    /// A `<url>` image is fetched with a CORS request in Anonymous mode
+    /// (CSS Masking 1 #priv-sec, for mask layers).
+    cors: bool,
 }
 
 /// Paint `layer`, returning whether it painted anything: an unloaded or
@@ -3891,6 +3981,7 @@ fn paint_image_layer(builder: &mut Builder<'_>, layer: ImageLayer<'_>) -> bool {
         position,
         repeat,
         lengths,
+        cors,
     } = layer;
     // A gradient is an image with no natural size or ratio: CSS
     // Backgrounds 3 #background-size resolves its `auto` axes, and
@@ -3901,7 +3992,11 @@ fn paint_image_layer(builder: &mut Builder<'_>, layer: ImageLayer<'_>) -> bool {
         (None, gradient_size(size, positioning, lengths))
     } else if let Some(url) = css_url(image) {
         let base = builder.dom.style_resource_base(node, builder.base);
-        let source = resolve_image_source(&base, &url);
+        let mut source = resolve_image_source(&base, &url);
+        if cors && !source.starts_with("data:") && !source.starts_with("blob:") {
+            source =
+                crate::img::cors_image_source(&source, crate::http::CredentialsMode::SameOrigin);
+        }
         let handle = builder.image(source.clone());
         // CSS Backgrounds 3 #background-size: auto/auto with a natural
         // ratio but neither natural dimension uses contain. SVG decoder
@@ -10122,7 +10217,12 @@ mod tests {
         // (or failed to) is a transparent black layer. Masking does not
         // clip hit testing, so the group bound is a layer clip, not PushClip.
         let html = r#"<div id=m style="width:80px;height:60px;background:red;-webkit-mask-image:url(dots.png)">x</div>"#;
-        let source = "https://example.test/dots.png";
+        // #priv-sec: a mask image is a CORS request in Anonymous mode.
+        let source = crate::img::cors_image_source(
+            "https://example.test/dots.png",
+            crate::http::CredentialsMode::SameOrigin,
+        );
+        let source = source.as_str();
         for (sizes, loaded) in [
             (Default::default(), false),
             ([(source.to_string(), (20, 10))].into_iter().collect(), true),

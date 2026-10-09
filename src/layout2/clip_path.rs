@@ -317,8 +317,34 @@ impl ClipPath {
         if let Source::Url(url) = &self.source {
             let target = dom.svg_resource_target(node, url, document_url);
             dom.note_svg_resource_use(node, target);
-            let target = target?;
-            self.source = Source::Svg(Arc::new(dom.svg_clip_source(target)?));
+            if let Some(target) = target {
+                self.source = Source::Svg(Arc::new(dom.svg_clip_source(target)?));
+                return Some(self);
+            }
+            // #the-clip-path `<clip-source>` in an external resource document
+            // (`dom::svg_external`): until it has loaded, or after a network
+            // error (#priv-sec: as if `none`), no clipping is applied.
+            let document_url = document_url?;
+            let base = dom.style_resource_base(node, document_url);
+            let absolute = base.join(url.trim()).ok()?;
+            let fragment = absolute
+                .fragment()
+                .filter(|fragment| !fragment.is_empty())?;
+            let mut resource = absolute.clone();
+            resource.set_fragment(None);
+            let mut document = base.as_ref().clone();
+            document.set_fragment(None);
+            if url.trim().starts_with('#') || resource == document {
+                // A local reference that names nothing.
+                return None;
+            }
+            let crate::dom::ExternalSvg::Loaded(external) =
+                dom.external_svg_document(node, &absolute, &base)
+            else {
+                return None;
+            };
+            let target = external.target(fragment)?;
+            self.source = Source::Svg(Arc::new(external.dom.svg_clip_source(target)?));
             return Some(self);
         }
         let units = Units::of(dom, node);

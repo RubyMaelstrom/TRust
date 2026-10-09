@@ -344,7 +344,7 @@ fn utf16_len(text: &str) -> u32 {
 }
 
 impl Dom {
-    fn is_svg_element(&self, id: NodeId) -> bool {
+    pub(super) fn is_svg_element(&self, id: NodeId) -> bool {
         self.namespace_uri(id) == Some(SVG_NS)
     }
 
@@ -581,7 +581,7 @@ impl Dom {
     }
 
     /// The font environment the inline SVG containing `id` lays text out with.
-    fn svg_geometry_fonts(&self, id: NodeId) -> u64 {
+    pub(super) fn svg_geometry_fonts(&self, id: NodeId) -> u64 {
         self.scope_font_set(id)
             .map_or_else(crate::font_system::page_svg_font_environment, |set| {
                 set.svg_font_environment()
@@ -1622,6 +1622,8 @@ fn text_metrics(text: &usvg::Text, fontdb: &usvg::fontdb::Database) -> TextMetri
 
 /// The group a clip or mask document applies its resource to.
 const RESOURCE_TARGET_ID: &str = "trust-svg-resource-target";
+/// The filter converting a `linearRGB` luminance mask's content to alpha.
+const LINEAR_LUMINANCE_ID: &str = "trust-svg-linear-luminance";
 
 /// CSS Masking 1 #ClipPathElement: a `clipPath` element with its inherited
 /// context and the resources it references, ready to be resolved for any
@@ -1763,7 +1765,7 @@ impl Dom {
     /// The markup of `resource` (an SVG resource element) for a standalone
     /// document: wrapped in groups carrying the inherited properties of its
     /// SVG ancestors, followed by the resources it references.
-    fn svg_effect_resource_markup(
+    pub(super) fn svg_effect_resource_markup(
         &self,
         resource: NodeId,
         images: &mut SvgImageRefs,
@@ -1854,11 +1856,54 @@ impl Dom {
                 ("height", Some(local_ink.height.max(0.0).to_string())),
             ]);
         }
-        let mask_type = mode.map(|luminance| if luminance { "luminance" } else { "alpha" });
+        // #MaskValues step 1: a luminance mask whose `mask` element computes
+        // `color-interpolation: linearRGB` takes the luminance of linear-light
+        // color values. The SVG renderer computes luminance from sRGB values,
+        // so convert inside the mask instead: its content, wrapped in a
+        // linearRGB luminance-to-alpha filter whose alpha is multiplied by the
+        // content's own, is then used as an alpha mask. The matrix is written
+        // out: resvg's `luminanceToAlpha` keeps SVG 1.1's rounded 0.2125,
+        // 0.7154, 0.0721 rather than Filter Effects 1 #feColorMatrixElement's.
+        let luminance = mode.unwrap_or_else(|| {
+            !self
+                .svg_property(mask, "mask-type", false)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("alpha"))
+        });
+        let linear = luminance
+            && self
+                .svg_property(mask, "color-interpolation", true)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("linearRGB"));
+        let mask_type = if linear {
+            Some("alpha")
+        } else {
+            mode.map(|luminance| if luminance { "luminance" } else { "alpha" })
+        };
         if let Some(mask_type) = mask_type {
             edits.push(("mask-type", Some(mask_type.to_string())));
         }
-        let body = rewrite_first_start_tag(&body, "mask", &edits, mask_type)?;
+        let mut body = rewrite_first_start_tag(&body, "mask", &edits, mask_type)?;
+        let mut defs = defs;
+        if linear {
+            let open = body.find("<mask")?;
+            let content = open + body[open..].find('>')? + 1;
+            let close = body.rfind("</mask>")?;
+            if close < content {
+                return None;
+            }
+            body.insert_str(close, "</g>");
+            body.insert_str(
+                content,
+                &format!("<g filter=\"url(#{LINEAR_LUMINANCE_ID})\">"),
+            );
+            defs.push_str(&format!(
+                "<filter id=\"{LINEAR_LUMINANCE_ID}\" filterUnits=\"userSpaceOnUse\" \
+                 x=\"-1e6\" y=\"-1e6\" width=\"2e6\" height=\"2e6\" \
+                 color-interpolation-filters=\"linearRGB\">\
+                 <feColorMatrix values=\"0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 \
+                 0.2126 0.7152 0.0722 0 0\"/>\
+                 <feComposite in2=\"SourceAlpha\" operator=\"arithmetic\" k1=\"1\"/></filter>"
+            ));
+        }
         let (width, height) = (
             f64::from(bbox.width).max(1e-3),
             f64::from(bbox.height).max(1e-3),

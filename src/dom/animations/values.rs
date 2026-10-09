@@ -110,7 +110,7 @@ impl Kind {
             },
             "font-weight" => Self::FontWeight,
             "visibility" => Self::Visibility,
-            "filter" => Self::Filter,
+            "filter" | "backdrop-filter" => Self::Filter,
             "transform" => Self::Transform,
             _ => Self::Discrete,
         }

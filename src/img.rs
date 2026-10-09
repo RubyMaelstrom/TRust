@@ -29,9 +29,10 @@ mod yuv;
 #[cfg(test)]
 pub(crate) use inline_svg::document_svg_data_url_for_navigation;
 pub(crate) use inline_svg::{
-    begin_document_svg_navigation, document_svg_data_url, document_svg_geometry_tree,
-    document_svg_image_requests, document_svg_image_target, document_svg_image_url,
-    document_svg_navigation, document_svg_revision, record_document_svg_image,
+    begin_document_svg_navigation, cors_image_source, cors_image_target, document_svg_data_url,
+    document_svg_geometry_tree, document_svg_image_requests, document_svg_image_target,
+    document_svg_image_url, document_svg_navigation, document_svg_revision,
+    record_document_svg_image,
 };
 
 /// Hard ceiling on decoded raster dimensions: a small download can still claim
@@ -1236,6 +1237,17 @@ fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
 }
 
 fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgImage, String> {
+    parse_svg_at_size_with(bytes, viewport, false)
+}
+
+/// [`parse_svg_at_size`]; `stretch` treats the root's `preserveAspectRatio`
+/// as `none`, as an SVG `image` element requires of the SVG it embeds (SVG 2
+/// embedded.html #ImageElement, svgwg c403ca46ad04).
+fn parse_svg_at_size_with(
+    bytes: &[u8],
+    viewport: Option<(f32, f32)>,
+    stretch: bool,
+) -> Result<SvgImage, String> {
     let data = bounded_svg_data(bytes)?;
     let text = std::str::from_utf8(&data).map_err(|_| String::from("SVG is not UTF-8"))?;
     let text = svg_without_doctype(text)?;
@@ -1313,6 +1325,16 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
             match view_box {
                 Some(attr) => edits.push((attr.range(), synthesized)),
                 None => edits.push((name_end..name_end, format!(" {synthesized}"))),
+            }
+        }
+        if stretch {
+            let none = String::from("preserveAspectRatio=\"none\"");
+            match root
+                .attributes()
+                .find(|a| a.name() == "preserveAspectRatio" && a.namespace().is_none())
+            {
+                Some(attr) => edits.push((attr.range(), none)),
+                None => edits.push((name_end..name_end, format!(" {none}"))),
             }
         }
         root_style.push_str(&format!(
@@ -1834,7 +1856,25 @@ impl SvgRasterSize {
     }
 
     pub(crate) fn rasterize(self, source: &[u8]) -> Result<crate::render::ImageResource, String> {
-        let svg = parse_svg_at_size(source, Some((self.css_width, self.css_height)))?;
+        self.rasterize_with(source, false)
+    }
+
+    /// [`Self::rasterize`] for an SVG `image` element (or `feImage`): the
+    /// embedded root's `preserveAspectRatio` is treated as `none`, since the
+    /// referencing element's own fitting produced this size.
+    pub(crate) fn rasterize_stretched(
+        self,
+        source: &[u8],
+    ) -> Result<crate::render::ImageResource, String> {
+        self.rasterize_with(source, true)
+    }
+
+    fn rasterize_with(
+        self,
+        source: &[u8],
+        stretch: bool,
+    ) -> Result<crate::render::ImageResource, String> {
+        let svg = parse_svg_at_size_with(source, Some((self.css_width, self.css_height)), stretch)?;
         let mut pixmap = tiny_skia::Pixmap::new(self.width, self.height)
             .ok_or_else(|| String::from("svg target is too large"))?;
         let transform = tiny_skia::Transform::from_scale(

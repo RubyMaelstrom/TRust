@@ -230,6 +230,216 @@ fn mask_image_references_render_the_mask_element() {
 }
 
 #[test]
+fn luminance_masks_honour_the_mask_color_interpolation() {
+    // CSS Masking 1 #MaskValues step 1: a `mask` element computing
+    // `color-interpolation: linearRGB` takes the luminance of linear-light
+    // values (0.2126/0.7152/0.0722, Filter Effects 1 #feColorMatrixElement);
+    // the initial sRGB uses the gamma-encoded values. 50% gray masks red
+    // over white to G = 255 × (1 − 0.502) in sRGB, 255 × (1 − 0.216) linear.
+    let (_, frame) = render(
+        r##"<body style="margin:0;background:white">
+        <svg width=0 height=0 style="position:absolute">
+          <mask id=srgb><rect width="100%" height="100%" fill="#808080"/></mask>
+          <mask id=linear style="color-interpolation:linearRGB"><rect width="100%" height="100%" fill="#808080"/></mask>
+          <g color-interpolation="linearRGB"><mask id=inherited><rect width="100%" height="100%" fill="#808080"/></mask></g>
+        </svg>
+        <div style="position:absolute;left:0;top:0;width:40px;height:40px;background:red;mask-image:url(#srgb)"></div>
+        <div style="position:absolute;left:50px;top:0;width:40px;height:40px;background:red;mask-image:url(#linear)"></div>
+        <div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:red;mask-image:url(#inherited)"></div>
+        <div style="position:absolute;left:150px;top:0;width:40px;height:40px;background:red;mask:url(#linear) alpha"></div>"##,
+    );
+    let near = |actual: [u8; 4], green: u8| {
+        actual[0] == 255 && actual[1].abs_diff(green) <= 2 && actual[2].abs_diff(green) <= 2
+    };
+    assert!(
+        near(pixel(&frame, 20, 20), 127),
+        "{:?}",
+        pixel(&frame, 20, 20)
+    );
+    assert!(
+        near(pixel(&frame, 70, 20), 200),
+        "{:?}",
+        pixel(&frame, 70, 20)
+    );
+    assert!(
+        near(pixel(&frame, 120, 20), 200),
+        "{:?}",
+        pixel(&frame, 120, 20)
+    );
+    // An alpha mask ignores color: the opaque gray keeps the content.
+    assert_eq!(pixel(&frame, 170, 20), RED);
+}
+
+const LIME: [u8; 4] = [0, 255, 0, 255];
+
+#[test]
+fn fe_image_draws_images_and_referenced_elements() {
+    // Filter Effects 1 #feImageElement: an image is fitted into the
+    // primitive subregion by preserveAspectRatio (initially xMidYMid meet);
+    // a referenced element renders like `use`, in the user space of
+    // primitiveUnits, translated by the feImage's x and y.
+    let square = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' \
+                  height='10'%3E%3Crect width='10' height='10' fill='blue'/%3E%3C/svg%3E";
+    let (_, frame) = render(&format!(
+        r##"<body style="margin:0;background:white">
+        <svg width=0 height=0 style="position:absolute">
+          <filter id=meet x=0 y=0 width=1 height=1><feImage href="{square}"/></filter>
+          <filter id=fill x=0 y=0 width=1 height=1><feImage href="{square}" preserveAspectRatio="none"/></filter>
+          <filter id=dot filterUnits="userSpaceOnUse" x=0 y=0 width=80 height=40><feImage href="#disc"/></filter>
+          <filter id=moved filterUnits="userSpaceOnUse" x=0 y=0 width=80 height=40><feImage href="#disc" x="30"/></filter>
+          <circle id=disc cx=20 cy=20 r=10 fill=lime />
+        </svg>
+        <div style="position:absolute;left:0;top:0;width:80px;height:40px;background:red;filter:url(#meet)"></div>
+        <div style="position:absolute;left:100px;top:0;width:80px;height:40px;background:red;filter:url(#fill)"></div>
+        <div style="position:absolute;left:0;top:50px;width:80px;height:40px;background:red;filter:url(#dot)"></div>
+        <div style="position:absolute;left:100px;top:50px;width:80px;height:40px;background:red;filter:url(#moved)"></div>"##
+    ));
+    // Meet: a 40px square centered in the 80×40 subregion.
+    assert_eq!(pixel(&frame, 10, 20), WHITE);
+    assert_eq!(pixel(&frame, 40, 20), BLUE);
+    assert_eq!(pixel(&frame, 70, 20), WHITE);
+    // None: stretched over the subregion.
+    assert_eq!(pixel(&frame, 104, 20), BLUE);
+    assert_eq!(pixel(&frame, 176, 20), BLUE);
+    // The referenced circle, at its own user coordinates, then moved by x.
+    assert_eq!(pixel(&frame, 20, 70), LIME);
+    assert_eq!(pixel(&frame, 60, 70), WHITE);
+    assert_eq!(pixel(&frame, 120, 70), WHITE);
+    assert_eq!(pixel(&frame, 150, 70), LIME);
+}
+
+#[test]
+fn tainted_displacement_maps_pass_their_input_through() {
+    // Filter Effects 1 #fedisplacemnentmap-restrictions: SourceGraphic and a
+    // currentColor flood are tainted (#tainted-filter-primitives), so a
+    // displacement map reading them is a pass through filter; an ordinary
+    // flood displaces by scale × (R − ½) = 20px.
+    let (_, frame) = render(
+        r##"<body style="margin:0;background:white">
+        <svg width=0 height=0 style="position:absolute" color-interpolation-filters="sRGB">
+          <filter id=source x=0 y=0 width=1 height=1>
+            <feDisplacementMap in="SourceGraphic" in2="SourceGraphic" scale="40" xChannelSelector="R" yChannelSelector="B"/>
+          </filter>
+          <filter id=current x=0 y=0 width=1 height=1 style="color:#ff8080">
+            <feFlood flood-color="currentColor" result="map"/>
+            <feDisplacementMap in="SourceGraphic" in2="map" scale="40" xChannelSelector="R" yChannelSelector="A"/>
+          </filter>
+          <filter id=plain x=0 y=0 width=1 height=1>
+            <feFlood flood-color="#ff8080" flood-opacity="0.5" result="map"/>
+            <feDisplacementMap in="SourceGraphic" in2="map" scale="40" xChannelSelector="R" yChannelSelector="A"/>
+          </filter>
+        </svg>
+        <div style="position:absolute;left:0;top:0;width:80px;height:20px;background:red;filter:url(#source)"></div>
+        <div style="position:absolute;left:0;top:30px;width:80px;height:20px;background:red;filter:url(#current)"></div>
+        <div style="position:absolute;left:0;top:60px;width:80px;height:20px;background:red;filter:url(#plain)"></div>"##,
+    );
+    assert_eq!(pixel(&frame, 75, 10), RED);
+    assert_eq!(pixel(&frame, 75, 40), RED);
+    // Displaced: x samples x + 20, past the box's right edge.
+    assert_eq!(pixel(&frame, 30, 70), RED);
+    assert_eq!(pixel(&frame, 75, 70), WHITE);
+}
+
+#[test]
+fn external_resource_documents_apply_once_loaded() {
+    // Filter Effects 1 #FilterProperty and CSS Masking 1 #the-clip-path /
+    // #the-mask-image: references into another document resolve once it
+    // has loaded. Until then a filter list and a clip-path apply nothing
+    // and a mask layer is transparent black; a network error is as if the
+    // value were `none` (#origin-restrictions, #priv-sec).
+    let defs = "https://cdn.test/svg-effect-tests-defs.svg";
+    let failed = "https://cdn.test/svg-effect-tests-missing.svg";
+    let html = format!(
+        r##"<body style="margin:0;background:white">
+        <div style="position:absolute;left:0;top:0;width:40px;height:40px;background:red;filter:url({defs}#recolor)"></div>
+        <div style="position:absolute;left:50px;top:0;width:40px;height:40px;background:red;clip-path:url({defs}#corner)"></div>
+        <div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:red;mask-image:url({defs}#half)"></div>
+        <div style="position:absolute;left:150px;top:0;width:40px;height:40px;background:red;filter:url({failed}#f) invert(1)"></div>"##
+    );
+    let (_, frame) = render(&html);
+    assert_eq!(pixel(&frame, 20, 20), RED);
+    assert_eq!(pixel(&frame, 85, 35), RED);
+    assert_eq!(pixel(&frame, 110, 20), WHITE);
+    assert_eq!(pixel(&frame, 170, 20), RED);
+    let key = |url: &str| crate::dom::ExternalSvgKey {
+        partition: String::from("https://example.test"),
+        url: url.to_string(),
+        restricted: false,
+    };
+    crate::dom::record_external_svg_document(
+        &key(defs),
+        crate::dom::ExternalSvgOutcome::of_response(Some((
+            "image/svg+xml",
+            br##"<svg xmlns="http://www.w3.org/2000/svg">
+              <filter id="recolor" x="0" y="0" width="1" height="1">
+                <feFlood flood-color="blue"/><feComposite in2="SourceGraphic" operator="in"/>
+              </filter>
+              <clipPath id="corner"><rect width="20" height="20"/></clipPath>
+              <mask id="half" maskContentUnits="objectBoundingBox">
+                <rect width="0.5" height="1" fill="white"/>
+              </mask>
+            </svg>"##,
+        ))),
+    );
+    crate::dom::record_external_svg_document(
+        &key(failed),
+        crate::dom::ExternalSvgOutcome::of_response(None),
+    );
+    let (_, frame) = render(&html);
+    assert_eq!(pixel(&frame, 20, 20), BLUE);
+    assert_eq!(pixel(&frame, 55, 5), RED);
+    assert_eq!(pixel(&frame, 85, 35), WHITE);
+    assert_eq!(pixel(&frame, 110, 20), RED);
+    assert_eq!(pixel(&frame, 130, 20), WHITE);
+    // The failed document: the whole filter list is ignored.
+    assert_eq!(pixel(&frame, 170, 20), RED);
+}
+
+#[test]
+fn mask_images_and_cross_origin_fe_images_use_cors_requests() {
+    // CSS Masking 1 #priv-sec: mask-image images are fetched with CORS
+    // requests in Anonymous mode; Filter Effects 1 #feImageElement's
+    // `crossorigin` makes its image a CORS request too.
+    let dom = Dom::parse_document(
+        r##"<body><svg width=0 height=0>
+        <filter id=f><feImage href="https://cdn.test/fe.png" crossorigin="use-credentials"/></filter>
+        </svg>
+        <div style="width:10px;height:10px;mask-image:url(https://cdn.test/mask.png)"></div>
+        <div style="width:10px;height:10px;background-image:url(https://cdn.test/bg.png)"></div>
+        <div style="width:10px;height:10px;filter:url(#f)"></div>"##,
+    );
+    let base = Url::parse("https://example.test/page.html").unwrap();
+    let layout = crate::layout2::lay_out_graphical(
+        &dom,
+        &base,
+        crate::layout2::Viewport::new(SIZE.0, SIZE.1),
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let targets: Vec<_> = layout
+        .paint
+        .image_requests
+        .iter()
+        .map(|request| {
+            crate::img::cors_image_target(&request.source)
+                .map(|(url, credentials)| (url.to_string(), Some(credentials)))
+                .unwrap_or_else(|| (request.source.clone(), None))
+        })
+        .collect();
+    use crate::http::CredentialsMode;
+    assert!(targets.contains(&(
+        "https://cdn.test/mask.png".to_string(),
+        Some(CredentialsMode::SameOrigin)
+    )));
+    assert!(targets.contains(&("https://cdn.test/bg.png".to_string(), None)));
+    assert!(targets.contains(&(
+        "https://cdn.test/fe.png".to_string(),
+        Some(CredentialsMode::Include)
+    )));
+}
+
+#[test]
 fn effects_agree_between_cpu_and_hybrid() {
     // Backend selection must not change output: Hybrid draws the effect
     // pixels the CPU reference renderer computes.

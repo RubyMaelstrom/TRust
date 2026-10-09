@@ -208,21 +208,35 @@ impl<'a> Environment<'a> {
             match step {
                 Step::Function(function) => chain.push(Resolved::Function(function.clone())),
                 Step::Reference(reference) => {
-                    let fragment = if let Some(fragment) = reference.strip_prefix('#') {
-                        fragment.to_owned()
+                    let (fragment, external) = if let Some(fragment) = reference.strip_prefix('#') {
+                        (fragment.to_owned(), None)
                     } else {
                         let url = base.join(reference).ok()?;
                         let mut without = url.clone();
                         without.set_fragment(None);
                         let mut document = base.clone();
                         document.set_fragment(None);
-                        if without != document {
-                            return None;
-                        }
-                        url.fragment()?.to_owned()
+                        let fragment = url.fragment()?.to_owned();
+                        (fragment, (without != document).then_some(url))
                     };
                     let fragment = percent_decoded(&fragment)?;
-                    let markup = self.dom.canvas_svg_filter(self.document?, &fragment)?;
+                    let markup = match external {
+                        None => self.dom.canvas_svg_filter(self.document?, &fragment)?,
+                        // A filter in an external resource document, loaded
+                        // as for CSS references (`dom::svg_external`); the
+                        // drawing proceeds unfiltered until it has loaded.
+                        Some(url) => {
+                            let node = self.element.or(self.document)?;
+                            let crate::dom::ExternalSvg::Loaded(document) =
+                                self.dom.external_svg_document(node, &url, base)
+                            else {
+                                return None;
+                            };
+                            document
+                                .dom
+                                .canvas_svg_filter(crate::dom::DOCUMENT, &fragment)?
+                        }
+                    };
                     chain.push(Resolved::Svg {
                         markup,
                         id: fragment,

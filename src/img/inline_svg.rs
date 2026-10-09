@@ -80,6 +80,39 @@ fn nonce() -> &'static str {
     NONCE.as_str()
 }
 
+/// Marks a presentation image request that must be a CORS request: CSS
+/// Masking 1 #priv-sec ("potentially CORS-enabled fetch" in Anonymous mode
+/// for `mask-image` images) and Filter Effects 1 #feImageElement's
+/// `crossorigin` CORS settings attribute. Like a document image request,
+/// the marker carries the process secret, so no author URL can forge one.
+const CORS_FRAGMENT: &str = "trust-cors-image-";
+
+/// The presentation image source for a CORS request of `url` with
+/// `credentials` (HTML #cors-settings-attribute: Anonymous is same-origin,
+/// Use Credentials is include).
+pub(crate) fn cors_image_source(url: &str, credentials: crate::http::CredentialsMode) -> String {
+    let mode = if credentials == crate::http::CredentialsMode::Include {
+        "use-credentials"
+    } else {
+        "anonymous"
+    };
+    format!("{url}#{CORS_FRAGMENT}{}-{mode}", nonce())
+}
+
+/// For an image source the fetch chokepoints are about to load, the URL and
+/// credentials mode of the CORS request it was marked for.
+pub(crate) fn cors_image_target(source: &str) -> Option<(&str, crate::http::CredentialsMode)> {
+    let (url, fragment) = source.rsplit_once('#')?;
+    let (secret, mode) = fragment.strip_prefix(CORS_FRAGMENT)?.split_once('-')?;
+    (secret == nonce()).then_some(())?;
+    let credentials = match mode {
+        "anonymous" => crate::http::CredentialsMode::SameOrigin,
+        "use-credentials" => crate::http::CredentialsMode::Include,
+        _ => return None,
+    };
+    Some((url, credentials))
+}
+
 /// Whether a resolved `<image>` URL can be a document image dependency.
 /// `file:` is excluded as defense in depth, as for `dom::prime_sprite_sheet`:
 /// partitions follow the global navigation rather than a document's own
@@ -503,6 +536,28 @@ impl DocumentImages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cors_image_markers_round_trip_and_cannot_be_forged() {
+        use crate::http::CredentialsMode;
+        let marked = cors_image_source("https://cdn.test/a.svg#view", CredentialsMode::SameOrigin);
+        assert_eq!(
+            cors_image_target(&marked),
+            Some(("https://cdn.test/a.svg#view", CredentialsMode::SameOrigin))
+        );
+        let credentialed = cors_image_source("https://cdn.test/b.png", CredentialsMode::Include);
+        assert_eq!(
+            cors_image_target(&credentialed),
+            Some(("https://cdn.test/b.png", CredentialsMode::Include))
+        );
+        assert_eq!(cors_image_target("https://cdn.test/b.png"), None);
+        assert_eq!(
+            cors_image_target(&format!(
+                "https://cdn.test/b.png#{CORS_FRAGMENT}00000000000000000000000000000000-anonymous"
+            )),
+            None
+        );
+    }
 
     fn render(source: &str) -> image::RgbaImage {
         let bytes = super::super::decode_data_url(source).expect("data URL");

@@ -71,9 +71,17 @@ pub(crate) mod shadow;
 mod sheet_cache;
 mod slotting;
 mod svg_dependencies;
+mod svg_external;
+#[cfg(test)]
+pub(crate) use svg_external::ExternalSvgKey;
+pub(crate) use svg_external::{
+    ExternalSvg, ExternalSvgOutcome, ExternalSvgRequest, external_svg_document_known,
+    record_external_svg_document,
+};
 pub(crate) mod svg_geometry;
 mod svg_references;
 mod svg_resources;
+pub(crate) use svg_resources::FilterUse;
 mod transitions;
 mod validity;
 mod xml;
@@ -605,6 +613,9 @@ pub struct Dom {
     /// importing sheet's owner node and the absolute URL, each URL once
     /// (CSS Cascade 4 #fetch-an-import), for the page actor to fetch.
     import_requests: RefCell<ImportRequests>,
+    /// External SVG resource documents layout referenced before any fetch
+    /// obtained them (`svg_external`), for the page actor to fetch.
+    svg_resource_requests: RefCell<svg_external::Requests>,
     input_values: FxHashMap<NodeId, input::InputValue>,
     /// Element state that is not a content attribute: form control
     /// checkedness, option selectedness and textarea raw values, and custom
@@ -1148,6 +1159,7 @@ impl Dom {
             downloaded_fonts,
             font_requests,
             import_requests,
+            svg_resource_requests,
             input_values,
             element_states,
             media_fallbacks,
@@ -1337,6 +1349,11 @@ impl Dom {
             for url in requested.keys() {
                 bytes = bytes.saturating_add(url.capacity());
             }
+        }
+        {
+            let (requests, hashed) = svg_resource_requests.borrow().retained_memory();
+            bytes = bytes.saturating_add(requests);
+            opaque |= hashed;
         }
         fixed_map!(input_values, (NodeId, input::InputValue));
         fixed_map!(element_states, (NodeId, input::ElementState));
@@ -1713,6 +1730,7 @@ impl Dom {
             downloaded_fonts: FxHashMap::default(),
             font_requests: RefCell::default(),
             import_requests: RefCell::default(),
+            svg_resource_requests: RefCell::default(),
             input_values: FxHashMap::default(),
             element_states: FxHashMap::default(),
             media_fallbacks: RefCell::new(media::MediaFallbacks::default()),
@@ -14922,6 +14940,7 @@ const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
     "lighting-color",
     "color-interpolation-filters",
     "mask-type",
+    "color-interpolation",
 ];
 
 /// The inherited members of `SVG_PRESENTATION_PROPERTIES` (SVG 2 property
@@ -14929,6 +14948,7 @@ const SVG_PRESENTATION_PROPERTIES: &[&str] = &[
 /// `flood-opacity`, `lighting-color` and `mask-type` do not inherit.
 const SVG_INHERITED_PRESENTATION_PROPERTIES: &[&str] = &[
     "color-interpolation-filters",
+    "color-interpolation",
     "fill",
     "fill-opacity",
     "fill-rule",
@@ -17448,6 +17468,9 @@ const PROPS: &[PropDef] = &[
     prop("lighting-color", false, false),
     prop("color-interpolation-filters", true, false),
     prop("mask-type", false, false),
+    // SVG 2 #ColorInterpolationProperty: the `mask` element's color space
+    // for luminance (CSS Masking 1 #MaskValues).
+    prop("color-interpolation", true, false),
     // CSS UI 4 §6.2/§6.3: both inherit and affect hit testing without
     // changing box generation. Bake them into live snapshots so the layout
     // arena sees the same interaction eligibility as the resident page DOM.

@@ -1045,6 +1045,11 @@ pub async fn fetch_graphical_image_with_cookie_policy(
     blobs: Option<&crate::js::BlobMap>,
     restricted: bool,
 ) -> Result<Vec<u8>, String> {
+    if let Some((url, credentials)) = crate::img::cors_image_target(source) {
+        return fetch_cors_page_image(page, url, credentials, restricted)
+            .await
+            .map(|(_, bytes)| bytes);
+    }
     // An inline SVG's `<image>` loads as an ordinary page image of its URL;
     // the outcome is also recorded for the SVG decoder (`img::inline_svg`).
     let Some(document_image) = crate::img::document_svg_image_target(source) else {
@@ -1078,6 +1083,22 @@ pub async fn fetch_presentation_image(
     images: Option<&crate::page_images::PageImages>,
     restricted: bool,
 ) -> Result<std::sync::Arc<[u8]>, String> {
+    // A CORS image (CSS Masking 1 #priv-sec, feImage `crossorigin`): the
+    // document's CORS request of that mode, else the frontend's own.
+    if let Some((url, credentials)) = crate::img::cors_image_target(source) {
+        if let Some(images) = images {
+            match images.presentation_cors(url, credentials).await {
+                crate::page_images::Presentation::Image(image) => return Ok(image.body.clone()),
+                crate::page_images::Presentation::Failed => {
+                    return Err(String::from("the document's image request failed"));
+                }
+                crate::page_images::Presentation::Unavailable => {}
+            }
+        }
+        return fetch_cors_page_image(page, url, credentials, restricted)
+            .await
+            .map(|(_, bytes)| std::sync::Arc::from(bytes));
+    }
     let Some(document_image) = crate::img::document_svg_image_target(source) else {
         return presentation_page_image(page, source, blobs, images, restricted)
             .await
@@ -1154,6 +1175,36 @@ async fn fetch_page_image(
         ));
     }
     let mut request = Request::subresource(url, page, "image", None);
+    request.cookie_context.as_mut().unwrap().cross_site_ancestor = restricted;
+    set_image_accept(&mut request);
+    set_referrer(&mut request, page);
+    fetch(&request)
+        .await
+        .map(|response| ((200..300).contains(&response.status), response.body))
+}
+
+/// Load one page image with a CORS request (Fetch #cors-protocol): a
+/// cross-origin response must pass the CORS check, or it is a network error.
+/// `data:` URLs need no check (Fetch #main-fetch).
+async fn fetch_cors_page_image(
+    page: &Url,
+    source: &str,
+    credentials: CredentialsMode,
+    restricted: bool,
+) -> Result<(bool, Vec<u8>), String> {
+    if source.starts_with("data:") {
+        return fetch_page_image(page, source, None, restricted).await;
+    }
+    let url = Url::parse(source).map_err(|error| format!("invalid image URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(String::from("CORS image requests need HTTP(S)"));
+    }
+    if !subresource_allowed(page, &url) {
+        return Err(String::from(
+            "image subresource blocked by page-origin policy",
+        ));
+    }
+    let mut request = Request::subresource(url, page, "image", Some(credentials));
     request.cookie_context.as_mut().unwrap().cross_site_ancestor = restricted;
     set_image_accept(&mut request);
     set_referrer(&mut request, page);
@@ -7928,21 +7979,60 @@ async fn css_only_with_sheets(
             frame_sheets.push(sheet);
         }
     }
+    let render = || {
+        css_only_render(
+            &html,
+            &sheets,
+            &frames,
+            &frame_sheets,
+            (&base, &response.url),
+            (viewport, cell_px, device_pixel_ratio),
+            document_encoding,
+            terminal_presentation,
+        )
+    };
+    let (mut rendered, mut body, requests) = render();
+    // External SVG resource documents the rendering referenced: fetch them,
+    // then render once more with them (`dom::svg_external`).
+    if fetch_svg_resource_documents(requests, &response.url).await {
+        (rendered, body, _) = render();
+    }
+    response.rendered = Some(Box::new(rendered));
+    // Retain a baked source snapshot for history/diagnostics only. Frontends
+    // consume `response.rendered` and never parse this presentation copy.
+    response.body = body;
+    response.content_type = String::from("text/html; charset=utf-8");
+    response
+}
+
+/// Build and render a script-free document's arena: its rendering, its baked
+/// serialization, and the external SVG resource documents it referenced
+/// that nothing has obtained yet. The arena never leaves this thread.
+#[allow(clippy::too_many_arguments)]
+fn css_only_render(
+    html: &str,
+    sheets: &[PageSheet],
+    frames: &FrameDocuments,
+    frame_sheets: &[PageSheet],
+    (base, page_url): (&Url, &Url),
+    (viewport, cell_px, device_pixel_ratio): ((u16, u16), (u16, u16), f32),
+    document_encoding: &'static encoding_rs::Encoding,
+    terminal_presentation: bool,
+) -> (RenderedPage, Vec<u8>, Vec<crate::dom::ExternalSvgRequest>) {
     // The terminal lays text out in its cell font from the cascade on (`ch`
-    // units resolve against it). No `.await` follows: the guard and the DOM
-    // stay on this worker thread.
+    // units resolve against it).
     let _cells = terminal_presentation
         .then(|| crate::text::cell_metrics_scope(terminal_cell_metrics(cell_px)));
-    let mut dom = crate::js::css_prepare(&html, viewport, cell_px);
+    let mut dom = crate::js::css_prepare(html, viewport, cell_px);
     dom.set_document_encoding(crate::dom::DOCUMENT, document_encoding);
     if !frames.is_empty() {
-        install_page_frames(&mut dom, &response.url, &frames);
+        install_page_frames(&mut dom, page_url, frames);
     }
     if !sheets.is_empty() {
-        dom.attach_external_sheets(&sheets);
+        dom.attach_external_sheets(sheets);
     }
     if !frame_sheets.is_empty() {
-        dom.attach_external_sheets(&frame_sheets);
+        dom.attach_external_sheets(frame_sheets);
     }
     dom.set_doc_url(Some(base.clone()));
     dom.set_device_pixel_ratio(device_pixel_ratio);
@@ -7952,19 +8042,68 @@ async fn css_only_with_sheets(
         cell_px,
     )
     .css_viewport();
-    response.rendered = Some(Box::new(render_arena(
+    let rendered = render_arena(
         &dom,
-        &base,
+        base,
         css_viewport,
         device_pixel_ratio,
         None,
         &crate::layout2::ImageSizes::new(),
-    )));
-    // Retain a baked source snapshot for history/diagnostics only. Frontends
-    // consume `response.rendered` and never parse this presentation copy.
-    response.body = dom.serialize(crate::dom::DOCUMENT).into_bytes();
-    response.content_type = String::from("text/html; charset=utf-8");
-    response
+    );
+    let body = dom.serialize(crate::dom::DOCUMENT).into_bytes();
+    (rendered, body, dom.take_svg_resource_requests())
+}
+
+/// Filter Effects 1 #origin-restrictions and CSS Masking 1 #priv-sec for a
+/// script-free document: fetch the external resource documents its
+/// rendering referenced with CORS requests in Anonymous mode and record each
+/// outcome. Returns whether any was recorded.
+async fn fetch_svg_resource_documents(
+    requests: Vec<crate::dom::ExternalSvgRequest>,
+    page_url: &Url,
+) -> bool {
+    let partition = page_url.origin().ascii_serialization();
+    let requests: Vec<_> = requests
+        .into_iter()
+        .filter(|request| {
+            request.key.partition == partition
+                && subresource_allowed(page_url, &request.url)
+                && !crate::dom::external_svg_document_known(&request.key)
+        })
+        .collect();
+    if requests.is_empty() {
+        return false;
+    }
+    futures::stream::iter(requests.into_iter().map(|request| {
+        let page_url = page_url.clone();
+        async move {
+            let mut fetch_request = Request::subresource(
+                request.url.clone(),
+                &page_url,
+                "image",
+                Some(CredentialsMode::SameOrigin),
+            );
+            if let Some(cookies) = fetch_request.cookie_context.as_mut() {
+                cookies.cross_site_ancestor |= request.key.restricted;
+            }
+            let response = fetch(&fetch_request)
+                .await
+                .ok()
+                .filter(|response| (200..300).contains(&response.status));
+            crate::dom::record_external_svg_document(
+                &request.key,
+                crate::dom::ExternalSvgOutcome::of_response(
+                    response
+                        .as_ref()
+                        .map(|response| (response.content_type.as_str(), &response.body[..])),
+                ),
+            );
+        }
+    }))
+    .buffered(PREFETCH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    true
 }
 
 fn strip_fragment(u: &str) -> &str {

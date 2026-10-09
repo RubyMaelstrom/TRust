@@ -1836,7 +1836,9 @@ fn cancel(
 /// The initial value used for `initial`, `unset` and missing keyframes.
 fn initial_value(property: &str) -> Option<&'static str> {
     cssom_initial_value(property).or(match property {
-        "text-shadow" | "box-shadow" | "filter" | "background-image" => Some("none"),
+        "text-shadow" | "box-shadow" | "filter" | "backdrop-filter" | "background-image" => {
+            Some("none")
+        }
         "letter-spacing" | "word-spacing" => Some("normal"),
         "width" | "height" | "min-width" | "min-height" | "flex-basis" => Some("auto"),
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => Some("0px"),

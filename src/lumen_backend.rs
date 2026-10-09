@@ -189,6 +189,9 @@ enum LumenHostTask {
         url: String,
         bytes: Option<Vec<u8>>,
     },
+    /// An external SVG resource document a CSS reference named settled
+    /// (`dom::svg_external`); its outcome is in the store.
+    SvgResourceDone,
     /// Style sheets fetched for `@import` rules a sheet gained after the
     /// document was fetched, with the sheets their own imports reached
     /// (CSS Cascade 4 #fetch-an-import). `url` is the import whose fetch
@@ -4903,6 +4906,7 @@ mod desktop {
         let _ = trust_number(page, "updateIntersections");
         start_font_fetches(page);
         start_style_import_fetches(page);
+        start_svg_resource_fetches(page);
         start_document_image_fetches(page, &rendered.1);
         rendered
     }
@@ -4979,9 +4983,21 @@ mod desktop {
             }
         }
         for source in sources.iter() {
-            let url = crate::img::document_svg_image_target(&source.url)
-                .map_or(source.url.as_str(), |target| target.url());
-            if url.starts_with("data:") || url.starts_with("blob:") || store.contains(url) {
+            // A consumer that must use a CORS request (CSS Masking 1
+            // #priv-sec, feImage `crossorigin`) marks its source.
+            let marked = crate::img::cors_image_target(&source.url);
+            let url = match marked {
+                Some((url, _)) => url,
+                None => crate::img::document_svg_image_target(&source.url)
+                    .map_or(source.url.as_str(), |target| target.url()),
+            };
+            if url.starts_with("data:")
+                || url.starts_with("blob:")
+                || match marked {
+                    Some((_, credentials)) => store.contains_mode(url, Some(credentials)),
+                    None => store.contains(url),
+                }
+            {
                 continue;
             }
             let (context, cors, referrer_policy) = {
@@ -4995,7 +5011,9 @@ mod desktop {
                 } else {
                     0
                 };
-                if source.initiator == crate::page_images::ImageInitiator::Img {
+                if let Some((_, credentials)) = marked {
+                    (context, Some(credentials), Default::default())
+                } else if source.initiator == crate::page_images::ImageInitiator::Img {
                     (
                         context,
                         dom.attr(source.node, "crossorigin").map(|value| {
@@ -5064,12 +5082,19 @@ mod desktop {
                     },
                     None => None,
                 };
+                let document_svg = document_svg.is_some();
+                // Layout reads a marked image's dimensions by its source.
+                let url = if crate::img::cors_image_target(&request).is_some() {
+                    request
+                } else {
+                    url
+                };
                 let _ = events.send(LumenHostTask::DocumentImageDone {
                     context,
                     url,
                     timing,
                     size,
-                    document_svg: document_svg.is_some(),
+                    document_svg,
                 });
             });
         }
@@ -5126,6 +5151,80 @@ mod desktop {
                 let sheets =
                     crate::http::fetch_imported_sheet(url, client, Vec::new(), encoding).await;
                 let _ = events.send(LumenHostTask::StyleImportsDone { url: key, sheets });
+            });
+        }
+    }
+
+    /// Filter Effects 1 #origin-restrictions and CSS Masking 1 #priv-sec:
+    /// fetch each external resource document that `filter`, `clip-path`,
+    /// `mask-image` or a canvas `filter` named and layout could not resolve
+    /// yet, with a CORS request in Anonymous mode from the referencing
+    /// element's document. Its outcome, a network error included, is
+    /// recorded once; the rendering then resolves the references again.
+    fn start_svg_resource_fetches(page: &mut LumenPage) {
+        let requests = page.dom.borrow().take_svg_resource_requests();
+        if requests.is_empty() {
+            return;
+        }
+        let Some((handle, cache, events)) =
+            page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+                let network = state.network.as_ref()?;
+                Some((
+                    network.handle.clone(),
+                    network.cache.clone(),
+                    state.task_events.clone()?,
+                ))
+            })
+        else {
+            return;
+        };
+        for request in requests {
+            let context = {
+                let dom = page.dom.clone();
+                let dom = dom.borrow();
+                let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+                    return;
+                };
+                if dom.is_valid(request.node) {
+                    node_window_context(state, &dom, request.node).unwrap_or(0)
+                } else {
+                    0
+                }
+            };
+            let client = request_context_url(page.engine.ctx(), context);
+            // Layout keyed the document by the origin it saw; only a request
+            // from a client of that origin may settle it.
+            if client.origin().ascii_serialization() != request.key.partition
+                || !crate::http::subresource_allowed(&client, &request.url)
+                || crate::dom::external_svg_document_known(&request.key)
+            {
+                continue;
+            }
+            let mut cookies = crate::http::CookieContext::subresource(&client);
+            cookies.cross_site_ancestor |= request.key.restricted;
+            let fetched = cache.fetch_resource_with_cookies(
+                &handle,
+                request.url.clone(),
+                &client,
+                "image",
+                Some(crate::http::CredentialsMode::SameOrigin),
+                cookies,
+            );
+            let events = events.clone();
+            cache.spawn(&handle, async move {
+                let response = fetched
+                    .await
+                    .ok()
+                    .filter(|response| (200..300).contains(&response.status));
+                crate::dom::record_external_svg_document(
+                    &request.key,
+                    crate::dom::ExternalSvgOutcome::of_response(
+                        response
+                            .as_ref()
+                            .map(|response| (response.content_type.as_str(), &response.body[..])),
+                    ),
+                );
+                let _ = events.send(LumenHostTask::SvgResourceDone);
             });
         }
     }
@@ -17571,6 +17670,12 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 .dom
                 .clone();
             canvas_host::present_frames(&mut dom.borrow_mut(), Some(node));
+        }
+        LumenHostTask::SvgResourceDone => {
+            // The next rendering opportunity resolves the references again.
+            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                state.dom.borrow_mut().resource_changed();
+            }
         }
         LumenHostTask::FontDone { url, bytes } => {
             let dom = engine
@@ -33907,6 +34012,49 @@ mod tests {
             value_string(&mut worker, &result),
             "255,0,0,255|0,255,255,255"
         );
+    }
+
+    #[test]
+    fn canvas_filters_use_external_documents_once_loaded() {
+        // HTML #dom-context-2d-filter: a filter in an external resource
+        // document that is not loaded yet draws with no filtering; the
+        // reference requests it, and later drawing uses it.
+        let mut engine = platform_engine();
+        let draw = r#"
+            (function () {
+                const c = globalThis.externalFilterCanvas
+                    || (globalThis.externalFilterCanvas = document.createElement('canvas').getContext('2d'));
+                c.filter = 'url(https://cdn.test/canvas-external-filter.svg#blue)';
+                c.fillStyle = 'red'; c.fillRect(0, 0, 4, 4);
+                return Array.from(c.getImageData(1, 1, 1, 1).data).join();
+            })()
+        "#;
+        let before = eval_value(&mut engine, draw, "unloaded external filter").unwrap();
+        assert_eq!(value_string(&mut engine, &before), "255,0,0,255");
+        let requests = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .dom
+            .borrow()
+            .take_svg_resource_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].key.partition, "https://example.com");
+        assert_eq!(
+            requests[0].url.as_str(),
+            "https://cdn.test/canvas-external-filter.svg"
+        );
+        crate::dom::record_external_svg_document(
+            &requests[0].key,
+            crate::dom::ExternalSvgOutcome::of_response(Some((
+                "image/svg+xml",
+                br#"<svg xmlns="http://www.w3.org/2000/svg"><filter id="blue" x="0" y="0" width="1" height="1">
+                    <feFlood flood-color="blue"/><feComposite in2="SourceGraphic" operator="in"/>
+                </filter></svg>"#,
+            ))),
+        );
+        let after = eval_value(&mut engine, draw, "loaded external filter").unwrap();
+        assert_eq!(value_string(&mut engine, &after), "0,0,255,255");
     }
 
     #[test]

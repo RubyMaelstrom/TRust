@@ -12,10 +12,10 @@
 //! is also its object bounding box. Percentages of `userSpaceOnUse` lengths
 //! refer to that box as the element's viewport.
 
-use super::{Dom, NodeData, NodeId};
+use super::{Dom, NodeData, NodeId, SvgImageRefs};
 use crate::render::filter_graph::{
-    CompositeOp, ConvolveMatrix, EdgeMode, FilterGraph, FilterInput, FilterPrimitive,
-    FilterPrimitiveKind, LightSource, Lighting, TransferFunction, Turbulence,
+    AspectRatio, CompositeOp, ConvolveMatrix, EdgeMode, FeImage, FilterGraph, FilterInput,
+    FilterPrimitive, FilterPrimitiveKind, LightSource, Lighting, TransferFunction, Turbulence,
 };
 use crate::render::{Affine2d, BlendMode, CssRect, PaintColor};
 
@@ -97,6 +97,20 @@ impl Units {
             translate
         }
     }
+}
+
+/// What a `filter` element is resolved for.
+pub(crate) struct FilterUse<'a> {
+    /// #FillPaint / #StrokePaint of the referencing element.
+    pub fill_paint: [f32; 4],
+    pub stroke_paint: [f32; 4],
+    /// The URL of the document holding the `filter` element: `feImage`
+    /// references resolve against it. Without it, they are unusable.
+    pub document_url: Option<&'a url::Url>,
+    /// The origin of the referencing element's document. An `feImage`
+    /// image of another origin fetched without CORS is tainted
+    /// (#tainted-filter-primitives); without an origin, every one is.
+    pub origin: Option<&'a url::Origin>,
 }
 
 fn absolute(number: f32, unit: svgtypes::LengthUnit, font_size: f32) -> Option<f32> {
@@ -225,7 +239,12 @@ impl Dom {
     /// The value of an SVG property on `id`: its author cascade winner,
     /// else its `style` attribute declaration, else its presentation
     /// attribute; for an inherited property, the nearest ancestor's.
-    fn svg_property(&self, id: NodeId, property: &str, inherited: bool) -> Option<String> {
+    pub(super) fn svg_property(
+        &self,
+        id: NodeId,
+        property: &str,
+        inherited: bool,
+    ) -> Option<String> {
         let mut current = Some(id);
         while let Some(node) =
             current.filter(|&node| matches!(self.nodes[node].data, NodeData::Element { .. }))
@@ -302,15 +321,64 @@ impl Dom {
             .clamp(0.0, 1.0)
     }
 
-    /// Filter Effects 1 #FilterElement / #FilterEffectsRegion /
-    /// #FilterPrimitivesOverview: resolve `filter` (a `filter` element) for
-    /// the element `target` whose border box (its object bounding box and
-    /// user space origin) is `bbox` in local CSS px.
+    /// [`Self::svg_filter_graph_for`] for a `filter` element of the
+    /// referencing element `target`'s own document.
+    #[cfg(test)]
     pub(crate) fn svg_filter_graph(
         &self,
         filter: NodeId,
         target: NodeId,
         bbox: CssRect,
+    ) -> FilterGraph {
+        let (fill_paint, stroke_paint) = self.svg_filter_paints(target);
+        self.svg_filter_graph_for(
+            filter,
+            bbox,
+            &FilterUse {
+                fill_paint,
+                stroke_paint,
+                document_url: None,
+                origin: None,
+            },
+        )
+    }
+
+    /// #FillPaint / #StrokePaint: the `fill` and `stroke` of the element a
+    /// filter applies to, as straight sRGB (transparent when not a color).
+    pub(crate) fn svg_filter_paints(&self, target: NodeId) -> ([f32; 4], [f32; 4]) {
+        let paint = |property: &str| -> [f32; 4] {
+            // SVG 2 #FillProperty / #StrokeProperty initial values.
+            let value = self
+                .computed_value_resolved(target, property)
+                .unwrap_or_else(|| String::from(if property == "fill" { "black" } else { "none" }));
+            let value = value.trim();
+            if value.eq_ignore_ascii_case("currentcolor") {
+                return match PaintColor::parse_css(&self.svg_used_color(target)) {
+                    Some(PaintColor::Rgba(r, g, b, a)) => {
+                        [r, g, b, a].map(|c| f32::from(c) / 255.0)
+                    }
+                    _ => [0.0; 4],
+                };
+            }
+            match PaintColor::parse_css(value) {
+                Some(PaintColor::Rgba(r, g, b, a)) => [r, g, b, a].map(|c| f32::from(c) / 255.0),
+                _ => [0.0; 4],
+            }
+        };
+        (paint("fill"), paint("stroke"))
+    }
+
+    /// Filter Effects 1 #FilterElement / #FilterEffectsRegion /
+    /// #FilterPrimitivesOverview: resolve `filter` (a `filter` element of
+    /// this document) for a referencing element whose border box (its object
+    /// bounding box and user space origin) is `bbox` in local CSS px. The
+    /// referencing element may belong to another document (an external
+    /// resource document's filter); `filter_use` carries what is known of it.
+    pub(crate) fn svg_filter_graph_for(
+        &self,
+        filter: NodeId,
+        bbox: CssRect,
+        filter_use: &FilterUse<'_>,
     ) -> FilterGraph {
         let font_size = self.font_px(filter).max(0.0);
         let units_of = |attribute: &str, initial_bbox: bool| Units {
@@ -338,32 +406,12 @@ impl Dom {
             region_value("height", "120%", 1, false),
         );
         let primitive_units = units_of("primitiveUnits", false);
-        let paint = |property: &str| -> [f32; 4] {
-            // SVG 2 #FillProperty / #StrokeProperty initial values.
-            let value = self
-                .computed_value_resolved(target, property)
-                .unwrap_or_else(|| String::from(if property == "fill" { "black" } else { "none" }));
-            let value = value.trim();
-            if value.eq_ignore_ascii_case("currentcolor") {
-                return match PaintColor::parse_css(&self.svg_used_color(target)) {
-                    Some(PaintColor::Rgba(r, g, b, a)) => {
-                        [r, g, b, a].map(|c| f32::from(c) / 255.0)
-                    }
-                    _ => [0.0; 4],
-                };
-            }
-            match PaintColor::parse_css(value) {
-                Some(PaintColor::Rgba(r, g, b, a)) => [r, g, b, a].map(|c| f32::from(c) / 255.0),
-                _ => [0.0; 4],
-            }
-        };
         let mut graph = FilterGraph {
             region,
             primitives: Vec::new(),
             primitive_space: primitive_units.to_user_space(),
-            // #FillPaint / #StrokePaint: SVG 2 fill and stroke initial values.
-            fill_paint: paint("fill"),
-            stroke_paint: paint("stroke"),
+            fill_paint: filter_use.fill_paint,
+            stroke_paint: filter_use.stroke_paint,
         };
         if !(region.width > 0.0 && region.height > 0.0) {
             // A negative or zero region disables the effect of the filter:
@@ -372,6 +420,17 @@ impl Dom {
         }
         // `result` names in order, for `in`/`in2` lookups.
         let mut results: Vec<Option<String>> = Vec::new();
+        // #tainted-filter-primitives: whether each primitive's result may
+        // hold privacy-sensitive pixels. Every standard input is tainted.
+        let mut tainted: Vec<bool> = Vec::new();
+        let input_tainted = |input: FilterInput, tainted: &[bool]| match input {
+            FilterInput::Result(index) => tainted.get(index).copied().unwrap_or(true),
+            _ => true,
+        };
+        let current_color = |node: NodeId, property: &str| {
+            self.svg_property(node, property, false)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("currentcolor"))
+        };
         for child in self.child_iter(filter).take(MAX_FILTER_CHILDREN) {
             if self.namespace_uri(child) != Some(SVG_NS) {
                 continue;
@@ -381,6 +440,8 @@ impl Dom {
             };
             let index = graph.primitives.len();
             let input = |name: &str| self.filter_input(child, name, index, &results);
+            // Tainted by its own source rather than its inputs.
+            let mut source_tainted = false;
             let kind = match tag {
                 "feBlend" => FilterPrimitiveKind::Blend {
                     input: input("in"),
@@ -473,6 +534,7 @@ impl Dom {
                     let mut color =
                         self.svg_color_property(child, "flood-color", [0.0, 0.0, 0.0, 1.0]);
                     color[3] *= self.svg_opacity_property(child, "flood-opacity");
+                    source_tainted = current_color(child, "flood-color");
                     FilterPrimitiveKind::DropShadow {
                         input: input("in"),
                         dx: primitive_units.scalar(number("dx", 2.0), 0),
@@ -488,6 +550,7 @@ impl Dom {
                     let mut color =
                         self.svg_color_property(child, "flood-color", [0.0, 0.0, 0.0, 1.0]);
                     color[3] *= self.svg_opacity_property(child, "flood-opacity");
+                    source_tainted = current_color(child, "flood-color");
                     FilterPrimitiveKind::Flood { color }
                 }
                 "feGaussianBlur" => {
@@ -504,9 +567,22 @@ impl Dom {
                         edge: edge_mode(self.attr(child, "edgeMode"), EdgeMode::None),
                     }
                 }
-                // #feImageElement: TRust does not fetch or render feImage
-                // sources inside filter graphs; its result is transparent.
-                "feImage" => FilterPrimitiveKind::Transparent,
+                "feImage" => {
+                    // Without inputs, the default subregion is the region.
+                    let viewport = self.primitive_subregion(
+                        child,
+                        &FilterPrimitiveKind::Transparent,
+                        &graph,
+                        primitive_units,
+                    );
+                    match self.fe_image(child, viewport, primitive_units, filter_use) {
+                        Some((image, image_tainted)) => {
+                            source_tainted = image_tainted;
+                            FilterPrimitiveKind::Image(Box::new(image))
+                        }
+                        None => FilterPrimitiveKind::Transparent,
+                    }
+                }
                 "feMerge" => FilterPrimitiveKind::Merge {
                     inputs: self
                         .child_iter(child)
@@ -572,6 +648,7 @@ impl Dom {
                     }
                 }
                 "feDiffuseLighting" | "feSpecularLighting" => {
+                    source_tainted = current_color(child, "lighting-color");
                     match self.lighting(child, tag == "feSpecularLighting", primitive_units) {
                         Some(lighting) => FilterPrimitiveKind::Lighting {
                             input: input("in"),
@@ -583,6 +660,25 @@ impl Dom {
                 }
                 _ => continue,
             };
+            // #fedisplacemnentmap-restrictions: a tainted displacement map
+            // makes feDisplacementMap a pass through filter.
+            let kind = match kind {
+                FilterPrimitiveKind::DisplacementMap { input, input2, .. }
+                    if input_tainted(input2, &tainted) =>
+                {
+                    FilterPrimitiveKind::ColorMatrix {
+                        input,
+                        matrix: None,
+                    }
+                }
+                kind => kind,
+            };
+            tainted.push(
+                source_tainted
+                    || filter_kind_inputs(&kind)
+                        .into_iter()
+                        .any(|input| input_tainted(input, &tainted)),
+            );
             let subregion = self.primitive_subregion(child, &kind, &graph, primitive_units);
             let linear_rgb = !self
                 .svg_property(child, "color-interpolation-filters", true)
@@ -604,6 +700,152 @@ impl Dom {
             );
         }
         graph
+    }
+
+    /// #feImageElement for `node`, whose primitive subregion (the image's
+    /// viewport) is `viewport`: the graphic it draws and whether it is
+    /// tainted (#tainted-filter-primitives). `None` when the reference is
+    /// unusable; the primitive is then transparent black.
+    fn fe_image(
+        &self,
+        node: NodeId,
+        viewport: CssRect,
+        units: Units,
+        filter_use: &FilterUse<'_>,
+    ) -> Option<(FeImage, bool)> {
+        // `href` overrides the deprecated `xlink:href`.
+        let href = self
+            .attr(node, "href")
+            .or_else(|| self.attr(node, "xlink:href"))?
+            .trim();
+        let document_url = filter_use.document_url?;
+        if href.is_empty() || !(viewport.width > 0.0 && viewport.height > 0.0) {
+            return None;
+        }
+        // SVG 2 #processingURL-absolute: against the element's base URL.
+        let url = self.resource_base_url(node, document_url).join(href).ok()?;
+        let mut resource = url.clone();
+        resource.set_fragment(None);
+        let mut document = document_url.clone();
+        document.set_fragment(None);
+        if href.starts_with('#') || (url.fragment().is_some() && resource == document) {
+            // A reference into this document: rendered like `use`, and
+            // always tainted.
+            let reference = if href.starts_with('#') {
+                href
+            } else {
+                url.as_str()
+            };
+            let element = self.svg_resource_target(node, reference, Some(document_url))?;
+            let image = self.fe_image_element(node, element, viewport, units, document_url)?;
+            return Some((image, true));
+        }
+        // An image resource, rendered like an `image` element whose viewport
+        // is the subregion. HTML #cors-settings-attribute: a missing
+        // `crossorigin` is No CORS; `use-credentials` is Use Credentials and
+        // any other value Anonymous.
+        let cors = self.attr(node, "crossorigin").map(|value| {
+            if value.trim().eq_ignore_ascii_case("use-credentials") {
+                crate::http::CredentialsMode::Include
+            } else {
+                crate::http::CredentialsMode::SameOrigin
+            }
+        });
+        // Fetch #main-fetch: a `data:` URL, and a same-origin URL, yield a
+        // basic response; a CORS request either passes its CORS check or is
+        // a network error (an image that fails to download). Only a
+        // cross-origin No-CORS response is opaque, hence tainted.
+        let local = url.scheme() == "data";
+        let same_origin = filter_use
+            .origin
+            .is_some_and(|origin| *origin == url.origin());
+        let (source, tainted) = match cors {
+            Some(credentials) if !local => (
+                crate::img::cors_image_source(url.as_str(), credentials),
+                false,
+            ),
+            _ => (url.to_string(), !(local || same_origin)),
+        };
+        let aspect = self
+            .attr(node, "preserveAspectRatio")
+            .and_then(AspectRatio::parse)
+            .unwrap_or_default();
+        Some((
+            FeImage {
+                handle: crate::render::ImageHandle::for_source(&source),
+                source: source.into(),
+                viewport,
+                aspect,
+            },
+            tainted,
+        ))
+    }
+
+    /// #feImageElement: `element` rendered according to the behavior of the
+    /// `use` element (SVG 2 #UseElement) in the user coordinate system of
+    /// `primitiveUnits`, translated by the feImage's `x` and `y` as a `use`
+    /// is by its own, into a document image that covers the primitive
+    /// subregion `viewport` exactly.
+    fn fe_image_element(
+        &self,
+        node: NodeId,
+        element: NodeId,
+        viewport: CssRect,
+        units: Units,
+        document_url: &url::Url,
+    ) -> Option<FeImage> {
+        if !self.is_svg_element(element) {
+            return None;
+        }
+        let to_user = units.to_user_space();
+        let user = |x: f32, y: f32| to_user.map_point(crate::core::CssPoint::new(x, y));
+        let (start, end) = (
+            user(viewport.x, viewport.y),
+            user(viewport.x + viewport.width, viewport.y + viewport.height),
+        );
+        let origin = user(units.bbox.x, units.bbox.y);
+        let offset = |name: &str, axis: usize| {
+            self.attr(node, name)
+                .and_then(|value| units.length(value, axis, true))
+                .map(|local| {
+                    let point = if axis == 0 {
+                        user(local, units.bbox.y)
+                    } else {
+                        user(units.bbox.x, local)
+                    };
+                    if axis == 0 {
+                        point.x - origin.x
+                    } else {
+                        point.y - origin.y
+                    }
+                })
+                .unwrap_or(0.0)
+        };
+        let (dx, dy) = (offset("x", 0), offset("y", 1));
+        let mut images = SvgImageRefs::new(Some(document_url));
+        let (body, defs) = self.svg_effect_resource_markup(element, &mut images);
+        let svg = format!(
+            "<svg xmlns=\"{SVG_NS}\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+             width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\" preserveAspectRatio=\"none\">\
+             <defs>{defs}</defs><g transform=\"translate({dx} {dy})\">{body}</g></svg>",
+            viewport.width,
+            viewport.height,
+            start.x,
+            start.y,
+            end.x - start.x,
+            end.y - start.y,
+        );
+        let source =
+            crate::img::document_svg_data_url(&svg, self.svg_geometry_fonts(element), &images.urls);
+        Some(FeImage {
+            handle: crate::render::ImageHandle::for_source(&source),
+            source: source.into(),
+            viewport,
+            aspect: AspectRatio {
+                align: None,
+                slice: false,
+            },
+        })
     }
 
     /// #CommonAttributes `in`: a keyword, or the closest preceding
@@ -865,6 +1107,7 @@ fn filter_kind_inputs(kind: &FilterPrimitiveKind) -> Vec<FilterInput> {
         FilterPrimitiveKind::Merge { inputs } => inputs.clone(),
         FilterPrimitiveKind::Flood { .. }
         | FilterPrimitiveKind::Turbulence(_)
+        | FilterPrimitiveKind::Image(_)
         | FilterPrimitiveKind::Transparent => Vec::new(),
     }
 }
@@ -1088,6 +1331,81 @@ mod tests {
             graph.primitives[3].kind,
             FilterPrimitiveKind::ColorMatrix { matrix: None, .. }
         ));
+    }
+
+    #[test]
+    fn fe_image_sources_and_taint_follow_their_fetch_mode() {
+        // #feImageElement and #tainted-filter-primitives: a displacement map
+        // from a cross-origin No-CORS image or an element reference is
+        // tainted (#fedisplacemnentmap-restrictions: a pass through filter);
+        // same-origin, data: and CORS (`crossorigin`) images are not.
+        let dom = dom(r##"<svg><filter id=f>
+              <feImage href="https://cdn.test/opaque.png" result=opaque />
+              <feImage href="/same.png" result=same />
+              <feImage href="data:image/png;base64,AA==" result=data />
+              <feImage href="https://cdn.test/cors.png" crossorigin result=cors />
+              <feImage href="#shape" result=element />
+              <feImage href="#missing" result=missing />
+              <feDisplacementMap in2=opaque />
+              <feDisplacementMap in2=same />
+              <feDisplacementMap in2=data />
+              <feDisplacementMap in2=cors />
+              <feDisplacementMap in2=element />
+              <feComposite in2=same />
+              <feDisplacementMap in2=SourceGraphic />
+            </filter><rect id=shape width=4 height=4 /></svg><div id=t></div>"##);
+        let page = url::Url::parse("https://example.test/dir/page.html").unwrap();
+        let origin = page.origin();
+        let graph = dom.svg_filter_graph_for(
+            dom.get_by_id("f").unwrap(),
+            CssRect::new(0.0, 0.0, 20.0, 10.0),
+            &FilterUse {
+                fill_paint: [0.0; 4],
+                stroke_paint: [0.0; 4],
+                document_url: Some(&page),
+                origin: Some(&origin),
+            },
+        );
+        let image = |index: usize| match &graph.primitives[index].kind {
+            FilterPrimitiveKind::Image(image) => Some(image.source.to_string()),
+            _ => None,
+        };
+        assert_eq!(image(0).as_deref(), Some("https://cdn.test/opaque.png"));
+        assert_eq!(image(1).as_deref(), Some("https://example.test/same.png"));
+        assert_eq!(image(2).as_deref(), Some("data:image/png;base64,AA=="));
+        assert_eq!(
+            image(3).as_deref().and_then(crate::img::cors_image_target),
+            Some((
+                "https://cdn.test/cors.png",
+                crate::http::CredentialsMode::SameOrigin
+            ))
+        );
+        // The element renders into a document image covering the subregion
+        // (the default filter region: -10%/120% of the box).
+        let FilterPrimitiveKind::Image(element) = &graph.primitives[4].kind else {
+            panic!("element reference");
+        };
+        assert!(element.source.starts_with("data:image/svg+xml"));
+        assert_eq!(element.viewport, CssRect::new(-2.0, -1.0, 24.0, 12.0));
+        assert!(element.aspect.align.is_none());
+        assert!(matches!(
+            graph.primitives[5].kind,
+            FilterPrimitiveKind::Transparent
+        ));
+        let displaced = |index: usize| {
+            matches!(
+                graph.primitives[index].kind,
+                FilterPrimitiveKind::DisplacementMap { .. }
+            )
+        };
+        assert!(!displaced(6), "cross-origin No-CORS image");
+        assert!(displaced(7), "same-origin image");
+        assert!(displaced(8), "data: image");
+        assert!(displaced(9), "CORS image");
+        assert!(!displaced(10), "element reference");
+        // Every standard input is tainted.
+        assert!(!displaced(12), "SourceGraphic");
+        assert_eq!(graph.images().count(), 5);
     }
 
     #[test]

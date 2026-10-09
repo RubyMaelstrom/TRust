@@ -417,6 +417,60 @@ impl PageImages {
             .is_ok_and(|inner| inner.entries.contains_key(url))
     }
 
+    /// Whether the document requested `url` with this CORS mode.
+    pub(crate) fn contains_mode(&self, url: &str, cors: Option<CredentialsMode>) -> bool {
+        self.inner.lock().is_ok_and(|inner| {
+            inner
+                .entries
+                .get(url)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.key.cors == cors))
+        })
+    }
+
+    /// [`Self::presentation`] for a consumer that must use a CORS request
+    /// with `credentials` (CSS Masking 1 #priv-sec, an feImage with a
+    /// `crossorigin` attribute): only the document's CORS request of that
+    /// mode serves it, whose failure (a failed CORS check included) is a
+    /// network error.
+    pub(crate) async fn presentation_cors(
+        &self,
+        url: &str,
+        credentials: CredentialsMode,
+    ) -> Presentation {
+        let fetches = {
+            let Ok(inner) = self.inner.lock() else {
+                return Presentation::Unavailable;
+            };
+            inner
+                .entries
+                .get(url)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| entry.key.cors == Some(credentials))
+                        .map(|entry| entry.fetch.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        if fetches.is_empty() {
+            return Presentation::Unavailable;
+        }
+        let mut cancelled = true;
+        for fetch in fetches {
+            match fetch.await {
+                Ok(image) => return Presentation::Image(image),
+                Err(ImageFailure::Cancelled) => {}
+                Err(_) => cancelled = false,
+            }
+        }
+        if cancelled {
+            Presentation::Unavailable
+        } else {
+            Presentation::Failed
+        }
+    }
+
     /// The document's response for `url`. The document requests every image
     /// its rendering needs before publishing that rendering, so an unknown URL
     /// is one the document will not request: the frontend fetches it itself.

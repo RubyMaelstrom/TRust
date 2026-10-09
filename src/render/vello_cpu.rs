@@ -74,6 +74,41 @@ pub(super) struct BackdropPaint {
     pub shape: PaintShape,
 }
 
+/// Filter Effects 1 #feImageElement pixels from the scene's image store: a
+/// vector image is rasterized at the size it is drawn, like an image
+/// painted directly.
+struct SceneFilterImages<'a>(&'a Scene);
+
+impl crate::render::filter_graph::FilterImageSource for SceneFilterImages<'_> {
+    fn natural_size(&self, handle: ImageHandle) -> Option<(u32, u32)> {
+        self.0
+            .image(handle)
+            .map(|image| (image.width, image.height))
+    }
+
+    fn pixels(
+        &self,
+        handle: ImageHandle,
+        rect: CssRect,
+        to_pixel: Affine2d,
+    ) -> Option<crate::render::ImageResource> {
+        let image = self.0.image(handle)?;
+        let Some(source) = image.svg_source.as_ref() else {
+            return Some(image);
+        };
+        let [a, b, c, d, e, f] = to_pixel.0.map(f64::from);
+        crate::img::SvgRasterSize::new(
+            image.width,
+            image.height,
+            rect,
+            crate::render::ImageFit::Fill,
+            [a, b, c, d, e, f],
+        )
+        .rasterize_stretched(source)
+        .ok()
+    }
+}
+
 /// The filtered pixels of an offscreen group, drawn over `local_rect` (the
 /// group's local CSS px) with `local_from_pixmap` as the paint transform.
 #[derive(Clone, Debug)]
@@ -974,6 +1009,7 @@ impl VelloCpuRenderer {
             crate::render::filter_graph::FilterOptions {
                 blur_edge: crate::render::filter_graph::EdgeMode::Mirror,
                 background: None,
+                images: Some(&SceneFilterImages(scene)),
             },
         );
         Some(BackdropPaint {
@@ -1085,6 +1121,7 @@ impl VelloCpuRenderer {
             crate::render::filter_graph::FilterOptions {
                 blur_edge: crate::render::filter_graph::EdgeMode::None,
                 background: background.as_ref(),
+                images: Some(&SceneFilterImages(scene)),
             },
         );
         Some(EffectImage {

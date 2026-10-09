@@ -84,6 +84,8 @@ pub(in crate::dom) fn valid(property: &str, value: &str) -> Option<bool> {
             component(p, Kind::Number, None) || component(p, Kind::Percentage, None)
         }),
         "color-interpolation-filters" => one_of(&["auto", "srgb", "linearrgb"]),
+        // SVG 2 painting.html #ColorInterpolationProperty.
+        "color-interpolation" => one_of(&["auto", "srgb", "linearrgb"]),
         // CSS Masking 1 #the-mask-type.
         "mask-type" => one_of(&["luminance", "alpha"]),
         "pointer-events" => one_of(&[

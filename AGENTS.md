@@ -484,18 +484,29 @@ current behavior and limits; consult the governing standards before changing it.
   caption preferences). The arena journals track element parent changes
   (`src/dom/media_tracks.rs`) so parser-created tracks get their addtrack
   events and selection. Cues are never rendered: no media plays inline.
-- `filter: url(#f)` (also inside `backdrop-filter`) resolves the
-  same-document SVG `filter` element into `render::FilterGraph`; external
-  filter documents are invalid references, which ignore the whole chain.
-  Groups with such graphs, and `backdrop-filter` Backdrop Root Images, are
-  rasterized offscreen by the CPU reference renderer and filtered by
-  `render::filter_graph`; Hybrid draws those CPU pixels, so backends agree.
-  Offscreen work is bounded (64 renders per frame, nesting depth 4, 4 Mpx
-  buffers at reduced resolution beyond); over budget, content paints
-  unfiltered. `feImage` renders transparent. `clip-path: url()` and
-  `mask-image: url()` resolve `clipPath`/`mask` through usvg geometry and a
-  generated mask image. The terminal frontend ignores filters, backdrop
-  filters and masks; clip paths clip by their bounds.
+- `filter: url()` (also inside `backdrop-filter`) resolves an SVG `filter`
+  element into `render::FilterGraph`. Groups with such graphs, and
+  `backdrop-filter` Backdrop Root Images, are rasterized offscreen by the
+  CPU reference renderer and filtered by `render::filter_graph`; Hybrid
+  draws those CPU pixels, so backends agree. Offscreen work is bounded (64
+  renders per frame, nesting depth 4, 4 Mpx buffers at reduced resolution
+  beyond); over budget, content paints unfiltered. `feImage` draws page
+  images and referenced elements (as a generated document image); taint
+  follows the URL's origin, so a tainted map makes `feDisplacementMap` a
+  pass-through. `clip-path: url()` and `mask-image: url()` resolve
+  `clipPath`/`mask` through usvg geometry and a generated mask image. The
+  terminal frontend ignores filters, backdrop filters and masks; clip paths
+  clip by their bounds.
+- External resource documents named by `filter`, `clip-path`, `mask-image`
+  and canvas `filter` (`doc.svg#id`) are fetched with CORS Anonymous
+  requests by the page actor (`take_svg_resource_requests`) or the
+  script-free load, into a bounded process store keyed by document origin
+  (`dom::svg_external`: 16 documents, 16 MiB, no `file:`); arrival advances
+  `svg_sprite_revision`. Until loaded a filter or clip-path applies nothing
+  and a mask layer is transparent black. `mask-image` images and
+  `crossorigin` feImages are CORS requests: their image source carries a
+  secret marker (`img::cors_image_source`) that the page actor and
+  `fetch_presentation_image` turn into a CORS fetch.
 - WebGL 1 uses lazy-loaded EGL/OpenGL ES with Rust shader preparation and
   validation, without bundled ANGLE. A missing robust context makes
   `getContext("webgl")` return `null`. WebGL 2 and multisample antialiasing are
