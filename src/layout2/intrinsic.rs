@@ -92,6 +92,15 @@ impl Flow<'_> {
         inl: &InlineStyle,
         cb_h: Option<f32>,
     ) -> f32 {
+        // A replaced box resolves its own percentage heights as it is sized
+        // (CSS 2 §10.6.2), so its measurement is keyed by the containing
+        // block's height instead (see `intrinsic_w_keyed`).
+        if matches!(b.content, Content::Atomic(_)) {
+            return match cb_h {
+                Some(_) => self.intrinsic_w_keyed(b, mode, inl, Some(cb_h)),
+                None => self.intrinsic_w(b, mode, inl),
+            };
+        }
         let resolved = self.intrinsic_height_basis_in(b, cb_h);
         if resolved == self.intrinsic_height_basis(b) {
             self.intrinsic_w(b, mode, inl)
@@ -100,8 +109,9 @@ impl Flow<'_> {
         }
     }
 
-    /// `height` overrides the box's own height basis; it is part of the
-    /// memo key, and the per-pass memo holds only the context-free results.
+    /// `height` overrides the box's own height basis (for a replaced box,
+    /// its containing block's height); it is part of the memo key, and the
+    /// per-pass memo holds only the context-free results.
     fn intrinsic_w_keyed(
         &self,
         b: &BoxNode,
@@ -141,7 +151,11 @@ impl Flow<'_> {
             return width;
         }
         let inputs = super::memo::ReadScope::new(self.dom, reuse);
-        let basis = height.unwrap_or_else(|| self.intrinsic_height_basis(b));
+        let basis = match (&b.content, height) {
+            (Content::Atomic(_), height) => height.flatten(),
+            (_, Some(height)) => height,
+            (_, None) => self.intrinsic_height_basis(b),
+        };
         let v = self.intrinsic_w_inner(b, mode, inl, basis);
         let value = super::memo::Intrinsic {
             value: v,
@@ -283,7 +297,7 @@ impl Flow<'_> {
                         .fold(inline_w, f32::max)
                 }
             }
-            Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode, &here),
+            Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode, &here, basis),
             Content::Grid(items) => self.grid_intrinsic_width(b, items, mode, &here),
             Content::Flex(items) => {
                 let u = Units::of(self.dom, b.node);
@@ -476,9 +490,21 @@ impl Flow<'_> {
     }
 
     /// A replaced/control/media atom's content intrinsic width, px. Under an
-    /// intrinsic constraint percentages behave as auto here; `contribution`
-    /// applies the special cyclic-percentage constraints around this content.
-    fn atom_intrinsic_w(&self, atom: &super::tree::Atom, mode: IMode, inl: &InlineStyle) -> f32 {
+    /// intrinsic constraint a percentage width behaves as auto here;
+    /// `contribution` applies the special cyclic-percentage constraints
+    /// around this content. css-sizing-3 #cyclic-percentage-contribution:
+    /// the containing block's definite height `cb_h` does not depend on the
+    /// width being measured, so an image's percentage height resolves
+    /// against it and its width follows through the ratio, as the inline
+    /// probe already sizes an inline image (a block-level `height:100%`
+    /// cover in a 400px card measured its natural width instead).
+    fn atom_intrinsic_w(
+        &self,
+        atom: &super::tree::Atom,
+        mode: IMode,
+        inl: &InlineStyle,
+        cb_h: Option<f32>,
+    ) -> f32 {
         match &atom.kind {
             AtomKind::GeneratedImage { url } => crate::responsive_image::density_corrected_size(
                 super::memo::image_size(self.dom, self.images, url),
@@ -506,7 +532,7 @@ impl Flow<'_> {
                         url: url.as_deref(),
                     },
                     None,
-                    None,
+                    cb_h,
                     self.vp,
                 ) {
                     Some(r) => r.box_w,

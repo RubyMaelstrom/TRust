@@ -14243,6 +14243,43 @@ b</xmp></body>"#;
     }
 
     #[test]
+    fn intrinsic_widths_resolve_block_image_percentage_heights_against_a_definite_height() {
+        // css-sizing-3 #cyclic-percentage-contribution for a block-level
+        // image: its `height:100%` of a definite 400px wrapper is not cyclic,
+        // so the 600x900 cover contributes 400 * 600 / 900 px, not its natural
+        // width capped by the card's `max-width:340px` (ziggurat.games' slick
+        // cover carousel left 73px gaps; Chromium: 282.66px floats).
+        let mut images = HashMap::new();
+        images.insert("http://e.com/c.png".to_string(), (600u32, 900u32));
+        for display in ["block", "inline-block"] {
+            for image in [
+                "display:block",
+                "display:block;max-width:100%",
+                "float:left",
+            ] {
+                let html = format!(
+                    r#"<body style="margin:0"><div id=s style="float:left;padding-left:16px"><a style="display:{display};width:100%;max-width:340px;height:400px"><div style="height:100%"><img src="c.png" style="height:100%;{image}"></div></a></div></body>"#
+                );
+                let dom = Dom::parse_document(&html);
+                let layout = lay_graphical(&html, 5000.0, &images);
+                let s = layout.boxes[&dom.get_by_id("s").unwrap()];
+                assert!(
+                    (s.width - 282.67).abs() < 0.01,
+                    "{display} {image}: {}",
+                    s.width
+                );
+            }
+        }
+        // A percentage of an indefinite height stays cyclic (auto): the
+        // natural width, capped by the card.
+        let html = r#"<body style="margin:0"><div id=s style="float:left"><a style="display:block;width:100%;max-width:340px"><img src="c.png" style="height:100%;display:block"></a></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 5000.0, &images);
+        let s = layout.boxes[&dom.get_by_id("s").unwrap()];
+        assert!((s.width - 340.0).abs() < 0.01, "indefinite: {}", s.width);
+    }
+
+    #[test]
     fn inline_replaced_images_paint_their_background_and_border() {
         // CSS 2 Appendix E step 7.2.1: each box in a line box paints its
         // background and border, then an inline-level replaced element its
