@@ -4057,6 +4057,7 @@ impl App {
                 fetch_metadata: None,
                 cookie_context: None,
                 timing_client: None,
+                use_cors_preflight: false,
                 fetch_policy: None,
             };
             if let Some(page) = &referrer {
@@ -10915,6 +10916,7 @@ mod tests {
         let response = crate::http::Response {
             url: url::Url::parse("https://example.test/report.pdf").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: String::from("application/pdf"),
             headers: vec![],
             body: b"%PDF-1.7".to_vec(),
@@ -15835,6 +15837,7 @@ mod tests {
         let response = crate::http::Response {
             url: url::Url::parse("https://www.imdb.com/list/ls123/").unwrap(),
             status: 202,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             blobs: None,
@@ -15898,6 +15901,7 @@ mod tests {
         let response = crate::http::Response {
             url: base,
             status: 200,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             blobs: None,
@@ -17338,6 +17342,7 @@ mod tests {
             crate::http::Response {
                 url: url.clone(),
                 status: 200,
+                status_text: String::new(),
                 content_type: String::from("image/svg+xml"),
                 headers: Vec::new(),
                 blobs: None,

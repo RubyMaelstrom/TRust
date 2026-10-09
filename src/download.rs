@@ -909,7 +909,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
                     .nth(1)
                     .and_then(|status| status.parse().ok())
                     .ok_or_else(|| format!("malformed download response: {status_line:?}"))?;
-                let mut headers = std::collections::HashMap::new();
+                let mut headers = http::Headers::new();
                 loop {
                     let line = download_line(io).await?;
                     if line.is_empty() {
@@ -1165,6 +1165,7 @@ mod tests {
         http::Response {
             url: Url::parse("https://example.test/files/report").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: content_type.into(),
             headers,
             body: body.to_vec(),

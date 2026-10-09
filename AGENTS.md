@@ -320,9 +320,13 @@ current behavior and limits; consult the governing standards before changing it.
   loop and close when the worker ends. Asynchronous XHR reads its body as it
   arrives (LOADING, `readystatechange` and `progress` at most every ~50 ms);
   a synchronous XHR receives it whole, so its timeout is detected only after
-  the response. `statusText` stays empty (the host response keeps no reason
-  phrase), and XHR's use-CORS-preflight flag for upload listeners is not
-  forwarded to the host.
+  the response. Responses carry the HTTP/1.x reason phrase as `statusText`
+  (empty over HTTP/2 and HTTP/3) and their header list in wire order with
+  duplicates (`http::Headers`, `http::header_list_get`); scripts' Headers and
+  `getAllResponseHeaders()` sort and combine it. XHR upload listeners set the
+  request's use-CORS-preflight flag (`Request::use_cors_preflight`), which
+  forces a CORS preflight for a cross-origin request. TRust keeps no
+  CORS-preflight cache.
 - Script `fetch()` and asynchronous XHR responses resolve at the response
   header section; HTTP/1.1, HTTP/2 and HTTP/3 bodies then stream
   (`http::fetch_script_streaming`, `http/body_stream.rs`) with incremental
@@ -399,9 +403,27 @@ current behavior and limits; consult the governing standards before changing it.
   actor exits fullscreen, else fires the Escape keydown (canceling it consumes
   the request), else processes the close watchers (modal dialogs by `closedby`,
   auto/hint popovers, `CloseWatcher`, grouped per HTML's user-activation
-  rules). Only an unconsumed request makes the frontend stop loading (the
-  navigation, page subresource and image fetches) while the page and its scripts
-  keep running. Other modes keep their own Escape meaning. COMMAND `stop` stops
+  rules). Only an unconsumed request makes the frontend stop loading while the
+  page and its scripts keep running: the frontend cancels its navigation and
+  image work, and `PageHandle::stop_loading` sends `PageCmd::StopLoading`, a
+  task in which the actor runs HTML #nav-stop exactly as `window.stop()` does
+  (`stop_loading_navigable`): the ongoing navigation the running task
+  requested is dropped, descendant navigables' Documents are aborted by queued
+  tasks, and the Document is aborted (#abort-a-document). Aborting cancels its
+  fetch group: pending `fetch()` rejects with an "AbortError" DOMException,
+  bodies still arriving error with it, XHR fires readystatechange/abort/loadend
+  inside the stop (a body already loading ends with "error", per XHR's
+  processBodyError), an EventSource whose response has not arrived fails, a
+  connecting WebSocket fails (established ones stay open), keepalive fetches
+  and beacons continue, and the browser's own subresource and image fetches
+  and frame navigations are canceled (their elements see a failed load).
+  Queued tasks of canceled script fetches are discarded. Workers are
+  unaffected. While the top-level parser still runs (`window.stop()` from
+  a parser script or a task during parsing) it is aborted: the tree builder's
+  nodes after the parser's position are removed, readiness goes
+  "interactive" then "complete", remaining and deferred parser scripts never
+  run, DOMContentLoaded and load never fire, and `document.write()` is
+  ignored. Other modes keep their own Escape meaning. COMMAND `stop` stops
   loading the same way; `kill` drops the live page and its scripts.
 - Showing popovers, modal dialogs and fullscreen elements share the arena's
   ordered top layer (`Dom::top_layer`): each generates a root-sibling box above

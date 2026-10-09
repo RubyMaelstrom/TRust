@@ -256,6 +256,7 @@ pub(crate) fn image_response(response: Response) -> Result<crate::http::Response
         url: ::url::Url::parse(&response.url.public_url().to_string())
             .map_err(|e| e.to_string())?,
         status: 200,
+        status_text: String::new(),
         content_type: mime.clone(),
         body: response.body,
         headers: Vec::new(),

@@ -3890,6 +3890,7 @@ async fn fetch_protocol_interactive(
                 fetch_metadata: None,
                 cookie_context: None,
                 timing_client: None,
+                use_cors_preflight: false,
                 fetch_policy: None,
             };
             if let Some(referrer) = referrer {
@@ -4801,6 +4802,7 @@ mod tests {
             Ok(FetchedDocument::Http(Box::new(crate::http::Response {
                 url: source,
                 status: 200,
+                status_text: String::new(),
                 content_type: String::from("text/html"),
                 headers: Vec::new(),
                 body: b"<p>redirecting</p>".to_vec(),
@@ -4864,6 +4866,7 @@ mod tests {
             crate::http::Response {
                 url: url::Url::parse("https://example.test/report.pdf").unwrap(),
                 status: 200,
+                status_text: String::new(),
                 content_type: String::from("application/pdf"),
                 headers: vec![("content-length".into(), "9".into())],
                 body: b"%PDF-1.7".to_vec(),
@@ -4973,6 +4976,8 @@ mod tests {
         );
         assert!(browser.declarative_refresh_task.is_none());
         assert_eq!(browser.snapshot().status, "Stopped loading.");
+        // The page actor aborts the document as a task (HTML #nav-stop).
+        assert!(matches!(rx.try_recv(), Ok(crate::js::PageCmd::StopLoading)));
         browser.handle_action(UserAction::Kill);
         assert!(
             !browser.page_is_live(),
@@ -5461,6 +5466,7 @@ mod tests {
             document: FetchedDocument::Http(Box::new(crate::http::Response {
                 url: url::Url::parse("https://example.com/").unwrap(),
                 status: 200,
+                status_text: String::new(),
                 content_type: String::from("text/html"),
                 headers: Vec::new(),
                 body: b"<p>server source</p>".to_vec(),

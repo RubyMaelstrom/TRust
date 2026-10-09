@@ -5266,6 +5266,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         trust.fire(g.document, "DOMContentLoaded", true);
     };
     trust.completeDocumentLoad = function () {
+        // An aborted parser never reaches HTML #the-end, whose steps fire load.
+        if (trust.activeParserWasAborted) return;
         trust.setDocumentReadiness("complete");
         trust.fire(g.window, "load", false);
     };
@@ -17462,6 +17464,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function documentWrite(doc, values, lineFeed) {
         rejectXMLDocumentWrite(doc);
+        // HTML #document-write-steps: nothing is written once the document's
+        // active parser was aborted (window.stop() while it was parsing).
+        if (doc === g.document && trust.activeParserWasAborted) return;
         let markup = "";
         for (const value of values) markup += String(value);
         if (lineFeed) markup += "\n";
@@ -25711,7 +25716,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     headerWire = "Content-Type\n" + extracted.type;
                 }
             }
-            __http_fetch_async(parsed[0], "POST", bytes, contentType, headerWire, corsMode, "include", "beacon")
+            // Argument 11: a keepalive fetch, which stopping the document leaves running.
+            __http_fetch_async(parsed[0], "POST", bytes, contentType, headerWire, corsMode, "include", "beacon",
+                false, undefined, false, true)
                 .then(() => { if (bytes !== null) fetchAPI.releaseKeepalive(length); },
                     () => { if (bytes !== null) fetchAPI.releaseKeepalive(length); });
             return true;
@@ -26677,6 +26684,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         log("warn")("window.close(): TRust does not close its only top-level browsing context " +
             "(closing it would quit the browser); the page stays open");
     }
+    // HTML #dom-window-stop: if this Window's navigable is null, return;
+    // otherwise stop loading it (#nav-stop), which the host runs: its ongoing
+    // navigation ends and its active Document and their descendants' are
+    // aborted (#abort-a-document-and-its-descendants).
+    g.stop = { stop() {
+        if (navigableRecord.closed) return;
+        __stop_loading();
+    } }.stop;
     // HTML #dom-window-moveto and siblings: each first returns unless the
     // browsing context is an auxiliary one created by script. TRust creates
     // no auxiliary browsing contexts, so these always end at that step.
@@ -38658,6 +38673,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const charCodeAt = String.prototype.charCodeAt, stringSlice = String.prototype.slice;
     const fromCharCode = String.fromCharCode, toWellFormed = String.prototype.toWellFormed;
     const arraySort = Array.prototype.sort, iteratorSymbol = Symbol.iterator, toStringTag = Symbol.toStringTag;
+    const arrayPush = Array.prototype.push, arraySplice = Array.prototype.splice;
+    const arrayIndexOf = Array.prototype.indexOf, arraySlice = Array.prototype.slice;
     const jsonParse = JSON.parse, jsonStringify = JSON.stringify;
     const MathMin = Math.min, MathFloor = Math.floor;
     const URLSearchParamsCtor = g.URLSearchParams;
@@ -39157,17 +39174,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // its transfer.
     const FinalizationRegistryCtor = g.FinalizationRegistry;
     const hostBodyRelease = typeof FinalizationRegistryCtor === "function"
-        ? new FinalizationRegistryCtor(function (id) { httpFetchCancel(id); }) : null;
+        ? new FinalizationRegistryCtor(function (id) { httpFetchCancel(id); removeHostBodyRecord(id); }) : null;
+    const WeakRefCtor = g.WeakRef, weakRefDeref = typeof WeakRefCtor === "function" ? WeakRefCtor.prototype.deref : null;
     const registryRegister = hostBodyRelease === null ? null : FinalizationRegistryCtor.prototype.register;
     const registryUnregister = hostBodyRelease === null ? null : FinalizationRegistryCtor.prototype.unregister;
-    function bodyFromHost(id) {
+    function bodyFromHost(id, keepalive) {
         const body = bodyFromStream(null, null, null);
         const token = {};
         let pending = null, settled = false, stream = null;
+        // Until its body has been transmitted the fetch is ongoing: it stays
+        // in the fetch group, where stopping the document aborts it. The
+        // group holds the abort steps weakly, so a body nobody can read any
+        // more is still collected, canceling its transfer.
+        const record = {keepalive: !!keepalive, id, abort: null};
+        addFetchRecord(record);
         // The transfer is over or abandoned: it needs no cancellation.
         const settle = function () {
             if (settled) return false;
             settled = true;
+            removeFetchRecord(record);
             if (hostBodyRelease !== null) apply(registryUnregister, hostBodyRelease, [token]);
             return true;
         };
@@ -39176,6 +39201,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         // #fetch-controller-abort / #fetch-controller-terminate
         body.terminate = function () { if (settle()) httpFetchCancel(id); };
+        // #concept-http-network-fetch "if aborted": an aborted fetch's
+        // response gets its aborted flag and its body's stream errors with
+        // the deserialized abort reason (an "AbortError" DOMException when
+        // the controller was aborted without one, #fetch-controller-abort).
+        const abortSteps = function () {
+            if (!settle()) return;
+            httpFetchCancel(id);
+            pending = null;
+            if (streamsAPI.readable(stream)) streamsAPI.error(stream, domException("The fetch was aborted", "AbortError"));
+            done();
+        };
+        body.abortSteps = abortSteps;
+        record.abort = weakRefDeref === null ? abortSteps : weakSteps(new WeakRefCtor(abortSteps));
         stream = streamsAPI.setUpBytes(function () {
             if (pending !== null && pending.length) {
                 pending = streamsAPI.pullFromBytes(stream, pending);
@@ -40207,25 +40245,113 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const parsed = parseURL(url, null);
         return parsed !== null && parsed.origin === origin && origin !== "null";
     }
+    // --- the fetch group (#concept-fetch-group) ---------------------------------
+    // The fetch records of this realm's environment settings object whose
+    // fetch is ongoing on the network, from the request until its response
+    // body has been transmitted. Each record's `abort` aborts its fetch
+    // controller (#fetch-controller-abort) "due to the user or page logic"
+    // (#fetch-elsewhere-ongoing). Keepalive fetches are marked: they outlive
+    // their document (#concept-fetch-group-terminate), so stopping the
+    // document leaves them running.
+    const fetchGroup = [];
+    function addFetchRecord(record) { apply(arrayPush, fetchGroup, [record]); }
+    function removeFetchRecord(record) {
+        const index = apply(arrayIndexOf, fetchGroup, [record]);
+        if (index >= 0) apply(arraySplice, fetchGroup, [index, 1]);
+    }
+    // Steps reached through a weak reference, from a scope that holds nothing
+    // else of their owner's.
+    function weakSteps(reference) {
+        return function () {
+            const steps = apply(weakRefDeref, reference, []);
+            if (steps !== undefined) steps();
+        };
+    }
+    // The body of host transfer `id` was collected: its fetch has ended.
+    function removeHostBodyRecord(id) {
+        for (let i = 0; i < fetchGroup.length; i++)
+            if (fetchGroup[i].id === id) { apply(arraySplice, fetchGroup, [i, 1]); return; }
+    }
+    // #concept-aborted-network-error
+    function abortedNetworkError() {
+        const response = networkError();
+        response.aborted = true;
+        return response;
+    }
+    // HTML #abort-a-document step 2: "cancel any instances of the fetch
+    // algorithm in the context of document, discarding any tasks queued for
+    // them, and discarding any further data received from the network for
+    // them". Each fetch is aborted at once: one waiting for its response gets
+    // an aborted network error (so fetch() rejects with an "AbortError"
+    // DOMException and XMLHttpRequest runs its request error steps for
+    // "abort"), and a response body still arriving errors with the abort
+    // reason. Its host transfer stops and its queued networking tasks are
+    // discarded (see `host_stop_loading`). Returns whether a fetch was
+    // canceled.
+    function abortFetchGroup() {
+        const records = apply(arraySlice, fetchGroup, []);
+        let canceled = false;
+        for (let i = 0; i < records.length; i++) {
+            if (records[i].keepalive) continue;
+            removeFetchRecord(records[i]);
+            canceled = true;
+            records[i].abort();
+        }
+        return canceled;
+    }
     // The host's HTTP(S) fetch: CORS checks and response filtering, cookies and
     // redirects run natively. Resolves with a response record.
     // `stream`: the caller reads the body as it arrives; otherwise the host
-    // delivers it whole.
-    function httpFetch(request, bodyBytes, sync = false, stream = false) {
+    // delivers it whole. `processAbort`, when given, receives the aborted
+    // network error of a fetch stopped before its response (in place of the
+    // promise), at the moment it is aborted.
+    function httpFetch(request, bodyBytes, sync = false, stream = false, processAbort = null) {
         let headerWire = "";
         for (let i = 0; i < request.headerList.length; i++)
             headerWire += (headerWire ? "\n" : "") + request.headerList[i][0] + "\n" + request.headerList[i][1];
         const contentType = headerListGet(request.headerList, "Content-Type");
         const initiator = request.initiatorType || "fetch";
         bodyBytes = hostRequestBody(bodyBytes);
+        // Argument 10 is the request's use-CORS-preflight flag (#use-cors-preflight-flag).
+        const useCORSPreflight = !!request.useCORSPreflight;
         if (sync) {
             return hostResponse(request, httpFetchSync(request.url, request.method, bodyBytes, contentType, headerWire,
-                request.mode, request.credentials, initiator));
+                request.mode, request.credentials, initiator, undefined, undefined, useCORSPreflight));
         }
-        return react(httpFetchAsync(request.url, request.method, bodyBytes, contentType, headerWire,
-            request.mode, request.credentials, initiator, !!stream, request.cache), function (result) {
-            return hostResponse(request, result);
-        }, function () { return networkError(); });
+        let resolveFetch = null, settled = false;
+        const promise = new PromiseCtor(function (resolve) { resolveFetch = resolve; });
+        const record = {keepalive: !!request.keepalive, abort: null};
+        record.abort = function () {
+            if (settled) return;
+            settled = true;
+            const response = abortedNetworkError();
+            if (processAbort !== null) processAbort(response);
+            else resolveFetch(response);
+        };
+        addFetchRecord(record);
+        // Argument 11 tells the host a keepalive fetch apart from the ones
+        // stopping the document cancels.
+        react(httpFetchAsync(request.url, request.method, bodyBytes, contentType, headerWire,
+            request.mode, request.credentials, initiator, !!stream, request.cache, useCORSPreflight,
+            !!request.keepalive), function (result) {
+            if (settled) {
+                // Aborted meanwhile: release a transfer that already began.
+                if (result && typeof result[8] === "number") httpFetchCancel(result[8]);
+                return;
+            }
+            settled = true;
+            removeFetchRecord(record);
+            let response;
+            try { response = hostResponse(request, result); }
+            catch (_) { response = networkError(); }
+            resolveFetch(response);
+        }, function () {
+            if (settled) return;
+            settled = true;
+            removeFetchRecord(record);
+            resolveFetch(networkError());
+        });
+        return promise;
     }
     // The host's fetch result as a response record.
     function hostResponse(request, result) {
@@ -40246,7 +40372,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const urlList = withoutFragment(finalURL) !== withoutFragment(request.url) ? [request.url, finalURL] : [request.url];
         const type = request.mode === "cors" && !sameOrigin(finalURL, adapter.origin()) ? "cors" : "basic";
         let body;
-        if (typeof result[8] === "number") body = bodyFromHost(result[8]);
+        if (typeof result[8] === "number") body = bodyFromHost(result[8], request.keepalive);
         else {
             const bytes = isArrayBuffer(result[3]) ? new Uint8ArrayCtor(result[3]) : utf8(`${result[2] || ""}`);
             body = bodyFromBytes(bytes, null, bytes.length);
@@ -40262,9 +40388,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // caller queues its processing. The record's body bytes are fully read.
     // Other platform fetches of a whole resource (a track element's text
     // track) pass their own mode, destination and initiator type.
-    function fetchForXHR(fields, deliver) {
+    function fetchForXHR(fields, deliver, processAbort = null) {
         const request = newRequestRecord({url: fields.url, urlList: [fields.url], method: fields.method,
-            headerList: fields.headerList, mode: fields.mode || "cors", credentials: fields.credentials});
+            headerList: fields.headerList, mode: fields.mode || "cors", credentials: fields.credentials,
+            useCORSPreflight: !!fields.useCORSPreflight});
         request.initiatorType = fields.initiatorType || "xmlhttprequest";
         if (fields.destination) request.destination = fields.destination;
         const parsed = parseURL(request.url, null);
@@ -40300,9 +40427,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return null;
         }
         // The asynchronous response body is read incrementally (XHR
-        // #the-send()-method processResponse).
-        react(httpFetch(request, fields.body, false, true), function (response) { deliver(finish(response)); },
-            function () { deliver(networkError()); });
+        // #the-send()-method processResponse). A fetch aborted before its
+        // response reaches `processAbort` as it is aborted, when given.
+        react(httpFetch(request, fields.body, false, true, processAbort === null ? null : function (response) {
+            processAbort(finish(response));
+        }), function (response) { deliver(finish(response)); }, function () { deliver(networkError()); });
         return null;
     }
     // HTML #dom-eventsource: fetch an event stream. The request is a
@@ -40432,6 +40561,16 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         abortAPI.add(request.signal, abortSteps);
         const processResponse = function (response) {
             if (locallyAborted) { terminateBody(response.body); return; }
+            // #dom-global-fetch processResponse: an aborted response (the
+            // document stopped loading, HTML #abort-a-document) aborts the
+            // fetch() call with the deserialized abort reason, which is an
+            // "AbortError" DOMException for a controller aborted without one
+            // (#deserialize-a-serialized-abort-reason).
+            if (response.aborted) {
+                abortAPI.remove(request.signal, abortSteps);
+                abortFetchCall(p, request, responseObject, domException("The fetch was aborted", "AbortError"));
+                return;
+            }
             // #main-fetch: a HEAD request or a null body status has a null body.
             if (response.type !== "error" && response.type !== "opaque" &&
                 (request.method === "HEAD" || NULL_BODY_STATUSES.indexOf(response.status) >= 0)) {
@@ -40477,8 +40616,17 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             adapter.queue(function () { processResponse(filtered); });
             return promise;
         }
+        // While its request body is read the fetch is already ongoing: it
+        // belongs to the fetch group from here (#concept-fetch-group).
+        let stopped = false;
+        const bodyRecord = {keepalive: !!request.keepalive, abort() {
+            stopped = true;
+            processResponse(abortedNetworkError());
+        }};
+        addFetchRecord(bodyRecord);
         react(requestBodyBytes(request), function (bodyBytes) {
-            if (locallyAborted) return;
+            removeFetchRecord(bodyRecord);
+            if (locallyAborted || stopped) return;
             const keepaliveLength = request.keepalive && bodyBytes !== null ? bodyBytes.length : 0;
             if (request.keepalive && !reserveKeepalive(keepaliveLength)) { processResponse(networkError()); return; }
             // A response is handed over once its header section arrives and
@@ -40494,7 +40642,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                     processResponse(matches ? response : networkError());
                 }, function () { processResponse(networkError()); });
             });
-        }, function () { processResponse(networkError()); });
+        }, function () {
+            removeFetchRecord(bodyRecord);
+            if (!stopped) processResponse(networkError());
+        });
         return promise;
     }
 
@@ -40572,6 +40723,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         createFormData,
         fetchForXHR,
         fetchForEventSource,
+        abortFetchGroup,
         incrementallyReadBody,
         terminateBody,
         isURLSearchParams,
@@ -40595,6 +40747,33 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     })(globalThis);
     /*__FETCH_END__*/
     const fetchAPI = g.__fetch_api, fileAPI = g.__file_api, platformFetch = g.fetch;
+    // HTML #nav-stop step 2 for this Window's navigable: set its ongoing
+    // navigation to null, discarding the navigation this task requested.
+    // Returns whether there was one.
+    trust.cancelNavigation = function () {
+        const pending = !!trust.navigation;
+        trust.navigation = null; trust.navigationReplace = false; trust.navigationReload = false;
+        return pending;
+    };
+    // HTML #abort-a-document step 2 for this Window's Document: abort its
+    // fetch group (fetch(), XMLHttpRequest, EventSource) and the opening
+    // handshakes of its connecting WebSockets. The host (`abort_document`)
+    // then stops their network work. Returns whether anything was canceled.
+    trust.abortDocumentFetches = function () {
+        let canceled = fetchAPI.abortFetchGroup();
+        if (typeof trust.wsFailConnecting === "function" && trust.wsFailConnecting()) canceled = true;
+        return canceled;
+    };
+    // HTML #abort-a-document step 4 once the host threw away the parser's
+    // pending input: set the Document's active parser was aborted, then
+    // #abort-a-parser steps 3-5. "The end" never runs for this parser, so
+    // DOMContentLoaded and load do not fire (see completeDocumentLoad).
+    trust.activeParserWasAborted = false;
+    trust.abortParser = function () {
+        trust.activeParserWasAborted = true;
+        trust.setDocumentReadiness("interactive");
+        trust.setDocumentReadiness("complete");
+    };
     // XHR and the event factories use the shared ProgressEvent interface.
     ProgressEvent = fileAPI.ProgressEvent;
     // The shared rejection block's view of this Window: its events, the DOM
@@ -43237,7 +43416,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const frame = trust.__activeFrame || null;
             return function (fn) { __queue_network_task(fn, frame); };
         },
-        bind(event) { trust.wsEvent = event; },
+        bind(event, failConnecting) { trust.wsEvent = event; trust.wsFailConnecting = failConnecting; },
     };
     /*__WEBSOCKET_BEGIN__*/
     // WebSockets Standard (local whatwg/websockets@9879e5c), shared verbatim by
@@ -43485,7 +43664,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     define(WebSocket, "length", {value: 1, configurable: true});
     define(WebSocket.prototype, Symbol.toStringTag, {value: "WebSocket", configurable: true});
     define(g, "WebSocket", {value: WebSocket, writable: true, configurable: true});
-    adapter.bind(event);
+    // HTML #abort-a-document cancels the fetches in the context of the
+    // document, which include the opening handshake of a WebSocket that is
+    // still connecting (#concept-websocket-establish fetches with the
+    // WebSocket's relevant settings object as client). Its processResponse
+    // then sees a network error and fails the WebSocket connection (error,
+    // then close with code 1006). An established connection has no fetch and
+    // is not affected. Returns whether a handshake was canceled.
+    function failConnecting() {
+        let canceled = false;
+        for (const [id, target] of sockets) {
+            const socket = state(target);
+            if (socket.readyState !== CONNECTING || socket.failing) continue;
+            socket.failing = true;
+            canceled = true;
+            adapter.close(id, 0, "");
+        }
+        return canceled;
+    }
+    adapter.bind(event, failConnecting);
     })(globalThis);
     /*__WEBSOCKET_END__*/
     // The shared EVENTSOURCE block's view of this Window: its events, the
@@ -46210,8 +46407,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 }
             }
             if (adapter.hasListeners(xhr.upload)) xhr.uploadListener = true;
+            // #the-send()-method: the request's use-CORS-preflight flag is set
+            // when the upload object has event listeners.
             const fields = {method: xhr.method, url: xhr.url, headerList: copyHeaders(xhr.headers), body: xhr.body,
-                credentials: xhr.credentials ? "include" : "same-origin", sync: xhr.sync};
+                credentials: xhr.credentials ? "include" : "same-origin", sync: xhr.sync,
+                useCORSPreflight: xhr.uploadListener};
             xhr.uploadComplete = false;
             xhr.timedOut = false;
             if (xhr.body === null) xhr.uploadComplete = true;
@@ -46241,6 +46441,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                         if (xhr.controller === controller) processResponse(target, xhr, response, controller, queue);
                         else fetchAPI.terminateBody(response.body);
                     });
+                }, function (response) {
+                    // The fetch was aborted because its document stopped
+                    // loading (HTML #abort-a-document), which discards its
+                    // queued tasks: processResponse runs the request error
+                    // steps for "abort" now, inside that abort.
+                    if (xhr.controller === controller) processResponse(target, xhr, response, controller, queue);
                 });
                 xhr.sendStart = adapter.now();
                 armTimeout(this, xhr);

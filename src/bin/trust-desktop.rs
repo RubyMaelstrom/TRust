@@ -9347,6 +9347,7 @@ mod tests {
         let response = trust::http::Response {
             url: url::Url::parse("https://example.test/email-verification").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: "text/html".into(),
             headers: Vec::new(),
             body: br#"<!doctype html><style>

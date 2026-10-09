@@ -404,6 +404,10 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
             context: calling,
             resolve,
             native_lease,
+            keepalive: false,
+            // The image request itself is the page's (`page_images`), which
+            // stopping the top-level document cancels.
+            task: None,
         },
     );
     let name = selected.source.clone();

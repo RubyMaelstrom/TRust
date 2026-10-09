@@ -366,6 +366,12 @@ pub enum PageCmd {
     CloseRequest {
         modifiers: crate::core::Modifiers,
     },
+    /// The user agent's "stop loading" of the top-level navigable (HTML
+    /// #nav-stop): the actor aborts its active Document and their
+    /// descendants' as a task (#abort-a-document-and-its-descendants),
+    /// canceling every fetch of theirs, scripts' fetch() and XMLHttpRequest
+    /// included. The page and its scripts keep running.
+    StopLoading,
     /// The frontend's answer to `PageEvt::FullscreenRequest` (whether its
     /// viewport now fills the screen) or `PageEvt::FullscreenExit`, sent after
     /// the resized viewport.
@@ -496,6 +502,7 @@ impl PageCmd {
                 | Self::FileDrag(_)
                 | Self::ReleasePointerLock
                 | Self::CloseRequest { .. }
+                | Self::StopLoading
                 | Self::FullscreenResult { .. }
                 | Self::ExitFullscreen
                 | Self::InputModifiers(_)
@@ -852,11 +859,19 @@ impl PageHandle {
     }
 
     /// HTML #nav-stop for a page whose actor and scripts stay alive (the
-    /// alternative processing of an unconsumed close request): cancel the
-    /// document's in-flight subresource fetches. Returns whether any fetch
-    /// was still loading.
+    /// user's stop, or the alternative processing of an unconsumed close
+    /// request): the actor runs #abort-a-document-and-its-descendants as a
+    /// task (`PageCmd::StopLoading`), which cancels the document's fetches,
+    /// its scripts' fetch() and XMLHttpRequest included, with their
+    /// script-visible results. Returns whether any fetch was still loading.
     pub fn stop_loading(&self) -> bool {
-        self.state.cache.stop_loading()
+        let loading = self.state.cache.loading();
+        if self.try_send_user(PageCmd::StopLoading).is_err() {
+            // The actor cannot take the task: still stop the browser's own
+            // fetches for the document.
+            return self.state.cache.stop_loading() || loading;
+        }
+        loading
     }
 
     #[cfg(test)]

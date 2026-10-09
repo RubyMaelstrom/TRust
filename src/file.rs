@@ -193,6 +193,7 @@ pub(crate) async fn fetch(request: &crate::http::Request) -> Result<crate::http:
     Ok(crate::http::Response {
         url: request.url.clone(),
         status: 200,
+        status_text: String::new(),
         content_type,
         headers,
         body,

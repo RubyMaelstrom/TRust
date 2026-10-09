@@ -1213,6 +1213,7 @@ mod tests {
         let response = trust::http::Response {
             url: Url::parse("https://images.example/page").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             body: br#"<body style="margin:0">
@@ -1268,6 +1269,7 @@ mod tests {
         let missing = FetchedDocument::Http(Box::new(trust::http::Response {
             url: Url::parse("https://example.com/gone").unwrap(),
             status: 404,
+            status_text: String::new(),
             content_type: String::from("text/html; charset=utf-8"),
             headers: Vec::new(),
             body: b"<p>gone</p>".to_vec(),

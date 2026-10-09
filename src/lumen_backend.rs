@@ -144,7 +144,8 @@ fn top_hit_key(ctx: &mut Ctx) -> TopHitKey {
 }
 
 /// (status, Content-Type, body, header blob, final URL after redirects; empty when unknown).
-type LumenFetchResult = Option<(u16, String, Vec<u8>, String, String)>;
+/// (status, Content-Type, body, header list, final URL, status message).
+type LumenFetchResult = Option<(u16, String, Vec<u8>, String, String, String)>;
 type LumenResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
 
 use crate::performance::ResourceTiming as LumenResourceTiming;
@@ -284,6 +285,12 @@ enum LumenHostTask {
     WorkerExited {
         id: usize,
     },
+    /// HTML #abort-a-document-and-its-descendants: abort this descendant
+    /// navigable's active Document, as a task queued on the navigation and
+    /// traversal task source of its Window.
+    AbortDocument {
+        context: u64,
+    },
 }
 
 struct LumenNetwork {
@@ -334,6 +341,12 @@ struct LumenPendingFetch {
     resolve: Value,
     /// HTML image requests retain their element until their networking task finishes.
     native_lease: Option<DomResourceLease>,
+    /// A keepalive fetch outlives its document's loading: stopping the
+    /// document (HTML #abort-a-document) leaves it running.
+    keepalive: bool,
+    /// The network task delivering this fetch's response, which stopping the
+    /// document aborts. None when the fetch shares another request (images).
+    task: Option<tokio::task::AbortHandle>,
 }
 
 #[derive(Clone)]
@@ -632,6 +645,25 @@ impl Drop for DomResourceLease {
     }
 }
 
+/// HTML #active-parser of the top-level Document while `load_page` replays
+/// its parse. TRust's tree builder has parsed the whole input before any
+/// script runs; the parser's position is the last source script it reached,
+/// and the content after that script is still pending in its input stream.
+#[derive(Default)]
+struct ParserProgress {
+    active: bool,
+    /// The parser-inserted script the parser last reached.
+    position: Option<usize>,
+    /// Arena identities below this one were created by the tree builder.
+    watermark: usize,
+    /// HTML #abort-a-parser ran: no more parser scripts and no "the end".
+    aborted: bool,
+    /// Parser scripts the aborted parser had prepared but not executed. Their
+    /// fetches were canceled with the Document's; a completion still queued
+    /// for one is discarded (HTML #abort-a-document step 2).
+    abandoned: std::collections::HashSet<usize>,
+}
+
 struct HostState {
     message_ports: message_port_host::Agent,
     /// This agent towards its storage shed's Indexed Database coordinator.
@@ -678,6 +710,11 @@ struct HostState {
     realm_origins: HashMap<u64, url::Origin>,
     /// The newest Window Realm created for each navigable container element.
     frame_contexts: HashMap<usize, u64>,
+    /// The Window Realm whose Document contains each child navigable's
+    /// container (the realm that created it): HTML #descendant-navigables.
+    window_parents: HashMap<u64, u64>,
+    /// The top-level Document's active parser while `load_page` runs it.
+    parser: ParserProgress,
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
     image_data_slots: Option<Value>,
@@ -817,6 +854,8 @@ impl HostState {
             window_cookie_contexts: HashMap::new(),
             realm_origins: HashMap::new(),
             frame_contexts: HashMap::new(),
+            window_parents: HashMap::new(),
+            parser: ParserProgress::default(),
             image_data_slots: None,
             image_bitmap_slots: None,
             canvas_gradient_slots: None,
@@ -867,6 +906,7 @@ impl HostState {
     fn forget_realm_origin(&mut self, context: u64) {
         self.realm_origins.remove(&context);
         self.frame_contexts.retain(|_, owner| *owner != context);
+        self.window_parents.remove(&context);
     }
 
     #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
@@ -970,9 +1010,36 @@ impl HostState {
             return;
         };
         let pending_dynamic_modules = self.pending_dynamic_modules.clone();
+        // The top-level Window's settings, for starting its imports' fetches
+        // as import() runs (`begin_dynamic_module_fetch`).
+        let top_level = self.network.as_ref().map(|network| {
+            let page = self
+                .window_request_urls
+                .get(&0)
+                .unwrap_or(&self.base)
+                .clone();
+            LumenDynamicModuleLoader {
+                context: 0,
+                cookie_context: self.window_cookie_contexts.get(&0).map_or_else(
+                    || crate::http::CookieContext::subresource(&page),
+                    |(_, _, context)| context.clone(),
+                ),
+                page,
+                events: events.clone(),
+                import_map: self.import_maps.get(&0).cloned().unwrap_or_default(),
+                network: Some(LumenDynamicModuleNetwork {
+                    handle: network.handle.clone(),
+                    cache: network.cache.clone(),
+                    fetched: network.fetched.clone(),
+                }),
+            }
+        });
         engine.set_async_dynamic_module_loader_with_context(
             move |request_id, context, specifier, referrer, _attribute_type| {
                 pending_dynamic_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(loader) = top_level.as_ref().filter(|_| context == 0) {
+                    begin_dynamic_module_fetch(loader, specifier, referrer);
+                }
                 let _ = events.send(LumenHostTask::DynamicModuleStart {
                     request_id,
                     context,
@@ -1061,6 +1128,8 @@ impl RetainedMemory for HostState {
             window_cookie_contexts,
             realm_origins,
             frame_contexts,
+            window_parents,
+            parser,
             image_data_slots,
             image_bitmap_slots,
             canvas_gradient_slots,
@@ -1621,13 +1690,21 @@ impl RetainedMemory for HostState {
                         .sum::<usize>(),
             ));
         }
-        if !realm_origins.is_empty() || !frame_contexts.is_empty() {
+        if !realm_origins.is_empty() || !frame_contexts.is_empty() || !window_parents.is_empty() {
             visitor.opaque_storage(); // url::Origin hosts own unreported heap strings.
             visitor.allocation(RetainedManagedAllocation::new(
                 "trust.realm-origins",
                 realm_origins as *const _ as usize,
                 realm_origins.capacity() * std::mem::size_of::<(u64, url::Origin)>()
-                    + frame_contexts.capacity() * std::mem::size_of::<(usize, u64)>(),
+                    + frame_contexts.capacity() * std::mem::size_of::<(usize, u64)>()
+                    + window_parents.capacity() * std::mem::size_of::<(u64, u64)>(),
+            ));
+        }
+        if parser.abandoned.capacity() != 0 {
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.parser-abandoned-scripts",
+                &parser.abandoned as *const _ as usize,
+                parser.abandoned.capacity() * std::mem::size_of::<usize>(),
             ));
         }
         if !window_request_urls.is_empty() {
@@ -3441,6 +3518,9 @@ mod desktop {
             }
             dom.note_fetched_imports();
         }
+        // Every node the tree builder created has an identity below this
+        // (identities are monotonic and never recycled); scripts' come later.
+        let parser_watermark = dom.borrow().live_ids().max().map_or(0, |id| id + 1);
         let scripts: Vec<_> = dom
             .borrow()
             .scripts()
@@ -3605,6 +3685,15 @@ mod desktop {
         );
         let mut tasks = ParserTasks::new(host_rx, events, &mut page);
         let mut deferred = Vec::new();
+        // HTML #active-parser: the Document has one until "the end" (or until
+        // window.stop() aborts it, `abort_active_parser`).
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.parser = ParserProgress {
+                active: true,
+                watermark: parser_watermark,
+                ..ParserProgress::default()
+            };
+        }
         // HTML #link-type-stylesheet / #link-type-preload: the parser fetches
         // and processes each external resource link as it connects it, in
         // token order (arena IDs are allocated monotonically by the tree
@@ -3685,7 +3774,14 @@ mod desktop {
         let mut queue: std::collections::VecDeque<(usize, bool)> =
             scripts.into_iter().map(|node| (node, false)).collect();
         while let Some((node, written)) = queue.pop_front() {
+            if parser_aborted(&mut page) {
+                break;
+            }
             if !written {
+                // The parser has consumed the input through this script.
+                if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                    state.parser.position = Some(node);
+                }
                 process_parser_links(&mut page, &mut parser_links, Some(node));
                 process_parser_images(&mut page, &mut parser_images, Some(node));
                 process_parser_media(&mut page, &mut parser_media, Some(node));
@@ -3794,12 +3890,33 @@ mod desktop {
                 if !tasks.execute_when_ready(&mut page, node) {
                     return Err(page.outcome);
                 }
+                if parser_aborted(&mut page) {
+                    // window.stop() ran while this script was pending: it
+                    // never executes, nor does any script after it.
+                    break;
+                }
                 take_written_scripts(&mut page, &mut queue, &mut script_leases);
             }
+        }
+        if parser_aborted(&mut page) {
+            // HTML #abort-a-parser: the parser never reaches "the end", so
+            // neither the deferred scripts nor DOMContentLoaded run.
+            abandon_parser_scripts(&mut page, deferred.iter().copied());
+            for (_, task) in tasks.ready.drain() {
+                ParserTasks::dispatch(&mut page, task);
+            }
+            return Ok(page);
+        }
+        // The whole input has been consumed; "the end" stops the parser.
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.parser.position = None;
         }
         process_parser_links(&mut page, &mut parser_links, None);
         process_parser_images(&mut page, &mut parser_images, None);
         process_parser_media(&mut page, &mut parser_media, None);
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.parser.active = false;
+        }
         let _ = call_trust(&mut page, "parserFinished", &[], "parser EOF");
         checkpoint(&mut page, "parser EOF");
         for node in deferred {
@@ -3838,6 +3955,21 @@ mod desktop {
         }
         for &node in written.iter().rev() {
             queue.push_front((node, true));
+        }
+    }
+
+    fn parser_aborted(page: &mut LumenPage) -> bool {
+        page.engine
+            .ctx()
+            .host_mut::<HostState>()
+            .is_some_and(|state| state.parser.aborted)
+    }
+
+    /// Discard the queued completions of parser scripts the aborted parser
+    /// will never execute (HTML #abort-a-document step 2).
+    fn abandon_parser_scripts(page: &mut LumenPage, nodes: impl IntoIterator<Item = usize>) {
+        if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+            state.parser.abandoned.extend(nodes);
         }
     }
 
@@ -4012,6 +4144,10 @@ mod desktop {
                 if let LumenHostTask::ResourceDone { node_id, .. } = &task {
                     if *node_id == node {
                         self.deferred.remove(&node);
+                        if parser_aborted(page) {
+                            // Its parser was aborted: the script never runs.
+                            abandon_parser_scripts(page, std::iter::once(node));
+                        }
                         Self::dispatch(page, task);
                         return true;
                     }
@@ -4021,6 +4157,12 @@ mod desktop {
                     }
                 }
                 Self::dispatch(page, task);
+                // A task the parser ran while it waited aborted it
+                // (window.stop()): stop waiting for this script.
+                if parser_aborted(page) {
+                    abandon_parser_scripts(page, std::iter::once(node));
+                    return true;
+                }
             }
             false
         }
@@ -5272,6 +5414,14 @@ mod desktop {
                 events
                     .blocking_send(PageEvt::CloseRequestHandled { consumed })
                     .is_ok()
+            }
+            PageCmd::StopLoading => {
+                // HTML #nav-stop for the top-level navigable, run as a task
+                // on its Document's event loop.
+                prepare_interaction(page, interrupt);
+                stop_loading_navigable(page.engine.ctx(), 0);
+                checkpoint(page, "stop loading");
+                finish_task_with_ack(page, events, false)
             }
             PageCmd::FullscreenResult { request, ok } => {
                 prepare_interaction(page, interrupt);
@@ -8442,6 +8592,7 @@ mod desktop {
             let url = String::from("https://example.com/page.png");
             let response = Arc::new(crate::http::CachedResp {
                 status: 200,
+                status_text: String::new(),
                 content_type: String::from("image/png"),
                 headers: Vec::new(),
                 body: crate::img::red_png(),
@@ -8601,6 +8752,7 @@ mod desktop {
                 let url = format!("https://example.com{path}");
                 let response = Arc::new(crate::http::CachedResp {
                     status,
+                    status_text: String::new(),
                     content_type: String::from(content_type),
                     headers: Vec::new(),
                     body,
@@ -8809,6 +8961,7 @@ mod desktop {
                 let url = format!("https://example.com{path}");
                 let response = Arc::new(crate::http::CachedResp {
                     status: 200,
+                    status_text: String::new(),
                     content_type: String::from("image/png"),
                     headers: Vec::new(),
                     body: crate::img::red_png(),
@@ -10541,6 +10694,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__http_fetch_async", 5, host_http_fetch_async),
     ("__http_fetch_pull", 1, host_http_fetch_pull),
     ("__http_fetch_cancel", 1, host_http_fetch_cancel),
+    ("__stop_loading", 0, host_stop_loading),
     ("__dom_run_injected_script", 1, guarded_run_injected_script),
     ("__dom_script_started", 1, guarded_script_started),
     ("__dom_insertion_resources", 1, guarded_insertion_resources),
@@ -12073,6 +12227,14 @@ fn host_request_body(
         .map_err(|error| error.message().to_string())
 }
 
+/// The request's use-CORS-preflight flag (Fetch #use-cors-preflight-flag),
+/// argument 10 of `__http_fetch`/`__http_fetch_async`: XHR send() sets it when
+/// its upload object has event listeners, the Request constructor for a
+/// ReadableStream body.
+fn host_fetch_use_cors_preflight(args: &[Value]) -> bool {
+    matches!(args.get(10), Some(Value::Bool(true)))
+}
+
 fn host_fetch_args(ctx: &mut Ctx, args: &[Value]) -> Result<HostFetchArgs, String> {
     let target = host_arg_usv(ctx, args, 0);
     let mut method: String = host_arg_usv(ctx, args, 1)
@@ -12240,6 +12402,7 @@ fn prepare_uncounted_client_request(
         fetch_metadata: None,
         cookie_context: None,
         timing_client: None,
+        use_cors_preflight: false,
         fetch_policy: fetch_policy.map(|(mode, credentials)| crate::http::FetchPolicy {
             origin: origin.clone(),
             mode,
@@ -12286,6 +12449,7 @@ fn lumen_fetch_result(response: crate::http::Response) -> LumenFetchResult {
         response.body,
         crate::js::headers_to_blob(&response.headers),
         response.url.to_string(),
+        response.status_text,
     ))
 }
 
@@ -12307,11 +12471,12 @@ fn lumen_cached_result(response: &crate::http::CachedResp) -> LumenFetchResult {
             .url_list
             .last()
             .map_or_else(String::new, |url| url.to_string()),
+        response.status_text.clone(),
     ))
 }
 
 fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
-    let Some((status, content_type, body, headers, url)) = result else {
+    let Some((status, content_type, body, headers, url, status_text)) = result else {
         return Value::Null;
     };
     let text = if crate::js::response_body_is_binary(&content_type) {
@@ -12326,8 +12491,12 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
     let bytes = ctx
         .make_array_buffer(&body)
         .unwrap_or_else(|_| Value::from_string(body.iter().copied().map(char::from).collect()));
-    // [status, Content-Type, text, bytes, headers, final URL]: Fetch's response
-    // URL list ends with the URL that answered after redirects.
+    // [status, Content-Type, text, bytes, headers, final URL, -, status
+    // message]: Fetch's response URL list ends with the URL that answered
+    // after redirects; the header list keeps its order and duplicates (Fetch
+    // #concept-header-list) and the status message is the reason phrase
+    // (Fetch #concept-response-status-message). Index 6 is the navigation
+    // result's referrer (`navigation_result_value`).
     ctx.make_array(vec![
         Value::Num(f64::from(status)),
         Value::from_string(content_type),
@@ -12335,6 +12504,8 @@ fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
         bytes,
         Value::from_string(headers),
         Value::from_string(url),
+        Value::Undefined,
+        Value::from_string(status_text),
     ])
 }
 
@@ -12436,12 +12607,17 @@ fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let client = request_client_url(ctx);
     let cookie_context = request_cookie_context(ctx);
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
-        eprintln!("[fetch-trace] sync {method} {target}");
+        eprintln!(
+            "[fetch-trace] @{:>6}ms sync {method} {target}",
+            crate::http::trace_ms()
+        );
     }
+    let use_cors_preflight = host_fetch_use_cors_preflight(args);
     let work = ctx.host_mut::<HostState>().and_then(|state| {
         prepare_client_request(state, &client, &target, method, body, headers, policy).map(
             |(handle, cache, mut request)| {
                 request.cookie_context = Some(cookie_context);
+                request.use_cors_preflight = use_cors_preflight;
                 (handle, cache, request)
             },
         )
@@ -12579,6 +12755,8 @@ fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 context,
                 resolve: resolve.clone(),
                 native_lease: None,
+                keepalive: false,
+                task: None,
             },
         );
         Some((id, events, navigation))
@@ -12596,7 +12774,7 @@ fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         target,
         destination,
     } = navigation;
-    cache.spawn(&handle, async move {
+    let work = async move {
         let details = crate::http::fetch_with_metadata(&request, policy)
             .await
             .ok()
@@ -12608,7 +12786,17 @@ fn host_http_navigate_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             target,
             destination,
         });
-    });
+    };
+    // The navigation request's client is the navigating Document: stopping
+    // it aborts this fetch (HTML #abort-a-document, `abort_document_fetches`).
+    let task = cache.task_scope().spawn_abortable(&handle, work, false);
+    if let Some(pending) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.network.as_mut())
+        .and_then(|network| network.pending_fetches.get_mut(&id))
+    {
+        pending.task = task;
+    }
     Ok(promise)
 }
 
@@ -12748,6 +12936,9 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         host_arg_string(ctx, args, 9).as_str(),
         "no-store" | "reload" | "no-cache"
     );
+    let use_cors_preflight = host_fetch_use_cors_preflight(args);
+    // Argument 11: the request's keepalive (Fetch #request-keepalive-flag).
+    let keepalive = matches!(args.get(11), Some(Value::Bool(true)));
     let started = crate::performance::now_ms();
     let client = request_client_url(ctx);
     let cookie_context = request_cookie_context(ctx);
@@ -12755,7 +12946,10 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         .join(&target)
         .map_or_else(|_| String::new(), |url| url.to_string());
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
-        eprintln!("[fetch-trace] async {method} {target}");
+        eprintln!(
+            "[fetch-trace] @{:>6}ms async {method} {target}",
+            crate::http::trace_ms()
+        );
     }
     let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
     let context = ctx.host_job_context();
@@ -12802,6 +12996,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             None => prepare_client_request(state, &client, &target, method, body, headers, policy)
                 .map(|(_, _, mut request)| {
                     request.cookie_context = Some(cookie_context);
+                    request.use_cors_preflight = use_cors_preflight;
                     AsyncFetchSource::Request(Box::new(request))
                 }),
         };
@@ -12816,6 +13011,8 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                         context,
                         resolve: resolve.clone(),
                         native_lease: None,
+                        keepalive,
+                        task: None,
                     },
                 );
                 Some((
@@ -12834,7 +13031,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         let _ = ctx.invoke(resolve, Value::Undefined, &[Value::Null]);
         return Ok(promise);
     };
-    cache.spawn(&handle, async move {
+    let work = async move {
         let (result, timing) = match source {
             AsyncFetchSource::Cached(shared) => match shared.await {
                 Ok(response) => {
@@ -12901,7 +13098,17 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             }
         };
         let _ = events.send(LumenHostTask::FetchDone { id, result, timing });
-    });
+    };
+    let task = cache.task_scope().spawn_abortable(&handle, work, keepalive);
+    // HTML #abort-a-document aborts this task with the document's other
+    // fetches (`abort_document_fetches`).
+    if let Some(pending) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.network.as_mut())
+        .and_then(|network| network.pending_fetches.get_mut(&id))
+    {
+        pending.task = task;
+    }
     Ok(promise)
 }
 
@@ -13052,6 +13259,204 @@ fn host_http_fetch_cancel(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
         }
     }
     Ok(Value::Undefined)
+}
+
+/// HTML #dom-window-stop: "If this's navigable is null, then return" ran in
+/// the prelude; stop loading this Window's navigable.
+fn host_stop_loading(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let context = ctx.host_job_context();
+    stop_loading_navigable(ctx, context);
+    Ok(Value::Undefined)
+}
+
+/// HTML #nav-stop ("stop loading", local whatwg/html@e5071a2) for the
+/// navigable whose active Document belongs to Window `context`, run in a task
+/// of that Document's event loop, from `window.stop()` or the user agent's
+/// stop for the top-level navigable (`PageCmd::StopLoading`). Returns whether
+/// anything was loading.
+fn stop_loading_navigable(ctx: &mut Ctx, context: u64) -> bool {
+    // Step 2: TRust's ongoing navigation of this navigable is the one its
+    // Window requested in the running task (the frontend starts it only after
+    // the task), so setting the ongoing navigation to null discards that
+    // request. TRust runs no unload steps in a live Document: its unload
+    // counter is 0.
+    let navigation = call_trust_in_context(ctx, context, "cancelNavigation")
+        .is_some_and(|value| ctx.to_boolean(&value));
+    // Step 3, #abort-a-document-and-its-descendants: queue a global task on
+    // the navigation and traversal task source to abort each descendant
+    // navigable's active Document, then abort this Document.
+    let (descendants, events) = match ctx.host_mut::<HostState>() {
+        Some(state) => (
+            descendant_contexts(state, context),
+            state.task_events.clone(),
+        ),
+        None => (Vec::new(), None),
+    };
+    if let Some(events) = events {
+        for descendant in descendants {
+            let _ = events.send(LumenHostTask::AbortDocument {
+                context: descendant,
+            });
+        }
+    }
+    abort_document(ctx, context) || navigation
+}
+
+/// The descendant navigables of Window `context`'s Document (HTML
+/// #descendant-navigables), as the Window Realms of their active Documents:
+/// each child, in creation order, followed by its own descendants.
+fn descendant_contexts(state: &HostState, context: u64) -> Vec<u64> {
+    fn visit(children: &[(u64, u64)], parent: u64, root: u64, found: &mut Vec<u64>) {
+        for &(owner, child) in children {
+            if owner == parent && child != root && !found.contains(&child) {
+                found.push(child);
+                visit(children, child, root, found);
+            }
+        }
+    }
+    let mut children: Vec<_> = state
+        .window_parents
+        .iter()
+        .filter(|&(child, _)| state.window_realms.contains_key(child))
+        .map(|(&child, &parent)| (parent, child))
+        .collect();
+    children.sort_unstable();
+    let mut found = Vec::new();
+    visit(&children, context, context, &mut found);
+    found
+}
+
+/// Call a platform-control operation of Window `context`'s Realm.
+fn call_trust_in_context(ctx: &mut Ctx, context: u64, name: &str) -> Option<Value> {
+    if context == ctx.host_job_context() {
+        return host_call_trust(ctx, name, &[]).ok();
+    }
+    let realm = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.window_realms.get(&context).cloned())?;
+    ctx.with_embed_realm(&realm, |realm_ctx| {
+        host_call_trust(realm_ctx, name, &[]).ok()
+    })
+    .ok()
+    .flatten()
+}
+
+/// HTML #abort-a-document for Window `context`'s Document, in a task of its
+/// event loop. Returns whether this canceled anything.
+fn abort_document(ctx: &mut Ctx, context: u64) -> bool {
+    // Step 2: cancel the fetches in the context of the document. Its Realm
+    // aborts its fetch group first, producing the script-visible results
+    // (fetch() rejects with an "AbortError" DOMException, XMLHttpRequest
+    // runs its request error steps for "abort", an EventSource fails its
+    // connection, a connecting WebSocket fails); the host then stops their
+    // network work and discards their queued networking tasks.
+    let mut canceled = call_trust_in_context(ctx, context, "abortDocumentFetches")
+        .is_some_and(|value| ctx.to_boolean(&value));
+    canceled |= abort_document_fetches(ctx, context);
+    // (Step 3 concerns WebDriver BiDi, which TRust does not implement.)
+    // Step 4: the active parser, which only the top-level Document's
+    // `load_page` runs.
+    if context == 0 {
+        canceled |= abort_active_parser(ctx);
+    }
+    canceled
+}
+
+/// The host half of HTML #abort-a-document step 2 for Window `context`'s
+/// Document: abort the network tasks of its fetches (keepalive ones excepted,
+/// Fetch #concept-fetch-group-terminate), discard their queued networking
+/// tasks by forgetting them (a `FetchHead`/`FetchDone`/`NavigateDone`/
+/// `ImageDone` for a forgotten id is inert), and settle each fetch's waiting
+/// consumer as a network failure. Response bodies still arriving stop. The
+/// top-level Document also cancels the browser's own subresource fetches and
+/// image requests (`PageCache::stop_loading`).
+fn abort_document_fetches(ctx: &mut Ctx, context: u64) -> bool {
+    let Some(network) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.network.as_mut())
+    else {
+        return false;
+    };
+    let ids: Vec<usize> = network
+        .pending_fetches
+        .iter()
+        .filter(|(_, pending)| pending.context == context && !pending.keepalive)
+        .map(|(&id, _)| id)
+        .collect();
+    let pending: Vec<LumenPendingFetch> = ids
+        .iter()
+        .filter_map(|id| network.pending_fetches.remove(id))
+        .collect();
+    let streams: Vec<LumenBodyStream> = {
+        let ids: Vec<usize> = network
+            .body_streams
+            .iter()
+            .filter(|(_, stream)| stream.context == context)
+            .map(|(&id, _)| id)
+            .collect();
+        ids.iter()
+            .filter_map(|id| network.body_streams.remove(id))
+            .collect()
+    };
+    let resources = context == 0 && network.cache.stop_loading();
+    let canceled = resources || !pending.is_empty() || !streams.is_empty();
+    for mut stream in streams {
+        stream.flow.cancel();
+        if let Some(pull) = stream.pull.take() {
+            let _ = ctx.invoke(pull, Value::Undefined, &[Value::Bool(false)]);
+        }
+    }
+    for pending in pending {
+        if let Some(task) = &pending.task {
+            task.abort();
+        }
+        // A network error for a consumer that has not settled it already
+        // (fetch, XMLHttpRequest and EventSource settled theirs as aborted).
+        let _ = ctx.invoke(pending.resolve, Value::Undefined, &[Value::Null]);
+        drop(pending.native_lease);
+    }
+    canceled
+}
+
+/// HTML #abort-a-document step 4 for the top-level Document: if it has an
+/// active parser, set its active parser was aborted to true and abort that
+/// parser (#abort-a-parser). Returns whether there was one.
+fn abort_active_parser(ctx: &mut Ctx) -> bool {
+    let (position, watermark) = {
+        let Some(state) = ctx.host_mut::<HostState>() else {
+            return false;
+        };
+        let parser = &mut state.parser;
+        if !parser.active || parser.aborted {
+            return false;
+        }
+        parser.aborted = true;
+        (parser.position, parser.watermark)
+    };
+    // #abort-a-parser step 1: throw away any pending content in the input
+    // stream. The tree builder already consumed all of it, so remove the
+    // nodes it built after the parser's position (the script it last
+    // reached): they would not exist yet. Nodes scripts created stay.
+    if let Some(position) = position {
+        let pending = |id: usize| id > position && id < watermark;
+        let handle = host_dom(ctx);
+        let mut dom = handle.borrow_mut();
+        let roots: Vec<usize> = (position + 1..watermark)
+            .filter(|&id| {
+                dom.is_valid(id) && dom.node(id).parent.is_some_and(|parent| !pending(parent))
+            })
+            .collect();
+        for root in roots {
+            dom.detach(root);
+        }
+    }
+    // Step 2 stops the speculative parser: TRust's speculative fetches are
+    // the document's fetches step 2 of #abort-a-document canceled. Steps 3-5
+    // update the current document readiness to "interactive" and then
+    // "complete" (each firing readystatechange) around popping the stack of
+    // open elements, which the tree builder already did.
+    let _ = call_trust_in_context(ctx, 0, "abortParser");
+    true
 }
 
 /// Run `run` in the Realm of the environment `context`; a task for an
@@ -13481,6 +13886,7 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         };
         state.realm_origins.insert(context, origin);
         state.frame_contexts.insert(frame_id, context);
+        state.window_parents.insert(context, creator_context);
         let mut cookie_context = crate::http::CookieContext::subresource(&client_url);
         cookie_context
             .top_level_site
@@ -14147,6 +14553,16 @@ fn spawn_resource_fetch(
     let trace_fetch = std::env::var_os("TRUST_TRACE_FETCH").is_some();
     let environment = dom_fallback_encoding(&host_dom(ctx).borrow(), node_id);
     let cors_mode = credentials.is_some();
+    // A module script's descendants are fetched when its own fetch completes
+    // (`speculate_module_graph`), as `speculate_engine_imports` permits.
+    let module_graph = (matches!(kind, LumenResourceKind::ModuleScript)
+        && !request_cookie_context(ctx).cross_site_ancestor)
+        .then(|| {
+            let state = ctx.host_mut::<HostState>()?;
+            let fetched = state.network.as_ref()?.fetched.clone();
+            Some((state.base.clone(), fetched, handle.clone(), cache.clone()))
+        })
+        .flatten();
     cache.spawn(&handle, async move {
         let mut response_url = request.url.clone();
         let (result, timing) = match shared {
@@ -14240,6 +14656,19 @@ fn spawn_resource_fetch(
             }
             _ => (None, None),
         };
+        if let (Some((page, fetched, runtime, graph_cache)), Some((status, content_type, body, _))) =
+            (module_graph, &result)
+            && crate::http::module_script_response_allowed(*status, content_type)
+        {
+            speculate_module_graph(
+                page,
+                runtime,
+                graph_cache,
+                fetched,
+                request.url.clone(),
+                body,
+            );
+        }
         if trace_fetch {
             match &result {
                 Some((status, ctype, body, _)) => eprintln!(
@@ -14447,7 +14876,10 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         return Ok(Value::Undefined);
     }
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
-        eprintln!("[fetch-trace] injected script src={src:?} module={module} node={node_id}");
+        eprintln!(
+            "[fetch-trace] @{:>6}ms injected script src={src:?} module={module} node={node_id}",
+            crate::http::trace_ms()
+        );
     }
 
     if let Some(src) = src {
@@ -16082,6 +16514,80 @@ fn queue_dynamic_module_load(
     });
 }
 
+/// HTML #hostloadimportedmodule: import() fetches the imported module script
+/// at once ("fetch a single imported module script", whose network work runs
+/// in parallel); only processing its response waits for a task. The engine's
+/// loader queues `DynamicModuleStart` for the page thread, which can be busy
+/// for seconds (the parser's scripts, the first rendering) before it reaches
+/// that task. Start the same request here, as import() runs, so the task's
+/// `queue_dynamic_module_load` joins it in the page cache; its static graph
+/// is fetched as the response arrives.
+fn begin_dynamic_module_fetch(loader: &LumenDynamicModuleLoader, specifier: &str, referrer: &str) {
+    let Some(network) = loader.network.as_ref() else {
+        return;
+    };
+    if loader.cookie_context.cross_site_ancestor {
+        // `queue_dynamic_module_load` does not share these requests.
+        return;
+    }
+    let base = url::Url::parse(referrer).unwrap_or_else(|_| loader.page.clone());
+    let Some(resolved) = loader
+        .import_map
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .resolve(specifier, &base)
+    else {
+        return;
+    };
+    if !matches!(resolved.scheme(), "http" | "https")
+        || !crate::http::subresource_allowed(&loader.page, &resolved)
+        || network
+            .cache
+            .peek_resource(
+                &resolved,
+                &loader.page,
+                "script",
+                Some(crate::http::CredentialsMode::SameOrigin),
+            )
+            .is_some()
+    {
+        return;
+    }
+    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        eprintln!(
+            "lumen: @{:>6}ms dynamic import {resolved}",
+            crate::http::trace_ms()
+        );
+    }
+    network
+        .fetched
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let shared = network.cache.fetch_resource_with_cookies(
+        &network.handle,
+        resolved.clone(),
+        &loader.page,
+        "script",
+        Some(crate::http::CredentialsMode::SameOrigin),
+        loader.cookie_context.clone(),
+    );
+    let (page, handle, cache, fetched) = (
+        loader.page.clone(),
+        network.handle.clone(),
+        network.cache.clone(),
+        network.fetched.clone(),
+    );
+    network.cache.spawn(&network.handle, async move {
+        let Ok(response) = shared.await else {
+            return;
+        };
+        if crate::http::module_script_response_allowed(response.status, &response.content_type)
+            && cache.claim_module_import_scan(&resolved)
+        {
+            speculate_module_graph(page, handle, cache, fetched, resolved, &response.body);
+        }
+    });
+}
+
 fn speculate_engine_imports(engine: &mut lumen::Engine, base: &url::Url, body: &[u8]) {
     if request_cookie_context(engine.ctx()).cross_site_ancestor {
         return;
@@ -16105,6 +16611,9 @@ fn speculate_engine_imports(engine: &mut lumen::Engine, base: &url::Url, body: &
 /// HTML §4.12.1 fetches a module script and its dependencies in parallel. Lumen's graph loader
 /// intentionally stays synchronous and atomic, so warm every statically named dependency in the
 /// shared page cache before that loader asks for them in source order.
+///
+/// Returns each statically named dependency's shared fetch, whether this
+/// started it or found it in the cache.
 fn speculate_module_imports(
     page: &url::Url,
     handle: &tokio::runtime::Handle,
@@ -16112,7 +16621,8 @@ fn speculate_module_imports(
     fetched: &std::sync::atomic::AtomicUsize,
     base: &url::Url,
     body: &[u8],
-) {
+) -> Vec<(url::Url, crate::http::SharedFetch)> {
+    let mut dependencies = Vec::new();
     for specifier in crate::js::scan_module_imports(body)
         .into_iter()
         .take(crate::js::MAX_SPECULATIVE_IMPORTS)
@@ -16124,15 +16634,13 @@ fn speculate_module_imports(
         else {
             continue;
         };
-        if cache
-            .peek_resource(
-                &resolved,
-                page,
-                "script",
-                Some(crate::http::CredentialsMode::SameOrigin),
-            )
-            .is_some()
-        {
+        if let Some(shared) = cache.peek_resource(
+            &resolved,
+            page,
+            "script",
+            Some(crate::http::CredentialsMode::SameOrigin),
+        ) {
+            dependencies.push((resolved, shared));
             continue;
         }
         if !crate::http::subresource_allowed(page, &resolved)
@@ -16149,15 +16657,54 @@ fn speculate_module_imports(
             continue;
         }
         if std::env::var_os("TRUST_NET_TRACE").is_some() {
-            eprintln!("lumen: module prefetch {resolved}");
+            eprintln!(
+                "lumen: @{:>6}ms module prefetch {resolved}",
+                crate::http::trace_ms()
+            );
         }
-        drop(cache.fetch_resource(
+        let shared = cache.fetch_resource(
             handle,
-            resolved,
+            resolved.clone(),
             page,
             "script",
             Some(crate::http::CredentialsMode::SameOrigin),
-        ));
+        );
+        dependencies.push((resolved, shared));
+    }
+    dependencies
+}
+
+/// HTML #fetch-a-module-script-tree (local whatwg/html@e5071a2): as soon as a
+/// module script's own fetch completes, "fetch the descendants of and link"
+/// it fetches each of its static dependencies, and theirs in turn, in
+/// parallel with the parser and every other script; only linking waits for
+/// the whole graph. Lumen's graph loader fetches and links when the module
+/// is about to run, which for a deferred module is after the parser's last
+/// script. Walk the static graph here instead, on the network runtime as each
+/// response arrives, so the loader finds every dependency already fetched.
+/// Each module is scanned once (`claim_module_import_scan`), within the
+/// speculative-fetch bounds of `speculate_module_imports`.
+fn speculate_module_graph(
+    page: url::Url,
+    handle: tokio::runtime::Handle,
+    cache: Arc<crate::http::PageCache>,
+    fetched: Arc<std::sync::atomic::AtomicUsize>,
+    base: url::Url,
+    body: &[u8],
+) {
+    for (url, shared) in speculate_module_imports(&page, &handle, &cache, &fetched, &base, body) {
+        let (page, runtime, graph_cache, fetched) =
+            (page.clone(), handle.clone(), cache.clone(), fetched.clone());
+        cache.spawn(&handle, async move {
+            let Ok(response) = shared.await else {
+                return;
+            };
+            if crate::http::module_script_response_allowed(response.status, &response.content_type)
+                && graph_cache.claim_module_import_scan(&url)
+            {
+                speculate_module_graph(page, runtime, graph_cache, fetched, url, &response.body);
+            }
+        });
     }
 }
 
@@ -16969,6 +17516,10 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 } else {
                     state.pending_preloads = state.pending_preloads.saturating_sub(1);
                 }
+                // A script of an aborted parser: its task is discarded.
+                if state.parser.abandoned.remove(&node_id) {
+                    return Ok(());
+                }
             }
             // HTML §8.1.7.2 queues element work against the element's relevant
             // global/Document. A parallel resource fetch therefore retains
@@ -17011,6 +17562,12 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             specifier,
             referrer,
         } => {
+            if std::env::var_os("TRUST_NET_TRACE").is_some() {
+                eprintln!(
+                    "lumen: @{:>6}ms dynamic import task {specifier}",
+                    crate::http::trace_ms()
+                );
+            }
             let cookie_context = cookie_context_for_id(engine.ctx(), context);
             let page = request_context_url(engine.ctx(), context);
             let state = engine
@@ -17074,6 +17631,13 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 workers.shared.retain(|_, (shared, ..)| *shared != id);
             }
             result?;
+        }
+        LumenHostTask::AbortDocument { context } => {
+            // A navigable whose Document is no longer active has none to abort.
+            run_in_context_realm(engine, context, "abort document", move |engine| {
+                abort_document(engine.ctx(), context);
+                Ok(())
+            })?;
         }
     }
     Ok(())
@@ -30258,7 +30822,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 239, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 240, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -30269,7 +30833,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 239);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 240);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -33360,6 +33924,7 @@ mod tests {
             };
             let response = Arc::new(crate::http::CachedResp {
                 status: 200,
+                status_text: String::new(),
                 content_type: "image/png".into(),
                 headers: Vec::new(),
                 body: bytes.clone(),
@@ -36423,6 +36988,7 @@ mod tests {
         use futures::FutureExt as _;
         let response = Arc::new(crate::http::CachedResp {
             status,
+            status_text: String::new(),
             content_type,
             body,
             headers,

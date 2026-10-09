@@ -1260,6 +1260,7 @@ fn response(url: &GopherUrl, body: Vec<u8>, mime: &str) -> Result<crate::http::R
     Ok(crate::http::Response {
         url: url::Url::parse(&url.to_string()).map_err(|e| e.to_string())?,
         status: 200,
+        status_text: String::new(),
         content_type: mime.into(),
         headers: Vec::new(),
         body,

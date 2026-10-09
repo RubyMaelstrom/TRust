@@ -627,6 +627,7 @@ pub(crate) mod tests {
         http::Response {
             url: Url::parse("https://rdap.example.test/domain/example.test").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: "application/rdap+json".into(),
             headers: Vec::new(),
             body: serde_json::to_vec(&value).unwrap(),

@@ -143,6 +143,7 @@ fn fetch_metadata_preload_cache_keeps_authorization_context() {
         Some(CredentialsMode::SameOrigin),
         CachedResp {
             status: 200,
+            status_text: String::new(),
             content_type: "text/javascript".into(),
             headers: vec![],
             body: b"/*original authorized source*/".to_vec(),

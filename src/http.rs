@@ -337,6 +337,11 @@ pub struct Request {
     /// realm. Navigation and browser-owned subresource requests leave this
     /// unset and retain the existing browser defaults.
     pub(crate) fetch_policy: Option<FetchPolicy>,
+    /// Fetch #use-cors-preflight-flag: set by XHR send() when the upload
+    /// object has event listeners, and by the Request constructor for a
+    /// ReadableStream body. A cross-origin "cors" request carrying it is
+    /// always preflighted (Fetch #main-fetch, #http-fetch).
+    pub(crate) use_cors_preflight: bool,
 }
 
 /// RFC6265bis #same-site-requests / #document-requests (1057fe0f, 2026-09-06).
@@ -556,6 +561,7 @@ impl Request {
             fetch_metadata: None,
             cookie_context: None,
             timing_client: None,
+            use_cors_preflight: false,
             fetch_policy: None,
         }
     }
@@ -592,12 +598,19 @@ pub struct Response {
     /// The URL that finally answered, after redirects.
     pub url: Url,
     pub status: u16,
+    /// Fetch #concept-response-status-message: the HTTP/1.x reason phrase
+    /// (RFC 9112 §4), isomorphic decoded; empty over HTTP/2 and HTTP/3, which
+    /// carry none, and for responses TRust synthesizes.
+    pub status_text: String,
     pub content_type: String,
-    /// Response headers (names lowercased, sorted; the dedup'ing wire map is
-    /// unordered), minus `Set-Cookie` — that's a forbidden response-header
-    /// name for scripts (Fetch spec), and exposing it would leak HttpOnly
-    /// cookies the jar deliberately hides. Pages read real APIs' out-of-band
-    /// results from here (Steam's WebAPI puts the EResult in `x-eresult`).
+    /// The response's header list (Fetch #concept-header-list): fields in
+    /// the order they arrived, duplicates included, names lowercased, minus
+    /// `Set-Cookie`/`Set-Cookie2` — forbidden response-header names for
+    /// scripts (Fetch #forbidden-response-header-name), and exposing them
+    /// would leak HttpOnly cookies the jar deliberately hides. Read one field
+    /// with [`header_list_get`], which combines duplicates. Pages read real
+    /// APIs' out-of-band results from here (Steam's WebAPI puts the EResult
+    /// in `x-eresult`).
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// Typed canonical-DOM → CSS-pixel output for HTML. Once present, neither
@@ -1157,9 +1170,11 @@ pub struct LivePage {
 #[derive(Debug)]
 pub struct CachedResp {
     pub status: u16,
+    /// `Response.status_text`.
+    pub status_text: String,
     pub content_type: String,
-    /// Same filtered/sorted pairs as `Response.headers` (a `seed`ed entry
-    /// synthesizes just its content-type).
+    /// Same filtered, ordered header list as `Response.headers` (a `seed`ed
+    /// entry synthesizes just its content-type).
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// Fetch URL list, including every redirect hop. Empty means unavailable
@@ -1187,6 +1202,9 @@ pub struct PageTaskScope {
     cancelled: std::sync::atomic::AtomicBool,
     tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     fetches: std::sync::Mutex<Vec<futures::future::AbortHandle>>,
+    /// Script fetches (`spawn_abortable`) still running, for `loading`. Their
+    /// abort handles also live in `tasks`; the page actor aborts them itself.
+    script_fetches: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     children: std::sync::Mutex<Vec<std::sync::Weak<PageTaskScope>>>,
 }
 
@@ -1226,6 +1244,45 @@ impl PageTaskScope {
             return;
         }
         tasks.push(handle.spawn(future).abort_handle());
+    }
+
+    /// [`Self::spawn`] for work a document can stop on its own (a script's
+    /// fetch, HTML #abort-a-document): its abort handle, unless the scope was
+    /// already retired. While it runs it counts as loading ([`Self::loading`])
+    /// unless it is `keepalive`.
+    pub(crate) fn spawn_abortable<F>(
+        &self,
+        handle: &tokio::runtime::Handle,
+        future: F,
+        keepalive: bool,
+    ) -> Option<tokio::task::AbortHandle>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        if self.cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let task = handle.spawn(future).abort_handle();
+        tasks.push(task.clone());
+        drop(tasks);
+        if !keepalive {
+            let mut loading = self.script_fetches.lock().unwrap();
+            loading.retain(|task| !task.is_finished());
+            loading.push(task.clone());
+        }
+        Some(task)
+    }
+
+    /// Whether a script fetch spawned by [`Self::spawn_abortable`] still runs.
+    pub(crate) fn loading(&self) -> bool {
+        let mut loading = self.script_fetches.lock().unwrap();
+        loading.retain(|task| !task.is_finished());
+        !loading.is_empty()
     }
 
     pub fn track<T>(&self, task: tokio::task::JoinHandle<T>)
@@ -1371,11 +1428,25 @@ impl PageCache {
         self.tasks.spawn(handle, future);
     }
 
-    /// The user agent's "stop loading" (HTML #nav-stop: abort the document)
-    /// for a document whose resident page stays alive: cancel its in-flight
-    /// subresource fetches and forget their unfinished shared entries, so a
-    /// later request fetches anew instead of joining the cancelled one.
-    /// Returns whether any fetch was still in flight.
+    /// Whether any of the document's fetches is still in flight: a shared
+    /// subresource fetch, an image request, or a script's fetch.
+    pub fn loading(&self) -> bool {
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .any(|entry| entry.future.peek().is_none())
+            || self.images.has_unfinished()
+            || self.tasks.loading()
+    }
+
+    /// The network half of HTML #abort-a-document step 2 for the browser's
+    /// own fetches in a document whose resident page stays alive: cancel its
+    /// in-flight subresource fetches and image requests and forget their
+    /// unfinished shared entries, so a later request fetches anew instead of
+    /// joining the cancelled one. The page actor runs it inside the stop
+    /// loading task, with the script-visible steps. Returns whether any fetch
+    /// was still in flight.
     pub fn stop_loading(&self) -> bool {
         let mut stopped = false;
         self.map.lock().unwrap().retain(|_, entry| {
@@ -1515,6 +1586,7 @@ impl PageCache {
                         }
                         Ok(std::sync::Arc::new(CachedResp {
                             status: r.status,
+                            status_text: r.status_text,
                             content_type: r.content_type,
                             headers: r.headers,
                             body: r.body,
@@ -1715,6 +1787,7 @@ impl PageCache {
         use futures::future::FutureExt as _;
         let resp = std::sync::Arc::new(CachedResp {
             status,
+            status_text: String::new(),
             headers,
             content_type,
             body,
@@ -1984,7 +2057,12 @@ async fn fetch_script_timing_inner(
         }
         return fetch_timed(request, sink).await;
     }
-    if needs_preflight {
+    // Fetch #main-fetch selects the CORS-with-preflight branch when the
+    // request's use-CORS-preflight flag is set, or when its method or header
+    // list is not CORS-safelisted; #http-fetch step 5.1 then makes the
+    // preflight for a non-safelisted method, the flag, or an unsafe header
+    // name. (TRust keeps no CORS-preflight cache, so no entry can match.)
+    if needs_preflight || request.use_cors_preflight {
         let names = cors_non_safelisted_header_names(request);
         let mut headers = vec![(
             String::from("Access-Control-Request-Method"),
@@ -2011,6 +2089,7 @@ async fn fetch_script_timing_inner(
             }),
             cookie_context: request.cookie_context.clone(),
             timing_client: request.timing_client.clone(),
+            use_cors_preflight: false,
             fetch_policy: Some(FetchPolicy {
                 origin: policy.origin.clone(),
                 mode: RequestMode::Cors,
@@ -2156,13 +2235,9 @@ fn validate_cors_preflight(
     if !(200..300).contains(&response.status) {
         return Err(String::from("CORS preflight failed"));
     }
-    let header = |name: &str| {
-        response
-            .headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    };
+    // Fetch #cors-preflight-fetch-0 reads these fields with "get" and
+    // "extracting header list values", which combine repeated fields.
+    let header = |name: &str| header_list_get(&response.headers, name);
     let credentials = request
         .fetch_policy
         .as_ref()
@@ -2172,14 +2247,13 @@ fn validate_cors_preflight(
         .as_ref()
         .map(|policy| policy.origin.origin().ascii_serialization())
         .unwrap_or_default();
-    let allowed_origin = header("access-control-allow-origin")
-        .unwrap_or_default()
-        .trim();
+    let allowed_origin = header("access-control-allow-origin").unwrap_or_default();
+    let allowed_origin = allowed_origin.trim();
     if allowed_origin != origin && !(allowed_origin == "*" && !credentials) {
         return Err(String::from("CORS preflight origin not allowed"));
     }
-    let methods = header("access-control-allow-methods")
-        .unwrap_or_default()
+    let methods = header("access-control-allow-methods").unwrap_or_default();
+    let methods = methods
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -2512,6 +2586,7 @@ fn enforce_fetch_policy_for_redirect_chain(
             // Fetch exposes a filtered opaque response for no-cors requests:
             // status, headers, and body are intentionally unreadable.
             response.status = 0;
+            response.status_text.clear();
             response.content_type.clear();
             response.headers.clear();
             response.body.clear();
@@ -2519,20 +2594,18 @@ fn enforce_fetch_policy_for_redirect_chain(
             Ok(response)
         }
         RequestMode::Cors if cross_origin => {
-            let allowed_origin = response
-                .headers
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("access-control-allow-origin"))
-                .map(|(_, value)| value.trim());
+            // Fetch #concept-cors-check reads each field with "get" (Fetch
+            // #concept-header-list-get), which combines repeated fields: two
+            // `Access-Control-Allow-Origin` fields never match one origin.
+            let allowed_origin = header_list_get(&response.headers, "access-control-allow-origin");
+            let allowed_origin = allowed_origin.as_deref().map(str::trim);
             let origin = serialized_origin.unwrap_or("null");
             let origin_ok = allowed_origin.is_some_and(|value| {
                 value == origin || (value == "*" && policy.credentials != CredentialsMode::Include)
             });
             let credentials_ok = policy.credentials != CredentialsMode::Include
-                || response.headers.iter().any(|(name, value)| {
-                    name.eq_ignore_ascii_case("access-control-allow-credentials")
-                        && value.trim().eq_ignore_ascii_case("true")
-                });
+                || header_list_get(&response.headers, "access-control-allow-credentials")
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
             if origin_ok && credentials_ok {
                 // HTML's script/link consumers inspect the unsafe (internal)
                 // response after CORS succeeds. Filtering `nosniff` here would
@@ -2545,11 +2618,10 @@ fn enforce_fetch_policy_for_redirect_chain(
                 {
                     return Ok(response);
                 }
-                let exposed = response
-                    .headers
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case("access-control-expose-headers"))
-                    .map(|(_, value)| {
+                // Fetch #main-fetch: extracting header list values, over
+                // every `Access-Control-Expose-Headers` field.
+                let exposed = header_list_get(&response.headers, "access-control-expose-headers")
+                    .map(|value| {
                         value
                             .split(',')
                             .map(|name| name.trim().to_ascii_lowercase())
@@ -4636,13 +4708,15 @@ fn finish_response_parts(
         response_cookie(request, line);
     }
     // Redirect processing also consumes response headers (notably
-    // Referrer-Policy). Preserve those while still hiding Set-Cookie.
-    let mut header_pairs: Vec<(String, String)> = headers
+    // Referrer-Policy). Preserve those, in order and with duplicates (Fetch
+    // #concept-header-list), while still hiding the forbidden response-header
+    // names (Fetch #forbidden-response-header-name).
+    let header_pairs: Vec<(String, String)> = headers
         .iter()
-        .filter(|(k, _)| *k != "set-cookie")
+        .filter(|(k, _)| *k != "set-cookie" && *k != "set-cookie2")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    header_pairs.sort();
+    let status_text = headers.status_message.clone();
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
         let location = headers
             .get("location")
@@ -4653,6 +4727,7 @@ fn finish_response_parts(
         return Ok(Response {
             url: url.clone(),
             status,
+            status_text,
             content_type: location,
             headers: header_pairs,
             body: Vec::new(),
@@ -4674,6 +4749,7 @@ fn finish_response_parts(
     Ok(Response {
         url: url.clone(),
         status,
+        status_text,
         content_type,
         headers: header_pairs,
         body,
@@ -4689,7 +4765,103 @@ fn finish_response_parts(
     })
 }
 
-type Headers = HashMap<String, String>;
+/// A response's header list (Fetch #concept-header-list): its fields in the
+/// order they arrived, duplicates included, with lowercased names (HTTP/2 and
+/// HTTP/3 field names are lowercase on the wire; no Fetch API exposes the
+/// original case). `get` combines every value of a name in order (Fetch
+/// #concept-header-list-get), which is the view message framing, content
+/// coding and the other protocol checks read. Both views are bounded by the
+/// header-section limits of the transport that parsed them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Headers {
+    list: Vec<(String, String)>,
+    combined: HashMap<String, String>,
+    /// Fetch #concept-response-status-message, which arrives in the same
+    /// response head: the HTTP/1.x status line's reason phrase (RFC 9112 §4),
+    /// isomorphic decoded. HTTP/2 and HTTP/3 have none, so it stays empty.
+    pub(crate) status_message: String,
+}
+
+impl Headers {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fetch #concept-header-list-append, for a lowercased name.
+    pub(crate) fn append(&mut self, name: String, value: String) {
+        self.combined
+            .entry(name.clone())
+            .and_modify(|existing| {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            })
+            .or_insert_with(|| value.clone());
+        self.list.push((name, value));
+    }
+
+    /// Fetch #concept-header-list-set, for a lowercased name: replace every
+    /// field of that name with one.
+    pub(crate) fn insert(&mut self, name: String, value: String) {
+        self.list.retain(|(existing, _)| *existing != name);
+        self.combined.remove(&name);
+        self.append(name, value);
+    }
+
+    /// Fetch #concept-header-list-get for a lowercased name.
+    pub(crate) fn get(&self, name: &str) -> Option<&String> {
+        self.combined.get(name)
+    }
+
+    pub(crate) fn contains_key(&self, name: &str) -> bool {
+        self.combined.contains_key(name)
+    }
+
+    /// The fields in order, duplicates included.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.list.iter().map(|(name, value)| (name, value))
+    }
+}
+
+impl std::ops::Index<&str> for Headers {
+    type Output = String;
+
+    /// The combined value of a lowercased name that is present.
+    fn index(&self, name: &str) -> &String {
+        &self.combined[name]
+    }
+}
+
+impl<const N: usize> From<[(String, String); N]> for Headers {
+    fn from(fields: [(String, String); N]) -> Self {
+        let mut headers = Self::new();
+        for (name, value) in fields {
+            headers.append(name, value);
+        }
+        headers
+    }
+}
+
+/// Fetch #concept-header-list-get over a response's exposed header list:
+/// every value of `name` (case-insensitively), in order, joined by ", ".
+pub(crate) fn header_list_get<'a>(
+    list: &'a [(String, String)],
+    name: &str,
+) -> Option<std::borrow::Cow<'a, str>> {
+    let mut values = list
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str());
+    let first = values.next()?;
+    let Some(second) = values.next() else {
+        return Some(std::borrow::Cow::Borrowed(first));
+    };
+    let mut combined = format!("{first}, {second}");
+    for value in values {
+        combined.push_str(", ");
+        combined.push_str(value);
+    }
+    Some(std::borrow::Cow::Owned(combined))
+}
 
 /// Protocol-independent browser-owned headers. HTTP/1.1 adds Host and
 /// Connection; HTTP/2 and HTTP/3 derive pseudo-headers from the URL and never
@@ -4957,6 +5129,15 @@ async fn exchange_head(
 
 /// One CRLF-terminated line, sans terminator. Err on EOF-before-line.
 async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(io: &mut R) -> Result<String, String> {
+    read_line_bytes(io)
+        .await
+        .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// [`read_line`] without decoding: the line's octets, sans terminator.
+async fn read_line_bytes<R: tokio::io::AsyncBufRead + Unpin>(
+    io: &mut R,
+) -> Result<Vec<u8>, String> {
     const MAX_LINE: usize = 64 * 1024;
     let mut buf = Vec::new();
     loop {
@@ -4986,9 +5167,33 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(io: &mut R) -> Result<Str
                 return Err(String::from("bare carriage return in line"));
             }
             buf.truncate(buf.len() - 2);
-            return Ok(String::from_utf8_lossy(&buf).into_owned());
+            return Ok(buf);
         }
     }
+}
+
+/// RFC 9112 §4: `status-line = HTTP-version SP status-code SP [ reason-phrase ]`
+/// with `reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )`. Returns the
+/// version, the three status-code characters and the reason phrase. Fetch's
+/// status message is that phrase as a byte sequence; it is isomorphic decoded
+/// here (one char per octet), as Web IDL's ByteString exposes it. A missing
+/// phrase, or a line that ends right after the code, is the empty message.
+fn parse_status_line(line: &[u8]) -> Option<(&str, &str, String)> {
+    let space = line.iter().position(|&byte| byte == b' ')?;
+    let version = std::str::from_utf8(&line[..space]).ok()?;
+    let rest = &line[space + 1..];
+    let code_end = rest
+        .iter()
+        .position(|&byte| byte == b' ')
+        .unwrap_or(rest.len());
+    let code = std::str::from_utf8(&rest[..code_end]).ok()?;
+    let reason = rest
+        .get(code_end + 1..)
+        .unwrap_or_default()
+        .iter()
+        .map(|&byte| char::from(byte))
+        .collect();
+    Some((version, code, reason))
 }
 
 /// Read one response off the stream: status line, headers, then a body
@@ -5053,17 +5258,19 @@ async fn read_response_head<R: AsyncRead + Unpin>(
         // timestamp taken before this await would measure request completion.
         let _ = io.fill_buf().await.map_err(|e| e.to_string())?;
         let response_start = crate::performance::now_ms();
-        let status_line = read_line(io).await?;
-        let Some((version, rest)) = status_line.split_once(' ') else {
-            return Err(format!("malformed status line: {status_line:?}"));
+        let status_line = read_line_bytes(io).await?;
+        let Some((version, status_code, reason)) = parse_status_line(&status_line) else {
+            return Err(format!(
+                "malformed status line: {:?}",
+                String::from_utf8_lossy(&status_line)
+            ));
         };
+        let status_line = String::from_utf8_lossy(&status_line);
         let http11 = version == "HTTP/1.1";
         if version != "HTTP/1.0" && !http11 {
             return Err(format!("unsupported HTTP version: {version:?}"));
         }
-        let status_code = rest
-            .split(' ')
-            .next()
+        let status_code = Some(status_code)
             .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
             .ok_or_else(|| format!("malformed status line: {status_line:?}"))?;
         let status: u16 = status_code
@@ -5075,7 +5282,8 @@ async fn read_response_head<R: AsyncRead + Unpin>(
             // failures. They remain non-ok and never select redirect handling.
             .filter(|status| (100..=999).contains(status))
             .ok_or_else(|| format!("invalid status code: {status_line:?}"))?;
-        let mut headers = HashMap::new();
+        let mut headers = Headers::new();
+        headers.status_message = reason;
         let mut set_cookies = Vec::new();
         let mut header_bytes = status_line.len();
         loop {
@@ -5109,13 +5317,7 @@ async fn read_response_head<R: AsyncRead + Unpin>(
             if name == "set-cookie" {
                 set_cookies.push(value.trim().to_string());
             }
-            headers
-                .entry(name)
-                .and_modify(|existing: &mut String| {
-                    existing.push_str(", ");
-                    existing.push_str(value.trim());
-                })
-                .or_insert_with(|| value.trim().to_string());
+            headers.append(name, value.trim().to_string());
         }
         // RFC 9110 permits one or more informational responses before the
         // final response. They have no body and must never be returned as the
@@ -9990,6 +10192,7 @@ mod tests {
         Response {
             url: Url::parse(url).unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             body: html.as_bytes().to_vec(),
@@ -10009,6 +10212,7 @@ mod tests {
         Response {
             url: Url::parse(url).unwrap(),
             status,
+            status_text: String::new(),
             content_type: String::from("text/plain"),
             headers: headers
                 .iter()
@@ -10037,6 +10241,7 @@ mod tests {
             fetch_metadata: None,
             cookie_context: None,
             timing_client: None,
+            use_cors_preflight: false,
             fetch_policy: Some(FetchPolicy {
                 origin: Url::parse("https://app.example").unwrap(),
                 mode,
@@ -10378,6 +10583,162 @@ mod tests {
         assert_eq!(cors_non_safelisted_header_names(&request), ["x-custom"]);
     }
 
+    #[test]
+    fn status_line_reason_phrase_is_the_status_message() {
+        // RFC 9112 §4: status-line = HTTP-version SP status-code SP
+        // [ reason-phrase ], reason-phrase = 1*( HTAB / SP / VCHAR / obs-text ).
+        // Fetch's status message is that byte sequence, isomorphic decoded.
+        for (line, code, reason) in [
+            (&b"HTTP/1.1 200 OK"[..], "200", "OK"),
+            (b"HTTP/1.1 404 Not  Found ", "404", "Not  Found "),
+            (b"HTTP/1.1 204 ", "204", ""),
+            (b"HTTP/1.1 204", "204", ""),
+            (b"HTTP/1.0 418 I\xe9\tteapot", "418", "I\u{e9}\tteapot"),
+        ] {
+            let (version, status, phrase) = parse_status_line(line).unwrap();
+            assert!(version.starts_with("HTTP/1."));
+            assert_eq!((status, phrase.as_str()), (code, reason));
+        }
+        assert!(parse_status_line(b"HTTP/1.1").is_none());
+    }
+
+    #[tokio::test]
+    async fn http1_response_keeps_its_reason_phrase_and_ordered_header_list() {
+        // Fetch #concept-header-list keeps every field in order, duplicates
+        // included; "get" combines them (#concept-header-list-get). The
+        // forbidden response-header names never reach the exposed list.
+        let raw = b"HTTP/1.1 203 Partly \xe9Fine\r\nX-B: 1\r\nX-A: 2\r\nSet-Cookie: s=1\r\nx-b: 3\r\nSet-Cookie2: t=2\r\nContent-Length: 2\r\n\r\nok";
+        let (status, headers, body, _, cookies) =
+            read_response(&mut BufReader::new(&raw[..]), false)
+                .await
+                .unwrap();
+        assert_eq!((status, body.as_slice()), (203, &b"ok"[..]));
+        assert_eq!(headers.status_message, "Partly \u{e9}Fine");
+        assert_eq!(headers.get("x-b").map(String::as_str), Some("1, 3"));
+        assert_eq!(cookies, ["s=1"]);
+        let response = finish_response_parts(
+            &Request::get(Url::parse("http://127.0.0.1:1/").unwrap()),
+            (status, headers, body, Vec::new()),
+            crate::performance::FetchTiming::new(),
+        )
+        .unwrap();
+        assert_eq!(response.status_text, "Partly \u{e9}Fine");
+        let names: Vec<_> = response
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        assert_eq!(names, ["x-b=1", "x-a=2", "x-b=3", "content-length=2"]);
+        assert_eq!(
+            header_list_get(&response.headers, "X-B").as_deref(),
+            Some("1, 3")
+        );
+        assert_eq!(
+            header_list_get(&response.headers, "x-a").as_deref(),
+            Some("2")
+        );
+        assert_eq!(header_list_get(&response.headers, "x-none"), None);
+    }
+
+    #[test]
+    fn cors_checks_combine_repeated_fields() {
+        // Fetch #concept-cors-check "gets" Access-Control-Allow-Origin: two
+        // fields combine into a value that matches no origin.
+        let request = scripted_request(
+            "https://cdn.example/data",
+            RequestMode::Cors,
+            CredentialsMode::SameOrigin,
+        );
+        let response = |headers: &[(&str, &str)]| Response {
+            url: request.url.clone(),
+            status: 200,
+            status_text: String::new(),
+            content_type: String::new(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect(),
+            body: Vec::new(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            images: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+            timing: None,
+        };
+        let single = response(&[("access-control-allow-origin", "https://app.example")]);
+        assert!(validate_cors_preflight(&single, &request, &[]).is_ok());
+        let repeated = response(&[
+            ("access-control-allow-origin", "https://app.example"),
+            ("access-control-allow-origin", "https://app.example"),
+        ]);
+        assert!(validate_cors_preflight(&repeated, &request, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn use_cors_preflight_flag_forces_a_preflight_for_a_simple_request() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Fetch #main-fetch takes the CORS-with-preflight branch when the
+        // request's use-CORS-preflight flag is set (XHR send() with upload
+        // listeners), even for a CORS-safelisted GET; #http-fetch then makes
+        // the CORS-preflight fetch. Without the flag the same request goes
+        // straight to the network.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 2048];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let head = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://app.example\r\n\
+                          Access-Control-Allow-Methods: GET\r\nContent-Length: 2\r\n\
+                          Connection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                requests.push(head);
+            }
+            requests
+        });
+        let url = format!("http://{address}/data");
+        let mut flagged = scripted_request(&url, RequestMode::Cors, CredentialsMode::SameOrigin);
+        flagged.use_cors_preflight = true;
+        assert!(!cors_preflight_required(&flagged));
+        let response = fetch_script(&flagged).await.unwrap();
+        assert_eq!(
+            (response.status, response.body.as_slice()),
+            (200, &b"ok"[..])
+        );
+        let plain = scripted_request(&url, RequestMode::Cors, CredentialsMode::SameOrigin);
+        fetch_script(&plain).await.unwrap();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(requests[0].starts_with("options /data "), "{}", requests[0]);
+        assert!(
+            requests[0].contains("access-control-request-method: get\r\n"),
+            "{}",
+            requests[0]
+        );
+        assert!(!requests[0].contains("access-control-request-headers"));
+        assert!(requests[1].starts_with("get /data "), "{}", requests[1]);
+        assert!(requests[2].starts_with("get /data "), "{}", requests[2]);
+    }
+
     #[tokio::test]
     async fn script_fetch_with_browser_referrer_gets_svg_without_preflight() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -10460,6 +10821,7 @@ mod tests {
         let response = Response {
             url: Url::parse("https://example.test/photo.png").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: String::from("image/png"),
             headers: Vec::new(),
             body: b"\x89PNG\r\n\x1a\n".to_vec(),
@@ -12364,6 +12726,7 @@ mod tests {
         let response = Response {
             url: parse_url("https://example.test/schemes").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             body: br#"<body><script>
@@ -12432,6 +12795,7 @@ mod tests {
         let response = Response {
             url: parse_url("https://example.test/detached-frame").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             body: br#"<body><div id=out>OK</div><script>
@@ -12719,6 +13083,7 @@ mod tests {
             let response = Response {
                 url: parse_url("https://example.test/frames").unwrap(),
                 status: 200,
+                status_text: String::new(),
                 content_type: "text/html".into(),
                 headers: Vec::new(),
                 body: html.into_bytes(),
@@ -12760,6 +13125,7 @@ mod tests {
         let response = Response {
             url: parse_url("https://example.test/deep-frames").unwrap(),
             status: 200,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             body: format!("<body>{nested}</body>").into_bytes(),
@@ -12794,6 +13160,7 @@ mod tests {
             let response = Response {
                 url: parse_url("https://example.test/disclosure").unwrap(),
                 status: 200,
+                status_text: String::new(),
                 content_type: "text/html".into(),
                 headers: Vec::new(),
                 body: html.as_bytes().to_vec(),
@@ -12868,6 +13235,7 @@ mod tests {
         let response = Response {
             url,
             status: 200,
+            status_text: String::new(),
             content_type: String::from("text/html"),
             headers: Vec::new(),
             body: br#"<html><head><style>
@@ -17863,6 +18231,7 @@ customElements.define('lit-counter', LitCounter);
             fetch_metadata: None,
             cookie_context: None,
             timing_client: None,
+            use_cors_preflight: false,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -17886,6 +18255,7 @@ customElements.define('lit-counter', LitCounter);
                 fetch_metadata: None,
                 cookie_context: None,
                 timing_client: None,
+                use_cors_preflight: false,
                 fetch_policy: None,
             };
             let response = fetch(&request).await.unwrap();
@@ -17907,6 +18277,7 @@ customElements.define('lit-counter', LitCounter);
             fetch_metadata: None,
             cookie_context: None,
             timing_client: None,
+            use_cors_preflight: false,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -17972,6 +18343,7 @@ customElements.define('lit-counter', LitCounter);
             fetch_metadata: None,
             cookie_context: None,
             timing_client: None,
+            use_cors_preflight: false,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -18841,6 +19213,7 @@ customElements.define('lit-counter', LitCounter);
             fetch_metadata: None,
             cookie_context: None,
             timing_client: None,
+            use_cors_preflight: false,
             fetch_policy: None,
         };
         let resp = fetch(&request).await.unwrap();
@@ -18899,6 +19272,7 @@ customElements.define('lit-counter', LitCounter);
             fetch_metadata: None,
             cookie_context: None,
             timing_client: None,
+            use_cors_preflight: false,
             fetch_policy: None,
         };
         let resp = fetch(&request).await.unwrap();

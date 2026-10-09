@@ -103,13 +103,7 @@ pub(super) fn response_headers(fields: &HeaderMap) -> Result<(Headers, Vec<Strin
         if name == "set-cookie" {
             cookies.push(value.to_string());
         }
-        headers
-            .entry(name.to_string())
-            .and_modify(|existing: &mut String| {
-                existing.push_str(", ");
-                existing.push_str(&value);
-            })
-            .or_insert_with(|| value.into_owned());
+        headers.append(name.to_string(), value.into_owned());
     }
     Ok((headers, cookies))
 }

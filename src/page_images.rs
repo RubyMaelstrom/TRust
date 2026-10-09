@@ -470,6 +470,17 @@ impl PageImages {
     /// Forget the requests still in flight (their fetches are being
     /// cancelled by the user agent's "stop loading"); completed responses stay
     /// shared. Returns whether any request was unfinished.
+    /// Whether any image request is still being fetched.
+    pub(crate) fn has_unfinished(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .flatten()
+            .any(|entry| entry.fetch.peek().is_none())
+    }
+
     pub(crate) fn forget_unfinished(&self) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let mut forgot = false;

@@ -1,7 +1,9 @@
 //! Response bodies read as they arrive, against local servers that write
 //! their bodies in delayed pieces: Fetch #concept-http-network-fetch for
 //! fetch(), XMLHttpRequest's processBodyChunk, and HTML server-sent events
-//! (#server-sent-events) with reconnection.
+//! (#server-sent-events) with reconnection; and the network side of
+//! responses (status message, header list, CORS preflight), of stopping a
+//! document (HTML #abort-a-document) and of module graph fetching.
 
 use super::tests::{configured_engine, run_microtask_checkpoint, string_value};
 use super::*;
@@ -771,4 +773,505 @@ fn dedicated_workers_stream_fetch_bodies_and_event_streams() {
         "close() ended the stream"
     );
     eval(&mut engine, "worker.terminate()", "terminate").unwrap();
+}
+
+/// Serve `count` requests, one per connection, answering each request head
+/// with `respond(head)`; returns the heads in arrival order.
+fn serve_each(
+    runtime: &tokio::runtime::Runtime,
+    listener: TcpListener,
+    count: usize,
+    respond: fn(&str) -> Vec<u8>,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    runtime.spawn(async move {
+        let mut heads = Vec::new();
+        for _ in 0..count {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut socket).await;
+            socket.write_all(&respond(&head)).await.unwrap();
+            heads.push(head);
+        }
+        heads
+    })
+}
+
+#[test]
+fn responses_expose_the_reason_phrase_and_the_ordered_header_list() {
+    // Fetch #concept-response-status-message is the HTTP/1.1 reason phrase
+    // (RFC 9112 §4). The header list keeps the fields' order and duplicates
+    // (#concept-header-list); Headers iterates it sorted and combined
+    // (#concept-header-list-sort-and-combine), and getAllResponseHeaders()
+    // sorts and combines it too (XHR #the-getallresponseheaders()-method).
+    // Set-Cookie is a forbidden response-header name.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 2, |_| {
+        b"HTTP/1.1 203 Partly Fine\r\nX-B: 1\r\nX-A: 2\r\nx-b: 3\r\nSet-Cookie: s=1\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        r#"
+        fetch('/fetch').then(async response => {
+            log.push(response.status + ' ' + response.statusText,
+                [...response.headers].map(pair => pair.join('=')).join(','),
+                response.headers.get('X-B'), await response.text());
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', '/xhr');
+            xhr.onload = () => log.push(xhr.status + ' ' + xhr.statusText,
+                JSON.stringify(xhr.getAllResponseHeaders()), xhr.getResponseHeader('x-b'));
+            xhr.send();
+        }).catch(error => log.push('failed:' + error));
+        "#,
+        "status message and header list",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length >= 7");
+    assert_eq!(
+        log(&mut engine),
+        "203 Partly Fine|connection=close,content-length=2,content-type=text/plain,x-a=2,x-b=1, 3|1, 3|ok|\
+         203 Partly Fine|\"connection: close\\r\\ncontent-length: 2\\r\\ncontent-type: text/plain\\r\\nx-a: 2\\r\\nx-b: 1, 3\\r\\n\"|1, 3"
+    );
+    runtime.block_on(server).unwrap();
+}
+
+#[test]
+fn xhr_upload_listeners_preflight_a_cross_origin_request() {
+    // XHR #the-send()-method sets the request's use-CORS-preflight flag when
+    // the upload object has event listeners; Fetch #main-fetch then makes a
+    // CORS-preflight fetch (#cors-preflight-fetch-0) even for a safelisted
+    // method and header list. Without listeners the request goes directly.
+    let runtime = runtime();
+    let (_page_listener, page_base) = listen(&runtime);
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 3, |head| {
+        let origin = head
+            .lines()
+            .find_map(|line| line.strip_prefix("origin: "))
+            .unwrap_or("null")
+            .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: GET\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        )
+        .into_bytes()
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{page_base}/page"));
+    eval(
+        &mut engine,
+        &format!(
+            r#"
+            const watched = new XMLHttpRequest();
+            watched.open('GET', '{base}/watched');
+            watched.upload.onprogress = () => {{}};
+            watched.onloadend = () => {{
+                log.push('watched:' + watched.status + ':' + watched.responseText);
+                const plain = new XMLHttpRequest();
+                plain.open('GET', '{base}/plain');
+                plain.onloadend = () => log.push('plain:' + plain.status + ':' + plain.responseText);
+                plain.send();
+            }};
+            watched.send();
+            "#
+        ),
+        "XHR upload listener preflight",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length >= 2");
+    assert_eq!(log(&mut engine), "watched:200:ok|plain:200:ok");
+    let heads = runtime.block_on(server).unwrap();
+    assert!(heads[0].starts_with("options /watched "), "{}", heads[0]);
+    assert!(
+        heads[0].contains("access-control-request-method: get\r\n"),
+        "{}",
+        heads[0]
+    );
+    assert!(heads[1].starts_with("get /watched "), "{}", heads[1]);
+    assert!(heads[2].starts_with("get /plain "), "{}", heads[2]);
+}
+
+/// A server for `window_stop_*`: requests that wait for the client to give
+/// up (reporting whether it closed the connection), an event stream that
+/// never answers, a response whose body never ends and a keepalive request
+/// answered only once `release` fires.
+fn serve_stoppable(
+    runtime: &tokio::runtime::Runtime,
+    listener: TcpListener,
+    count: usize,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> (
+    tokio::task::JoinHandle<Vec<(String, bool)>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let arrived = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = arrived.clone();
+    let server = runtime.spawn(async move {
+        let release = std::sync::Arc::new(tokio::sync::Mutex::new(Some(release)));
+        let mut connections = Vec::new();
+        for _ in 0..count {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let counter = counter.clone();
+            let release = release.clone();
+            connections.push(tokio::spawn(async move {
+                let head = read_head(&mut socket).await;
+                let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if path == "/keep" {
+                    if let Some(release) = release.lock().await.take() {
+                        let _ = release.await;
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nkept")
+                        .await
+                        .unwrap();
+                    return (path, false);
+                }
+                if path == "/stream" {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    socket.write_all(&chunk(b"first")).await.unwrap();
+                }
+                // Wait for the client to close the connection.
+                let mut buffer = [0u8; 64];
+                let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return true,
+                            Ok(_) => {}
+                        }
+                    }
+                })
+                .await
+                .unwrap_or(false);
+                (path, closed)
+            }));
+        }
+        let mut results = Vec::new();
+        for connection in connections {
+            results.push(connection.await.unwrap());
+        }
+        results.sort();
+        results
+    });
+    (server, arrived)
+}
+
+#[test]
+fn window_stop_aborts_the_documents_fetches() {
+    // HTML #dom-window-stop → #nav-stop → #abort-a-document step 2: the
+    // document's fetches are aborted (Fetch #fetch-controller-abort): a
+    // pending fetch() rejects with an "AbortError" DOMException, a body
+    // still arriving errors with it, XMLHttpRequest runs its request error
+    // steps for "abort" inside stop() and an EventSource whose response has
+    // not arrived fails its connection. Their connections are closed. A
+    // keepalive fetch outlives the document's loading and still completes.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (server, arrived) = serve_stoppable(&runtime, listener, 5, released);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        r#"
+        fetch('/slow').then(() => log.push('fetch resolved'), error => log.push('fetch:' + error.name));
+        fetch('/keep', {keepalive: true}).then(response => response.text())
+            .then(text => log.push('keepalive:' + text), error => log.push('keepalive failed:' + error));
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', '/xhr');
+        xhr.onreadystatechange = () => log.push('rs' + xhr.readyState);
+        xhr.onabort = () => log.push('abort:' + xhr.status + ':' + xhr.readyState);
+        xhr.onerror = () => log.push('xhr error');
+        xhr.onloadend = () => log.push('loadend');
+        xhr.send();
+        const source = new EventSource('/events');
+        source.onerror = () => log.push('eventsource error:' + source.readyState);
+        fetch('/stream').then(async response => {
+            globalThis.reader = response.body.getReader();
+            await reader.read();
+            log.push('chunk');
+        });
+        "#,
+        "loading fetches",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.includes('chunk')");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while arrived.load(std::sync::atomic::Ordering::SeqCst) < 5 {
+        assert!(Instant::now() < deadline, "requests reached the server");
+        run_for(&runtime, &mut engine, &mut tasks, Duration::from_millis(20));
+    }
+    eval(
+        &mut engine,
+        r#"
+        log.push('stop');
+        window.stop();
+        log.push('stopped');
+        reader.read().then(() => log.push('read'), error => log.push('read:' + error.name));
+        "#,
+        "window.stop()",
+    )
+    .unwrap();
+    // The XMLHttpRequest's events fire inside stop().
+    assert_eq!(log(&mut engine), "chunk|stop|rs4|abort:0:4|loadend|stopped");
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "['fetch:AbortError', 'read:AbortError', 'eventsource error:2'].every(entry => log.includes(entry))",
+    );
+    release.send(()).unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('keepalive:kept')",
+    );
+    let results = runtime.block_on(server).unwrap();
+    assert_eq!(
+        results,
+        [
+            (String::from("/events"), true),
+            (String::from("/keep"), false),
+            (String::from("/slow"), true),
+            (String::from("/stream"), true),
+            (String::from("/xhr"), true),
+        ],
+        "stopping closed every connection but the keepalive one"
+    );
+    let log = log(&mut engine);
+    assert!(
+        !log.contains("resolved") && !log.contains("xhr error"),
+        "{log}"
+    );
+    assert_eq!(streams_in_flight(&mut engine), 0);
+}
+
+#[test]
+fn the_user_agents_stop_cancels_the_navigation_and_fetches_but_not_scripts() {
+    // HTML #nav-stop for the top-level navigable (`PageCmd::StopLoading`):
+    // the navigation the running task requested is canceled, the document's
+    // fetch is aborted, and the page keeps running.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let (_release, released) = tokio::sync::oneshot::channel::<()>();
+    let (server, arrived) = serve_stoppable(&runtime, listener, 1, released);
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        "fetch('/slow').catch(error => log.push('fetch:' + error.name));",
+        "loading fetch",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while arrived.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "the request reached the server");
+        run_for(&runtime, &mut engine, &mut tasks, Duration::from_millis(20));
+    }
+    eval(&mut engine, "location.href = '/elsewhere';", "navigate").unwrap();
+    assert!(stop_loading_navigable(engine.ctx(), 0));
+    assert_eq!(
+        string_value(&mut engine, "String(__trust.takeNavigationRequest())"),
+        "null"
+    );
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('fetch:AbortError')",
+    );
+    eval(&mut engine, "log.push('still running')", "script").unwrap();
+    assert_eq!(log(&mut engine), "fetch:AbortError|still running");
+    // Nothing is loading any more.
+    assert!(!stop_loading_navigable(engine.ctx(), 0));
+    assert_eq!(
+        runtime.block_on(server).unwrap(),
+        [(String::from("/slow"), true)]
+    );
+}
+
+#[test]
+fn window_stop_while_parsing_aborts_the_parser() {
+    // HTML #abort-a-document step 4 and #abort-a-parser: the content after
+    // the parser's position is thrown away, readiness becomes "interactive"
+    // then "complete", later parser scripts and deferred scripts never run,
+    // "the end" (DOMContentLoaded, load) never happens, and
+    // document.write() is ignored once the active parser was aborted.
+    let html = r#"<!doctype html><html><head>
+        <script>
+            window.events = [];
+            document.addEventListener('readystatechange', () => events.push('rs:' + document.readyState));
+            document.addEventListener('DOMContentLoaded', () => document.documentElement.setAttribute('data-dcl', ''));
+            window.addEventListener('load', () => document.documentElement.setAttribute('data-load', ''));
+        </script>
+        <script defer src="data:text/javascript,document.documentElement.setAttribute('data-deferred','')"></script>
+        <script>
+            events.push('before:' + document.readyState + ':' + !!document.getElementById('later'));
+            window.stop();
+            events.push('after:' + document.readyState + ':' + !!document.getElementById('later') + ':' + !!document.body);
+            document.write('<p id=written>w</p>');
+            document.documentElement.setAttribute('data-events', events.join(','));
+        </script>
+        <script>document.documentElement.setAttribute('data-next', '')</script>
+        </head><body><p id=later>later</p></body></html>"#;
+    let (rendered, outcome) = crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert!(
+        rendered.contains(
+            "data-events=\"before:loading:true,rs:interactive,rs:complete,after:complete:false:false\""
+        ),
+        "{rendered}"
+    );
+    for absent in [
+        "data-dcl",
+        "data-load",
+        "data-deferred",
+        "data-next",
+        "id=\"later\"",
+        "id=\"written\"",
+    ] {
+        assert!(!rendered.contains(absent), "{absent}: {rendered}");
+    }
+}
+
+#[test]
+fn stopping_aborts_descendant_documents_by_window_realm() {
+    // HTML #abort-a-document-and-its-descendants: every descendant navigable,
+    // found through the Window Realm whose Document contains its container.
+    let mut state = HostState::new(
+        Rc::new(RefCell::new(Dom::new())),
+        Rc::new(RealmClock::new()),
+    );
+    for (child, parent) in [(1, 0), (2, 1), (3, 0), (4, 9)] {
+        state.window_realms.insert(child, Value::Num(child as f64));
+        state.window_parents.insert(child, parent);
+    }
+    // A retired child's Window Realm is gone.
+    state.window_parents.insert(5, 3);
+    assert_eq!(descendant_contexts(&state, 0), [1, 2, 3]);
+    assert_eq!(descendant_contexts(&state, 1), [2]);
+    assert!(descendant_contexts(&state, 2).is_empty());
+}
+
+#[test]
+fn a_module_scripts_static_graph_is_fetched_as_its_responses_arrive() {
+    // HTML #fetch-a-module-script-tree: when a module script's fetch
+    // completes, its descendants are fetched (and theirs in turn) without
+    // waiting for the graph to be linked for evaluation.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 2, |head| {
+        let body: &[u8] = if head.starts_with("get /b.js ") {
+            b"import {c} from './c.js'; export const b = c;"
+        } else {
+            b"export const c = 1;"
+        };
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    });
+    let page = url::Url::parse(&format!("{base}/page")).unwrap();
+    let cache = Arc::new(crate::http::PageCache::default());
+    speculate_module_graph(
+        page.clone(),
+        runtime.handle().clone(),
+        cache.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        page.join("/a.js").unwrap(),
+        b"import {b} from \"./b.js\";\nimport('./dynamic.js');",
+    );
+    let heads = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(10), server).await })
+        .unwrap()
+        .unwrap();
+    assert!(heads[0].starts_with("get /b.js "), "{}", heads[0]);
+    assert!(heads[1].starts_with("get /c.js "), "{}", heads[1]);
+    for module in ["/b.js", "/c.js"] {
+        assert!(
+            cache
+                .peek_resource(
+                    &page.join(module).unwrap(),
+                    &page,
+                    "script",
+                    Some(crate::http::CredentialsMode::SameOrigin),
+                )
+                .is_some(),
+            "{module} waits in the page cache for the graph loader"
+        );
+    }
+}
+
+#[test]
+fn an_unreachable_streamed_body_still_cancels_its_transfer() {
+    // The fetch group holds a body's abort steps weakly: a response nobody
+    // can read is collected, which cancels its transfer and ends its fetch
+    // (Fetch #garbage-collection), so stopping finds nothing to cancel.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = runtime.spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_head(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        stream_until_closed(&mut socket).await
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        "fetch('/endless').then(response => { log.push('head:' + response.status); });",
+        "unread body",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length >= 1");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while streams_in_flight(&mut engine) != 0 {
+        assert!(Instant::now() < deadline, "the unread body was collected");
+        engine.ctx().collect_garbage_for_host();
+        run_for(&runtime, &mut engine, &mut tasks, Duration::from_millis(20));
+        while string_value(&mut engine, "__trust.hasPlatformTask()") == "true" {
+            eval(&mut engine, "__trust.runPlatformTask()", "platform task").unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+    }
+    assert!(
+        runtime.block_on(server).unwrap(),
+        "its transfer was canceled"
+    );
+    assert!(!stop_loading_navigable(engine.ctx(), 0));
+}
+
+#[test]
+fn import_starts_its_fetch_before_the_page_thread_takes_its_task() {
+    // HTML #hostloadimportedmodule fetches the imported module script as
+    // import() runs; only processing the response waits for a task. The
+    // request reaches the network while the page thread is still busy (here:
+    // not dispatching host tasks at all), and the queued task then joins it.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 1, |_| {
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: 22\r\nConnection: close\r\n\r\nexport const v = 'ok';"
+            .to_vec()
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        "import('/dynamic.js').then(module => log.push(module.v), error => log.push('failed:' + error));",
+        "dynamic import",
+    )
+    .unwrap();
+    let heads = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(10), server).await })
+        .expect("the import's request started without its task")
+        .unwrap();
+    assert!(heads[0].starts_with("get /dynamic.js "), "{}", heads[0]);
+    run_until(&runtime, &mut engine, &mut tasks, "log.length >= 1");
+    assert_eq!(log(&mut engine), "ok");
 }
