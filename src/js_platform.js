@@ -34686,9 +34686,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     // Web IDL #a-promise-resolved-with: a new promise resolved with the value
     // (a thenable takes its own resolution steps; this is not PromiseResolve).
-    function resolvedWith(value) { return new PromiseCtor(function (resolve) { resolve(value); }); }
+    // Adopting a thenable is a platform job with null job settings, as for react().
+    function resolvedWith(value) { return __promise_resolved_with(value); }
     function rejectedWith(reason) { return apply(promiseReject, PromiseCtor, [reason]); }
-    function react(promise, onFulfilled, onRejected) { return apply(promiseThen, promise, [onFulfilled, onRejected]); }
+    // Web IDL #dfn-perform-steps-once-promise-is-settled: platform steps whose
+    // jobs have null job settings, so they still run after the Document of the
+    // stream's Realm is discarded.
+    function react(promise, onFulfilled, onRejected) { return __promise_react(promise, onFulfilled, onRejected); }
     function uponFulfillment(promise, steps) { return react(promise, steps, undefined); }
     function uponRejection(promise, steps) { return react(promise, undefined, steps); }
     function markHandled(promise) { react(promise, undefined, function () {}); }
@@ -39568,7 +39572,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     }
     function isObject(value) { return (typeof value === "object" && value !== null) || typeof value === "function"; }
     function rejected(reason) { return apply(promiseReject, PromiseCtor, [reason]); }
-    function react(promise, onFulfilled, onRejected) { return apply(promiseThen, promise, [onFulfilled, onRejected]); }
+    // Web IDL "react to a promise" with platform steps (see the Streams block).
+    function react(promise, onFulfilled, onRejected) { return __promise_react(promise, onFulfilled, onRejected); }
     function domException(message, name) { return new g.DOMException(message, name); }
     function isArrayBuffer(value) {
         try { apply(bufferByteLength, value, []); return true; } catch (_) { return false; }
@@ -41678,8 +41683,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // takes the engine's rejected promises that had no handler at the end of a
     // microtask checkpoint (#perform-a-microtask-checkpoint step "notify about
     // rejected promises") and hands them to notify(), which queues a global task
-    // on the DOM manipulation task source to fire unhandledrejection; an event
-    // that is not canceled is reported to the developer console.
+    // on the DOM manipulation task source. That task skips a promise handled in
+    // the meantime ([[PromiseIsHandled]]), fires unhandledrejection, reports an
+    // event that is not canceled to the developer console, and adds a promise
+    // still unhandled to the outstanding rejected promises weak set, which the
+    // engine keeps. HostPromiseRejectionTracker's "handle" on such a promise
+    // comes back through notifyHandled(), which queues rejectionhandled.
     (function (g) {
         "use strict";
         const adapter = g.__rejection_adapter;
@@ -41734,13 +41743,25 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             adapter.queue(function () {
                 for (let i = 0; i < list.length; i += 2) {
                     const promise = list[i], reason = list[i + 1];
+                    if (__promise_is_handled(promise)) continue;
                     const notCanceled = adapter.fire(g, PromiseRejectionEvent, "unhandledrejection",
                         {cancelable: true, promise, reason});
                     if (notCanceled) adapter.report(reason);
+                    if (!__promise_is_handled(promise)) __promise_mark_outstanding(promise);
                 }
             });
         }
-        g.__rejection_api = {notify, PromiseRejectionEvent};
+        // HostPromiseRejectionTracker(promise, "handle") for promises that left the
+        // outstanding rejected promises weak set: one rejectionhandled task each.
+        function notifyHandled(list) {
+            for (let i = 0; i < list.length; i += 2) {
+                const promise = list[i], reason = list[i + 1];
+                adapter.queue(function () {
+                    adapter.fire(g, PromiseRejectionEvent, "rejectionhandled", {promise, reason});
+                });
+            }
+        }
+        g.__rejection_api = {notify, notifyHandled, PromiseRejectionEvent};
     })(globalThis);
     /*__REJECTION_END__*/
     const rejectionAPI = g.__rejection_api;
@@ -41748,6 +41769,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Called by the host after each microtask checkpoint with the rejected
     // promises that are still unhandled (alternating promise and reason).
     trust.notifyRejectedPromises = function (list) { rejectionAPI.notify(list); };
+    // Called by the host with the outstanding rejected promises that gained a
+    // handler (alternating promise and reason).
+    trust.notifyHandledPromises = function (list) { rejectionAPI.notifyHandled(list); };
     // --- the network, over the __http_fetch_async syscall ---
     // Requests fire as async jobs; the JS thread does NOT block on them,
     // so many in-flight fetches overlap and Promise.all runs them in

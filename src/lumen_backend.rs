@@ -4709,6 +4709,17 @@ mod desktop {
                 }
             }
         }
+        // HTML HostPromiseRejectionTracker "handle": a handler attached to a promise of the
+        // outstanding rejected promises weak set queues a task to fire rejectionhandled.
+        let handled = page.engine.take_handled_rejections();
+        if !handled.is_empty() {
+            let pairs: Vec<Value> = handled
+                .into_iter()
+                .flat_map(|(promise, reason)| [promise, reason])
+                .collect();
+            let list = page.engine.ctx().make_array(pairs);
+            let _ = engine_call_trust(&mut page.engine, "notifyHandledPromises", &[list]);
+        }
         if std::env::var_os("TRUST_LUMEN_TRACE").is_some() {
             for error in &page.outcome.errors[error_start..] {
                 eprintln!("lumen: {error}");
@@ -5564,8 +5575,7 @@ mod desktop {
             PageCmd::ClipboardResult { request, ok } => {
                 prepare_interaction(page, interrupt);
                 if let Err(error) = settle_clipboard_request(page.engine.ctx(), request, ok) {
-                    let message = describe_throw(&mut page.engine, error, "clipboard result");
-                    page.outcome.errors.push(message);
+                    record_eval_error(page, error, "clipboard result");
                 }
                 checkpoint(page, "clipboard result");
                 finish_task_with_ack(page, events, false)
@@ -5633,10 +5643,7 @@ mod desktop {
                 match settle_file_picker_request(page.engine.ctx(), request, files) {
                     Ok(Some(trouble)) => page.outcome.errors.push(trouble),
                     Ok(None) => {}
-                    Err(error) => {
-                        let message = describe_throw(&mut page.engine, error, "file picker result");
-                        page.outcome.errors.push(message);
-                    }
+                    Err(error) => record_eval_error(page, error, "file picker result"),
                 }
                 checkpoint(page, "file picker result");
                 finish_task_with_ack(page, events, false)
@@ -11144,6 +11151,14 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
         3,
         lumen_wasm::host_exception_binding,
     ),
+    ("__promise_is_handled", 1, host_promise_is_handled),
+    (
+        "__promise_mark_outstanding",
+        1,
+        host_promise_mark_outstanding,
+    ),
+    ("__promise_react", 3, host_promise_react),
+    ("__promise_resolved_with", 1, host_promise_resolved_with),
 ];
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
@@ -13910,6 +13925,33 @@ fn host_call_trust(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, V
     ctx.invoke(function, trust, args)
 }
 
+/// [`host_call_trust`] for a host task outside any native function, where a host interruption
+/// must stay distinct from a JavaScript throw.
+fn host_call_trust_interruptible(
+    ctx: &mut Ctx,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, EvalError> {
+    let trust = host_trust(ctx).map_err(EvalError::Throw)?;
+    let function = ctx.member_get(&trust, name).map_err(EvalError::Throw)?;
+    ctx.invoke_interruptible(function, trust, args)
+}
+
+/// A host task's JavaScript failure as its error report: a throw is described; an interruption
+/// is reported unless it is a navigation or cancellation, which ends the task silently.
+fn host_task_failure(ctx: &mut Ctx, error: EvalError, label: &str) -> Result<(), String> {
+    match error {
+        EvalError::Interrupted(
+            lumen::InterruptReason::UserNavigation | lumen::InterruptReason::Cancelled,
+        ) => Ok(()),
+        EvalError::Interrupted(reason) => Err(format!("{label} interrupted: {}", reason.message())),
+        EvalError::Throw(error) => Err(ctx
+            .coerce_string(&error)
+            .map(|message| format!("{label}: {message}"))
+            .unwrap_or_else(|_| format!("{label} failed"))),
+    }
+}
+
 fn host_allocate_job_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     const MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
     let Some(state) = ctx.host_mut::<HostState>() else {
@@ -15827,6 +15869,14 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
     engine.define_global("__navigator_binding", 1, host_navigator_binding);
     engine.define_global("__performance_binding", 1, host_performance_binding);
     engine.define_global("__platform_slots", 2, host_platform_slots);
+    engine.define_global("__promise_is_handled", 1, host_promise_is_handled);
+    engine.define_global(
+        "__promise_mark_outstanding",
+        1,
+        host_promise_mark_outstanding,
+    );
+    engine.define_global("__promise_react", 3, host_promise_react);
+    engine.define_global("__promise_resolved_with", 1, host_promise_resolved_with);
     // DedicatedWorkerGlobalScope is DOM-less. Install only the operations the
     // shared worker prelude can reach, including its independent per-agent
     // WebAssembly store.
@@ -16296,6 +16346,20 @@ fn lumen_worker_report_buffered_errors(
         let list = engine.ctx().make_array(pairs);
         if let Err(EvalError::Interrupted(_)) =
             lumen_worker_internal_call(engine, "notifyRejectedPromises", &[list])
+        {
+            return false;
+        }
+    }
+    // HostPromiseRejectionTracker "handle" for the outstanding rejected promises weak set.
+    let handled = engine.take_handled_rejections();
+    if !handled.is_empty() {
+        let pairs: Vec<Value> = handled
+            .into_iter()
+            .flat_map(|(promise, reason)| [promise, reason])
+            .collect();
+        let list = engine.ctx().make_array(pairs);
+        if let Err(EvalError::Interrupted(_)) =
+            lumen_worker_internal_call(engine, "notifyHandledPromises", &[list])
         {
             return false;
         }
@@ -17289,7 +17353,12 @@ fn track_module_evaluation(engine: &mut lumen::Engine, node_id: usize, name: &st
     let attached = engine
         .ctx()
         .member_get(&promise, "then")
-        .and_then(|then| engine.ctx().invoke(then, promise, &[fulfilled, rejected]))
+        .map_err(EvalError::Throw)
+        .and_then(|then| {
+            engine
+                .ctx()
+                .invoke_interruptible(then, promise, &[fulfilled, rejected])
+        })
         .is_ok();
     if !attached && let Some(state) = engine.ctx().host_mut::<HostState>() {
         state.pending_resources = state.pending_resources.saturating_sub(1);
@@ -17310,7 +17379,22 @@ fn run_injected_classic_task(
 ) -> Result<(), String> {
     let trust = host_trust(engine.ctx()).map_err(|_| "read the platform control".to_string())?;
     let document_base = state_base(engine.ctx());
-    engine.set_import_base(name);
+    // HTML #prepare-the-script-element: a fetched classic script's base URL is its URL; an
+    // inline one's is its node document's document base URL. Lumen keeps it as the referrer of
+    // the script's import() calls, including later ones from functions the script created.
+    let script_base = if name == url {
+        name.to_string()
+    } else {
+        host_call_trust_interruptible(
+            engine.ctx(),
+            "resourceBaseURL",
+            &[Value::Num(node_id as f64)],
+        )
+        .ok()
+        .and_then(|base| engine.ctx().coerce_string(&base).ok())
+        .map_or_else(|| document_base.clone(), |base| base.to_string())
+    };
+    engine.set_import_base(&script_base);
     let old_current = engine
         .ctx()
         .member_get(&trust, "currentScript")
@@ -17698,15 +17782,10 @@ fn dispatch_websocket_task(
             args[7] = Value::Bool(failed);
         }
     }
-    host_call_trust(engine.ctx(), "wsEvent", &args)
-        .map(|_| ())
-        .map_err(|error| {
-            engine
-                .ctx()
-                .coerce_string(&error)
-                .map(|message| format!("WebSocket task: {message}"))
-                .unwrap_or_else(|_| String::from("WebSocket task failed"))
-        })
+    match host_call_trust_interruptible(engine.ctx(), "wsEvent", &args) {
+        Ok(_) => Ok(()),
+        Err(error) => host_task_failure(engine.ctx(), error, "WebSocket task"),
+    }
 }
 
 /// Run the engine-owned portion of one selected host task. The caller performs the HTML event
@@ -18154,16 +18233,13 @@ fn dispatch_lumen_worker_task(
     let Some(context) = context else {
         return Ok(());
     };
-    let run = move |engine: &mut lumen::Engine| {
-        host_call_trust(engine.ctx(), name, &[Value::Num(id as f64), payload])
-            .map(|_| ())
-            .map_err(|error| {
-                engine
-                    .ctx()
-                    .coerce_string(&error)
-                    .map(|message| format!("Worker task: {message}"))
-                    .unwrap_or_else(|_| String::from("Worker task failed"))
-            })
+    let run = move |engine: &mut lumen::Engine| match host_call_trust_interruptible(
+        engine.ctx(),
+        name,
+        &[Value::Num(id as f64), payload],
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) => host_task_failure(engine.ctx(), error, "Worker task"),
     };
     if context == engine.ctx().host_job_context() {
         run(engine)
@@ -22183,13 +22259,14 @@ fn host_fullscreen_frontend(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     Ok(Value::Undefined)
 }
 
-/// Deliver a frontend's answer to a clipboard write request.
-fn settle_clipboard_request(ctx: &mut Ctx, request: u64, ok: bool) -> Result<(), Value> {
+/// Deliver a frontend's answer to a clipboard write request. This runs as a host task, outside
+/// any native function, so a host interruption stays distinct from a throw.
+fn settle_clipboard_request(ctx: &mut Ctx, request: u64, ok: bool) -> Result<(), EvalError> {
     let settle = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.clipboard_settlers.remove(&request));
     if let Some(settle) = settle {
-        ctx.invoke(settle, Value::Undefined, &[Value::Bool(ok)])?;
+        ctx.invoke_interruptible(settle, Value::Undefined, &[Value::Bool(ok)])?;
     }
     Ok(())
 }
@@ -22276,7 +22353,7 @@ fn settle_file_picker_request(
     ctx: &mut Ctx,
     request: u64,
     files: Option<Vec<std::path::PathBuf>>,
-) -> Result<Option<String>, Value> {
+) -> Result<Option<String>, EvalError> {
     let Some(settler) = ctx
         .host_mut::<HostState>()
         .and_then(|state| state.file_picker_settlers.remove(&request))
@@ -22301,7 +22378,7 @@ fn settle_file_picker_request(
             }
         }
     };
-    ctx.invoke(settler.settle, Value::Undefined, &[records])?;
+    ctx.invoke_interruptible(settler.settle, Value::Undefined, &[records])?;
     Ok(trouble)
 }
 
@@ -22582,6 +22659,46 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
         }
         _ => Ok(Value::Undefined),
     }
+}
+
+/// `__promise_is_handled(promise)`: the promise's [[PromiseIsHandled]] (undefined for anything
+/// else), which HTML #notify-about-rejected-promises reads when its task runs.
+fn host_promise_is_handled(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let promise = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(ctx
+        .promise_is_handled(&promise)
+        .map_or(Value::Undefined, Value::Bool))
+}
+
+/// `__promise_mark_outstanding(promise)`: after its `unhandledrejection` event, add a rejected
+/// promise that is still unhandled to the settings object's outstanding rejected promises weak
+/// set (HTML #notify-about-rejected-promises). The engine holds the set weakly and reports a
+/// later handler through `take_handled_rejections`.
+fn host_promise_mark_outstanding(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let promise = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(Value::Bool(ctx.add_outstanding_rejection(&promise)))
+}
+
+/// `__promise_react(promise, onFulfilled, onRejected)`: Web IDL "react to a promise" for the
+/// platform's own steps (Streams' and Fetch's "upon fulfillment"/"upon rejection"). The engine
+/// gives their jobs null job settings (HTML HostEnqueuePromiseJob with a null Realm), so a
+/// stream created in a since-discarded Document still completes, and no author-visible
+/// `then` or species lookup is involved.
+fn host_promise_react(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let argument = |index: usize| args.get(index).cloned().unwrap_or(Value::Undefined);
+    ctx.react_to_promise(&argument(0), argument(1), argument(2))
+}
+
+/// `__promise_resolved_with(value)`: Web IDL "a promise resolved with" for the platform's own
+/// steps. Adopting a thenable's state is a job with null job settings, like the reactions of
+/// `__promise_react`.
+fn host_promise_resolved_with(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(ctx.promise_resolved_with(value))
 }
 
 fn host_resolved_promise(ctx: &mut Ctx, value: Value) -> Result<Value, Value> {
@@ -31952,7 +32069,7 @@ mod tests {
     #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
-        assert_eq!(canonical.len(), 242, "canonical host boundary changed");
+        assert_eq!(canonical.len(), 246, "canonical host boundary changed");
         assert_eq!(
             canonical
                 .iter()
@@ -31963,7 +32080,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 242);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 246);
 
         // Check bootstrap-only capabilities before the prelude consumes/removes them.
         let mut engine = configured_engine_before_prelude(
@@ -39932,6 +40049,129 @@ mod tests {
                 "(() => { try { new PromiseRejectionEvent('x', {}); return 'no'; } catch (e) { return e.name; } })()"
             ),
             "TypeError"
+        );
+    }
+
+    #[test]
+    fn rejection_handled_events_follow_the_outstanding_rejected_promises_set() {
+        // HTML #unhandled-promise-rejections (local whatwg/html@e5071a2): the notify task skips
+        // a promise handled since the checkpoint ([[PromiseIsHandled]]) and adds a promise
+        // still unhandled after unhandledrejection, canceled or not, to the outstanding
+        // rejected promises weak set; a handler attached to one of those later queues a single
+        // rejectionhandled task (HostPromiseRejectionTracker "handle").
+        let html = r#"<!doctype html><body><pre id="o">pending</pre><script>
+            const events = [];
+            const a = Promise.reject('a'), b = Promise.reject('b');
+            addEventListener('unhandledrejection', e => {
+                events.push('unhandled:' + e.reason);
+                if (e.reason !== 'a') return;
+                e.preventDefault();
+                b.catch(() => {});
+                setTimeout(() => { a.catch(() => {}); a.catch(() => {}); }, 0);
+            });
+            addEventListener('rejectionhandled', e => {
+                events.push([e.type, e.reason, e.promise === a, e.cancelable, e.isTrusted,
+                    e instanceof PromiseRejectionEvent].join(':'));
+            });
+            // The host notifies after its own checkpoints, so the event may follow later timers.
+            const finish = () => { document.getElementById('o').textContent = events.join(','); };
+            onrejectionhandled = e => { events.push('handler:' + e.reason); finish(); };
+            setTimeout(finish, 50);
+            </script>"#;
+        let (output, _) = crate::js::transform(html, &crate::js::PageEnv::bare(DEFAULT_URL));
+        let result = output
+            .split("<pre id=\"o\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</pre>").next())
+            .unwrap_or_default();
+        assert_eq!(
+            result, "unhandled:a,rejectionhandled:a:true:false:true:true,handler:a",
+            "{output}"
+        );
+
+        let mut worker = worker_platform_engine();
+        eval(
+            &mut worker,
+            r#"
+            globalThis.events = [];
+            globalThis.late = Promise.reject('late');
+            self.onunhandledrejection = e => events.push('unhandled:' + e.reason);
+            self.onrejectionhandled = e =>
+                events.push('handled:' + e.reason + ':' + (e.promise === late) + ':' + e.isTrusted);
+            "#,
+            "worker rejections",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut worker);
+        let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+        let events = LumenTaskSender::Page(events);
+        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        assert_eq!(settle_fixture_events(&mut worker), "unhandled:late");
+        eval(&mut worker, "late.catch(() => {});", "late handler").unwrap();
+        run_microtask_checkpoint(&mut worker);
+        assert!(lumen_worker_report_buffered_errors(&mut worker, &events, 7));
+        assert_eq!(
+            settle_fixture_events(&mut worker),
+            "unhandled:late,handled:late:true:true"
+        );
+    }
+
+    #[test]
+    fn text_streams_of_a_removed_iframe_keep_working() {
+        // WPT encoding/streams/invalid-realm.window.js and streams/transform-streams/
+        // invalid-realm.tentative.window.js: Streams' "upon fulfillment" reactions and the
+        // adoption jobs of its "promise resolved with" are platform steps whose jobs have null
+        // job settings (HTML HostEnqueuePromiseJob), so discarding the iframe's Document does
+        // not drop them.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            globalThis.results = [];
+            const record = label => [value => results.push(label + ':' + value),
+                error => results.push(label + ':error ' + error)];
+            {
+                // streams/transform-streams/invalid-realm.tentative.window.js
+                const frame = document.createElement('iframe');
+                body.appendChild(frame);
+                const stream = new frame.contentWindow.TransformStream();
+                const readPromise = stream.readable.getReader().read();
+                const writer = stream.writable.getWriter();
+                frame.remove();
+                Promise.all([writer.write('A'), readPromise])
+                    .then(([, read]) => read.value).then(...record('TransformStream write'));
+            }
+            for (const type of ['TextDecoderStream', 'TextEncoderStream']) {
+                const frame = document.createElement('iframe');
+                body.appendChild(frame);
+                const stream = new frame.contentWindow[type]();
+                const readPromise = stream.readable.getReader().read();
+                const writer = stream.writable.getWriter();
+                writer.ready.then(() => {
+                    frame.remove();
+                    const chunk = type === 'TextDecoderStream' ? new Uint8Array([65]) : 'A';
+                    return Promise.all([writer.write(chunk), readPromise]);
+                }).then(([, read]) => read.value instanceof Uint8Array ? read.value[0] : read.value)
+                  .then(...record(type + ' write'));
+                const closing = document.createElement('iframe');
+                body.appendChild(closing);
+                const closed = new closing.contentWindow[type]();
+                closing.remove();
+                closed.writable.close().then(() => 'closed').then(...record(type + ' close'));
+            }
+            "#,
+            "detached text streams",
+        )
+        .unwrap();
+        for _ in 0..4 {
+            run_microtask_checkpoint(&mut engine);
+        }
+        assert_eq!(
+            string_value(&mut engine, "results.sort().join()"),
+            "TextDecoderStream close:closed,TextDecoderStream write:A,\
+             TextEncoderStream close:closed,TextEncoderStream write:65,TransformStream write:A"
         );
     }
 

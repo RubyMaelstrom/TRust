@@ -243,6 +243,10 @@ pub(crate) const HOST_BOUNDARY_SIGNATURES: &[(&str, usize)] = &[
     ("__wasm_table_set", 3),
     ("__wasm_table_grow", 3),
     ("__wasm_exception_binding", 3),
+    ("__promise_is_handled", 1),
+    ("__promise_mark_outstanding", 1),
+    ("__promise_react", 3),
+    ("__promise_resolved_with", 1),
 ];
 
 /// Serialize a non-negative CSS pixel length with stable layout precision and

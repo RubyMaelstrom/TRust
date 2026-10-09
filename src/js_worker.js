@@ -114,7 +114,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         consoleLines: [],
         takeConsole: function () { var lines = this.consoleLines; this.consoleLines = []; return lines.join("\u001e"); },
         // HTML #notify-about-rejected-promises (the shared rejection block).
-        notifyRejectedPromises: function (list) { if (rejectionAPI) rejectionAPI.notify(list); }
+        notifyRejectedPromises: function (list) { if (rejectionAPI) rejectionAPI.notify(list); },
+        // HostPromiseRejectionTracker "handle" on outstanding rejected promises.
+        notifyHandledPromises: function (list) { if (rejectionAPI) rejectionAPI.notifyHandled(list); }
     };
     var rejectionAPI = null;
     var workerClosing = false;
