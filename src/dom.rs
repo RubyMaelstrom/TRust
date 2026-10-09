@@ -15801,7 +15801,7 @@ fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
             }
             let mut chars = raw.chars().peekable();
             let name = take_name(&mut chars)?;
-            if chars.next().is_some() || name.contains('*') {
+            if chars.next().is_some() || name == "*" {
                 return None;
             }
             StatePseudo::Custom(name)
@@ -16992,6 +16992,11 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
             }
             c if c.is_ascii_whitespace() || c == '>' || c == '+' || c == '~' => break,
             _ => {
+                // Selectors 4 #typedef-compound-selector: at most one type
+                // selector (`*div` is two).
+                if compound.tag.is_some() {
+                    return None;
+                }
                 let tag = take_name(chars)?;
                 compound.tag = Some(tag.to_ascii_lowercase());
             }
@@ -17249,7 +17254,7 @@ fn parse_attribute_selector(chars: &mut std::iter::Peekable<std::str::Chars>) ->
         chars.next();
     }
     let name = take_name(chars)?;
-    if name.contains('*') {
+    if name == "*" {
         return None;
     }
     skip_whitespace(chars);
@@ -17290,7 +17295,7 @@ fn parse_attribute_selector(chars: &mut std::iter::Peekable<std::str::Chars>) ->
                 return None;
             }
             let ident = take_name(chars)?;
-            if ident.contains('*')
+            if ident == "*"
                 || (ident.starts_with('-') && ident[1..].starts_with(|c: char| c.is_ascii_digit()))
             {
                 return None;
@@ -17346,9 +17351,15 @@ fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String>
                 // An escape at the end of the input is U+FFFD.
                 out.push(chars.next().unwrap_or('\u{FFFD}'));
             }
-        } else if is_ident_code_point(c) || c == '*' {
+        } else if is_ident_code_point(c) {
             out.push(c);
             chars.next();
+        } else if c == '*' && out.is_empty() {
+            // The universal selector (Selectors 4 #the-universal-selector)
+            // is a `*` delim token of its own, never part of an ident: CSS
+            // Syntax 3 tokenizes `[class*=x]` as `class` followed by `*=`.
+            chars.next();
+            return Some("*".into());
         } else {
             break;
         }
@@ -32441,6 +32452,33 @@ mod tests {
         assert_eq!(q("[href^=FILE i]"), 2, "unquoted value with flag");
         assert_eq!(q("[href^=FILE]"), 1, "sensitive prefix matches only one");
         assert_eq!(q("[href='file.pdf' i]"), 1, "i flag: exact");
+    }
+
+    #[test]
+    fn substring_attribute_selectors_tokenize_star_equals() {
+        // Selectors 4 #attribute-substrings with CSS Syntax 3 tokenization:
+        // `*=` is one token after the attribute name, which used to swallow
+        // the `*`, so every `[attr*=value]` selector was invalid.
+        let dom = Dom::parse_document(
+            "<body><div id=a class='list-jetboost-item' data-x='a*b'></div>\
+             <div id=b class=other></div><x-y id=c></x-y></body>",
+        );
+        let q =
+            |s: &str| SelectorList::parse(s).map(|list| dom.query(DOCUMENT, &list, false).len());
+        assert_eq!(q("[class*='jetboost']"), Some(1));
+        assert_eq!(q("[class*=jetboost]"), Some(1));
+        assert_eq!(q("div[class *= \"OTH\" i]"), Some(1));
+        assert_eq!(q("[class*=t]"), Some(2));
+        assert_eq!(q("[data-x*='*']"), Some(1));
+        assert_eq!(q("[class*=zzz]"), Some(0));
+        // An escaped `*` is part of an identifier; the universal selector
+        // still stands alone and once.
+        assert_eq!(q("[data-x=a\\*b]"), Some(1));
+        assert_eq!(q("*"), Some(6));
+        assert_eq!(q("*[id]"), Some(3));
+        assert_eq!(q("[class*]"), None);
+        assert_eq!(q("[*=a]"), None);
+        assert_eq!(q("*div"), None);
     }
 
     #[test]
