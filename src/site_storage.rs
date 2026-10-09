@@ -406,6 +406,7 @@ pub(crate) fn before_bookmarks_write(
     write_json(&directory(path).join("generations.json"), &epochs)?;
     for site in removed {
         crate::http::http3::forget_site(site);
+        crate::http::forget_site_preflights(site);
         match fs::remove_file(file_for(path, site)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

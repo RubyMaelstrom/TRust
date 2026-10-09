@@ -61,7 +61,8 @@ pub(super) fn request(
         } else {
             value.trim_matches([' ', '\t'])
         };
-        let mut value = HeaderValue::from_str(value)
+        // Header values are byte sequences (Fetch #header-value).
+        let mut value = HeaderValue::from_bytes(&super::isomorphic_encode(value))
             .map_err(|_| Error::malformed("invalid HTTP request header value"))?;
         // HPACK honors never-indexed; the HTTP/3 encoder uses stateless
         // QPACK (no dynamic table) for all fields, including credentials.
@@ -81,6 +82,10 @@ pub(super) fn response_headers(fields: &HeaderMap) -> Result<(Headers, Vec<Strin
     for (name, value) in fields {
         let name = name.as_str();
         let raw = value.as_bytes();
+        // RFC 9113 §8.2.1 / RFC 9114 §4.2: a field value MUST NOT contain
+        // NUL, LF or CR, nor start or end with SP or HTAB, and
+        // connection-specific fields make the message malformed. Other bytes,
+        // obs-text included, are kept as they are (Fetch #header-value).
         if matches!(
             name,
             "connection"
@@ -91,7 +96,7 @@ pub(super) fn response_headers(fields: &HeaderMap) -> Result<(Headers, Vec<Strin
                 | "te"
         ) || raw.first().is_some_and(|b| matches!(b, b' ' | b'\t'))
             || raw.last().is_some_and(|b| matches!(b, b' ' | b'\t'))
-            || raw.iter().any(|b| (*b < 0x20 && *b != b'\t') || *b == 0x7f)
+            || raw.iter().any(|b| matches!(b, 0 | b'\n' | b'\r'))
         {
             return Err(Error::malformed("malformed HTTP response header"));
         }
@@ -99,11 +104,11 @@ pub(super) fn response_headers(fields: &HeaderMap) -> Result<(Headers, Vec<Strin
         if bytes > HEADER_BYTES as usize {
             return Err(Error::limit("HTTP response headers exceed size limit"));
         }
-        let value = String::from_utf8_lossy(raw);
+        let value = super::isomorphic_decode(raw);
         if name == "set-cookie" {
-            cookies.push(value.to_string());
+            cookies.push(super::header_value_utf8(&value));
         }
-        headers.append(name.to_string(), value.into_owned());
+        headers.append(name.to_string(), value);
     }
     Ok((headers, cookies))
 }

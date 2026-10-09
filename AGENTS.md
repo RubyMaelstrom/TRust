@@ -346,10 +346,19 @@ current behavior and limits; consult the governing standards before changing it.
   the response. Responses carry the HTTP/1.x reason phrase as `statusText`
   (empty over HTTP/2 and HTTP/3) and their header list in wire order with
   duplicates (`http::Headers`, `http::header_list_get`); scripts' Headers and
-  `getAllResponseHeaders()` sort and combine it. XHR upload listeners set the
-  request's use-CORS-preflight flag (`Request::use_cors_preflight`), which
-  forces a CORS preflight for a cross-origin request. TRust keeps no
-  CORS-preflight cache.
+  `getAllResponseHeaders()` sort and combine it. Header values are byte
+  sequences, held isomorphic decoded (one char per byte, the ByteString form
+  script sees: `http::isomorphic_decode`/`isomorphic_encode`) through the
+  transports and the cache, and written to the wire as those bytes; consumers
+  read them per their specs (Location's bytes are percent-encoded for the URL
+  parser, a Set-Cookie line and the Cookie header are UTF-8 text, a
+  Content-Disposition filename is UTF-8 when its bytes are). XHR upload
+  listeners set the request's use-CORS-preflight flag
+  (`Request::use_cors_preflight`), which forces a CORS preflight for a
+  cross-origin request. Successful preflights fill the Fetch CORS-preflight
+  cache (`PREFLIGHT_CACHE`, keyed by top-level site, origin, URL and
+  credentials, `Access-Control-Max-Age` capped at 2 h, 512 entries, cleared on
+  a CORS failure and with site data).
 - Script `fetch()` and asynchronous XHR responses resolve at the response
   header section; HTTP/1.1, HTTP/2 and HTTP/3 bodies then stream
   (`http::fetch_script_streaming`, `http/body_stream.rs`) with incremental
@@ -364,6 +373,15 @@ current behavior and limits; consult the governing standards before changing it.
   421 bodies, integrity-checked fetches, cached page resources and
   browser-owned subresources still use whole bodies. Resource Timing reports
   at the end of the body.
+- As soon as an HTML document arrives, the speculative parser
+  (`http::prefetch_parser_scripts`) fetches its parser-inserted classic and
+  module scripts (with each module's static graph) and modulepreloads beside
+  the style sheets, as the elements would request them (`<base href>`,
+  `crossorigin`, `referrerpolicy`); responses only fill the page cache, so a
+  script runs only when its prepared element's own request finds one. Their
+  timing reports wait in the cache until the page actor takes them. A
+  module's static imports start fetching when its response arrives, and an
+  `import()` in any same-agent Window starts its fetch while `import()` runs.
 - EventSource (HTML #server-sent-events) runs over that streaming fetch: a
   potential-CORS request (`withCredentials` selects credentials "include"),
   `Accept: text/event-stream`, cache mode "no-store", initiator type "other".
@@ -456,7 +474,12 @@ current behavior and limits; consult the governing standards before changing it.
   and beacons continue, and the browser's own subresource and image fetches
   and frame navigations are canceled (their elements see a failed load).
   Queued tasks of canceled script fetches are discarded. Workers are
-  unaffected. While the top-level parser still runs (`window.stop()` from
+  unaffected, including one still fetching its own script: that is a
+  non-subresource request (its reserved client is the worker), which Fetch
+  keeps out of the Document's fetch group. A page-initiated cross-document navigation or form submission
+  runs the same abort for the old Document and its descendants before the
+  navigation leaves the actor (`abort_for_navigation`), so its in-flight
+  fetches abort while it is alive. While the top-level parser still runs (`window.stop()` from
   a parser script or a task during parsing) it is aborted: the tree builder's
   nodes after the parser's position are removed, readiness goes
   "interactive" then "complete", remaining and deferred parser scripts never

@@ -1398,6 +1398,25 @@ pub struct PageCache {
     tasks: std::sync::Arc<PageTaskScope>,
     /// The document's image requests (`page_images`), in the same task scope.
     images: std::sync::Arc<crate::page_images::PageImages>,
+    /// Resource Timing reports of speculative parser fetches that finished
+    /// before the page actor could take them (`forward_speculative_timings`).
+    speculative_timings: std::sync::Mutex<SpeculativeTimings>,
+    /// The document's fetch count, which bounds speculative fetches
+    /// (`js::MAX_PAGE_FETCHES_WITH_SPECULATION`); the page actor counts on.
+    fetched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+type TimingForward = std::sync::Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync>;
+
+enum SpeculativeTimings {
+    Held(Vec<crate::performance::ResourceTiming>),
+    Forward(TimingForward),
+}
+
+impl Default for SpeculativeTimings {
+    fn default() -> Self {
+        Self::Held(Vec::new())
+    }
 }
 
 impl Default for PageCache {
@@ -1462,6 +1481,41 @@ impl PageCache {
             map: Default::default(),
             images: std::sync::Arc::new(crate::page_images::PageImages::new(tasks.clone())),
             tasks,
+            speculative_timings: Default::default(),
+            fetched: Default::default(),
+        }
+    }
+
+    /// The document's fetch count (see the field).
+    pub(crate) fn fetch_count(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.fetched.clone()
+    }
+
+    /// Fetch #fetch-finale for a speculative parser fetch: its timing goes to
+    /// the document's Window, which may not exist yet; hold it until then.
+    fn report_speculative_timing(&self, timing: crate::performance::ResourceTiming) {
+        let forward = match &mut *self.speculative_timings.lock().unwrap() {
+            SpeculativeTimings::Held(held) => {
+                held.push(timing);
+                return;
+            }
+            SpeculativeTimings::Forward(forward) => forward.clone(),
+        };
+        forward(timing);
+    }
+
+    /// The page actor takes the speculative fetches' timings: those held so
+    /// far now, later ones as they finish.
+    pub(crate) fn forward_speculative_timings(&self, forward: TimingForward) {
+        let held = match std::mem::replace(
+            &mut *self.speculative_timings.lock().unwrap(),
+            SpeculativeTimings::Forward(forward.clone()),
+        ) {
+            SpeculativeTimings::Held(held) => held,
+            SpeculativeTimings::Forward(_) => Vec::new(),
+        };
+        for timing in held {
+            forward(timing);
         }
     }
 
@@ -2113,11 +2167,36 @@ async fn fetch_script_timing_inner(
     }
     // Fetch #main-fetch selects the CORS-with-preflight branch when the
     // request's use-CORS-preflight flag is set, or when its method or header
-    // list is not CORS-safelisted; #http-fetch step 5.1 then makes the
-    // preflight for a non-safelisted method, the flag, or an unsafe header
-    // name. (TRust keeps no CORS-preflight cache, so no entry can match.)
+    // list is not CORS-safelisted. A network error from that branch clears
+    // the request's CORS-preflight cache entries (#concept-cache-clear).
     if needs_preflight || request.use_cors_preflight {
-        let names = cors_non_safelisted_header_names(request);
+        let result = fetch_cors_with_preflight(request, policy, sink).await;
+        if result.is_err() {
+            PREFLIGHT_CACHE.lock().unwrap().clear_for(request);
+        }
+        return result;
+    }
+    fetch_timed(request, sink).await
+}
+
+/// Fetch #http-fetch step 5.1 for a request taking the CORS-with-preflight
+/// branch: make a CORS-preflight fetch unless the CORS-preflight cache
+/// (#cors-preflight-cache) already permits its method and every CORS-unsafe
+/// request-header name, then fetch the request.
+async fn fetch_cors_with_preflight(
+    request: &Request,
+    policy: &FetchPolicy,
+    sink: BodySink<'_>,
+) -> Result<Response, TimedFetchError> {
+    let names = cors_non_safelisted_header_names(request);
+    let method_safelisted = matches!(request.method.as_str(), "GET" | "HEAD" | "POST");
+    let needed = {
+        let mut cache = PREFLIGHT_CACHE.lock().unwrap();
+        (!cache.method_match(request, &request.method)
+            && (!method_safelisted || request.use_cors_preflight))
+            || names.iter().any(|name| !cache.header_match(request, name))
+    };
+    if needed {
         let mut headers = vec![(
             String::from("Access-Control-Request-Method"),
             request.method.clone(),
@@ -2156,8 +2235,210 @@ async fn fetch_script_timing_inner(
         // fields to appear in `Access-Control-Expose-Headers`.
         let response = fetch_preflight(&preflight).await?;
         validate_cors_preflight(&response, request, &names)?;
+        PREFLIGHT_CACHE
+            .lock()
+            .unwrap()
+            .store(request, &response, Instant::now());
     }
     fetch_timed(request, sink).await
+}
+
+/// Fetch #cors-preflight-cache (local whatwg/fetch@394d20d): what successful
+/// CORS-preflight fetches permitted, so later requests skip the preflight.
+/// Each entry is keyed by the network partition key (the top-level site, as
+/// connections are, Fetch #network-partition-keys), the byte-serialized
+/// request origin, the request URL and the credentials flag, and permits one
+/// method or one header name until its max-age passes. Bounded: expired
+/// entries go first, and beyond `PREFLIGHT_CACHE_ENTRIES` the entries that
+/// would expire soonest are dropped ("may be removed before that moment").
+static PREFLIGHT_CACHE: std::sync::LazyLock<std::sync::Mutex<PreflightCache>> =
+    std::sync::LazyLock::new(Default::default);
+
+const PREFLIGHT_CACHE_ENTRIES: usize = 512;
+/// #cors-preflight-fetch-0 step 7.9: the user agent's imposed limit on
+/// `Access-Control-Max-Age` (two hours, Chromium's limit).
+const PREFLIGHT_MAX_AGE_LIMIT: u64 = 2 * 60 * 60;
+/// #cors-preflight-fetch-0 step 7.8: the max-age of a response without one.
+const PREFLIGHT_DEFAULT_MAX_AGE: u64 = 5;
+
+#[derive(Default)]
+struct PreflightCache {
+    entries: Vec<PreflightEntry>,
+}
+
+struct PreflightEntry {
+    key: Option<String>,
+    origin: String,
+    url: String,
+    credentials: bool,
+    method: Option<String>,
+    header: Option<String>,
+    expires: Instant,
+}
+
+/// The fields of a cache entry a request determines.
+struct PreflightKey {
+    key: Option<String>,
+    origin: String,
+    url: String,
+    credentials: bool,
+}
+
+impl PreflightKey {
+    fn for_request(request: &Request) -> Option<Self> {
+        let policy = request.fetch_policy.as_ref()?;
+        Some(Self {
+            // #request-determine-the-network-partition-key: the top-level site.
+            key: request
+                .cookie_context
+                .as_ref()
+                .and_then(|context| context.top_level_site.clone())
+                .or_else(|| cookie_site(&policy.origin)),
+            // #byte-serializing-a-request-origin
+            origin: policy.origin.origin().ascii_serialization(),
+            url: request.url.to_string(),
+            credentials: policy.credentials == CredentialsMode::Include,
+        })
+    }
+
+    /// #concept-cache-match
+    fn matches(&self, entry: &PreflightEntry) -> bool {
+        entry.key == self.key
+            && entry.origin == self.origin
+            && entry.url == self.url
+            && (entry.credentials || !self.credentials)
+    }
+}
+
+impl PreflightCache {
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|entry| entry.expires > now);
+    }
+
+    /// #concept-cache-match-method
+    fn method_match(&mut self, request: &Request, method: &str) -> bool {
+        self.prune(Instant::now());
+        let Some(key) = PreflightKey::for_request(request) else {
+            return false;
+        };
+        self.entries.iter().any(|entry| {
+            key.matches(entry)
+                && entry
+                    .method
+                    .as_deref()
+                    .is_some_and(|m| m == method || m == "*")
+        })
+    }
+
+    /// #concept-cache-match-header
+    fn header_match(&mut self, request: &Request, name: &str) -> bool {
+        self.prune(Instant::now());
+        let Some(key) = PreflightKey::for_request(request) else {
+            return false;
+        };
+        self.entries.iter().any(|entry| {
+            key.matches(entry)
+                && entry.header.as_deref().is_some_and(|header| {
+                    header.eq_ignore_ascii_case(name)
+                        || (header == "*" && !name.eq_ignore_ascii_case("authorization"))
+                })
+        })
+    }
+
+    /// #cors-preflight-fetch-0 steps 7.1-7.4 and 7.8-7.15, after the
+    /// response passed its checks (`validate_cors_preflight`).
+    fn store(&mut self, request: &Request, response: &Response, now: Instant) {
+        let Some(key) = PreflightKey::for_request(request) else {
+            return;
+        };
+        let values = |name: &str| -> Option<Vec<String>> {
+            header_list_get(&response.headers, name).map(|value| {
+                value
+                    .split(',')
+                    .map(|item| item.trim_matches([' ', '\t']).to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect()
+            })
+        };
+        let mut methods = values("access-control-allow-methods");
+        if methods.is_none() && request.use_cors_preflight {
+            methods = Some(vec![request.method.clone()]);
+        }
+        let header_names = values("access-control-allow-headers").unwrap_or_default();
+        // #cors-preflight-fetch-0 steps 7.8-7.10: delta-seconds, else 5,
+        // within the imposed limit.
+        let max_age = header_list_get(&response.headers, "access-control-max-age")
+            .and_then(|value| {
+                let value = value.trim_matches([' ', '\t']);
+                (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                    .then(|| value.parse::<u64>().unwrap_or(u64::MAX))
+            })
+            .unwrap_or(PREFLIGHT_DEFAULT_MAX_AGE)
+            .min(PREFLIGHT_MAX_AGE_LIMIT);
+        let expires = now + Duration::from_secs(max_age);
+        self.prune(now);
+        let mut put = |method: Option<String>, header: Option<String>| {
+            // Steps 7.12/7.14 update a matching entry's max-age; 7.13/7.15
+            // create one.
+            if let Some(entry) = self.entries.iter_mut().find(|entry| {
+                key.matches(entry)
+                    && entry.credentials == key.credentials
+                    && entry.method == method
+                    && match (&entry.header, &header) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        (a, b) => a == b,
+                    }
+            }) {
+                entry.expires = expires;
+                return;
+            }
+            self.entries.push(PreflightEntry {
+                key: key.key.clone(),
+                origin: key.origin.clone(),
+                url: key.url.clone(),
+                credentials: key.credentials,
+                method,
+                header,
+                expires,
+            });
+        };
+        for method in methods.unwrap_or_default() {
+            put(Some(method), None);
+        }
+        for name in header_names {
+            put(None, Some(name));
+        }
+        if self.entries.len() > PREFLIGHT_CACHE_ENTRIES {
+            self.entries
+                .sort_by_key(|entry| std::cmp::Reverse(entry.expires));
+            self.entries.truncate(PREFLIGHT_CACHE_ENTRIES);
+        }
+    }
+
+    /// #concept-cache-clear
+    fn clear_for(&mut self, request: &Request) {
+        if let Some(key) = PreflightKey::for_request(request) {
+            self.entries.retain(|entry| {
+                !(entry.key == key.key && entry.origin == key.origin && entry.url == key.url)
+            });
+        }
+    }
+}
+
+/// Site data removal also removes what the CORS-preflight cache remembers
+/// about the site, as a target or as the top-level site.
+pub(crate) fn forget_site_preflights(site: &str) {
+    PREFLIGHT_CACHE.lock().unwrap().entries.retain(|entry| {
+        let target = Url::parse(&entry.url).ok().and_then(|url| {
+            url.host_str()
+                .map(|host| psl::domain_str(host).unwrap_or(host).to_string())
+        });
+        target.as_deref() != Some(site)
+            && !entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.split("://").nth(1) == Some(site))
+    });
 }
 
 fn cors_preflight_required(request: &Request) -> bool {
@@ -4772,10 +5053,17 @@ fn finish_response_parts(
         .collect();
     let status_text = headers.status_message.clone();
     if matches!(status, 301 | 302 | 303 | 307 | 308) {
-        let location = headers
-            .get("location")
-            .cloned()
-            .ok_or_else(|| format!("{status} redirect without a Location header"))?;
+        // Fetch #concept-response-location-url: "extracting header list
+        // values" fails when the single-valued `Location` occurs more than
+        // once, and the value's bytes are parsed as a URL.
+        let mut locations = headers.iter().filter(|(name, _)| *name == "location");
+        let location = match (locations.next(), locations.next()) {
+            (Some((_, value)), None) => location_value_for_url_parser(value),
+            (None, _) => return Err(format!("{status} redirect without a Location header")),
+            (Some(_), Some(_)) => {
+                return Err(format!("{status} redirect with several Location fields"));
+            }
+        };
         // Smuggle the location to `fetch` via content_type; 3xx bodies
         // are not rendered.
         return Ok(Response {
@@ -4819,10 +5107,64 @@ fn finish_response_parts(
     })
 }
 
+/// Infra #isomorphic-decode: one char per byte, U+0000 to U+00FF. Header
+/// values (Fetch #header-value) are byte sequences; TRust holds them in this
+/// form, which is also the ByteString Web IDL hands to script, so no byte is
+/// lost or reinterpreted on the way. A consumer that needs another reading
+/// (a URL, a UTF-8 file name) recovers the bytes with [`isomorphic_encode`].
+pub(crate) fn isomorphic_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
+/// Infra #isomorphic-encode, the inverse of [`isomorphic_decode`]. A header
+/// value never holds a code point above U+00FF; one that does (text that was
+/// never a byte sequence) is written as its UTF-8 bytes rather than lost.
+pub(crate) fn isomorphic_encode(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(value.len());
+    for ch in value.chars() {
+        match u8::try_from(u32::from(ch)) {
+            Ok(byte) => bytes.push(byte),
+            Err(_) => bytes.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    bytes
+}
+
+/// A header value holding the UTF-8 encoding of `text` (for example the
+/// cookie-string, which HTML #dom-document-cookie and RFC 6265bis treat as
+/// UTF-8 text), in the isomorphic form header lists use.
+pub(crate) fn utf8_header_value(text: &str) -> String {
+    isomorphic_decode(text.as_bytes())
+}
+
+/// The UTF-8 reading of a header value's bytes (for example a Set-Cookie
+/// line, whose octets the cookie store keeps as UTF-8 text), with U+FFFD for
+/// bytes that are not UTF-8.
+pub(crate) fn header_value_utf8(value: &str) -> String {
+    String::from_utf8_lossy(&isomorphic_encode(value)).into_owned()
+}
+
+/// Fetch #concept-response-location-url step 3 parses the `Location` value,
+/// a byte sequence, as a URL. Bytes outside ASCII are percent-encoded as they
+/// are, which is the URL parser's UTF-8 percent-encoding for a UTF-8 value
+/// and keeps any other byte instead of guessing an encoding.
+pub(crate) fn location_value_for_url_parser(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    for byte in isomorphic_encode(value) {
+        if byte.is_ascii() {
+            text.push(char::from(byte));
+        } else {
+            text.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    text
+}
+
 /// A response's header list (Fetch #concept-header-list): its fields in the
 /// order they arrived, duplicates included, with lowercased names (HTTP/2 and
 /// HTTP/3 field names are lowercase on the wire; no Fetch API exposes the
-/// original case). `get` combines every value of a name in order (Fetch
+/// original case) and values as byte sequences in [`isomorphic_decode`]d
+/// form. `get` combines every value of a name in order (Fetch
 /// #concept-header-list-get), which is the view message framing, content
 /// coding and the other protocol checks read. Both views are bounded by the
 /// header-section limits of the transport that parsed them.
@@ -5052,7 +5394,9 @@ fn request_headers(request: &Request, origin: Option<&str>) -> Vec<(String, Stri
     }
     if !cookie.is_empty() {
         trace_cookie_wire(url, &cookie);
-        headers.push(("Cookie".into(), cookie));
+        // The cookie-string is UTF-8 text (RFC 6265bis #retrieval-algorithm
+        // serializes the stored octets); as a header value it is those bytes.
+        headers.push(("Cookie".into(), utf8_header_value(&cookie)));
     }
     if let Some(origin) = origin {
         headers.push(("Origin".into(), origin.into()));
@@ -5150,19 +5494,22 @@ async fn exchange_head(
     let mut head = format!(
         "{} {path} HTTP/1.1\r\nHost: {host_header}\r\n",
         request.method
-    );
+    )
+    .into_bytes();
     for (name, value) in request_headers(request, origin) {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        // Header values are byte sequences (Fetch #header-value).
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(&isomorphic_encode(&value));
+        head.extend_from_slice(b"\r\n");
         if name == "Accept-Encoding" {
-            head.push_str("Connection: keep-alive\r\n");
+            head.extend_from_slice(b"Connection: keep-alive\r\n");
         }
     }
-    head.push_str("\r\n");
+    head.extend_from_slice(b"\r\n");
 
     timing.request_start = crate::performance::now_ms();
-    io.write_all(head.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
+    io.write_all(&head).await.map_err(|e| e.to_string())?;
     if let Some((_, payload)) = &request.body {
         io.write_all(payload).await.map_err(|e| e.to_string())?;
     }
@@ -5341,7 +5688,9 @@ async fn read_response_head<R: AsyncRead + Unpin>(
         let mut set_cookies = Vec::new();
         let mut header_bytes = status_line.len();
         loop {
-            let line = read_line(io).await?;
+            // RFC 9112 §5: field-line = field-name ":" OWS field-value OWS.
+            // The value stays a byte sequence (Fetch #header-value).
+            let line = read_line_bytes(io).await?;
             header_bytes = header_bytes.saturating_add(line.len().saturating_add(2));
             if line.len() > MAX_HEADER_LINE || header_bytes > MAX_HEADER_BYTES {
                 return Err(String::from("response headers exceed size limit"));
@@ -5349,29 +5698,25 @@ async fn read_response_head<R: AsyncRead + Unpin>(
             if line.is_empty() {
                 break;
             }
-            let Some((raw_name, value)) = line.split_once(':') else {
+            let Some(colon) = line.iter().position(|&byte| byte == b':') else {
                 return Err(String::from("malformed response header"));
             };
-            if raw_name.is_empty()
-                || raw_name.trim() != raw_name
-                || !raw_name.bytes().all(is_http_token)
-            {
+            let (raw_name, value) = (&line[..colon], &line[colon + 1..]);
+            if raw_name.is_empty() || !raw_name.iter().copied().all(is_http_token) {
                 return Err(String::from("malformed response header name"));
             }
             if value
-                .bytes()
-                .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+                .iter()
+                .any(|&byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
             {
                 return Err(String::from("malformed response header value"));
             }
-            let name = raw_name.to_ascii_lowercase();
-            if name.is_empty() {
-                return Err(String::from("response header has an empty name"));
-            }
+            let name = String::from_utf8_lossy(raw_name).to_ascii_lowercase();
+            let value = isomorphic_decode(value.trim_ascii_start().trim_ascii_end());
             if name == "set-cookie" {
-                set_cookies.push(value.trim().to_string());
+                set_cookies.push(header_value_utf8(&value));
             }
-            headers.append(name, value.trim().to_string());
+            headers.append(name, value);
         }
         // RFC 9110 permits one or more informational responses before the
         // final response. They have no body and must never be returned as the
@@ -6027,15 +6372,51 @@ pub(crate) fn prefetch_page_scripts(
     let Ok(client) = Url::parse(&env.url) else {
         return;
     };
-    let base = base_with_doc_base(html, &client);
+    prefetch_parser_scripts(
+        html,
+        &client,
+        (
+            f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
+            f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
+        ),
+        env.device_pixel_ratio,
+        env.document_encoding,
+        &env.cache,
+        handle,
+        report,
+    );
+}
+
+/// The speculative HTML parser's fetches (HTML #speculative-html-parsing):
+/// the parser-inserted external classic scripts, module scripts (with their
+/// static module graphs, #fetch-a-module-script-tree) and modulepreloads, as
+/// the elements would request them: URLs encoding-parsed against the
+/// document base URL (`<base href>`), CORS mode and credentials from
+/// `crossorigin`, the Referer from `referrerpolicy`. They only fill the
+/// document's resource cache. A script runs only when the parser or the DOM
+/// prepares its element and that element's own request finds the response
+/// (`PageCache::consume_resource` matches URL, destination and credentials),
+/// so a wrong guess never executes anything. Bounded by `MAX_PAGE_SCRIPTS`,
+/// `MAX_PAGE_PRELOADS` and the speculative import limits. A response's
+/// Resource Timing report goes to `report` (Fetch #fetch-finale). Requests
+/// already in the cache are not repeated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefetch_parser_scripts(
+    html: &str,
+    client: &Url,
+    viewport_px: (f32, f32),
+    device_pixel_ratio: f32,
+    document_encoding: &'static encoding_rs::Encoding,
+    cache: &std::sync::Arc<PageCache>,
+    handle: &tokio::runtime::Handle,
+    report: std::sync::Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync>,
+) {
+    let base = base_with_doc_base(html, client);
     let mut scripts = 0;
     let mut preloads = 0;
-    for job in crate::js::external_resources_at(
-        html,
-        f32::from(env.viewport.0) * f32::from(env.cell_px.0.max(1)),
-        f32::from(env.viewport.1) * f32::from(env.cell_px.1.max(1)),
-        env.device_pixel_ratio,
-    ) {
+    for job in
+        crate::js::external_resources_at(html, viewport_px.0, viewport_px.1, device_pixel_ratio)
+    {
         let allowed = match job.kind {
             crate::js::ExternalResourceKind::Script => {
                 scripts += 1;
@@ -6053,18 +6434,36 @@ pub(crate) fn prefetch_page_scripts(
             && let Ok(url) = crate::form_encoding::encoding_parse_url(
                 &job.source,
                 Some(&base),
-                env.document_encoding,
+                document_encoding,
             )
             && matches!(url.scheme(), "http" | "https" | "file")
-            && subresource_allowed(&client, &url)
+            && subresource_allowed(client, &url)
         {
             let credentials = job.cors_credentials();
             let name = url.to_string();
             let report = report.clone();
-            drop(env.cache.fetch_request_reporting(
+            let mut request = Request::subresource(url.clone(), client, "script", credentials);
+            // The element's request computes its Referer from its
+            // `referrerpolicy` attribute (HTML #referrer-policy-attributes);
+            // the speculative request must send exactly what it would.
+            let policy = job
+                .referrer_policy
+                .as_deref()
+                .and_then(crate::referrer_policy::ReferrerPolicy::parse)
+                .unwrap_or_default();
+            request
+                .headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
+            if let Some(referrer) = policy.determine(client, &request.url) {
+                request
+                    .headers
+                    .push(("Referer".into(), referrer.to_string()));
+            }
+            let module = job.kind == crate::js::ExternalResourceKind::Preload;
+            let shared = cache.fetch_request_reporting(
                 handle,
-                Request::subresource(url, &client, "script", credentials),
-                ResourceCacheContext::new(&client, "script", credentials),
+                request,
+                ResourceCacheContext::new(client, "script", credentials),
                 Some(Box::new(move |timing| {
                     if let Some(mut timing) = timing {
                         timing.render_blocking = job.render_blocking;
@@ -6076,7 +6475,30 @@ pub(crate) fn prefetch_page_scripts(
                         });
                     }
                 })),
-            ));
+            );
+            if module {
+                // HTML #fetch-a-module-script-tree: its descendants are
+                // fetched as soon as the module script's own fetch completes.
+                let (cache, runtime, page) = (cache.clone(), handle.clone(), client.clone());
+                cache.clone().spawn(handle, async move {
+                    let Ok(response) = shared.await else {
+                        return;
+                    };
+                    if module_script_response_allowed(response.status, &response.content_type)
+                        && cache.claim_module_import_scan(&url)
+                    {
+                        let fetched = cache.fetch_count();
+                        crate::lumen_backend::speculate_module_graph(
+                            page,
+                            runtime,
+                            cache,
+                            fetched,
+                            url,
+                            &response.body,
+                        );
+                    }
+                });
+            }
         }
     }
 }
@@ -6214,6 +6636,30 @@ async fn execute_js_with_presentation(
     // "unexpected token '<'" and the app never boots). The SSRF gate still
     // keys off the real page URL.
     let doc_base = base_with_doc_base(&html, &response.url);
+    // The parser, module loader, and page fetches share this resource cache.
+    let cache = std::sync::Arc::new(PageCache::default());
+    // HTML #speculative-html-parsing: the parser's scripts start fetching as
+    // soon as the document's bytes are here, alongside its style sheets,
+    // instead of when the page engine has started. Their timing reports wait
+    // in the cache for the document's Window (Fetch #fetch-finale).
+    let held = std::sync::Arc::downgrade(&cache);
+    prefetch_parser_scripts(
+        &html,
+        &response.url,
+        (
+            f32::from(viewport.0) * f32::from(cell_px.0.max(1)),
+            f32::from(viewport.1) * f32::from(cell_px.1.max(1)),
+        ),
+        device_pixel_ratio,
+        document_encoding,
+        &cache,
+        &tokio::runtime::Handle::current(),
+        std::sync::Arc::new(move |timing| {
+            if let Some(cache) = held.upgrade() {
+                cache.report_speculative_timing(timing);
+            }
+        }),
+    );
     let results = futures::stream::iter(jobs.into_iter().map(|job| {
         let doc_base = doc_base.clone();
         let page_url = response.url.clone();
@@ -6253,8 +6699,6 @@ async fn execute_js_with_presentation(
     .collect::<Vec<_>>()
     .await;
 
-    // The parser, module loader, and page fetches share this resource cache.
-    let cache = std::sync::Arc::new(PageCache::default());
     let prefetched = prefetched_sheets.is_some();
     let mut sheets = prefetched_sheets.unwrap_or_default();
     let mut resource_timings = Vec::new();
@@ -11139,6 +11583,314 @@ mod tests {
             .push((String::from("X-Custom"), String::from("yes")));
         assert!(cors_preflight_required(&request));
         assert_eq!(cors_non_safelisted_header_names(&request), ["x-custom"]);
+    }
+
+    #[tokio::test]
+    async fn header_values_stay_byte_sequences() {
+        // Fetch #header-value: a byte sequence. TRust holds it isomorphic
+        // decoded (Infra #isomorphic-decode), the ByteString form script
+        // sees, so no byte is lost; a Set-Cookie line is the cookie store's
+        // UTF-8 text.
+        let raw = b"HTTP/1.1 200 OK\r\nX-Utf8: caf\xc3\xa9\r\nX-Latin: \xe9t\xe9\r\nSet-Cookie: n=caf\xc3\xa9\r\nContent-Length: 0\r\n\r\n";
+        let (_, headers, _, _, cookies) = read_response(&mut BufReader::new(&raw[..]), false)
+            .await
+            .unwrap();
+        assert_eq!(headers["x-utf8"], "caf\u{c3}\u{a9}");
+        assert_eq!(isomorphic_encode(&headers["x-utf8"]), b"caf\xc3\xa9");
+        assert_eq!(headers["x-latin"], "\u{e9}t\u{e9}");
+        assert_eq!(isomorphic_encode(&headers["x-latin"]), b"\xe9t\xe9");
+        assert_eq!(cookies, ["n=café"]);
+        assert_eq!(header_value_utf8("caf\u{c3}\u{a9}"), "café");
+        assert_eq!(utf8_header_value("café"), "caf\u{c3}\u{a9}");
+        assert_eq!(
+            isomorphic_decode(&[0, 0x7f, 0x80, 0xff]),
+            "\u{0}\u{7f}\u{80}\u{ff}"
+        );
+    }
+
+    #[test]
+    fn location_bytes_become_a_url_and_a_repeated_location_fails() {
+        // Fetch #concept-response-location-url: the value's bytes are parsed
+        // as a URL (non-ASCII bytes percent-encoded as they are), and
+        // "extracting header list values" fails for a second `Location`.
+        assert_eq!(
+            location_value_for_url_parser("/caf\u{c3}\u{a9}?q=\u{ff}#f"),
+            "/caf%C3%A9?q=%FF#f"
+        );
+        let base = Url::parse("https://example.test/a").unwrap();
+        assert_eq!(
+            base.join(&location_value_for_url_parser("/caf\u{c3}\u{a9}"))
+                .unwrap()
+                .as_str(),
+            base.join("/café").unwrap().as_str()
+        );
+        let request = Request::get(base.clone());
+        let mut headers = Headers::new();
+        headers.append("location".into(), "/one".into());
+        headers.append("location".into(), "/two".into());
+        assert!(
+            finish_response_parts(
+                &request,
+                (302, headers, Vec::new(), Vec::new()),
+                crate::performance::FetchTiming::new(),
+            )
+            .is_err()
+        );
+        let mut headers = Headers::new();
+        headers.append("location".into(), "/caf\u{c3}\u{a9}".into());
+        let response = finish_response_parts(
+            &request,
+            (302, headers, Vec::new(), Vec::new()),
+            crate::performance::FetchTiming::new(),
+        )
+        .unwrap();
+        assert_eq!(response.content_type, "/caf%C3%A9");
+    }
+
+    #[tokio::test]
+    async fn request_header_values_are_written_as_their_bytes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // A header value set by script is a ByteString; on the wire it is
+        // those bytes, not their UTF-8 encoding. The cookie-string is UTF-8.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0; 2048];
+            while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                head.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        });
+        let mut request = Request::get(Url::parse(&format!("http://{address}/bytes")).unwrap());
+        request
+            .headers
+            .push(("X-Name".into(), "caf\u{e9} \u{ff}".into()));
+        let response = fetch(&request).await.unwrap();
+        assert_eq!(response.status, 204);
+        let head = server.await.unwrap();
+        assert!(
+            head.windows(14).any(|part| part == b"X-Name: caf\xe9 \xff"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cors_preflight_cache_spares_repeated_preflights() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Fetch #cors-preflight-cache and #http-fetch step 5.1: a successful
+        // preflight's methods and header names are remembered for its
+        // max-age, per partition key, origin, URL and credentials. A header
+        // it did not allow needs a new preflight, whose failure clears the
+        // URL's entries (#concept-cache-clear), and `Access-Control-Max-Age:
+        // 0` keeps nothing.
+        const REQUESTS: usize = 11;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            for _ in 0..REQUESTS {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buffer = [0; 2048];
+                while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0);
+                    head.extend_from_slice(&buffer[..read]);
+                }
+                let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+                let max_age = if head.contains(" /zero ") { "0" } else { "60" };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://app.example\r\n\
+                             Access-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: x-one\r\n\
+                             Access-Control-Max-Age: {max_age}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let line = head.lines().next().unwrap();
+                lines.push(line.trim_end_matches(" http/1.1").to_string());
+            }
+            lines
+        });
+        let put = |path: &str, header: Option<&str>| {
+            let mut request = scripted_request(
+                &format!("http://{address}{path}"),
+                RequestMode::Cors,
+                CredentialsMode::SameOrigin,
+            );
+            request.method = String::from("PUT");
+            if let Some(name) = header {
+                request.headers.push((name.into(), "1".into()));
+            }
+            request
+        };
+        for (request, ok) in [
+            (put("/cached", Some("X-One")), true),
+            (put("/cached", Some("X-One")), true),
+            (put("/cached", None), true),
+            (put("/cached", Some("X-Two")), false),
+            (put("/cached", Some("X-One")), true),
+            (put("/zero", None), true),
+            (put("/zero", None), true),
+        ] {
+            assert_eq!(fetch_script(&request).await.is_ok(), ok);
+        }
+        let lines = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lines,
+            [
+                "options /cached",
+                "put /cached",
+                "put /cached",
+                "put /cached",
+                "options /cached",
+                "options /cached",
+                "put /cached",
+                "options /zero",
+                "put /zero",
+                "options /zero",
+                "put /zero",
+            ]
+        );
+        let mut cache = PREFLIGHT_CACHE.lock().unwrap();
+        let cached = put("/cached", Some("X-One"));
+        assert!(cache.method_match(&cached, "PUT"));
+        assert!(cache.header_match(&cached, "x-one"));
+        assert!(!cache.header_match(&cached, "x-two"));
+        assert!(!cache.method_match(&put("/zero", None), "PUT"));
+        // A credentialed request does not use an entry stored without them.
+        let mut credentialed = put("/cached", None);
+        credentialed.fetch_policy.as_mut().unwrap().credentials = CredentialsMode::Include;
+        assert!(!cache.method_match(&credentialed, "PUT"));
+        cache.clear_for(&cached);
+        assert!(!cache.method_match(&cached, "PUT"));
+    }
+
+    #[test]
+    fn parser_scripts_are_fetched_speculatively_as_their_elements_would() {
+        // HTML #speculative-html-parsing: classic scripts, module scripts and
+        // their static graphs (#fetch-a-module-script-tree), resolved against
+        // `<base href>`, with each element's `referrerpolicy`. Their timing
+        // reports wait in the cache for the page (Fetch #fetch-finale).
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = runtime.spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buffer = [0; 2048];
+                while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0);
+                    head.extend_from_slice(&buffer[..read]);
+                }
+                let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+                let path = head.split(' ').nth(1).unwrap().to_string();
+                let body = if path == "/sub/m.js" {
+                    "import {d} from './d.js'; export default d;"
+                } else {
+                    "export const d = 1;"
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                requests.push((path, head.contains("\r\nreferer: ")));
+            }
+            requests.sort();
+            requests
+        });
+        let html = r#"<!doctype html><head><base href="/sub/">
+            <script src="a.js" referrerpolicy="no-referrer"></script>
+            <script src="b.js"></script><script type="module" src="m.js"></script>"#;
+        let page = Url::parse(&format!("http://{address}/page")).unwrap();
+        let cache = std::sync::Arc::new(PageCache::default());
+        let held = std::sync::Arc::downgrade(&cache);
+        prefetch_parser_scripts(
+            html,
+            &page,
+            (1024.0, 768.0),
+            1.0,
+            encoding_rs::UTF_8,
+            &cache,
+            runtime.handle(),
+            std::sync::Arc::new(move |timing| {
+                if let Some(cache) = held.upgrade() {
+                    cache.report_speculative_timing(timing);
+                }
+            }),
+        );
+        let requests = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(10), server).await })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            requests,
+            [
+                (String::from("/sub/a.js"), false),
+                (String::from("/sub/b.js"), true),
+                (String::from("/sub/d.js"), true),
+                (String::from("/sub/m.js"), true),
+            ]
+        );
+        // The reports were held for the page and are handed over in order.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        loop {
+            if let SpeculativeTimings::Held(held) = &*cache.speculative_timings.lock().unwrap()
+                && held.len() >= 3
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "speculative timings");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sink = names.clone();
+        cache.forward_speculative_timings(std::sync::Arc::new(move |timing| {
+            sink.lock().unwrap().push(timing.name);
+        }));
+        let mut names = names.lock().unwrap().clone();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                format!("http://{address}/sub/a.js"),
+                format!("http://{address}/sub/b.js"),
+                format!("http://{address}/sub/m.js"),
+            ]
+        );
     }
 
     #[test]

@@ -87,7 +87,11 @@ fn authority(value: &str, origin: &str) -> Option<Alternative> {
     let port = port.parse().ok().filter(|port| *port != 0)?;
     let host = if host.is_empty() { origin } else { host };
     // URI hosts, not URLs, credentials, paths, zones, or backslash aliases.
-    if host.bytes().any(|b| b <= 0x20 || b"/@?#\\".contains(&b)) {
+    // RFC 3986 uri-host is ASCII; the field's other bytes are not a host.
+    if host
+        .bytes()
+        .any(|b| b <= 0x20 || !b.is_ascii() || b"/@?#\\".contains(&b))
+    {
         return None;
     }
     let host = url::Host::parse(host).ok()?.to_string();
@@ -181,6 +185,16 @@ mod tests {
     fn selected(value: &str) -> Option<(String, u64)> {
         parse(value, "example.com", Duration::from_secs(30))
             .map(|(a, ttl)| (a.authority(), ttl.as_secs()))
+    }
+    #[test]
+    fn an_alternative_host_is_ascii() {
+        // The header value is bytes (held isomorphic decoded); RFC 7838's
+        // alt-authority holds an RFC 3986 uri-host, which is ASCII.
+        assert_eq!(selected("h3=\"caf\u{c3}\u{a9}.example:443\""), None);
+        assert_eq!(
+            selected("h3=\"cafe.example:443\"").map(|(authority, _)| authority),
+            Some(String::from("cafe.example:443"))
+        );
     }
     #[test]
     fn http3_advertisements_obey_alpn_preference_freshness_and_quoting() {

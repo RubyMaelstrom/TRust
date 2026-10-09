@@ -1532,6 +1532,31 @@ mod tests {
     }
 
     #[test]
+    fn http2_field_values_are_bytes() {
+        // RFC 9113 §8.2.1 / RFC 9114 §4.2 permit obs-text in a field value;
+        // Fetch #header-value keeps the bytes (isomorphic decoded here), and a
+        // Set-Cookie line becomes the cookie store's UTF-8 text.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-name",
+            HeaderValue::from_bytes(b"caf\xc3\xa9 \xff").unwrap(),
+        );
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_bytes(b"n=caf\xc3\xa9").unwrap(),
+        );
+        let (fields, cookies) = response_headers(&headers).unwrap();
+        assert_eq!(fields["x-name"], "caf\u{c3}\u{a9} \u{ff}");
+        assert_eq!(cookies, ["n=café"]);
+        // A request value is written as its bytes.
+        let mut request = Request::get(url::Url::parse("https://example.test/").unwrap());
+        request.headers.push(("x-name".into(), "caf\u{e9}".into()));
+        let wire = super::super::wire::request(&request, None, false, http_wire::Version::HTTP_2)
+            .unwrap_or_else(|_| panic!("request"));
+        assert_eq!(wire.headers()["x-name"].as_bytes(), b"caf\xe9");
+    }
+
+    #[test]
     fn http2_field_sections_are_bounded_by_size_not_line_count() {
         // RFC 9110 §5.4: no line-count limit. RFC 9113 §6.5.2 sizes a list as
         // name + value + 32 octets per line, which alone bounds the section.

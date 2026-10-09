@@ -740,6 +740,9 @@ struct HostState {
     window_parents: HashMap<u64, u64>,
     /// The top-level Document's active parser while `load_page` runs it.
     parser: ParserProgress,
+    /// Each same-agent Window's settings for starting an import()'s fetch as
+    /// it runs, shared with the engine's dynamic module loader.
+    early_imports: Rc<RefCell<HashMap<u64, LumenDynamicModuleLoader>>>,
     /// One private WeakMap shared by this Agent's ImageData interface bindings. The map is
     /// rooted, not its keys: same-Agent cross-Realm getters keep their Web IDL brand semantics.
     image_data_slots: Option<Value>,
@@ -890,6 +893,7 @@ impl HostState {
             frame_contexts: HashMap::new(),
             window_parents: HashMap::new(),
             parser: ParserProgress::default(),
+            early_imports: Rc::default(),
             image_data_slots: None,
             image_bitmap_slots: None,
             canvas_gradient_slots: None,
@@ -942,6 +946,7 @@ impl HostState {
         self.realm_origins.remove(&context);
         self.frame_contexts.retain(|_, owner| *owner != context);
         self.window_parents.remove(&context);
+        self.early_imports.borrow_mut().remove(&context);
     }
 
     #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
@@ -971,8 +976,9 @@ impl HostState {
         });
         self.network = Some(LumenNetwork {
             handle,
+            // The document's count includes its speculative parser fetches.
+            fetched: cache.fetch_count(),
             cache,
-            fetched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_fetch_id: 0,
             pending_fetches: HashMap::new(),
             body_streams: HashMap::new(),
@@ -1045,15 +1051,17 @@ impl HostState {
             return;
         };
         let pending_dynamic_modules = self.pending_dynamic_modules.clone();
-        // The top-level Window's settings, for starting its imports' fetches
-        // as import() runs (`begin_dynamic_module_fetch`).
-        let top_level = self.network.as_ref().map(|network| {
+        // Each Window's settings, for starting its imports' fetches as
+        // import() runs (`begin_dynamic_module_fetch`): the top-level one
+        // here, a child Window's when its Realm is created
+        // (`host_create_window_realm`).
+        if let Some(network) = self.network.as_ref() {
             let page = self
                 .window_request_urls
                 .get(&0)
                 .unwrap_or(&self.base)
                 .clone();
-            LumenDynamicModuleLoader {
+            let loader = LumenDynamicModuleLoader {
                 context: 0,
                 cookie_context: self.window_cookie_contexts.get(&0).map_or_else(
                     || crate::http::CookieContext::subresource(&page),
@@ -1067,12 +1075,14 @@ impl HostState {
                     cache: network.cache.clone(),
                     fetched: network.fetched.clone(),
                 }),
-            }
-        });
+            };
+            self.early_imports.borrow_mut().insert(0, loader);
+        }
+        let early_imports = self.early_imports.clone();
         engine.set_async_dynamic_module_loader_with_context(
             move |request_id, context, specifier, referrer, _attribute_type| {
                 pending_dynamic_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(loader) = top_level.as_ref().filter(|_| context == 0) {
+                if let Some(loader) = early_imports.borrow().get(&context) {
                     begin_dynamic_module_fetch(loader, specifier, referrer);
                 }
                 let _ = events.send(LumenHostTask::DynamicModuleStart {
@@ -1167,6 +1177,7 @@ impl RetainedMemory for HostState {
             frame_contexts,
             window_parents,
             parser,
+            early_imports,
             image_data_slots,
             image_bitmap_slots,
             canvas_gradient_slots,
@@ -1732,6 +1743,15 @@ impl RetainedMemory for HostState {
                 realm_origins.capacity() * std::mem::size_of::<(u64, url::Origin)>()
                     + frame_contexts.capacity() * std::mem::size_of::<(usize, u64)>()
                     + window_parents.capacity() * std::mem::size_of::<(u64, u64)>(),
+            ));
+        }
+        if !early_imports.borrow().is_empty() {
+            visitor.opaque_storage(); // Import map handles and settings URLs.
+            visitor.allocation(RetainedManagedAllocation::new(
+                "trust.early-import-settings",
+                Rc::as_ptr(early_imports) as usize,
+                early_imports.borrow().capacity()
+                    * std::mem::size_of::<(u64, LumenDynamicModuleLoader)>(),
             ));
         }
         if parser.abandoned.capacity() != 0 {
@@ -2738,7 +2758,7 @@ mod desktop {
             checkpoint(&mut page, "load event");
             lifecycle_complete = true;
             if let Some((url, replace)) = take_navigation(&mut page) {
-                let _ = send_navigation(&events, url, replace);
+                let _ = send_navigation(&mut page, &events, url, replace);
                 return;
             }
             lifecycle_submission = take_form_submit(&mut page);
@@ -2774,6 +2794,8 @@ mod desktop {
             return;
         }
         if let Some((form, submitter, submission)) = lifecycle_submission {
+            // A form submission navigates (HTML #form-submission-algorithm).
+            abort_for_navigation(&mut page);
             let _ = events.blocking_send(PageEvt::SubmitForm {
                 form,
                 submitter,
@@ -3709,14 +3731,16 @@ mod desktop {
         // execution order are separate: async scripts run on completion;
         // blocking scripts suspend the parser while other task sources run;
         // deferred classics and modules execute in order after interactive.
-        // Start speculation only once the realm can consume its completions.
-        crate::http::prefetch_page_scripts(
-            html,
-            &env,
+        // The frontend may have started this speculation when the document
+        // arrived (`http::prefetch_parser_scripts`); its timing reports are
+        // taken now, before any parser script can run, and later ones queue
+        // as tasks. Requests already made are not repeated.
+        let report: Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync> =
             Arc::new(move |timing| {
                 let _ = host_tasks.send(LumenHostTask::ParserResourceTiming(timing));
-            }),
-        );
+            });
+        env.cache.forward_speculative_timings(report.clone());
+        crate::http::prefetch_page_scripts(html, &env, report);
         let mut tasks = ParserTasks::new(host_rx, events, &mut page);
         let mut deferred = Vec::new();
         // HTML #active-parser: the Document has one until "the end" (or until
@@ -5418,7 +5442,7 @@ mod desktop {
         .is_some_and(|value| page.engine.ctx().to_boolean(&value));
         checkpoint(page, if released { "keyup" } else { "keydown" });
         if let Some((url, replace)) = take_navigation(page) {
-            return send_navigation(events, url, replace);
+            return send_navigation(page, events, url, replace);
         }
         let mut editable_handled = false;
         if !released && !prevented && !input.composing && edit_key.is_none() {
@@ -5482,6 +5506,8 @@ mod desktop {
             {
                 return false;
             }
+            // A form submission navigates (HTML #form-submission-algorithm).
+            abort_for_navigation(page);
             return events
                 .blocking_send(PageEvt::SubmitForm {
                     form,
@@ -5568,7 +5594,7 @@ mod desktop {
                     {
                         return false;
                     }
-                    return send_navigation(events, url, replace);
+                    return send_navigation(page, events, url, replace);
                 }
                 if !finish_task_with_ack(page, events, false) {
                     return false;
@@ -5620,7 +5646,7 @@ mod desktop {
                 file_drag(page, drag);
                 checkpoint(page, "file drag");
                 if let Some((url, replace)) = take_navigation(page) {
-                    return send_navigation(events, url, replace);
+                    return send_navigation(page, events, url, replace);
                 }
                 finish_task_with_ack(page, events, false)
             }
@@ -5789,13 +5815,15 @@ mod desktop {
                 if let Some((url, replace)) =
                     take_navigation(page).or_else(|| anchor.map(|url| (url, NavigationAction::New)))
                 {
-                    return send_navigation(events, url, replace);
+                    return send_navigation(page, events, url, replace);
                 }
                 let click_submit = take_click_submit(page);
                 if !finish_task_with_ack(page, events, click_submit.is_none()) {
                     return false;
                 }
                 if let Some((form, submitter, submission)) = click_submit {
+                    // A form submission navigates (HTML #form-submission-algorithm).
+                    abort_for_navigation(page);
                     return events
                         .blocking_send(PageEvt::SubmitForm {
                             form,
@@ -5921,7 +5949,7 @@ mod desktop {
                 .is_some_and(|value| page.engine.ctx().to_boolean(&value));
                 checkpoint(page, "form submit");
                 if let Some((url, replace)) = take_navigation(page) {
-                    return send_navigation(events, url, replace);
+                    return send_navigation(page, events, url, replace);
                 }
                 if !prevented {
                     return events.blocking_send(PageEvt::SubmitDefault).is_ok();
@@ -6358,7 +6386,7 @@ mod desktop {
             }
         }
         if let Some((url, replace)) = take_navigation(page) {
-            return send_navigation(events, url, replace);
+            return send_navigation(page, events, url, replace);
         }
         let traversals = {
             let state = page
@@ -6664,6 +6692,8 @@ mod desktop {
             sent_primary = true;
         }
         if let Some((form, submitter, submission)) = submission {
+            // A form submission navigates (HTML #form-submission-algorithm).
+            abort_for_navigation(page);
             return events
                 .blocking_send(PageEvt::SubmitForm {
                     form,
@@ -6708,16 +6738,44 @@ mod desktop {
     }
 
     fn send_navigation(
+        page: &mut LumenPage,
         events: &tokio::sync::mpsc::Sender<PageEvt>,
         url: String,
         action: NavigationAction,
     ) -> bool {
+        abort_for_navigation(page);
         let event = match action {
             NavigationAction::Replace => PageEvt::Replace(url),
             NavigationAction::Reload => PageEvt::Reload(url),
             NavigationAction::New => PageEvt::Navigate(url),
         };
         events.blocking_send(event).is_ok()
+    }
+
+    /// HTML #navigate: a cross-document navigation of the top-level
+    /// navigable queues a global task to "abort a document and its
+    /// descendants" for its active document before it fetches anything.
+    /// TRust retires the page actor once the frontend starts the navigation,
+    /// so that task runs here, between the navigating task and the
+    /// navigation leaving the actor: the old Document's in-flight fetches
+    /// abort (XMLHttpRequest abort events, fetch() rejections) while it is
+    /// still alive. The descendants' Documents, whose own tasks would come
+    /// later, are aborted in tree order right after.
+    fn abort_for_navigation(page: &mut LumenPage) {
+        abort_document(page.engine.ctx(), 0);
+        let descendants = page
+            .engine
+            .ctx()
+            .host_mut::<HostState>()
+            .map(|state| descendant_contexts(state, 0))
+            .unwrap_or_default();
+        for context in descendants {
+            let _ = run_in_context_realm(&mut page.engine, context, "abort document", |engine| {
+                abort_document(engine.ctx(), context);
+                Ok(())
+            });
+        }
+        checkpoint(page, "navigation abort");
     }
 
     fn take_scroll_fragment(page: &mut LumenPage) -> Option<String> {
@@ -13640,6 +13698,12 @@ fn abort_document(ctx: &mut Ctx, context: u64) -> bool {
     let mut canceled = call_trust_in_context(ctx, context, "abortDocumentFetches")
         .is_some_and(|value| ctx.to_boolean(&value));
     canceled |= abort_document_fetches(ctx, context);
+    // A worker's own script fetch stays: its request is a non-subresource
+    // request (destination "worker"/"sharedworker") whose reserved client
+    // is the worker's environment, so Fetch #concept-fetch never
+    // records it in this Document's fetch group (#concept-fetch-group); it
+    // belongs to the worker being created, as a navigation's fetch belongs
+    // to its navigable, and HTML #run-a-worker continues.
     // (Step 3 concerns WebDriver BiDi, which TRust does not implement.)
     // Step 4: the active parser, which only the top-level Document's
     // `load_page` runs.
@@ -14199,6 +14263,24 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             .dom
             .borrow_mut()
             .set_frame_cookie_restriction(frame_id, cookie_context.cross_site_ancestor);
+        // HTML #hostloadimportedmodule for this Window too: its import()s
+        // start their fetches as they run (`begin_dynamic_module_fetch`),
+        // with the settings `queue_dynamic_module_load` will use.
+        if let (Some(network), Some(events)) = (state.network.as_ref(), state.task_events.clone()) {
+            let loader = LumenDynamicModuleLoader {
+                context,
+                page: client_url.clone(),
+                cookie_context: cookie_context.clone(),
+                events,
+                import_map: state.import_maps.entry(context).or_default().clone(),
+                network: Some(LumenDynamicModuleNetwork {
+                    handle: network.handle.clone(),
+                    cache: network.cache.clone(),
+                    fetched: network.fetched.clone(),
+                }),
+            };
+            state.early_imports.borrow_mut().insert(context, loader);
+        }
         state.window_cookie_contexts.insert(
             context,
             (
@@ -17082,7 +17164,7 @@ fn speculate_module_imports(
 /// response arrives, so the loader finds every dependency already fetched.
 /// Each module is scanned once (`claim_module_import_scan`), within the
 /// speculative-fetch bounds of `speculate_module_imports`.
-fn speculate_module_graph(
+pub(crate) fn speculate_module_graph(
     page: url::Url,
     handle: tokio::runtime::Handle,
     cache: Arc<crate::http::PageCache>,

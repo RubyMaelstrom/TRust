@@ -1275,3 +1275,287 @@ fn import_starts_its_fetch_before_the_page_thread_takes_its_task() {
     run_until(&runtime, &mut engine, &mut tasks, "log.length >= 1");
     assert_eq!(log(&mut engine), "ok");
 }
+
+#[test]
+fn script_sees_header_values_as_byte_strings() {
+    // Fetch #header-value: byte sequences, which Headers, getResponseHeader
+    // and getAllResponseHeaders expose isomorphic decoded (Web IDL
+    // ByteString); a ByteString request header value goes out as its bytes.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = runtime.spawn(async move {
+        let mut heads = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0u8; 2048];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nX-Name: caf\xc3\xa9\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            heads.push(head);
+        }
+        heads
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        r#"
+        const codes = text => [...text].map(c => c.charCodeAt(0).toString(16)).join(' ');
+        fetch('/fetch', {headers: {'X-Sent': 'café'}}).then(response => {
+            log.push(codes(response.headers.get('x-name')));
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', '/xhr');
+            xhr.onload = () => log.push(codes(xhr.getResponseHeader('X-Name')),
+                xhr.getAllResponseHeaders().includes('x-name: cafÃ©\r\n'));
+            xhr.send();
+        }).catch(error => log.push('failed:' + error));
+        "#,
+        "header bytes",
+    )
+    .unwrap();
+    run_until(&runtime, &mut engine, &mut tasks, "log.length >= 3");
+    assert_eq!(log(&mut engine), "63 61 66 c3 a9|63 61 66 c3 a9|true");
+    let heads = runtime.block_on(server).unwrap();
+    assert!(
+        heads[0]
+            .windows(b"X-Sent: caf\xe9".len())
+            .any(|window| window == b"X-Sent: caf\xe9"),
+        "{}",
+        String::from_utf8_lossy(&heads[0])
+    );
+}
+
+#[test]
+fn a_child_windows_import_starts_its_fetch_as_import_runs() {
+    // HTML #hostloadimportedmodule for a same-agent child Window: the fetch
+    // starts while import() runs, before the page thread takes the task.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let server = serve_each(&runtime, listener, 1, |_| {
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: 22\r\nConnection: close\r\n\r\nexport const v = 'ok';"
+            .to_vec()
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        &format!(
+            r#"
+            const html = document.createElement('html'), body = document.createElement('body');
+            document.appendChild(html); html.appendChild(body);
+            const frame = document.createElement('iframe'); body.appendChild(frame);
+            const context = __dom_allocate_job_context();
+            __dom_load_frame(frame.__id, '<body></body>', '{base}/frame');
+            frame.__contentDoc = undefined;
+            globalThis.child = __dom_create_window_realm(context, frame.__id, '{base}/frame',
+                __trust_cfg, window, window, frame, 0, '');
+            child.eval("globalThis.result = 'pending'; import('/child.js')" +
+                ".then(m => globalThis.result = m.v, e => globalThis.result = 'failed:' + e)");
+            "#
+        ),
+        "child Window import",
+    )
+    .unwrap();
+    // No host task has been dispatched: the request left as import() ran.
+    let heads = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(10), server).await })
+        .expect("the child Window's import fetch started without its task")
+        .unwrap();
+    assert!(heads[0].starts_with("get /child.js "), "{}", heads[0]);
+    run_until(&runtime, &mut engine, &mut tasks, "child.result === 'ok'");
+}
+
+#[test]
+fn stopping_the_document_leaves_its_workers_script_fetches() {
+    // HTML #run-a-worker fetches the worker's script as a non-subresource
+    // request (destination "worker") whose reserved client is the worker's
+    // own environment; Fetch #concept-fetch records only subresource
+    // requests in the client's fetch group, so stopping the Document (HTML
+    // #abort-a-document) leaves it, and the worker still starts. A running
+    // worker's fetches have the worker as client and are not touched either.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let (release, released) = tokio::sync::watch::channel(false);
+    let arrived = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = arrived.clone();
+    let server = runtime.spawn(async move {
+        let mut connections = Vec::new();
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let counter = counter.clone();
+            let mut released = released.clone();
+            connections.push(tokio::spawn(async move {
+                let head = read_head(&mut socket).await;
+                let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = match path.as_str() {
+                    "/running.js" => {
+                        "fetch('/in-worker').then(r => r.text()).then(t => postMessage(t));"
+                    }
+                    "/in-worker" => "done",
+                    _ => "postMessage('loaded');",
+                };
+                if path != "/running.js" {
+                    let _ = released.wait_for(|released| *released).await;
+                }
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                path
+            }));
+        }
+        let mut paths = Vec::new();
+        for connection in connections {
+            paths.push(connection.await.unwrap());
+        }
+        paths.sort();
+        paths
+    });
+    let (mut engine, mut tasks) = page(&runtime, &format!("{base}/page"));
+    eval(
+        &mut engine,
+        r#"
+        globalThis.running = new Worker('/running.js');
+        running.onmessage = event => log.push('running:' + event.data);
+        running.onerror = () => log.push('running error');
+        "#,
+        "running worker",
+    )
+    .unwrap();
+    let wait_for = |engine: &mut lumen::Engine,
+                    tasks: &mut tokio::sync::mpsc::UnboundedReceiver<LumenHostTask>,
+                    count: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while arrived.load(std::sync::atomic::Ordering::SeqCst) < count {
+            assert!(
+                Instant::now() < deadline,
+                "{count} requests reached the server"
+            );
+            run_for(&runtime, engine, tasks, Duration::from_millis(20));
+        }
+    };
+    wait_for(&mut engine, &mut tasks, 2);
+    eval(
+        &mut engine,
+        r#"
+        globalThis.loading = new Worker('/loading.js');
+        loading.onerror = () => log.push('loading error');
+        loading.onmessage = event => log.push('loading:' + event.data);
+        "#,
+        "loading worker",
+    )
+    .unwrap();
+    wait_for(&mut engine, &mut tasks, 3);
+    eval(&mut engine, "window.stop()", "window.stop()").unwrap();
+    release.send(true).unwrap();
+    run_until(
+        &runtime,
+        &mut engine,
+        &mut tasks,
+        "log.includes('running:done') && log.includes('loading:loaded')",
+    );
+    assert!(!log(&mut engine).contains("error"), "{}", log(&mut engine));
+    assert_eq!(
+        runtime.block_on(server).unwrap(),
+        ["/in-worker", "/loading.js", "/running.js"]
+    );
+}
+
+#[test]
+fn a_page_navigation_aborts_the_old_documents_fetches_first() {
+    // HTML #navigate queues "abort a document and its descendants" for the
+    // navigable's active document as a cross-document navigation begins:
+    // its XMLHttpRequest fires abort (here sending a beacon, a keepalive
+    // fetch that outlives the document) before the navigation leaves the
+    // page actor, and the XHR's connection closes.
+    let runtime = runtime();
+    let (listener, base) = listen(&runtime);
+    let (arrivals, mut arrived) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
+    runtime.spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let arrivals = arrivals.clone();
+            tokio::spawn(async move {
+                let head = read_head(&mut socket).await;
+                let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                if path == "/slow" {
+                    let _ = arrivals.send((path.clone(), false));
+                    let mut buffer = [0u8; 64];
+                    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            match socket.read(&mut buffer).await {
+                                Ok(0) | Err(_) => return true,
+                                Ok(_) => {}
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    let _ = arrivals.send((String::from("/slow closed"), closed));
+                } else {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let _ = arrivals.send((path, false));
+                }
+            });
+        }
+    });
+    let html = r#"<!doctype html><body><script>
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', '/slow');
+        xhr.onabort = () => navigator.sendBeacon('/aborted', 'gone');
+        xhr.send();
+        setTimeout(() => { location.href = '/next'; }, 1000);
+    </script>"#;
+    let mut env = crate::js::PageEnv::bare(&format!("{base}/page"));
+    env.net = Some(runtime.handle().clone());
+    let (_handle, mut events) = crate::js::spawn_page(html.into(), env);
+    let navigated = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.recv().await {
+                    Some(crate::js::PageEvt::Navigate(url)) => return url,
+                    Some(crate::js::PageEvt::Trouble(errors)) => panic!("page: {errors:?}"),
+                    Some(_) => {}
+                    None => panic!("page closed before navigating"),
+                }
+            }
+        })
+        .await
+        .expect("navigation")
+    });
+    assert_eq!(navigated, format!("{base}/next"));
+    let mut seen = Vec::new();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !(seen.iter().any(|(path, _)| path == "/aborted")
+                && seen.iter().any(|(path, _)| path == "/slow closed"))
+            {
+                seen.push(arrived.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("abort effects: {seen:?}"));
+    });
+    assert!(
+        seen.contains(&(String::from("/slow closed"), true)),
+        "{seen:?}"
+    );
+}

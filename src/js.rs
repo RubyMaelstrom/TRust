@@ -1359,6 +1359,9 @@ pub(crate) struct ExternalResource {
     /// The element's `charset` attribute: a style sheet's environment
     /// encoding label (HTML #link-type-stylesheet).
     pub charset: Option<String>,
+    /// The element's `referrerpolicy` attribute (HTML
+    /// #referrer-policy-attributes), which a speculative request honors.
+    pub referrer_policy: Option<String>,
 }
 
 impl ExternalResource {
@@ -1454,6 +1457,7 @@ pub(crate) fn external_resources_at(
                 initiator: "script",
                 render_blocking: blocks(node, false),
                 charset: dom.attr(node, "charset").map(str::to_string),
+                referrer_policy: dom.attr(node, "referrerpolicy").map(str::to_string),
             });
         }
     }
@@ -1484,6 +1488,7 @@ pub(crate) fn external_resources_at(
             render_blocking: kind == ExternalResourceKind::Sheet && blocks(node, true)
                 || tag == Some("script") && blocks(node, false),
             charset: dom.attr(node, "charset").map(str::to_string),
+            referrer_policy: dom.attr(node, "referrerpolicy").map(str::to_string),
         };
         if tag == Some("link")
             && rel_has("stylesheet")

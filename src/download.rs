@@ -515,7 +515,7 @@ fn suggested_filename(response: &http::Response, mime: &str) -> String {
             if name.eq_ignore_ascii_case("filename*") {
                 extended = decode_extended_filename(&value);
             } else if name.eq_ignore_ascii_case("filename") {
-                plain = Some(value);
+                plain = Some(plain_filename(&value));
             }
         }
         extended.or(plain)
@@ -575,6 +575,16 @@ fn unquote(value: &str) -> String {
         }
     }
     out
+}
+
+/// RFC 6266 §4.3 `filename`: the parameter's bytes, which the header holds
+/// isomorphic decoded and whose quoted-string form defaults to ISO-8859-1.
+/// Like the user agents RFC 6266 Appendix C.3 describes, a value whose bytes
+/// are UTF-8 is read as UTF-8 (servers commonly send raw UTF-8 names); any
+/// other bytes keep the ISO-8859-1 reading.
+fn plain_filename(value: &str) -> String {
+    let bytes = http::isomorphic_encode(value);
+    String::from_utf8(bytes).unwrap_or_else(|_| value.to_string())
 }
 
 fn decode_extended_filename(value: &str) -> Option<String> {
@@ -917,9 +927,13 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
                     }
                     if let Some((name, value)) = line.split_once(':') {
                         let name = name.trim().to_ascii_lowercase();
-                        let value = value.trim().to_string();
+                        // RFC 9112 §5: only SP and HTAB surround a value.
+                        let value = value.trim_matches([' ', '\t']).to_string();
                         if name == "set-cookie" {
-                            http::response_cookie(&cookie_request, &value);
+                            http::response_cookie(
+                                &cookie_request,
+                                &http::header_value_utf8(&value),
+                            );
                         }
                         headers.insert(name, value);
                     }
@@ -933,7 +947,7 @@ async fn stream_get(url: &Url, referrer: Option<&Url>, partial: &Path) -> Result
                 .get("location")
                 .ok_or_else(|| format!("HTTP {status} redirect without Location"))?;
             current = current
-                .join(location)
+                .join(&http::location_value_for_url_parser(location))
                 .map_err(|error| format!("bad download redirect: {error}"))?;
             http::update_navigation_metadata_for_redirect(&mut cookie_request, &current);
             continue;
@@ -995,7 +1009,8 @@ async fn download_line<R: tokio::io::AsyncBufRead + Unpin>(io: &mut R) -> Result
     {
         bytes.pop();
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    // Header values are byte sequences, kept isomorphic decoded.
+    Ok(http::isomorphic_decode(&bytes))
 }
 
 async fn stream_exact<R: tokio::io::AsyncRead + Unpin>(
@@ -1193,6 +1208,27 @@ mod tests {
         );
         assert!(response_needs_download(&response, true));
         assert_eq!(suggested_filename(&response, "text/html"), "safe name.html");
+    }
+
+    #[test]
+    fn a_plain_filename_is_read_from_its_bytes() {
+        // RFC 6266 §4.3: the header holds the parameter's bytes (isomorphic
+        // decoded); UTF-8 bytes read as UTF-8 (Appendix C.3), others as
+        // ISO-8859-1.
+        for (value, expected) in [
+            ("attachment; filename=\"caf\u{c3}\u{a9}.txt\"", "café.txt"),
+            ("attachment; filename=\u{e9}t\u{e9}.txt", "été.txt"),
+        ] {
+            let response = response(
+                "application/octet-stream",
+                b"x",
+                vec![("content-disposition".into(), value.into())],
+            );
+            assert_eq!(
+                suggested_filename(&response, "application/octet-stream"),
+                expected
+            );
+        }
     }
 
     #[test]

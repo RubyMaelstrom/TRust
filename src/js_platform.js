@@ -41262,8 +41262,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // response record; the returned function aborts the fetch.
     function fetchForEventSource(url, credentials, lastEventId, queue, deliver) {
         const headerList = [["Accept", "text/event-stream"]];
-        // The last event ID string, UTF-8 encoded by the host.
-        if (lastEventId !== "") headerList.push(["Last-Event-ID", lastEventId]);
+        // The last event ID string, encoded as UTF-8: a header value is a
+        // byte sequence, held one byte per code unit (#header-value).
+        if (lastEventId !== "") headerList.push(["Last-Event-ID", binaryString(utf8(lastEventId))]);
         const request = newRequestRecord({url, urlList: [url], method: "GET", headerList, mode: "cors",
             credentials, cache: "no-store"});
         request.initiatorType = "other";
