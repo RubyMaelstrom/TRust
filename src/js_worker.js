@@ -560,7 +560,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         fire(target, C, type, init) { return dispatchScopeEvent(trustedScopeEvent(C, type, init), true, target); },
         handlers(proto, types) { installTargetHandlers(proto, types); },
         parseURL(url) { var parsed = __url_parse(url, lp[0]); return parsed ? parsed[0] : null; },
-        blobSource(href) { var entry = __resolveBlobURL(href); return entry ? entry.bytes : null; },
         serialize(message, transfer) { return portAPI.serialize(message, transfer); },
         deserialize(packet) { return portAPI.deserialize(packet); },
         optionsTransfer(options) { return portAPI.optionsTransfer(options); },
@@ -843,45 +842,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     /*__URL_SHARED__*/
     const URLSearchParams = g.URLSearchParams, URL = g.URL;
 
-    // --- Blob URL store (worker realm) — RAM-only, mirrors the page realm ---
-    var __blobURLStore = Object.create(null);
-    function __blobBytes(b) {
-        if (!b || !Array.isArray(internalsFor(b).parts)) return "";
-        var enc = new g.TextEncoder(), out = "";
-        for (var i = 0; i < internalsFor(b).parts.length; i++) {
-            var p = internalsFor(b).parts[i], v, j;
-            if (typeof p === "string") { v = enc.encode(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-            else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-            else if (p && typeof p.byteLength === "number" && p.buffer) { v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-            else if (p && Array.isArray(internalsFor(p).parts)) out += __blobBytes(p);
-            else if (p != null) { v = enc.encode(String(p)); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
-        }
-        return out;
-    }
-    function __blobText(bytes) { var u = new Uint8Array(bytes.length); for (var i = 0; i < bytes.length; i++) u[i] = bytes.charCodeAt(i) & 0xFF; return new g.TextDecoder().decode(u); }
-    function __resolveBlobURL(u) {
-        var h = u.indexOf("#"), key = h >= 0 ? u.slice(0, h) : u, obj = __blobURLStore[key];
-        if (!obj) return null;
-        if (Array.isArray(internalsFor(obj).parts)) return { bytes: __blobBytes(obj), type: obj.type || "" };
-        return { bytes: "", type: "" };
-    }
-    // File API #unicodeBlobURL: a fresh UUID, whether or not this worker is
-    // a secure context exposing crypto.randomUUID().
-    function blobUUID() {
-        var b = __crypto_random_bytes(16), h = "";
-        b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
-        for (var i = 0; i < 16; i++) h += (b[i] < 16 ? "0" : "") + b[i].toString(16);
-        return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
-    }
-    URL.createObjectURL = function (obj) {
-        if (obj === null || typeof obj !== "object") throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
-        var origin = lp[8] || "null";
-        var u = "blob:" + (origin || "null") + "/" + blobUUID();
-        __blobURLStore[u] = obj; return u;
-    };
-    URL.revokeObjectURL = function (u) {
-        u = String(u); var h = u.indexOf("#"); if (h >= 0) u = u.slice(0, h);
-        if (u.slice(0, 5) === "blob:") delete __blobURLStore[u];
+    // --- Blob URL store: the page's, in the host (File API #url-model) ---
+    // URL.createObjectURL and URL.revokeObjectURL are the shared BLOB_URL
+    // block's; this worker's adapter supplies the origin a minted URL
+    // serializes and receives the block's resolver.
+    let blobURLAPI = null;
+    g.__blob_url_adapter = {
+        origin() { return lp[8] || "null"; },
+        register(api) { blobURLAPI = api; },
     };
 
     // HTML "fetch a classic worker-imported script" uses Fetch's script
@@ -919,9 +887,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         for (i = 0; i < records.length; i++) {
             var url = records[i], source;
             if (url.slice(0, 5) === "blob:") {
-                var entry = __resolveBlobURL(url);
+                // Fetch #scheme-fetch "blob" for this worker's environment.
+                var entry = blobURLAPI.read(url);
                 if (!entry) throw new g.DOMException("importScripts failed to load " + url, "NetworkError");
-                source = __blobText(entry.bytes);
+                source = new g.TextDecoder().decode(entry.bytes);
             } else {
                 var r = __http_fetch(url, "GET", null, null, "");
                 if (!__classicScriptResponseOK(r)) throw new g.DOMException("importScripts failed to load " + url, "NetworkError");
@@ -956,16 +925,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         fire(target, C, type, init) { dispatchScopeEvent(trustedScopeEvent(C, type, init), true, target); },
         queue(fn) { platformTasks.push(fn); },
         now: Date.now,
-        // A worker never holds a selected file's host part: a File reaches
-        // it by structured clone, which copies the bytes.
-        readHostFile() { throw new g.DOMException("The file is not readable in this realm", "NotReadableError"); },
+        // A selected file's range reaches a worker through the page's blob
+        // URL store: the host registered the file for this agent, which reads
+        // it lazily, like a Window, failing once its snapshot state changed.
+        readHostFile(range) {
+            if (range.end <= range.start) return "";
+            var bytes = __file_read(range.id, range.start, range.end);
+            if (typeof bytes === "string") return bytes;
+            throw new g.DOMException(String(bytes[1]), String(bytes[0]));
+        },
     };
     g.__fetch_adapter = {
         baseURL() { return lp[0]; },
         origin() { return lp[8] || "null"; },
         resolveBlobURL(url) {
-            var hash = url.indexOf("#"), entry = __blobURLStore[hash >= 0 ? url.slice(0, hash) : url];
-            return entry || null;
+            var entry = blobURLAPI.resolve(url);
+            return entry ? entry.object : null;
         },
         queue(fn) { platformTasks.push(fn); },
         formEntries() { throw new TypeError("FormData constructor: argument 1 is not an HTMLFormElement"); },

@@ -1138,11 +1138,14 @@ async fn fetch_page_image(
             .ok_or_else(|| String::from("invalid data image URL"));
     }
     if source.starts_with("blob:") {
-        let key = source.split('#').next().unwrap_or(source);
+        // The page's own image request obtained the entry for its environment
+        // (`image_host`); presenting that image reads the same store.
         return blobs
-            .and_then(|mirror| mirror.lock().ok())
-            .and_then(|mirror| mirror.get(key).map(|(bytes, _)| (true, bytes.clone())))
-            .ok_or_else(|| String::from("blob image is not present in the page mirror"));
+            .and_then(|store| store.resolve(source))
+            .ok_or_else(|| String::from("blob image is not in the page's blob URL store"))?
+            .read()
+            .map(|bytes| (true, bytes))
+            .map_err(|error| error.message().to_string());
     }
     let url = Url::parse(source).map_err(|error| format!("invalid image URL: {error}"))?;
     if !subresource_allowed(page, &url) {
@@ -10849,10 +10852,7 @@ mod tests {
         let page = Url::parse("https://example.test/login").unwrap();
         let blob_url = "blob:https://example.test/qr-code";
         let blobs = crate::js::BlobMap::default();
-        blobs.lock().unwrap().insert(
-            blob_url.to_owned(),
-            (vec![0, 1, 2, 255], "image/png".to_owned()),
-        );
+        blobs.add_bytes(blob_url, vec![0, 1, 2, 255], "image/png");
 
         assert_eq!(
             fetch_graphical_image(&page, &format!("{blob_url}#fragment"), Some(&blobs))
@@ -10872,10 +10872,7 @@ mod tests {
         let page = Url::parse("https://example.test/flood").unwrap();
         let blob_url = "blob:https://example.test/inline-svg-texture";
         let blobs = crate::js::BlobMap::default();
-        blobs.lock().unwrap().insert(
-            blob_url.to_owned(),
-            (crate::img::red_png(), "image/png".to_owned()),
-        );
+        blobs.add_bytes(blob_url, crate::img::red_png(), "image/png");
         let svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image href="{blob_url}" width="4" height="4"/></svg>"#
         );
@@ -15923,13 +15920,14 @@ mod tests {
             }
         }
         if let Some(blobs) = &resp.blobs {
-            for (u, (b, t)) in blobs.lock().unwrap().iter() {
+            for (u, entry) in blobs.snapshot() {
+                let head = entry.read().unwrap_or_default();
                 eprintln!(
                     "BLOB {} type={:?} len={} head={:?}",
                     u,
-                    t,
-                    b.len(),
-                    String::from_utf8_lossy(&b[..b.len().min(60)])
+                    entry.content_type,
+                    entry.size(),
+                    String::from_utf8_lossy(&head[..head.len().min(60)])
                 );
             }
         }

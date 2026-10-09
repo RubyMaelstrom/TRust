@@ -522,6 +522,46 @@ pub struct UserFiles {
     ids: HashMap<(PathBuf, Snapshot), u64>,
 }
 
+/// A byte range of a file the user selected, with the snapshot state taken when it was
+/// selected. It carries no open handle and no bytes: the File API's blob URL store keeps such
+/// ranges for a selected file's Blob, and any agent that obtains the entry reads them lazily
+/// (`read`) or makes them its own `UserFiles` entries (`UserFiles::register_range`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRange {
+    path: PathBuf,
+    snapshot: Snapshot,
+    start: u64,
+    end: u64,
+}
+
+impl FileRange {
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    pub fn len(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The range's bytes, read now; fails like [`UserFiles::read`].
+    pub fn read(&self) -> Result<Vec<u8>, ReadError> {
+        read_snapshot(&self.path, &self.snapshot, self.start, self.end)
+    }
+
+    /// Approximate heap bytes held for the range.
+    pub fn retained_bytes(&self) -> usize {
+        2 * self.path.as_os_str().len() + size_of::<Self>()
+    }
+}
+
 /// One piece of a request body whose file parts are read only when the body is assembled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BodySegment {
@@ -583,6 +623,40 @@ impl UserFiles {
             .ok()
             .and_then(|id| id.checked_sub(1))
             .and_then(|index| self.files.get(index))
+    }
+
+    /// Bytes `start..end` (clamped to the snapshot length) of file `id` as a [`FileRange`],
+    /// without reading them.
+    pub fn range(&self, id: u64, start: u64, end: u64) -> Option<FileRange> {
+        let file = self.entry(id)?;
+        let end = end.min(file.snapshot.len);
+        Some(FileRange {
+            path: file.path.clone(),
+            snapshot: file.snapshot,
+            start: start.min(end),
+            end,
+        })
+    }
+
+    /// Make the file of `range` readable here too; returns its id. A range from another
+    /// agent's registry names a file its user selected under the same snapshot.
+    pub fn register_range(&mut self, range: &FileRange) -> Result<u64, String> {
+        let key = (range.path.clone(), range.snapshot);
+        if let Some(&id) = self.ids.get(&key) {
+            return Ok(id);
+        }
+        if self.files.len() >= MAX_REGISTERED_FILES {
+            return Err(format!(
+                "more than {MAX_REGISTERED_FILES} files were selected on this page"
+            ));
+        }
+        self.files.push(Registered {
+            path: range.path.clone(),
+            snapshot: range.snapshot,
+        });
+        let id = self.files.len() as u64;
+        self.ids.insert(key, id);
+        Ok(id)
     }
 
     /// Read bytes `start..end` (clamped to the snapshot length) of file `id`, failing when the

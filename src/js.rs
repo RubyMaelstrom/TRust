@@ -61,9 +61,9 @@ pub enum WorkerOut {
     Console(String),
 }
 
-/// Page-lifetime mirror of JavaScript-created `blob:` URL bytes.
-pub type BlobMap =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, String)>>>;
+/// The page's blob URL store (File API #url-model), shared by its Windows, frames and workers
+/// and by the frontend that presents the page's `blob:` images.
+pub type BlobMap = std::sync::Arc<crate::blob_url_store::BlobUrlStore>;
 
 /// After this many actual or speculative cache-miss fetches, stop issuing additional optional
 /// module prefetches. Required Fetch/HTML requests must never consult this optimization threshold:
@@ -989,6 +989,7 @@ pub(crate) fn worker_prelude() -> &'static str {
             let abort = platform_block("/*__ABORT_BEGIN__*/", "/*__ABORT_END__*/");
             let streams = platform_block("/*__STREAMS_BEGIN__*/", "/*__STREAMS_END__*/");
             let file = platform_block("/*__FILE_BEGIN__*/", "/*__FILE_END__*/");
+            let blob_url = platform_block("/*__BLOB_URL_BEGIN__*/", "/*__BLOB_URL_END__*/");
             let fetch = platform_block("/*__FETCH_BEGIN__*/", "/*__FETCH_END__*/");
             let xhr = platform_block("/*__XHR_BEGIN__*/", "/*__XHR_END__*/");
             let websocket = platform_block("/*__WEBSOCKET_BEGIN__*/", "/*__WEBSOCKET_END__*/");
@@ -1029,7 +1030,7 @@ pub(crate) fn worker_prelude() -> &'static str {
                     1,
                 );
             format!(
-                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{crypto}\n{urlpattern}\n{wasm}\n\
+                "{domexception}\n{worker_scope}\n{geometry}\n{string_list}\n{navigator}\n{permissions}\n{ports}\n{codec}\n{features}\n{abort}\n{streams}\n{file}\n{blob_url}\n{fetch}\n{cache_storage}\n{indexed_db}\n{xhr}\n{websocket}\n{eventsource}\n{dedicated_worker}\n{rejection}\n__rejection_bind(__rejection_api);\n{bitmap}\n{WEBGL}\n{canvas}\n{crypto}\n{urlpattern}\n{wasm}\n\
                  __port_api.setCodec(__sc_serialize, __sc_deserialize);\n\
                  __port_api.setStreams(__streams_api);\n\
                  __port_api.setBitmaps(__bitmap_api); __sc_bitmap_codec(__bitmap_api);\n\

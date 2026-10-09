@@ -10661,9 +10661,10 @@ async fn load_page_image(
     // page's own JS minted via `URL.createObjectURL` (Steam's login QR).
     // Keyed without a fragment, like the JS-side store; never the wire.
     if url.starts_with("blob:") {
-        let key = url.split('#').next().unwrap_or(url);
         let raw: std::sync::Arc<[u8]> = blobs
-            .and_then(|m| m.lock().unwrap().get(key).map(|(b, _)| b.clone()))?
+            .and_then(|store| store.resolve(url))?
+            .read()
+            .ok()?
             .into();
         let (intrinsic, has_alpha) = decoded_intrinsic(raw.clone()).await?;
         return Some(DecodedImage {
@@ -17138,12 +17139,12 @@ mod tests {
             .to_vec()
     }
 
-    /// A `blob:` image resolves from the page's blob byte mirror (`Doc.blobs`)
+    /// A `blob:` image resolves from the page's blob URL store (`Doc.blobs`)
     /// — never the wire. This is how a client-GENERATED image renders: the
-    /// page mints `URL.createObjectURL(blob)` (Steam's login QR), the prelude
-    /// mirrors the bytes via `__blob_mirror`, and the app's image pipeline
-    /// decodes from the shared map. A URL missing from the map (revoked before
-    /// mirroring existed, or another page's) decodes to nothing, like a 404.
+    /// page mints `URL.createObjectURL(blob)` (Steam's login QR), which adds
+    /// an entry to the store (`__blob_url`), and the app's image pipeline
+    /// decodes from it. A URL missing from the store (revoked, or another
+    /// page's) decodes to nothing, like a 404.
     /// The terminal image loader records an inline SVG `<image>` load for the
     /// SVG decoder too, fetching the plain URL (SVG 2
     /// linking.html#processingURL-fetch).
@@ -17152,10 +17153,7 @@ mod tests {
         let page = url::Url::parse("https://example.com/flood").unwrap();
         let blob_url = "blob:https://example.com/terminal-inline-svg-texture";
         let blobs = crate::js::BlobMap::default();
-        blobs.lock().unwrap().insert(
-            blob_url.to_string(),
-            (crate::img::red_png(), String::from("image/png")),
-        );
+        blobs.add_bytes(blob_url, crate::img::red_png(), "image/png");
         let svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image href="{blob_url}" width="4" height="4"/></svg>"#
         );
@@ -17179,10 +17177,7 @@ mod tests {
         let page = url::Url::parse("https://example.com/login").unwrap();
         let blob_url = "blob:https://example.com/0f7c18cd-0475-4912-9865-1cd4adacebaa";
         let blobs = crate::js::BlobMap::default();
-        blobs.lock().unwrap().insert(
-            blob_url.to_string(),
-            (svg_fixture(), String::from("image/svg+xml")),
-        );
+        blobs.add_bytes(blob_url, svg_fixture(), "image/svg+xml");
         let decoded = super::load_one_image(&page, blob_url, Some(&blobs))
             .await
             .expect("blob image decoded from the mirror");

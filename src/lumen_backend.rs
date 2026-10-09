@@ -495,6 +495,12 @@ struct LumenWorkerSelf {
     /// worker's settings object is a secure context, which a nested worker
     /// inherits when its own script URL is potentially trustworthy.
     secure_context: bool,
+    /// The settings object's origin itself, created once: an opaque origin (a data: worker)
+    /// is equal only to itself (File API storage keys compare it).
+    settings_origin: url::Origin,
+    /// The worker's policy container's referrer policy (HTML #run-a-worker): inherited from
+    /// the outside settings for a local-scheme script URL, otherwise from the script response.
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -513,7 +519,17 @@ struct LumenWorkerLaunch {
     script_url: url::Url,
     kind: LumenWorkerKind,
     name: String,
-    script_body: Option<Vec<u8>>,
+    /// HTML #dom-worker: the script URL's blob URL entry, resolved (and checked for the
+    /// outside settings' partition, File API #blob-url-obtain-object) when the constructor
+    /// parsed the URL, so a later revocation does not affect the worker's script fetch.
+    script_blob: Option<Arc<crate::blob_url_store::BlobUrlEntry>>,
+    /// The page's blob URL store, shared with the worker.
+    blobs: crate::js::BlobMap,
+    /// Fetch #determine-requests-referrer for the script fetch, whose client is the outside
+    /// settings: the owning Window's document URL or the owning worker's URL, and that
+    /// environment's referrer policy.
+    referrer_source: url::Url,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
     secure_context: bool,
     /// A SharedWorkerGlobalScope rather than a DedicatedWorkerGlobalScope.
     shared: bool,
@@ -674,6 +690,10 @@ struct HostState {
     base: url::Url,
     storage: crate::js::WebStorage,
     blobs: crate::js::BlobMap,
+    /// This agent's identity in the page's blob URL store (File API #blob-url-entry-environment).
+    blob_agent: u64,
+    /// A worker removes the entries it created from the store when it ends (#lifeTime).
+    blob_release: Option<crate::blob_url_store::EnvironmentRelease>,
     viewport: Cell<crate::layout2::Viewport>,
     device_pixel_ratio: Cell<f32>,
     screen_position: Cell<(i32, i32)>,
@@ -828,6 +848,12 @@ impl HostState {
             base: url::Url::parse(DEFAULT_URL).expect("static default URL parses"),
             storage: Default::default(),
             blobs: Default::default(),
+            blob_agent: {
+                static NEXT_BLOB_AGENT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT_BLOB_AGENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            blob_release: None,
             viewport: Cell::new(viewport),
             device_pixel_ratio: Cell::new(device_pixel_ratio),
             screen_position: Cell::new((0, 0)),
@@ -1102,6 +1128,8 @@ impl RetainedMemory for HostState {
             base,
             storage,
             blobs,
+            blob_agent: _,
+            blob_release: _,
             viewport,
             device_pixel_ratio,
             screen_position,
@@ -1269,24 +1297,13 @@ impl RetainedMemory for HostState {
             visitor.unavailable();
         }
 
-        if let Ok(blobs) = blobs.lock() {
-            let mut bytes = std::mem::size_of_val(self.blobs.as_ref()).saturating_add(
-                blobs
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(String, (Vec<u8>, String))>()),
-            );
-            if blobs.capacity() != 0 {
+        {
+            let bytes =
+                std::mem::size_of_val(blobs.as_ref()).saturating_add(blobs.retained_bytes());
+            if !blobs.is_empty() {
                 visitor.opaque_storage();
             }
-            for (url, (data, media_type)) in blobs.iter() {
-                bytes = bytes
-                    .saturating_add(url.capacity())
-                    .saturating_add(data.capacity())
-                    .saturating_add(media_type.capacity());
-            }
             report_arc_payload(visitor, "trust.blob-url-map", &self.blobs, bytes);
-        } else {
-            visitor.unavailable();
         }
 
         if let Ok(cache) = geom_cache.try_borrow() {
@@ -8831,6 +8848,88 @@ mod desktop {
         }
 
         #[tokio::test]
+        async fn document_resources_resolve_blob_urls_their_workers_created() {
+            // File API (local w3c/FileAPI@1341d26) #url-model with Fetch
+            // #scheme-fetch "blob": a page's <img>, <script>, <link
+            // rel=stylesheet> and <iframe> obtain entries a dedicated worker
+            // of the same origin created in the page's shared blob URL store.
+            let html = r##"<!doctype html><html><body>
+                <button id="keep">keep actor resident</button>
+                <p id="styled">styled</p>
+                <output id="result">pending</output>
+                <script>
+                    document.getElementById("keep").addEventListener("click", () => {});
+                    const log = [];
+                    const finish = () => { document.getElementById("result").textContent = "done " + log.join("|"); };
+                    const worker = new Worker(URL.createObjectURL(new Blob([`
+                        const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+                        postMessage({
+                            png: URL.createObjectURL(new Blob([Uint8Array.fromBase64(png)], {type: "image/png"})),
+                            script: URL.createObjectURL(new Blob(["window.fromWorkerScript = 42;"], {type: "text/javascript"})),
+                            css: URL.createObjectURL(new Blob(["#styled { color: rgb(1, 2, 3) }"], {type: "text/css"})),
+                            text: URL.createObjectURL(new Blob(["from-worker"], {type: "text/plain"})),
+                        });
+                    `], {type: "text/javascript"})));
+                    worker.onerror = (event) => { log.push("worker-error:" + event.message); finish(); };
+                    worker.onmessage = async (event) => {
+                        const urls = event.data;
+                        const settle = (element) => new Promise((resolve) => {
+                            element.onload = () => resolve("load");
+                            element.onerror = () => resolve("error");
+                        });
+                        const image = new Image();
+                        const loaded = settle(image);
+                        image.src = urls.png;
+                        log.push("img:" + await loaded + ":" + image.naturalWidth + "x" + image.naturalHeight);
+                        const script = document.createElement("script");
+                        const ran = settle(script);
+                        script.src = urls.script;
+                        document.body.appendChild(script);
+                        log.push("script:" + await ran + ":" + window.fromWorkerScript);
+                        const link = document.createElement("link");
+                        link.rel = "stylesheet";
+                        const styled = settle(link);
+                        link.href = urls.css;
+                        document.head.appendChild(link);
+                        log.push("link:" + await styled + ":" + getComputedStyle(document.getElementById("styled")).color);
+                        const frame = document.createElement("iframe");
+                        const framed = settle(frame);
+                        frame.src = urls.text;
+                        document.body.appendChild(frame);
+                        await framed;
+                        log.push("iframe:" + (frame.contentDocument && frame.contentDocument.body.textContent));
+                        finish();
+                    };
+                </script>
+            </body></html>"##;
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.net = Some(tokio::runtime::Handle::current());
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+            let html = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("done ") => {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => {
+                            panic!("blob resources failed: {errors:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the blob resources loaded"),
+                    }
+                }
+            })
+            .await
+            .expect("blob resources did not settle");
+            let start = html.find("done ").unwrap() + 5;
+            let end = html[start..].find("</output>").unwrap() + start;
+            assert_eq!(
+                &html[start..end],
+                "img:load:1x1|script:load:42|link:load:rgb(1, 2, 3)|iframe:from-worker"
+            );
+        }
+
+        #[tokio::test]
         async fn document_timeline_reads_the_rendering_update_clock() {
             // Web Animations 1 #the-documenttimeline-interface and
             // #update-animations-and-send-events (local CSSWG snapshot
@@ -10717,7 +10816,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__ws_open", 2, host_ws_open),
     ("__ws_send", 3, host_ws_send),
     ("__ws_close", 3, host_ws_close),
-    ("__worker_spawn", 4, host_worker_spawn),
+    ("__worker_spawn", 3, host_worker_spawn),
     ("__worker_post", 2, host_worker_post),
     ("__worker_terminate", 1, host_worker_terminate),
     ("__worker_self_post", 1, host_worker_self_post),
@@ -10756,7 +10855,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__file_picker", 4, host_file_picker),
     ("__file_read", 3, host_file_read),
     ("__file_expand", 1, host_file_expand),
-    ("__blob_mirror", 3, host_blob_mirror),
+    ("__blob_url", 4, host_blob_url),
     ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
     ("__crypto_digest", 2, host_crypto_digest),
     ("__crypto_random_bytes", 1, host_crypto_random_bytes),
@@ -12411,7 +12510,27 @@ fn prepare_uncounted_client_request(
     };
     let mode = fetch_policy.map_or(crate::http::RequestMode::NoCors, |(mode, _)| mode);
     crate::http::set_fetch_metadata(&mut request, origin, "empty", mode.as_str());
-    crate::http::set_referrer(&mut request, page);
+    match state
+        .worker_self
+        .as_ref()
+        .map(|worker| worker.referrer_policy)
+    {
+        // Fetch #determine-requests-referrer for a worker client: its creation URL (`page`,
+        // the worker's URL) under its policy container's referrer policy.
+        Some(policy) => {
+            if !request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                && let Some(referrer) = policy.determine(page, &request.url)
+            {
+                request
+                    .headers
+                    .push((String::from("Referer"), referrer.to_string()));
+            }
+        }
+        None => crate::http::set_referrer(&mut request, page),
+    }
     if let Some(context) = request.cookie_context.as_mut() {
         context.top_level_site = state.window_cookie_contexts.get(&0).map_or_else(
             || {
@@ -14036,6 +14155,10 @@ fn host_release_job_context(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         state.window_realms.remove(&context);
         state.message_ports.release(Some(context));
         state.indexed_db.release(Some(context));
+        // File API #lifeTime: the Window's entries go away with its Document.
+        state
+            .blobs
+            .remove_environment(state.blob_agent, Some(context));
         state.window_request_urls.remove(&context);
         state.window_cookie_contexts.remove(&context);
         state.forget_realm_origin(context);
@@ -14269,6 +14392,33 @@ fn data_resource_result(url: &str) -> LumenResourceResult {
         .map(|body| (200, data_url_content_type(url), body, Vec::new()))
 }
 
+/// Fetch #scheme-fetch "blob" for an element's resource (a script, style sheet or preload),
+/// whose URL was parsed when the element was prepared: the element's environment obtains the
+/// blob URL entry (File API #blob-url-obtain-object, same partition only) and the response is
+/// the Blob's byte sequence with its Content-Length and Content-Type. A missing entry, another
+/// partition's entry or an unreadable selected file is a network error.
+fn blob_resource_result(ctx: &mut Ctx, node_id: usize, url: &str) -> LumenResourceResult {
+    let calling = ctx.host_job_context();
+    let state = ctx.host_mut::<HostState>()?;
+    let context = {
+        let dom = state.dom.clone();
+        let dom = dom.borrow();
+        node_window_context(state, &dom, node_id).unwrap_or(calling)
+    };
+    let key = blob_storage_key(&realm_origin(state, context));
+    let entry = state.blobs.obtain(url.trim(), Some(&key))?;
+    let body = entry.read().ok()?;
+    Some((
+        200,
+        entry.content_type.clone(),
+        body,
+        vec![
+            (String::from("Content-Length"), entry.size().to_string()),
+            (String::from("Content-Type"), entry.content_type.clone()),
+        ],
+    ))
+}
+
 fn send_resource_completion(
     ctx: &mut Ctx,
     node_id: usize,
@@ -14365,8 +14515,13 @@ fn host_preload_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     let Some(href) = host_resource_url(ctx, node_id, href) else {
         return Ok(Value::Undefined);
     };
-    if href.trim_start().starts_with("data:") {
-        let result = data_resource_result(href.trim());
+    let local = href.trim_start();
+    if local.starts_with("data:") || local.starts_with("blob:") {
+        let result = if local.starts_with("data:") {
+            data_resource_result(href.trim())
+        } else {
+            blob_resource_result(ctx, node_id, &href)
+        };
         if !send_resource_completion(ctx, node_id, href, LumenResourceKind::Preload, result, true) {
             host_fire_script_event(ctx, node_id, "error");
         }
@@ -14883,8 +15038,13 @@ fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     }
 
     if let Some(src) = src {
-        if src.trim_start().starts_with("data:") {
-            let result = data_resource_result(src.trim());
+        let local = src.trim_start();
+        if local.starts_with("data:") || local.starts_with("blob:") {
+            let result = if local.starts_with("data:") {
+                data_resource_result(src.trim())
+            } else {
+                blob_resource_result(ctx, node_id, &src)
+            };
             if !send_resource_completion(
                 ctx,
                 node_id,
@@ -14982,13 +15142,19 @@ fn host_load_injected_stylesheet(
     let Some(href) = host_resource_url(ctx, node_id, href) else {
         return Ok(Value::Undefined);
     };
-    if href.trim_start().starts_with("data:") {
+    let local = href.trim_start();
+    if local.starts_with("data:") || local.starts_with("blob:") {
+        let result = if local.starts_with("data:") {
+            data_resource_result(href.trim())
+        } else {
+            blob_resource_result(ctx, node_id, &href)
+        };
         if !send_resource_completion(
             ctx,
             node_id,
             href.clone(),
             LumenResourceKind::Stylesheet,
-            data_resource_result(href.trim()),
+            result,
             true,
         ) {
             host_fire_script_event(ctx, node_id, "error");
@@ -15135,23 +15301,28 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         LumenWorkerKind::Classic
     };
     let name = host_arg_string(ctx, args, 2);
-    let script_body = args
-        .get(3)
-        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
-        .map(|_| host_latin1_bytes(ctx, args, 3));
     let context = ctx.host_job_context();
     // A nested worker's outside settings object is its owning worker's: the
-    // creator origin and secure-context state that worker inherited itself.
-    let nested_owner = ctx
-        .host_mut::<HostState>()
-        .and_then(|state| state.worker_self.as_ref())
-        .map(|worker| (worker.origin.clone(), worker.secure_context));
-    let (owner_page, owner_secure) = match nested_owner {
-        Some((origin, secure)) => (origin, secure),
+    // creator origin and secure-context state that worker inherited itself,
+    // and, for its script fetch's referrer, the owning worker's URL (its
+    // creation URL) and referrer policy (Fetch #determine-requests-referrer).
+    let nested_owner = ctx.host_mut::<HostState>().and_then(|state| {
+        let base = state.base.clone();
+        state.worker_self.as_ref().map(|worker| {
+            (
+                worker.origin.clone(),
+                worker.secure_context,
+                base,
+                worker.referrer_policy,
+            )
+        })
+    });
+    let (owner_page, owner_secure, referrer_source, referrer_policy) = match nested_owner {
+        Some(owner) => owner,
         None => {
             let page = request_client_url(ctx);
             let secure = lumen_potentially_trustworthy(&page);
-            (page, secure)
+            (page.clone(), secure, page, Default::default())
         }
     };
     let cookie_context = request_cookie_context(ctx);
@@ -15160,6 +15331,16 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         .map_err(|_| ctx.make_error("SyntaxError", "invalid worker script URL"))?;
     let secure_context = owner_secure
         && (script_url.scheme() == "blob" || lumen_potentially_trustworthy(&script_url));
+    // URL #concept-url-parser: parsing the script URL resolved its blob URL entry; the
+    // worker's script fetch obtains the Blob for the outside settings (File API
+    // #blob-url-obtain-object), so another partition's URL is a network error.
+    let (_, _, storage_key) = blob_environment(ctx);
+    let script_blob = (script_url.scheme() == "blob")
+        .then(|| {
+            ctx.host_mut::<HostState>()
+                .and_then(|state| state.blobs.obtain(script_url.as_str(), Some(&storage_key)))
+        })
+        .flatten();
     let Some(state) = ctx
         .host_mut::<HostState>()
         .filter(|state| state.workers.is_some())
@@ -15204,7 +15385,10 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         script_url,
         kind,
         name,
-        script_body,
+        script_blob,
+        blobs: state.blobs.clone(),
+        referrer_source,
+        referrer_policy,
         secure_context,
         shared,
         agent_cluster: state.agent_cluster,
@@ -15401,7 +15585,7 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__ws_close", 3, host_ws_close as NativeFn),
         ("__worker_self_post", 1, host_worker_self_post as NativeFn),
         ("__worker_self_close", 0, host_worker_self_close as NativeFn),
-        ("__worker_spawn", 4, host_worker_spawn as NativeFn),
+        ("__worker_spawn", 3, host_worker_spawn as NativeFn),
         ("__worker_post", 2, host_worker_post as NativeFn),
         ("__worker_terminate", 1, host_worker_terminate as NativeFn),
         ("__storage_manager", 2, host_storage_manager as NativeFn),
@@ -15414,7 +15598,8 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
         ("__storage_key", 2, host_storage_key as NativeFn),
         ("__storage_len", 1, host_storage_len as NativeFn),
         ("__indexed_db", 2, indexed_db_host::call as NativeFn),
-        ("__blob_mirror", 3, host_blob_mirror as NativeFn),
+        ("__blob_url", 4, host_blob_url as NativeFn),
+        ("__file_read", 3, host_file_read as NativeFn),
         (
             "__crypto_sha256_digest",
             1,
@@ -15563,6 +15748,9 @@ fn lumen_same_origin(left: &url::Url, right: &url::Url) -> bool {
 struct LumenWorkerScript {
     url: url::Url,
     source: String,
+    /// HTML #run-a-worker: the policy container's referrer policy from the script response
+    /// (Referrer Policy #parse-referrer-policy-from-header); None for a local scheme.
+    referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
 struct LumenWorkerModuleFetch {
@@ -15581,10 +15769,20 @@ fn fetch_lumen_worker_script(
     handle: &tokio::runtime::Handle,
     cache: &Arc<crate::http::PageCache>,
 ) -> Option<LumenWorkerScript> {
-    if let Some(body) = launch.script_body.as_ref() {
-        return (launch.script_url.scheme() == "blob").then(|| LumenWorkerScript {
+    if launch.script_url.scheme() == "blob" {
+        // Fetch #scheme-fetch "blob": the entry the constructor's URL parse resolved; a
+        // selected file's range is read now. Without one, a network error.
+        let entry = launch.script_blob.as_ref()?;
+        if launch.kind == LumenWorkerKind::Module
+            && !crate::http::module_script_response_allowed(200, &entry.content_type)
+        {
+            return None;
+        }
+        let body = entry.read().ok()?;
+        return Some(LumenWorkerScript {
             url: launch.script_url.clone(),
-            source: String::from_utf8_lossy(body).into_owned(),
+            source: String::from_utf8_lossy(&body).into_owned(),
+            referrer_policy: None,
         });
     }
     if launch.script_url.scheme() == "data" {
@@ -15598,6 +15796,7 @@ fn fetch_lumen_worker_script(
         return Some(LumenWorkerScript {
             url: launch.script_url.clone(),
             source: String::from_utf8_lossy(&body).into_owned(),
+            referrer_policy: None,
         });
     }
     if !matches!(launch.script_url.scheme(), "http" | "https")
@@ -15610,7 +15809,17 @@ fn fetch_lumen_worker_script(
     let mut request = crate::http::Request::get(launch.script_url.clone());
     crate::http::set_fetch_metadata(&mut request, &launch.owner_page, "worker", "same-origin");
     request.cookie_context = Some(launch.cookie_context.clone());
-    crate::http::set_referrer(&mut request, &launch.owner_page);
+    // HTML #fetch-a-classic-worker-script: the request's client is the outside settings, so
+    // Fetch #determine-requests-referrer uses its creation URL (the owning Window's document
+    // or, for a nested worker, the owning worker's URL) under its referrer policy.
+    if let Some(referrer) = launch
+        .referrer_policy
+        .determine(&launch.referrer_source, &request.url)
+    {
+        request
+            .headers
+            .push((String::from("Referer"), referrer.to_string()));
+    }
     request.fetch_policy = Some(crate::http::FetchPolicy {
         origin: launch.owner_page.clone(),
         mode: crate::http::RequestMode::SameOrigin,
@@ -15624,11 +15833,12 @@ fn fetch_lumen_worker_script(
                 response.status,
                 response.content_type,
                 response.body,
+                crate::referrer_policy::ReferrerPolicy::from_headers(&response.headers),
             )
         });
         let _ = sender.send(result);
     });
-    let (response_url, status, content_type, body) = receiver.recv().ok().flatten()?;
+    let (response_url, status, content_type, body, policy) = receiver.recv().ok().flatten()?;
     if !lumen_same_origin(&launch.owner_page, &response_url)
         || !crate::http::module_script_response_allowed(status, &content_type)
     {
@@ -15637,6 +15847,7 @@ fn fetch_lumen_worker_script(
     Some(LumenWorkerScript {
         url: response_url,
         source: String::from_utf8_lossy(&body).into_owned(),
+        referrer_policy: Some(policy.unwrap_or_default()),
     })
 }
 
@@ -15961,6 +16172,13 @@ fn run_lumen_worker(
     );
     state.agent_cluster = launch.agent_cluster;
     state.storage = launch.storage.clone();
+    // File API #url-model: one blob URL store for the page and all of its agents; this
+    // worker's entries leave it when the worker ends (#lifeTime).
+    state.blobs = launch.blobs.clone();
+    state.blob_release = Some(crate::blob_url_store::EnvironmentRelease {
+        store: launch.blobs.clone(),
+        agent: state.blob_agent,
+    });
     state.permission_store = launch.permission_store.clone();
     state.message_ports.registry = launch.port_registry.clone();
     state.message_ports.wake = launch.port_wake.clone();
@@ -16004,8 +16222,12 @@ fn run_lumen_worker(
         id: launch.id,
         events: events.clone(),
         closed: false,
+        settings_origin: worker_origin.origin(),
         origin: worker_origin,
         secure_context: launch.secure_context,
+        // Until the script response is known, the outside settings' policy (HTML
+        // #run-a-worker inherits it for a local-scheme script URL).
+        referrer_policy: launch.referrer_policy,
     });
 
     let mut engine = lumen::Engine::new_with_interrupt(interrupt);
@@ -16073,6 +16295,14 @@ fn run_lumen_worker(
         return;
     };
     engine.set_import_base(script.url.as_str());
+    if let Some(policy) = script.referrer_policy
+        && let Some(worker) = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .and_then(|state| state.worker_self.as_mut())
+    {
+        worker.referrer_policy = policy;
+    }
     let continued = match launch.kind {
         LumenWorkerKind::Classic => eval_lumen_worker_classic(
             &mut engine,
@@ -21793,19 +22023,136 @@ fn host_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn host_blob_mirror(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let url = host_arg_usv(ctx, args, 0);
-    let bytes = host_latin1_bytes(ctx, args, 1);
-    let mime = host_arg_usv(ctx, args, 2);
-    if !url.is_empty() {
-        let blobs = ctx
-            .host_mut::<HostState>()
-            .expect("HostState installed before any Lumen host call")
-            .blobs
-            .clone();
-        blobs.lock().unwrap().insert(url, (bytes, mime));
+/// Storage #obtain-a-storage-key-for-non-storage-purposes for an environment of `origin`: the
+/// blob URL store compares these (File API #partitioningOfBlobUrls). An opaque origin is equal
+/// only to itself, so its key is its identity.
+fn blob_storage_key(origin: &url::Origin) -> String {
+    if origin.is_tuple() {
+        origin.ascii_serialization()
+    } else {
+        format!("opaque {origin:?}")
     }
-    Ok(Value::Undefined)
+}
+
+/// The current settings object's environment, origin serialization and storage key.
+fn blob_environment(ctx: &mut Ctx) -> (crate::blob_url_store::Environment, String, String) {
+    let realm = ctx.host_job_context();
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed before any Lumen host call");
+    let origin = match state.worker_self.as_ref() {
+        Some(worker) => worker.settings_origin.clone(),
+        None => realm_origin(state, realm),
+    };
+    (
+        crate::blob_url_store::Environment {
+            agent: state.blob_agent,
+            realm,
+        },
+        origin.ascii_serialization(),
+        blob_storage_key(&origin),
+    )
+}
+
+/// `__blob_url(op, url, type, leaves)`: the platform's File API blob URL store operations for
+/// the current settings object. "create" adds an entry for the Blob whose leaves are given
+/// (#add-an-entry: in-memory bytes are copied; a selected file's leaf stays an unread range),
+/// "resolve" returns `[type, origin, leaves]` for #blob-url-resolve and
+/// #blob-url-obtain-object (a file range becomes this agent's own selected-file id), or null,
+/// and "revoke" runs #dfn-revokeObjectURL steps 3-7. The bootstrap captures this binding.
+fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let op = host_arg_string(ctx, args, 0);
+    let url = host_arg_usv(ctx, args, 1);
+    let (environment, origin, storage_key) = blob_environment(ctx);
+    match op.as_str() {
+        "create" => {
+            let content_type = host_arg_string(ctx, args, 2);
+            let list = args.get(3).cloned().unwrap_or(Value::Undefined);
+            let length = ctx
+                .member_get(&list, "length")
+                .ok()
+                .and_then(|length| length.as_num_opt())
+                .filter(|length| length.is_finite() && *length >= 0.0)
+                .map_or(0, |length| length as usize);
+            let mut parts = Vec::with_capacity(length);
+            for index in 0..length {
+                let leaf = ctx.member_get(&list, &index.to_string())?;
+                if let Some(bytes) = ctx.buffer_source_bytes(&leaf, false) {
+                    parts.push(crate::blob_url_store::BlobPart::Bytes(Arc::from(bytes)));
+                    continue;
+                }
+                let mut numbers = [0u64; 3];
+                for (at, slot) in numbers.iter_mut().enumerate() {
+                    *slot = ctx
+                        .member_get(&leaf, &at.to_string())?
+                        .as_num_opt()
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .map_or(0, |value| value as u64);
+                }
+                let range = ctx
+                    .host_mut::<HostState>()
+                    .and_then(|state| state.user_files.range(numbers[0], numbers[1], numbers[2]))
+                    .ok_or_else(|| ctx.make_error("NotReadableError", "unknown selected file"))?;
+                parts.push(crate::blob_url_store::BlobPart::File(range));
+            }
+            let state = ctx.host_mut::<HostState>().expect("HostState installed");
+            state.blobs.add(
+                url,
+                crate::blob_url_store::BlobUrlEntry {
+                    parts,
+                    content_type,
+                    origin,
+                    storage_key,
+                    environment,
+                },
+            );
+            Ok(Value::Undefined)
+        }
+        "resolve" => {
+            let entry = ctx
+                .host_mut::<HostState>()
+                .and_then(|state| state.blobs.obtain(&url, Some(&storage_key)));
+            let Some(entry) = entry else {
+                return Ok(Value::Null);
+            };
+            let mut leaves = Vec::with_capacity(entry.parts.len());
+            for part in &entry.parts {
+                match part {
+                    crate::blob_url_store::BlobPart::Bytes(bytes) => {
+                        let view = ctx.make_uint8array(bytes)?;
+                        leaves.push(ctx.member_get(&view, "buffer")?);
+                    }
+                    crate::blob_url_store::BlobPart::File(range) => {
+                        let registered = ctx
+                            .host_mut::<HostState>()
+                            .map(|state| state.user_files.register_range(range));
+                        let Some(Ok(id)) = registered else {
+                            // This agent cannot hold the file: a network error.
+                            return Ok(Value::Null);
+                        };
+                        leaves.push(ctx.make_array(vec![
+                            Value::Num(id as f64),
+                            Value::Num(range.start() as f64),
+                            Value::Num(range.end() as f64),
+                        ]));
+                    }
+                }
+            }
+            let leaves = ctx.make_array(leaves);
+            Ok(ctx.make_array(vec![
+                Value::from_string(entry.content_type.clone()),
+                Value::from_string(entry.origin.clone()),
+                leaves,
+            ]))
+        }
+        "revoke" => {
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                state.blobs.revoke(&url, &storage_key);
+            }
+            Ok(Value::Undefined)
+        }
+        _ => Ok(Value::Undefined),
+    }
 }
 
 fn host_resolved_promise(ctx: &mut Ctx, value: Value) -> Result<Value, Value> {
@@ -26435,6 +26782,8 @@ mod tests {
             closed: false,
             origin: url::Url::parse(DEFAULT_URL).unwrap(),
             secure_context: true,
+            settings_origin: url::Url::parse(DEFAULT_URL).unwrap().origin(),
+            referrer_policy: Default::default(),
         });
         let origin = clock.origin_ms;
         let mut engine = lumen::Engine::new();
@@ -38998,6 +39347,292 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blob_url_store_is_shared_by_a_page_and_its_workers() {
+        // File API (local w3c/FileAPI@1341d26) #url-model, #blob-url-resolve,
+        // #blob-url-obtain-object, #dfn-revokeObjectURL and #lifeTime, with URL
+        // #concept-url-parser and Fetch #scheme-fetch: one store for the page's
+        // Window and workers; Worker/SharedWorker construction, importScripts,
+        // fetch, XHR, <img>, <script> and <iframe> resolve each other's URLs;
+        // revocation crosses agents but not partitions; a parsed URL keeps its
+        // entry; and a worker's entries leave the store when it ends.
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        eval(
+            &mut engine,
+            include_str!("fixtures/worker_blob_urls.mjs"),
+            "blob URL store",
+        )
+        .unwrap();
+        let log = pump_page_with_workers(
+            &runtime,
+            &mut engine,
+            &mut task_rx,
+            "blobDone",
+            "blobLog.join('|')",
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            log,
+            "worker-from-revoked-url|worker-used:from-window,from-window,7,nested-ok|\
+             worker-url-origin:true:true|window-fetch:from-worker:from-worker|\
+             window-worker:worker-made-worker|\
+             worker-after-window-revoke:TypeError|window-after-worker-revoke:TypeError|\
+             races:race-request,race-xhr,race-fetch,TypeError|shared:shared-ok|\
+             partition:TypeError:true:TypeError|held:held"
+        );
+        let store = engine.ctx().host_mut::<HostState>().unwrap().blobs.clone();
+        let held = string_value(&mut engine, "heldURL");
+        let kept = string_value(&mut engine, "keptURL");
+        assert!(store.resolve(&held).is_some() && store.resolve(&kept).is_some());
+        eval(&mut engine, "blobWorker.terminate()", "end the worker").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.resolve(&held).is_some() {
+            assert!(Instant::now() < deadline, "the ended worker's entry stayed");
+            pump_page_for(
+                &runtime,
+                &mut engine,
+                &mut task_rx,
+                Duration::from_millis(20),
+            );
+        }
+        assert!(
+            store.resolve(&kept).is_some(),
+            "the Window's own entries remain"
+        );
+    }
+
+    #[test]
+    fn blob_urls_of_selected_files_stay_unread_until_consumed() {
+        // File API #blob-url-entry and #snapshot-state: a URL for a selected
+        // file keeps the file's range, not its bytes. A worker reads it
+        // lazily through the page's store; once the file changes on disk,
+        // every later read fails instead of serving a stale copy.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picked.txt");
+        std::fs::write(&path, b"dropped!").unwrap();
+        let (runtime, mut engine, mut task_rx) = worker_test_environment();
+        let file = crate::file_select::SelectedFile::from_path(&path, String::new()).unwrap();
+        let id = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .unwrap()
+            .user_files
+            .register(&file)
+            .unwrap();
+        eval(
+            &mut engine,
+            &format!(
+                r#"
+            if (!document.documentElement) document.appendChild(document.createElement('html'));
+            if (!document.body) document.documentElement.appendChild(document.createElement('body'));
+            globalThis.zone = document.createElement('div');
+            document.body.appendChild(zone);
+            for (const type of ['dragenter', 'dragover']) zone.addEventListener(type, e => e.preventDefault());
+            zone.addEventListener('drop', e => {{ e.preventDefault(); globalThis.picked = e.dataTransfer.files[0]; }});
+            __trust.fileDrag('enter', ['text/plain']);
+            __trust.fileDrag('over', zone.__id, 5, 5, 5, 5, 0);
+            __trust.fileDrag('drop', zone.__id, 6, 6, 6, 6, 0, [[{id}, 'picked.txt', 'text/plain', 8, 0, '', false]]);
+            globalThis.fileURL = URL.createObjectURL(picked);
+            globalThis.fileLog = [];
+            globalThis.reader = new Worker(URL.createObjectURL(new Blob([`
+                onmessage = async (event) => {{
+                    try {{ postMessage(await (await fetch(event.data)).text()); }}
+                    catch (error) {{ postMessage(error.name); }}
+                }};
+            `], {{type: 'text/javascript'}})));
+            reader.onmessage = event => fileLog.push('worker:' + event.data);
+            reader.postMessage(fileURL);
+            "#
+            ),
+            "selected file blob URL",
+        )
+        .unwrap();
+        let url = string_value(&mut engine, "fileURL");
+        let store = engine.ctx().host_mut::<HostState>().unwrap().blobs.clone();
+        let entry = store
+            .resolve(&url)
+            .expect("the store has the selected file's entry");
+        assert!(
+            matches!(
+                entry.parts.as_slice(),
+                [crate::blob_url_store::BlobPart::File(range)] if range.len() == 8
+            ),
+            "the entry keeps an unread range"
+        );
+        let log = pump_page_with_workers(
+            &runtime,
+            &mut engine,
+            &mut task_rx,
+            "fileLog.length === 1",
+            "fileLog.join('|')",
+            Duration::from_secs(20),
+        );
+        assert_eq!(log, "worker:dropped!");
+        // A changed file no longer matches the selection's snapshot state.
+        std::fs::write(&path, b"changed!").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400))
+            .unwrap();
+        eval(
+            &mut engine,
+            r#"
+            fetch(fileURL).then(r => r.text()).then(t => fileLog.push('window:' + t), e => fileLog.push('window:' + e.name));
+            reader.postMessage(fileURL);
+            "#,
+            "changed file",
+        )
+        .unwrap();
+        let log = pump_page_with_workers(
+            &runtime,
+            &mut engine,
+            &mut task_rx,
+            "fileLog.length === 3",
+            "fileLog.slice(1).sort().join('|')",
+            Duration::from_secs(20),
+        );
+        // Fetch #concept-body-consume-body rejects with the Blob stream's
+        // error (File API #blob-get-stream: the read's NotReadableError).
+        assert_eq!(log, "window:NotReadableError|worker:NotReadableError");
+        eval(&mut engine, "reader.terminate()", "cleanup").unwrap();
+    }
+
+    #[test]
+    fn nested_worker_requests_use_the_owning_workers_referrer() {
+        // HTML #dom-worker and #fetch-a-classic-worker-script: a nested
+        // worker's script request has the owning worker's settings as its
+        // client, so Fetch #determine-requests-referrer uses that worker's URL
+        // under its referrer policy (HTML #run-a-worker: from the script
+        // response, Referrer-Policy #parse-referrer-policy-from-header, or
+        // inherited for a blob: script URL). A worker's own fetches use its
+        // own URL; a blob: URL is a local scheme and sends no referrer.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let page = url::Url::parse(&format!("{base}/page.html")).unwrap();
+        let outer = r#"
+            const tag = location.pathname.includes("origin") ? "origin" : "outer";
+            fetch("/" + tag + "-data").then(() => {
+                const nested = new Worker("/inner.js?" + tag);
+                nested.onmessage = () => {
+                    if (tag !== "origin") { postMessage(tag + "-done"); return; }
+                    const local = new Worker(URL.createObjectURL(new Blob(
+                        ["fetch(self.origin + '/blob-data').then(() => postMessage('blob-done'))"], {type: "text/javascript"})));
+                    local.onmessage = () => postMessage(tag + "-done");
+                };
+            });
+        "#;
+        let inner =
+            r#"fetch("/inner-data" + location.search).then(() => postMessage("inner-done"));"#;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let server = runtime.spawn(async move {
+            for _ in 0..9 {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(20), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = tokio::time::timeout(Duration::from_secs(20), stream.read(&mut bytes))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let head = String::from_utf8_lossy(&request).into_owned();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let referer = head
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                            .map(|(_, value)| value.trim().to_string())
+                    })
+                    .unwrap_or_else(|| String::from("none"));
+                record.lock().unwrap().push(format!("{path} {referer}"));
+                let (mime, body, policy) = match path.as_str() {
+                    "/outer.js" => ("text/javascript", outer, ""),
+                    "/outer-origin.js" => ("text/javascript", outer, "Referrer-Policy: origin\r\n"),
+                    p if p.starts_with("/inner.js") => ("text/javascript", inner, ""),
+                    _ => ("text/plain", "data", ""),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n{policy}Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = HostState::new(
+            Rc::new(RefCell::new(Dom::new())),
+            Rc::new(RealmClock::new()),
+        );
+        state.enable_network(
+            page.clone(),
+            runtime.handle().clone(),
+            Arc::default(),
+            task_tx,
+        );
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            r#"
+            globalThis.refLog = [];
+            globalThis.refWorkers = ['/outer.js', '/outer-origin.js'].map(url => {
+                const worker = new Worker(url);
+                worker.onmessage = event => refLog.push(event.data);
+                worker.onerror = event => refLog.push('error:' + event.message);
+                return worker;
+            });
+            "#,
+            "referrer workers",
+        )
+        .unwrap();
+        let log = pump_page_with_workers(
+            &runtime,
+            &mut engine,
+            &mut task_rx,
+            "refLog.length === 2",
+            "refLog.slice().sort().join('|')",
+            Duration::from_secs(30),
+        );
+        assert_eq!(log, "origin-done|outer-done");
+        runtime.block_on(server).unwrap();
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                String::from("/blob-data none"),
+                format!("/inner-data?origin {base}/inner.js?origin"),
+                format!("/inner-data?outer {base}/inner.js?outer"),
+                format!("/inner.js?origin {base}/"),
+                format!("/inner.js?outer {base}/outer.js"),
+                format!("/origin-data {base}/"),
+                format!("/outer-data {base}/outer.js"),
+                format!("/outer-origin.js {base}/page.html"),
+                format!("/outer.js {base}/page.html"),
+            ]
+        );
+        eval(
+            &mut engine,
+            "refWorkers.forEach(worker => worker.terminate())",
+            "cleanup",
+        )
+        .unwrap();
+    }
+
     fn worker_test_environment() -> (
         tokio::runtime::Runtime,
         lumen::Engine,
@@ -39733,6 +40368,8 @@ mod tests {
                 closed: false,
                 origin: script.clone(),
                 secure_context: true,
+                settings_origin: script.origin(),
+                referrer_policy: Default::default(),
             });
             state.enable_websockets(
                 page.clone(),
@@ -43103,6 +43740,8 @@ mod tests {
             closed: false,
             origin: url::Url::parse(DEFAULT_URL).unwrap(),
             secure_context: secure,
+            settings_origin: url::Url::parse(DEFAULT_URL).unwrap().origin(),
+            referrer_policy: Default::default(),
         });
         let origin = clock.origin_ms;
         let mut engine = lumen::Engine::new();
@@ -43689,9 +44328,12 @@ mod tests {
             .expect("host state")
             .blobs
             .clone();
+        let entry = blobs
+            .resolve(&blob_url)
+            .expect("the blob URL store has the entry");
         assert_eq!(
-            blobs.lock().unwrap().get(&blob_url).cloned(),
-            Some((vec![0, 128, 255], "application/x-lumen-port".to_owned()))
+            (entry.read().unwrap(), entry.content_type.as_str()),
+            (vec![0, 128, 255], "application/x-lumen-port")
         );
     }
 

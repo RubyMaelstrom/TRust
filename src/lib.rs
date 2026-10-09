@@ -25,6 +25,7 @@ pub fn release_allocator_memory() {
 
 pub mod accessibility;
 pub mod av1;
+pub mod blob_url_store;
 pub mod bookmarks;
 mod canvas;
 mod canvas_filter;

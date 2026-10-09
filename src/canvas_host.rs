@@ -1576,12 +1576,16 @@ fn source_bitmap(
     let (bytes, clean) = if source.starts_with("data:") {
         (crate::img::decode_data_url(&source)?, true)
     } else if source.starts_with("blob:") {
+        // Fetch #scheme-fetch "blob" for the image's environment (File API
+        // #blob-url-obtain-object); the image is clean when the Blob's
+        // creator origin (URL #concept-url-origin) is the canvas's.
+        let realm = ctx.host_job_context();
         let state = ctx.host_mut::<HostState>()?;
-        let bytes = state.blobs.lock().ok()?.get(&source)?.0.clone();
-        let origin = url::Url::parse(&source).ok()?.origin();
+        let key = super::blob_storage_key(&super::realm_origin(state, realm));
+        let entry = state.blobs.obtain(&source, Some(&key))?;
         (
-            bytes,
-            destination_origin != "null" && origin.ascii_serialization() == destination_origin,
+            entry.read().ok()?,
+            destination_origin != "null" && entry.origin == destination_origin,
         )
     } else {
         let url = url::Url::parse(&source).ok()?;

@@ -336,20 +336,16 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let inline = if selected.source.starts_with("data:") {
         Some(crate::img::decode_data_url(&selected.source).map(|bytes| (Arc::from(bytes), true)))
     } else if selected.source.starts_with("blob:") {
-        let same_origin = url::Url::parse(&selected.source)
-            .ok()
-            .is_some_and(|url| url.origin() == client.origin());
+        // Fetch #scheme-fetch "blob": the element's environment obtains the
+        // entry (File API #blob-url-obtain-object, same partition only), and
+        // the request's body is the Blob's byte sequence.
+        let key = super::blob_storage_key(&super::realm_origin(state, context));
         Some(
-            same_origin
-                .then(|| {
-                    state
-                        .blobs
-                        .lock()
-                        .ok()?
-                        .get(&selected.source)
-                        .map(|entry| (Arc::from(entry.0.as_slice()), true))
-                })
-                .flatten(),
+            state
+                .blobs
+                .obtain(&selected.source, Some(&key))
+                .and_then(|entry| entry.read().ok())
+                .map(|bytes| (Arc::from(bytes), true)),
         )
     } else {
         None

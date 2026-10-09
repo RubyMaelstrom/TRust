@@ -355,9 +355,24 @@ current behavior and limits; consult the governing standards before changing it.
   Windows and in dedicated and shared worker globals (`SharedWorker` stays
   Window-only, as HTML exposes it). A nested worker's tasks reach its owning
   worker's inbox, it inherits that worker's origin and secure context, and it
-  ends when its owner ends (the owner's handles drop). Worker blob: URL stores
-  are per realm, so a nested worker or `importScripts()` needs a blob: URL
-  created in its own realm.
+  ends when its owner ends (the owner's handles drop). Its script request's
+  referrer is the owning worker's URL under that worker's referrer policy (from
+  its script response's `Referrer-Policy`, inherited for blob:/data: scripts);
+  a worker's own fetches use its URL and policy, and blob:/data: workers send
+  no referrer.
+- The File API blob URL store is the host's (`src/blob_url_store.rs`), one per
+  page (`PageEnv.blobs`, also what frontends present `blob:` images from) and
+  shared by the page's Windows, frames and workers through the shared
+  `/*__BLOB_URL_BEGIN__*/` block and `__blob_url`. Entries keep in-memory
+  bytes or still-unread selected-file ranges (`file_select::FileRange`, read
+  lazily by whichever agent consumes them) and their environment; resolution
+  and revocation check the storage key (an opaque origin matches only
+  itself). URLs are resolved when parsed (Request construction, XHR `open()`,
+  Worker construction, element preparation, frame navigation), so a later
+  revocation does not fail them. A frame Window's entries go when its realm
+  is released and a worker's when it ends; the top-level Document's go with
+  the page's store. `<img>`, `<script>`, style sheets, preloads and frames
+  resolve `blob:` URLs; top-level navigation to one does not.
 - IndexedDB and Cache Storage are shared blocks (`/*__INDEXEDDB_BEGIN__*/`,
   `/*__CACHE_STORAGE_BEGIN__*/`) in Windows and workers over the storage shed's
   per-origin bottles, so every agent of an origin sees the same databases and

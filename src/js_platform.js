@@ -5185,7 +5185,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 frameNavigationURLs.set(frame, { source, parsed, location:!!locationRequest,
                     base:locationRequest ? locationRequest[3] : null,
                     sourceURL:locationRequest ? locationRequest[4] : null,
-                    blob: parsed[1] === "blob:" ? __blobURLStore[key] || null : null });
+                    blob: parsed[1] === "blob:" ? blobURLEntry(key) : null });
             } else frameNavigationURLs.delete(frame);
         }
         if (internalsFor(frame).trustNavigationQueued) return false;
@@ -37409,14 +37409,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     // Platform code below keeps the pristine interfaces, whatever author
     // script later assigns to the global properties.
     const URLSearchParams = g.URLSearchParams, URL = g.URL;
-    // --- Blob URL store (File API §"Creating and Revoking a blob URL") ---
-    // RAM-only, page-lifetime, per-realm: a map from a minted `blob:` URL string
-    // to its Blob object and private creator origin, kept in this realm — zero I/O, like the rest
-    // of TRust's web storage. `createObjectURL` mints a spec-shaped URL + stores
-    // the object; `revokeObjectURL` drops it; `fetch`/XHR below resolve a `blob:`
-    // URL straight from the store WITHOUT touching the network syscall (a blob URL
-    // never hits the wire). The null-prototype store is only ever keyed by string.
-    const __blobURLStore = Object.create(null);
+    // --- Blob URL store (File API #url-model) ---
+    // The user agent's blob URL store is the host's (`blob_url_store.rs`), one
+    // per page and shared by its Windows, frames and workers. URL's static
+    // createObjectURL/revokeObjectURL are the shared BLOB_URL block below the
+    // File API. A Window resolves an entry for its own environment: the host
+    // checks that its storage key is the creator's (#blob-url-obtain-object)
+    // and hands over the Blob's leaves, from which this realm builds a Blob.
+    let blobURLAPI = null;
     // A latin1 byte string of a Blob's bytes (one code unit per byte).
     function __blobBytes(b) { return fileAPI.isBlob(b) ? fileAPI.binaryString(fileAPI.bytes(b)) : ""; }
     function __latin1ToBytes(s) { const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff; return u; }
@@ -37428,12 +37428,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
         return __latin1ToBytes(value || "");
     }
-    // Resolve a `blob:` URL to { bytes (latin1), type } or null (no entry → a
-    // network error at the call site). Keyed without a fragment, per spec.
-    function __resolveBlobURL(u) {
-        const h = u.indexOf("#"); const key = h >= 0 ? u.slice(0, h) : u;
-        return __blobURLParts(__blobURLStore[key]);
+    // URL #concept-url-parser's blob URL entry for this Window: {object, origin,
+    // originKey}, or null (a network error at the call site). The entry passed
+    // the same-partition check, so its creator's origin is this Window's: an
+    // opaque one is this Window's own identity.
+    function blobURLEntry(u) {
+        const entry = blobURLAPI.resolve(u);
+        if (entry === null) return null;
+        const own = windowMessageState(g);
+        return { object: entry.object, origin: entry.origin,
+            originKey: entry.origin === "null" ? (own ? own.originKey : Symbol()) : entry.origin };
     }
+    // Resolve a `blob:` URL to { bytes (latin1), type, origin, originKey } or null.
+    function __resolveBlobURL(u) { return __blobURLParts(blobURLEntry(u)); }
     function __blobURLParts(entry) {
         if (!entry) return null;
         const obj = entry.object;
@@ -37442,36 +37449,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         try { bytes = __blobBytes(obj); } catch (_) { return null; }
         return { bytes, type: fileAPI.type(obj), origin: entry.origin, originKey: entry.originKey };
     }
-    // File API #creating-revoking (partial interface URL): static operations,
-    // enumerable like every Web IDL operation. The minted URL is
-    // `blob:<origin>/<uuid>`; the store is RAM-only (above).
-    const urlStatics = {
-        // (Blob or MediaSource): this user agent has no MediaSource.
-        createObjectURL(obj) {
-            if (arguments.length < 1) throw new TypeError("createObjectURL requires 1 argument");
-            if (!fileAPI.isBlob(obj)) throw new TypeError("createObjectURL requires a Blob");
-            // File API #unicodeBlobURL uses the settings object's origin,
-            // not Location.origin (about:srcdoc/blank URLs are opaque).
-            const owner = windowMessageState(g);
-            const origin = owner ? owner.origin : "null";
-            const u = "blob:" + (origin || "null") + "/" + cryptoRandomUUID();
-            __blobURLStore[u] = { object: obj, origin, originKey: owner ? owner.originKey : Symbol() };
-            // Mirror the bytes Rust-side so the APP can decode an
-            // `<img src="blob:…">` (Steam's client-generated QR code).
-            if (typeof __blob_mirror === "function") {
-                try { __blob_mirror(u, __blobBytes(obj), fileAPI.type(obj)); } catch (e) {}
-            }
-            return u;
-        },
-        revokeObjectURL(u) {
-            u = String(u);
-            const h = u.indexOf("#"); if (h >= 0) u = u.slice(0, h);
-            if (u.slice(0, 5) !== "blob:") return;
-            delete __blobURLStore[u];
-        },
-    };
-    for (const name of ["createObjectURL", "revokeObjectURL"])
-        Object.defineProperty(URL, name, { value: urlStatics[name], writable: true, enumerable: true, configurable: true });
     // URL Standard: [LegacyWindowAlias=webkitURL] on Window only.
     Object.defineProperty(g, "webkitURL", { value: URL, writable: true, configurable: true });
 
@@ -37678,11 +37655,18 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         baseURL() { return windowAPIBaseURL(); },
         origin() { return messageWindowState.origin; },
         resolveBlobURL(url) {
-            const hash = url.indexOf("#"), entry = __blobURLStore[hash >= 0 ? url.slice(0, hash) : url];
+            const entry = blobURLAPI.resolve(url);
             return entry ? entry.object : null;
         },
         queue(fn) { __queue_dom_task(fn); },
         formEntries(form, submitter) { return formDataEntriesFromForm(form, submitter); },
+    };
+    // The shared BLOB_URL block's view of this Window: the origin a minted
+    // URL serializes (#unicodeBlobURL uses the settings object's origin, not
+    // Location.origin: about:srcdoc/blank Documents inherit theirs).
+    g.__blob_url_adapter = {
+        origin() { const owner = windowMessageState(g); return owner ? owner.origin || "null" : "null"; },
+        register(api) { blobURLAPI = api; },
     };
     /*__FILE_BEGIN__*/
     // File API (local w3c/FileAPI@1341d26) and XHR's ProgressEvent
@@ -38614,6 +38598,19 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         copyFile,
         // The leaves of a Blob's byte sequence: Uint8Arrays and host parts.
         leaves(value) { return blobState(value).parts.slice(); },
+        // A Blob in this realm over leaves from the host's blob URL store
+        // (File API #blob-url-obtain-object): ArrayBuffers of in-memory bytes
+        // and [id, start, end] ranges of this agent's selected files, which
+        // stay unread until the Blob is read.
+        fromHostLeaves(leaves, type) {
+            const parts = [];
+            for (let i = 0; i < leaves.length; i++) {
+                const leaf = leaves[i];
+                if (isArray(leaf)) parts.push(hostFilePart(leaf[0], leaf[1], leaf[2]));
+                else parts.push(new Uint8ArrayCtor(leaf));
+            }
+            return initializeBlob(objectCreate(Blob.prototype), parts, normalizeType(`${type}`));
+        },
         hasHostParts(value) { return hasHostParts(blobState(value)); },
         partLength,
         readPart,
@@ -38641,6 +38638,84 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     };
     })(globalThis);
     /*__FILE_END__*/
+    /*__BLOB_URL_BEGIN__*/
+    // File API (local w3c/FileAPI@1341d26) #creating-revoking, shared by
+    // Window and worker realms: URL.createObjectURL adds an entry to the
+    // page's blob URL store (`__blob_url`, the host's store shared by every
+    // agent of the page) for the current settings object, keeping a selected
+    // file's leaves as unread ranges; URL.revokeObjectURL removes one for an
+    // environment of the creator's partition. Resolution (#blob-url-resolve,
+    // #blob-url-obtain-object) builds a Blob in this realm over the entry.
+    (function (g) {
+        "use strict";
+        const adapter = g.__blob_url_adapter;
+        delete g.__blob_url_adapter;
+        const fileAPI = g.__file_api, URLCtor = g.URL;
+        const define = Object.defineProperty, apply = Reflect.apply;
+        const randomBytes = __crypto_random_bytes, urlParse = __url_parse;
+        const TypeErrorCtor = TypeError;
+        const hexDigits = "0123456789abcdef";
+        // RFC 4122 version 4 UUID (#unicodeBlobURL step 9).
+        function uuid() {
+            const b = randomBytes(16);
+            b[6] = (b[6] & 15) | 64;
+            b[8] = (b[8] & 63) | 128;
+            let h = "";
+            for (let i = 0; i < 16; i++) {
+                if (i === 4 || i === 6 || i === 8 || i === 10) h += "-";
+                h += hexDigits[b[i] >> 4] + hexDigits[b[i] & 15];
+            }
+            return h;
+        }
+        // The Blob's leaves for the host: Uint8Arrays, and [id, start, end]
+        // for each selected-file range (read only when consumed).
+        function hostLeaves(blob) {
+            const leaves = fileAPI.leaves(blob), out = [];
+            for (let i = 0; i < leaves.length; i++) {
+                const host = fileAPI.hostRange(leaves[i]);
+                out.push(host === undefined ? leaves[i] : [host.id, host.start, host.end]);
+            }
+            return out;
+        }
+        // #blob-url-resolve and #blob-url-obtain-object for the current
+        // settings object: {object: Blob, origin} or null.
+        function resolve(url) {
+            const entry = __blob_url("resolve", `${url}`, null, null);
+            if (entry === null) return null;
+            return { object: fileAPI.fromHostLeaves(entry[2], entry[0]), origin: entry[1] };
+        }
+        // The resolved Blob's byte sequence, read now: {bytes, type}, or null
+        // for a missing entry or an unreadable selected file (network errors).
+        function read(url) {
+            const entry = resolve(url);
+            if (entry === null) return null;
+            try { return { bytes: fileAPI.bytes(entry.object), type: fileAPI.type(entry.object) }; }
+            catch (_) { return null; }
+        }
+        const statics = {
+            // (Blob or MediaSource): this user agent has no MediaSource.
+            createObjectURL(obj) {
+                if (arguments.length < 1) throw new TypeErrorCtor("createObjectURL requires 1 argument");
+                if (!fileAPI.isBlob(obj)) throw new TypeErrorCtor("createObjectURL requires a Blob");
+                // #unicodeBlobURL and #add-an-entry.
+                const url = "blob:" + adapter.origin() + "/" + uuid();
+                __blob_url("create", url, fileAPI.type(obj), hostLeaves(obj));
+                return url;
+            },
+            revokeObjectURL(url) {
+                if (arguments.length < 1) throw new TypeErrorCtor("revokeObjectURL requires 1 argument");
+                // #dfn-revokeObjectURL steps 1-2: parse; only blob: URLs.
+                const record = urlParse(`${url}`, null);
+                if (record === null || record[1] !== "blob:") return;
+                // Steps 3-7 (the entry, the partition check, the removal).
+                __blob_url("revoke", record[0], null, null);
+            },
+        };
+        for (const name of ["createObjectURL", "revokeObjectURL"])
+            define(URLCtor, name, { value: statics[name], writable: true, enumerable: true, configurable: true });
+        adapter.register({ resolve, read });
+    })(globalThis);
+    /*__BLOB_URL_END__*/
     /*__FETCH_BEGIN__*/
     // Fetch Standard API (local whatwg/fetch@394d20d, #fetch-api): Headers,
     // the Body mixin, Request, Response and fetch(), plus XHR's FormData
@@ -39868,6 +39943,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 if (parsedURL.username !== "" || parsedURL.password !== "")
                     throw new TypeErrorCtor("Request cannot be constructed from a URL that includes credentials");
                 request = newRequestRecord({url: parsedURL.href, urlList: [parsedURL.href]});
+                // URL #concept-url-parser: parsing resolves a blob: URL's
+                // entry now, so revoking it later does not fail this request.
+                if (parsedURL.protocol === "blob:") request.blobURLEntry = adapter.resolveBlobURL(parsedURL.href);
                 fallbackMode = "cors";
             } else {
                 request = inputRequest;
@@ -39880,6 +39958,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const headerListCopy = [];
             for (let i = 0; i < request.headerList.length; i++)
                 headerListCopy.push([request.headerList[i][0], request.headerList[i][1]]);
+            const blobURLEntry = request.blobURLEntry;
             request = newRequestRecord({
                 url: request.url, method: request.method, headerList: headerListCopy, origin: request.origin,
                 referrer: request.referrer, referrerPolicy: request.referrerPolicy, mode: request.mode,
@@ -39889,6 +39968,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 urlList: request.urlList.slice(), traversable: traversableForUserPrompts,
                 priority: request.priority, destination: request.destination,
             });
+            // The URL records carry their blob URL entry (URL #concept-url-blob-entry).
+            if (blobURLEntry !== undefined) request.blobURLEntry = blobURLEntry;
             if (isNonEmptyDictionary(dict)) {
                 if (request.mode === "navigate") request.mode = "same-origin";
                 request.reloadNavigation = false;
@@ -40203,7 +40284,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return networkError();
         }
         if (scheme === "blob:") {
-            const blob = request.method === "GET" ? adapter.resolveBlobURL(url) : null;
+            // #scheme-fetch "blob": the current URL's blob URL entry, as its
+            // parse resolved it (obtained for the request's environment).
+            const entry = request.blobURLEntry !== undefined ? request.blobURLEntry : adapter.resolveBlobURL(url);
+            const blob = request.method === "GET" ? entry : null;
             if (blob === null || !fileAPI.isBlob(blob)) return networkError();
             // The response body is the blob's stream: a selected file is
             // read as the body is read.
@@ -40392,6 +40476,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const request = newRequestRecord({url: fields.url, urlList: [fields.url], method: fields.method,
             headerList: fields.headerList, mode: fields.mode || "cors", credentials: fields.credentials,
             useCORSPreflight: !!fields.useCORSPreflight});
+        if (fields.blobURLEntry !== undefined) request.blobURLEntry = fields.blobURLEntry;
         request.initiatorType = fields.initiatorType || "xmlhttprequest";
         if (fields.destination) request.destination = fields.destination;
         const parsed = parseURL(request.url, null);
@@ -40722,6 +40807,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         toByteString,
         createFormData,
         fetchForXHR,
+        // URL #concept-url-parser's blob URL entry for a parsed URL (XHR
+        // open() parses the request URL before send() fetches it).
+        blobURLEntry(href) { return adapter.resolveBlobURL(href); },
         fetchForEventSource,
         abortFetchGroup,
         incrementallyReadBody,
@@ -45766,12 +45854,6 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const parsed = __url_parse(url, baseHref(), documentQueryEncoding(g.document));
             return parsed ? parsed[0] : null;
         },
-        // The File API Blob URL Store of this realm: an active entry's bytes,
-        // so that a revoked URL fails closed.
-        blobSource(href) {
-            const entry = __resolveBlobURL(href);
-            return entry ? entry.bytes : null;
-        },
         serialize(message, transfer) { return serializeMessage(message, transfer); },
         deserialize(packet) { return deserializeMessage(packet); },
         optionsTransfer(options) { return portAPI.optionsTransfer(options); },
@@ -45853,8 +45935,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 super();
                 const state = { id: -1 };
                 apply(slotSet, slots, [this, state]);
-                const blobSource = apply(startsWith, href, ["blob:"]) ? adapter.blobSource(href) : null;
-                state.id = __worker_spawn(href, type, name, blobSource);
+                // The host resolves a blob: URL's entry for this environment
+                // now, as parsing the URL does (URL #concept-url-parser).
+                state.id = __worker_spawn(href, type, name);
                 if (state.id > 0) workers[state.id] = this;
             }
             postMessage(message, options = undefined) {
@@ -45973,12 +46056,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             super();
             const channel = new SharedMessageChannel();
             sharedWorkerSlots.set(this, {port: channel.port1, handler: null});
-            let blobSource = null;
-            if (href.slice(0, 5) === "blob:") {
-                const entry = __resolveBlobURL(href);
-                if (entry) blobSource = entry.bytes;
-            }
-            const id = __worker_spawn(href, "shared:" + type, name, blobSource);
+            // The host resolves a blob: URL's entry for this environment now.
+            const id = __worker_spawn(href, "shared:" + type, name);
             if (!(id > 0)) {
                 // A matching scope with a different type or secure-context
                 // state: fire error and do not connect.
@@ -46161,6 +46240,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const urlSetUsername = getOwn(URLCtor.prototype, "username").set;
     const urlSetPassword = getOwn(URLCtor.prototype, "password").set;
     const urlHost = getOwn(URLCtor.prototype, "host").get;
+    const urlProtocol = getOwn(URLCtor.prototype, "protocol").get;
     const ProgressEvent = fileAPI.ProgressEvent;
     const isObject = value => (typeof value === "object" && value !== null) || typeof value === "function";
     const usvString = value => apply(toWellFormed, `${value}`, []);
@@ -46326,6 +46406,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             xhr.uploadListener = false;
             xhr.method = method;
             xhr.url = apply(urlHref, parsedURL, []);
+            xhr.blobURLEntry = apply(urlProtocol, parsedURL, []) === "blob:" ? fetchAPI.blobURLEntry(xhr.url) : undefined;
             xhr.sync = !async;
             xhr.headers = [];
             xhr.body = null;
@@ -46411,7 +46492,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             // when the upload object has event listeners.
             const fields = {method: xhr.method, url: xhr.url, headerList: copyHeaders(xhr.headers), body: xhr.body,
                 credentials: xhr.credentials ? "include" : "same-origin", sync: xhr.sync,
-                useCORSPreflight: xhr.uploadListener};
+                useCORSPreflight: xhr.uploadListener, blobURLEntry: xhr.blobURLEntry};
             xhr.uploadComplete = false;
             xhr.timedOut = false;
             if (xhr.body === null) xhr.uploadComplete = true;
