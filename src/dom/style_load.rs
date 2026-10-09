@@ -290,6 +290,7 @@ mod tests {
             base: String::from("https://example.com/a.css"),
             text: String::from("@import url(c.css);"),
             cors_same_origin: true,
+            referrer_policy: None,
         }]);
         assert_eq!(
             dom.critical_subresources(style, &idle),
@@ -301,6 +302,7 @@ mod tests {
             base: String::from("https://example.com/c.css"),
             text: String::from("@import url(a.css); p{}"),
             cors_same_origin: true,
+            referrer_policy: None,
         }]);
         assert_eq!(
             dom.critical_subresources(style, &idle),

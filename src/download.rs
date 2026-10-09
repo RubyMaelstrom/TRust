@@ -1193,6 +1193,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         }
     }
 

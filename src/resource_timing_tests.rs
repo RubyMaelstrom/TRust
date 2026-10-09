@@ -558,9 +558,16 @@ async fn document_images_report_timing_in_their_documents_and_are_fetched_once()
     // A frontend presenting the rendering joins the document's responses.
     for path in ["/parsed.png", "/bg.png", "/child.png", "/late.png"] {
         let source = url.join(path).unwrap();
-        let bytes = fetch_presentation_image(&url, source.as_str(), None, Some(&images), false)
-            .await
-            .unwrap();
+        let bytes = fetch_presentation_image(
+            &url,
+            source.as_str(),
+            None,
+            Some(&images),
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(&bytes[..], &png[..], "{path}");
     }
     server.abort();

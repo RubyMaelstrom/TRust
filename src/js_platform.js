@@ -43,6 +43,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     const storageContextId = Number(cfg.hostSettingsContext) || 0;
     const storageOpaque = !!cfg.cookieOpaque;
     const documentReferrers = new WeakMap(), frameReferrers = new WeakMap();
+    // A frame's navigation response `Referrer-Policy` (HTML #creating-a-policy-
+    // container-from-a-fetch-response), for the Document the response creates.
+    const frameResponsePolicies = new WeakMap();
     // HTML #dom-document-lastmodified: the source's last modification time
     // (ms since the epoch) for documents loaded with one.
     const documentLastModified = new WeakMap();
@@ -1616,6 +1619,22 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             internalsFor(node).cssStarted = true;
             __dom_preload_link(nodeIds.get(node));
             return;
+        }
+        // HTML #link-type-modulepreload fetches the module script: for a blob:
+        // URL, Fetch #scheme-fetch obtains the entry its URL parse resolved for
+        // this environment (File API's same-partition check) and the Blob's
+        // type must be a JavaScript MIME type; the result fires load or error.
+        if (rels.indexOf("modulepreload") >= 0 && blobURLAPI) {
+            const href = node.getAttribute("href");
+            const parsed = href === null ? null : encodingParseForNode(href, node);
+            if (parsed && parsed[1] === "blob:") {
+                internalsFor(node).cssStarted = true;
+                const ok = blobURLAPI.moduleScript(parsed[0]);
+                __queue_dom_task(() => {
+                    try { node.dispatchEvent(new Event(ok ? "load" : "error")); } catch (e) {}
+                });
+                return;
+            }
         }
         // Other resource hints (`prefetch`/`modulepreload`/`preconnect`/
         // `dns-prefetch`): we don't speculatively fetch (hints are optional), but
@@ -4759,8 +4778,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 frameReferrers.get(frame) || "",
                 contentType,
                 navigationTiming,
-                frameAboutBaseURLs.get(frame) || null
+                frameAboutBaseURLs.get(frame) || null,
+                frameResponsePolicies.get(frame) || ""
             );
+            frameResponsePolicies.delete(frame);
         } catch (e) {
             trust.errors.push("Window Realm: " + ((e && e.message) || e));
         }
@@ -5138,6 +5159,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // The response bytes (r[3]) are decoded per the document's rules; a
         // record without them carries text already decoded as UTF-8 (r[2]).
         const body = r[3] instanceof ArrayBuffer || ArrayBuffer.isView(r[3]) ? r[3] : (r[2] || "");
+        frameResponsePolicies.set(frame, typeof r[9] === "string" ? r[9] : "");
         loadFrameResource(frame, body, r[1], finalURL, generation, r[6] || "", r[7]);
     }
     // Process every frame within `root` (the document at load, or a freshly
@@ -5636,7 +5658,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (context && context.record) pendingClickHyperlink = t;
             else {
                 const url = followHyperlink(t);
-                if (url) g.location.href = url;
+                const followed = trust.hyperlinkNavigation;
+                trust.hyperlinkNavigation = null;
+                if (url) navigateLoc(url, false, false, g, g, followed ? followed[0] : "");
             }
             return false;
         }
@@ -7527,7 +7551,14 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const slots = internalsFor(form);
         const record = slots.preparedSubmission;
         slots.preparedSubmission = null;
-        return record ? JSON.stringify(record) : "";
+        if (!record) return "";
+        // HTML #form-submission-algorithm: a noreferrer form navigates with
+        // referrerPolicy "no-referrer"; its node document is the source.
+        const rel = form.getAttribute("rel");
+        record.referrerPolicy = rel !== null &&
+            asciiLower(rel).split(/[\t\n\f\r ]+/).includes("noreferrer") ? "no-referrer" : "";
+        record.context = trust.resourceClientContext(formId);
+        return JSON.stringify(record);
     };
 
     // --- the DOM classes over the syscall boundary ---
@@ -15643,8 +15674,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return value === null ? null : value.toLowerCase() === "use-credentials" ? "use-credentials" : "anonymous";
         }
         set crossOrigin(value) { if (value === null) this.removeAttribute("crossorigin"); else this.setAttribute("crossorigin", String(value)); }
-        get referrerPolicy() { return this.getAttribute("referrerpolicy") || ""; }
-        set referrerPolicy(value) { this.setAttribute("referrerpolicy", String(value)); }
+        // referrerPolicy is an enumerated reflection limited to the known
+        // values (HTML #referrer-policy-attributes; ENUMERATED_REFLECTIONS).
         // HTML #dom-img-decode (local WHATWG snapshot e5071a20). The steps
         // run in a microtask so that `img.src = url; img.decode()` waits for
         // the request that src assignment's own microtask creates.
@@ -17666,6 +17697,23 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!anchor) return null;
         return followHyperlink(anchor);
     };
+    // HTML #hyperlink-referrer-policy: "no-referrer" for a noreferrer link,
+    // else the state of its referrerpolicy attribute (#referrer-policy-attributes).
+    function hyperlinkReferrerPolicy(subject) {
+        const rel = subject.getAttribute("rel");
+        if (rel !== null && asciiLower(rel).split(/[\t\n\f\r ]+/).includes("noreferrer")) return "no-referrer";
+        return referrerPolicyAttributeState(subject);
+    }
+    function referrerPolicyAttributeState(element) {
+        const raw = element.getAttribute("referrerpolicy");
+        const value = raw === null ? "" : asciiLower(raw);
+        return Object.prototype.hasOwnProperty.call(REFERRER_POLICY_KEYWORDS, value) ? REFERRER_POLICY_KEYWORDS[value] : "";
+    }
+    trust.takeHyperlinkNavigation = function () {
+        const navigation = trust.hyperlinkNavigation || null;
+        trust.hyperlinkNavigation = null;
+        return navigation;
+    };
     function followHyperlink(anchor) {
         const raw = anchor.getAttribute("href");
         // Presence, not non-emptiness, creates the hyperlink. `href=""`
@@ -17711,6 +17759,11 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 navigateLoc(url, false, false);
                 return null;
             }
+            // The top-level navigation's source Document and referrerPolicy,
+            // for the host (see takeHyperlinkNavigation).
+            trust.hyperlinkNavigation = [hyperlinkReferrerPolicy(anchor),
+                trust.resourceClientContext(nodeIds.get(anchor))];
+            if (parsed[1] === "blob:" && blobURLAPI) blobURLAPI.hold(url);
             return url;
         }
         try {
@@ -25749,7 +25802,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         const ev = createTrustedEvent(HashChangeEvent, "hashchange", {oldURL: String(oldURL), newURL: String(newURL)});
         dispatch(g, ev, false);
     };
-    const navigateLoc = (u, hashOnly, replace, source = g, incumbent = source) => {
+    const navigateLoc = (u, hashOnly, replace, source = g, incumbent = source, referrerPolicy = "") => {
         // HTML #dom-location-href / #dom-location-assign / #dom-location-replace:
         // encoding-parse relative to the ENTRY settings object's API base URL,
         // even when the Location belongs to another Window or about:blank.
@@ -25787,6 +25840,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             const initiator = windowMessageSlots && windowMessageState(incumbent);
             trust.navigationSourceBase = initiator ? initiator.apiBaseURL() : baseHref();
             trust.navigationSourceURL = initiator ? initiator.documentURL() : g.document.URL;
+            // HTML #navigate: the source Document (its settings context) and
+            // referrerPolicy reach the host's navigation request. Parsing a
+            // blob: URL resolved its entry (URL #concept-url-blob-entry).
+            trust.navigationSourceContext = initiator ? initiator.settingsContext : topWindowState.hostSettingsContext;
+            trust.navigationReferrerPolicy = referrerPolicy;
+            if (p[1] === "blob:" && blobURLAPI) blobURLAPI.hold(p[0]);
             trust.navigationReload = false;
             // navigate-convert-to-replace: same-origin, equal-URL navigation
             // with automatic history handling replaces the current entry.
@@ -26011,8 +26070,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         if (!trust.navigation) return null;
         const result = [trust.navigation, trust.navigationReload ? 'reload' :
             trust.navigationReplace ? 'replace' : 'navigate', realmRootFrame ? nodeIds.get(realmRootFrame) : 0,
-            trust.navigationSourceBase || baseHref(), trust.navigationSourceURL || g.document.URL];
+            trust.navigationSourceBase || baseHref(), trust.navigationSourceURL || g.document.URL,
+            trust.navigationReferrerPolicy || "", trust.navigationSourceContext || topWindowState.hostSettingsContext];
         trust.navigation = null; trust.navigationReplace = false; trust.navigationReload = false;
+        trust.navigationReferrerPolicy = ""; trust.navigationSourceContext = null;
         return result;
     };
     // HTML §7.2.5 URL and history update steps are synchronous inside the
@@ -30906,6 +30967,9 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             return policy === null ? "" : policy.toLowerCase();
         },
         frameId: realmRootFrame ? nodeIds.get(realmRootFrame) : 0,
+        // The host environment settings context of this Window's Document,
+        // a navigation's source Document for the host's referrer steps.
+        settingsContext: Number(cfg.hostSettingsContext) || 0,
         // HTML #sandboxed-origin-browsing-context-flag: without allow-same-origin
         // a sandboxed navigable's Document has a fresh opaque origin.
         origin: cfg.cookieOpaque ? "null"
@@ -39490,6 +39554,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             try { return { bytes: fileAPI.bytes(entry.object), type: fileAPI.type(entry.object) }; }
             catch (_) { return null; }
         }
+        // A top-level navigation's URL parse resolved its entry: the host holds
+        // it for the navigation fetch (Fetch #scheme-fetch, not partitioned).
+        function hold(url) { __blob_url("navigate", `${url}`, null, null); }
+        // HTML #fetch-a-single-module-script for a blob: URL: whether this
+        // environment obtains a Blob whose type is a JavaScript MIME type.
+        function moduleScript(url) { return __blob_url("module", `${url}`, null, null) === true; }
         const statics = {
             // (Blob or MediaSource): this user agent has no MediaSource.
             createObjectURL(obj) {
@@ -39511,7 +39581,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         };
         for (const name of ["createObjectURL", "revokeObjectURL"])
             define(URLCtor, name, { value: statics[name], writable: true, enumerable: true, configurable: true });
-        adapter.register({ resolve, read });
+        adapter.register({ resolve, read, hold, moduleScript });
     })(globalThis);
     /*__BLOB_URL_END__*/
     /*__FETCH_BEGIN__*/
@@ -41197,9 +41267,15 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         bodyBytes = hostRequestBody(bodyBytes);
         // Argument 10 is the request's use-CORS-preflight flag (#use-cors-preflight-flag).
         const useCORSPreflight = !!request.useCORSPreflight;
+        // Arguments 12 and 13: Fetch #main-fetch steps 7-8 run in the host
+        // with the request's referrer ("client", "no-referrer" or a URL) and
+        // referrer policy ("" for the client's policy container's).
+        const referrer = typeof request.referrer === "string" ? request.referrer : "client";
+        const referrerPolicy = request.referrerPolicy || "";
         if (sync) {
             return hostResponse(request, httpFetchSync(request.url, request.method, bodyBytes, contentType, headerWire,
-                request.mode, request.credentials, initiator, undefined, undefined, useCORSPreflight));
+                request.mode, request.credentials, initiator, undefined, undefined, useCORSPreflight, false,
+                referrer, referrerPolicy));
         }
         let resolveFetch = null, settled = false;
         const promise = new PromiseCtor(function (resolve) { resolveFetch = resolve; });
@@ -41216,7 +41292,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         // stopping the document cancels.
         react(httpFetchAsync(request.url, request.method, bodyBytes, contentType, headerWire,
             request.mode, request.credentials, initiator, !!stream, request.cache, useCORSPreflight,
-            !!request.keepalive), function (result) {
+            !!request.keepalive, referrer, referrerPolicy), function (result) {
             if (settled) {
                 // Aborted meanwhile: release a transfer that already began.
                 if (result && typeof result[8] === "number") httpFetchCancel(result[8]);

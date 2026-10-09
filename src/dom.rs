@@ -632,6 +632,11 @@ pub struct Dom {
     created_images: Vec<(NodeId, bool)>,
     /// Advanced for each newly queued image creation or adoption.
     created_images_generation: u64,
+    /// HTML #meta-referrer: policies set by `<meta name=referrer>` elements
+    /// inserted into a document or whose name/content changed, with their node
+    /// document, in mutation order. The page actor applies them to the
+    /// Document's policy container before computing any request's referrer.
+    referrer_meta_updates: Vec<(NodeId, crate::referrer_policy::ReferrerPolicy)>,
     /// host element → shadow root fragment (attachShadow).
     shadow_roots: FxHashMap<NodeId, NodeId>,
     /// and the reverse: shadow root fragment → host element.
@@ -1167,6 +1172,7 @@ impl Dom {
             canvases,
             created_images,
             created_images_generation: _,
+            referrer_meta_updates: _,
             shadow_roots,
             shadow_hosts,
             shadow_data,
@@ -1738,6 +1744,7 @@ impl Dom {
             canvases: RefCell::new(FxHashMap::default()),
             created_images: Vec::new(),
             created_images_generation: 0,
+            referrer_meta_updates: Vec::new(),
             shadow_roots: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
             shadow_data: FxHashMap::default(),
@@ -4120,6 +4127,7 @@ impl Dom {
         self.note_picture_child_change(parent, child);
         self.note_track_parent_change(parent, child, true);
         self.note_autofocus_insertion(child);
+        self.note_inserted_referrer_metas(child);
     }
 
     /// Link a newly-created, detached node while constructing another detached
@@ -4413,6 +4421,7 @@ impl Dom {
         self.note_picture_child_change(parent, child);
         self.note_track_parent_change(parent, child, true);
         self.note_autofocus_insertion(child);
+        self.note_inserted_referrer_metas(child);
     }
 
     /// Implement the DOM Standard's adopt algorithm (DOM §4.5): remove the
@@ -4774,6 +4783,11 @@ impl Dom {
             self.input_attribute_changed(id, invalidated_attribute, old_input_type);
             if canvas_reset {
                 self.reset_canvas(id);
+            }
+            if invalidated_attribute.eq_ignore_ascii_case("name")
+                || invalidated_attribute.eq_ignore_ascii_case("content")
+            {
+                self.note_referrer_meta(id);
             }
         }
     }
@@ -11593,6 +11607,82 @@ impl Dom {
     /// Return images whose document is not yet ready to take them.
     pub(crate) fn requeue_created_images(&mut self, images: Vec<(NodeId, bool)>) {
         self.created_images.extend(images);
+    }
+
+    /// HTML #meta-referrer for `id`: when it is a `<meta name=referrer>` in a
+    /// document tree with a non-empty `content` naming a referrer policy (the
+    /// legacy keywords included), record that policy for its node document.
+    fn note_referrer_meta(&mut self, id: NodeId) {
+        if self.tag_name(id) != Some("meta")
+            || !self
+                .attr(id, "name")
+                .is_some_and(|name| name.eq_ignore_ascii_case("referrer"))
+        {
+            return;
+        }
+        let Some(policy) = self
+            .attr(id, "content")
+            .filter(|content| !content.is_empty())
+            .and_then(crate::referrer_policy::ReferrerPolicy::parse_meta)
+        else {
+            return;
+        };
+        // "If element is not in a document tree, then return": its root is a
+        // Document, not a shadow root or a detached subtree.
+        let mut root = id;
+        while let Some(parent) = self.nodes[root].parent {
+            root = parent;
+        }
+        if !matches!(self.nodes[root].data, NodeData::Document) {
+            return;
+        }
+        self.referrer_meta_updates.push((root, policy));
+    }
+
+    /// Run [`Self::note_referrer_meta`] for every meta element an insertion
+    /// connected, in tree order (HTML: each is "inserted into the document").
+    fn note_inserted_referrer_metas(&mut self, child: NodeId) {
+        let mut stack = vec![child];
+        while let Some(node) = stack.pop() {
+            if self.tag_name(node) == Some("meta") {
+                self.note_referrer_meta(node);
+            }
+            let mut next = self.nodes[node].last_child;
+            while let Some(kid) = next {
+                stack.push(kid);
+                next = self.nodes[kid].prev_sibling;
+            }
+        }
+    }
+
+    /// The `<meta name=referrer>` policy updates since the last call, each with
+    /// its node document, in the order they took effect.
+    pub(crate) fn take_referrer_meta_updates(
+        &mut self,
+    ) -> Vec<(NodeId, crate::referrer_policy::ReferrerPolicy)> {
+        std::mem::take(&mut self.referrer_meta_updates)
+    }
+
+    /// A parsed document's `<meta name=referrer>` result: the parser inserted
+    /// its meta elements in tree order, so the last one that names a policy is
+    /// the one in effect (HTML #meta-referrer).
+    pub(crate) fn parsed_referrer_meta_policy(
+        &self,
+        document: NodeId,
+    ) -> Option<crate::referrer_policy::ReferrerPolicy> {
+        self.descendants(document)
+            .filter(|&node| {
+                self.tag_name(node) == Some("meta")
+                    && self
+                        .attr(node, "name")
+                        .is_some_and(|name| name.eq_ignore_ascii_case("referrer"))
+            })
+            .filter_map(|node| {
+                self.attr(node, "content")
+                    .filter(|content| !content.is_empty())
+                    .and_then(crate::referrer_policy::ReferrerPolicy::parse_meta)
+            })
+            .last()
     }
 
     pub(crate) fn created_images_generation(&self) -> u64 {
@@ -27645,6 +27735,7 @@ mod tests {
             base: url.into(),
             text: text.into(),
             cors_same_origin: true,
+            referrer_policy: None,
         };
         dom.attach_external_sheets(&[
             import("https://e.test/css/a.css", ".x{color:red}.y{color:green}"),
@@ -27695,6 +27786,7 @@ mod tests {
             base: "https://e.test/late.css".into(),
             text: "@import 'deeper.css'; #p { color: rgb(1, 2, 3) }".into(),
             cors_same_origin: true,
+            referrer_policy: None,
         }]);
         assert_eq!(
             dom.computed_value(p, "color").as_deref(),

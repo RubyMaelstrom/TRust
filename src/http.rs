@@ -342,6 +342,11 @@ pub struct Request {
     /// ReadableStream body. A cross-origin "cors" request carrying it is
     /// always preflighted (Fetch #main-fetch, #http-fetch).
     pub(crate) use_cors_preflight: bool,
+    /// Fetch #concept-request-referrer-policy once the browser has chosen the
+    /// request's `Referer`: redirects re-determine the referrer under it
+    /// (Referrer Policy #set-requests-referrer-policy-on-redirect). `None`
+    /// uses the policy the caller passes to `fetch_with_timing`.
+    pub(crate) referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
 /// RFC6265bis #same-site-requests / #document-requests (1057fe0f, 2026-09-06).
@@ -562,6 +567,7 @@ impl Request {
             cookie_context: None,
             timing_client: None,
             use_cors_preflight: false,
+            referrer_policy: None,
             fetch_policy: None,
         }
     }
@@ -647,6 +653,17 @@ pub struct Response {
     /// Native Fetch timestamps, never synthesized from page JavaScript. The
     /// record follows the response into the document's own timing entry.
     pub timing: Option<Box<FetchTiming>>,
+    /// The final request's `Referer` (Fetch #concept-request-referrer after
+    /// redirects), or empty: a navigated Document's `document.referrer`.
+    pub referrer: String,
+    /// The Document's policy container referrer policy where it is not the
+    /// response's `Referrer-Policy` header (`None` takes the header): a local
+    /// document's (about:, blob:, data:) initiator's or a blob URL entry's
+    /// environment's (HTML #determine-navigation-params-policy-container,
+    /// #creating-a-policy-container-from-a-fetch-response), or, once the
+    /// static pipeline parsed the document, its `<meta name=referrer>`
+    /// (#meta-referrer). `response_referrer_policy` gives the effective policy.
+    pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
 /// A parsed HTML/HTTP declarative refresh. WHATWG HTML's shared declarative
@@ -1020,6 +1037,7 @@ pub fn adapt_rendered_terminal(
         cookie_restricted_images: rendered.cookie_restricted_images,
         deferred_images,
         blobs: None,
+        referrer_policy: Default::default(),
         carousels: output.carousels,
         fixed: output.fixed,
         regions: output.regions,
@@ -1053,11 +1071,18 @@ pub async fn fetch_graphical_image_with_cookie_policy(
     // An inline SVG's `<image>` loads as an ordinary page image of its URL;
     // the outcome is also recorded for the SVG decoder (`img::inline_svg`).
     let Some(document_image) = crate::img::document_svg_image_target(source) else {
-        return fetch_page_image(page, source, blobs, restricted)
+        return fetch_page_image(page, source, blobs, restricted, Default::default())
             .await
             .map(|(_, bytes)| bytes);
     };
-    let result = fetch_page_image(page, document_image.url(), blobs, restricted).await;
+    let result = fetch_page_image(
+        page,
+        document_image.url(),
+        blobs,
+        restricted,
+        Default::default(),
+    )
+    .await;
     crate::img::record_document_svg_image(
         &document_image,
         result
@@ -1076,12 +1101,14 @@ pub async fn fetch_graphical_image_with_cookie_policy(
 /// resumes only near the viewport), and the frontend never repeats the fetch.
 /// `data:`/`blob:` images stay local. Without a live document, or for a URL
 /// its retired page will not request, the frontend fetches as before.
+/// `referrer_policy` is the Document's policy container's referrer policy.
 pub async fn fetch_presentation_image(
     page: &Url,
     source: &str,
     blobs: Option<&crate::js::BlobMap>,
     images: Option<&crate::page_images::PageImages>,
     restricted: bool,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Result<std::sync::Arc<[u8]>, String> {
     // A CORS image (CSS Masking 1 #priv-sec, feImage `crossorigin`): the
     // document's CORS request of that mode, else the frontend's own.
@@ -1100,12 +1127,19 @@ pub async fn fetch_presentation_image(
             .map(|(_, bytes)| std::sync::Arc::from(bytes));
     }
     let Some(document_image) = crate::img::document_svg_image_target(source) else {
-        return presentation_page_image(page, source, blobs, images, restricted)
+        return presentation_page_image(page, source, blobs, images, restricted, referrer_policy)
             .await
             .map(|(_, bytes)| bytes);
     };
-    let result =
-        presentation_page_image(page, document_image.url(), blobs, images, restricted).await;
+    let result = presentation_page_image(
+        page,
+        document_image.url(),
+        blobs,
+        images,
+        restricted,
+        referrer_policy,
+    )
+    .await;
     crate::img::record_document_svg_image(
         &document_image,
         result
@@ -1125,6 +1159,7 @@ pub(crate) async fn presentation_page_image(
     blobs: Option<&crate::js::BlobMap>,
     images: Option<&crate::page_images::PageImages>,
     restricted: bool,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Result<(bool, std::sync::Arc<[u8]>), String> {
     if let Some(images) = images
         && !source.starts_with("data:")
@@ -1140,7 +1175,7 @@ pub(crate) async fn presentation_page_image(
             crate::page_images::Presentation::Unavailable => {}
         }
     }
-    fetch_page_image(page, source, blobs, restricted)
+    fetch_page_image(page, source, blobs, restricted, referrer_policy)
         .await
         .map(|(ok, bytes)| (ok, std::sync::Arc::from(bytes)))
 }
@@ -1152,6 +1187,7 @@ async fn fetch_page_image(
     source: &str,
     blobs: Option<&crate::js::BlobMap>,
     restricted: bool,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Result<(bool, Vec<u8>), String> {
     if source.starts_with("data:") {
         return crate::img::decode_data_url(source)
@@ -1177,7 +1213,7 @@ async fn fetch_page_image(
     let mut request = Request::subresource(url, page, "image", None);
     request.cookie_context.as_mut().unwrap().cross_site_ancestor = restricted;
     set_image_accept(&mut request);
-    set_referrer(&mut request, page);
+    set_request_referrer(&mut request, Some(page), referrer_policy);
     fetch(&request)
         .await
         .map(|response| ((200..300).contains(&response.status), response.body))
@@ -1193,7 +1229,7 @@ async fn fetch_cors_page_image(
     restricted: bool,
 ) -> Result<(bool, Vec<u8>), String> {
     if source.starts_with("data:") {
-        return fetch_page_image(page, source, None, restricted).await;
+        return fetch_page_image(page, source, None, restricted, Default::default()).await;
     }
     let url = Url::parse(source).map_err(|error| format!("invalid image URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -1600,21 +1636,25 @@ impl PageCache {
         )
     }
 
-    pub(crate) fn fetch_resource_with_cookies(
+    /// A subresource request the caller prepared (its cookie context and
+    /// referrer determined), shared by URL, destination, client and
+    /// credentials; a cookie-restricted request gets its own cache context.
+    pub(crate) fn fetch_prepared_resource(
         &self,
         handle: &tokio::runtime::Handle,
-        url: Url,
+        request: Request,
         client: &Url,
         destination: &'static str,
         credentials: Option<CredentialsMode>,
-        cookie_context: CookieContext,
     ) -> SharedFetch {
-        let mut request = Request::subresource(url, client, destination, credentials);
         let mut context = ResourceCacheContext::new(client, destination, credentials);
-        if cookie_context.cross_site_ancestor {
+        if request
+            .cookie_context
+            .as_ref()
+            .is_some_and(|cookies| cookies.cross_site_ancestor)
+        {
             context = ResourceCacheContext::CookieRestricted(Box::new(context));
         }
-        request.cookie_context = Some(cookie_context);
         self.fetch_request(handle, request, context)
     }
 
@@ -1931,13 +1971,9 @@ pub async fn fetch_web_default(url: &Url) -> Result<Response, String> {
 /// attempt and its HTTP fallback carry the same navigation context.
 pub async fn fetch_web_default_with_referrer(
     url: &Url,
-    referrer: Option<&Url>,
+    initiator: Option<&NavigationInitiator>,
 ) -> Result<Response, String> {
-    let mut first_request = Request::get(url.clone());
-    set_navigation_metadata(&mut first_request, referrer);
-    if let Some(source) = referrer {
-        set_referrer(&mut first_request, source);
-    }
+    let first_request = navigation_request(url.clone(), None, initiator);
     let first = fetch(&first_request).await;
     if first.is_ok() || url.scheme() != "https" {
         return first;
@@ -1946,11 +1982,7 @@ pub async fn fetch_web_default_with_referrer(
     let Some(http_url) = parse_url(&http_str) else {
         return first;
     };
-    let mut fallback_request = Request::get(http_url);
-    set_navigation_metadata(&mut fallback_request, referrer);
-    if let Some(source) = referrer {
-        set_referrer(&mut fallback_request, source);
-    }
+    let fallback_request = navigation_request(http_url, None, initiator);
     match fetch(&fallback_request).await {
         Ok(response) => Ok(response),
         Err(_) => first,
@@ -2223,6 +2255,7 @@ async fn fetch_cors_with_preflight(
             cookie_context: request.cookie_context.clone(),
             timing_client: request.timing_client.clone(),
             use_cors_preflight: false,
+            referrer_policy: request.referrer_policy,
             fetch_policy: Some(FetchPolicy {
                 origin: policy.origin.clone(),
                 mode: RequestMode::Cors,
@@ -2667,9 +2700,10 @@ async fn fetch_redirecting(
 
 async fn fetch_redirecting_inner(
     request: &Request,
-    mut policy: crate::referrer_policy::ReferrerPolicy,
+    policy: crate::referrer_policy::ReferrerPolicy,
     mut sink: BodySink<'_>,
 ) -> Result<FetchResponseDetails, TimedFetchError> {
+    let mut policy = request.referrer_policy.unwrap_or(policy);
     let navigation_start = crate::performance::now_ms();
     let mut redirect_end = 0.0;
     // Fetch's navigation TAO list contains only the timing allow values, not
@@ -2810,6 +2844,7 @@ async fn fetch_redirecting_inner(
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
                     .map_or_else(String::new, |(_, value)| value.clone());
+                response.referrer.clone_from(&referrer);
                 return Ok(FetchResponseDetails {
                     response,
                     url_list,
@@ -3793,9 +3828,9 @@ mod cookie_policy_tests {
         );
         let frames = HashMap::from([
             (page.join("/redirect").unwrap().to_string(), (url("https://third.example.net/"),
-                "<img src='https://picture.example.com/private.png'><div style=\"background-image:url(https://picture.example.com/background.png)\">x</div><iframe src='https://picture.example.com/inner'></iframe>".into(), encoding_rs::UTF_8)),
-            (page.join("/inner").unwrap().to_string(), (page.join("/inner").unwrap(), "<img src='https://picture.example.com/nested.png'>".into(), encoding_rs::UTF_8)),
-            (page.join("/same").unwrap().to_string(), (page.join("/same").unwrap(), "<img src='https://picture.example.com/allowed.png'>".into(), encoding_rs::UTF_8)),
+                "<img src='https://picture.example.com/private.png'><div style=\"background-image:url(https://picture.example.com/background.png)\">x</div><iframe src='https://picture.example.com/inner'></iframe>".into(), encoding_rs::UTF_8, Default::default())),
+            (page.join("/inner").unwrap().to_string(), (page.join("/inner").unwrap(), "<img src='https://picture.example.com/nested.png'>".into(), encoding_rs::UTF_8, Default::default())),
+            (page.join("/same").unwrap().to_string(), (page.join("/same").unwrap(), "<img src='https://picture.example.com/allowed.png'>".into(), encoding_rs::UTF_8, Default::default())),
         ]);
         install_page_frames(&mut dom, &page, &frames);
         let outer = dom
@@ -5082,6 +5117,8 @@ fn finish_response_parts(
             challenge: None,
             from_post: false,
             timing: Some(Box::new(timing)),
+            referrer: String::new(),
+            referrer_policy: None,
         });
     }
     // RFC 9110 §8.3 and MIME Sniffing §5: an absent Content-Type is unknown,
@@ -5104,6 +5141,8 @@ fn finish_response_parts(
         challenge: detect_challenge(&headers),
         from_post: false,
         timing: Some(Box::new(timing)),
+        referrer: String::new(),
+        referrer_policy: None,
     })
 }
 
@@ -6381,6 +6420,8 @@ pub(crate) fn prefetch_page_scripts(
         ),
         env.device_pixel_ratio,
         env.document_encoding,
+        // HTML #meta-referrer: as the parser will have set it for these scripts.
+        document_referrer_policy(html, env.referrer_policy),
         &env.cache,
         handle,
         report,
@@ -6392,7 +6433,8 @@ pub(crate) fn prefetch_page_scripts(
 /// static module graphs, #fetch-a-module-script-tree) and modulepreloads, as
 /// the elements would request them: URLs encoding-parsed against the
 /// document base URL (`<base href>`), CORS mode and credentials from
-/// `crossorigin`, the Referer from `referrerpolicy`. They only fill the
+/// `crossorigin`, the Referer from `referrerpolicy`, else the document's policy
+/// container's `referrer_policy`. They only fill the
 /// document's resource cache. A script runs only when the parser or the DOM
 /// prepares its element and that element's own request finds the response
 /// (`PageCache::consume_resource` matches URL, destination and credentials),
@@ -6407,6 +6449,7 @@ pub(crate) fn prefetch_parser_scripts(
     viewport_px: (f32, f32),
     device_pixel_ratio: f32,
     document_encoding: &'static encoding_rs::Encoding,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
     cache: &std::sync::Arc<PageCache>,
     handle: &tokio::runtime::Handle,
     report: std::sync::Arc<dyn Fn(crate::performance::ResourceTiming) + Send + Sync>,
@@ -6444,21 +6487,14 @@ pub(crate) fn prefetch_parser_scripts(
             let report = report.clone();
             let mut request = Request::subresource(url.clone(), client, "script", credentials);
             // The element's request computes its Referer from its
-            // `referrerpolicy` attribute (HTML #referrer-policy-attributes);
-            // the speculative request must send exactly what it would.
-            let policy = job
-                .referrer_policy
-                .as_deref()
-                .and_then(crate::referrer_policy::ReferrerPolicy::parse)
-                .unwrap_or_default();
-            request
-                .headers
-                .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
-            if let Some(referrer) = policy.determine(client, &request.url) {
-                request
-                    .headers
-                    .push(("Referer".into(), referrer.to_string()));
-            }
+            // `referrerpolicy` attribute (HTML #referrer-policy-attributes),
+            // else the Document's policy (Fetch #main-fetch step 7); the
+            // speculative request must send exactly what it would.
+            set_request_referrer(
+                &mut request,
+                Some(client),
+                job.referrer_policy.unwrap_or(referrer_policy),
+            );
             let module = job.kind == crate::js::ExternalResourceKind::Preload;
             let shared = cache.fetch_request_reporting(
                 handle,
@@ -6557,13 +6593,17 @@ async fn execute_js_with_presentation(
     if response.declarative_refresh.is_none() {
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
+    // HTML #meta-referrer: the parser applies the document's referrer
+    // metadata before its stylesheets and frames are requested.
+    let referrer_policy = document_referrer_policy(&html, response_referrer_policy(&response));
     // Keep the CSS-only path for inert documents. HTML native activation
     // (#the-summary-element, form controls) and Selectors 4 §9.1 hover state
     // need the canonical live DOM even when there are no author scripts.
     let mut prefetched_sheets = None;
     let mut scripted_frames = false;
     if !html.to_ascii_lowercase().contains("<script") {
-        let sheets = fetch_page_sheets(&html, &response.url, document_encoding).await;
+        let sheets =
+            fetch_page_sheets(&html, &response.url, document_encoding, referrer_policy).await;
         let needs_live_dom = {
             let mut probe = crate::js::css_prepare(&html, viewport, cell_px);
             probe.attach_external_sheets(&sheets);
@@ -6576,14 +6616,23 @@ async fn execute_js_with_presentation(
         let lower = html.to_ascii_lowercase();
         let frames = if !needs_live_dom && (lower.contains("<iframe") || lower.contains("<frame")) {
             let base = base_with_doc_base(&html, &response.url);
-            Some(prefetch_frame_documents(&html, &base, &response.url, document_encoding).await)
+            Some(
+                prefetch_frame_documents(
+                    &html,
+                    &base,
+                    &response.url,
+                    document_encoding,
+                    referrer_policy,
+                )
+                .await,
+            )
         } else {
             None
         };
         scripted_frames = frames.as_ref().is_some_and(|frames| {
             frames
                 .values()
-                .any(|(_, markup, _)| markup.to_ascii_lowercase().contains("<script"))
+                .any(|(_, markup, _, _)| markup.to_ascii_lowercase().contains("<script"))
         });
         if !needs_live_dom && !scripted_frames {
             return css_only_with_sheets(
@@ -6652,6 +6701,7 @@ async fn execute_js_with_presentation(
         ),
         device_pixel_ratio,
         document_encoding,
+        referrer_policy,
         &cache,
         &tokio::runtime::Handle::current(),
         std::sync::Arc::new(move |timing| {
@@ -6681,11 +6731,16 @@ async fn execute_js_with_presentation(
                     if std::env::var_os("TRUST_NET_TRACE").is_some() {
                         eprintln!("src: @{:>6}ms PREFETCH {u}", trace_ms());
                     }
-                    let request = Request::subresource(
+                    let mut request = Request::subresource(
                         u.clone(),
                         &page_url,
                         job.destination(),
                         job.cors_credentials(),
+                    );
+                    set_request_referrer(
+                        &mut request,
+                        Some(&page_url),
+                        job.referrer_policy.unwrap_or(referrer_policy),
                     );
                     Some(fetch_with_timing(&request, Default::default()).await)
                 }
@@ -6757,6 +6812,8 @@ async fn execute_js_with_presentation(
                         &r.body,
                         Some(environment),
                     );
+                    let sheet_policy =
+                        crate::referrer_policy::ReferrerPolicy::from_headers(&r.headers);
                     let fetched = fetched_stylesheet(
                         css,
                         url.clone(),
@@ -6764,6 +6821,9 @@ async fn execute_js_with_presentation(
                         response.url.clone(),
                         cors_mode,
                         encoding,
+                        SheetReferrer::document(&response.url, referrer_policy)
+                            .sheet(&url, &r.headers),
+                        sheet_policy,
                     )
                     .await;
                     sheets.push(PageSheet {
@@ -6772,6 +6832,7 @@ async fn execute_js_with_presentation(
                         base: fetched.base,
                         text: fetched.text,
                         cors_same_origin: fetched.cors_same_origin,
+                        referrer_policy: sheet_policy,
                     });
                     push_imported_sheets(&mut sheets, fetched.imports);
                 }
@@ -6788,10 +6849,12 @@ async fn execute_js_with_presentation(
         }
     }
     if !prefetched {
-        let inline = fetch_inline_style_imports(&html, &response.url, document_encoding).await;
+        let inline =
+            fetch_inline_style_imports(&html, &response.url, document_encoding, referrer_policy)
+                .await;
         push_imported_sheets(&mut sheets, inline);
     }
-    install_stylesheet_fonts(&html, &sheets, &response.url, true).await;
+    install_stylesheet_fonts(&html, &sheets, &response.url, true, referrer_policy).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
     // and decodes blob: image srcs from it even after the page froze.
     let blobs = crate::js::BlobMap::default();
@@ -6800,6 +6863,8 @@ async fn execute_js_with_presentation(
     // its responses from this store (HTML #updating-the-image-data).
     response.images = Some(cache.images());
     let env = crate::js::PageEnv {
+        referrer_policy: response_referrer_policy(&response),
+        referrer: response.referrer.clone(),
         url: response.url.to_string(),
         navigation_timing: response.timing.clone(),
         resource_timings,
@@ -6902,6 +6967,11 @@ async fn execute_js_with_presentation(
         response.content_type = String::from("text/html; charset=utf-8");
     }
     response.rendered = Some(rendered);
+    // HTML #meta-referrer: the Document's policy as its parser left it, for
+    // navigations the frontend starts.
+    if let Some(policy) = outcome.referrer_policy {
+        response.referrer_policy = Some(policy);
+    }
     response.js = Some(outcome);
     response.live = live;
     response
@@ -6915,7 +6985,12 @@ async fn execute_js_with_presentation(
 /// inline vector. Cheap-guarded: a page with no `<use>` pays one substring
 /// check. SVG 2 URL reference processing uses the document base URL; the SSRF
 /// policy remains anchored to the actual page URL.
-async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url) {
+async fn fetch_svg_sprite_sheets(
+    html: &str,
+    document_base: &Url,
+    page_url: &Url,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
+) {
     if !html.contains("<use") {
         return;
     }
@@ -6934,7 +7009,9 @@ async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url
             if crate::dom::sprite_sheet_cached(abs.as_str()) {
                 return;
             }
-            if let Ok(r) = fetch(&Request::subresource(abs.clone(), &page_url, "image", None)).await
+            let mut request = Request::subresource(abs.clone(), &page_url, "image", None);
+            set_request_referrer(&mut request, Some(&page_url), referrer_policy);
+            if let Ok(r) = fetch(&request).await
                 && (200..300).contains(&r.status)
             {
                 let text = crate::document_encoding::decode_xml(&r.body, &r.content_type).text;
@@ -6971,6 +7048,9 @@ pub struct PageSheet {
     /// #concept-response-cors-same-origin), CSSOM's origin-clean flag before
     /// an imported sheet also takes its parent's flag.
     pub cors_same_origin: bool,
+    /// The sheet's referrer policy (Referrer Policy #integration-with-css):
+    /// its response's `Referrer-Policy`, or `None` for the Document's.
+    pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
 impl PageSheet {
@@ -6984,6 +7064,7 @@ impl PageSheet {
             base: href,
             text: text.into(),
             cors_same_origin: true,
+            referrer_policy: None,
         }
     }
 }
@@ -6998,8 +7079,62 @@ pub struct FetchedStyleSheet {
     pub base: String,
     /// The response was CORS-same-origin.
     pub cors_same_origin: bool,
+    /// The sheet's own referrer policy, as `PageSheet::referrer_policy`.
+    pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
     /// Its imported sheets, in the order the imports first reached them.
     pub imports: Vec<PageSheet>,
+}
+
+/// Referrer Policy #integration-with-css: the request referrer and referrer
+/// policy of the requests a style sheet is responsible for (its `@import`
+/// rules and `@font-face` sources).
+#[derive(Clone, Debug)]
+pub(crate) struct SheetReferrer {
+    /// The sheet's location, or for a sheet without one (an inline `<style>`)
+    /// its owner node's document's URL; none for a Document with an opaque
+    /// origin (Fetch #determine-requests-referrer).
+    pub(crate) source: Option<Url>,
+    /// The sheet's referrer policy, else its document's policy container's.
+    pub(crate) policy: crate::referrer_policy::ReferrerPolicy,
+    /// The document's policy container referrer policy, for imported sheets
+    /// whose responses name no policy.
+    pub(crate) document_policy: crate::referrer_policy::ReferrerPolicy,
+}
+
+impl SheetReferrer {
+    /// A sheet with a null location in the Document at `url`.
+    pub(crate) fn document(url: &Url, policy: crate::referrer_policy::ReferrerPolicy) -> Self {
+        Self {
+            source: url.origin().is_tuple().then(|| url.clone()),
+            policy,
+            document_policy: policy,
+        }
+    }
+
+    /// The sheet located at `location` whose response's headers are `headers`.
+    pub(crate) fn sheet(&self, location: &Url, headers: &[(String, String)]) -> Self {
+        Self::located(location, headers, self.document_policy)
+    }
+
+    /// The sheet located at `location` whose response's headers are
+    /// `headers`, in a Document whose policy container's policy is
+    /// `document_policy`.
+    pub(crate) fn located(
+        location: &Url,
+        headers: &[(String, String)],
+        document_policy: crate::referrer_policy::ReferrerPolicy,
+    ) -> Self {
+        Self {
+            source: Some(location.clone()),
+            policy: crate::referrer_policy::ReferrerPolicy::from_headers(headers)
+                .unwrap_or(document_policy),
+            document_policy,
+        }
+    }
+
+    fn apply(&self, request: &mut Request) {
+        set_request_referrer(request, self.source.as_ref(), self.policy);
+    }
 }
 
 /// Fetch #concept-response-cors-same-origin for a style sheet response: a
@@ -7082,6 +7217,7 @@ async fn fetch_page_sheets(
     html: &str,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Vec<PageSheet> {
     let base = base_with_doc_base(html, page_url);
     let jobs = crate::js::external_resources(html)
@@ -7099,14 +7235,18 @@ async fn fetch_page_sheets(
                     .filter(|u| subresource_allowed(&page_url, u));
             let cors_mode = job.cors_credentials().is_some();
             let resp = match &resolved {
-                Some(u) => fetch(&Request::subresource(
-                    u.clone(),
-                    &page_url,
-                    "style",
-                    job.cors_credentials(),
-                ))
-                .await
-                .ok(),
+                Some(u) => {
+                    let mut request =
+                        Request::subresource(u.clone(), &page_url, "style", job.cors_credentials());
+                    // HTML #referrer-policy-attributes: the link's policy, else
+                    // the Document's (Fetch #main-fetch step 7).
+                    set_request_referrer(
+                        &mut request,
+                        Some(&page_url),
+                        job.referrer_policy.unwrap_or(referrer_policy),
+                    );
+                    fetch(&request).await.ok()
+                }
                 None => None,
             };
             (job.source, job.charset, resolved, resp, cors_mode)
@@ -7134,6 +7274,9 @@ async fn fetch_page_sheets(
             text: absolutize_css_urls(&css, &response.url),
             url: url.to_string(),
             base: response.url.to_string(),
+            referrer_policy: crate::referrer_policy::ReferrerPolicy::from_headers(
+                &response.headers,
+            ),
         };
         // Stream the boxed futures themselves: a closure taking the encoding
         // reference and returning an async block would be lifetime-generic,
@@ -7144,6 +7287,7 @@ async fn fetch_page_sheets(
             page_url.clone(),
             vec![sheet.url.clone()],
             encoding,
+            SheetReferrer::document(page_url, referrer_policy).sheet(&url, &response.headers),
         );
         Some((sheet, imports))
     })
@@ -7156,7 +7300,7 @@ async fn fetch_page_sheets(
     for imported in imported {
         push_imported_sheets(&mut sheets, imported);
     }
-    let inline = fetch_inline_style_imports(html, page_url, encoding).await;
+    let inline = fetch_inline_style_imports(html, page_url, encoding, referrer_policy).await;
     push_imported_sheets(&mut sheets, inline);
     sheets
 }
@@ -7181,19 +7325,26 @@ async fn fetch_inline_style_imports(
     html: &str,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
 ) -> Vec<PageSheet> {
     if !html.to_ascii_lowercase().contains("@import") {
         return Vec::new();
     }
     let base = base_with_doc_base(html, page_url);
     let styles = crate::dom::Dom::parse_document(html).inline_stylesheets();
-    let fetched: Vec<Vec<PageSheet>> =
-        futures::stream::iter(styles.into_iter().map(|css| {
-            fetch_sheet_imports(css, base.clone(), page_url.clone(), Vec::new(), encoding)
-        }))
-        .buffered(PREFETCH_CONCURRENCY)
-        .collect()
-        .await;
+    let fetched: Vec<Vec<PageSheet>> = futures::stream::iter(styles.into_iter().map(|css| {
+        fetch_sheet_imports(
+            css,
+            base.clone(),
+            page_url.clone(),
+            Vec::new(),
+            encoding,
+            SheetReferrer::document(page_url, referrer_policy),
+        )
+    }))
+    .buffered(PREFETCH_CONCURRENCY)
+    .collect()
+    .await;
     let mut sheets = Vec::new();
     for imported in fetched {
         push_imported_sheets(&mut sheets, imported);
@@ -7228,6 +7379,8 @@ pub(crate) struct CssImport {
 /// `request` is the URL the element requested and `cors_mode` whether that
 /// was a CORS request. `encoding` is the sheet's own encoding, its imports'
 /// environment encoding.
+/// `referrer` is the sheet's own (`SheetReferrer::sheet`), for its imports.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetched_stylesheet(
     css: String,
     request: Url,
@@ -7235,6 +7388,8 @@ pub(crate) async fn fetched_stylesheet(
     client: Url,
     cors_mode: bool,
     encoding: &'static encoding_rs::Encoding,
+    referrer: SheetReferrer,
+    referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 ) -> FetchedStyleSheet {
     let text = absolutize_css_urls(&css, &sheet_url);
     let imports = fetch_sheet_imports(
@@ -7243,12 +7398,14 @@ pub(crate) async fn fetched_stylesheet(
         client.clone(),
         vec![request.to_string()],
         encoding,
+        referrer,
     )
     .await;
     FetchedStyleSheet {
         cors_same_origin: sheet_cors_same_origin(&client, &request, &sheet_url, cors_mode),
         base: sheet_url.to_string(),
         text,
+        referrer_policy,
         imports,
     }
 }
@@ -7267,6 +7424,7 @@ fn fetch_sheet_imports(
     client: Url,
     ancestry: Vec<String>,
     encoding: &'static encoding_rs::Encoding,
+    referrer: SheetReferrer,
 ) -> futures::future::BoxFuture<'static, Vec<PageSheet>> {
     use futures::FutureExt as _;
     async move {
@@ -7286,8 +7444,14 @@ fn fetch_sheet_imports(
             {
                 continue;
             }
-            let fetched =
-                fetch_imported_sheet(url, client.clone(), ancestry.clone(), encoding).await;
+            let fetched = fetch_imported_sheet(
+                url,
+                client.clone(),
+                ancestry.clone(),
+                encoding,
+                referrer.clone(),
+            )
+            .await;
             push_imported_sheets(&mut sheets, fetched);
         }
         sheets
@@ -7300,15 +7464,19 @@ fn fetch_sheet_imports(
 /// encoding, and fetch its own imports. Returns the sheet followed by the
 /// sheets its imports reached; nothing when the fetch fails or the
 /// response is not a style sheet.
+/// `referrer` is the importing sheet's (Referrer Policy #integration-with-css).
 pub(crate) fn fetch_imported_sheet(
     url: Url,
     client: Url,
     ancestry: Vec<String>,
     encoding: &'static encoding_rs::Encoding,
+    referrer: SheetReferrer,
 ) -> futures::future::BoxFuture<'static, Vec<PageSheet>> {
     use futures::FutureExt as _;
     async move {
-        let Some(response) = fetch(&Request::subresource(url.clone(), &client, "style", None))
+        let mut request = Request::subresource(url.clone(), &client, "style", None);
+        referrer.apply(&mut request);
+        let Some(response) = fetch(&request)
             .await
             .ok()
             .and_then(StylesheetResponseExt::filter_stylesheet)
@@ -7329,6 +7497,7 @@ pub(crate) fn fetch_imported_sheet(
             client.clone(),
             child_ancestry,
             child_encoding,
+            referrer.sheet(&url, &response.headers),
         )
         .await;
         let mut sheets = vec![PageSheet {
@@ -7337,6 +7506,9 @@ pub(crate) fn fetch_imported_sheet(
             url: url.to_string(),
             base: response.url.to_string(),
             text,
+            referrer_policy: crate::referrer_policy::ReferrerPolicy::from_headers(
+                &response.headers,
+            ),
         }];
         push_imported_sheets(&mut sheets, nested);
         sheets
@@ -8126,6 +8298,8 @@ struct DocumentFontFace {
     sources: Vec<DocumentFontSource>,
     unicode_range: Vec<(u32, u32)>,
     descriptors: crate::font_system::FaceDescriptors,
+    /// The declaring sheet's requests' referrer (Referrer Policy #integration-with-css).
+    referrer: SheetReferrer,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -8144,18 +8318,39 @@ impl DocumentFontSource {
     }
 }
 
-fn document_font_faces(html: &str, sheets: &[PageSheet], page_url: &Url) -> Vec<DocumentFontFace> {
+fn document_font_faces(
+    html: &str,
+    sheets: &[PageSheet],
+    page_url: &Url,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
+) -> Vec<DocumentFontFace> {
     // CSS Fonts 4 §4.1 defines downloadable faces from the complete set of
     // sheets belonging to the document. Inline style URLs use the document
     // base URL; external-sheet URLs were made absolute against their own sheet
     // when they were fetched (`PageSheet::text`).
     let document_base = base_with_doc_base(html, page_url);
     let inline = crate::dom::Dom::parse_document(html).inline_stylesheets();
+    let document = SheetReferrer::document(page_url, referrer_policy);
     inline
         .iter()
-        .chain(sheets.iter().map(|sheet| &sheet.text))
-        .flat_map(|css| stylesheet_font_faces(css))
-        .filter_map(|face| {
+        .map(|css| (css, document.clone()))
+        .chain(sheets.iter().map(|sheet| {
+            let referrer = match Url::parse(&sheet.url) {
+                Ok(location) => SheetReferrer {
+                    source: Some(location),
+                    policy: sheet.referrer_policy.unwrap_or(referrer_policy),
+                    document_policy: referrer_policy,
+                },
+                Err(_) => document.clone(),
+            };
+            (&sheet.text, referrer)
+        }))
+        .flat_map(|(css, referrer)| {
+            stylesheet_font_faces(css)
+                .into_iter()
+                .map(move |face| (face, referrer.clone()))
+        })
+        .filter_map(|(face, referrer)| {
             let sources = face
                 .sources
                 .into_iter()
@@ -8177,6 +8372,7 @@ fn document_font_faces(html: &str, sheets: &[PageSheet], page_url: &Url) -> Vec<
                 sources,
                 unicode_range: face.unicode_range,
                 descriptors: face.descriptors,
+                referrer,
             })
         })
         .collect()
@@ -8225,15 +8421,17 @@ async fn load_document_face(
             }
             continue;
         }
-        let response = fetch(&Request::subresource(
+        let mut request = Request::subresource(
             url.clone(),
             page_url,
             "font",
             Some(CredentialsMode::SameOrigin),
-        ))
-        .await
-        .ok()
-        .filter(|response| (200..300).contains(&response.status));
+        );
+        face.referrer.apply(&mut request);
+        let response = fetch(&request)
+            .await
+            .ok()
+            .filter(|response| (200..300).contains(&response.status));
         let font = response.and_then(|response| {
             crate::font_system::PageFont::from_web_resource(family.clone(), response.body)
                 .and_then(|font| font.select_face(url.fragment()))
@@ -8254,9 +8452,16 @@ async fn load_document_face(
 /// late faces, used if they load within their swap period. A document
 /// rendered once (`!live`) waits through the swap period instead, so each
 /// face is either used or, after it, a failed load.
-async fn install_stylesheet_fonts(html: &str, sheets: &[PageSheet], page_url: &Url, live: bool) {
+/// `referrer_policy` is the document's policy container's referrer policy.
+async fn install_stylesheet_fonts(
+    html: &str,
+    sheets: &[PageSheet],
+    page_url: &Url,
+    live: bool,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
+) {
     let started = tokio::time::Instant::now();
-    let faces = document_font_faces(html, sheets, page_url);
+    let faces = document_font_faces(html, sheets, page_url, referrer_policy);
     let mut late = Vec::new();
     let fonts = futures::stream::iter(faces.into_iter().map(|face| {
         let (block, swap) = face.descriptors.display.periods();
@@ -8369,7 +8574,8 @@ async fn css_only_for_device(
     if response.declarative_refresh.is_none() {
         response.declarative_refresh = detect_declarative_refresh(&response, &html);
     }
-    let sheets = fetch_page_sheets(&html, &response.url, decoded.encoding).await;
+    let referrer_policy = document_referrer_policy(&html, response_referrer_policy(&response));
+    let sheets = fetch_page_sheets(&html, &response.url, decoded.encoding, referrer_policy).await;
     css_only_with_sheets(
         response,
         viewport,
@@ -8397,23 +8603,36 @@ async fn css_only_with_sheets(
 ) -> Response {
     let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
     let (html, document_encoding) = (decoded.text, decoded.encoding);
-    install_stylesheet_fonts(&html, &sheets, &response.url, false).await;
+    // HTML #meta-referrer: the policy container referrer policy the parsed
+    // document leaves for its requests and the frontend's navigations.
+    let referrer_policy = document_referrer_policy(&html, response_referrer_policy(&response));
+    response.referrer_policy = Some(referrer_policy);
+    install_stylesheet_fonts(&html, &sheets, &response.url, false, referrer_policy).await;
     let base = base_with_doc_base(&html, &response.url);
-    fetch_svg_sprite_sheets(&html, &base, &response.url).await;
+    fetch_svg_sprite_sheets(&html, &base, &response.url, referrer_policy).await;
     // The frame documents are fetched up front into a url→content map (Dom is
     // not `Send`, so it must never cross an `.await`), then installed into the
     // real arena synchronously.
     let frames = match frames {
         Some(frames) => frames,
-        None => prefetch_frame_documents(&html, &base, &response.url, document_encoding).await,
+        None => {
+            prefetch_frame_documents(
+                &html,
+                &base,
+                &response.url,
+                document_encoding,
+                referrer_policy,
+            )
+            .await
+        }
     };
     // A nested document owns its stylesheets (HTML #the-iframe-element): fetch
     // each frame's `<link rel=stylesheet>` against that frame's own URL. The
     // installed frame tree carries absolutized hrefs, so key them absolutely.
     let mut frame_sheets = Vec::new();
-    for (frame_url, markup, encoding) in frames.values() {
+    for (frame_url, markup, encoding, frame_policy) in frames.values() {
         let frame_base = base_with_doc_base(markup, frame_url);
-        for mut sheet in fetch_page_sheets(markup, frame_url, encoding).await {
+        for mut sheet in fetch_page_sheets(markup, frame_url, encoding, *frame_policy).await {
             if let Some(source) = sheet.link_href.take() {
                 match frame_base.join(&source) {
                     Ok(url) => sheet.link_href = Some(url.to_string()),
@@ -8815,7 +9034,17 @@ fn scan_frame_sources(
 
 /// Prefetched frame documents by requested URL: the final URL, the decoded
 /// markup and its character encoding.
-type FrameDocuments = HashMap<String, (Url, String, &'static encoding_rs::Encoding)>;
+/// Each frame `src`'s document: its URL, markup, encoding, and policy
+/// container referrer policy (HTML #meta-referrer applied).
+type FrameDocuments = HashMap<
+    String,
+    (
+        Url,
+        String,
+        &'static encoding_rs::Encoding,
+        crate::referrer_policy::ReferrerPolicy,
+    ),
+>;
 
 /// Fetch every frame document a script-less page (and its nested frames) needs,
 /// into a `url → content` map, breadth-first so each level's `src` fetches
@@ -8828,17 +9057,20 @@ async fn prefetch_frame_documents(
     base: &Url,
     page_url: &Url,
     encoding: &'static encoding_rs::Encoding,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
 ) -> FrameDocuments {
     use std::collections::VecDeque;
     let mut map = FrameDocuments::new();
     // (document markup, its base, fragment-stripped ancestor URLs, the URL
-    // that determines its origin, its character encoding)
+    // that determines its origin, its character encoding, its policy
+    // container's referrer policy)
     type Pending = (
         String,
         Url,
         Vec<String>,
         Url,
         &'static encoding_rs::Encoding,
+        crate::referrer_policy::ReferrerPolicy,
     );
     let mut queue: VecDeque<Pending> = VecDeque::new();
     queue.push_back((
@@ -8847,9 +9079,12 @@ async fn prefetch_frame_documents(
         vec![strip_fragment(page_url.as_str()).to_string()],
         page_url.clone(),
         encoding,
+        referrer_policy,
     ));
 
-    while let Some((markup, base, ancestors, origin_url, encoding)) = queue.pop_front() {
+    while let Some((markup, base, ancestors, origin_url, encoding, referrer_policy)) =
+        queue.pop_front()
+    {
         let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors, encoding);
 
         let cookie_ancestor = ancestors.iter().any(|ancestor| {
@@ -8859,16 +9094,30 @@ async fn prefetch_frame_documents(
         });
         // Fetch this level's `src` documents concurrently.
         let origin_url = &origin_url;
-        let fetched: Vec<Option<(Url, Url, String, &'static encoding_rs::Encoding)>> =
+        type Fetched = (
+            Url,
+            Url,
+            String,
+            &'static encoding_rs::Encoding,
+            crate::referrer_policy::ReferrerPolicy,
+        );
+        let fetched: Vec<Option<Fetched>> =
             futures::stream::iter(srcs.into_iter().map(|url| async move {
                 if url.scheme() == "data" {
                     // The CSS-only presentation never reads a data: frame's
-                    // encoding; its nested documents are cross-origin.
-                    return data_frame_document(&url)
-                        .map(|body| (url.clone(), url, body, encoding_rs::UTF_8));
+                    // encoding; its nested documents are cross-origin. A local
+                    // URL's Document inherits its initiator's policy container
+                    // (HTML #determine-navigation-params-policy-container).
+                    return data_frame_document(&url).map(|body| {
+                        let policy = document_referrer_policy(&body, referrer_policy);
+                        (url.clone(), url, body, encoding_rs::UTF_8, policy)
+                    });
                 }
                 let mut request = Request::subresource(url.clone(), page_url, "iframe", None);
                 request.cookie_context.as_mut().unwrap().cross_site_ancestor = cookie_ancestor;
+                // Fetch #determine-requests-referrer: the containing Document's
+                // URL under its policy container's referrer policy.
+                set_request_referrer(&mut request, Some(origin_url), referrer_policy);
                 let resp = fetch(&request).await.ok()?;
                 let media = resp
                     .content_type
@@ -8890,13 +9139,15 @@ async fn prefetch_frame_documents(
                     &resp.body,
                     container,
                 );
-                Some((url, resp.url, decoded.text, decoded.encoding))
+                let policy =
+                    document_referrer_policy(&decoded.text, response_referrer_policy(&resp));
+                Some((url, resp.url, decoded.text, decoded.encoding, policy))
             }))
             .buffered(PREFETCH_CONCURRENCY)
             .collect()
             .await;
 
-        for (requested, url, body, child_encoding) in fetched.into_iter().flatten() {
+        for (requested, url, body, child_encoding, policy) in fetched.into_iter().flatten() {
             let mut child_ancestors = ancestors.clone();
             child_ancestors.push(strip_fragment(url.as_str()).to_string());
             // Nested frames in the fetched content resolve against ITS url.
@@ -8906,19 +9157,24 @@ async fn prefetch_frame_documents(
                 child_ancestors,
                 url.clone(),
                 child_encoding,
+                policy,
             ));
-            map.insert(requested.to_string(), (url, body, child_encoding));
+            map.insert(requested.to_string(), (url, body, child_encoding, policy));
         }
         // srcdoc bodies hold no URL of their own; recurse to load THEIR frames
         // (base/origin inherit the parent document, per about:srcdoc). Their
         // source is already decoded text (HTML #charset), hence UTF-8.
         for srcdoc in srcdocs {
+            // HTML #determine-navigation-params-policy-container: an
+            // about:srcdoc Document's container is its parent's.
+            let policy = document_referrer_policy(&srcdoc, referrer_policy);
             queue.push_back((
                 srcdoc,
                 base.clone(),
                 ancestors.clone(),
                 origin_url.clone(),
                 encoding_rs::UTF_8,
+                policy,
             ));
         }
     }
@@ -8987,7 +9243,7 @@ fn install_page_frames(dom: &mut crate::dom::Dom, page_url: &Url, fetched: &Fram
             }
             if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
                 && let Some(url) = resolve_frame_src(src, &base, page_url, &ancestors, encoding)
-                && let Some((final_url, content, child_encoding)) = fetched.get(url.as_str())
+                && let Some((final_url, content, child_encoding, _)) = fetched.get(url.as_str())
             {
                 plans.push((
                     id,
@@ -9069,6 +9325,18 @@ pub(crate) fn is_ad_or_tracker_host(host: &str) -> bool {
 /// always fine (localhost dev included). Known ad/tracker networks are
 /// blocked outright (see `AD_TRACKER_HOSTS`).
 pub(crate) fn subresource_allowed(page: &Url, script: &Url) -> bool {
+    // A blob: Document's origin is its URL's origin, that of the URL in its
+    // path (URL #concept-url-origin): gate its requests by that host.
+    let inner;
+    let page = if page.scheme() == "blob"
+        && let Ok(url) = Url::parse(page.path())
+        && matches!(url.scheme(), "http" | "https")
+    {
+        inner = url;
+        &inner
+    } else {
+        page
+    };
     // A shared absent host is not an origin or filesystem permission. In
     // particular, data:/about: documents must never inherit file access.
     if script.scheme() == "file" {
@@ -9235,41 +9503,235 @@ pub fn set_navigation_metadata(req: &mut Request, referrer: Option<&Url>) {
     });
 }
 
+/// HTML #creating-a-policy-container-from-a-fetch-response and
+/// #determine-navigation-params-policy-container: a navigated Document's
+/// policy container referrer policy (Referrer Policy #parse-referrer-policy-from-header).
+pub fn response_referrer_policy(response: &Response) -> crate::referrer_policy::ReferrerPolicy {
+    response
+        .referrer_policy
+        .or_else(|| crate::referrer_policy::ReferrerPolicy::from_headers(&response.headers))
+        .unwrap_or_default()
+}
+
+/// HTML #meta-referrer once the parser has inserted a document's elements:
+/// the last `<meta name=referrer>` with a valid `content` sets the policy
+/// container's referrer policy, else it keeps `container` (the response's).
+pub(crate) fn document_referrer_policy(
+    html: &str,
+    container: crate::referrer_policy::ReferrerPolicy,
+) -> crate::referrer_policy::ReferrerPolicy {
+    // Most documents name no referrer metadata; skip their second parse.
+    if !html
+        .as_bytes()
+        .windows(8)
+        .any(|window| window.eq_ignore_ascii_case(b"referrer"))
+    {
+        return container;
+    }
+    crate::dom::Dom::parse_document(html)
+        .parsed_referrer_meta_policy(crate::dom::DOCUMENT)
+        .unwrap_or(container)
+}
+
+/// HTML #navigate's source Document as its navigation request sees it (the
+/// request's client), with the hyperlink's or form's referrer policy.
+#[derive(Clone, Debug)]
+pub struct NavigationInitiator {
+    /// The source Document's URL: Fetch Metadata's and SameSite's client.
+    pub client: Url,
+    /// Fetch #concept-request-referrer once "client" is resolved
+    /// (#determine-requests-referrer): the source Document's URL, or `None`
+    /// for an opaque origin.
+    pub referrer: Option<Url>,
+    /// Fetch #concept-request-referrer-policy after main fetch step 7: the
+    /// navigation's `referrerPolicy` (the hyperlink's `referrerpolicy` or
+    /// `noreferrer`, the form's `noreferrer`), else the source Document's.
+    pub referrer_policy: crate::referrer_policy::ReferrerPolicy,
+    /// The source Document's policy container referrer policy, which a local
+    /// URL's Document inherits (#determine-navigation-params-policy-container).
+    pub policy_container: crate::referrer_policy::ReferrerPolicy,
+    /// URL #concept-url-blob-entry: the entry a `blob:` target's URL parse
+    /// resolved, which the navigation fetch obtains (Fetch #scheme-fetch).
+    pub blob: Option<std::sync::Arc<crate::blob_url_store::BlobUrlEntry>>,
+}
+
+impl NavigationInitiator {
+    /// A navigation from the Document at `url` under its policy container's
+    /// referrer `policy`, with no element-specific referrer policy.
+    pub fn document(url: &Url, policy: crate::referrer_policy::ReferrerPolicy) -> Self {
+        Self {
+            client: url.clone(),
+            referrer: url.origin().is_tuple().then(|| url.clone()),
+            referrer_policy: policy,
+            policy_container: policy,
+            blob: None,
+        }
+    }
+
+    /// A browser-initiated navigation to a `blob:` URL the user entered (or a
+    /// link the frontend followed for a Document without a page actor), whose
+    /// entry the page's store resolved: no source Document, so no referrer, and
+    /// the Document takes the entry's environment's policy container (HTML
+    /// #determine-navigation-params-policy-container).
+    pub fn user_blob(
+        url: &Url,
+        entry: std::sync::Arc<crate::blob_url_store::BlobUrlEntry>,
+    ) -> Self {
+        Self {
+            client: url.clone(),
+            referrer: None,
+            referrer_policy: crate::referrer_policy::ReferrerPolicy::NoReferrer,
+            policy_container: entry.referrer_policy,
+            blob: Some(entry),
+        }
+    }
+
+    /// Fetch #main-fetch steps 7-8 and Fetch Metadata for a navigation
+    /// request from this initiator.
+    pub(crate) fn apply(&self, request: &mut Request) {
+        set_request_referrer(request, self.referrer.as_ref(), self.referrer_policy);
+        set_navigation_metadata(request, Some(&self.client));
+    }
+}
+
+/// A `blob:` URL record, for a navigation target (URL #concept-basic-url-parser).
+pub fn parse_blob_url(s: &str) -> Option<Url> {
+    let s = s.trim();
+    s.get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("blob:"))
+        .then(|| Url::parse(s).ok())
+        .flatten()
+}
+
+/// URL #concept-url-blob-entry for a top-level navigation to `url`: the entry
+/// the navigation's own URL parse resolved, else the one `store` (the current
+/// page's blob URL store) holds now. A navigation from no Document gets the
+/// entry through `NavigationInitiator::user_blob`.
+pub fn with_blob_entry(
+    url: &Url,
+    initiator: Option<NavigationInitiator>,
+    store: Option<&crate::blob_url_store::BlobUrlStore>,
+) -> Option<NavigationInitiator> {
+    if url.scheme() != "blob"
+        || initiator
+            .as_ref()
+            .is_some_and(|initiator| initiator.blob.is_some())
+    {
+        return initiator;
+    }
+    let Some(entry) = store.and_then(|store| store.resolve(url.as_str())) else {
+        return initiator;
+    };
+    Some(match initiator {
+        Some(mut initiator) => {
+            initiator.blob = Some(entry);
+            initiator
+        }
+        None => NavigationInitiator::user_blob(url, entry),
+    })
+}
+
+/// HTML #create-navigation-request: a GET, or a POST of a form's entity
+/// `body`, for the top-level traversable from `initiator` (none for a
+/// browser-initiated navigation, which has no referrer).
+pub fn navigation_request(
+    url: Url,
+    body: Option<(String, Vec<u8>)>,
+    initiator: Option<&NavigationInitiator>,
+) -> Request {
+    let mut request = Request::get(url);
+    if body.is_some() {
+        request.method = String::from("POST");
+        request.body = body;
+    }
+    match initiator {
+        Some(initiator) => initiator.apply(&mut request),
+        None => set_navigation_metadata(&mut request, None),
+    }
+    request
+}
+
+/// Fetch #scheme-fetch "blob" for a top-level navigation (destination
+/// "document", so File API #blob-url-obtain-object runs without the partition
+/// check): the Blob of the entry the URL parse resolved, as a 200 response with
+/// its type. HTML #determine-navigation-params-policy-container gives a local
+/// URL its initiator's policy container, else the entry's environment's
+/// (#creating-a-policy-container-from-a-fetch-response). The Document's origin
+/// is the entry's environment's (URL #concept-url-origin, HTML
+/// #determining-the-origin).
+pub fn blob_navigation_response(
+    url: &Url,
+    initiator: Option<&NavigationInitiator>,
+) -> Result<Response, String> {
+    if url.scheme() != "blob" {
+        return Err(format!("not a blob URL: {url}"));
+    }
+    let entry = initiator
+        .and_then(|initiator| initiator.blob.as_ref())
+        .ok_or_else(|| format!("blob URL is not in the blob URL store: {url}"))?;
+    let body = entry.read().map_err(|error| error.message().to_string())?;
+    let content_type = entry.content_type.clone();
+    let referrer = initiator
+        .and_then(|initiator| {
+            let source = initiator.referrer.as_ref()?;
+            initiator.referrer_policy.determine(source, url)
+        })
+        .map_or_else(String::new, String::from);
+    Ok(Response {
+        url: url.clone(),
+        status: 200,
+        status_text: String::new(),
+        headers: vec![
+            (String::from("content-length"), body.len().to_string()),
+            (String::from("content-type"), content_type.clone()),
+        ],
+        content_type,
+        body,
+        rendered: None,
+        js: None,
+        blobs: None,
+        live: None,
+        images: None,
+        declarative_refresh: None,
+        challenge: None,
+        from_post: false,
+        timing: None,
+        referrer,
+        referrer_policy: Some(initiator.map_or(entry.referrer_policy, |initiator| {
+            initiator.policy_container
+        })),
+    })
+}
+
 /// The `Referer` value to send when the document at `page` requests
 /// `target`, under the browser default referrer policy
-/// (`strict-origin-when-cross-origin`):
-///   - `page` isn't http(s): no referrer.
-///   - https → http (a downgrade): no referrer (never leak a secure URL).
-///   - same origin: the full page URL, minus fragment and credentials.
-///   - cross origin: the page's origin only (`scheme://host[:port]/`).
+/// (`strict-origin-when-cross-origin`): one shared implementation of Fetch
+/// #determine-requests-referrer (`referrer_policy::ReferrerPolicy::determine`).
 ///
 /// This is host-agnostic browser behaviour. Hotlink-protected image/media
 /// CDNs (gelbooru and many boorus, plenty of CDNs) answer a refererless
 /// request with a 302/403 to a placeholder instead of the file; sending
 /// what a browser sends is what makes their subresources load.
 pub fn referrer_for(page: &Url, target: &Url) -> Option<String> {
-    if !matches!(page.scheme(), "http" | "https") {
-        return None;
-    }
-    if page.scheme() == "https" && target.scheme() == "http" {
-        return None;
-    }
-    if same_origin(page, target) {
-        let mut r = page.clone();
-        r.set_fragment(None);
-        let _ = r.set_username("");
-        let _ = r.set_password(None);
-        Some(r.to_string())
-    } else {
-        Some(format!("{}/", page.origin().ascii_serialization()))
-    }
+    crate::referrer_policy::ReferrerPolicy::default()
+        .determine(page, target)
+        .map(String::from)
 }
 
-/// Add a `Referer` header to `req` (for `page`) unless the page-supplied
-/// headers already carry one. Used by every document-initiated request —
-/// subresource loads and the page's own `fetch()`/XHR — so they look like
-/// a browser's. No-op when policy says to send nothing.
+/// Add a `Referer` header to `req` (for `page`, under the default referrer
+/// policy) unless the request already carries one.
 pub fn set_referrer(req: &mut Request, page: &Url) {
+    set_referrer_with_policy(req, page, crate::referrer_policy::ReferrerPolicy::default());
+}
+
+/// Fetch #main-fetch step 8: the `Referer` of a request whose referrer source is
+/// `source` (a client's document or creation URL, a style sheet's location, or a
+/// URL `RequestInit` chose) under `policy`, unless the request already has one.
+pub(crate) fn set_referrer_with_policy(
+    req: &mut Request,
+    source: &Url,
+    policy: crate::referrer_policy::ReferrerPolicy,
+) {
     if req
         .headers
         .iter()
@@ -9277,9 +9739,39 @@ pub fn set_referrer(req: &mut Request, page: &Url) {
     {
         return;
     }
-    if let Some(referer) = referrer_for(page, &req.url) {
-        req.headers.push((String::from("Referer"), referer));
+    req.referrer_policy = Some(policy);
+    if let Some(referer) = policy.determine(source, &req.url) {
+        req.headers
+            .push((String::from("Referer"), referer.to_string()));
     }
+}
+
+/// Replace a request's `Referer` with the referrer determined under `policy`
+/// (or none), recording the policy for redirects.
+pub(crate) fn replace_referrer(
+    req: &mut Request,
+    referrer: Option<&Url>,
+    policy: crate::referrer_policy::ReferrerPolicy,
+) {
+    req.headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
+    req.referrer_policy = Some(policy);
+    if let Some(referrer) = referrer {
+        req.headers
+            .push((String::from("Referer"), referrer.to_string()));
+    }
+}
+
+/// Fetch #main-fetch step 8 for a browser-owned request whose referrer is the
+/// client (or a style sheet): replace any default `Referer` with the referrer
+/// `source` yields under `policy`.
+pub(crate) fn set_request_referrer(
+    req: &mut Request,
+    source: Option<&Url>,
+    policy: crate::referrer_policy::ReferrerPolicy,
+) {
+    let referrer = source.and_then(|source| policy.determine(source, &req.url));
+    replace_referrer(req, referrer.as_ref(), policy);
 }
 
 /// Set Fetch's image-destination `Accept` default on an image subresource.
@@ -9511,6 +10003,7 @@ pub fn parse_seeded(
         image_urls,
         deferred_images: Vec::new(),
         blobs: None,
+        referrer_policy: Default::default(),
         carousels,
         fixed,
         regions,
@@ -11001,6 +11494,227 @@ mod tests {
         ));
     }
 
+    fn html_response(url: &Url, headers: Vec<(String, String)>, body: &str) -> Response {
+        Response {
+            url: url.clone(),
+            status: 200,
+            status_text: String::new(),
+            content_type: String::from("text/html"),
+            headers,
+            body: body.as_bytes().to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            images: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+            timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn static_pipeline_requests_follow_the_document_referrer_policy() {
+        // HTML #meta-referrer (legacy "always" is unsafe-url, overriding the
+        // response's Referrer-Policy), #referrer-policy-attributes for a
+        // link, Referrer Policy #integration-with-css (a sheet's imports and
+        // fonts use its location and its own Referrer-Policy, an inline
+        // sheet's its document's URL), and a frame's own policy container.
+        let server = referer_server::Server::start(|path| {
+            let css = |body: &str| {
+                (
+                    String::from("text/css"),
+                    String::new(),
+                    body.as_bytes().to_vec(),
+                )
+            };
+            match path {
+                "/a.css" => (
+                    String::from("text/css"),
+                    String::from("Referrer-Policy: origin\r\n"),
+                    b"@import '/a-import.css'; @font-face{font-family:F;src:url(/font.woff)}"
+                        .to_vec(),
+                ),
+                "/b.css" => css("@import '/b-import.css';"),
+                "/frame.html" => (
+                    String::from("text/html"),
+                    String::from("Referrer-Policy: no-referrer\r\n"),
+                    b"<link rel=stylesheet href=/frame.css>".to_vec(),
+                ),
+                "/sprite.svg" => (
+                    String::from("image/svg+xml"),
+                    String::new(),
+                    b"<svg xmlns='http://www.w3.org/2000/svg'><symbol id='i'/></svg>".to_vec(),
+                ),
+                _ => css(""),
+            }
+        })
+        .await;
+        let base = server.base.clone();
+        let page = Url::parse(&format!("{base}/doc/page.html?q=1")).unwrap();
+        let html = "<meta name=referrer content=Always>\
+            <link rel=stylesheet href=/a.css>\
+            <link rel=stylesheet href=/b.css referrerpolicy=NO-REFERRER>\
+            <style>@import '/inline.css';</style>\
+            <iframe src=/frame.html></iframe>\
+            <svg><use href='/sprite.svg#i'/></svg>";
+        let response = html_response(
+            &page,
+            vec![(String::from("referrer-policy"), String::from("no-referrer"))],
+            html,
+        );
+        let response = css_only(response, (80, 24), (8, 16)).await;
+        assert_eq!(
+            response.referrer_policy,
+            Some(crate::referrer_policy::ReferrerPolicy::UnsafeUrl)
+        );
+        server
+            .wait_for(&[
+                "/a.css",
+                "/a-import.css",
+                "/font.woff",
+                "/b.css",
+                "/b-import.css",
+                "/inline.css",
+                "/frame.html",
+                "/frame.css",
+                "/sprite.svg",
+            ])
+            .await;
+        let full = Some(page.to_string());
+        let origin = Some(format!("{base}/"));
+        assert_eq!(server.referer("/a.css"), Some(full.clone()));
+        assert_eq!(server.referer("/a-import.css"), Some(origin.clone()));
+        assert_eq!(server.referer("/font.woff"), Some(origin));
+        assert_eq!(server.referer("/b.css"), Some(None));
+        assert_eq!(
+            server.referer("/b-import.css"),
+            Some(Some(format!("{base}/b.css")))
+        );
+        assert_eq!(server.referer("/inline.css"), Some(full.clone()));
+        assert_eq!(server.referer("/frame.html"), Some(full.clone()));
+        assert_eq!(server.referer("/frame.css"), Some(None));
+        assert_eq!(server.referer("/sprite.svg"), Some(full));
+    }
+
+    #[tokio::test]
+    async fn navigation_requests_carry_the_initiators_referrer_policy_across_redirects() {
+        // Fetch #main-fetch steps 7-8 for a navigation request, and Referrer
+        // Policy #set-requests-referrer-policy-on-redirect: the request's
+        // policy re-determines the referrer at each hop unless a redirect
+        // response names its own.
+        let server = referer_server::Server::start(|_| {
+            (String::from("text/plain"), String::new(), b"ok".to_vec())
+        })
+        .await;
+        let source = Url::parse(&format!("{}/from/page?secret=1", server.base)).unwrap();
+        let mut initiator = NavigationInitiator::document(
+            &source,
+            crate::referrer_policy::ReferrerPolicy::UnsafeUrl,
+        );
+        let target = Url::parse(&format!("{}/full", server.base)).unwrap();
+        fetch(&navigation_request(target, None, Some(&initiator)))
+            .await
+            .unwrap();
+        initiator.referrer_policy = crate::referrer_policy::ReferrerPolicy::Origin;
+        let target = Url::parse(&format!("{}/origin", server.base)).unwrap();
+        fetch(&navigation_request(target, None, Some(&initiator)))
+            .await
+            .unwrap();
+        initiator.referrer_policy = crate::referrer_policy::ReferrerPolicy::NoReferrer;
+        let target = Url::parse(&format!("{}/none", server.base)).unwrap();
+        let request = navigation_request(
+            target,
+            Some((String::new(), b"x".to_vec())),
+            Some(&initiator),
+        );
+        assert_eq!(request.method, "POST");
+        fetch(&request).await.unwrap();
+        // A browser-initiated navigation has no referrer.
+        let target = Url::parse(&format!("{}/typed", server.base)).unwrap();
+        fetch(&navigation_request(target, None, None))
+            .await
+            .unwrap();
+        server
+            .wait_for(&["/full", "/origin", "/none", "/typed"])
+            .await;
+        assert_eq!(server.referer("/full"), Some(Some(source.to_string())));
+        assert_eq!(
+            server.referer("/origin"),
+            Some(Some(format!("{}/", server.base)))
+        );
+        assert_eq!(server.referer("/none"), Some(None));
+        assert_eq!(server.referer("/typed"), Some(None));
+        // The recorded request policy governs redirects too.
+        let mut request = Request::get(Url::parse("https://example.test/").unwrap());
+        replace_referrer(
+            &mut request,
+            Some(&source),
+            crate::referrer_policy::ReferrerPolicy::SameOrigin,
+        );
+        assert_eq!(
+            request.referrer_policy,
+            Some(crate::referrer_policy::ReferrerPolicy::SameOrigin)
+        );
+    }
+
+    #[test]
+    fn blob_navigation_responses_take_the_entry_and_its_policy_container() {
+        // Fetch #scheme-fetch "blob" and HTML
+        // #determine-navigation-params-policy-container: a local URL's
+        // Document inherits its initiator's container, else (a URL the user
+        // entered) the blob URL entry's environment's.
+        let store = crate::blob_url_store::BlobUrlStore::default();
+        let url = Url::parse("blob:https://maker.test/5d7a").unwrap();
+        store.add_bytes(url.as_str(), b"<p>made</p>".to_vec(), "text/html");
+        assert!(blob_navigation_response(&url, None).is_err());
+        let user = with_blob_entry(&url, None, Some(&store)).unwrap();
+        let response = blob_navigation_response(&url, Some(&user)).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/html");
+        assert_eq!(response.body, b"<p>made</p>");
+        assert_eq!(response.referrer, "");
+        assert_eq!(
+            response_referrer_policy(&response),
+            crate::referrer_policy::ReferrerPolicy::default()
+        );
+        let source = Url::parse("https://maker.test/app?x=1").unwrap();
+        let initiator = with_blob_entry(
+            &url,
+            Some(NavigationInitiator::document(
+                &source,
+                crate::referrer_policy::ReferrerPolicy::NoReferrerWhenDowngrade,
+            )),
+            Some(&store),
+        )
+        .unwrap();
+        let response = blob_navigation_response(
+            &Url::parse(&format!("{url}#frag")).unwrap(),
+            Some(&initiator),
+        )
+        .unwrap();
+        assert_eq!(response.body, b"<p>made</p>");
+        assert_eq!(response.referrer, "https://maker.test/app?x=1");
+        assert_eq!(
+            response_referrer_policy(&response),
+            crate::referrer_policy::ReferrerPolicy::NoReferrerWhenDowngrade
+        );
+        assert_eq!(
+            parse_blob_url(" BLOB:https://maker.test/5d7a ").as_ref(),
+            Some(&url)
+        );
+        assert!(parse_blob_url("https://maker.test/").is_none());
+        // A blob: Document's subresources are gated by its URL's origin.
+        let local = Url::parse("blob:http://127.0.0.1:8000/5d7a").unwrap();
+        assert!(subresource_allowed(
+            &local,
+            &Url::parse("http://127.0.0.1:8000/a.css").unwrap()
+        ));
+    }
+
     #[tokio::test]
     async fn inline_style_imports_are_fetched_with_the_page_sheets() {
         // CSS Cascade 5 §2.2: an inline <style>'s @import is fetched against
@@ -11019,6 +11733,7 @@ mod tests {
             <style>@IMPORT 'fonts.css';</style>"#,
             &page,
             encoding_rs::UTF_8,
+            Default::default(),
         )
         .await;
         let url = page.join("css/fonts.css").unwrap();
@@ -11113,6 +11828,7 @@ mod tests {
              <link rel=stylesheet href=declared.css>",
             &page,
             encoding_rs::WINDOWS_1252,
+            Default::default(),
         )
         .await;
         let text = |name: &str| {
@@ -11153,6 +11869,7 @@ mod tests {
             r#"<base href="assets/"><link rel="stylesheet" href="main.css">"#,
             &page,
             encoding_rs::UTF_8,
+            Default::default(),
         )
         .await;
         // The linked sheet and the sheet it imports, each with its own text.
@@ -11176,9 +11893,14 @@ mod tests {
             page.join("assets/").unwrap()
         );
         assert!(
-            fetch_page_sheets(&spoofed_base, &remote, encoding_rs::UTF_8)
-                .await
-                .is_empty()
+            fetch_page_sheets(
+                &spoofed_base,
+                &remote,
+                encoding_rs::UTF_8,
+                Default::default()
+            )
+            .await
+            .is_empty()
         );
         assert!(
             resolve_frame_src(page.as_str(), &page, &remote, &[], encoding_rs::UTF_8).is_none()
@@ -11207,6 +11929,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         }
     }
 
@@ -11230,6 +11954,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         }
     }
 
@@ -11244,6 +11970,7 @@ mod tests {
             cookie_context: None,
             timing_client: None,
             use_cors_preflight: false,
+            referrer_policy: None,
             fetch_policy: Some(FetchPolicy {
                 origin: Url::parse("https://app.example").unwrap(),
                 mode,
@@ -11844,6 +12571,7 @@ mod tests {
             (1024.0, 768.0),
             1.0,
             encoding_rs::UTF_8,
+            Default::default(),
             &cache,
             runtime.handle(),
             std::sync::Arc::new(move |timing| {
@@ -11978,6 +12706,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let single = response(&[("access-control-allow-origin", "https://app.example")]);
         assert!(validate_cors_preflight(&single, &request, &[]).is_ok());
@@ -12144,6 +12874,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let response = image_navigation_response(response, "image/png");
         assert_eq!(response.content_type, "text/html; charset=utf-8");
@@ -12479,7 +13211,7 @@ mod tests {
             "@font-face{font-family:External;\
              src:url(https://cdn.example.test/fonts/external.woff2)}",
         )];
-        let faces = document_font_faces(html, &sheets, &page);
+        let faces = document_font_faces(html, &sheets, &page, Default::default());
         assert_eq!(faces.len(), 2);
         assert_eq!(faces[0].family, "Inline");
         assert_eq!(
@@ -12502,6 +13234,7 @@ mod tests {
                 url("fallback)with;punctuation.woff2") format("woff2")}</style>"#,
             &[],
             &page,
+            Default::default(),
         );
         assert_eq!(faces.len(), 1);
         assert_eq!(faces[0].sources.len(), 2);
@@ -14084,6 +14817,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let mut body = String::from_utf8_lossy(&response.body).into_owned();
@@ -14151,6 +14886,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
@@ -14433,6 +15170,8 @@ mod tests {
                 challenge: None,
                 from_post: false,
                 timing: None,
+                referrer: String::new(),
+                referrer_policy: None,
             };
             let response = execute_js_with_presentation(
                 response,
@@ -14475,6 +15214,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
@@ -14510,6 +15251,8 @@ mod tests {
                 challenge: None,
                 from_post: false,
                 timing: None,
+                referrer: String::new(),
+                referrer_policy: None,
             };
             let mut response = execute_js_with_presentation(
                 response,
@@ -14589,6 +15332,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let initial = String::from_utf8_lossy(&response.body).into_owned();
@@ -16913,7 +17658,7 @@ mod tests {
                         last_html = Some(html);
                         break;
                     }
-                    Some(crate::js::PageEvt::Navigate(u)) => eprintln!("EVT Navigate -> {u}"),
+                    Some(crate::js::PageEvt::Navigate(u, ..)) => eprintln!("EVT Navigate -> {u}"),
                     Some(crate::js::PageEvt::SubmitDefault) => eprintln!("EVT SubmitDefault"),
                     Some(other) => {
                         eprintln!("EVT {other:?}");
@@ -16992,7 +17737,9 @@ mod tests {
                         }
                         last_html = Some(html);
                     }
-                    Ok(Some(crate::js::PageEvt::Navigate(u))) => eprintln!("EVT2 Navigate -> {u}"),
+                    Ok(Some(crate::js::PageEvt::Navigate(u, ..))) => {
+                        eprintln!("EVT2 Navigate -> {u}")
+                    }
                     Ok(Some(crate::js::PageEvt::SubmitDefault)) => eprintln!("EVT2 SubmitDefault"),
                     Ok(Some(crate::js::PageEvt::Settled)) => {} // keep watching the stream
                     Ok(Some(other)) => {
@@ -17061,7 +17808,7 @@ mod tests {
                         );
                         *html = h;
                     }
-                    crate::js::PageEvt::Navigate(u) => {
+                    crate::js::PageEvt::Navigate(u, ..) => {
                         eprintln!("  >>> Navigate -> {u}");
                         return;
                     }
@@ -18122,7 +18869,7 @@ mod tests {
             let _ = live.handle.cmds.send(crate::js::PageCmd::Click(node)).await;
             for _ in 0..10 {
                 match tokio::time::timeout(Duration::from_secs(20), live.events.recv()).await {
-                    Ok(Some(crate::js::PageEvt::Navigate(u))) => {
+                    Ok(Some(crate::js::PageEvt::Navigate(u, ..))) => {
                         eprintln!("CLICK EVT Navigate({u})");
                     }
                     Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
@@ -19588,6 +20335,7 @@ customElements.define('lit-counter', LitCounter);
             cookie_context: None,
             timing_client: None,
             use_cors_preflight: false,
+            referrer_policy: None,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -19612,6 +20360,7 @@ customElements.define('lit-counter', LitCounter);
                 cookie_context: None,
                 timing_client: None,
                 use_cors_preflight: false,
+                referrer_policy: None,
                 fetch_policy: None,
             };
             let response = fetch(&request).await.unwrap();
@@ -19634,6 +20383,7 @@ customElements.define('lit-counter', LitCounter);
             cookie_context: None,
             timing_client: None,
             use_cors_preflight: false,
+            referrer_policy: None,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -19700,6 +20450,7 @@ customElements.define('lit-counter', LitCounter);
             cookie_context: None,
             timing_client: None,
             use_cors_preflight: false,
+            referrer_policy: None,
             fetch_policy: None,
         };
         let response = fetch(&request).await.unwrap();
@@ -20570,6 +21321,7 @@ customElements.define('lit-counter', LitCounter);
             cookie_context: None,
             timing_client: None,
             use_cors_preflight: false,
+            referrer_policy: None,
             fetch_policy: None,
         };
         let resp = fetch(&request).await.unwrap();
@@ -20629,6 +21381,7 @@ customElements.define('lit-counter', LitCounter);
             cookie_context: None,
             timing_client: None,
             use_cors_preflight: false,
+            referrer_policy: None,
             fetch_policy: None,
         };
         let resp = fetch(&request).await.unwrap();
@@ -22857,5 +23610,101 @@ customElements.define('lit-counter', LitCounter);
         assert_eq!(doc.forms[0].fields.len(), 1);
         assert_eq!(doc.forms[0].fields[0].kind, FieldKind::Text);
         assert!(!has_item(&doc, "[ Submit ]"));
+    }
+}
+
+/// A loopback HTTP/1.1 server for referrer tests: it records each request's
+/// path and `Referer` (none as `None`) and answers a path with `route`'s
+/// (content type, extra header lines, body). Dropping it aborts its task.
+#[cfg(test)]
+pub(crate) mod referer_server {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    pub(crate) type Log = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    pub(crate) struct Server {
+        pub(crate) base: String,
+        pub(crate) log: Log,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Server {
+        pub(crate) async fn start(
+            route: impl Fn(&str) -> (String, String, Vec<u8>) + Send + Sync + 'static,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let log: Log = Arc::default();
+            let record = log.clone();
+            let route = Arc::new(route);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let record = record.clone();
+                    let route = route.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut bytes = [0; 4096];
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            match stream.read(&mut bytes).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(count) => request.extend_from_slice(&bytes[..count]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&request).into_owned();
+                        let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let referer = head.lines().find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                                .map(|(_, value)| value.trim().to_string())
+                        });
+                        record.lock().unwrap().push((path.clone(), referer));
+                        let (content_type, headers, body) = route(&path);
+                        let mut response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{headers}Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(&body);
+                        let _ = stream.write_all(&response).await;
+                    });
+                }
+            });
+            Self { base, log, task }
+        }
+
+        /// The `Referer` of the first request for `path`: `None` while it was
+        /// not requested, `Some(None)` for a request without one.
+        pub(crate) fn referer(&self, path: &str) -> Option<Option<String>> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(seen, _)| seen == path)
+                .map(|(_, referer)| referer.clone())
+        }
+
+        /// Wait until every path in `paths` was requested.
+        pub(crate) async fn wait_for(&self, paths: &[&str]) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            while paths.iter().any(|path| self.referer(path).is_none()) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "requests never arrived: {:?} of {:?}",
+                    paths,
+                    self.log.lock().unwrap()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
     }
 }

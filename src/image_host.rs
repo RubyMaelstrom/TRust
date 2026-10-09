@@ -156,7 +156,9 @@ pub(super) fn document_request(
     context: u64,
     source: &str,
     cors: Option<CredentialsMode>,
-    referrer_policy: crate::referrer_policy::ReferrerPolicy,
+    // The element's referrer policy attribute; None (the empty string) uses the
+    // Document's policy container's (Fetch #main-fetch step 7).
+    referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 ) -> Option<(SharedImageFetch, ImageJoin, tokio::runtime::Handle)> {
     let client = super::request_context_url(ctx, context);
     let restricted = super::cookie_context_for_id(ctx, context).cross_site_ancestor;
@@ -185,12 +187,15 @@ pub(super) fn document_request(
         }
         return None;
     };
-    request
-        .headers
-        .retain(|(key, _)| !key.eq_ignore_ascii_case("referer"));
-    if let Some(url) = referrer_policy.determine(&client, &request.url) {
-        request.headers.push(("Referer".into(), url.to_string()));
-    }
+    super::apply_request_referrer(
+        state,
+        context,
+        &super::RequestReferrer::Client,
+        referrer_policy,
+        &mut request,
+    );
+    let referrer_policy =
+        referrer_policy.unwrap_or_else(|| super::environment_referrer_policy(state, context));
     crate::http::set_image_accept(&mut request);
     crate::http::set_fetch_metadata(
         &mut request,
@@ -306,8 +311,7 @@ pub(super) fn call(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
                 ),
                 dom.attr(id, "crossorigin").map(str::to_string),
                 dom.attr(id, "referrerpolicy")
-                    .and_then(crate::referrer_policy::ReferrerPolicy::parse)
-                    .unwrap_or_default(),
+                    .and_then(crate::referrer_policy::ReferrerPolicy::parse_attribute),
             )
         } else {
             (None, None, Default::default())

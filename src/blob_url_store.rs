@@ -59,6 +59,11 @@ pub struct BlobUrlEntry {
     /// an origin's serialization, or a unique identity for an opaque origin.
     pub storage_key: String,
     pub environment: Environment,
+    /// The referrer policy of the environment's policy container when the URL was created.
+    /// HTML #creating-a-policy-container-from-a-fetch-response clones the environment's
+    /// container for a blob URL's Document or worker; TRust keeps the policy the entry was
+    /// created under rather than following later `<meta name=referrer>` changes.
+    pub referrer_policy: crate::referrer_policy::ReferrerPolicy,
 }
 
 impl BlobUrlEntry {
@@ -108,7 +113,7 @@ pub struct BlobUrlStore {
 }
 
 /// The store key of a URL string: its serialization without the fragment (#blob-url-resolve).
-fn key(url: &str) -> &str {
+pub fn key(url: &str) -> &str {
     url.split_once('#').map_or(url, |(key, _)| key)
 }
 
@@ -190,6 +195,7 @@ impl BlobUrlStore {
                 origin: origin.clone(),
                 storage_key: origin,
                 environment: Environment { agent: 0, realm: 0 },
+                referrer_policy: Default::default(),
             },
         );
     }
@@ -227,6 +233,7 @@ mod tests {
             origin: String::from(key),
             storage_key: String::from(key),
             environment: Environment { agent, realm },
+            referrer_policy: Default::default(),
         }
     }
 

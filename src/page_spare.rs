@@ -229,6 +229,7 @@ fn warm(engine: &mut lumen::Engine, snapshot: &'static [u8]) -> Result<(), Strin
     install_agent_host_hooks(engine);
     let config = main_window_config(
         &blank,
+        "",
         DEFAULT_VIEWPORT,
         1.0,
         serde_json::Value::Null,

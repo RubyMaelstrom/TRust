@@ -738,8 +738,8 @@ fn event_variant_name(event: &crate::js::PageEvt) -> &'static str {
         crate::js::PageEvt::Updated { .. } => "Updated",
         crate::js::PageEvt::Patched { .. } => "Patched",
         crate::js::PageEvt::Static { .. } => "Static",
-        crate::js::PageEvt::Navigate(_) => "Navigate",
-        crate::js::PageEvt::Replace(_) => "Replace",
+        crate::js::PageEvt::Navigate(..) => "Navigate",
+        crate::js::PageEvt::Replace(..) => "Replace",
         crate::js::PageEvt::Reload(_) => "Reload",
         crate::js::PageEvt::HistoryUpdate { .. } => "HistoryUpdate",
         crate::js::PageEvt::ScrollToFragment(_) => "ScrollToFragment",
@@ -1005,7 +1005,12 @@ impl BrowserController {
             }
             return;
         }
-        self.begin_page_fetch(Link::Gopher(submission.url), false, NavigationIntent::New);
+        self.begin_page_fetch(
+            Link::Gopher(submission.url),
+            false,
+            NavigationIntent::New,
+            None,
+        );
     }
 
     fn security_action(&mut self, action: gemini::security::Action) -> bool {
@@ -1920,7 +1925,12 @@ impl BrowserController {
                 CoreEvent::DeclarativeRefresh { generation, url } => {
                     if generation == self.document_generation {
                         self.declarative_refresh_task = None;
-                        self.begin_page_fetch(Link::Http(url), false, NavigationIntent::Replace);
+                        self.begin_page_fetch(
+                            Link::Http(url),
+                            false,
+                            NavigationIntent::Replace,
+                            None,
+                        );
                         changed = true;
                     }
                 }
@@ -1967,17 +1977,49 @@ impl BrowserController {
         true
     }
 
-    fn begin_page_address(&mut self, address: &str, intent: NavigationIntent) -> bool {
+    fn begin_page_address(
+        &mut self,
+        address: &str,
+        intent: NavigationIntent,
+        initiator: Option<Box<http::NavigationInitiator>>,
+    ) -> bool {
         match parse_navigation_target(address) {
-            Ok((target, fallback)) => self.begin_page_fetch(target, fallback, intent),
+            Ok((target, fallback)) => self.begin_page_fetch(
+                target,
+                fallback,
+                intent,
+                initiator.map(|initiator| *initiator),
+            ),
             Err(error) => self.status = error,
         }
         true
     }
 
+    /// The current Document as a navigation's source (HTML #navigate's
+    /// sourceDocument), under its policy container's referrer policy.
+    fn document_initiator(&self) -> Option<http::NavigationInitiator> {
+        let page = self.current.as_ref()?;
+        let Link::Http(url) = &page.target else {
+            return None;
+        };
+        let policy = match &page.document {
+            FetchedDocument::Http(response) => http::response_referrer_policy(response),
+            _ => Default::default(),
+        };
+        Some(http::NavigationInitiator::document(url, policy))
+    }
+
     /// A document-directed navigation is not an address-bar filesystem grant.
     /// Keep this check before retiring the current page or starting any I/O.
-    fn begin_page_fetch(&mut self, target: Link, fallback: bool, intent: NavigationIntent) {
+    /// `initiator` is the source Document's request context, by default the
+    /// current Document's.
+    fn begin_page_fetch(
+        &mut self,
+        target: Link,
+        fallback: bool,
+        intent: NavigationIntent,
+        initiator: Option<http::NavigationInitiator>,
+    ) {
         if let Link::Http(url) = &target
             && url.scheme() == "file"
             && !self.current.as_ref().is_some_and(|page| {
@@ -1989,7 +2031,8 @@ impl BrowserController {
             self.status = String::from("Local file navigation blocked for this document.");
             return;
         }
-        self.begin_fetch(target, fallback, intent);
+        let initiator = initiator.or_else(|| self.document_initiator());
+        self.begin_fetch_from(target, fallback, intent, initiator);
     }
 
     /// Small-net Back/Forward is local while its bounded source is retained.
@@ -2093,6 +2136,33 @@ impl BrowserController {
     }
 
     fn begin_fetch(&mut self, target: Link, fallback_http: bool, intent: NavigationIntent) {
+        self.begin_fetch_from(target, fallback_http, intent, None);
+    }
+
+    /// The page's blob URL store, for a `blob:` URL the user entered or a
+    /// navigation whose URL parse did not reach the page actor.
+    fn current_blobs(&self) -> Option<crate::js::BlobMap> {
+        match &self.current.as_ref()?.document {
+            FetchedDocument::Http(response) => response.blobs.clone(),
+            _ => None,
+        }
+    }
+
+    /// Navigate the top-level traversable to `target` from `initiator`'s
+    /// Document (`None`: a browser-initiated navigation, with no referrer).
+    fn begin_fetch_from(
+        &mut self,
+        target: Link,
+        fallback_http: bool,
+        intent: NavigationIntent,
+        initiator: Option<http::NavigationInitiator>,
+    ) {
+        let initiator = match &target {
+            Link::Http(url) => {
+                http::with_blob_entry(url, initiator, self.current_blobs().as_deref())
+            }
+            _ => initiator,
+        };
         if matches!(intent, NavigationIntent::New | NavigationIntent::Replace)
             && let Link::Http(url) = &target
             && url.fragment().is_some()
@@ -2325,7 +2395,7 @@ impl BrowserController {
             let result = fetch_protocol_interactive(
                 &target,
                 fallback_http,
-                None,
+                initiator.as_ref(),
                 window_environment,
                 storage,
                 None,
@@ -3368,7 +3438,7 @@ impl BrowserController {
                 self.begin_fetch(Link::External(url), false, NavigationIntent::New)
             }
             Link::External(url) => self.status = format!("External target: {url}"),
-            target => self.begin_page_fetch(target, false, NavigationIntent::New),
+            target => self.begin_page_fetch(target, false, NavigationIntent::New, None),
         }
         true
     }
@@ -3414,6 +3484,13 @@ impl BrowserController {
                 self.page_text_control_state = None;
                 self.last_js_outcome = Some(outcome.clone());
                 if let Some(page) = &mut self.current {
+                    // HTML #meta-referrer: navigations this controller starts
+                    // from the retired Document use its final policy.
+                    if let (FetchedDocument::Http(response), Some(policy)) =
+                        (&mut page.document, outcome.referrer_policy)
+                    {
+                        response.referrer_policy = Some(policy);
+                    }
                     // The actor has classified this document as inert and is
                     // about to exit.  Preserve its settled serialization as
                     // the static document source: later viewport/image
@@ -3463,10 +3540,14 @@ impl BrowserController {
                 }
                 true
             }
-            PageEvt::Navigate(address) => self.begin_page_address(&address, NavigationIntent::New),
-            PageEvt::Reload(address) => self.begin_page_address(&address, NavigationIntent::Reload),
-            PageEvt::Replace(address) => {
-                self.begin_page_address(&address, NavigationIntent::Replace)
+            PageEvt::Navigate(address, initiator) => {
+                self.begin_page_address(&address, NavigationIntent::New, initiator)
+            }
+            PageEvt::Reload(address) => {
+                self.begin_page_address(&address, NavigationIntent::Reload, None)
+            }
+            PageEvt::Replace(address, initiator) => {
+                self.begin_page_address(&address, NavigationIntent::Replace, initiator)
             }
             PageEvt::HistoryTraverse { delta } => {
                 // An absent target is a silent no-op for the History API.
@@ -3709,12 +3790,13 @@ impl BrowserController {
                 let body = form.encode(submitter);
                 let mut target = submission.action;
                 target.set_query(Some(body.as_str()));
-                self.begin_page_fetch(Link::Http(target), false, NavigationIntent::New);
+                self.begin_page_fetch(Link::Http(target), false, NavigationIntent::New, None);
             }
             // HTML #submit-body: the enctype's entity body.
             FormMethod::Post => match form.entity_body(submitter) {
                 Ok((content_type, body)) => {
-                    self.begin_form_post_body(submission.action, content_type, body)
+                    let initiator = self.document_initiator();
+                    self.begin_post_body(submission.action, content_type, body, initiator)
                 }
                 Err(error) => self.status = format!("Form submission failed: {error}"),
             },
@@ -3722,36 +3804,36 @@ impl BrowserController {
         }
     }
 
-    fn submit_page_form(&mut self, submission: crate::js::FormSubmission) {
+    fn submit_page_form(&mut self, mut submission: crate::js::FormSubmission) {
         let Ok(mut action) = url::Url::parse(&submission.action) else {
             self.status = String::from("Invalid form action.");
             return;
         };
-        if submission.method.eq_ignore_ascii_case("post") {
-            self.begin_form_post_body(action, submission.content_type, submission.body);
-        } else if !submission.method.eq_ignore_ascii_case("dialog") {
-            action.set_query(submission.query());
-            self.begin_page_fetch(Link::Http(action), false, NavigationIntent::New);
-        }
-    }
-
-    /// POST a form's entity body in the MIME type of its enctype
-    /// (HTML #submit-body).
-    fn begin_form_post_body(&mut self, url: url::Url, content_type: String, body: Vec<u8>) {
         // HTML #plan-to-navigate / #process-a-navigate-fetch retain the form
         // document as the fetch client (local snapshot e5071a20, 2026-09-06).
         // Capture it before retiring the actor so Fetch can derive Origin,
         // Referer, Fetch Metadata and SameSite cookies from the real source.
         // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#plan-to-navigate
         // https://fetch.spec.whatwg.org/#append-a-request-origin-header
-        let source = self.current.as_ref().and_then(|page| match &page.target {
-            Link::Http(url) => Some(url.clone()),
-            _ => None,
-        });
-        self.begin_post_body(url, content_type, body, source);
+        let initiator = submission
+            .initiator
+            .take()
+            .map(|initiator| *initiator)
+            .or_else(|| self.document_initiator());
+        if submission.method.eq_ignore_ascii_case("post") {
+            self.begin_post_body(action, submission.content_type, submission.body, initiator);
+        } else if !submission.method.eq_ignore_ascii_case("dialog") {
+            action.set_query(submission.query());
+            self.begin_page_fetch(Link::Http(action), false, NavigationIntent::New, initiator);
+        }
     }
 
-    fn begin_post(&mut self, url: url::Url, body: String, source: Option<url::Url>) {
+    fn begin_post(
+        &mut self,
+        url: url::Url,
+        body: String,
+        source: Option<http::NavigationInitiator>,
+    ) {
         self.begin_post_body(
             url,
             crate::js::FORM_URLENCODED.to_string(),
@@ -3765,7 +3847,7 @@ impl BrowserController {
         url: url::Url,
         content_type: String,
         body: Vec<u8>,
-        source: Option<url::Url>,
+        source: Option<http::NavigationInitiator>,
     ) {
         if crate::media::is_youtube_video_url(&url) {
             self.delegate_external_media(url);
@@ -3814,7 +3896,7 @@ impl BrowserController {
 pub async fn fetch_protocol(
     target: &Link,
     fallback_http: bool,
-    referrer: Option<&url::Url>,
+    initiator: Option<&http::NavigationInitiator>,
 ) -> Result<FetchedDocument, String> {
     match target {
         Link::Gopher(url) if url.is_binary_file() => match gopher::fetch_file(url).await? {
@@ -3841,16 +3923,13 @@ pub async fn fetch_protocol(
         Link::Dict(url) => crate::dict::fetch(url).await.map(|reply| {
             FetchedDocument::Dict(Box::new(crate::dict::Page::new(url.clone(), reply)))
         }),
+        Link::Http(url) if url.scheme() == "blob" => http::blob_navigation_response(url, initiator)
+            .map(|response| FetchedDocument::Http(Box::new(response))),
         Link::Http(url) => {
             let response = if fallback_http {
-                http::fetch_web_default_with_referrer(url, referrer).await
+                http::fetch_web_default_with_referrer(url, initiator).await
             } else {
-                let mut request = http::Request::get(url.clone());
-                if let Some(referrer) = referrer {
-                    http::set_referrer(&mut request, referrer);
-                }
-                http::set_navigation_metadata(&mut request, referrer);
-                http::fetch(&request).await
+                http::fetch(&http::navigation_request(url.clone(), None, initiator)).await
             }?;
             if crate::rdap::is_response(&response) {
                 Ok(FetchedDocument::Rdap(crate::rdap::Page::from_response(
@@ -3882,7 +3961,7 @@ pub async fn fetch_protocol(
 async fn fetch_protocol_interactive(
     target: &Link,
     fallback_http: bool,
-    referrer: Option<&url::Url>,
+    initiator: Option<&http::NavigationInitiator>,
     window_environment: tokio::sync::watch::Receiver<WindowEnvironment>,
     storage: crate::js::WebStorage,
     post_body: Option<(String, Vec<u8>)>,
@@ -3938,32 +4017,24 @@ async fn fetch_protocol_interactive(
         ))));
     }
     if let Link::Http(url) = target {
-        let mut response = if let Some(body) = post_body {
-            let mut request = http::Request {
-                method: String::from("POST"),
-                url: url.clone(),
-                body: Some(body),
-                headers: Vec::new(),
-                fetch_metadata: None,
-                cookie_context: None,
-                timing_client: None,
-                use_cors_preflight: false,
-                fetch_policy: None,
-            };
-            if let Some(referrer) = referrer {
-                http::set_referrer(&mut request, referrer);
+        let mut response = if url.scheme() == "blob" {
+            // Fetch #scheme-fetch: the GET method restriction applies to a
+            // blob: form submission too.
+            if post_body.is_some() {
+                return Err(String::from("blob URLs accept only GET navigations"));
             }
-            http::set_navigation_metadata(&mut request, referrer);
-            http::fetch(&request).await?
+            http::blob_navigation_response(url, initiator)?
+        } else if let Some(body) = post_body {
+            http::fetch(&http::navigation_request(
+                url.clone(),
+                Some(body),
+                initiator,
+            ))
+            .await?
         } else if fallback_http {
-            http::fetch_web_default_with_referrer(url, referrer).await?
+            http::fetch_web_default_with_referrer(url, initiator).await?
         } else {
-            let mut request = http::Request::get(url.clone());
-            if let Some(referrer) = referrer {
-                http::set_referrer(&mut request, referrer);
-            }
-            http::set_navigation_metadata(&mut request, referrer);
-            http::fetch(&request).await?
+            http::fetch(&http::navigation_request(url.clone(), None, initiator)).await?
         };
         if let Some(timing) = response.timing.as_mut() {
             timing.navigation_type = intent.timing_type();
@@ -4019,7 +4090,7 @@ async fn fetch_protocol_interactive(
             response,
         ))))
     } else {
-        fetch_protocol(target, fallback_http, referrer)
+        fetch_protocol(target, fallback_http, initiator)
             .await
             .map(InteractiveFetch::Document)
     }
@@ -4094,6 +4165,11 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
 /// HTTPS with HTTP fallback, matching the existing terminal address behavior.
 pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
     if let Some(url) = crate::file::url_from_input(address)? {
+        return Ok((Link::Http(url), false));
+    }
+    // File API #url-model: a blob URL names a Document's resource in the
+    // page's blob URL store.
+    if let Some(url) = http::parse_blob_url(address) {
         return Ok((Link::Http(url), false));
     }
     if let Some((host, port, tls)) = crate::command::telnet_target(address) {
@@ -4300,6 +4376,7 @@ mod tests {
                                 method: "post".into(),
                                 content_type: crate::js::FORM_URLENCODED.into(),
                                 body: body.as_bytes().to_vec(),
+                                initiator: None,
                             }),
                         });
                     }
@@ -4875,6 +4952,8 @@ mod tests {
                 challenge: None,
                 from_post: false,
                 timing: None,
+                referrer: String::new(),
+                referrer_policy: None,
             })))
         ));
 
@@ -4890,6 +4969,97 @@ mod tests {
         assert_eq!(pending.intent, NavigationIntent::Replace);
         assert!(browser.back.is_empty(), "the source is not added twice");
         browser.task.take().unwrap().abort();
+    }
+
+    fn desktop_page(
+        target: &url::Url,
+        policy: Option<crate::referrer_policy::ReferrerPolicy>,
+    ) -> BrowserPage {
+        BrowserPage {
+            target: Link::Http(target.clone()),
+            fallback_http: false,
+            document: FetchedDocument::Http(Box::new(crate::http::Response {
+                url: target.clone(),
+                status: 200,
+                status_text: String::new(),
+                content_type: String::from("text/html"),
+                headers: Vec::new(),
+                body: b"<p>source</p>".to_vec(),
+                rendered: None,
+                js: None,
+                blobs: None,
+                live: None,
+                images: None,
+                declarative_refresh: None,
+                challenge: None,
+                from_post: false,
+                timing: None,
+                referrer: String::new(),
+                referrer_policy: policy,
+            })),
+            status: String::from("Ready"),
+            rendered: None,
+            rendered_revision: 1,
+            revision: 1,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn desktop_navigations_use_the_source_referrer_policy_and_load_blob_documents() {
+        // HTML #navigate and Fetch #main-fetch steps 7-8: a page-directed navigation's
+        // referrer is its source Document's URL under the navigation's referrerPolicy, else
+        // the Document's policy container's; a blob: target loads the entry's bytes with its
+        // type (Fetch #scheme-fetch) and never touches the network.
+        use crate::referrer_policy::ReferrerPolicy;
+        let server = crate::http::referer_server::Server::start(|_| {
+            (String::from("text/plain"), String::new(), b"ok".to_vec())
+        })
+        .await;
+        let base = server.base.clone();
+        let page = url::Url::parse(&format!("{base}/doc/page?q=1")).unwrap();
+        let mut browser =
+            BrowserController::new(Handle::current(), || {}, CssSize::new(800.0, 600.0));
+        async fn finish(browser: &mut BrowserController) {
+            browser.task.take().unwrap().await.unwrap();
+            browser.process_async_events();
+        }
+        browser.current = Some(desktop_page(&page, Some(ReferrerPolicy::Origin)));
+        browser.handle_page_event(crate::js::PageEvt::Navigate(format!("{base}/linked"), None));
+        finish(&mut browser).await;
+        browser.current = Some(desktop_page(&page, Some(ReferrerPolicy::Origin)));
+        let mut initiator = http::NavigationInitiator::document(&page, ReferrerPolicy::Origin);
+        initiator.referrer_policy = ReferrerPolicy::UnsafeUrl;
+        browser.handle_page_event(crate::js::PageEvt::Replace(
+            format!("{base}/replaced"),
+            Some(Box::new(initiator)),
+        ));
+        finish(&mut browser).await;
+        server.wait_for(&["/linked", "/replaced"]).await;
+        assert_eq!(server.referer("/linked"), Some(Some(format!("{base}/"))));
+        assert_eq!(server.referer("/replaced"), Some(Some(page.to_string())));
+
+        let store = crate::js::BlobMap::default();
+        store.add_bytes(
+            "blob:https://maker.test/5d7a",
+            b"<p>made here</p>".to_vec(),
+            "text/html",
+        );
+        let mut maker = desktop_page(&url::Url::parse("https://maker.test/app").unwrap(), None);
+        if let FetchedDocument::Http(response) = &mut maker.document {
+            response.blobs = Some(store);
+        }
+        browser.current = Some(maker);
+        browser.handle_action(UserAction::Navigate(String::from(
+            "blob:https://maker.test/5d7a",
+        )));
+        finish(&mut browser).await;
+        let current = browser.current_page().unwrap();
+        assert_eq!(current.address(), "blob:https://maker.test/5d7a");
+        let FetchedDocument::Http(response) = &current.document else {
+            panic!("blob document");
+        };
+        assert!(String::from_utf8_lossy(&response.body).contains("made here"));
+        assert_eq!(server.log.lock().unwrap().len(), 2, "no network request");
     }
 
     #[test]
@@ -4936,6 +5106,8 @@ mod tests {
                 challenge: None,
                 from_post: false,
                 timing: None,
+                referrer: String::new(),
+                referrer_policy: None,
             },
         ));
 
@@ -5536,6 +5708,8 @@ mod tests {
                 challenge: None,
                 from_post: false,
                 timing: None,
+                referrer: String::new(),
+                referrer_policy: None,
             })),
             status: String::from("Ready"),
             rendered: None,
@@ -5856,11 +6030,10 @@ mod tests {
         let (url, _) = browser.take_external_media().unwrap();
         assert_eq!(url.host_str(), Some("youtu.be"));
 
-        assert!(
-            browser.handle_page_event(crate::js::PageEvt::Replace(String::from(
-                "https://www.youtube.com/shorts/scripted123",
-            )))
-        );
+        assert!(browser.handle_page_event(crate::js::PageEvt::Replace(
+            String::from("https://www.youtube.com/shorts/scripted123"),
+            None,
+        )));
         let (url, _) = browser.take_external_media().unwrap();
         assert_eq!(url.path(), "/shorts/scripted123");
         assert!(browser.current_page().is_none());
@@ -6005,8 +6178,8 @@ mod tests {
                 .contains("Local file navigation blocked")
         );
         for event in [
-            crate::js::PageEvt::Navigate(target.to_string()),
-            crate::js::PageEvt::Replace(target.to_string()),
+            crate::js::PageEvt::Navigate(target.to_string(), None),
+            crate::js::PageEvt::Replace(target.to_string(), None),
             crate::js::PageEvt::Reload(target.to_string()),
         ] {
             browser.handle_page_event(event);

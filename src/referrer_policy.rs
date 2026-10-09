@@ -4,7 +4,7 @@
 use url::{Host, Url};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum ReferrerPolicy {
+pub enum ReferrerPolicy {
     NoReferrer,
     NoReferrerWhenDowngrade,
     Origin,
@@ -29,6 +29,42 @@ impl ReferrerPolicy {
             "unsafe-url" => Self::UnsafeUrl,
             _ => return None,
         })
+    }
+
+    /// The policy's keyword (Referrer Policy §3).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoReferrer => "no-referrer",
+            Self::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+            Self::Origin => "origin",
+            Self::OriginWhenCrossOrigin => "origin-when-cross-origin",
+            Self::SameOrigin => "same-origin",
+            Self::StrictOrigin => "strict-origin",
+            Self::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+            Self::UnsafeUrl => "unsafe-url",
+        }
+    }
+
+    /// HTML #meta-referrer steps 4-6: the `content` value of a
+    /// `<meta name=referrer>`, ASCII-lowercased, with its legacy keywords
+    /// ("never", "default", "always", "origin-when-crossorigin") mapped to the
+    /// policies they stand for. None when the value is not a referrer policy.
+    pub fn parse_meta(value: &str) -> Option<Self> {
+        let value = value.to_ascii_lowercase();
+        match value.as_str() {
+            "never" => Some(Self::NoReferrer),
+            "default" => Some(Self::default()),
+            "always" => Some(Self::UnsafeUrl),
+            "origin-when-crossorigin" => Some(Self::OriginWhenCrossOrigin),
+            other => Self::parse(other),
+        }
+    }
+
+    /// A referrer policy attribute's state (HTML #referrer-policy-attributes): an
+    /// ASCII case-insensitive keyword, with the empty string as the missing and
+    /// invalid value default (None).
+    pub fn parse_attribute(value: &str) -> Option<Self> {
+        Self::parse(&value.to_ascii_lowercase())
     }
 
     pub fn from_headers(headers: &[(String, String)]) -> Option<Self> {
@@ -79,6 +115,18 @@ impl ReferrerPolicy {
 }
 
 fn trustworthy(url: &Url) -> bool {
+    // Secure Contexts #potentially-trustworthy-url: about:blank, about:srcdoc
+    // and data: URLs are; a blob: URL is as its origin, that of the URL in
+    // its path (URL #concept-url-origin).
+    if matches!(url.as_str(), "about:blank" | "about:srcdoc") || url.scheme() == "data" {
+        return true;
+    }
+    if url.scheme() == "blob" {
+        return Url::parse(url.path())
+            .ok()
+            .filter(|inner| inner.scheme() != "blob")
+            .is_some_and(|inner| trustworthy(&inner));
+    }
     // Secure Contexts §3.1. Do not grant the optional localhost-name trust
     // exemption without a resolver guarantee; numeric loopback is unambiguous.
     matches!(url.scheme(), "https" | "wss" | "file")
@@ -155,5 +203,60 @@ mod tests {
             )]),
             Some(ReferrerPolicy::NoReferrer)
         );
+    }
+
+    #[test]
+    fn meta_and_attribute_values_follow_html() {
+        // HTML #meta-referrer steps 4-6 (ASCII-lowercased content; legacy
+        // keywords) and #referrer-policy-attributes (case-insensitive
+        // keywords; missing, empty and invalid values are the empty state).
+        for (value, expected) in [
+            ("never", Some(ReferrerPolicy::NoReferrer)),
+            ("DEFAULT", Some(ReferrerPolicy::StrictOriginWhenCrossOrigin)),
+            ("Always", Some(ReferrerPolicy::UnsafeUrl)),
+            (
+                "origin-when-crossorigin",
+                Some(ReferrerPolicy::OriginWhenCrossOrigin),
+            ),
+            ("Same-Origin", Some(ReferrerPolicy::SameOrigin)),
+            ("", None),
+            (" origin", None),
+            ("bogus", None),
+        ] {
+            assert_eq!(ReferrerPolicy::parse_meta(value), expected, "{value}");
+        }
+        assert_eq!(
+            ReferrerPolicy::parse_attribute("NO-REFERRER"),
+            Some(ReferrerPolicy::NoReferrer)
+        );
+        assert_eq!(ReferrerPolicy::parse_attribute("never"), None);
+        assert_eq!(ReferrerPolicy::parse_attribute(""), None);
+        // #parse-referrer-policy-from-header: the last recognized token wins.
+        let headers = [
+            (
+                String::from("Referrer-Policy"),
+                String::from("origin, bogus"),
+            ),
+            (
+                String::from("referrer-policy"),
+                String::from("unsafe-url,  ,nonsense"),
+            ),
+        ];
+        assert_eq!(
+            ReferrerPolicy::from_headers(&headers),
+            Some(ReferrerPolicy::UnsafeUrl)
+        );
+        for policy in [
+            ReferrerPolicy::NoReferrer,
+            ReferrerPolicy::NoReferrerWhenDowngrade,
+            ReferrerPolicy::Origin,
+            ReferrerPolicy::OriginWhenCrossOrigin,
+            ReferrerPolicy::SameOrigin,
+            ReferrerPolicy::StrictOrigin,
+            ReferrerPolicy::StrictOriginWhenCrossOrigin,
+            ReferrerPolicy::UnsafeUrl,
+        ] {
+            assert_eq!(ReferrerPolicy::parse(policy.as_str()), Some(policy));
+        }
     }
 }

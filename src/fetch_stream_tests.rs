@@ -1531,7 +1531,7 @@ fn a_page_navigation_aborts_the_old_documents_fetches_first() {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match events.recv().await {
-                    Some(crate::js::PageEvt::Navigate(url)) => return url,
+                    Some(crate::js::PageEvt::Navigate(url, ..)) => return url,
                     Some(crate::js::PageEvt::Trouble(errors)) => panic!("page: {errors:?}"),
                     Some(_) => {}
                     None => panic!("page closed before navigating"),

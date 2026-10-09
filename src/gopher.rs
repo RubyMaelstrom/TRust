@@ -1273,6 +1273,8 @@ fn response(url: &GopherUrl, body: Vec<u8>, mime: &str) -> Result<crate::http::R
         challenge: None,
         from_post: false,
         timing: None,
+        referrer: String::new(),
+        referrer_policy: None,
     })
 }
 

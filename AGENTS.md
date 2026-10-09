@@ -412,8 +412,37 @@ current behavior and limits; consult the governing standards before changing it.
   Worker construction, element preparation, frame navigation), so a later
   revocation does not fail them. A frame Window's entries go when its realm
   is released and a worker's when it ends; the top-level Document's go with
-  the page's store. `<img>`, `<script>`, style sheets, preloads and frames
-  resolve `blob:` URLs; top-level navigation to one does not.
+  the page's store. `<img>`, `<script>`, style sheets, preloads, frames and
+  module scripts (static and dynamic imports, import-map targets,
+  modulepreload, module workers' imports; `ModuleFetchEnvironment`) resolve
+  `blob:` URLs for their own partition, and modules need a JavaScript type.
+  Top-level navigation to a `blob:` URL (links, `location`, the address bar)
+  loads the entry's bytes with its type in both frontends
+  (`http::blob_navigation_response`) without the partition check; the page
+  actor holds the entry the navigation's URL parse resolved
+  (`NavigationInitiator::blob`), the address bar resolves in the current
+  page's store, and the Document's origin is its URL's (the creator's).
+  Without a live entry (a reload after the creating page is gone) it fails.
+- Referrer Policy: every Document has a policy container referrer policy,
+  from the navigation response's `Referrer-Policy` (last valid token),
+  inherited by local (about:, blob:, data:, srcdoc) Documents from their
+  initiator or parent, and updated by each inserted or changed
+  `<meta name=referrer>` (legacy never/default/always/
+  origin-when-crossorigin), tracked by the DOM (`referrer_meta_updates`) and
+  per realm in `HostState::referrer_policies`. One implementation
+  (`ReferrerPolicy::determine`) serves fetch/XHR (`Request.referrer` and
+  `referrerPolicy`), sendBeacon, EventSource, workers, element requests
+  (`referrerpolicy` on a, area, img, iframe, link, script), CSS (imports and
+  static-pipeline fonts use the sheet's location and its own
+  `Referrer-Policy`; CSS images and live-DOM fonts use the Document's URL),
+  frames, module imports (the importing script's URL), redirects
+  (`Request::referrer_policy`), the static pipeline (`document_referrer_policy`)
+  and frontend navigations (`http::NavigationInitiator`: the actor reports a
+  hyperlink's or form's `noreferrer`/`referrerpolicy` with each
+  `PageEvt::Navigate`/`Replace`/`SubmitForm`; static documents use
+  `Doc::referrer_policy` or the response's). Elements with their own policy
+  keep a page live so the actor applies it. `document.referrer` is the
+  navigation request's final `Referer`.
 - IndexedDB and Cache Storage are shared blocks (`/*__INDEXEDDB_BEGIN__*/`,
   `/*__CACHE_STORAGE_BEGIN__*/`) in Windows and workers over the storage shed's
   per-origin bottles, so every agent of an origin sees the same databases and

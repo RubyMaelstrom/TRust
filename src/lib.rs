@@ -42,7 +42,7 @@ mod history;
 mod import_maps;
 pub mod page_images;
 mod page_threads;
-mod referrer_policy;
+pub mod referrer_policy;
 mod relative_color;
 pub mod render;
 pub mod responsive_image;

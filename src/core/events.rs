@@ -559,8 +559,8 @@ mod tests {
                 html: String::new(),
                 outcome: Outcome::default(),
             },
-            PageEvt::Navigate("https://example.test/next".into()),
-            PageEvt::Replace("https://example.test/replace".into()),
+            PageEvt::Navigate("https://example.test/next".into(), None),
+            PageEvt::Replace("https://example.test/replace".into(), None),
             PageEvt::HistoryUpdate {
                 url: "https://example.test/history".into(),
                 replace: false,

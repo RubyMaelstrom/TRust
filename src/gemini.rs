@@ -269,6 +269,8 @@ pub(crate) fn image_response(response: Response) -> Result<crate::http::Response
         challenge: None,
         from_post: false,
         timing: None,
+        referrer: String::new(),
+        referrer_policy: None,
     };
     Ok(crate::http::image_navigation_response(response, &mime))
 }

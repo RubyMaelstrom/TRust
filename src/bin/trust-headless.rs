@@ -717,6 +717,7 @@ async fn snapshot_with_images(
         let blobs = response.blobs.clone();
         // The live document owns its image requests; present its responses.
         let images = response.images.clone();
+        let referrer_policy = trust::http::response_referrer_policy(response);
         let restricted = rendered.cookie_restricted_images.clone();
         let results: Vec<_> = futures::stream::iter(sources)
             .map(|source| {
@@ -731,6 +732,7 @@ async fn snapshot_with_images(
                             blobs.as_ref(),
                             images.as_deref(),
                             restricted,
+                            referrer_policy,
                         ),
                     )
                     .await
@@ -1233,6 +1235,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let rendered = trust::http::render_html_for_environment(
             &response,
@@ -1282,6 +1286,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         }));
         assert_eq!(describe_fetch(&missing), "HTTP 404 (text/html)");
         assert_eq!(

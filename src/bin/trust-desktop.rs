@@ -2421,6 +2421,14 @@ impl DesktopApp {
                 FetchedDocument::Http(response) => response.images.clone(),
                 _ => None,
             });
+        // Fetch #main-fetch step 7: the Document's policy container's policy.
+        let referrer_policy = self
+            .browser
+            .current_page()
+            .map_or_else(Default::default, |page| match &page.document {
+                FetchedDocument::Http(response) => trust::http::response_referrer_policy(response),
+                _ => Default::default(),
+            });
         for request in self.image_loads.take_ready(slots) {
             let proxy = self.event_proxy.clone();
             let page = page.clone();
@@ -2440,6 +2448,7 @@ impl DesktopApp {
                     blobs.as_ref(),
                     images.as_deref(),
                     restricted,
+                    referrer_policy,
                 )
                 .await
                 {
@@ -10242,6 +10251,8 @@ mod tests {
             challenge: None,
             from_post: false,
             timing: None,
+            referrer: String::new(),
+            referrer_policy: None,
         };
         let rendered = trust::http::render_html_for_environment(
             &response,

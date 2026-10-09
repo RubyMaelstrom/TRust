@@ -369,6 +369,77 @@ struct LumenDynamicModuleLoader {
     events: LumenTaskSender,
     network: Option<LumenDynamicModuleNetwork>,
     import_map: crate::import_maps::Handle,
+    environment: ModuleFetchEnvironment,
+}
+
+/// What a module script fetch needs of its settings object beyond the network: the page's blob
+/// URL store with the environment's storage key, for `blob:` module URLs (Fetch #scheme-fetch,
+/// File API #blob-url-obtain-object and #check-for-same-partition-blob-url-usage), and the
+/// policy container's referrer policy for HTTP(S) requests (Fetch #main-fetch step 7).
+#[derive(Clone, Default)]
+struct ModuleFetchEnvironment {
+    blobs: crate::js::BlobMap,
+    storage_key: String,
+    referrer_policy: crate::referrer_policy::ReferrerPolicy,
+}
+
+impl ModuleFetchEnvironment {
+    /// The settings object `context` of this agent (a Window realm, or the worker's own).
+    fn of(ctx: &mut Ctx, context: u64) -> Self {
+        let Some(state) = ctx.host_mut::<HostState>() else {
+            return Self::default();
+        };
+        let origin = match state.worker_self.as_ref() {
+            Some(worker) => worker.settings_origin.clone(),
+            None => realm_origin(state, context),
+        };
+        Self {
+            blobs: state.blobs.clone(),
+            storage_key: blob_storage_key(&origin),
+            referrer_policy: environment_referrer_policy(state, context),
+        }
+    }
+
+    /// HTML #fetch-a-single-module-script for a `blob:` URL: the entry's Blob (URL parsing
+    /// resolved the entry; this environment must share its partition), whose type must be a
+    /// JavaScript MIME type, as `(module URL, source)`.
+    fn blob_module(&self, url: &url::Url, integrity: &str) -> Option<(String, String)> {
+        let entry = self.blobs.obtain(url.as_str(), Some(&self.storage_key))?;
+        if !crate::http::module_script_response_allowed(200, &entry.content_type) {
+            return None;
+        }
+        let body = entry.read().ok()?;
+        crate::import_maps::integrity_matches(integrity, &body).then(|| {
+            (
+                url.to_string(),
+                crate::document_encoding::decode_utf8(&body),
+            )
+        })
+    }
+
+    /// A module script request for `url`: HTML #fetch-a-single-imported-module-script's referrer
+    /// is the referencing script's base URL, under this environment's referrer policy.
+    fn module_request(
+        &self,
+        url: url::Url,
+        page: &url::Url,
+        referrer: &str,
+        cookie_context: &crate::http::CookieContext,
+    ) -> crate::http::Request {
+        let mut request = crate::http::Request::subresource(
+            url,
+            page,
+            "script",
+            Some(crate::http::CredentialsMode::SameOrigin),
+        );
+        request.cookie_context = Some(cookie_context.clone());
+        let source = url::Url::parse(referrer)
+            .ok()
+            .filter(|source| source.origin().is_tuple())
+            .unwrap_or_else(|| page.clone());
+        crate::http::set_request_referrer(&mut request, Some(&source), self.referrer_policy);
+        request
+    }
 }
 
 struct LumenWebSockets {
@@ -533,7 +604,7 @@ struct LumenWorkerLaunch {
     /// Fetch #determine-requests-referrer for the script fetch, whose client is the outside
     /// settings: the owning Window's document URL or the owning worker's URL, and that
     /// environment's referrer policy.
-    referrer_source: url::Url,
+    referrer_source: Option<url::Url>,
     referrer_policy: crate::referrer_policy::ReferrerPolicy,
     secure_context: bool,
     /// A SharedWorkerGlobalScope rather than a DedicatedWorkerGlobalScope.
@@ -733,6 +804,13 @@ struct HostState {
     /// HTML #concept-settings-object-origin of each Window Realm, by host settings context.
     /// Opaque origins are created once, so identity (not serialization) decides equality.
     realm_origins: HashMap<u64, url::Origin>,
+    /// HTML #policy-container-referrer-policy of each Window Realm's Document, by host
+    /// settings context: from its navigation response's `Referrer-Policy` header, inherited
+    /// for local URLs and srcdoc documents, and updated by `<meta name=referrer>`.
+    referrer_policies: HashMap<u64, crate::referrer_policy::ReferrerPolicy>,
+    /// URL #concept-url-blob-entry of the pending top-level navigation's `blob:` URL, held
+    /// when the navigation parsed it (keyed without the fragment).
+    navigation_blob: Option<(String, Arc<crate::blob_url_store::BlobUrlEntry>)>,
     /// The newest Window Realm created for each navigable container element.
     frame_contexts: HashMap<usize, u64>,
     /// The Window Realm whose Document contains each child navigable's
@@ -890,6 +968,8 @@ impl HostState {
             window_request_urls: HashMap::new(),
             window_cookie_contexts: HashMap::new(),
             realm_origins: HashMap::new(),
+            referrer_policies: HashMap::new(),
+            navigation_blob: None,
             frame_contexts: HashMap::new(),
             window_parents: HashMap::new(),
             parser: ParserProgress::default(),
@@ -944,6 +1024,7 @@ impl HostState {
 
     fn forget_realm_origin(&mut self, context: u64) {
         self.realm_origins.remove(&context);
+        self.referrer_policies.remove(&context);
         self.frame_contexts.retain(|_, owner| *owner != context);
         self.window_parents.remove(&context);
         self.early_imports.borrow_mut().remove(&context);
@@ -1030,6 +1111,16 @@ impl HostState {
             let cache = network.cache.clone();
             let fetched = network.fetched.clone();
             let import_map = self.import_maps.get(&0).cloned().unwrap_or_default();
+            let origin = self
+                .realm_origins
+                .get(&0)
+                .cloned()
+                .unwrap_or_else(|| page.origin());
+            let environment = ModuleFetchEnvironment {
+                blobs: self.blobs.clone(),
+                storage_key: blob_storage_key(&origin),
+                referrer_policy: self.referrer_policies.get(&0).copied().unwrap_or_default(),
+            };
             engine.set_module_loader(move |specifier, referrer| {
                 module_dependency_loader(
                     &page,
@@ -1038,6 +1129,7 @@ impl HostState {
                     &cache,
                     &fetched,
                     Some(&import_map),
+                    &environment,
                     specifier,
                     referrer,
                 )
@@ -1061,12 +1153,22 @@ impl HostState {
                 .get(&0)
                 .unwrap_or(&self.base)
                 .clone();
+            let origin = self
+                .realm_origins
+                .get(&0)
+                .cloned()
+                .unwrap_or_else(|| page.origin());
             let loader = LumenDynamicModuleLoader {
                 context: 0,
                 cookie_context: self.window_cookie_contexts.get(&0).map_or_else(
                     || crate::http::CookieContext::subresource(&page),
                     |(_, _, context)| context.clone(),
                 ),
+                environment: ModuleFetchEnvironment {
+                    blobs: self.blobs.clone(),
+                    storage_key: blob_storage_key(&origin),
+                    referrer_policy: self.referrer_policies.get(&0).copied().unwrap_or_default(),
+                },
                 page,
                 events: events.clone(),
                 import_map: self.import_maps.get(&0).cloned().unwrap_or_default(),
@@ -1174,6 +1276,8 @@ impl RetainedMemory for HostState {
             window_request_urls,
             window_cookie_contexts,
             realm_origins,
+            referrer_policies: _,
+            navigation_blob: _,
             frame_contexts,
             window_parents,
             parser,
@@ -2423,6 +2527,8 @@ mod desktop {
             document_encoding: env.document_encoding,
             content_type: env.content_type.clone(),
             fullscreen_supported: env.fullscreen_supported,
+            referrer_policy: env.referrer_policy,
+            referrer: env.referrer.clone(),
         };
         let mut page = match load_page(
             html,
@@ -2773,6 +2879,7 @@ mod desktop {
                 let mut outcome = std::mem::take(&mut page.outcome);
                 outcome.elapsed = page.started.elapsed();
                 outcome.rendered = Some(Box::new(rendered));
+                outcome.referrer_policy = top_level_referrer_policy(&mut page);
                 let _ = events.blocking_send(PageEvt::Static {
                     html: static_document_source(&page, shell),
                     outcome,
@@ -2784,6 +2891,7 @@ mod desktop {
         let mut outcome = std::mem::take(&mut page.outcome);
         outcome.elapsed = page.started.elapsed();
         outcome.rendered = Some(Box::new(rendered));
+        outcome.referrer_policy = top_level_referrer_policy(&mut page);
         if events
             .blocking_send(PageEvt::Updated {
                 html: shell,
@@ -3584,6 +3692,12 @@ mod desktop {
             .map(|(_, _, _, node)| node)
             .collect();
         if scripts.is_empty() && !env.scripted_frames && !crate::js::needs_live_dom(&dom.borrow()) {
+            // HTML #meta-referrer: the parsed document's referrer metadata.
+            outcome.referrer_policy = Some(
+                dom.borrow()
+                    .parsed_referrer_meta_policy(DOCUMENT)
+                    .unwrap_or(env.referrer_policy),
+            );
             return Err(outcome);
         }
 
@@ -3612,6 +3726,13 @@ mod desktop {
         // Windows: otherwise a relative base is applied twice to images,
         // and a remote page's <base href=file:...> could grant file access.
         state.window_request_urls.insert(0, response_url.clone());
+        // HTML #policy-container-referrer-policy: the response's, then each parser-inserted
+        // `<meta name=referrer>` in tree order (#meta-referrer).
+        let referrer_policy = dom
+            .borrow()
+            .parsed_referrer_meta_policy(DOCUMENT)
+            .unwrap_or(env.referrer_policy);
+        state.referrer_policies.insert(0, referrer_policy);
         state.storage = env.storage.clone().unwrap_or_default();
         state.blobs = env.blobs.clone();
         state.viewport.set(viewport);
@@ -3667,6 +3788,7 @@ mod desktop {
         // collapses every such navigation to the base path.
         let config = main_window_config(
             &response_url,
+            &env.referrer,
             viewport,
             env.device_pixel_ratio,
             env.navigation_timing
@@ -4346,6 +4468,7 @@ mod desktop {
         let mut outcome = std::mem::take(&mut page.outcome);
         outcome.elapsed = page.started.elapsed();
         outcome.rendered = Some(Box::new(rendered));
+        outcome.referrer_policy = top_level_referrer_policy(page);
         Some(PageEvt::Static {
             html: static_document_source(page, shell),
             outcome,
@@ -5059,11 +5182,11 @@ mod desktop {
                             }
                         }),
                         dom.attr(source.node, "referrerpolicy")
-                            .and_then(crate::referrer_policy::ReferrerPolicy::parse)
-                            .unwrap_or_default(),
+                            .and_then(crate::referrer_policy::ReferrerPolicy::parse_attribute),
                     )
                 } else {
-                    (context, None, Default::default())
+                    // CSS images and other non-img consumers: the Document's policy.
+                    (context, None, None)
                 }
             };
             let started = crate::performance::now_ms();
@@ -5181,10 +5304,15 @@ mod desktop {
             if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
                 state.in_flight_imports.insert(key.clone());
             }
+            // Referrer Policy #integration-with-css: an inline sheet's (or a
+            // CSSOM rule's) import is requested with its owner document's URL
+            // and policy container referrer policy.
+            let referrer = sheet_owner_referrer(page, owner);
             let events = events.clone();
             cache.spawn(&handle, async move {
                 let sheets =
-                    crate::http::fetch_imported_sheet(url, client, Vec::new(), encoding).await;
+                    crate::http::fetch_imported_sheet(url, client, Vec::new(), encoding, referrer)
+                        .await;
                 let _ = events.send(LumenHostTask::StyleImportsDone { url: key, sheets });
             });
         }
@@ -5237,14 +5365,23 @@ mod desktop {
             }
             let mut cookies = crate::http::CookieContext::subresource(&client);
             cookies.cross_site_ancestor |= request.key.restricted;
-            let fetched = cache.fetch_resource_with_cookies(
-                &handle,
+            let credentials = Some(crate::http::CredentialsMode::SameOrigin);
+            let mut fetch = crate::http::Request::subresource(
                 request.url.clone(),
                 &client,
                 "image",
-                Some(crate::http::CredentialsMode::SameOrigin),
-                cookies,
+                credentials,
             );
+            fetch.cookie_context = Some(cookies);
+            // Fetch #determine-requests-referrer: the referencing element's
+            // Document under its policy container's referrer policy.
+            if let Some(state) = page.engine.ctx().host_mut::<HostState>() {
+                let source = environment_referrer_source(state, context);
+                let policy = environment_referrer_policy(state, context);
+                crate::http::set_request_referrer(&mut fetch, source.as_ref(), policy);
+            }
+            let fetched =
+                cache.fetch_prepared_resource(&handle, fetch, &client, "image", credentials);
             let events = events.clone();
             cache.spawn(&handle, async move {
                 let response = fetched
@@ -5264,19 +5401,53 @@ mod desktop {
         }
     }
 
+    /// Referrer Policy #integration-with-css for a sheet owned by `owner`: a
+    /// `<link>`'s sheet requests with its location (the link's URL), any other
+    /// with its owner's document's URL, under that document's policy.
+    fn sheet_owner_referrer(page: &mut LumenPage, owner: usize) -> crate::http::SheetReferrer {
+        let dom = page.dom.clone();
+        let link = (dom.borrow().tag_name(owner) == Some("link"))
+            .then(|| host_resource_url(page.engine.ctx(), owner, None))
+            .flatten()
+            .and_then(|url| url::Url::parse(&url).ok());
+        let Some(state) = page.engine.ctx().host_mut::<HostState>() else {
+            return crate::http::SheetReferrer {
+                source: None,
+                policy: Default::default(),
+                document_policy: Default::default(),
+            };
+        };
+        let context = {
+            let dom = dom.borrow();
+            node_window_context(state, &dom, owner).unwrap_or(0)
+        };
+        let policy = environment_referrer_policy(state, context);
+        crate::http::SheetReferrer {
+            source: link.or_else(|| environment_referrer_source(state, context)),
+            policy,
+            document_policy: policy,
+        }
+    }
+
     fn start_font_fetches(page: &mut LumenPage) {
         let urls = page.dom.borrow().take_font_requests();
         if urls.is_empty() {
             return;
         }
         let client = request_context_url(page.engine.ctx(), 0);
-        let Some((handle, cache, events)) =
+        let Some((handle, cache, events, source, policy)) =
             page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+                // Referrer Policy #integration-with-css: the Document's URL
+                // and policy container referrer policy.
+                let source = environment_referrer_source(state, 0);
+                let policy = environment_referrer_policy(state, 0);
                 let network = state.network.as_ref()?;
                 Some((
                     network.handle.clone(),
                     network.cache.clone(),
                     state.task_events.clone()?,
+                    source,
+                    policy,
                 ))
             })
         else {
@@ -5311,14 +5482,12 @@ mod desktop {
                 });
                 continue;
             }
-            let fetched = cache.fetch_resource_with_cookies(
-                &handle,
-                url,
-                &client,
-                "font",
-                Some(crate::http::CredentialsMode::SameOrigin),
-                crate::http::CookieContext::subresource(&client),
-            );
+            let credentials = Some(crate::http::CredentialsMode::SameOrigin);
+            let mut request = crate::http::Request::subresource(url, &client, "font", credentials);
+            request.cookie_context = Some(crate::http::CookieContext::subresource(&client));
+            crate::http::set_request_referrer(&mut request, source.as_ref(), policy);
+            let fetched =
+                cache.fetch_prepared_resource(&handle, request, &client, "font", credentials);
             let events = events.clone();
             cache.spawn(&handle, async move {
                 let bytes = fetched
@@ -5345,6 +5514,9 @@ mod desktop {
                 continue;
             }
             let prepared = page.engine.ctx().host_mut::<HostState>().and_then(|state| {
+                // The Document's request referrer (Fetch #determine-requests-referrer).
+                let source = environment_referrer_source(state, 0);
+                let policy = environment_referrer_policy(state, 0);
                 let network = state.network.as_ref()?;
                 if !matches!(url.scheme(), "http" | "https")
                     || !crate::http::subresource_allowed(&client, &url)
@@ -5362,13 +5534,16 @@ mod desktop {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mut context = crate::http::CookieContext::subresource(&client);
                     context.cross_site_ancestor = restricted;
-                    network.cache.fetch_resource_with_cookies(
+                    let mut request =
+                        crate::http::Request::subresource(url.clone(), &client, "image", None);
+                    request.cookie_context = Some(context);
+                    crate::http::set_request_referrer(&mut request, source.as_ref(), policy);
+                    network.cache.fetch_prepared_resource(
                         &network.handle,
-                        url.clone(),
+                        request,
                         &client,
                         "image",
                         None,
-                        context,
                     )
                 };
                 Some((network.handle.clone(), shared))
@@ -5827,8 +6002,8 @@ mod desktop {
                     .filter(|value| !value.trim().is_empty())
                 };
                 checkpoint(page, "click");
-                if let Some((url, replace)) =
-                    take_navigation(page).or_else(|| anchor.map(|url| (url, NavigationAction::New)))
+                if let Some((url, replace)) = take_navigation(page)
+                    .or_else(|| anchor.map(|url| hyperlink_navigation(page, url)))
                 {
                     return send_navigation(page, events, url, replace);
                 }
@@ -6720,10 +6895,17 @@ mod desktop {
         sent_primary || !acknowledge_settle || events.blocking_send(PageEvt::Settled).is_ok()
     }
 
-    enum NavigationAction {
+    enum NavigationKind {
         New,
         Replace,
         Reload,
+    }
+
+    /// A top-level navigation's history handling and its source Document's
+    /// request context (HTML #navigate's sourceDocument and referrerPolicy).
+    struct NavigationAction {
+        kind: NavigationKind,
+        initiator: Option<Box<crate::http::NavigationInitiator>>,
     }
 
     fn take_navigation(page: &mut LumenPage) -> Option<(String, NavigationAction)> {
@@ -6734,12 +6916,111 @@ mod desktop {
         let url_value = page.engine.ctx().member_get(&value, "0").ok()?;
         let action_value = page.engine.ctx().member_get(&value, "1").ok()?;
         let url = value_to_string(page, &url_value)?;
-        let action = match value_to_string(page, &action_value)?.as_str() {
-            "reload" => NavigationAction::Reload,
-            "replace" => NavigationAction::Replace,
-            _ => NavigationAction::New,
+        let kind = match value_to_string(page, &action_value)?.as_str() {
+            "reload" => NavigationKind::Reload,
+            "replace" => NavigationKind::Replace,
+            _ => NavigationKind::New,
         };
-        (!url.trim().is_empty()).then(|| (url.trim().to_string(), action))
+        let policy = page
+            .engine
+            .ctx()
+            .member_get(&value, "5")
+            .ok()
+            .and_then(|value| value_to_string(page, &value))
+            .unwrap_or_default();
+        let context = page
+            .engine
+            .ctx()
+            .member_get(&value, "6")
+            .ok()
+            .and_then(|value| value.as_num_opt())
+            .filter(|context| context.is_finite() && *context >= 0.0)
+            .map_or(0, |context| context as u64);
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return None;
+        }
+        let initiator = navigation_initiator(page, &url, &policy, context);
+        Some((url, NavigationAction { kind, initiator }))
+    }
+
+    /// HTML #following-hyperlinks-2: the hyperlink a click followed, as
+    /// `[hyperlink referrer policy, its node document's settings context]`.
+    fn hyperlink_navigation(page: &mut LumenPage, url: String) -> (String, NavigationAction) {
+        let value = call_trust(page, "takeHyperlinkNavigation", &[], "hyperlink navigation")
+            .filter(|value| !value_is_nullish(value));
+        let (policy, context) = match value {
+            Some(value) => {
+                let policy = page
+                    .engine
+                    .ctx()
+                    .member_get(&value, "0")
+                    .ok()
+                    .and_then(|value| value_to_string(page, &value))
+                    .unwrap_or_default();
+                let context = page
+                    .engine
+                    .ctx()
+                    .member_get(&value, "1")
+                    .ok()
+                    .and_then(|value| value.as_num_opt())
+                    .filter(|context| context.is_finite() && *context >= 0.0)
+                    .map_or(0, |context| context as u64);
+                (policy, context)
+            }
+            None => (String::new(), 0),
+        };
+        let initiator = navigation_initiator(page, &url, &policy, context);
+        (
+            url,
+            NavigationAction {
+                kind: NavigationKind::New,
+                initiator,
+            },
+        )
+    }
+
+    /// The navigation request context of the Window `context`'s Document
+    /// navigating the top-level traversable to `url` with `referrerPolicy`
+    /// `policy` (empty: the Document's own). Fetch #determine-requests-referrer
+    /// resolves "client" to the Document's URL here; a `blob:` URL's entry was
+    /// held when its URL was parsed (else it is resolved now), and a top-level
+    /// navigation obtains it without the partition check (File API
+    /// #blob-url-obtain-object, Fetch #scheme-fetch).
+    fn navigation_initiator(
+        page: &mut LumenPage,
+        url: &str,
+        policy: &str,
+        context: u64,
+    ) -> Option<Box<crate::http::NavigationInitiator>> {
+        let state = page.engine.ctx().host_mut::<HostState>()?;
+        let client = state
+            .window_request_urls
+            .get(&context)
+            .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
+            .unwrap_or(&state.base)
+            .clone();
+        let referrer = environment_referrer_source(state, context);
+        let policy_container = environment_referrer_policy(state, context);
+        let referrer_policy =
+            crate::referrer_policy::ReferrerPolicy::parse(policy).unwrap_or(policy_container);
+        let held = state.navigation_blob.take();
+        let blob = url::Url::parse(url)
+            .ok()
+            .filter(|target| target.scheme() == "blob")
+            .and_then(|target| {
+                let key = crate::blob_url_store::key(target.as_str());
+                held.filter(|(url, _)| url == key)
+                    .map(|(_, entry)| entry)
+                    .or_else(|| state.blobs.resolve(key))
+            });
+        Some(Box::new(crate::http::NavigationInitiator {
+            client,
+            referrer,
+            referrer_policy,
+            policy_container,
+            blob,
+        }))
     }
 
     fn take_history_updates(page: &mut LumenPage) -> Vec<(String, bool)> {
@@ -6759,10 +7040,10 @@ mod desktop {
         action: NavigationAction,
     ) -> bool {
         abort_for_navigation(page);
-        let event = match action {
-            NavigationAction::Replace => PageEvt::Replace(url),
-            NavigationAction::Reload => PageEvt::Reload(url),
-            NavigationAction::New => PageEvt::Navigate(url),
+        let event = match action.kind {
+            NavigationKind::Replace => PageEvt::Replace(url, action.initiator),
+            NavigationKind::Reload => PageEvt::Reload(url),
+            NavigationKind::New => PageEvt::Navigate(url, action.initiator),
         };
         events.blocking_send(event).is_ok()
     }
@@ -6817,6 +7098,14 @@ mod desktop {
             }
         };
         Some((form, submitter, submission))
+    }
+
+    /// The top-level Document's policy container referrer policy (HTML #meta-referrer).
+    fn top_level_referrer_policy(
+        page: &mut LumenPage,
+    ) -> Option<crate::referrer_policy::ReferrerPolicy> {
+        let state = page.engine.ctx().host_mut::<HostState>()?;
+        Some(environment_referrer_policy(state, 0))
     }
 
     fn take_form_submit(
@@ -6918,7 +7207,19 @@ mod desktop {
         let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
             return Ok(None);
         };
+        // HTML #form-submission-algorithm: the form's node document navigates, with
+        // referrerPolicy "no-referrer" for a `noreferrer` form and else the empty string.
+        let context = value
+            .get("context")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let policy = value
+            .get("referrerPolicy")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let initiator = navigation_initiator(page, action, policy, context);
         Ok(Some(FormSubmission {
+            initiator,
             action: action.to_string(),
             content_type: value
                 .get("enctype")
@@ -7325,7 +7626,7 @@ mod desktop {
                             );
                             acknowledged = true;
                         }
-                        Some(PageEvt::Navigate(url)) => {
+                        Some(PageEvt::Navigate(url, ..)) => {
                             assert!(
                                 acknowledged,
                                 "keydown acknowledged before release navigation"
@@ -8573,7 +8874,7 @@ mod desktop {
                         .unwrap();
                     loop {
                         match events.recv().await {
-                            Some(PageEvt::Navigate(url)) => {
+                            Some(PageEvt::Navigate(url, ..)) => {
                                 assert_eq!(
                                     url,
                                     "https://example.com/search?query=cats+%26+dogs&tab=all"
@@ -8673,7 +8974,7 @@ mod desktop {
                 handle.try_send_navigation_click(target).unwrap();
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::Navigate(url)) => {
+                        Some(PageEvt::Navigate(url, ..)) => {
                             assert_eq!(url, "https://example.com/gallery/next");
                             break;
                         }
@@ -8706,11 +9007,11 @@ mod desktop {
                 handle.try_send_navigation_click(target).unwrap();
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::Replace(url)) => {
+                        Some(PageEvt::Replace(url, ..)) => {
                             assert_eq!(url, DEFAULT_URL);
                             break;
                         }
-                        Some(PageEvt::Navigate(url)) => {
+                        Some(PageEvt::Navigate(url, ..)) => {
                             panic!("replacement became a history push: {url}")
                         }
                         Some(PageEvt::Trouble(errors)) => {
@@ -8738,7 +9039,7 @@ mod desktop {
                             assert_eq!(url, DEFAULT_URL);
                             break;
                         }
-                        Some(PageEvt::Navigate(_) | PageEvt::Replace(_)) => {
+                        Some(PageEvt::Navigate(..) | PageEvt::Replace(..)) => {
                             panic!("reload intent was lost")
                         }
                         Some(PageEvt::Trouble(errors)) => panic!("reload failed: {errors:?}"),
@@ -9084,6 +9385,421 @@ mod desktop {
             expect("frame-removed", "EncodingError");
             expect("brand", "TypeError");
             assert_eq!(results["distinct"].as_bool(), Some(true), "{results}");
+        }
+
+        /// Run `html` in a resident page actor until its `<output id=result>` reads "done …";
+        /// returns the text after "done ".
+        async fn page_result(html: &str, env: PageEnv) -> String {
+            let (_handle, mut events) = spawn_page(html.to_string(), env);
+            let html = tokio::time::timeout(Duration::from_secs(40), async {
+                loop {
+                    match events.recv().await {
+                        Some(PageEvt::Updated { html, .. }) if html.contains("done ") => {
+                            break html;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("page failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before the page finished"),
+                    }
+                }
+            })
+            .await
+            .expect("page did not finish");
+            let start = html.find("done ").unwrap() + 5;
+            let end = html[start..].find("</output>").unwrap() + start;
+            html[start..end].replace("&amp;", "&")
+        }
+
+        #[tokio::test]
+        async fn document_referrer_policy_governs_script_worker_and_element_requests() {
+            // HTML #policy-containers: the Document's referrer policy comes from the
+            // navigation response (here `origin`) and HTML #meta-referrer updates it, legacy
+            // keywords included, as each <meta name=referrer> is inserted or changed; an invalid
+            // value changes nothing. Fetch #main-fetch step 7 gives every request with an empty
+            // referrer policy the Document's, and #determine-requests-referrer its URL;
+            // RequestInit referrer/referrerPolicy (Fetch #dom-request) and the referrerpolicy
+            // attributes (HTML #referrer-policy-attributes) override them. A worker's own
+            // requests use its script response's Referrer-Policy (HTML #run-a-worker), a style
+            // sheet's imports its location (Referrer Policy #integration-with-css).
+            let server = crate::http::referer_server::Server::start(|path| {
+                let text = |body: &str| (String::from("text/plain"), String::new(), body.as_bytes().to_vec());
+                match path {
+                    "/w.js" => (
+                        String::from("text/javascript"),
+                        String::from("Referrer-Policy: unsafe-url\r\n"),
+                        b"fetch('/w-fetch?x').then(() => postMessage('ok'))".to_vec(),
+                    ),
+                    "/s.js" => (String::from("text/javascript"), String::new(), b"window.scriptRan = 1;".to_vec()),
+                    "/s.css" => (
+                        String::from("text/css"),
+                        String::from("Referrer-Policy: origin\r\n"),
+                        b"@import '/s-import.css';".to_vec(),
+                    ),
+                    "/es" => (String::from("text/event-stream"), String::new(), b"data: hi\n\n".to_vec()),
+                    "/frame" => (String::from("text/html"), String::new(), b"<p>frame</p>".to_vec()),
+                    "/img1" | "/img2" => (
+                        String::from("image/png"),
+                        String::new(),
+                        b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0d\x49\x44\x41\x54\x78\xda\x63\x64\xf8\xcf\x50\x0f\x00\x03\x86\x01\x80\x5a\x34\x7d\x6b\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82".to_vec(),
+                    ),
+                    _ => text("ok"),
+                }
+            })
+            .await;
+            let base = server.base.clone();
+            let page = format!("{base}/doc/page.html?q=1");
+            let html = r##"<!doctype html><html><head></head><body>
+                <button id="keep">keep actor resident</button>
+                <output id="result">pending</output>
+                <script>
+                    document.getElementById("keep").addEventListener("click", () => {});
+                    const log = [];
+                    const hit = (url, init) => fetch(url, init).then(r => r.text());
+                    const settle = (element) => new Promise((resolve) => {
+                        element.onload = () => resolve("load");
+                        element.onerror = () => resolve("error");
+                    });
+                    (async () => {
+                        await hit("/h-origin");
+                        const meta = document.createElement("meta");
+                        meta.name = "referrer";
+                        meta.content = "ALWAYS";
+                        document.head.append(meta);
+                        await hit("/m-always");
+                        meta.content = "never";
+                        await hit("/m-never");
+                        await hit("/r-origin", {referrerPolicy: "origin"});
+                        await hit("/r-custom", {referrer: "/custom?x", referrerPolicy: "unsafe-url"});
+                        await hit("/r-none", {referrer: "", referrerPolicy: "unsafe-url"});
+                        meta.content = "origin-when-crossorigin";
+                        await hit("/m-owc");
+                        meta.content = "bogus";
+                        await hit("/m-bogus");
+                        const later = document.createElement("meta");
+                        later.setAttribute("name", "Referrer");
+                        later.setAttribute("content", "same-origin");
+                        document.head.append(later);
+                        await new Promise((resolve) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("GET", "/xhr");
+                            xhr.onloadend = resolve;
+                            xhr.send();
+                        });
+                        const sync = new XMLHttpRequest();
+                        sync.open("GET", "/xhr-sync", false);
+                        sync.send();
+                        later.content = "no-referrer";
+                        const plain = new Image();
+                        const plainDone = settle(plain);
+                        plain.src = "/img1";
+                        const chosen = new Image();
+                        chosen.referrerPolicy = "unsafe-url";
+                        const chosenDone = settle(chosen);
+                        chosen.src = "/img2";
+                        log.push("img:" + await plainDone + "/" + await chosenDone);
+                        const script = document.createElement("script");
+                        script.setAttribute("referrerpolicy", "origin");
+                        const ran = settle(script);
+                        script.src = "/s.js";
+                        document.body.append(script);
+                        log.push("script:" + await ran);
+                        const link = document.createElement("link");
+                        link.rel = "stylesheet";
+                        link.referrerPolicy = "unsafe-url";
+                        const styled = settle(link);
+                        link.href = "/s.css";
+                        document.head.append(link);
+                        log.push("link:" + await styled);
+                        const frame = document.createElement("iframe");
+                        frame.referrerPolicy = "unsafe-url";
+                        const framed = settle(frame);
+                        frame.src = "/frame";
+                        document.body.append(frame);
+                        await framed;
+                        log.push("frame-referrer:" + frame.contentDocument.referrer);
+                        const worker = new Worker("/w.js");
+                        log.push("worker:" + await new Promise((resolve) => {
+                            worker.onmessage = (event) => resolve(event.data);
+                            worker.onerror = () => resolve("error");
+                        }));
+                        const source = new EventSource("/es");
+                        await new Promise((resolve) => { source.onmessage = resolve; source.onerror = resolve; });
+                        source.close();
+                        navigator.sendBeacon("/beacon");
+                        log.push("referrer:" + document.referrer);
+                        document.getElementById("result").textContent = "done " + log.join("|");
+                    })().catch((error) => {
+                        document.getElementById("result").textContent = "done error " + error;
+                    });
+                </script>
+            </body></html>"##;
+            let mut env = PageEnv::bare(&page);
+            env.net = Some(tokio::runtime::Handle::current());
+            env.referrer_policy = crate::referrer_policy::ReferrerPolicy::Origin;
+            env.referrer = String::from("http://referring.test/from");
+            let result = page_result(html, env).await;
+            assert_eq!(
+                result,
+                format!(
+                    "img:load/load|script:load|link:load|frame-referrer:{page}|worker:ok|referrer:http://referring.test/from"
+                )
+            );
+            server.wait_for(&["/beacon", "/s-import.css"]).await;
+            let origin = Some(format!("{base}/"));
+            let full = Some(page.clone());
+            for (path, expected) in [
+                ("/h-origin", origin.clone()),
+                ("/m-always", full.clone()),
+                ("/m-never", None),
+                ("/r-origin", origin.clone()),
+                ("/r-custom", Some(format!("{base}/custom?x"))),
+                ("/r-none", None),
+                ("/m-owc", full.clone()),
+                ("/m-bogus", full.clone()),
+                ("/xhr", full.clone()),
+                ("/xhr-sync", full.clone()),
+                ("/img1", None),
+                ("/img2", full.clone()),
+                ("/s.js", origin.clone()),
+                ("/s.css", full.clone()),
+                ("/s-import.css", origin.clone()),
+                ("/frame", full.clone()),
+                ("/w.js", None),
+                ("/w-fetch?x", Some(format!("{base}/w.js"))),
+                ("/es", None),
+                ("/beacon", None),
+            ] {
+                assert_eq!(server.referer(path), Some(expected), "{path}");
+            }
+        }
+
+        /// The first top-level navigation (or planned form submission) `html` starts.
+        async fn page_navigation(html: &str, url: &str) -> PageEvt {
+            let (_handle, mut events) = spawn_page(html.to_string(), PageEnv::bare(url));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Some(event @ (PageEvt::Navigate(..) | PageEvt::SubmitForm { .. })) => {
+                            break event;
+                        }
+                        Some(PageEvt::Trouble(errors)) => panic!("page failed: {errors:?}"),
+                        Some(_) => {}
+                        None => panic!("Lumen actor closed before navigating"),
+                    }
+                }
+            })
+            .await
+            .expect("page did not navigate")
+        }
+
+        #[tokio::test]
+        async fn top_level_navigations_carry_their_source_documents_referrer_policy() {
+            // HTML #following-hyperlinks-2 (#hyperlink-referrer-policy: noreferrer, else the
+            // referrerpolicy attribute), #form-submission-algorithm (a noreferrer form) and
+            // #navigate: the navigation request's referrer is its source Document's URL under that
+            // referrerPolicy, else the Document's policy container's (Fetch #main-fetch step 7),
+            // which a local URL's Document inherits (#determine-navigation-params-policy-container).
+            use crate::referrer_policy::ReferrerPolicy;
+            let url = "https://source.test/dir/page.html?q=1";
+            let source = url::Url::parse(url).unwrap();
+            let page = |body: &str| {
+                format!(
+                    "<!doctype html><html><head><meta name=referrer content=same-origin></head>\
+                     <body><button id=keep>keep</button>{body}<script>\
+                     document.getElementById('keep').addEventListener('click', () => {{}});\
+                     addEventListener('load', () => setTimeout(go, 0));</script></body></html>"
+                )
+            };
+            for (body, target, policy) in [
+                (
+                    "<a id=a rel='external NoReferrer' href=/next>n</a><script>function go(){document.getElementById('a').click()}</script>",
+                    "https://source.test/next",
+                    ReferrerPolicy::NoReferrer,
+                ),
+                (
+                    "<a id=a referrerpolicy=ORIGIN href=https://elsewhere.test/>o</a><script>function go(){document.getElementById('a').click()}</script>",
+                    "https://elsewhere.test/",
+                    ReferrerPolicy::Origin,
+                ),
+                (
+                    "<a id=a referrerpolicy=bogus href=/plain>p</a><script>function go(){document.getElementById('a').click()}</script>",
+                    "https://source.test/plain",
+                    ReferrerPolicy::SameOrigin,
+                ),
+                (
+                    "<script>function go(){location.href = '/assigned'}</script>",
+                    "https://source.test/assigned",
+                    ReferrerPolicy::SameOrigin,
+                ),
+            ] {
+                let PageEvt::Navigate(to, Some(initiator)) =
+                    page_navigation(&page(body), url).await
+                else {
+                    panic!("{body}: no navigation initiator");
+                };
+                assert_eq!(to, target, "{body}");
+                assert_eq!(initiator.referrer_policy, policy, "{body}");
+                assert_eq!(
+                    initiator.policy_container,
+                    ReferrerPolicy::SameOrigin,
+                    "{body}"
+                );
+                assert_eq!(initiator.referrer.as_ref(), Some(&source), "{body}");
+                assert_eq!(initiator.client, source, "{body}");
+                assert!(initiator.blob.is_none());
+            }
+            let form = "<form id=f rel=noreferrer action=/sent><input name=k value=v></form>\
+                        <script>function go(){document.getElementById('f').requestSubmit()}</script>";
+            let PageEvt::SubmitForm {
+                submission: Some(submission),
+                ..
+            } = page_navigation(&page(form), url).await
+            else {
+                panic!("no form submission");
+            };
+            assert!(submission.action.starts_with("https://source.test/sent"));
+            let initiator = submission.initiator.expect("form initiator");
+            assert_eq!(initiator.referrer_policy, ReferrerPolicy::NoReferrer);
+            assert_eq!(initiator.policy_container, ReferrerPolicy::SameOrigin);
+        }
+
+        #[tokio::test]
+        async fn blob_navigations_hold_the_entry_their_url_parse_resolved() {
+            // URL #concept-url-parser resolves a blob: URL's entry when the navigation parses it;
+            // the top-level navigation then obtains the Blob without the partition check (File
+            // API #blob-url-obtain-object with "top-level-navigation", Fetch #scheme-fetch), even
+            // after revokeObjectURL in the same task. The Document's policy container is its
+            // initiator's (HTML #determine-navigation-params-policy-container).
+            use crate::referrer_policy::ReferrerPolicy;
+            let url = "https://maker.test/app.html";
+            for go in [
+                "const u = URL.createObjectURL(new Blob(['<p>made</p>'], {type: 'text/html'})); \
+                 location.href = u + '#top'; URL.revokeObjectURL(u);",
+                "const u = URL.createObjectURL(new Blob(['<p>made</p>'], {type: 'text/html'})); \
+                 const a = document.createElement('a'); a.href = u; document.body.append(a); \
+                 a.click(); URL.revokeObjectURL(u);",
+            ] {
+                let html = format!(
+                    "<!doctype html><html><head><meta name=referrer content=origin></head><body>\
+                     <button id=keep>keep</button><script>\
+                     document.getElementById('keep').addEventListener('click', () => {{}});\
+                     addEventListener('load', () => setTimeout(() => {{ {go} }}, 0));\
+                     </script></body></html>"
+                );
+                let PageEvt::Navigate(to, Some(initiator)) = page_navigation(&html, url).await
+                else {
+                    panic!("{go}: no navigation initiator");
+                };
+                let target = url::Url::parse(&to).unwrap();
+                assert_eq!(target.scheme(), "blob", "{go}");
+                assert!(to.starts_with("blob:https://maker.test/"), "{go}: {to}");
+                let entry = initiator.blob.as_ref().expect("held blob URL entry");
+                assert_eq!(entry.content_type, "text/html");
+                assert_eq!(entry.origin, "https://maker.test");
+                let response = crate::http::blob_navigation_response(&target, Some(&initiator))
+                    .expect("blob document");
+                assert_eq!(response.body, b"<p>made</p>");
+                assert_eq!(
+                    crate::http::response_referrer_policy(&response),
+                    ReferrerPolicy::Origin
+                );
+                // URL #concept-url-origin: the Document's origin is the entry environment's.
+                assert_eq!(
+                    target.origin(),
+                    url::Url::parse(url).unwrap().origin(),
+                    "{go}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_blob_document_has_its_entry_environments_origin() {
+            // HTML #determining-the-origin and URL #concept-url-origin: a Document navigated to
+            // a blob: URL has the origin of the URL in its path, so its scripts, storage and
+            // requests act for the creator's origin; local schemes send no referrer.
+            let html = "<!doctype html><html><body><button id=keep>keep</button>\
+                <output id=result>pending</output><script>\
+                document.getElementById('keep').addEventListener('click', () => {});\
+                document.getElementById('result').textContent = 'done ' + [location.origin, \
+                    self.origin, document.URL.startsWith('blob:'), document.referrer].join('|');\
+                </script></body></html>";
+            let mut env =
+                PageEnv::bare("blob:https://maker.test/0b0e4d0c-6c3a-4bd3-9a5b-2d2b8e3c9f10");
+            env.referrer = String::from("https://maker.test/app.html");
+            let result = page_result(html, env).await;
+            assert_eq!(
+                result,
+                "https://maker.test|https://maker.test|true|https://maker.test/app.html"
+            );
+        }
+
+        #[tokio::test]
+        async fn module_scripts_import_blob_urls_through_the_shared_store() {
+            // HTML #fetch-a-single-module-script with Fetch #scheme-fetch "blob" and File API
+            // #url-model: static and dynamic imports, import-map targets and modulepreload of
+            // blob: URLs obtain the page's blob URL store entry for their environment. A
+            // non-JavaScript Blob type or a revoked URL fails, and a module worker's imports use
+            // the same store.
+            let html = r##"<!doctype html><html><head></head><body>
+                <button id="keep">keep actor resident</button>
+                <output id="result">pending</output>
+                <script>
+                    document.getElementById("keep").addEventListener("click", () => {});
+                    const js = (source) => URL.createObjectURL(new Blob([source], {type: "text/javascript"}));
+                    const log = [];
+                    const lib = js("export const v = 'static';");
+                    const mapped = js("export default 'mapped';");
+                    const plain = URL.createObjectURL(new Blob(["export default 1;"], {type: "text/plain"}));
+                    const map = document.createElement("script");
+                    map.type = "importmap";
+                    map.textContent = JSON.stringify({imports: {"blob-lib": mapped}});
+                    document.head.append(map);
+                    const settle = (element) => new Promise((resolve) => {
+                        element.onload = () => resolve("load");
+                        element.onerror = () => resolve("error");
+                    });
+                    (async () => {
+                        const module = document.createElement("script");
+                        module.type = "module";
+                        module.textContent = `import {v} from "${lib}"; window.staticResult = v;`;
+                        const ran = settle(module);
+                        document.body.append(module);
+                        await ran;
+                        log.push("static:" + window.staticResult);
+                        log.push("dynamic:" + (await import(js("export default 'dynamic';"))).default);
+                        log.push("mapped:" + (await import("blob-lib")).default);
+                        try { await import(plain); log.push("plain:loaded"); }
+                        catch (error) { log.push("plain:" + error.name); }
+                        const revoked = js("export default 'gone';");
+                        URL.revokeObjectURL(revoked);
+                        try { await import(revoked); log.push("revoked:loaded"); }
+                        catch (error) { log.push("revoked:" + error.name); }
+                        for (const href of [lib, plain]) {
+                            const link = document.createElement("link");
+                            link.rel = "modulepreload";
+                            const preloaded = settle(link);
+                            link.href = href;
+                            document.head.append(link);
+                            log.push("preload:" + await preloaded);
+                        }
+                        const worker = new Worker(js(`import {v} from "${lib}"; postMessage(v);`), {type: "module"});
+                        log.push("worker:" + await new Promise((resolve) => {
+                            worker.onmessage = (event) => resolve(event.data);
+                            worker.onerror = () => resolve("error");
+                        }));
+                        document.getElementById("result").textContent = "done " + log.join("|");
+                    })().catch((error) => {
+                        document.getElementById("result").textContent = "done error " + error;
+                    });
+                </script>
+            </body></html>"##;
+            let mut env = PageEnv::bare(DEFAULT_URL);
+            env.net = Some(tokio::runtime::Handle::current());
+            assert_eq!(
+                page_result(html, env).await,
+                "static:static|dynamic:dynamic|mapped:mapped|plain:TypeError|revoked:TypeError|\
+                 preload:load|preload:error|worker:static"
+            );
         }
 
         #[tokio::test]
@@ -9712,7 +10428,7 @@ mod desktop {
             let navigated = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::Navigate(url)) => break url,
+                        Some(PageEvt::Navigate(url, ..)) => break url,
                         Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
                         Some(_) => {}
                         None => panic!("Lumen actor closed during slotted link click"),
@@ -9858,7 +10574,7 @@ mod desktop {
             let navigated = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     match events.recv().await {
-                        Some(PageEvt::Navigate(url)) => break url,
+                        Some(PageEvt::Navigate(url, ..)) => break url,
                         Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
                         Some(_) => {}
                         None => panic!("Lumen actor closed during click task"),
@@ -9903,7 +10619,7 @@ mod desktop {
                             assert_eq!(delta, -1);
                             break;
                         }
-                        Some(PageEvt::Navigate(url) | PageEvt::Replace(url)) => {
+                        Some(PageEvt::Navigate(url, ..) | PageEvt::Replace(url, ..)) => {
                             panic!("unexpected navigation {url}")
                         }
                         Some(PageEvt::Trouble(errors)) => panic!("history task failed: {errors:?}"),
@@ -9976,7 +10692,7 @@ mod desktop {
                 loop {
                     match events.recv().await {
                         Some(PageEvt::HistoryUpdate { url, replace }) => break (url, replace),
-                        Some(PageEvt::Navigate(url) | PageEvt::Replace(url)) => {
+                        Some(PageEvt::Navigate(url, ..) | PageEvt::Replace(url, ..)) => {
                             panic!("pushState became a document navigation: {url}")
                         }
                         Some(PageEvt::Trouble(errors)) => panic!("click task failed: {errors:?}"),
@@ -11586,6 +12302,138 @@ fn realm_origin(state: &mut HostState, context: u64) -> url::Origin {
     realm_origin_ref(state, context).clone()
 }
 
+/// HTML #meta-referrer: apply the `<meta name=referrer>` changes the DOM recorded to their
+/// Documents' policy containers, in the order they happened.
+fn apply_referrer_meta_updates(state: &mut HostState) {
+    let updates = state.dom.borrow_mut().take_referrer_meta_updates();
+    if updates.is_empty() {
+        return;
+    }
+    let dom = state.dom.clone();
+    let dom = dom.borrow();
+    for (document, policy) in updates {
+        if let Some(context) = node_window_context(state, &dom, document) {
+            state.referrer_policies.insert(context, policy);
+        }
+    }
+}
+
+/// The referrer policy of the environment `context` names (its policy container's): a
+/// worker's own, or the Window Realm's Document's.
+fn environment_referrer_policy(
+    state: &mut HostState,
+    context: u64,
+) -> crate::referrer_policy::ReferrerPolicy {
+    if let Some(worker) = state.worker_self.as_ref() {
+        return worker.referrer_policy;
+    }
+    apply_referrer_meta_updates(state);
+    state
+        .referrer_policies
+        .get(&context)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Fetch #determine-requests-referrer, request's referrer "client": a worker's creation URL,
+/// or the Window's Document's URL (none for an opaque origin; an iframe srcdoc document's
+/// container document's URL instead).
+fn environment_referrer_source(state: &mut HostState, context: u64) -> Option<url::Url> {
+    if state.worker_self.is_some() {
+        return Some(state.base.clone());
+    }
+    if !realm_origin_ref(state, context).is_tuple() {
+        return None;
+    }
+    let document_url = state
+        .window_cookie_contexts
+        .get(&context)
+        .filter(|_| context != 0)
+        .map(|(_, url, _)| url.clone());
+    match document_url {
+        Some(url) if url.as_str() != "about:srcdoc" => Some(url),
+        _ => Some(
+            state
+                .window_request_urls
+                .get(&context)
+                .unwrap_or(&state.base)
+                .clone(),
+        ),
+    }
+}
+
+/// The request referrer and referrer policy a script fetch passed at `index` and `index + 1`.
+fn script_request_referrer(
+    ctx: &mut Ctx,
+    args: &[Value],
+    index: usize,
+) -> (
+    RequestReferrer,
+    Option<crate::referrer_policy::ReferrerPolicy>,
+) {
+    let referrer = RequestReferrer::parse(&host_arg_usv(ctx, args, index));
+    let policy =
+        crate::referrer_policy::ReferrerPolicy::parse(&host_arg_string(ctx, args, index + 1));
+    (referrer, policy)
+}
+
+/// A request's referrer (Fetch #concept-request-referrer).
+#[derive(Clone, Debug)]
+enum RequestReferrer {
+    Client,
+    NoReferrer,
+    Url(url::Url),
+}
+
+impl RequestReferrer {
+    /// The JavaScript request record's value: "client", "no-referrer" or a URL.
+    fn parse(value: &str) -> Self {
+        match value {
+            "" | "client" => Self::Client,
+            "no-referrer" => Self::NoReferrer,
+            other => url::Url::parse(other).map_or(Self::Client, Self::Url),
+        }
+    }
+}
+
+/// Fetch #main-fetch steps 7-8 for a request of the environment `context`: an empty request
+/// referrer policy becomes the environment's, then #determine-requests-referrer runs.
+fn determine_request_referrer(
+    state: &mut HostState,
+    context: u64,
+    referrer: &RequestReferrer,
+    request_policy: Option<crate::referrer_policy::ReferrerPolicy>,
+    target: &url::Url,
+) -> (Option<url::Url>, crate::referrer_policy::ReferrerPolicy) {
+    let policy = match request_policy {
+        Some(policy) => policy,
+        None => environment_referrer_policy(state, context),
+    };
+    let source = match referrer {
+        RequestReferrer::NoReferrer => None,
+        RequestReferrer::Url(url) => Some(url.clone()),
+        RequestReferrer::Client => environment_referrer_source(state, context),
+    };
+    (
+        source.and_then(|source| policy.determine(&source, target)),
+        policy,
+    )
+}
+
+/// Set `request`'s `Referer` (and the referrer policy its redirects use) as
+/// Fetch #main-fetch steps 7-8 determine it for the environment `context`.
+fn apply_request_referrer(
+    state: &mut HostState,
+    context: u64,
+    referrer: &RequestReferrer,
+    request_policy: Option<crate::referrer_policy::ReferrerPolicy>,
+    request: &mut crate::http::Request,
+) {
+    let (referrer, policy) =
+        determine_request_referrer(state, context, referrer, request_policy, &request.url);
+    crate::http::replace_referrer(request, referrer.as_ref(), policy);
+}
+
 fn realm_origin_ref(state: &mut HostState, context: u64) -> &url::Origin {
     if !state.realm_origins.contains_key(&context) {
         let origin = state
@@ -12751,6 +13599,7 @@ fn prepare_uncounted_client_request(
         cookie_context: None,
         timing_client: None,
         use_cors_preflight: false,
+        referrer_policy: None,
         fetch_policy: fetch_policy.map(|(mode, credentials)| crate::http::FetchPolicy {
             origin: origin.clone(),
             mode,
@@ -12974,6 +13823,8 @@ fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     let initiator = resource_initiator(ctx, args);
     let client = request_client_url(ctx);
     let cookie_context = request_cookie_context(ctx);
+    let (referrer, referrer_policy) = script_request_referrer(ctx, args, 12);
+    let context = ctx.host_job_context();
     if std::env::var_os("TRUST_TRACE_FETCH").is_some() {
         eprintln!(
             "[fetch-trace] @{:>6}ms sync {method} {target}",
@@ -12982,13 +13833,14 @@ fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     }
     let use_cors_preflight = host_fetch_use_cors_preflight(args);
     let work = ctx.host_mut::<HostState>().and_then(|state| {
-        prepare_client_request(state, &client, &target, method, body, headers, policy).map(
-            |(handle, cache, mut request)| {
-                request.cookie_context = Some(cookie_context);
-                request.use_cors_preflight = use_cors_preflight;
-                (handle, cache, request)
-            },
-        )
+        let prepared =
+            prepare_client_request(state, &client, &target, method, body, headers, policy);
+        prepared.map(|(handle, cache, mut request)| {
+            request.cookie_context = Some(cookie_context);
+            request.use_cors_preflight = use_cors_preflight;
+            apply_request_referrer(state, context, &referrer, referrer_policy, &mut request);
+            (handle, cache, request)
+        })
     });
     let (result, timing) = match work {
         Some((handle, cache, request)) => {
@@ -13022,7 +13874,10 @@ struct NavigationFetch {
 fn prepare_navigation_fetch(ctx: &mut Ctx, args: &[Value]) -> Option<NavigationFetch> {
     use crate::referrer_policy::ReferrerPolicy;
     let target = host_arg_usv(ctx, args, 0);
-    let policy = ReferrerPolicy::parse(&host_arg_usv(ctx, args, 2)).unwrap_or_default();
+    // The container's referrer policy attribute (reflected, limited to known values); the
+    // empty string uses the navigating Document's policy container's policy.
+    let attribute_policy = ReferrerPolicy::parse(&host_arg_usv(ctx, args, 2));
+    let calling = ctx.host_job_context();
     let node = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
@@ -13042,27 +13897,34 @@ fn prepare_navigation_fetch(ctx: &mut Ctx, args: &[Value]) -> Option<NavigationF
         } else {
             "iframe"
         };
-    let (handle, cache, mut request) = ctx.host_mut::<HostState>().and_then(|state| {
-        prepare_client_request(
-            state,
-            &client,
-            &target,
-            "GET".into(),
-            None,
-            Vec::new(),
-            None,
-        )
-    })?;
+    let state = ctx.host_mut::<HostState>()?;
+    let context = match node {
+        Some(node) => {
+            let dom = state.dom.clone();
+            let dom = dom.borrow();
+            node_window_context(state, &dom, node).unwrap_or(calling)
+        }
+        None => calling,
+    };
+    let (handle, cache, mut request) = prepare_client_request(
+        state,
+        &client,
+        &target,
+        "GET".into(),
+        None,
+        Vec::new(),
+        None,
+    )?;
     crate::http::set_fetch_metadata(&mut request, &client, destination, "navigate");
     request.cookie_context = Some(cookie_context);
-    request
-        .headers
-        .retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
-    if let Some(referrer) = policy.determine(&client, &request.url) {
-        request
-            .headers
-            .push(("Referer".into(), referrer.to_string()));
-    }
+    apply_request_referrer(
+        state,
+        context,
+        &RequestReferrer::Client,
+        attribute_policy,
+        &mut request,
+    );
+    let policy = attribute_policy.unwrap_or_else(|| environment_referrer_policy(state, context));
     Some(NavigationFetch {
         handle,
         cache,
@@ -13177,6 +14039,11 @@ fn navigation_result_value(
 ) -> Result<Value, Value> {
     let final_url = details.response.url.to_string();
     let referrer = details.referrer;
+    // HTML #creating-a-policy-container-from-a-fetch-response: the response's
+    // `Referrer-Policy` (Referrer Policy #parse-referrer-policy-from-header).
+    let response_policy =
+        crate::referrer_policy::ReferrerPolicy::from_headers(&details.response.headers)
+            .map_or("", crate::referrer_policy::ReferrerPolicy::as_str);
     let timing = match details.response.timing.as_ref() {
         Some(timing) => host_navigation_timing_value(ctx, timing, &final_url)?,
         None => Value::Null,
@@ -13198,6 +14065,11 @@ fn navigation_result_value(
     ctx.member_set(&result, "6", Value::from_string(referrer))?;
     ctx.member_set(&result, "7", timing)?;
     ctx.member_set(&result, "8", resource_timing)?;
+    ctx.member_set(
+        &result,
+        "9",
+        Value::from_string(String::from(response_policy)),
+    )?;
     Ok(result)
 }
 
@@ -13307,6 +14179,8 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     let use_cors_preflight = host_fetch_use_cors_preflight(args);
     // Argument 11: the request's keepalive (Fetch #request-keepalive-flag).
     let keepalive = matches!(args.get(11), Some(Value::Bool(true)));
+    // Arguments 12 and 13: the request's referrer and referrer policy.
+    let (referrer, referrer_policy) = script_request_referrer(ctx, args, 12);
     let started = crate::performance::now_ms();
     let client = request_client_url(ctx);
     let cookie_context = request_cookie_context(ctx);
@@ -13365,6 +14239,13 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                 .map(|(_, _, mut request)| {
                     request.cookie_context = Some(cookie_context);
                     request.use_cors_preflight = use_cors_preflight;
+                    apply_request_referrer(
+                        state,
+                        context,
+                        &referrer,
+                        referrer_policy,
+                        &mut request,
+                    );
                     AsyncFetchSource::Request(Box::new(request))
                 }),
         };
@@ -13989,8 +14870,10 @@ fn json_string(value: &str) -> String {
 }
 
 /// The `__trust_cfg` script a top-level Window Realm's platform bootstrap consumes.
+#[allow(clippy::too_many_arguments)]
 fn main_window_config(
     response_url: &url::Url,
+    referrer: &str,
     viewport: crate::layout2::Viewport,
     device_pixel_ratio: f32,
     navigation_timing: serde_json::Value,
@@ -13999,8 +14882,9 @@ fn main_window_config(
     traces: MainWindowTraces,
 ) -> String {
     format!(
-        "globalThis.__trust_cfg = {{ url: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {} }};",
+        "globalThis.__trust_cfg = {{ url: {}, referrer: {}, ua: {}, navigatorMode: {}, platform: {}, language: {}, languages: [{}, {}], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {}, frameTrace: {}, challengeMessageTrace: {}, navigationTiming: {}, lastModified: {}, fullscreenSupported: {} }};",
         json_string(response_url.as_str()),
+        json_string(referrer),
         json_string(crate::http::user_agent()),
         json_string(crate::http::navigator_compatibility_mode().as_str()),
         json_string(crate::http::navigator_platform()),
@@ -14257,6 +15141,9 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
     };
     let navigation_timing = args.get(10).cloned().unwrap_or(Value::Null);
     let about_base_url = args.get(11).cloned().unwrap_or(Value::Null);
+    // The navigation response's `Referrer-Policy`, when the document came from one.
+    let response_policy =
+        crate::referrer_policy::ReferrerPolicy::parse(&host_arg_string(ctx, args, 12));
     let snapshot = platform_prelude_snapshot().map_err(|error| {
         ctx.make_error(
             "SyntaxError",
@@ -14321,6 +15208,9 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
                 context,
                 page: client_url.clone(),
                 cookie_context: cookie_context.clone(),
+                // Its storage key and referrer policy are known once the Realm's URL and
+                // policy container are (below).
+                environment: ModuleFetchEnvironment::default(),
                 events,
                 import_map: state.import_maps.entry(context).or_default().clone(),
                 network: Some(LumenDynamicModuleNetwork {
@@ -14340,6 +15230,30 @@ fn host_create_window_realm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             ),
         );
         state.window_request_urls.insert(context, client_url);
+        // HTML #determining-navigation-params-policy-container: an about:srcdoc document and
+        // a local URL's (about:, blob:, data:) clone the navigating Document's policy
+        // container; another document creates one from its response. Then the parser
+        // inserted the document's `<meta name=referrer>` elements (#meta-referrer).
+        let policy = if matches!(parsed_url.scheme(), "about" | "blob" | "data") {
+            environment_referrer_policy(state, creator_context)
+        } else {
+            response_policy.unwrap_or_default()
+        };
+        let policy = {
+            let dom = state.dom.borrow();
+            dom.frame_document(frame_id)
+                .and_then(|document| dom.parsed_referrer_meta_policy(document))
+                .unwrap_or(policy)
+        };
+        state.referrer_policies.insert(context, policy);
+        let environment = ModuleFetchEnvironment {
+            blobs: state.blobs.clone(),
+            storage_key: blob_storage_key(&realm_origin(state, context)),
+            referrer_policy: policy,
+        };
+        if let Some(loader) = state.early_imports.borrow_mut().get_mut(&context) {
+            loader.environment = environment;
+        }
     }
     let installed = ctx.with_embed_realm(&realm, |realm_ctx| {
         realm_ctx.set_host_job_context(context);
@@ -14530,14 +15444,18 @@ fn prepare_element_request(
 ) -> Option<crate::http::Request> {
     let client = element_request_client_url(ctx, node);
     let cookie_context = element_cookie_context(ctx, node);
-    let (credentials, referrer_policy) = {
+    let calling = ctx.host_job_context();
+    let (credentials, referrer_policy, context) = {
         let dom = host_dom(ctx);
         let dom = dom.borrow();
+        let state = ctx.host_mut::<HostState>()?;
         (
             crate::js::element_cors_credentials(dom.attr(node, "crossorigin"), module),
+            // HTML #referrer-policy-attributes: the element's attribute, or the
+            // empty string for the Document's policy container's policy.
             dom.attr(node, "referrerpolicy")
-                .and_then(crate::referrer_policy::ReferrerPolicy::parse)
-                .unwrap_or_default(),
+                .and_then(crate::referrer_policy::ReferrerPolicy::parse_attribute),
+            node_window_context(state, &dom, node).unwrap_or(calling),
         )
     };
     let state = ctx.host_mut::<HostState>()?;
@@ -14561,14 +15479,13 @@ fn prepare_element_request(
         },
     );
     request.cookie_context = Some(cookie_context);
-    request
-        .headers
-        .retain(|(key, _)| !key.eq_ignore_ascii_case("referer"));
-    if let Some(referrer) = referrer_policy.determine(&client, &request.url) {
-        request
-            .headers
-            .push(("Referer".into(), referrer.to_string()));
-    }
+    apply_request_referrer(
+        state,
+        context,
+        &RequestReferrer::Client,
+        referrer_policy,
+        &mut request,
+    );
     Some(request)
 }
 
@@ -15018,6 +15935,16 @@ fn spawn_resource_fetch(
             Some((state.base.clone(), fetched, handle.clone(), cache.clone()))
         })
         .flatten();
+    // Referrer Policy #integration-with-css: the sheet's imports use its
+    // location and its own policy, else its document's.
+    let document_policy = ctx
+        .host_mut::<HostState>()
+        .map(|state| {
+            let dom = state.dom.clone();
+            let context = node_window_context(state, &dom.borrow(), node_id).unwrap_or(0);
+            environment_referrer_policy(state, context)
+        })
+        .unwrap_or_default();
     cache.spawn(&handle, async move {
         let mut response_url = request.url.clone();
         let (result, timing) = match shared {
@@ -15091,6 +16018,8 @@ fn spawn_resource_fetch(
                     client,
                     cors_mode,
                     encoding,
+                    crate::http::SheetReferrer::located(&request.url, headers, document_policy),
+                    crate::referrer_policy::ReferrerPolicy::from_headers(headers),
                 )
                 .await;
                 (None, Some(Box::new(sheet)))
@@ -15618,11 +16547,22 @@ fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
         })
     });
     let (owner_page, owner_secure, referrer_source, referrer_policy) = match nested_owner {
-        Some(owner) => owner,
+        Some((origin, secure, base, policy)) => (origin, secure, Some(base), policy),
         None => {
             let page = request_client_url(ctx);
             let secure = lumen_potentially_trustworthy(&page);
-            (page.clone(), secure, page, Default::default())
+            // Fetch #determine-requests-referrer for the owning Window's environment: its
+            // Document's URL (none for an opaque origin) under its policy container's policy.
+            let (source, policy) = ctx
+                .host_mut::<HostState>()
+                .map(|state| {
+                    (
+                        environment_referrer_source(state, context),
+                        environment_referrer_policy(state, context),
+                    )
+                })
+                .unwrap_or((Some(page.clone()), Default::default()));
+            (page, secure, source, policy)
         }
     };
     let cookie_context = request_cookie_context(ctx);
@@ -16067,6 +17007,7 @@ struct LumenWorkerModuleFetch {
     handle: tokio::runtime::Handle,
     cache: Arc<crate::http::PageCache>,
     fetched: Arc<std::sync::atomic::AtomicUsize>,
+    environment: ModuleFetchEnvironment,
 }
 
 /// HTML §8.1.4.2 classic/module worker fetch. Top-level HTTP(S) worker requests are same-origin;
@@ -16090,7 +17031,9 @@ fn fetch_lumen_worker_script(
         return Some(LumenWorkerScript {
             url: launch.script_url.clone(),
             source: String::from_utf8_lossy(&body).into_owned(),
-            referrer_policy: None,
+            // HTML #initialize-worker-policy-container: a blob: worker's container is the
+            // entry's environment's (#creating-a-policy-container-from-a-fetch-response).
+            referrer_policy: Some(entry.referrer_policy),
         });
     }
     if launch.script_url.scheme() == "data" {
@@ -16120,14 +17063,11 @@ fn fetch_lumen_worker_script(
     // HTML #fetch-a-classic-worker-script: the request's client is the outside settings, so
     // Fetch #determine-requests-referrer uses its creation URL (the owning Window's document
     // or, for a nested worker, the owning worker's URL) under its referrer policy.
-    if let Some(referrer) = launch
-        .referrer_policy
-        .determine(&launch.referrer_source, &request.url)
-    {
-        request
-            .headers
-            .push((String::from("Referer"), referrer.to_string()));
-    }
+    crate::http::set_request_referrer(
+        &mut request,
+        launch.referrer_source.as_ref(),
+        launch.referrer_policy,
+    );
     request.fetch_policy = Some(crate::http::FetchPolicy {
         origin: launch.owner_page.clone(),
         mode: crate::http::RequestMode::SameOrigin,
@@ -16260,6 +17200,7 @@ fn eval_lumen_worker_module(
     let loader_handle = fetch.handle;
     let loader_cache = fetch.cache;
     let loader_fetched = fetch.fetched;
+    let environment = fetch.environment;
     // A dependency that cannot be fetched leaves the module graph without a
     // result: #run-a-worker then fires a plain error event, not a report.
     let missing_dependency = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -16275,6 +17216,7 @@ fn eval_lumen_worker_module(
                 &loader_cache,
                 &loader_fetched,
                 None,
+                &environment,
                 specifier,
                 referrer,
             );
@@ -16640,6 +17582,7 @@ fn run_lumen_worker(
                 .and_then(|state| state.network.as_ref())
                 .map(|network| network.fetched.clone())
                 .unwrap_or_default();
+            let environment = ModuleFetchEnvironment::of(engine.ctx(), 0);
             eval_lumen_worker_module(
                 &mut engine,
                 &script,
@@ -16649,6 +17592,7 @@ fn run_lumen_worker(
                     handle: handle.clone(),
                     cache: cache.clone(),
                     fetched,
+                    environment,
                 },
                 &events,
                 launch.id,
@@ -16814,6 +17758,7 @@ fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
     let import_map = context_import_map(engine.ctx(), context);
     let page = request_context_url(engine.ctx(), context);
     let cookie_context = cookie_context_for_id(engine.ctx(), context);
+    let environment = ModuleFetchEnvironment::of(engine.ctx(), context);
     let work = engine.ctx().host_mut::<HostState>().and_then(|state| {
         state
             .network
@@ -16829,6 +17774,7 @@ fn install_context_module_loader(engine: &mut lumen::Engine, context: u64) {
                 &cache,
                 &fetched,
                 Some(&import_map),
+                &environment,
                 specifier,
                 referrer,
             )
@@ -16853,6 +17799,7 @@ fn module_dependency_loader(
     cache: &Arc<crate::http::PageCache>,
     fetched: &std::sync::atomic::AtomicUsize,
     import_map: Option<&crate::import_maps::Handle>,
+    environment: &ModuleFetchEnvironment,
     specifier: &str,
     referrer: &str,
 ) -> Option<(String, String)> {
@@ -16886,6 +17833,9 @@ fn module_dependency_loader(
             crate::document_encoding::decode_utf8(&body),
         ));
     }
+    if resolved.scheme() == "blob" {
+        return environment.blob_module(&resolved, &integrity);
+    }
     if !matches!(resolved.scheme(), "http" | "https")
         || !crate::http::subresource_allowed(page, &resolved)
     {
@@ -16907,13 +17857,13 @@ fn module_dependency_loader(
         // HTML's fetch-a-module-script graph algorithm requires this dependency. Keep the count
         // as diagnostics, but never turn historical activity into a synthetic load failure.
         fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let shared = cache.fetch_resource_with_cookies(
+        let request = environment.module_request(resolved.clone(), page, referrer, cookie_context);
+        let shared = cache.fetch_prepared_resource(
             handle,
-            resolved.clone(),
+            request,
             page,
             "script",
             Some(crate::http::CredentialsMode::SameOrigin),
-            cookie_context.clone(),
         );
         crate::http::PageCache::block_on_fetch(Some(handle), shared)?
     };
@@ -16999,6 +17949,16 @@ fn queue_dynamic_module_load(
         });
         return;
     }
+    if resolved.scheme() == "blob" {
+        // Resolving the specifier parsed the URL and resolved its blob URL entry now.
+        let result = loader.environment.blob_module(&resolved, &integrity);
+        let _ = loader.events.send(LumenHostTask::DynamicModule {
+            context: loader.context,
+            request_id,
+            result,
+        });
+        return;
+    }
     let Some(network) = loader.network.as_ref() else {
         let _ = loader.events.send(LumenHostTask::DynamicModule {
             context: loader.context,
@@ -17036,13 +17996,18 @@ fn queue_dynamic_module_load(
         network
             .fetched
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        network.cache.fetch_resource_with_cookies(
-            &network.handle,
+        let request = loader.environment.module_request(
             resolved.clone(),
+            &loader.page,
+            referrer,
+            &loader.cookie_context,
+        );
+        network.cache.fetch_prepared_resource(
+            &network.handle,
+            request,
             &loader.page,
             "script",
             Some(crate::http::CredentialsMode::SameOrigin),
-            loader.cookie_context.clone(),
         )
     };
     let events = loader.events.clone();
@@ -17114,13 +18079,18 @@ fn begin_dynamic_module_fetch(loader: &LumenDynamicModuleLoader, specifier: &str
     network
         .fetched
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let shared = network.cache.fetch_resource_with_cookies(
-        &network.handle,
+    let request = loader.environment.module_request(
         resolved.clone(),
+        &loader.page,
+        referrer,
+        &loader.cookie_context,
+    );
+    let shared = network.cache.fetch_prepared_resource(
+        &network.handle,
+        request,
         &loader.page,
         "script",
         Some(crate::http::CredentialsMode::SameOrigin),
-        loader.cookie_context.clone(),
     );
     let (page, handle, cache, fetched) = (
         loader.page.clone(),
@@ -17474,6 +18444,7 @@ fn run_injected_module_task(
     let import_map = context_import_map(engine.ctx(), context);
     let cookie_context = element_cookie_context(engine.ctx(), node_id);
     let client = element_request_client_url(engine.ctx(), node_id);
+    let environment = ModuleFetchEnvironment::of(engine.ctx(), context);
     let snapshot = engine.ctx().host_mut::<HostState>().and_then(|state| {
         let network = state.network.as_ref()?;
         Some((
@@ -17508,6 +18479,7 @@ fn run_injected_module_task(
                             &cache,
                             &fetched,
                             Some(&import_map),
+                            &environment,
                             specifier,
                             referrer,
                         )
@@ -17673,6 +18645,7 @@ fn run_resource_task(
                             .0,
                             base: name.clone(),
                             cors_same_origin: true,
+                            referrer_policy: None,
                             imports: Vec::new(),
                         }
                     },
@@ -17695,6 +18668,7 @@ fn run_resource_task(
                     base: sheet.base,
                     text: sheet.text,
                     cors_same_origin: sheet.cors_same_origin,
+                    referrer_policy: sheet.referrer_policy,
                 });
                 let imports = sheet.imports.into_iter().map(to_engine).collect();
                 dom.borrow_mut()
@@ -18145,6 +19119,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             }
             let cookie_context = cookie_context_for_id(engine.ctx(), context);
             let page = request_context_url(engine.ctx(), context);
+            let environment = ModuleFetchEnvironment::of(engine.ctx(), context);
             let state = engine
                 .ctx()
                 .host_mut::<HostState>()
@@ -18154,6 +19129,7 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                     context,
                     page,
                     cookie_context,
+                    environment,
                     events,
                     import_map: state.import_maps.entry(context).or_default().clone(),
                     network: state
@@ -22602,6 +23578,7 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
                 parts.push(crate::blob_url_store::BlobPart::File(range));
             }
             let state = ctx.host_mut::<HostState>().expect("HostState installed");
+            let referrer_policy = environment_referrer_policy(state, environment.realm);
             state.blobs.add(
                 url,
                 crate::blob_url_store::BlobUrlEntry {
@@ -22610,6 +23587,7 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
                     origin,
                     storage_key,
                     environment,
+                    referrer_policy,
                 },
             );
             Ok(Value::Undefined)
@@ -22654,6 +23632,25 @@ fn host_blob_url(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
         "revoke" => {
             if let Some(state) = ctx.host_mut::<HostState>() {
                 state.blobs.revoke(&url, &storage_key);
+            }
+            Ok(Value::Undefined)
+        }
+        // HTML #fetch-a-single-module-script (a modulepreload): the entry for this environment
+        // (#check-for-same-partition-blob-url-usage) with a JavaScript MIME type.
+        "module" => Ok(Value::Bool(
+            ctx.host_mut::<HostState>()
+                .and_then(|state| state.blobs.obtain(&url, Some(&storage_key)))
+                .is_some_and(|entry| {
+                    crate::http::module_script_response_allowed(200, &entry.content_type)
+                }),
+        )),
+        // URL #concept-url-parser for a top-level navigation's URL: hold the entry it
+        // resolves for the navigation fetch, which obtains it without the partition check
+        // (Fetch #scheme-fetch, destination "document").
+        "navigate" => {
+            if let Some(state) = ctx.host_mut::<HostState>() {
+                let key = crate::blob_url_store::key(&url).to_string();
+                state.navigation_blob = state.blobs.resolve(&key).map(|entry| (key, entry));
             }
             Ok(Value::Undefined)
         }
@@ -29526,6 +30523,7 @@ mod tests {
         assert!(
             main_window_config(
                 &url::Url::parse(DEFAULT_URL).unwrap(),
+                "",
                 crate::layout2::Viewport::new(10.0, 10.0),
                 1.0,
                 serde_json::Value::Null,
@@ -33214,6 +34212,7 @@ mod tests {
                     base: url.into(),
                     text: text.into(),
                     cors_same_origin: cors,
+                    referrer_policy: None,
                 };
             dom.attach_external_sheets(&[
                 sheet(
@@ -33302,6 +34301,7 @@ mod tests {
                     base: "https://example.com/late.css".into(),
                     text: "#target { color: rgb(7, 8, 9) }".into(),
                     cors_same_origin: true,
+                    referrer_policy: None,
                 }]);
             assert_eq!(
                 string_value(
@@ -33340,6 +34340,7 @@ mod tests {
             base: url.into(),
             text: text.into(),
             cors_same_origin: true,
+            referrer_policy: None,
         };
         assert_eq!(
             string_value(
@@ -45588,6 +46589,85 @@ mod tests {
             string_value(&mut engine, "result"),
             "TypeError|SecurityError|SecurityError|SecurityError|true"
         );
+    }
+
+    #[test]
+    fn referrer_policy_reflections_and_request_init_follow_html_and_fetch() {
+        // HTML #referrer-policy-attributes: a, area, img, iframe, link and script reflect
+        // referrerpolicy limited to the known values (missing and invalid are ""). Fetch
+        // #dom-request: RequestInit.referrerPolicy must be a ReferrerPolicy enumeration value.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const out = [];
+            for (const tag of ["a", "area", "img", "iframe", "link", "script"]) {
+                const element = document.createElement(tag);
+                const missing = element.referrerPolicy;
+                element.setAttribute("referrerpolicy", "NO-REFERRER");
+                const upper = element.referrerPolicy;
+                element.setAttribute("referrerpolicy", "never");
+                const invalid = element.referrerPolicy;
+                element.referrerPolicy = "origin";
+                out.push([tag, JSON.stringify(missing), upper, JSON.stringify(invalid),
+                    element.getAttribute("referrerpolicy")].join(":"));
+            }
+            out.push(new Request("https://example.test/", {referrerPolicy: "same-origin"}).referrerPolicy);
+            out.push(JSON.stringify(new Request("https://example.test/").referrerPolicy));
+            try { new Request("https://example.test/", {referrerPolicy: "never"}); out.push("accepted"); }
+            catch (error) { out.push(error.name); }
+            globalThis.reflectionResult = out.join("|");
+            "##,
+            "referrer policy reflections",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "reflectionResult"),
+            [
+                r#"a:"":no-referrer:"":origin"#,
+                r#"area:"":no-referrer:"":origin"#,
+                r#"img:"":no-referrer:"":origin"#,
+                r#"iframe:"":no-referrer:"":origin"#,
+                r#"link:"":no-referrer:"":origin"#,
+                r#"script:"":no-referrer:"":origin"#,
+                "same-origin",
+                r#""""#,
+                "TypeError",
+            ]
+            .join("|")
+        );
+    }
+
+    #[test]
+    fn blob_module_scripts_are_obtained_for_their_partition_with_a_javascript_type() {
+        // HTML #fetch-a-single-module-script with Fetch #scheme-fetch "blob": the entry is
+        // obtained for the module's settings object (File API
+        // #check-for-same-partition-blob-url-usage), its type must be a JavaScript MIME type,
+        // and an import map's integrity metadata applies to its bytes.
+        let store = crate::js::BlobMap::default();
+        let source = b"export default 1;".to_vec();
+        store.add_bytes("blob:https://a.test/1", source.clone(), "text/javascript");
+        store.add_bytes("blob:https://a.test/2", source.clone(), "text/plain");
+        let environment = |key: &str| ModuleFetchEnvironment {
+            blobs: store.clone(),
+            storage_key: key.to_string(),
+            referrer_policy: Default::default(),
+        };
+        let url = url::Url::parse("blob:https://a.test/1").unwrap();
+        assert_eq!(
+            environment("https://a.test").blob_module(&url, ""),
+            Some((url.to_string(), String::from("export default 1;")))
+        );
+        assert_eq!(environment("https://b.test").blob_module(&url, ""), None);
+        let text = url::Url::parse("blob:https://a.test/2").unwrap();
+        assert_eq!(environment("https://a.test").blob_module(&text, ""), None);
+        assert_eq!(
+            environment("https://a.test")
+                .blob_module(&url, "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            None
+        );
+        let gone = url::Url::parse("blob:https://a.test/3").unwrap();
+        assert_eq!(environment("https://a.test").blob_module(&gone, ""), None);
     }
 
     #[test]

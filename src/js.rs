@@ -19,6 +19,10 @@ pub struct Outcome {
     /// This presentation only advanced style-origin CSS animations; no DOM,
     /// resource or environment change contributed to it.
     pub(crate) animation_frame: bool,
+    /// The top-level Document's policy container referrer policy, after its
+    /// `<meta name=referrer>` elements (HTML #meta-referrer), for navigations
+    /// the frontend starts from this presentation.
+    pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
 impl std::fmt::Debug for Outcome {
@@ -181,6 +185,12 @@ pub struct PageEnv {
     /// The response's MIME type essence: an XML MIME type makes the page an
     /// XML document built by the XML parser (HTML #read-xml).
     pub(crate) content_type: String,
+    /// HTML #policy-container-referrer-policy of the Document's policy container: from
+    /// the navigation response's `Referrer-Policy` header, or cloned from the
+    /// initiator for a local URL (HTML #determining-navigation-params-policy-container).
+    pub(crate) referrer_policy: crate::referrer_policy::ReferrerPolicy,
+    /// HTML #dom-document-referrer: the navigation request's final referrer, or empty.
+    pub(crate) referrer: String,
     /// Fullscreen API #fullscreen-is-supported: whether the frontend can
     /// present this page fullscreen (`document.fullscreenEnabled` and
     /// `requestFullscreen()` consult it).
@@ -209,6 +219,8 @@ impl PageEnv {
             last_modified: None,
             document_encoding: encoding_rs::UTF_8,
             content_type: String::from("text/html"),
+            referrer_policy: Default::default(),
+            referrer: String::new(),
             fullscreen_supported: true,
         }
     }
@@ -651,6 +663,9 @@ pub struct FormSubmission {
     pub method: String,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// The form's node document as the navigation's source, with the form's
+    /// `noreferrer` referrer policy (`None`: the frontend's current document).
+    pub initiator: Option<Box<crate::http::NavigationInitiator>>,
 }
 
 impl FormSubmission {
@@ -679,8 +694,10 @@ pub enum PageEvt {
         html: String,
         outcome: Outcome,
     },
-    Navigate(String),
-    Replace(String),
+    /// A top-level navigation with its source Document's request context
+    /// (`None`: the frontend's current document).
+    Navigate(String, Option<Box<crate::http::NavigationInitiator>>),
+    Replace(String, Option<Box<crate::http::NavigationInitiator>>),
     Reload(String),
     HistoryUpdate {
         url: String,
@@ -1124,6 +1141,37 @@ pub(crate) fn needs_live_dom(dom: &Dom) -> bool {
         // origin on the document timeline.
         || dom.css_animations_declared()
         || clickable_set_for_dom(dom, &std::collections::HashSet::new()).1
+        || element_referrer_policies(dom)
+}
+
+/// Whether an element chooses its own requests' referrer policy: a
+/// `referrerpolicy` attribute (HTML #referrer-policy-attributes) or a
+/// `noreferrer` hyperlink or form (#link-type-noreferrer). The page actor
+/// owns those elements' image requests and navigations, so the canonical DOM
+/// applies them.
+fn element_referrer_policies(dom: &Dom) -> bool {
+    dom.composed_descendants(DOCUMENT).into_iter().any(|node| {
+        hyperlink_chooses_referrer(dom, node)
+            || (matches!(
+                dom.tag_name(node),
+                Some("img" | "iframe" | "link" | "script")
+            ) && dom.attr(node, "referrerpolicy").is_some())
+            || (dom.tag_name(node) == Some("form") && has_noreferrer(dom, node))
+    })
+}
+
+/// An `a` or `area` whose hyperlink referrer policy (HTML
+/// #hyperlink-referrer-policy) is its own rather than the Document's.
+fn hyperlink_chooses_referrer(dom: &Dom, node: usize) -> bool {
+    matches!(dom.tag_name(node), Some("a" | "area"))
+        && (dom.attr(node, "referrerpolicy").is_some() || has_noreferrer(dom, node))
+}
+
+fn has_noreferrer(dom: &Dom, node: usize) -> bool {
+    dom.attr(node, "rel").is_some_and(|rel| {
+        rel.split_ascii_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("noreferrer"))
+    })
 }
 
 pub(crate) fn clickable_set_for_dom(
@@ -1153,10 +1201,15 @@ pub(crate) fn clickable_set_for_dom(
         }
         false
     };
+    // A hyperlink with its own referrer policy is followed by the page actor,
+    // which applies it (HTML #following-hyperlinks-2).
     let anchors: Vec<usize> = everyone
         .iter()
         .copied()
-        .filter(|&node| dom.tag_name(node) == Some("a") && listens(node))
+        .filter(|&node| {
+            dom.tag_name(node) == Some("a")
+                && (listens(node) || hyperlink_chooses_referrer(dom, node))
+        })
         .collect();
     let mut candidates: HashSet<usize> = inherent.into_iter().collect();
     candidates.extend(listeners.iter().copied());
@@ -1365,9 +1418,10 @@ pub(crate) struct ExternalResource {
     /// The element's `charset` attribute: a style sheet's environment
     /// encoding label (HTML #link-type-stylesheet).
     pub charset: Option<String>,
-    /// The element's `referrerpolicy` attribute (HTML
-    /// #referrer-policy-attributes), which a speculative request honors.
-    pub referrer_policy: Option<String>,
+    /// The state of the element's `referrerpolicy` attribute (HTML
+    /// #referrer-policy-attributes); `None` is the empty string, which takes
+    /// the Document's policy container's policy.
+    pub referrer_policy: Option<crate::referrer_policy::ReferrerPolicy>,
 }
 
 impl ExternalResource {
@@ -1463,7 +1517,9 @@ pub(crate) fn external_resources_at(
                 initiator: "script",
                 render_blocking: blocks(node, false),
                 charset: dom.attr(node, "charset").map(str::to_string),
-                referrer_policy: dom.attr(node, "referrerpolicy").map(str::to_string),
+                referrer_policy: dom
+                    .attr(node, "referrerpolicy")
+                    .and_then(crate::referrer_policy::ReferrerPolicy::parse_attribute),
             });
         }
     }
@@ -1494,7 +1550,11 @@ pub(crate) fn external_resources_at(
             render_blocking: kind == ExternalResourceKind::Sheet && blocks(node, true)
                 || tag == Some("script") && blocks(node, false),
             charset: dom.attr(node, "charset").map(str::to_string),
-            referrer_policy: dom.attr(node, "referrerpolicy").map(str::to_string),
+            // SVG `use` has no referrerpolicy attribute.
+            referrer_policy: matches!(tag, Some("link" | "script"))
+                .then(|| dom.attr(node, "referrerpolicy"))
+                .flatten()
+                .and_then(crate::referrer_policy::ReferrerPolicy::parse_attribute),
         };
         if tag == Some("link")
             && rel_has("stylesheet")

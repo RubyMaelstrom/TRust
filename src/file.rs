@@ -206,6 +206,8 @@ pub(crate) async fn fetch(request: &crate::http::Request) -> Result<crate::http:
         challenge: None,
         from_post: false,
         timing: Some(Box::new(timing)),
+        referrer: String::new(),
+        referrer_policy: None,
     })
 }
 
