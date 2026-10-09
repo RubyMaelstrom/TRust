@@ -7,15 +7,17 @@
 //! and 8 (YCgCo) have dedicated equations; the chromaticity-derived matrices
 //! (12, 13) compute KR/KB from the colour primaries. Code points without an
 //! RGB-equivalent equation here (2 unspecified, reserved values, 11 YDzDx and
-//! 14 ICtCp) use BT.601, as libavif does. No transfer-function or gamut
-//! conversion happens: output samples are the decoded non-linear values,
-//! like TRust's other raster formats.
+//! 14 ICtCp) use BT.601, as libavif does. A tagged picture's colour
+//! conversion to sRGB (`super::color`) runs on each row of reconstructed
+//! non-linear R'G'B' at full precision, before quantization to 8 bits, so
+//! high-bit-depth PQ/HLG pictures are tone-mapped without 8-bit banding.
 //!
 //! Subsampled chroma is reconstructed with a triangle (bilinear) filter that
 //! assumes centre-sited chroma, weighting the nearest chroma sample 3/4 and
 //! the next one 1/4 in each subsampled direction (libavif's "bilinear"
 //! upsampling, also libjpeg's "fancy" upsampling).
 
+use super::color::Conversion;
 use crate::av1::{Frame, Samples};
 
 /// The colour interpretation chosen for a picture: an AVIF `colr` nclx box
@@ -74,19 +76,7 @@ impl Matrix {
 /// chromaticity-derived matrices).
 fn chromaticity_coefficients(primaries: u8) -> Option<(f32, f32)> {
     // [xr, yr, xg, yg, xb, yb, xw, yw]
-    let p: [f64; 8] = match primaries {
-        1 | 2 => [0.64, 0.33, 0.30, 0.60, 0.15, 0.06, 0.3127, 0.3290],
-        4 => [0.67, 0.33, 0.21, 0.71, 0.14, 0.08, 0.310, 0.316],
-        5 => [0.64, 0.33, 0.29, 0.60, 0.15, 0.06, 0.3127, 0.3290],
-        6 | 7 => [0.630, 0.340, 0.310, 0.595, 0.155, 0.070, 0.3127, 0.3290],
-        8 => [0.681, 0.319, 0.243, 0.692, 0.145, 0.049, 0.310, 0.316],
-        9 => [0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290],
-        10 => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0 / 3.0, 1.0 / 3.0],
-        11 => [0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.314, 0.351],
-        12 => [0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290],
-        22 => [0.630, 0.340, 0.295, 0.605, 0.155, 0.077, 0.3127, 0.3290],
-        _ => return None,
-    };
+    let p: [f64; 8] = super::color::h273_primaries(primaries)?;
     let [xr, yr, xg, yg, xb, yb, xw, yw] = p;
     let (zr, zg, zb, zw) = (1.0 - xr - yr, 1.0 - xg - yg, 1.0 - xb - yb, 1.0 - xw - yw);
     let denominator =
@@ -168,7 +158,16 @@ fn visible(canvas: &Canvas<'_>, x: usize, y: usize, width: usize, height: usize)
 /// Convert `frame` and write its colour into the canvas at (`x`, `y`), setting
 /// alpha to opaque. Parts outside the canvas are skipped, which implements a
 /// grid's crop to its output size.
-pub(crate) fn write_rgb(frame: &Frame, cicp: Cicp, canvas: &mut Canvas<'_>, x: usize, y: usize) {
+/// `convert` takes the reconstructed samples to sRGB when the picture is
+/// tagged with another colour space.
+pub(crate) fn write_rgb(
+    frame: &Frame,
+    cicp: Cicp,
+    convert: Option<&Conversion>,
+    canvas: &mut Canvas<'_>,
+    x: usize,
+    y: usize,
+) {
     let tables = Tables::new(frame.bit_depth, cicp.full_range);
     let matrix = Matrix::new(cicp);
     // GBR codes all three components like luma (H.273, MatrixCoefficients 0).
@@ -181,6 +180,7 @@ pub(crate) fn write_rgb(frame: &Frame, cicp: Cicp, canvas: &mut Canvas<'_>, x: u
         luma_table: &tables.luma,
         chroma_table,
         matrix,
+        convert,
     };
     let chroma = frame.chroma.as_ref().map(|[u, v]| (&u.samples, &v.samples));
     match (&frame.y.samples, chroma) {
@@ -201,6 +201,7 @@ struct Planes<'a> {
     luma_table: &'a [f32],
     chroma_table: &'a [f32],
     matrix: Matrix,
+    convert: Option<&'a Conversion>,
 }
 
 impl Planes<'_> {
@@ -221,7 +222,25 @@ impl Planes<'_> {
         let chroma_height = frame.chroma.as_ref().map_or(0, |[u, _]| u.height);
         let mut u_row = vec![0.0f32; chroma_width];
         let mut v_row = vec![0.0f32; chroma_width];
+        // One row of reconstructed R'G'B', converted as a whole.
+        let mut rgb_row = vec![0.0f32; columns * 3];
         let lookup = |table: &[f32], sample: T| table.get(sample.index()).copied().unwrap_or(0.0);
+        let finish = |rgb_row: &mut [f32], out: &mut [u8]| {
+            if let Some(convert) = self.convert {
+                for value in rgb_row.iter_mut() {
+                    *value = value.clamp(0.0, 1.0);
+                }
+                convert.apply_rgb_f32(rgb_row);
+            }
+            for (pixel, rgb) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(rgb_row.as_chunks::<3>().0)
+            {
+                *pixel = [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255];
+            }
+        };
 
         for row in 0..rows {
             let luma_row = &luma[row * width..row * width + columns];
@@ -229,10 +248,11 @@ impl Planes<'_> {
             let out = &mut canvas.rgba[out_start..out_start + columns * 4];
 
             let Some((u, v)) = chroma else {
-                for (pixel, &sample) in out.as_chunks_mut::<4>().0.iter_mut().zip(luma_row) {
-                    let value = to_u8(lookup(luma_table, sample));
-                    *pixel = [value, value, value, 255];
+                for (rgb, &sample) in rgb_row.as_chunks_mut::<3>().0.iter_mut().zip(luma_row) {
+                    let value = lookup(luma_table, sample);
+                    *rgb = [value, value, value];
                 }
+                finish(&mut rgb_row, out);
                 continue;
             };
 
@@ -256,8 +276,8 @@ impl Planes<'_> {
                     + (1.0 - near_weight) * lookup(chroma_table, v[f]);
             }
 
-            for (column, (pixel, &sample)) in out
-                .as_chunks_mut::<4>()
+            for (column, (pixel, &sample)) in rgb_row
+                .as_chunks_mut::<3>()
                 .0
                 .iter_mut()
                 .zip(luma_row)
@@ -296,8 +316,9 @@ impl Planes<'_> {
                         luma + cb_to_b * cb,
                     ),
                 };
-                *pixel = [to_u8(r), to_u8(g), to_u8(b), 255];
+                *pixel = [r, g, b];
             }
+            finish(&mut rgb_row, out);
         }
     }
 }

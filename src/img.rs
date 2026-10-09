@@ -21,7 +21,9 @@ use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FilterType, Resize};
 
 mod avif;
+mod color;
 mod inline_svg;
+mod xml_dtd;
 mod yuv;
 #[cfg(test)]
 pub(crate) use inline_svg::document_svg_data_url_for_navigation;
@@ -79,6 +81,8 @@ enum AnimatedRasterFormat {
     Gif,
     Png,
     WebP,
+    /// An AVIF image sequence (AVIF §3).
+    Avif,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,8 +98,14 @@ impl GraphicalAnimation {
 
     /// Conservative persistent decoder-canvas estimate. GIF/APNG disposal can
     /// require a current and previous canvas in addition to the emitted frame.
+    /// An AV1 decoder keeps up to eight reference frames (AV1 §7.20), for the
+    /// colour and any alpha track.
     pub fn decoder_working_set_bytes(&self) -> usize {
-        self.canvas_bytes.saturating_mul(3)
+        let canvases = match self.format {
+            AnimatedRasterFormat::Avif => 6,
+            _ => 3,
+        };
+        self.canvas_bytes.saturating_mul(canvases)
     }
 
     /// Start one play at its first frame.  Format decoders implement the
@@ -131,10 +141,18 @@ pub struct GraphicalAnimationFrame {
 /// desktop constructs and owns this value exclusively on its one animation
 /// worker thread.
 pub struct GraphicalAnimationDecoder {
-    frames: image::Frames<'static>,
+    frames: AnimationFrames,
     loop_count: AnimationLoopCount,
     /// The resource's metadata orientation, applied to every frame.
     orientation: image::metadata::Orientation,
+    /// The resource's colour tag, converted to sRGB on every frame (CSS
+    /// Color 4 #tagged-images).
+    color: Option<Arc<color::Conversion>>,
+}
+
+enum AnimationFrames {
+    Codec(image::Frames<'static>),
+    Avif(Box<avif::Sequence>),
 }
 
 impl GraphicalAnimationDecoder {
@@ -143,12 +161,26 @@ impl GraphicalAnimationDecoder {
     }
 
     pub fn next_frame(&mut self) -> Result<Option<GraphicalAnimationFrame>, String> {
-        let Some(frame) = self.frames.next() else {
-            return Ok(None);
+        let (mut rgba, delay) = match &mut self.frames {
+            AnimationFrames::Codec(frames) => {
+                let Some(frame) = frames.next() else {
+                    return Ok(None);
+                };
+                let frame = frame.map_err(|error| format!("animation decode: {error}"))?;
+                let delay = frame.delay().into();
+                (frame.into_buffer(), delay)
+            }
+            // The sequence converts its own colour while reconstructing.
+            AnimationFrames::Avif(sequence) => match sequence.next_frame()? {
+                Some(frame) => frame,
+                None => return Ok(None),
+            },
         };
-        let frame = frame.map_err(|error| format!("animation decode: {error}"))?;
-        let delay = frame.delay().into();
-        let rgba = oriented_rgba(frame.into_buffer(), self.orientation);
+        if let Some(conversion) = &self.color {
+            let width = rgba.width() as usize;
+            conversion.apply_rgba8(&mut rgba, width);
+        }
+        let rgba = oriented_rgba(rgba, self.orientation);
         let has_alpha = rgba.pixels().any(|pixel| pixel[3] < 255);
         Ok(Some(GraphicalAnimationFrame {
             image: crate::render::ImageResource {
@@ -640,9 +672,11 @@ pub fn decode_graphical_image_for_source(
 ) -> Result<DecodedGraphicalImage, String> {
     let bytes: Arc<[u8]> = bytes.into();
     let cursor_hotspot = cur_hotspot(&bytes);
-    let animated_format = image::guess_format(&bytes)
-        .ok()
-        .and_then(animated_raster_format);
+    let animated_format = match raster_format(&bytes) {
+        Some(RasterFormat::Codec(format)) => animated_raster_format(format),
+        Some(RasterFormat::Avif) => Some(AnimatedRasterFormat::Avif),
+        None => None,
+    };
     if let Some(format) = animated_format {
         let mut animation = GraphicalAnimation {
             bytes: Arc::clone(&bytes),
@@ -704,6 +738,11 @@ fn raster_limits() -> image::Limits {
 }
 
 fn animation_declared(format: AnimatedRasterFormat, bytes: Arc<[u8]>) -> Result<bool, String> {
+    if format == AnimatedRasterFormat::Avif {
+        // An image sequence of two or more samples; the file's primary item
+        // or first sample is otherwise its still image.
+        return Ok(avif::Sequence::open(bytes, avif_limits(MAX_AVIF_BYTES))?.is_some());
+    }
     let cursor = std::io::Cursor::new(bytes);
     match format {
         // GIF89a has no stream-level animation bit. Multiple table-based image
@@ -727,6 +766,7 @@ fn animation_declared(format: AnimatedRasterFormat, bytes: Arc<[u8]>) -> Result<
             }
             Ok(decoder.has_animation())
         }
+        AnimatedRasterFormat::Avif => unreachable!("handled above"),
     }
 }
 
@@ -861,32 +901,48 @@ fn animation_decoder(
     bytes: Arc<[u8]>,
     loop_count_override: Option<AnimationLoopCount>,
 ) -> Result<GraphicalAnimationDecoder, String> {
-    let orientation = metadata_orientation(
-        &bytes,
-        match format {
-            AnimatedRasterFormat::Gif => image::ImageFormat::Gif,
-            AnimatedRasterFormat::Png => image::ImageFormat::Png,
-            AnimatedRasterFormat::WebP => image::ImageFormat::WebP,
-        },
-    );
+    let codec = match format {
+        AnimatedRasterFormat::Gif => image::ImageFormat::Gif,
+        AnimatedRasterFormat::Png => image::ImageFormat::Png,
+        AnimatedRasterFormat::WebP => image::ImageFormat::WebP,
+        AnimatedRasterFormat::Avif => {
+            let sequence = avif::Sequence::open(bytes, avif_limits(MAX_AVIF_BYTES))?
+                .ok_or("AVIF file has no image sequence")?;
+            let loop_count = sequence
+                .plays()
+                .map_or(AnimationLoopCount::Infinite, AnimationLoopCount::Finite);
+            return Ok(GraphicalAnimationDecoder {
+                frames: AnimationFrames::Avif(Box::new(sequence)),
+                loop_count,
+                orientation: image::metadata::Orientation::NoTransforms,
+                color: None,
+            });
+        }
+    };
+    let orientation = metadata_orientation(&bytes, codec);
     match format {
         AnimatedRasterFormat::Gif => {
-            let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
-                .map_err(|error| format!("GIF animation header: {error}"))?;
+            let mut decoder =
+                image::codecs::gif::GifDecoder::new(std::io::Cursor::new(Arc::clone(&bytes)))
+                    .map_err(|error| format!("GIF animation header: {error}"))?;
             decoder
                 .set_limits(raster_limits())
                 .map_err(|error| format!("GIF animation limits: {error}"))?;
             let loop_count =
                 loop_count_override.unwrap_or_else(|| animation_loop_count(decoder.loop_count()));
+            // GIF carries an ICC profile in an `ICCRGBG1` application
+            // extension before its first image.
+            let color = raster_color(&bytes, codec, decoder.icc_profile().ok().flatten());
             Ok(GraphicalAnimationDecoder {
-                frames: decoder.into_frames(),
+                frames: AnimationFrames::Codec(decoder.into_frames()),
                 loop_count,
                 orientation,
+                color,
             })
         }
         AnimatedRasterFormat::Png => {
             let decoder = image::codecs::png::PngDecoder::with_limits(
-                std::io::Cursor::new(bytes),
+                std::io::Cursor::new(Arc::clone(&bytes)),
                 raster_limits(),
             )
             .map_err(|error| format!("PNG animation header: {error}"))?;
@@ -894,15 +950,19 @@ fn animation_decoder(
                 .apng()
                 .map_err(|error| format!("PNG animation: {error}"))?;
             let loop_count = animation_loop_count(decoder.loop_count());
+            // PNG 3: the colour chunks apply to every frame (fdAT included).
+            let color = raster_color(&bytes, codec, None);
             Ok(GraphicalAnimationDecoder {
-                frames: decoder.into_frames(),
+                frames: AnimationFrames::Codec(decoder.into_frames()),
                 loop_count,
                 orientation,
+                color,
             })
         }
         AnimatedRasterFormat::WebP => {
-            let mut decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
-                .map_err(|error| format!("WebP animation header: {error}"))?;
+            let mut decoder =
+                image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(Arc::clone(&bytes)))
+                    .map_err(|error| format!("WebP animation header: {error}"))?;
             let (width, height) = decoder.dimensions();
             if width > MAX_DIMENSION || height > MAX_DIMENSION {
                 return Err(format!(
@@ -920,13 +980,32 @@ fn animation_decoder(
                 .set_background_color(image::Rgba([0, 0, 0, 0]))
                 .map_err(|error| format!("WebP animation background: {error}"))?;
             let loop_count = animation_loop_count(decoder.loop_count());
+            let color = raster_color(&bytes, codec, decoder.icc_profile().ok().flatten());
             Ok(GraphicalAnimationDecoder {
-                frames: decoder.into_frames(),
+                frames: AnimationFrames::Codec(decoder.into_frames()),
                 loop_count,
                 orientation,
+                color,
             })
         }
+        AnimatedRasterFormat::Avif => unreachable!("returned above"),
     }
+}
+
+/// The conversion of a raster image's tagged samples to sRGB (CSS Color 4
+/// #tagged-images): PNG's colour chunks by their PNG 3 priority, otherwise
+/// the embedded ICC profile the decoder reports. `None` for untagged or
+/// sRGB images, and for invalid tags.
+fn raster_color(
+    bytes: &[u8],
+    format: image::ImageFormat,
+    icc: Option<Vec<u8>>,
+) -> Option<Arc<color::Conversion>> {
+    let tag = match format {
+        image::ImageFormat::Png => color::png_tag(bytes),
+        _ => color::icc_tag(icc),
+    }?;
+    color::conversion(&tag)
 }
 
 fn cur_hotspot(bytes: &[u8]) -> Option<(u16, u16)> {
@@ -971,11 +1050,13 @@ fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
         .map_err(|e| e.to_string())?;
     reader.limits(raster_limits());
     let mut orientation = image::metadata::Orientation::NoTransforms;
+    let mut icc = None;
     let decoded = reader
         .into_decoder()
         .and_then(|mut decoder| {
             use image::ImageDecoder as _;
             orientation = decoder.orientation().unwrap_or(orientation);
+            icc = decoder.icc_profile().ok().flatten();
             DynamicImage::from_decoder(decoder)
         })
         .map_err(|error| format!("decode: {error}"));
@@ -988,6 +1069,9 @@ fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
         Err(error) => decode_damaged_raster(bytes, format).ok_or(error)?,
     };
     image.apply_orientation(orientation);
+    if let Some(conversion) = raster_color(bytes, format, icc) {
+        image = conversion.apply_image(image);
+    }
     Ok((image, mime))
 }
 
@@ -1140,7 +1224,7 @@ fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
 fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgImage, String> {
     let data = bounded_svg_data(bytes)?;
     let text = std::str::from_utf8(&data).map_err(|_| String::from("SVG is not UTF-8"))?;
-    let text = svg_without_external_doctype(text)?;
+    let text = svg_without_doctype(text)?;
     let xml = resvg::usvg::roxmltree::Document::parse(text.as_ref())
         .map_err(|e| format!("svg XML parse: {e}"))?;
     let root = xml.root_element();
@@ -1153,8 +1237,16 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
     // missing dimensions use the 300x150 default object size constrained by
     // that ratio. Wrapping the original root in that concrete viewport also
     // prevents usvg's no-viewBox fallback from shrinking to the artwork bbox.
-    let width = root.attribute("width").and_then(svg_length_px);
-    let height = root.attribute("height").and_then(svg_length_px);
+    // CSS Values 4 #font-relative-lengths: `em` on the root's own width and
+    // height is the root's computed font-size.
+    let declared_font_size = svg_root_font_size(root, &xml);
+    let em = declared_font_size.unwrap_or(SVG_INITIAL_FONT_SIZE);
+    let width = root
+        .attribute("width")
+        .and_then(|value| svg_length_px(value, em));
+    let height = root
+        .attribute("height")
+        .and_then(|value| svg_length_px(value, em));
     let ratio = root
         .attribute("viewBox")
         .and_then(view_box_ratio)
@@ -1163,16 +1255,22 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
     let (width, height) = concrete_object_size(width, height, ratio)?;
     let (width, height) = viewport.unwrap_or((width, height));
     let mut original_root = text[root.range()].to_string();
+    let mut edits = Vec::new();
+    let name_end = root.range().start
+        + original_root
+            .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+            .unwrap_or(4);
+    // usvg honors root CSS over presentation attributes as well. A declared
+    // root font-size is carried as the computed px value resolved above, so
+    // `em` inside the document agrees with the root's size.
+    let mut root_style = declared_font_size
+        .map(|size| format!("font-size:{size}px!important;"))
+        .unwrap_or_default();
     if viewport.is_some() {
         // CSS Images 3 #object-negotiation passes the concrete object size to
         // SVG. SVG 2 #ViewportSpace / #ComputingAViewportsTransform then apply
         // viewBox and preserveAspectRatio inside that viewport. Do not stretch
         // a bitmap rendered at the 300x150 default object size.
-        let mut edits = Vec::new();
-        let name_end = root.range().start
-            + original_root
-                .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
-                .unwrap_or(4);
         for (name, value) in [("width", width), ("height", height)] {
             if let Some(attr) = root
                 .attributes()
@@ -1203,26 +1301,24 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
                 None => edits.push((name_end..name_end, format!(" {synthesized}"))),
             }
         }
-        // usvg honors root CSS over presentation attributes as well.
+        root_style.push_str(&format!(
+            "width:{width}px!important;height:{height}px!important"
+        ));
+    }
+    if !root_style.is_empty() {
         if let Some(attr) = root.attributes().find(|a| a.name() == "style") {
             let end = attr.range().end - 1;
-            edits.push((
-                end..end,
-                format!(";width:{width}px!important;height:{height}px!important"),
-            ));
+            edits.push((end..end, format!(";{root_style}")));
         } else {
-            edits.push((
-                name_end..name_end,
-                format!(r#" style="width:{width}px!important;height:{height}px!important""#),
-            ));
+            edits.push((name_end..name_end, format!(r#" style="{root_style}""#)));
         }
-        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-        for (range, value) in edits {
-            original_root.replace_range(
-                range.start - root.range().start..range.end - root.range().start,
-                &value,
-            );
-        }
+    }
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, value) in edits {
+        original_root.replace_range(
+            range.start - root.range().start..range.end - root.range().start,
+            &value,
+        );
     }
     let viewport_style = if viewport.is_some() {
         format!(r#" style="width:{width}px!important;height:{height}px!important""#)
@@ -1252,107 +1348,121 @@ fn parse_svg_at_size(bytes: &[u8], viewport: Option<(f32, f32)>) -> Result<SvgIm
     })
 }
 
-/// Return XML markup with an external-only document type declaration removed.
+/// Return XML markup without its document type declaration.
 ///
 /// XML 1.0 Fifth Edition, §2.8 permits a `doctypedecl`, while §5.1 allows a
 /// non-validating processor not to read its external subset. SVG 1.1 assets in
-/// the wild still commonly carry the published W3C external identifier. We do
-/// exactly that here: validate the declaration, never resolve its system ID,
-/// and pass the remaining document to the secure static SVG parser.
-///
-/// Internal subsets stay disabled. Besides not being needed for the external
-/// SVG DTD marker, accepting them would enable document-authored entity
-/// expansion before usvg sees the already bounded but otherwise untrusted XML.
-fn svg_without_external_doctype(text: &str) -> Result<Cow<'_, str>, String> {
-    let Some((start, end)) = external_doctype_range(text)? else {
-        return Ok(Cow::Borrowed(text));
-    };
-
-    // Validate the original declaration with the XML parser before removing
-    // it. `roxmltree` recognizes but does not fetch an external subset.
-    let options = resvg::usvg::roxmltree::ParsingOptions {
-        allow_dtd: true,
-        ..Default::default()
-    };
-    resvg::usvg::roxmltree::Document::parse_with_options(text, options)
-        .map_err(|e| format!("svg XML parse: {e}"))?;
-
-    let mut stripped = String::with_capacity(text.len() - (end - start) + 1);
-    stripped.push_str(&text[..start]);
-    // Keep prologue and root tokens separated even for compact input such as
-    // `<!DOCTYPE svg><svg ...>`.
-    stripped.push('\n');
-    stripped.push_str(&text[end..]);
-    Ok(Cow::Owned(stripped))
-}
-
-/// Locate an external-only XML document type declaration in the prologue.
-/// Returns the byte range including its closing `>`. A `[` outside a quoted
-/// public/system identifier starts an internal subset and is rejected.
-fn external_doctype_range(text: &str) -> Result<Option<(usize, usize)>, String> {
-    let bytes = text.as_bytes();
-    let mut cursor = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8();
-
-    loop {
-        while bytes
-            .get(cursor)
-            .is_some_and(|byte| byte.is_ascii_whitespace())
+/// the wild still commonly carry the published W3C external identifier, and
+/// Illustrator exports declare their namespaces as internal entities. The
+/// declaration is validated, its system ID is never resolved, and an internal
+/// subset is processed by TRust's bounded expander (`xml_dtd`) before the
+/// remaining document reaches the secure static SVG parser, which therefore
+/// never sees document-authored entity definitions.
+fn svg_without_doctype(text: &str) -> Result<Cow<'_, str>, String> {
+    Ok(
+        match xml_dtd::without_doctype(text, xml_dtd::Limits::for_svg(MAX_SVG_BYTES))
+            .map_err(|error| format!("SVG document type declaration: {error}"))?
         {
-            cursor += 1;
-        }
-
-        let tail = &text[cursor..];
-        if let Some(after_open) = tail.strip_prefix("<!--") {
-            let Some(close) = after_open.find("-->") else {
-                return Ok(None); // the regular XML parser reports the syntax error
-            };
-            cursor += 4 + close + 3;
-            continue;
-        }
-        if let Some(after_open) = tail.strip_prefix("<?") {
-            let Some(close) = after_open.find("?>") else {
-                return Ok(None); // the regular XML parser reports the syntax error
-            };
-            cursor += 2 + close + 2;
-            continue;
-        }
-        if !tail.starts_with("<!DOCTYPE") {
-            return Ok(None);
-        }
-
-        let start = cursor;
-        cursor += "<!DOCTYPE".len();
-        let mut quote = None;
-        while let Some(&byte) = bytes.get(cursor) {
-            if let Some(delimiter) = quote {
-                if byte == delimiter {
-                    quote = None;
-                }
-            } else {
-                match byte {
-                    b'\'' | b'"' => quote = Some(byte),
-                    b'[' => {
-                        return Err(String::from("SVG internal DTD subsets are not supported"));
-                    }
-                    b'>' => return Ok(Some((start, cursor + 1))),
-                    _ => {}
-                }
-            }
-            cursor += 1;
-        }
-        return Err(String::from("unterminated SVG document type declaration"));
-    }
+            Some(expanded) => Cow::Owned(expanded),
+            None => Cow::Borrowed(text),
+        },
+    )
 }
 
-fn svg_length_px(value: &str) -> Option<f32> {
+/// The initial `font-size` (CSS Fonts 4 #font-size-prop: `medium`, 16px). An
+/// SVG image is a separate document, so its root inherits nothing.
+const SVG_INITIAL_FONT_SIZE: f32 = 16.0;
+
+/// The computed font-size of an SVG image document's root, when the root
+/// declares one: from its `font-size` presentation attribute (SVG 2 §6.6,
+/// lowest precedence), the document's `<style>` sheets in specificity order
+/// and its `style` attribute, with `!important` declarations winning as in
+/// usvg's own cascade. Relative values resolve against the initial 16px.
+fn svg_root_font_size(
+    root: resvg::usvg::roxmltree::Node<'_, '_>,
+    document: &resvg::usvg::roxmltree::Document<'_>,
+) -> Option<f32> {
+    struct Element<'a, 'input>(resvg::usvg::roxmltree::Node<'a, 'input>);
+    impl simplecss::Element for Element<'_, '_> {
+        fn parent_element(&self) -> Option<Self> {
+            self.0.parent_element().map(Element)
+        }
+        fn prev_sibling_element(&self) -> Option<Self> {
+            self.0.prev_sibling_element().map(Element)
+        }
+        fn has_local_name(&self, local_name: &str) -> bool {
+            self.0.tag_name().name() == local_name
+        }
+        fn attribute_matches(
+            &self,
+            local_name: &str,
+            operator: simplecss::AttributeOperator,
+        ) -> bool {
+            self.0
+                .attribute(local_name)
+                .is_some_and(|value| operator.matches(value))
+        }
+        fn pseudo_class_matches(&self, class: simplecss::PseudoClass) -> bool {
+            matches!(class, simplecss::PseudoClass::FirstChild)
+                && self.0.prev_sibling_element().is_none()
+        }
+    }
+    let mut declared: Option<(String, bool)> = root
+        .attribute("font-size")
+        .map(|value| (value.to_string(), false));
+    let mut consider = |value: &str, important: bool| {
+        if declared
+            .as_ref()
+            .is_none_or(|(_, existing)| important || !existing)
+        {
+            declared = Some((value.to_string(), important));
+        }
+    };
+    let mut sheet = simplecss::StyleSheet::new();
+    for style in document
+        .descendants()
+        .filter(|node| node.has_tag_name("style"))
+    {
+        if style
+            .attribute("type")
+            .is_none_or(|kind| kind == "text/css")
+            && let Some(text) = style.text()
+        {
+            sheet.parse_more(text);
+        }
+    }
+    for rule in &sheet.rules {
+        if rule.selector.matches(&Element(root)) {
+            for declaration in rule.declarations.iter().filter(|d| d.name == "font-size") {
+                consider(declaration.value, declaration.important);
+            }
+        }
+    }
+    if let Some(style) = root.attribute("style") {
+        for declaration in simplecss::DeclarationTokenizer::from(style) {
+            if declaration.name == "font-size" {
+                consider(declaration.value, declaration.important);
+            }
+        }
+    }
+    let (value, _) = declared?;
+    crate::dom::font_size_px(&value, SVG_INITIAL_FONT_SIZE, SVG_INITIAL_FONT_SIZE)
+        .filter(|size| size.is_finite() && *size > 0.0)
+}
+
+/// An SVG root dimension in px. `em` is the root's computed font-size; `ex`
+/// is half of it (CSS Values 4 #ex permits 0.5em when the x-height cannot
+/// be determined, which is also the value usvg uses inside the document and
+/// TRust's CSS layout uses, so the root and its content agree).
+fn svg_length_px(value: &str, em: f32) -> Option<f32> {
     use svgtypes::LengthUnit as Unit;
 
     let length: svgtypes::Length = value.trim().parse().ok()?;
     let number = length.number as f32;
     let px = match length.unit {
         Unit::None | Unit::Px => number,
-        Unit::Em => number * 16.0,
-        Unit::Ex => number * 8.0,
+        Unit::Em => number * em,
+        Unit::Ex => number * em / 2.0,
         Unit::In => number * 96.0,
         Unit::Cm => number * (96.0 / 2.54),
         Unit::Mm => number * (96.0 / 25.4),
@@ -1405,7 +1515,7 @@ pub(crate) fn svg_bytes_ratio_only(bytes: &[u8]) -> Option<f32> {
     }
     let data = bounded_svg_data(bytes).ok()?;
     let text = std::str::from_utf8(&data).ok()?;
-    let text = svg_without_external_doctype(text).ok()?;
+    let text = svg_without_doctype(text).ok()?;
     let doc = resvg::usvg::roxmltree::Document::parse(text.as_ref()).ok()?;
     let root = doc.root_element();
     if root.tag_name().name() != "svg" {
@@ -1413,8 +1523,15 @@ pub(crate) fn svg_bytes_ratio_only(bytes: &[u8]) -> Option<f32> {
     }
     // A definite root width OR height is an intrinsic dimension → NOT rule 3
     // (the natural size the decoder reports already carries it).
-    if root.attribute("width").and_then(svg_length_px).is_some()
-        || root.attribute("height").and_then(svg_length_px).is_some()
+    let em = svg_root_font_size(root, &doc).unwrap_or(SVG_INITIAL_FONT_SIZE);
+    if root
+        .attribute("width")
+        .and_then(|value| svg_length_px(value, em))
+        .is_some()
+        || root
+            .attribute("height")
+            .and_then(|value| svg_length_px(value, em))
+            .is_some()
     {
         return None;
     }
@@ -2882,13 +2999,30 @@ mod tests {
     }
 
     #[test]
-    fn svg_internal_dtd_subset_remains_disabled() {
-        let svg = br#"<!DOCTYPE svg [<!ENTITY fill "red">]>
-<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4">
-  <rect width="4" height="4" fill="&fill;"/>
+    fn svg_internal_dtd_subset_entities_render() {
+        // XML 1.0 §4.4.2/§5.1: internal entities are included, as in
+        // Illustrator exports that declare their namespaces as entities.
+        let svg = br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
+	<!ENTITY ns_svg "http://www.w3.org/2000/svg">
+	<!ENTITY st0 "fill:#FF0000;">
+]>
+<svg xmlns="&ns_svg;" width="4" height="4">
+  <rect width="4" height="4" style="&st0;"/>
 </svg>"#;
-        let error = info(svg).unwrap_err();
-        assert!(error.contains("internal DTD subsets"), "{error}");
+        assert_eq!(info(svg).unwrap().width, 4);
+        let image = decode_graphical(svg).unwrap();
+        assert_eq!(&image.rgba[..4], &[255, 0, 0, 255]);
+        // Expansion bombs fail like any other malformed SVG.
+        let mut bomb = String::from("<!DOCTYPE svg [<!ENTITY a0 \"lol\">");
+        for level in 1..12 {
+            bomb.push_str(&format!(
+                "<!ENTITY a{level} \"{}\">",
+                format!("&a{};", level - 1).repeat(10)
+            ));
+        }
+        bomb.push_str("]><svg xmlns=\"http://www.w3.org/2000/svg\"><text>&a11;</text></svg>");
+        assert!(info(bomb.as_bytes()).unwrap_err().contains("document type"));
     }
 
     #[test]
@@ -3515,5 +3649,301 @@ mod tests {
         let protocol = encode(&picker, image, Size::new(20, 4), true).unwrap();
         let size = protocol.size();
         assert!(size.width > 0 && size.height > 0);
+    }
+
+    /// A Display P3 ICC profile (matrix/TRC), as moxcms writes it.
+    fn display_p3_profile() -> Vec<u8> {
+        moxcms::ColorProfile::new_display_p3().encode().unwrap()
+    }
+
+    /// The colour an sRGB display should show for `color` tagged as P3.
+    fn p3_to_srgb(color: [u8; 4]) -> [u8; 4] {
+        let conversion =
+            color::conversion(&color::Tag::Icc(Arc::from(display_p3_profile()))).unwrap();
+        let mut pixel = color;
+        conversion.apply_rgba8(&mut pixel, 1);
+        pixel
+    }
+
+    fn encode_tagged(format: image::ImageFormat, color: [u8; 4], icc: Option<Vec<u8>>) -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let pixels = image::RgbaImage::from_pixel(4, 4, image::Rgba(color));
+        let rgb = DynamicImage::ImageRgba8(pixels.clone()).to_rgb8();
+        let mut bytes = Vec::new();
+        match format {
+            image::ImageFormat::Png => {
+                let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+                if let Some(icc) = icc {
+                    encoder.set_icc_profile(icc).unwrap();
+                }
+                encoder
+                    .write_image(&pixels, 4, 4, image::ExtendedColorType::Rgba8)
+                    .unwrap();
+            }
+            image::ImageFormat::Jpeg => {
+                let mut encoder =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
+                if let Some(icc) = icc {
+                    encoder.set_icc_profile(icc).unwrap();
+                }
+                encoder
+                    .write_image(&rgb, 4, 4, image::ExtendedColorType::Rgb8)
+                    .unwrap();
+            }
+            image::ImageFormat::WebP => {
+                let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+                if let Some(icc) = icc {
+                    encoder.set_icc_profile(icc).unwrap();
+                }
+                encoder
+                    .write_image(&pixels, 4, 4, image::ExtendedColorType::Rgba8)
+                    .unwrap();
+            }
+            other => panic!("{other:?}"),
+        }
+        bytes
+    }
+
+    #[test]
+    fn embedded_icc_profiles_convert_to_srgb() {
+        // CSS Color 4 #tagged-images: a valid profile places the samples in
+        // its colour space; TRust presents in sRGB.
+        let color = [40, 160, 220, 255];
+        let expected = p3_to_srgb(color);
+        assert!(
+            expected.iter().zip(color).any(|(a, b)| a.abs_diff(b) >= 5),
+            "P3 differs from sRGB: {expected:?}"
+        );
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::WebP,
+        ] {
+            let tagged =
+                decode_graphical(&encode_tagged(format, color, Some(display_p3_profile())))
+                    .unwrap();
+            let untagged = decode_graphical(&encode_tagged(format, color, None)).unwrap();
+            // The same coded samples, then the profile's conversion.
+            let mut converted: [u8; 4] = untagged.rgba[..4].try_into().unwrap();
+            converted = p3_to_srgb(converted);
+            assert!(
+                tagged.rgba[..4]
+                    .iter()
+                    .zip(converted)
+                    .all(|(a, b)| a.abs_diff(b) <= 1),
+                "{format:?}: {:?} vs {converted:?}",
+                &tagged.rgba[..4]
+            );
+        }
+        // An invalid profile leaves the image untagged.
+        let bogus = decode_graphical(&encode_tagged(
+            image::ImageFormat::Png,
+            color,
+            Some(b"not an ICC profile".to_vec()),
+        ))
+        .unwrap();
+        assert_eq!(&bogus.rgba[..4], &color);
+    }
+
+    /// Insert an `ICCRGBG1` application extension (the GIF ICC convention
+    /// image's GIF decoder reads) after the logical screen.
+    fn gif_with_profile(mut gif: Vec<u8>, profile: &[u8]) -> Vec<u8> {
+        let packed = gif[10];
+        let table = if packed & 0x80 != 0 {
+            3usize << (usize::from(packed & 0x07) + 1)
+        } else {
+            0
+        };
+        let mut extension = vec![0x21, 0xff, 11];
+        extension.extend_from_slice(b"ICCRGBG1012");
+        for block in profile.chunks(255) {
+            extension.push(block.len() as u8);
+            extension.extend_from_slice(block);
+        }
+        extension.push(0);
+        let at = 13 + table;
+        gif.splice(at..at, extension);
+        gif
+    }
+
+    #[test]
+    fn gif_icc_profiles_convert_still_and_animated_frames() {
+        let profile = display_p3_profile();
+        let still = gif_with_profile(gif_frames(None, 1), &profile);
+        let (image, _) = decode(&still).unwrap();
+        assert_eq!(
+            &image.to_rgba8().as_raw()[..4],
+            &p3_to_srgb([255, 0, 0, 255])
+        );
+        let animated = gif_with_profile(
+            gif_frames(Some(image::codecs::gif::Repeat::Infinite), 2),
+            &profile,
+        );
+        let decoded = decode_graphical_image_for_source("https://e.test/p3.gif", animated).unwrap();
+        assert_eq!(&decoded.image.rgba[..4], &p3_to_srgb([255, 0, 0, 255]));
+        let mut frames = decoded.animation.unwrap().decoder().unwrap();
+        frames.next_frame().unwrap();
+        let second = frames.next_frame().unwrap().unwrap();
+        assert_eq!(&second.image.rgba[..4], &p3_to_srgb([0, 0, 255, 255]));
+    }
+
+    /// A 2×1 RGBA PNG with `chunks` placed after IHDR.
+    fn png_with_chunks(color: [u8; 4], chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let base = rgba_png(2, 1, color);
+        let after_ihdr = 8 + 25;
+        let mut bytes = base[..after_ihdr].to_vec();
+        for (name, payload) in chunks {
+            push_png_chunk(&mut bytes, name, payload);
+        }
+        bytes.extend_from_slice(&base[after_ihdr..]);
+        bytes
+    }
+
+    #[test]
+    fn png_colour_chunks_follow_their_png3_priority() {
+        use std::io::Write as _;
+        let linear_gamma = 100_000u32.to_be_bytes().to_vec();
+        // gAMA: samples are intensity^gamma; linear mid-grey shows as ~188.
+        let linear = decode_graphical(&png_with_chunks(
+            [128, 128, 128, 255],
+            &[(b"gAMA", linear_gamma.clone())],
+        ))
+        .unwrap();
+        assert!(linear.rgba[0].abs_diff(188) <= 2, "{:?}", &linear.rgba[..4]);
+        // sRGB (priority 3) outranks gAMA (priority 4).
+        let srgb = decode_graphical(&png_with_chunks(
+            [128, 128, 128, 255],
+            &[(b"sRGB", vec![0]), (b"gAMA", linear_gamma)],
+        ))
+        .unwrap();
+        assert_eq!(&srgb.rgba[..4], &[128, 128, 128, 255]);
+        // cICP Display P3 (12/13/0/1) converts like a P3 profile.
+        let color = [40, 160, 220, 255];
+        let cicp =
+            decode_graphical(&png_with_chunks(color, &[(b"cICP", vec![12, 13, 0, 1])])).unwrap();
+        let expected = p3_to_srgb(color);
+        assert!(
+            cicp.rgba[..4]
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.abs_diff(b) <= 2),
+            "{:?} vs {expected:?}",
+            &cicp.rgba[..4]
+        );
+        // cICP (priority 1) outranks an iCCP profile.
+        let mut iccp = b"Display P3\0\0".to_vec();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&display_p3_profile()).unwrap();
+        iccp.extend_from_slice(&encoder.finish().unwrap());
+        let both = decode_graphical(&png_with_chunks(
+            color,
+            &[(b"cICP", vec![1, 13, 0, 1]), (b"iCCP", iccp.clone())],
+        ))
+        .unwrap();
+        assert_eq!(&both.rgba[..4], &color);
+        let profile_only = decode_graphical(&png_with_chunks(color, &[(b"iCCP", iccp)])).unwrap();
+        assert_eq!(&profile_only.rgba[..4], &expected);
+        // BT.2100 PQ: HDR reference white (code value 0.58) is tone-mapped
+        // near SDR white rather than shown as dim grey.
+        let pq = decode_graphical(&png_with_chunks(
+            [148, 148, 148, 255],
+            &[(b"cICP", vec![9, 16, 0, 1])],
+        ))
+        .unwrap();
+        assert!(
+            pq.rgba[..3].iter().all(|v| *v >= 230),
+            "{:?}",
+            &pq.rgba[..4]
+        );
+    }
+
+    #[test]
+    fn animated_avif_sequences_use_the_animation_pipeline() {
+        let path = format!(
+            "{}/src/img/fixtures/avif/anim-loop2.avif",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let decoded = decode_graphical_image_for_source("https://e.test/a.avif", bytes).unwrap();
+        assert_eq!((decoded.image.width, decoded.image.height), (16, 16));
+        assert!(decoded.image.rgba[0] > 245 && decoded.image.rgba[2] < 10);
+        let animation = decoded.animation.expect("a three-sample sequence animates");
+        let mut frames = animation.decoder().unwrap();
+        assert_eq!(frames.loop_count(), AnimationLoopCount::Finite(2));
+        let delays: Vec<_> = std::iter::from_fn(|| frames.next_frame().unwrap())
+            .map(|frame| frame.delay)
+            .collect();
+        assert_eq!(delays, vec![Duration::from_millis(250); 3]);
+        assert!(animation.decoder_working_set_bytes() >= 16 * 16 * 4 * 6);
+    }
+
+    #[test]
+    fn svg_image_root_em_and_ex_use_the_roots_own_font_size() {
+        // CSS Values 4 #font-relative-lengths: `em` on the root's width and
+        // height is its computed font-size, from the initial 16px of a
+        // separate image document; `ex` is half of it (#ex's fallback).
+        let size = |svg: &str| {
+            let info = info(svg.as_bytes()).unwrap();
+            (info.width, info.height)
+        };
+        let ns = r#"xmlns="http://www.w3.org/2000/svg""#;
+        assert_eq!(
+            size(&format!(r#"<svg {ns} width="2em" height="3ex"/>"#)),
+            (32, 24)
+        );
+        assert_eq!(
+            size(&format!(
+                r#"<svg {ns} width="2em" height="1em" font-size="10"/>"#
+            )),
+            (20, 10)
+        );
+        assert_eq!(
+            size(&format!(
+                r#"<svg {ns} width="2em" height="2ex" font-size="10" style="font-size:24px"/>"#
+            )),
+            (48, 24)
+        );
+        assert_eq!(
+            size(&format!(
+                r#"<svg {ns} width="3em" height="3em"><style>svg {{ font-size: 5px }}</style></svg>"#
+            )),
+            (15, 15)
+        );
+        assert_eq!(
+            size(&format!(
+                r#"<svg {ns} width="2em" height="2em" font-size="large"/>"#
+            )),
+            (36, 36)
+        );
+        // In-document `em` agrees with the root: a 1em square fills the
+        // left half of a 2em-wide image.
+        let svg = format!(
+            r#"<svg {ns} width="2em" height="1em" font-size="10"><rect width="1em" height="1em" fill="red"/></svg>"#
+        );
+        let image = decode_graphical(svg.as_bytes()).unwrap();
+        assert_eq!((image.width, image.height), (20, 10));
+        let pixel = |x: usize| &image.rgba[(5 * 20 + x) * 4..(5 * 20 + x) * 4 + 4];
+        assert_eq!(pixel(8), &[255, 0, 0, 255]);
+        assert_eq!(pixel(12)[3], 0);
+    }
+
+    #[test]
+    fn inline_svg_em_lengths_use_the_elements_computed_font_size() {
+        // An inline SVG's `em` is its element's computed font-size, which the
+        // serialized resource carries to the image document.
+        let dom = crate::dom::Dom::parse_document(
+            r#"<body style="font-size:20px"><svg id=s width="40" height="20" viewBox="0 0 40 20"><rect width="1em" height="1em" fill="red"/></svg>
+               <div style="font-size:8px"><svg id=t font-size="200%" width="40" height="20" viewBox="0 0 40 20"><rect width="1em" height="1em" fill="red"/></svg></div></body>"#,
+        );
+        for (id, edge) in [("s", 20), ("t", 16)] {
+            let svg = dom.get_by_id(id).unwrap();
+            let (source, _) = dom.svg_image_data(svg, None).expect("paintable SVG");
+            let bytes = decode_data_url(&source).unwrap();
+            let image = decode_graphical(&bytes).unwrap();
+            assert_eq!((image.width, image.height), (40, 20));
+            let alpha = |x: usize| image.rgba[(2 * 40 + x) * 4 + 3];
+            assert_eq!(alpha(edge - 2), 255, "{id}: inside 1em");
+            assert_eq!(alpha(edge + 2), 0, "{id}: outside 1em");
+        }
     }
 }

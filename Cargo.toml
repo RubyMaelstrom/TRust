@@ -181,6 +181,13 @@ psl = "2.1.240"
 # is deliberately omitted; selected SVG fonts are read safely on demand.
 resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images"] }
 roxmltree = "0.21.1"
+# CSS Color 4 #tagged-images: embedded ICC profiles and H.273 code points are
+# converted to sRGB at decode time. Pure Rust (BSD-3-Clause OR Apache-2.0,
+# MSRV 1.85); the same release `image` already depends on.
+moxcms = "0.8.1"
+# The CSS selector matcher usvg already uses for SVG `<style>` sheets; an SVG
+# image's root font-size (its `em` basis) is resolved with the same cascade.
+simplecss = "0.2.2"
 # Native file dialogs for <input type=file> in trust-desktop. On Linux and the
 # BSDs the pure-Rust XDG Desktop Portal backend (ashpd over the zbus already in
 # the tree for AccessKit) runs on TRust's tokio runtime; no GTK is linked.

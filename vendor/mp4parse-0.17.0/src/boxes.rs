@@ -127,6 +127,7 @@ box_database!(
     PixelAspectRatioBox               0x7061_7370, // "pasp"
     PixelInformationBox               0x7069_7869, // "pixi"
     AuxiliaryTypeProperty             0x6175_7843, // "auxC"
+    AuxiliaryTypeInfoBox              0x6175_7869, // "auxi"
     CleanApertureBox                  0x636c_6170, // "clap"
     ImageRotation                     0x6972_6f74, // "irot"
     ImageMirror                       0x696d_6972, // "imir"

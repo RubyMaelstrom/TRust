@@ -16,23 +16,30 @@
 //! film grain, and image sequences (AVIF §3), whose primary item or, without
 //! one, first sample is decoded as a still image.
 //!
-//! TODO(animated AVIF): play `avis` sequences. The sample tables are already
-//! parsed (`AvifContext::sequence`) and [`crate::av1::Decoder`] can decode
-//! successive temporal units; the missing pieces are per-sample timing, the
-//! alpha track, and a decoder hook in `GraphicalAnimation`, which is built on
-//! `image::AnimationDecoder` today.
+//! A tagged picture is converted to sRGB while it is reconstructed
+//! (`super::color`): an ICC `colr` (`prof`/`rICC`) takes precedence, then
+//! the nclx colour primaries and transfer characteristics (PQ and HLG
+//! tone-mapped to SDR), then the AV1 sequence header's.
 //!
-//! Not supported: ICC profiles and transfer functions (samples are presented
-//! as decoded, as for TRust's other formats), layered images beyond the
-//! default operating point (`a1op`/`lsel`), gain maps (`tmap`) and sample
-//! transforms (`sato`), which fall back to their base image when the file
-//! offers one as the primary item.
+//! An image sequence of two or more samples plays as an animation
+//! ([`Sequence`]): the colour track's samples in decoding order, each an AV1
+//! temporal unit (AV1-ISOBMFF), shown for its time-to-sample duration, with
+//! an alpha auxiliary track's samples as alpha.
+//!
+//! Not supported: layered images beyond the default operating point
+//! (`a1op`/`lsel`), gain maps (`tmap`) and sample transforms (`sato`), which
+//! fall back to their base image when the file offers one as the primary
+//! item; and for sequences, transformative properties and premultiplied
+//! (`prem`) alpha tracks, which mp4parse does not report for tracks.
 
 use std::io::Cursor;
+use std::sync::Arc;
+use std::time::Duration;
 
 use image::RgbaImage;
 use mp4parse::{AvifContext, ImageMirror, ImageRotation, ParseStrictness};
 
+use super::color::{self, Conversion, Tag};
 use super::yuv::{self, Canvas, Cicp};
 use crate::av1::{self, Decoder, DecoderConfig, Frame};
 
@@ -115,22 +122,16 @@ fn decode_context(
     let colour = Item::primary(context, bytes)?;
     let alpha = Item::alpha(context)?;
     let nclx = match context.nclx_colour_information() {
-        Some(Ok(nclx)) => Some(Cicp {
-            color_primaries: nclx.colour_primaries(),
-            matrix_coefficients: nclx.matrix_coefficients(),
-            full_range: nclx.full_range_flag(),
-        }),
+        Some(Ok(nclx)) => Some(Nclx::of(nclx)),
         Some(Err(error)) => return Err(format!("AVIF colour: {error}")),
         None => None,
     };
+    let icc = match context.icc_colour_information() {
+        Some(Ok(profile)) => color::icc_tag(Some(profile.to_vec())),
+        _ => None,
+    };
 
-    let mut image = colour.decode(limits, |frame| {
-        nclx.unwrap_or(Cicp {
-            color_primaries: frame.color.color_primaries,
-            matrix_coefficients: frame.color.matrix_coefficients,
-            full_range: frame.color.full_range,
-        })
-    })?;
+    let mut image = colour.decode(limits, |frame| picture_colour(nclx, icc.as_ref(), frame))?;
     if let Some(alpha) = alpha {
         alpha.decode_alpha(&mut image)?;
         if context.premultiplied_alpha {
@@ -213,7 +214,11 @@ impl<'a> Item<'a> {
     }
 
     /// Decode the colour image into a new canvas.
-    fn decode(&self, limits: Limits, cicp: impl Fn(&Frame) -> Cicp) -> Result<RgbaImage, String> {
+    fn decode(
+        &self,
+        limits: Limits,
+        colour: impl Fn(&Frame) -> Colour,
+    ) -> Result<RgbaImage, String> {
         if let Some((width, height)) = self.declared_size() {
             limits.check(width, height)?;
         }
@@ -223,15 +228,30 @@ impl<'a> Item<'a> {
                 let frame = decode_frame(&mut decoder, data)?;
                 limits.check(frame.width, frame.height)?;
                 let mut image = RgbaImage::new(frame.width, frame.height);
-                yuv::write_rgb(&frame, cicp(&frame), &mut canvas(&mut image), 0, 0);
+                let (cicp, conversion) = colour(&frame);
+                yuv::write_rgb(
+                    &frame,
+                    cicp,
+                    conversion.as_deref(),
+                    &mut canvas(&mut image),
+                    0,
+                    0,
+                );
                 Ok(image)
             }
             Self::Grid(grid) => {
                 let mut image = RgbaImage::new(grid.output_width, grid.output_height);
-                let mut colour = None;
+                let mut tiles_colour = None;
                 for_each_tile(grid, &mut decoder, |frame, x, y| {
-                    let cicp = *colour.get_or_insert_with(|| cicp(frame));
-                    yuv::write_rgb(frame, cicp, &mut canvas(&mut image), x, y);
+                    let (cicp, conversion) = tiles_colour.get_or_insert_with(|| colour(frame));
+                    yuv::write_rgb(
+                        frame,
+                        *cicp,
+                        conversion.as_deref(),
+                        &mut canvas(&mut image),
+                        x,
+                        y,
+                    );
                 })?;
                 Ok(image)
             }
@@ -263,6 +283,59 @@ impl<'a> Item<'a> {
             }
         }
     }
+}
+
+/// How a picture's samples are reconstructed and converted to sRGB.
+type Colour = (Cicp, Option<Arc<Conversion>>);
+
+/// An nclx colour description (ISOBMFF §12.1.5, ITU-T H.273 code points).
+#[derive(Clone, Copy, Debug)]
+struct Nclx {
+    cicp: Cicp,
+    transfer: u8,
+}
+
+impl Nclx {
+    fn of(nclx: &mp4parse::NclxColourInformation) -> Self {
+        Self {
+            cicp: Cicp {
+                color_primaries: nclx.colour_primaries(),
+                matrix_coefficients: nclx.matrix_coefficients(),
+                full_range: nclx.full_range_flag(),
+            },
+            transfer: nclx.transfer_characteristics(),
+        }
+    }
+
+    /// The AV1 sequence header's colour description (AV1 §6.4.2), for a
+    /// picture without an nclx box.
+    fn of_frame(frame: &Frame) -> Self {
+        Self {
+            cicp: Cicp {
+                color_primaries: frame.color.color_primaries,
+                matrix_coefficients: frame.color.matrix_coefficients,
+                full_range: frame.color.full_range,
+            },
+            transfer: frame.color.transfer_characteristics,
+        }
+    }
+}
+
+/// The matrix and range that reconstruct R'G'B' from a picture, and the
+/// conversion of those samples to sRGB (CSS Color 4 #tagged-images). An ICC
+/// profile describes the RGB colour space when present; otherwise the
+/// primaries and transfer characteristics of the nclx box or of the
+/// sequence header do.
+fn picture_colour(nclx: Option<Nclx>, icc: Option<&Tag>, frame: &Frame) -> Colour {
+    let nclx = nclx.unwrap_or_else(|| Nclx::of_frame(frame));
+    let tag = icc.cloned().unwrap_or(Tag::Cicp {
+        primaries: nclx.cicp.color_primaries,
+        transfer: nclx.transfer,
+        // The reconstruction below already maps the coded range to [0, 1].
+        full_range: true,
+        peak: None,
+    });
+    (nclx.cicp, color::conversion(&tag))
 }
 
 fn canvas(image: &mut RgbaImage) -> Canvas<'_> {
@@ -312,10 +385,16 @@ fn for_each_tile(
     Ok(())
 }
 
-/// The first sample of the image sequence's colour track: the first AV1
-/// video track that is not an auxiliary (alpha) track of another.
+/// The first sample of the image sequence's colour track.
 fn first_sequence_sample<'a>(context: &AvifContext, bytes: &'a [u8]) -> Option<&'a [u8]> {
-    let sequence = context.sequence.as_ref()?;
+    let track = colour_track(context.sequence.as_ref()?)?;
+    let first = *sample_table(track, bytes.len())?.first()?;
+    bytes.get(first.start..first.end)
+}
+
+/// The image sequence's colour track: the first AV1 video or picture track
+/// that is not an auxiliary track of another.
+fn colour_track(sequence: &mp4parse::MediaContext) -> Option<&mp4parse::Track> {
     let auxiliary = |track: &mp4parse::Track| {
         track.tref.as_ref().is_some_and(|tref| {
             sequence
@@ -325,26 +404,326 @@ fn first_sequence_sample<'a>(context: &AvifContext, bytes: &'a [u8]) -> Option<&
                 .any(|id| Some(id) != track.track_id && tref.has_auxl_reference(id))
         })
     };
-    let track = sequence.tracks.iter().find(|track| {
+    sequence.tracks.iter().find(|track| {
         matches!(
             track.track_type,
             mp4parse::TrackType::Video | mp4parse::TrackType::Picture
         ) && !auxiliary(track)
-            && track.stsd.as_ref().is_some_and(|stsd| {
-                stsd.descriptions.iter().any(|entry| {
-                    matches!(entry, mp4parse::SampleEntry::Video(video)
-                        if video.codec_type == mp4parse::CodecType::AV1)
+            && av1_entry(track).is_some()
+    })
+}
+
+/// A track's AV1 visual sample entry.
+fn av1_entry(track: &mp4parse::Track) -> Option<&mp4parse::VideoSampleEntry> {
+    track
+        .stsd
+        .as_ref()?
+        .descriptions
+        .iter()
+        .find_map(|entry| match entry {
+            mp4parse::SampleEntry::Video(video) if video.codec_type == mp4parse::CodecType::AV1 => {
+                Some(video)
+            }
+            _ => None,
+        })
+}
+
+/// AVIF §4.1 "Auxiliary Image Items and Sequences": an AV1 Alpha Image
+/// Sequence is an auxiliary track (an 'auxl' reference to the colour
+/// track) whose AuxiliaryTypeInfoBox names the alpha URN.
+fn alpha_track<'a>(
+    sequence: &'a mp4parse::MediaContext,
+    colour: &mp4parse::Track,
+) -> Option<&'a mp4parse::Track> {
+    const ALPHA: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
+    let colour_id = colour.track_id?;
+    sequence.tracks.iter().find(|track| {
+        track.track_id != colour.track_id
+            && track
+                .tref
+                .as_ref()
+                .is_some_and(|tref| tref.has_auxl_reference(colour_id))
+            && av1_entry(track)
+                .and_then(|entry| entry.auxiliary_type.as_ref())
+                .is_some_and(|aux_type| {
+                    let aux_type = aux_type.as_slice();
+                    aux_type.strip_suffix(&[0]).unwrap_or(aux_type) == ALPHA
                 })
-            })
-    })?;
-    // The first sample opens the first chunk (ISOBMFF §8.7.4, §8.7.5).
-    let offset = usize::try_from(*track.stco.as_ref()?.offsets.first()?).ok()?;
+    })
+}
+
+/// One sample: its bytes in the file and its duration in media ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SampleRef {
+    start: usize,
+    end: usize,
+    ticks: u32,
+}
+
+/// Samples beyond this many are not played.
+const MAX_SEQUENCE_SAMPLES: usize = 1 << 16;
+
+/// The track's samples in decoding order (ISOBMFF §8.7.3 'stsz', §8.7.4
+/// 'stsc': runs of chunks with a sample count, first_chunk numbered from 1;
+/// §8.7.5 'stco'/'co64': chunk offsets, a chunk's samples being contiguous;
+/// §8.6.1.2 'stts': runs of sample durations). `None` when the tables are
+/// missing or place a sample outside the file.
+fn sample_table(track: &mp4parse::Track, file_len: usize) -> Option<Vec<SampleRef>> {
     let sizes = track.stsz.as_ref()?;
-    let size = match sizes.sample_size {
-        0 => *sizes.sample_sizes.first()?,
-        size => size,
-    };
-    bytes.get(offset..offset.checked_add(usize::try_from(size).ok()?)?)
+    let chunks = &track.stco.as_ref()?.offsets;
+    let runs = &track.stsc.as_ref()?.samples;
+    let times = track.stts.as_ref()?;
+    let timed: usize = times
+        .samples
+        .iter()
+        .map(|run| run.sample_count as usize)
+        .fold(0, usize::saturating_add);
+    let count = if sizes.sample_size == 0 {
+        sizes.sample_sizes.len()
+    } else {
+        timed
+    }
+    .min(MAX_SEQUENCE_SAMPLES);
+    let mut durations = times
+        .samples
+        .iter()
+        .flat_map(|run| std::iter::repeat_n(run.sample_delta, run.sample_count as usize));
+    let mut samples = Vec::with_capacity(count);
+    let mut run = 0;
+    for (index, &chunk_offset) in chunks.iter().enumerate() {
+        if samples.len() == count {
+            break;
+        }
+        let chunk = u32::try_from(index + 1).ok()?;
+        while runs
+            .get(run + 1)
+            .is_some_and(|next| next.first_chunk <= chunk)
+        {
+            run += 1;
+        }
+        let per_chunk = runs.get(run).filter(|entry| entry.first_chunk <= chunk)?;
+        let mut offset = usize::try_from(chunk_offset).ok()?;
+        for _ in 0..per_chunk.samples_per_chunk {
+            if samples.len() == count {
+                break;
+            }
+            let size = match sizes.sample_size {
+                0 => *sizes.sample_sizes.get(samples.len())?,
+                size => size,
+            };
+            let end = offset.checked_add(usize::try_from(size).ok()?)?;
+            if end > file_len {
+                return None;
+            }
+            samples.push(SampleRef {
+                start: offset,
+                end,
+                ticks: durations.next().unwrap_or(0),
+            });
+            offset = end;
+        }
+    }
+    Some(samples)
+}
+
+/// How many times a sequence plays, `None` for endlessly. ISOBMFF §8.6.6:
+/// an edit list with flags bit 0 set repeats its edits; as libavif reads it,
+/// the repetitions fill the track header's duration, all ones meaning an
+/// indefinite one, and a count beyond `i32::MAX` is endless too (FFmpeg
+/// writes `i64::MAX` for an indefinite version 1 duration). An edit list
+/// without that flag plays once. A track without an edit list states no
+/// repetition count; it plays endlessly, the count libavif-based browsers
+/// give such sequences.
+fn sequence_plays(track: &mp4parse::Track) -> Option<u32> {
+    match track.looped {
+        None => None,
+        Some(false) => Some(1),
+        Some(true) => {
+            let duration = track.tkhd.as_ref()?.duration;
+            if duration == u64::MAX || duration == u64::from(u32::MAX) {
+                return None;
+            }
+            let segment = track.edited_duration?.0;
+            if segment == 0 {
+                return None;
+            }
+            let plays = duration.div_ceil(segment).max(1);
+            (plays <= i32::MAX as u64).then_some(plays as u32)
+        }
+    }
+}
+
+/// An AVIF image sequence (AVIF §3 "Image Sequences", `avis`) played from
+/// its first sample: each sample of the colour track is an AV1 temporal unit
+/// (AV1-ISOBMFF) shown for its 'stts' duration, with the alpha auxiliary
+/// track's sample of the same index as its alpha.
+pub(crate) struct Sequence {
+    bytes: Arc<[u8]>,
+    colour: Vec<SampleRef>,
+    alpha: Option<Vec<SampleRef>>,
+    /// Media ticks per second ('mdhd').
+    timescale: u64,
+    plays: Option<u32>,
+    nclx: Option<Nclx>,
+    icc: Option<Tag>,
+    limits: Limits,
+    /// The sample entry's size, which every frame should have.
+    declared: Option<(u32, u32)>,
+    colour_decoder: Option<Decoder>,
+    alpha_decoder: Option<Decoder>,
+    next: usize,
+    size: Option<(u32, u32)>,
+}
+
+impl Sequence {
+    /// The image sequence of an AVIF file when it has at least two samples
+    /// (one sample is a still image), positioned before its first frame.
+    pub(crate) fn open(bytes: Arc<[u8]>, limits: Limits) -> Result<Option<Self>, String> {
+        let parsed = std::panic::catch_unwind(|| {
+            mp4parse::read_avif(&mut Cursor::new(&bytes[..]), ParseStrictness::Normal)
+        })
+        .map_err(|_| String::from("AVIF decoder failed"))?
+        .map_err(|error| format!("AVIF container: {error}"))?;
+        let Some(sequence) = parsed.sequence.as_ref() else {
+            return Ok(None);
+        };
+        let Some(track) = colour_track(sequence) else {
+            return Ok(None);
+        };
+        let Some(colour) = sample_table(track, bytes.len()) else {
+            return Err(String::from(
+                "AVIF image sequence has no valid sample table",
+            ));
+        };
+        if colour.len() < 2 {
+            return Ok(None);
+        }
+        let alpha = alpha_track(sequence, track)
+            .and_then(|alpha| sample_table(alpha, bytes.len()))
+            .filter(|alpha| alpha.len() == colour.len());
+        let entry = av1_entry(track);
+        let mut nclx = None;
+        let mut icc = None;
+        for information in entry
+            .into_iter()
+            .flat_map(|entry| entry.colour_information.iter())
+        {
+            match information {
+                mp4parse::ColourInformation::Nclx(value) => {
+                    nclx.get_or_insert(Nclx::of(value));
+                }
+                mp4parse::ColourInformation::Icc(profile, _) => {
+                    if icc.is_none() {
+                        icc = color::icc_tag(Some(profile.bytes().to_vec()));
+                    }
+                }
+            }
+        }
+        let declared = entry
+            .map(|entry| (u32::from(entry.width), u32::from(entry.height)))
+            .filter(|&(width, height)| width > 0 && height > 0);
+        if let Some((width, height)) = declared {
+            limits.check(width, height)?;
+        }
+        Ok(Some(Self {
+            timescale: track.timescale.map_or(0, |scale| scale.0),
+            plays: sequence_plays(track),
+            bytes: Arc::clone(&bytes),
+            colour,
+            alpha,
+            nclx,
+            icc,
+            limits,
+            declared,
+            colour_decoder: None,
+            alpha_decoder: None,
+            next: 0,
+            size: None,
+        }))
+    }
+
+    /// How many times the sequence plays; `None` for endlessly.
+    pub(crate) fn plays(&self) -> Option<u32> {
+        self.plays
+    }
+
+    fn decoder(&self) -> Result<Decoder, String> {
+        let max = self.limits.max_pixels();
+        let declared = self
+            .declared
+            .map_or(max, |(width, height)| width.saturating_mul(height));
+        Decoder::new(&DecoderConfig {
+            frame_size_limit: declared.clamp(1, max.max(1)),
+            ..DecoderConfig::default()
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// The next frame and how long it is shown, or `None` after the last.
+    pub(crate) fn next_frame(&mut self) -> Result<Option<(RgbaImage, Duration)>, String> {
+        let mut ticks = 0u64;
+        while let Some(&sample) = self.colour.get(self.next) {
+            let index = self.next;
+            self.next += 1;
+            ticks = ticks.saturating_add(u64::from(sample.ticks));
+            if self.colour_decoder.is_none() {
+                self.colour_decoder = Some(self.decoder()?);
+            }
+            let decoder = self
+                .colour_decoder
+                .as_mut()
+                .expect("decoder was just created");
+            // A temporal unit without a shown frame lengthens the next one.
+            let Some(frame) = decoder
+                .decode(&self.bytes[sample.start..sample.end])
+                .map_err(|error| error.to_string())?
+                .pop()
+            else {
+                continue;
+            };
+            self.limits.check(frame.width, frame.height)?;
+            if *self.size.get_or_insert((frame.width, frame.height)) != (frame.width, frame.height)
+            {
+                return Err(String::from("AVIF sequence frames differ in size"));
+            }
+            let mut image = RgbaImage::new(frame.width, frame.height);
+            let (cicp, conversion) = picture_colour(self.nclx, self.icc.as_ref(), &frame);
+            yuv::write_rgb(
+                &frame,
+                cicp,
+                conversion.as_deref(),
+                &mut canvas(&mut image),
+                0,
+                0,
+            );
+            if let Some(&alpha) = self.alpha.as_ref().and_then(|alpha| alpha.get(index)) {
+                if self.alpha_decoder.is_none() {
+                    self.alpha_decoder = Some(self.decoder()?);
+                }
+                let decoder = self
+                    .alpha_decoder
+                    .as_mut()
+                    .expect("decoder was just created");
+                if let Some(plane) = decoder
+                    .decode(&self.bytes[alpha.start..alpha.end])
+                    .map_err(|error| error.to_string())?
+                    .pop()
+                {
+                    if (plane.width, plane.height) != image.dimensions() {
+                        return Err(String::from("AVIF alpha size differs from the image"));
+                    }
+                    yuv::write_alpha(&plane, &mut canvas(&mut image), 0, 0);
+                }
+            }
+            let delay = if self.timescale == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs_f64(ticks as f64 / self.timescale as f64)
+            };
+            return Ok(Some((image, delay)));
+        }
+        Ok(None)
+    }
 }
 
 /// Apply the primary item's transformative properties: `clap`, then `irot`,
@@ -443,6 +822,14 @@ mod tests {
     //!   `irot` angle 1 and `imir` axis 1; and with an essential `clap` of
     //!   32×16 offset (16, −16) from the centre. FFmpeg's dav1d-based decoder
     //!   renders the same colour results for all three.
+    //! - anim-loop2, anim-infinite and anim-alpha (16×16, made 2026-10-08
+    //!   with FFmpeg's AVIF muxer, libaom-av1 4:4:4 `-crf 10`, 4 fps) are
+    //!   three-sample `avis` sequences of solid red, green and blue frames,
+    //!   each 4096 ticks of a 16384 Hz media timescale. anim-loop2 has an
+    //!   edit list with the repeat flag and a track duration of two plays
+    //!   (`-loop 2`), anim-infinite an indefinite one (`-loop 0`); anim-alpha
+    //!   adds an `auxl`/`auxi` alpha track (255, 128, 0) and an edit list
+    //!   without the repeat flag (`-loop 1`).
     use super::*;
 
     const LIMITS: Limits = Limits {
@@ -827,7 +1214,7 @@ mod tests {
                 width: 1,
                 height: 1,
             };
-            yuv::write_rgb(&frame, cicp, &mut canvas, 0, 0);
+            yuv::write_rgb(&frame, cicp, None, &mut canvas, 0, 0);
             rgba
         }
         let cicp = |matrix_coefficients, full_range| Cicp {
@@ -872,5 +1259,87 @@ mod tests {
             convert(8, cicp(8, true), [128, 128, 192]),
             [192, 128, 64, 255],
         );
+    }
+
+    fn play(name: &str) -> (Option<u32>, Vec<(RgbaImage, Duration)>) {
+        let mut sequence = Sequence::open(Arc::from(fixture(name)), LIMITS)
+            .unwrap()
+            .expect("an image sequence");
+        let mut frames = Vec::new();
+        while let Some(frame) = sequence.next_frame().unwrap() {
+            frames.push(frame);
+        }
+        (sequence.plays(), frames)
+    }
+
+    #[test]
+    fn image_sequences_play_each_sample_for_its_duration() {
+        // AVIF §3: each colour-track sample is a frame; ISOBMFF 'stts' gives
+        // 4096 / 16384 s.
+        let (plays, frames) = play("anim-loop2.avif");
+        assert_eq!(
+            plays,
+            Some(2),
+            "repeat flag with two plays of track duration"
+        );
+        assert_eq!(frames.len(), 3);
+        for ((image, delay), expected) in
+            frames
+                .iter()
+                .zip([[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]])
+        {
+            assert_eq!(*delay, Duration::from_millis(250));
+            assert_eq!(image.dimensions(), (16, 16));
+            assert_near(image, 8, 8, expected, 6);
+        }
+        assert_eq!(
+            play("anim-infinite.avif").0,
+            None,
+            "indefinite duration loops"
+        );
+        // A still image has no sequence; the decoder shows its primary item.
+        assert!(
+            Sequence::open(Arc::from(fixture("opaque-420-8bit.avif")), LIMITS)
+                .unwrap()
+                .is_none()
+        );
+        // The still decode of a sequence file is its first frame.
+        assert_near(
+            &decode(&fixture("anim-loop2.avif"), LIMITS).unwrap(),
+            8,
+            8,
+            [255, 0, 0, 255],
+            6,
+        );
+    }
+
+    #[test]
+    fn alpha_sequences_take_alpha_from_their_auxiliary_track() {
+        // AVIF §4.1: the alpha auxiliary sequence's sample of each index.
+        let (plays, frames) = play("anim-alpha.avif");
+        assert_eq!(
+            plays,
+            Some(1),
+            "an edit list without the repeat flag plays once"
+        );
+        let alphas: Vec<u8> = frames
+            .iter()
+            .map(|(image, _)| image.get_pixel(8, 8)[3])
+            .collect();
+        assert_eq!(alphas.len(), 3);
+        assert!(
+            alphas[0] >= 250 && alphas[1].abs_diff(128) <= 4 && alphas[2] <= 4,
+            "{alphas:?}"
+        );
+        assert_near(&frames[0].0, 8, 8, [255, 0, 0, 255], 6);
+    }
+
+    #[test]
+    fn sequence_limits_reject_frames_before_decoding() {
+        let tight = Limits {
+            max_dimension: 8,
+            max_bytes: 512 * 1024 * 1024,
+        };
+        assert!(Sequence::open(Arc::from(fixture("anim-loop2.avif")), tight).is_err());
     }
 }

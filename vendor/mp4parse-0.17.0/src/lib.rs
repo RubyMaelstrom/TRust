@@ -1191,6 +1191,12 @@ pub struct VideoSampleEntry {
     pub height: u16,
     pub codec_specific: VideoCodecSpecific,
     pub protection_info: TryVec<ProtectionSchemeInfoBox>,
+    /// The entry's 'colr' boxes (ISOBMFF § 12.1.5), in order; a malformed
+    /// one is skipped.
+    pub colour_information: TryVec<ColourInformation>,
+    /// The aux_track_type of an 'auxi' AuxiliaryTypeInfoBox (HEIF/MIAF
+    /// auxiliary image sequences), as stored (null-terminated).
+    pub auxiliary_type: Option<TryVec<u8>>,
 }
 
 /// Represent a Video Partition Codec Configuration 'vpcC' box (aka vp9). The meaning of each
@@ -4233,6 +4239,13 @@ pub struct IccColourInformation {
     bytes: TryVec<u8>,
 }
 
+impl IccColourInformation {
+    /// The profile's bytes.
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
 impl fmt::Debug for IccColourInformation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("IccColourInformation")
@@ -5972,9 +5985,19 @@ fn read_video_sample_entry<T: Read>(src: &mut BMFFBox<T>) -> Result<SampleEntry>
     // Skip clap/pasp/etc. for now.
     let mut codec_specific = None;
     let mut protection_info = TryVec::new();
+    let mut colour_information = TryVec::new();
+    let mut auxiliary_type = None;
     let mut iter = src.box_iter();
     while let Some(mut b) = iter.next_box()? {
         match b.head.name {
+            BoxType::ColourInformationBox => match read_colr(&mut b, ParseStrictness::Normal) {
+                Ok(colour) => colour_information.push(colour)?,
+                Err(_) => skip_box_remain(&mut b)?,
+            },
+            BoxType::AuxiliaryTypeInfoBox => {
+                let (_, _) = read_fullbox_extra(&mut b.content)?;
+                auxiliary_type = Some(b.read_into_try_vec()?);
+            }
             BoxType::AVCConfigurationBox => {
                 if (name != BoxType::AVCSampleEntry
                     && name != BoxType::AVC3SampleEntry
@@ -6077,6 +6100,8 @@ fn read_video_sample_entry<T: Read>(src: &mut BMFFBox<T>) -> Result<SampleEntry>
                 height,
                 codec_specific,
                 protection_info,
+                colour_information,
+                auxiliary_type,
             })
         }),
     )

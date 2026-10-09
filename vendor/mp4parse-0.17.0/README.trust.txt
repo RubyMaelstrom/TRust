@@ -20,6 +20,10 @@ grids for large images and clap for odd-sized crops, so TRust carries:
   `ImageSpatialExtentsProperty::{width,height}`), `nclx_colour_information`
   (with getters on `NclxColourInformation`) and `image_mirror`, instead of the
   raw-pointer C-API accessors.
+- `VideoSampleEntry` keeps its 'colr' boxes (`colour_information`, parsed
+  with `read_colr`; a malformed one is skipped as before) and the
+  aux_track_type of an 'auxi' AuxiliaryTypeInfoBox (`auxiliary_type`), so an
+  AVIF image sequence's colour and its alpha auxiliary track can be found.
 - Three `'_` lifetime annotations that current rustc warns about.
 - `u32::MAX`/`u64::MAX` replace the module constants `std::u32::MAX` and
   `std::u64::MAX`, deprecated by rustc 1.99, in `parse_mdhd`, `read_mvhd` and

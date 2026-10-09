@@ -11368,7 +11368,14 @@ impl Dom {
         };
         let root = document.root_element();
         let color = self.svg_used_color(id);
-        let inherited = self.svg_inherited_paint_style(id, &color);
+        // CSS Values 4 #font-relative-lengths: `em`/`ex` inside the inline
+        // SVG use its computed font-size, which the standalone resource
+        // otherwise lacks (usvg would start from the initial 16px).
+        let inherited = format!(
+            "{}font-size:{}px;",
+            self.svg_inherited_paint_style(id, &color),
+            self.svg_root_font_px(id)
+        );
         let (range, style) = root
             .attributes()
             .find(|attr| attr.name() == "style")
@@ -11388,6 +11395,26 @@ impl Dom {
         drop(document);
         svg.replace_range(range, &replacement);
         svg
+    }
+
+    /// The computed font-size an outer `<svg>` passes to its serialized
+    /// resource. SVG 2 §6.6 makes a `font-size` presentation attribute an
+    /// author declaration below every style rule; the cascade does not map
+    /// it, so resolve it against the inherited size when no rule wins.
+    fn svg_root_font_px(&self, id: NodeId) -> f32 {
+        if self.cascaded(id, "font-size").is_none()
+            && let Some(value) = self.attr(id, "font-size")
+        {
+            let parent = self
+                .style_parent(id)
+                .map_or(FONT_SIZE_INITIAL, |parent| self.font_px(parent));
+            if let Some(px) =
+                font_size_px_at(value, parent, self.root_font_px(), self.viewport_px())
+            {
+                return px;
+            }
+        }
+        self.font_px(id)
     }
 
     /// The inherited SVG paint properties an outer `<svg>` receives from its
