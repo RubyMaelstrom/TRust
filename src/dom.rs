@@ -795,8 +795,8 @@ pub struct Dom {
     scroll_changes: Vec<(NodeId, f64, f64)>,
     /// The document's URL (DOM §4.5 "documents have an associated URL"). Set
     /// by `load_page` from `PageEnv`; the live serializer resolves sprite
-    /// `<use>` hrefs against it (the SAME base `rewrite_inline_svgs` uses on
-    /// the layout side, so the `SPRITE_SHEETS` key matches). `None` = unknown
+    /// `<use>` hrefs against it (the SAME base layout's `svg_image_data` uses,
+    /// so the `SPRITE_SHEETS` key matches). `None` = unknown
     /// (sprite refs then count as unrenderable, the conservative answer).
     doc_url: Option<url::Url>,
     /// HTML #scroll-to-the-fragment-identifier, independent of history URL rewrites.
@@ -4398,7 +4398,7 @@ impl Dom {
     /// out Vec, and early-exiting callers (getElementById, querySelector's
     /// first match) stop walking at the hit. Borrowing `&self` for the walk
     /// also makes mutation-during-iteration a compile error; callers that
-    /// mutate mid-walk collect first (`rewrite_inline_svgs`).
+    /// mutate mid-walk collect first.
     pub fn descendants(&self, root: NodeId) -> Descendants<'_> {
         style_view::NodesRef::new(&self.nodes).descendants(root)
     }
@@ -11294,82 +11294,6 @@ impl Dom {
         })
     }
 
-    /// Replace each renderable inline `<svg>` with an `<img>` whose `src` is the
-    /// SVG as a `data:` URL, so the existing image pipeline decodes, sizes,
-    /// caches, and silhouette-tints it — a vector icon/logo becomes a rendered
-    /// glyph rather than its accessible-name text. `currentColor` is resolved
-    /// from the SVG element's computed CSS color before the graphical image
-    /// path sees the source; the terminal encoder may still apply its own
-    /// silhouette tint after that.
-    /// Non-renderable SVG (a `<use>`-only sprite instance, or a hidden
-    /// `<symbol>`/`<defs>` container) is left untouched, keeping the existing
-    /// icon-glyph / accessible-name fallback. Runs once per DOM build, before
-    /// image-URL collection and layout. This is the first slice of inline-SVG
-    /// support: a static snapshot of self-contained vector markup.
-    pub fn rewrite_inline_svgs(&mut self, base: Option<&url::Url>) {
-        self.rewrite_inline_svgs_in(DOCUMENT, base);
-    }
-
-    /// `rewrite_inline_svgs` restricted to one retained subtree. Incremental
-    /// graphical patches have already rewritten every unaffected sibling, so
-    /// revisiting the complete document would turn a local style response into
-    /// document-sized work.
-    pub fn rewrite_inline_svgs_in(&mut self, root: NodeId, base: Option<&url::Url>) {
-        // Materialize the candidate list first: the loop MUTATES the tree
-        // (insert/detach), which can't overlap the lazy descendants walk.
-        let svgs: Vec<NodeId> = std::iter::once(root)
-            .chain(self.descendants(root))
-            .filter(|&id| self.tag_name(id) == Some("svg"))
-            .collect();
-        for id in svgs {
-            if self.ancestor_is_svg(id) || self.is_hidden(id) {
-                continue;
-            }
-            let Some(parent) = self.nodes[id].parent else {
-                continue;
-            };
-            // The vector geometry: an EXTERNAL sprite reference
-            // (`<use href="file.svg#id">`) resolves to the primed sheet's
-            // symbol; otherwise the svg's OWN inline geometry. An svg with
-            // neither (an unfetched sprite, an empty svg) is left untouched and
-            // renders nothing, exactly as before.
-            let Some((svg, images)) = self.svg_render_resource(id, base) else {
-                continue;
-            };
-            let name = self.svg_accessible_name(id);
-            // Carry the SVG element's box onto the replacement <img> so layout
-            // sizes the vector the way the page does. A browser sizes a replaced
-            // SVG by its CSS `width`/`height` (here baked into `style` by the JS
-            // cascade — `width:2.7rem`, etc.) over its presentation `width`/
-            // `height` attrs over the viewBox ratio over the 300×150 default.
-            // Without this the <img> carried no size, so `image_used_box` fell
-            // to the SVG's intrinsic (300×150 when the markup has no width/height
-            // attr) and rendered logos page-sized. `style` also carries the
-            // box's margin/display/position so the icon lands where the SVG did.
-            let style = self.attr(id, "style").map(str::to_string);
-            let w_attr = self.attr(id, "width").map(str::to_string);
-            let h_attr = self.attr(id, "height").map(str::to_string);
-            let img = self.create_element("img");
-            let svg = self.resolve_svg_current_color(id, svg);
-            let source = self.svg_document_source(id, svg, &images);
-            self.set_attr(img, "src", &source);
-            if !name.is_empty() {
-                self.set_attr(img, "alt", &name);
-            }
-            if let Some(style) = style {
-                self.set_attr(img, "style", &style);
-            }
-            if let Some(w) = w_attr {
-                self.set_attr(img, "width", &w);
-            }
-            if let Some(h) = h_attr {
-                self.set_attr(img, "height", &h);
-            }
-            self.insert_before(parent, img, Some(id));
-            self.detach(id);
-        }
-    }
-
     /// Return the renderer-neutral image source and accessible fallback for an
     /// inline SVG without altering the DOM tree. Direct layout uses the SVG
     /// element itself as the replaced element, preserving its CSS box and node
@@ -11884,11 +11808,11 @@ impl Dom {
         })
     }
 
-    /// Whether `rewrite_inline_svgs` will turn this `<svg>` into a painted
-    /// `<img>` on the next layout parse — the serializer-side mirror of that
-    /// walk's per-candidate decision: an external sprite ref that resolves in
-    /// the primed sheet table (against the document URL, the same base the
-    /// rewrite uses), or renderable inline geometry.
+    /// Whether layout will paint this `<svg>` as a replaced box on the next
+    /// layout parse — the serializer-side mirror of `svg_image_data`'s
+    /// decision: an external sprite ref that resolves in the primed sheet
+    /// table (against the document URL, the same base layout uses), or
+    /// renderable inline geometry.
     fn svg_will_render(&self, id: NodeId) -> bool {
         if self.is_hidden(id) || self.ancestor_is_svg(id) {
             return false;
@@ -11910,7 +11834,7 @@ impl Dom {
 
     /// Whether the subtree under `id` (inclusive) will PAINT an icon in the
     /// laid-out page: a visible `<img>` with a source, or an `<svg>` the next
-    /// layout parse rewrites into one (`svg_will_render`). Such a clickable
+    /// layout parse paints (`svg_will_render`). Such a clickable
     /// needs no injected text handle — the rendered image is its visible,
     /// selectable content (and its `alt` still carries the accessible name).
     fn subtree_paints_icon(&self, id: NodeId) -> bool {
@@ -15664,7 +15588,7 @@ pub(crate) fn split_top_level_ws(input: &str) -> Vec<&str> {
 /// `<svg><use href="sprite.svg#id"></svg>` idiom (ChatGPT, GitHub, and most
 /// icon systems) keeps every icon's geometry in one shared file resvg won't
 /// fetch on its own; we fetch that file ONCE during the JS subresource phase
-/// (`prime_sprite_sheet`) and `rewrite_inline_svgs` inlines the referenced
+/// (`prime_sprite_sheet`) and `svg_image_data` inlines the referenced
 /// symbol so it rasterizes like any inline vector. Parsed once per sheet; a
 /// reparse (resize) or a second page on the same CDN reuses the table.
 /// Symbol declarations retain their own paint; inherited paint comes from <use>.
@@ -15687,7 +15611,7 @@ const MAX_SPRITE_SHEETS: usize = 16;
 
 /// Parse a fetched sprite sheet ONCE into its symbol table, keyed by absolute
 /// URL. Called from the async subresource phase (`execute_js`); the sync
-/// `rewrite_inline_svgs` then reads the table. Idempotent: an already-primed
+/// `svg_image_data` then reads the table. Idempotent: an already-primed
 /// URL is left alone (the sheet is immutable for the session).
 pub fn prime_sprite_sheet(abs_url: &str, text: &str) {
     #[cfg(test)]
@@ -25045,47 +24969,46 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_inline_svg_makes_a_renderable_one_a_data_image() {
-        let mut dom = Dom::parse_document(
+    fn renderable_inline_svg_is_its_own_replaced_data_image() {
+        // CSS 2 §10.3.2 / SVG Integration: an outer `<svg>` is a replaced
+        // element whose pixels come from its serialized document; layout
+        // keeps the SVG element itself (its box, selectors and identity).
+        let dom = Dom::parse_document(
             r##"<body>
-                <a href="/x"><svg viewBox="0 0 40 40" aria-label="Web">
+                <a href="/x"><svg id=web viewBox="0 0 40 40" aria-label="Web">
                     <title>Web</title><path d="M0 0h40v40H0z"/></svg></a>
-                <svg viewBox="0 0 10 10"><use href="#sprite"/></svg>
-                <svg style="display:none"><symbol id="s"><path d="M0 0z"/></symbol></svg>
+                <svg id=sprite viewBox="0 0 10 10"><use href="#sprite"/></svg>
+                <svg id=defs style="display:none"><symbol id="s"><path d="M0 0z"/></symbol></svg>
                </body>"##,
         );
-        dom.rewrite_inline_svgs(None);
-        let imgs: Vec<NodeId> = dom
-            .descendants(DOCUMENT)
-            .filter(|&d| dom.tag_name(d) == Some("img"))
-            .collect();
-        // The path-bearing SVG became an <img data:…> with its <title> as alt;
-        // the <use>-only and the hidden sprite-def SVG are left as <svg>.
-        assert_eq!(imgs.len(), 1, "only the renderable svg is rewritten");
-        let img = imgs[0];
-        assert!(
-            dom.attr(img, "src")
-                .unwrap()
-                .starts_with("data:image/svg+xml;base64,"),
-            "{:?}",
-            dom.attr(img, "src")
-        );
-        assert_eq!(dom.attr(img, "alt"), Some("Web"));
+        let (source, alt) = dom
+            .svg_image_data(dom.get_by_id("web").unwrap(), None)
+            .expect("the path-bearing svg paints");
+        assert!(source.starts_with("data:image/svg+xml;base64,"), "{source}");
+        assert_eq!(alt, "Web");
         // The data URL decodes back to SVG markup carrying the path + namespace.
-        let bytes = crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap();
+        let bytes = crate::img::decode_data_url(&source).unwrap();
         let svg = String::from_utf8(bytes).unwrap();
         assert!(
             svg.contains("<path") && svg.contains("viewBox") && svg.contains("xmlns"),
             "{svg}"
         );
-        // It stays inside the anchor, so the icon remains clickable.
-        assert_eq!(dom.tag_name(dom.nodes[img].parent.unwrap()), Some("a"));
-        // The two non-renderable SVGs survive untouched (glyph/text fallback).
-        let svgs = dom
-            .descendants(DOCUMENT)
-            .filter(|&d| dom.tag_name(d) == Some("svg"))
-            .count();
-        assert_eq!(svgs, 2);
+        // The <use>-only and the hidden sprite-def SVG paint nothing.
+        assert!(
+            dom.svg_image_data(dom.get_by_id("sprite").unwrap(), None)
+                .is_none()
+        );
+        assert!(
+            dom.svg_image_data(dom.get_by_id("defs").unwrap(), None)
+                .is_none()
+        );
+        // Nothing is rewritten: all three SVG elements stay in the tree.
+        assert_eq!(
+            dom.descendants(DOCUMENT)
+                .filter(|&d| dom.tag_name(d) == Some("svg"))
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -25312,12 +25235,12 @@ mod tests {
     }
 
     #[test]
-    fn external_sprite_use_rewrites_to_a_data_image() {
+    fn external_sprite_use_paints_as_a_data_image() {
         // The `<svg><use href="sprite.svg#id"></svg>` idiom (chatgpt.com's nav
         // icons, GitHub, most icon systems): the subresource phase primes the
-        // sheet, then `rewrite_inline_svgs` inlines the referenced symbol as a
-        // data:image the rasterizer renders. Unique URL so it can't race other
-        // tests on the process-global sheet cache.
+        // sheet, then the svg's image source inlines the referenced symbol as
+        // a data:image the rasterizer renders. Unique URL so it can't race
+        // other tests on the process-global sheet cache.
         let base = url::Url::parse("https://sprite-test.example/app/").unwrap();
         prime_sprite_sheet(
             "https://sprite-test.example/assets/sprite.svg",
@@ -25326,18 +25249,14 @@ mod tests {
                  <symbol id="other" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></symbol>
                </svg>"#,
         );
-        let mut dom = Dom::parse_document(
-            r#"<body><button><svg width="20" height="20" class="icon">
+        let dom = Dom::parse_document(
+            r#"<body><button><svg id=icon width="20" height="20" class="icon">
                  <use href="/assets/sprite.svg#pencil"/></svg></button></body>"#,
         );
-        dom.rewrite_inline_svgs(Some(&base));
-        let img = dom
-            .descendants(DOCUMENT)
-            .find(|&n| dom.tag_name(n) == Some("img"))
-            .expect("the sprite <use> becomes an <img>");
-        let decoded =
-            String::from_utf8(crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap())
-                .unwrap();
+        let (source, _) = dom
+            .svg_image_data(dom.get_by_id("icon").unwrap(), Some(&base))
+            .expect("the sprite <use> paints");
+        let decoded = String::from_utf8(crate::img::decode_data_url(&source).unwrap()).unwrap();
         assert!(
             decoded.contains(r#"viewBox="0 0 20 20""#),
             "carries the referenced symbol's viewBox: {decoded}"
@@ -25353,18 +25272,11 @@ mod tests {
         // The standalone svg actually RASTERIZES to painted pixels (a default-
         // fill path paints black → coverage for the silhouette tint). An empty
         // or malformed svg would decode to nothing and the icon would vanish.
-        let bytes = crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap();
+        let bytes = crate::img::decode_data_url(&source).unwrap();
         let (raster, _) = crate::img::decode(&bytes).expect("symbol svg rasterizes");
         assert!(
             raster.to_rgba8().pixels().any(|p| p[3] > 0),
             "the rasterized icon has painted pixels"
-        );
-        // The size attr rides onto the <img> so the icon is sized like the page.
-        assert_eq!(dom.attr(img, "width"), Some("20"));
-        // No raw <svg>/<use> left in the tree.
-        assert!(
-            !dom.descendants(DOCUMENT)
-                .any(|n| matches!(dom.tag_name(n), Some("svg" | "use")))
         );
     }
 
@@ -25437,27 +25349,6 @@ mod tests {
             collected.eager
         );
         assert!(collected.all.contains(&requests[0]));
-
-        // The presentation-DOM rewrite carries the same document context.
-        let mut rewritten = Dom::parse_document(
-            r#"<svg width=4 height=4><image href="/tex.png" width=4 height=4/></svg>"#,
-        );
-        rewritten.rewrite_inline_svgs(Some(&page));
-        let collected = crate::http::collect_image_urls(
-            &rewritten,
-            &page,
-            crate::layout2::Viewport::new(800., 600.),
-            1.0,
-        );
-        assert!(
-            collected
-                .eager
-                .iter()
-                .any(|request| crate::img::document_svg_image_target(request)
-                    .is_some_and(|image| image.url() == "https://page.test/tex.png")),
-            "{:?}",
-            collected.eager
-        );
     }
 
     /// HTML #img-available / SVG 2 linking.html#processingURL-fetch: once an
@@ -25564,15 +25455,13 @@ mod tests {
                </svg>"#,
         );
         for fragment in ["expand_more", "group"] {
-            let mut dom = Dom::parse_document(&format!(
-                r#"<body><svg width="24" height="24" viewBox="0 0 24 24"><use href="/sheet.svg#{fragment}"/></svg></body>"#
+            let dom = Dom::parse_document(&format!(
+                r#"<body><svg id=icon width="24" height="24" viewBox="0 0 24 24"><use href="/sheet.svg#{fragment}"/></svg></body>"#
             ));
-            dom.rewrite_inline_svgs(Some(&base));
-            let img = dom
-                .descendants(DOCUMENT)
-                .find(|&n| dom.tag_name(n) == Some("img"))
-                .unwrap_or_else(|| panic!("#{fragment} becomes an <img>"));
-            let bytes = crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap();
+            let (source, _) = dom
+                .svg_image_data(dom.get_by_id("icon").unwrap(), Some(&base))
+                .unwrap_or_else(|| panic!("#{fragment} paints"));
+            let bytes = crate::img::decode_data_url(&source).unwrap();
             let (raster, _) = crate::img::decode(&bytes).expect("the icon rasterizes");
             assert_eq!(raster.to_rgba8().get_pixel(12, 12).0[3], 255, "#{fragment}");
         }
@@ -25584,56 +25473,56 @@ mod tests {
     }
 
     #[test]
-    fn unfetched_sprite_use_is_left_untouched() {
-        // A sheet that was never fetched → the svg stays an svg (renders
-        // nothing), never a broken empty <img>. Same graceful fallback as
-        // before sprite support existed.
+    fn unfetched_sprite_use_paints_nothing() {
+        // A sheet that was never fetched → the svg has no image source and
+        // renders nothing, never a broken empty image. Same graceful
+        // fallback as before sprite support existed.
         let base = url::Url::parse("https://sprite-miss.example/").unwrap();
-        let mut dom = Dom::parse_document(
-            r#"<body><svg width="20" height="20"><use href="/never-fetched.svg#x"/></svg></body>"#,
-        );
-        dom.rewrite_inline_svgs(Some(&base));
-        assert!(
-            dom.descendants(DOCUMENT)
-                .any(|n| dom.tag_name(n) == Some("svg")),
-            "the svg is left in place"
+        let dom = Dom::parse_document(
+            r#"<body><svg id=icon width="20" height="20"><use href="/never-fetched.svg#x"/></svg></body>"#,
         );
         assert!(
-            !dom.descendants(DOCUMENT)
-                .any(|n| dom.tag_name(n) == Some("img")),
-            "no empty <img> is produced"
+            dom.svg_image_data(dom.get_by_id("icon").unwrap(), Some(&base))
+                .is_none()
         );
     }
 
     #[test]
-    fn rewrite_inline_svg_carries_the_elements_css_and_attr_size() {
-        // The replacement <img> must keep the SVG element's box so layout sizes
-        // the vector the way the page does — the cascaded CSS size (`style`)
-        // over presentation attrs over the intrinsic. archive.org's logo carries
-        // only `style="width:2.7rem;height:3rem"`; its media icons carry both a
-        // `width="40"` attr and a winning `style="width:4rem"`.
-        let mut dom = Dom::parse_document(
-            r##"<body>
-                <svg class="logo" viewBox="0 0 27 30" style="width:2.7rem;height:3rem">
+    fn inline_svg_boxes_take_their_own_css_and_attr_sizes() {
+        // CSS 2 §10.3.2 / SVG 2 §8.12: the replaced `<svg>` box is sized by its
+        // cascaded CSS size over its presentation attrs over the intrinsic.
+        // archive.org's logo carries only `style="width:2.7rem;height:3rem"`;
+        // its media icons carry both a `width="40"` attr and a winning
+        // `style="width:4rem"`; a class rule sizes the third.
+        let dom = Dom::parse_document(
+            r##"<head><style>.s{width:30px;height:20px}</style></head><body style="margin:0">
+                <svg id=logo class="logo" viewBox="0 0 27 30" style="width:2.7rem;height:3rem">
                     <path d="M0 0h27v30H0z"/></svg>
-                <svg width="40" height="40" viewBox="0 0 40 40" style="width:4rem;height:4rem">
+                <svg id=icon width="40" height="40" viewBox="0 0 40 40" style="width:4rem;height:4rem">
+                    <path d="M0 0h40v40H0z"/></svg>
+                <svg id=classed class=s width="40" height="40" viewBox="0 0 40 40">
                     <path d="M0 0h40v40H0z"/></svg>
                </body>"##,
         );
-        dom.rewrite_inline_svgs(None);
-        let imgs: Vec<NodeId> = dom
-            .descendants(DOCUMENT)
-            .filter(|&d| dom.tag_name(d) == Some("img"))
-            .collect();
-        assert_eq!(imgs.len(), 2);
-        // The style-only logo carries its CSS size (no width/height attr).
-        assert_eq!(dom.attr(imgs[0], "style"), Some("width:2.7rem;height:3rem"));
-        assert_eq!(dom.attr(imgs[0], "width"), None);
-        // The icon carries BOTH; CSS wins in layout, but the attr is preserved
-        // as the presentation-hint fallback.
-        assert_eq!(dom.attr(imgs[1], "style"), Some("width:4rem;height:4rem"));
-        assert_eq!(dom.attr(imgs[1], "width"), Some("40"));
-        assert_eq!(dom.attr(imgs[1], "height"), Some("40"));
+        let base = url::Url::parse("https://example.test/").unwrap();
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(800., 600.),
+            &[],
+            &std::collections::HashMap::new(),
+            &crate::layout2::ImageSizes::new(),
+        );
+        let size = |id: &str, expected: (f64, f64)| {
+            let rect = layout.boxes[&dom.get_by_id(id).unwrap()];
+            assert!(
+                (rect.width - expected.0).abs() < 0.01 && (rect.height - expected.1).abs() < 0.01,
+                "{id}: {rect:?}"
+            );
+        };
+        size("logo", (43.2, 48.));
+        size("icon", (64., 64.));
+        size("classed", (30., 20.));
     }
 
     #[test]

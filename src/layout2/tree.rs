@@ -484,9 +484,9 @@ impl Built {
     }
 }
 
-/// Elements whose subtree never renders as page content. Renderable inline
-/// `<svg>` was already rewritten to `<img data:…>` by `rewrite_inline_svgs`;
-/// what remains here has no terminal rendering. HTML Rendering
+/// Elements whose subtree never renders as page content (an inline `<svg>`
+/// is instead a replaced box painted from `Dom::svg_image_data`); what
+/// remains here has no terminal rendering. HTML Rendering
 /// #hidden-elements hides `head`, `title`, `style`, `script` and the other
 /// metadata elements with an ordinary UA `display: none` rule instead, so an
 /// author's `display` brings them back (`title { display: block }` shows a

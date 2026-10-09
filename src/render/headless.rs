@@ -60,8 +60,12 @@ pub fn render_paint_with_images(
 /// Render a self-contained HTML fixture. `data:` images are decoded
 /// synchronously between an intrinsic-discovery pass and the final layout.
 pub fn render_html(html: &str, base: &Url, viewport: CssSize) -> Result<OwnedRgbaFrame, String> {
-    let mut dom = crate::dom::Dom::parse_document(html);
-    dom.rewrite_inline_svgs(Some(base));
+    VelloCpuRenderer::new().render_rgba(&scene_for_html(html, base, viewport))
+}
+
+/// The scene [`render_html`] rasterizes, for backend differential tests.
+pub fn scene_for_html(html: &str, base: &Url, viewport: CssSize) -> Scene {
+    let dom = crate::dom::Dom::parse_document(html);
     let (forms, controls) = crate::http::extract_forms_arena(&dom, base, None);
     let mut sizes = ImageSizes::new();
     let store = ImageStore::default();
@@ -81,7 +85,7 @@ pub fn render_html(html: &str, base: &Url, viewport: CssSize) -> Result<OwnedRgb
             store.insert(request.handle, image);
         }
     }
-    render_dom_with_resources(&dom, base, viewport, &forms, &controls, &sizes, store)
+    scene_for_dom(&dom, base, viewport, &forms, &controls, &sizes, store)
 }
 
 /// Render an already-parsed DOM with caller-provided immutable image

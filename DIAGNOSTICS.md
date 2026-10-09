@@ -952,7 +952,7 @@ file and prints rows, regions, carousels, a DOM legend, and optional geometry.
 | `TRUST_DIAG_URL` | absolute URL | Base URL for relative resources and the legend. Default: `https://store.steampowered.com/`. |
 | `TRUST_LAYOUT_GREP` | text | Restricts printed row/region output to lines containing this substring. |
 | `TRUST_LAYOUT_SPRITE` | SVG/text file path | Primes every external SVG sprite sheet referenced by `<use>` for offline replay. |
-| `TRUST_LAYOUT_IMG_CELL` | `WIDTHxHEIGHT` | Seeds every resolved `<img>` with a decoded size expressed in terminal cells. |
+| `TRUST_LAYOUT_IMG_CELL` | `WIDTHxHEIGHT` | Seeds every resolved `<img>` and inline `<svg>` with a decoded size expressed in terminal cells. |
 | `TRUST_LAYOUT_IMG_ALPHA` | presence flag | Marks seeded images transparent for overlap-compositing replay. |
 | `TRUST_LAYOUT_MEASURE` | id/class substring | Prints CSSOM `getBoundingClientRect`-style geometry for matching elements. |
 | `TRUST_LAYOUT_NODES` | comma-separated node ids | Prints the DOM legend for each id and its ancestor chain; an optional leading `n` is accepted. |

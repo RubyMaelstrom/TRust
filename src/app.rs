@@ -10706,9 +10706,9 @@ async fn load_page_image(
 /// image fails to `None`, never unwinds the worker — the terminal is safe
 /// regardless, only the run loop restores it). The intrinsic box is the
 /// fallback size; an SVG (or any image) whose element carries a CSS/attr
-/// `width`/`height` is sized by that in `image_used_box`, which is why a
-/// rewritten inline `<svg>` keeps the original element's box (see
-/// `Dom::rewrite_inline_svgs`) instead of being clamped here.
+/// `width`/`height` is sized by that in `image_used_box`, which is why an
+/// inline `<svg>` keeps its own element's replaced box (see
+/// `Dom::svg_image_data`) instead of being clamped here.
 async fn decoded_intrinsic(bytes: std::sync::Arc<[u8]>) -> Option<((u32, u32), bool)> {
     tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -17377,9 +17377,9 @@ mod tests {
         let font = ratatui_image::picker::Picker::halfblocks().font_size();
         // An SVG decodes to its INTRINSIC cell box, never an artificial cap: a
         // 200×40 viewBox (no element CSS size) yields the same box a 200×40
-        // raster would. The element's own CSS/attr `width`/`height` — carried
-        // onto the rewritten <img> in `Dom::rewrite_inline_svgs` — is what
-        // resizes it, applied later in `image_used_box`, not here.
+        // raster would. The `<svg>` element's own CSS/attr `width`/`height`
+        // (its replaced box) is what resizes it, applied later in
+        // `image_used_box`, not here.
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40" viewBox="0 0 200 40"><path d="M0 0h200v40H0z"/></svg>"#;
         let (intrinsic, svg_alpha) = super::decoded_intrinsic(std::sync::Arc::from(&svg[..]))
             .await

@@ -930,7 +930,6 @@ pub fn render_html_for_environment(
     dom.set_fragment_target(response.url.fragment());
     dom.set_viewport_px(viewport.width, viewport.height);
     dom.set_device_pixel_ratio(device_pixel_ratio);
-    dom.rewrite_inline_svgs(Some(&base));
     Some(render_arena(
         &dom,
         &base,
@@ -6415,8 +6414,8 @@ async fn execute_js_with_presentation(
 /// External SVG sprite sheets: a `<use href="file.svg#id">` icon (ChatGPT,
 /// GitHub, most icon systems) keeps its geometry in one shared file resvg won't
 /// fetch itself. Fetch each referenced sheet ONCE — same subresource gate as
-/// scripts/sheets — and prime the process-global cache; the layout's
-/// `rewrite_inline_svgs` then inlines the used symbol so it rasterizes like any
+/// scripts/sheets — and prime the process-global cache; layout's
+/// `Dom::svg_image_data` then inlines the used symbol so it rasterizes like any
 /// inline vector. Cheap-guarded: a page with no `<use>` pays one substring
 /// check. SVG 2 URL reference processing uses the document base URL; the SSRF
 /// policy remains anchored to the actual page URL.
@@ -7946,7 +7945,6 @@ async fn css_only_with_sheets(
     }
     dom.set_doc_url(Some(base.clone()));
     dom.set_device_pixel_ratio(device_pixel_ratio);
-    dom.rewrite_inline_svgs(Some(&base));
     let css_viewport = crate::layout2::TerminalViewport::from_font_pixels(
         usize::from(viewport.0),
         usize::from(viewport.1),
@@ -8832,9 +8830,6 @@ pub fn parse_seeded(
         dom.set_doc_url(Some(url.clone()));
         dom.set_viewport_px(css_viewport.width, css_viewport.height);
         dom.set_device_pixel_ratio(1.0);
-        // Turn renderable inline <svg> into <img data:…> so vectors render
-        // (silhouette-tinted) through the image pipeline instead of as text.
-        dom.rewrite_inline_svgs(Some(url));
         let t_dom = t0.elapsed();
         let t1 = std::time::Instant::now();
         let (found, controls) = extract_forms_arena(&dom, url, seed);
@@ -9030,7 +9025,6 @@ pub fn lay_region_patch(
     dom.set_doc_url(Some(url.clone()));
     dom.set_viewport_px(css_viewport.width, css_viewport.height);
     dom.set_device_pixel_ratio(1.0);
-    dom.rewrite_inline_svgs(Some(url));
     let key = boundary_node.to_string();
     let boundary = dom
         .descendants(crate::dom::DOCUMENT)
@@ -9125,7 +9119,6 @@ pub fn lay_subtree_patch(
     dom.set_doc_url(Some(url.clone()));
     dom.set_viewport_px(css_viewport.width, css_viewport.height);
     dom.set_device_pixel_ratio(1.0);
-    dom.rewrite_inline_svgs(Some(url));
     let key = boundary_node.to_string();
     let boundary = dom
         .descendants(crate::dom::DOCUMENT)
@@ -17193,17 +17186,29 @@ mod tests {
                 }
             }
         }
-        // TRUST_LAYOUT_IMG_CELL=WxH: seed EVERY <img>'s src with a decoded cell
-        // box, so a layout that only shows the real box once decoded (an
-        // `object-fit`/`width:100%` product tile) can be reproduced offline.
+        // TRUST_DIAG_CELL=WxH: the terminal font's cell size in pixels
+        // (default 8x16). Row/column rounding depends on it.
+        let cell_px = std::env::var("TRUST_DIAG_CELL")
+            .ok()
+            .and_then(|v| {
+                let (w, h) = v.split_once('x')?;
+                Some((w.parse().ok()?, h.parse().ok()?))
+            })
+            .unwrap_or((8, 16));
+        // TRUST_LAYOUT_IMG_CELL=WxH: seed EVERY <img>'s src (and every inline
+        // <svg>'s data source) with a decoded cell box, so a layout that only
+        // shows the real box once decoded (an `object-fit`/`width:100%`
+        // product tile) can be reproduced offline.
         let mut images = crate::layout2::ImageSizes::new();
         if let Ok(spec) = std::env::var("TRUST_LAYOUT_IMG_CELL")
             && let Some((cw, ch)) = spec
                 .split_once('x')
                 .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)))
         {
-            let mut probe = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
-            probe.rewrite_inline_svgs(Some(&url));
+            // This diagnostic environment variable remains expressed
+            // in terminal cells; convert once at its terminal boundary.
+            let size = (u32::from(cw) * 8, u32::from(ch) * 16);
+            let probe = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
             for id in probe.live_ids() {
                 if probe.tag_name(id) == Some("img")
                     && let Some(src) = probe.attr(id, "src")
@@ -17215,9 +17220,25 @@ mod tests {
                     } else {
                         continue;
                     };
-                    // This diagnostic environment variable remains expressed
-                    // in terminal cells; convert once at its terminal boundary.
-                    images.insert(key, (u32::from(cw) * 8, u32::from(ch) * 16));
+                    images.insert(key, size);
+                }
+            }
+            // An inline <svg>'s source serializes its computed style, so seed
+            // the sources a first layout pass requests.
+            let pending = parse_seeded(
+                &url,
+                "text/html",
+                &html,
+                w,
+                vh,
+                cell_px,
+                None,
+                &images,
+                no_alpha(),
+            );
+            for source in pending.image_urls {
+                if source.starts_with("data:image/svg+xml") {
+                    images.entry(source).or_insert(size);
                 }
             }
         }
@@ -17229,15 +17250,6 @@ mod tests {
             } else {
                 std::collections::HashMap::new()
             };
-        // TRUST_DIAG_CELL=WxH: the terminal font's cell size in pixels
-        // (default 8x16). Row/column rounding depends on it.
-        let cell_px = std::env::var("TRUST_DIAG_CELL")
-            .ok()
-            .and_then(|v| {
-                let (w, h) = v.split_once('x')?;
-                Some((w.parse().ok()?, h.parse().ok()?))
-            })
-            .unwrap_or((8, 16));
         let doc = parse_seeded(
             &url,
             "text/html",
@@ -17298,8 +17310,7 @@ mod tests {
         }
         // Legend: reproduce the layout DOM (same NodeIds) so we can map an
         // item's `node` back to its element (tag/id/class + box/flex props).
-        let mut legend_dom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
-        legend_dom.rewrite_inline_svgs(Some(&url));
+        let legend_dom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
         let mut seen_nodes: std::collections::BTreeSet<usize> = Default::default();
         for (ri, row) in doc.rows.iter().enumerate() {
             let mut s = String::new();

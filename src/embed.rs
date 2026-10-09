@@ -91,8 +91,7 @@ impl EmbeddedDocument {
         Ok(Self::from_dom(dom, base, viewport, resources))
     }
 
-    fn from_dom(mut dom: Dom, base: Url, viewport: CssSize, resources: ImageStore) -> Self {
-        dom.rewrite_inline_svgs(Some(&base));
+    fn from_dom(dom: Dom, base: Url, viewport: CssSize, resources: ImageStore) -> Self {
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
         let sizes = ImageSizes::new();
         let layout = layout2::lay_out_graphical(

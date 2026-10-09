@@ -213,6 +213,8 @@ pub(crate) fn svg_resource_dimension(
 #[cfg(test)]
 mod svg_effect_tests;
 #[cfg(test)]
+mod svg_replaced_box_tests;
+#[cfg(test)]
 mod visual_regression_tests;
 
 use std::collections::HashMap;
