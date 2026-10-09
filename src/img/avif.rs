@@ -24,13 +24,19 @@
 //! An image sequence of two or more samples plays as an animation
 //! ([`Sequence`]): the colour track's samples in decoding order, each an AV1
 //! temporal unit (AV1-ISOBMFF), shown for its time-to-sample duration, with
-//! an alpha auxiliary track's samples as alpha.
+//! an alpha auxiliary track's samples as alpha. AVIF §3 makes the track a
+//! MIAF image sequence and defers its presentation to MIAF/HEIF (ISO texts
+//! that are not in the local library; the behaviour follows libavif): the
+//! colour track's sample entry carries `clap`, `irot` and `imir` boxes that
+//! apply to every frame in the item order, and a `prem` track reference from
+//! the colour track to the alpha track marks premultiplied colour, as the
+//! `prem` item reference does for items. A file whose only image is the
+//! sequence shows its first frame, presented the same way, as its still.
 //!
 //! Not supported: layered images beyond the default operating point
 //! (`a1op`/`lsel`), gain maps (`tmap`) and sample transforms (`sato`), which
 //! fall back to their base image when the file offers one as the primary
-//! item; and for sequences, transformative properties and premultiplied
-//! (`prem`) alpha tracks, which mp4parse does not report for tracks.
+//! item.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -119,7 +125,9 @@ fn decode_context(
     bytes: &[u8],
     limits: Limits,
 ) -> Result<RgbaImage, String> {
-    let colour = Item::primary(context, bytes)?;
+    let Some(colour) = Item::primary(context)? else {
+        return decode_first_frame(context, bytes, limits);
+    };
     let alpha = Item::alpha(context)?;
     let nclx = match context.nclx_colour_information() {
         Some(Ok(nclx)) => Some(Nclx::of(nclx)),
@@ -138,7 +146,25 @@ fn decode_context(
             yuv::unpremultiply(&mut image);
         }
     }
-    apply_transforms(context, image)
+    Ok(Transforms::of_item(context)?.apply(image))
+}
+
+/// The first frame of an image sequence without a primary item (AVIF §3,
+/// MIAF image sequences), presented as the sequence presents it.
+fn decode_first_frame(
+    context: &AvifContext,
+    bytes: &[u8],
+    limits: Limits,
+) -> Result<RgbaImage, String> {
+    let no_image = || String::from("AVIF file has no displayable image");
+    let tracks = match &context.sequence {
+        Some(sequence) => Tracks::of(sequence, bytes.len(), limits)?.ok_or_else(no_image)?,
+        None => return Err(no_image()),
+    };
+    Playback::default()
+        .next_frame(&tracks, bytes, limits)?
+        .map(|(image, _)| image)
+        .ok_or_else(no_image)
 }
 
 /// A primary or alpha image: one coded AV1 item, or a grid of them.
@@ -152,24 +178,21 @@ enum Item<'a> {
 }
 
 impl<'a> Item<'a> {
-    fn primary(context: &'a AvifContext, bytes: &'a [u8]) -> Result<Self, String> {
+    /// The primary item, or `None` when the file has none (an image
+    /// sequence alone).
+    fn primary(context: &'a AvifContext) -> Result<Option<Self>, String> {
         if let Some(grid) = context.primary_item_grid() {
             return grid
-                .map(Self::Grid)
+                .map(|grid| Some(Self::Grid(grid)))
                 .map_err(|error| format!("AVIF grid: {error}"));
         }
         let size = context
             .spatial_extents()
             .map_err(|error| format!("AVIF ispe: {error}"))?
             .map(|ispe| (ispe.width(), ispe.height()));
-        if let Some(data) = context.primary_item_coded_data() {
-            return Ok(Self::Coded { data, size });
-        }
-        // An image sequence without a primary item (AVIF §3, MIAF image
-        // sequences): present its first sample.
-        first_sequence_sample(context, bytes)
-            .map(|data| Self::Coded { data, size: None })
-            .ok_or_else(|| String::from("AVIF file has no displayable image"))
+        Ok(context
+            .primary_item_coded_data()
+            .map(|data| Self::Coded { data, size }))
     }
 
     fn alpha(context: &'a AvifContext) -> Result<Option<Self>, String> {
@@ -385,13 +408,6 @@ fn for_each_tile(
     Ok(())
 }
 
-/// The first sample of the image sequence's colour track.
-fn first_sequence_sample<'a>(context: &AvifContext, bytes: &'a [u8]) -> Option<&'a [u8]> {
-    let track = colour_track(context.sequence.as_ref()?)?;
-    let first = *sample_table(track, bytes.len())?.first()?;
-    bytes.get(first.start..first.end)
-}
-
 /// The image sequence's colour track: the first AV1 video or picture track
 /// that is not an auxiliary track of another.
 fn colour_track(sequence: &mp4parse::MediaContext) -> Option<&mp4parse::Track> {
@@ -553,12 +569,10 @@ fn sequence_plays(track: &mp4parse::Track) -> Option<u32> {
     }
 }
 
-/// An AVIF image sequence (AVIF §3 "Image Sequences", `avis`) played from
-/// its first sample: each sample of the colour track is an AV1 temporal unit
-/// (AV1-ISOBMFF) shown for its 'stts' duration, with the alpha auxiliary
-/// track's sample of the same index as its alpha.
-pub(crate) struct Sequence {
-    bytes: Arc<[u8]>,
+/// An image sequence's colour track and optional alpha auxiliary track:
+/// their samples and what the colour track's sample entry and track
+/// references say about presenting every frame.
+struct Tracks {
     colour: Vec<SampleRef>,
     alpha: Option<Vec<SampleRef>>,
     /// Media ticks per second ('mdhd').
@@ -566,41 +580,47 @@ pub(crate) struct Sequence {
     plays: Option<u32>,
     nclx: Option<Nclx>,
     icc: Option<Tag>,
-    limits: Limits,
     /// The sample entry's size, which every frame should have.
     declared: Option<(u32, u32)>,
-    colour_decoder: Option<Decoder>,
-    alpha_decoder: Option<Decoder>,
-    next: usize,
-    size: Option<(u32, u32)>,
+    /// A 'prem' track reference from the colour track to the alpha track:
+    /// the colour samples are premultiplied by alpha.
+    premultiplied: bool,
+    /// The sample entry's 'clap', 'irot' and 'imir'.
+    transforms: Transforms,
 }
 
-impl Sequence {
-    /// The image sequence of an AVIF file when it has at least two samples
-    /// (one sample is a still image), positioned before its first frame.
-    pub(crate) fn open(bytes: Arc<[u8]>, limits: Limits) -> Result<Option<Self>, String> {
-        let parsed = std::panic::catch_unwind(|| {
-            mp4parse::read_avif(&mut Cursor::new(&bytes[..]), ParseStrictness::Normal)
-        })
-        .map_err(|_| String::from("AVIF decoder failed"))?
-        .map_err(|error| format!("AVIF container: {error}"))?;
-        let Some(sequence) = parsed.sequence.as_ref() else {
-            return Ok(None);
-        };
+impl Tracks {
+    /// The colour and alpha tracks of `sequence`, or `None` when it has no
+    /// AV1 colour track.
+    fn of(
+        sequence: &mp4parse::MediaContext,
+        file_len: usize,
+        limits: Limits,
+    ) -> Result<Option<Self>, String> {
         let Some(track) = colour_track(sequence) else {
             return Ok(None);
         };
-        let Some(colour) = sample_table(track, bytes.len()) else {
+        let Some(colour) = sample_table(track, file_len) else {
             return Err(String::from(
                 "AVIF image sequence has no valid sample table",
             ));
         };
-        if colour.len() < 2 {
-            return Ok(None);
-        }
-        let alpha = alpha_track(sequence, track)
-            .and_then(|alpha| sample_table(alpha, bytes.len()))
-            .filter(|alpha| alpha.len() == colour.len());
+        let (alpha, alpha_id) = alpha_track(sequence, track)
+            .and_then(|alpha| {
+                sample_table(alpha, file_len)
+                    .filter(|samples| samples.len() == colour.len())
+                    .map(|samples| (Some(samples), alpha.track_id))
+            })
+            .unwrap_or((None, None));
+        // MIAF image sequences carry a master image's 'prem' relationship
+        // to its alpha as a track reference of that type, from the colour
+        // track to the alpha track, as items carry it in 'iref'.
+        let premultiplied = alpha_id.is_some_and(|alpha_id| {
+            track
+                .tref
+                .as_ref()
+                .is_some_and(|tref| tref.has_prem_reference(alpha_id))
+        });
         let entry = av1_entry(track);
         let mut nclx = None;
         let mut icc = None;
@@ -628,27 +648,18 @@ impl Sequence {
         Ok(Some(Self {
             timescale: track.timescale.map_or(0, |scale| scale.0),
             plays: sequence_plays(track),
-            bytes: Arc::clone(&bytes),
             colour,
             alpha,
             nclx,
             icc,
-            limits,
             declared,
-            colour_decoder: None,
-            alpha_decoder: None,
-            next: 0,
-            size: None,
+            premultiplied,
+            transforms: entry.map(Transforms::of_entry).unwrap_or_default(),
         }))
     }
 
-    /// How many times the sequence plays; `None` for endlessly.
-    pub(crate) fn plays(&self) -> Option<u32> {
-        self.plays
-    }
-
-    fn decoder(&self) -> Result<Decoder, String> {
-        let max = self.limits.max_pixels();
+    fn decoder(&self, limits: Limits) -> Result<Decoder, String> {
+        let max = limits.max_pixels();
         let declared = self
             .declared
             .map_or(max, |(width, height)| width.saturating_mul(height));
@@ -658,16 +669,32 @@ impl Sequence {
         })
         .map_err(|error| error.to_string())
     }
+}
 
+/// The decoding state of one play of an image sequence.
+#[derive(Default)]
+struct Playback {
+    colour_decoder: Option<Decoder>,
+    alpha_decoder: Option<Decoder>,
+    next: usize,
+    size: Option<(u32, u32)>,
+}
+
+impl Playback {
     /// The next frame and how long it is shown, or `None` after the last.
-    pub(crate) fn next_frame(&mut self) -> Result<Option<(RgbaImage, Duration)>, String> {
+    fn next_frame(
+        &mut self,
+        tracks: &Tracks,
+        bytes: &[u8],
+        limits: Limits,
+    ) -> Result<Option<(RgbaImage, Duration)>, String> {
         let mut ticks = 0u64;
-        while let Some(&sample) = self.colour.get(self.next) {
+        while let Some(&sample) = tracks.colour.get(self.next) {
             let index = self.next;
             self.next += 1;
             ticks = ticks.saturating_add(u64::from(sample.ticks));
             if self.colour_decoder.is_none() {
-                self.colour_decoder = Some(self.decoder()?);
+                self.colour_decoder = Some(tracks.decoder(limits)?);
             }
             let decoder = self
                 .colour_decoder
@@ -675,19 +702,19 @@ impl Sequence {
                 .expect("decoder was just created");
             // A temporal unit without a shown frame lengthens the next one.
             let Some(frame) = decoder
-                .decode(&self.bytes[sample.start..sample.end])
+                .decode(&bytes[sample.start..sample.end])
                 .map_err(|error| error.to_string())?
                 .pop()
             else {
                 continue;
             };
-            self.limits.check(frame.width, frame.height)?;
+            limits.check(frame.width, frame.height)?;
             if *self.size.get_or_insert((frame.width, frame.height)) != (frame.width, frame.height)
             {
                 return Err(String::from("AVIF sequence frames differ in size"));
             }
             let mut image = RgbaImage::new(frame.width, frame.height);
-            let (cicp, conversion) = picture_colour(self.nclx, self.icc.as_ref(), &frame);
+            let (cicp, conversion) = picture_colour(tracks.nclx, tracks.icc.as_ref(), &frame);
             yuv::write_rgb(
                 &frame,
                 cicp,
@@ -696,16 +723,16 @@ impl Sequence {
                 0,
                 0,
             );
-            if let Some(&alpha) = self.alpha.as_ref().and_then(|alpha| alpha.get(index)) {
+            if let Some(&alpha) = tracks.alpha.as_ref().and_then(|alpha| alpha.get(index)) {
                 if self.alpha_decoder.is_none() {
-                    self.alpha_decoder = Some(self.decoder()?);
+                    self.alpha_decoder = Some(tracks.decoder(limits)?);
                 }
                 let decoder = self
                     .alpha_decoder
                     .as_mut()
                     .expect("decoder was just created");
                 if let Some(plane) = decoder
-                    .decode(&self.bytes[alpha.start..alpha.end])
+                    .decode(&bytes[alpha.start..alpha.end])
                     .map_err(|error| error.to_string())?
                     .pop()
                 {
@@ -713,51 +740,133 @@ impl Sequence {
                         return Err(String::from("AVIF alpha size differs from the image"));
                     }
                     yuv::write_alpha(&plane, &mut canvas(&mut image), 0, 0);
+                    if tracks.premultiplied {
+                        yuv::unpremultiply(&mut image);
+                    }
                 }
             }
-            let delay = if self.timescale == 0 {
+            let delay = if tracks.timescale == 0 {
                 Duration::ZERO
             } else {
-                Duration::from_secs_f64(ticks as f64 / self.timescale as f64)
+                Duration::from_secs_f64(ticks as f64 / tracks.timescale as f64)
             };
-            return Ok(Some((image, delay)));
+            return Ok(Some((tracks.transforms.apply(image), delay)));
         }
         Ok(None)
     }
 }
 
-/// Apply the primary item's transformative properties: `clap`, then `irot`,
-/// then `imir` (MIAF §7.3.6.7; mp4parse rejects other orders).
-fn apply_transforms(context: &AvifContext, mut image: RgbaImage) -> Result<RgbaImage, String> {
-    let clap = context
-        .clean_aperture()
-        .map_err(|error| format!("AVIF clap: {error}"))?;
-    if let Some((x, y, width, height)) =
-        clap.and_then(|clap| clean_aperture_rect(clap, image.width(), image.height()))
-    {
-        image = image::imageops::crop_imm(&image, x, y, width, height).to_image();
+/// An AVIF image sequence (AVIF §3 "Image Sequences", `avis`) played from
+/// its first sample: each sample of the colour track is an AV1 temporal unit
+/// (AV1-ISOBMFF) shown for its 'stts' duration, with the alpha auxiliary
+/// track's sample of the same index as its alpha.
+pub(crate) struct Sequence {
+    bytes: Arc<[u8]>,
+    tracks: Tracks,
+    limits: Limits,
+    playback: Playback,
+}
+
+impl Sequence {
+    /// The image sequence of an AVIF file when it has at least two samples
+    /// (one sample is a still image), positioned before its first frame.
+    pub(crate) fn open(bytes: Arc<[u8]>, limits: Limits) -> Result<Option<Self>, String> {
+        let parsed = std::panic::catch_unwind(|| {
+            mp4parse::read_avif(&mut Cursor::new(&bytes[..]), ParseStrictness::Normal)
+        })
+        .map_err(|_| String::from("AVIF decoder failed"))?
+        .map_err(|error| format!("AVIF container: {error}"))?;
+        let Some(sequence) = parsed.sequence.as_ref() else {
+            return Ok(None);
+        };
+        let Some(tracks) = Tracks::of(sequence, bytes.len(), limits)? else {
+            return Ok(None);
+        };
+        if tracks.colour.len() < 2 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            bytes,
+            tracks,
+            limits,
+            playback: Playback::default(),
+        }))
     }
-    // `irot` turns the image anti-clockwise by angle × 90° (HEIF §6.5.10).
-    image = match context
-        .image_rotation()
-        .map_err(|error| format!("AVIF irot: {error}"))?
-    {
-        ImageRotation::D0 => image,
-        ImageRotation::D90 => image::imageops::rotate270(&image),
-        ImageRotation::D180 => image::imageops::rotate180(&image),
-        ImageRotation::D270 => image::imageops::rotate90(&image),
-    };
-    // HEIF (ISO/IEC 23008-12:2022) §6.5.12: `imir` axis 0 exchanges the top
-    // and bottom parts, axis 1 the left and right parts.
-    match context
-        .image_mirror()
-        .map_err(|error| format!("AVIF imir: {error}"))?
-    {
-        Some(ImageMirror::TopBottom) => image::imageops::flip_vertical_in_place(&mut image),
-        Some(ImageMirror::LeftRight) => image::imageops::flip_horizontal_in_place(&mut image),
-        None => {}
+
+    /// How many times the sequence plays; `None` for endlessly.
+    pub(crate) fn plays(&self) -> Option<u32> {
+        self.tracks.plays
     }
-    Ok(image)
+
+    /// The next frame and how long it is shown, or `None` after the last.
+    pub(crate) fn next_frame(&mut self) -> Result<Option<(RgbaImage, Duration)>, String> {
+        self.playback
+            .next_frame(&self.tracks, &self.bytes, self.limits)
+    }
+}
+
+/// Transformative properties, applied in the order MIAF requires (§7.3.6.7;
+/// mp4parse rejects other item property orders): `clap`, then `irot`, then
+/// `imir`. An image sequence's sample entry carries them as boxes.
+#[derive(Clone, Copy, Debug, Default)]
+struct Transforms {
+    clap: Option<mp4parse::CleanAperture>,
+    rotation: Option<ImageRotation>,
+    mirror: Option<ImageMirror>,
+}
+
+impl Transforms {
+    /// The primary item's transformative properties.
+    fn of_item(context: &AvifContext) -> Result<Self, String> {
+        Ok(Self {
+            clap: context
+                .clean_aperture()
+                .map_err(|error| format!("AVIF clap: {error}"))?
+                .copied(),
+            rotation: Some(
+                context
+                    .image_rotation()
+                    .map_err(|error| format!("AVIF irot: {error}"))?,
+            ),
+            mirror: context
+                .image_mirror()
+                .map_err(|error| format!("AVIF imir: {error}"))?
+                .copied(),
+        })
+    }
+
+    /// The transformative boxes of an image sequence's sample entry.
+    fn of_entry(entry: &mp4parse::VideoSampleEntry) -> Self {
+        Self {
+            clap: entry.clean_aperture,
+            rotation: entry.image_rotation,
+            mirror: entry.image_mirror,
+        }
+    }
+
+    fn apply(&self, mut image: RgbaImage) -> RgbaImage {
+        if let Some((x, y, width, height)) = self
+            .clap
+            .and_then(|clap| clean_aperture_rect(&clap, image.width(), image.height()))
+        {
+            image = image::imageops::crop_imm(&image, x, y, width, height).to_image();
+        }
+        // `irot` turns the image anti-clockwise by angle × 90° (HEIF §6.5.10).
+        image = match self.rotation {
+            None | Some(ImageRotation::D0) => image,
+            Some(ImageRotation::D90) => image::imageops::rotate270(&image),
+            Some(ImageRotation::D180) => image::imageops::rotate180(&image),
+            Some(ImageRotation::D270) => image::imageops::rotate90(&image),
+        };
+        // HEIF (ISO/IEC 23008-12:2022) §6.5.12: `imir` axis 0 exchanges the
+        // top and bottom parts, axis 1 the left and right parts.
+        match self.mirror {
+            Some(ImageMirror::TopBottom) => image::imageops::flip_vertical_in_place(&mut image),
+            Some(ImageMirror::LeftRight) => image::imageops::flip_horizontal_in_place(&mut image),
+            None => {}
+        }
+        image
+    }
 }
 
 /// The integer crop rectangle of a clean aperture (ISOBMFF §12.1.4): a
@@ -1332,6 +1441,42 @@ mod tests {
             "{alphas:?}"
         );
         assert_near(&frames[0].0, 8, 8, [255, 0, 0, 255], 6);
+    }
+
+    /// anim-transform-prem.avif: two 32×32 frames, red, green, blue (yellow
+    /// in frame 2) and white quadrants, the top-right green half transparent
+    /// and stored premultiplied as (0, 128, 0). Its colour track's sample
+    /// entry adds `clap` (the top 32×16), `irot` 1 and `imir` axis 0, and a
+    /// `prem` track reference names the alpha track; the primary item has
+    /// none of them. The -sequence-only copy lacks the primary item ('pitm'
+    /// renamed, image brands replaced by 'avis'/'msf1').
+    #[test]
+    fn sequence_tracks_apply_sample_entry_transforms_and_prem() {
+        let (_, frames) = play("anim-transform-prem.avif");
+        assert_eq!(frames.len(), 2);
+        for (image, _) in &frames {
+            // The 32×16 crop [red | green] turned anti-clockwise puts green
+            // on top of red; the top-bottom mirror puts red back on top.
+            assert_eq!(image.dimensions(), (16, 32));
+            assert_near(image, 8, 8, [255, 0, 0, 255], 6);
+            // 'prem': (0, 128, 0) at alpha 128 is straight (0, 255, 0).
+            assert_near(image, 8, 24, [0, 255, 0, 128], 6);
+        }
+        // The primary item carries no transformative property and no
+        // 'prem' reference: its still image is the stored picture.
+        let still = decode(&fixture("anim-transform-prem.avif"), LIMITS).unwrap();
+        assert_eq!(still.dimensions(), (32, 32));
+        assert_near(&still, 24, 8, [0, 128, 0, 128], 6);
+        // Without a primary item the still is the sequence's first frame,
+        // presented the same way.
+        let only = fixture("anim-transform-prem-sequence-only.avif");
+        let still = decode(&only, LIMITS).unwrap();
+        assert_eq!(still.dimensions(), (16, 32));
+        assert_near(&still, 8, 8, [255, 0, 0, 255], 6);
+        assert_near(&still, 8, 24, [0, 255, 0, 128], 6);
+        let (_, frames) = play("anim-transform-prem-sequence-only.avif");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0.as_raw(), still.as_raw());
     }
 
     #[test]

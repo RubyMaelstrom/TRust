@@ -24,6 +24,15 @@ grids for large images and clap for odd-sized crops, so TRust carries:
   with `read_colr`; a malformed one is skipped as before) and the
   aux_track_type of an 'auxi' AuxiliaryTypeInfoBox (`auxiliary_type`), so an
   AVIF image sequence's colour and its alpha auxiliary track can be found.
+- `VideoSampleEntry` also keeps the transformative boxes an image sequence's
+  sample entry carries: `clean_aperture` ('clap', `read_clap`),
+  `image_rotation` ('irot', `read_irot`) and `image_mirror` ('imir',
+  `read_imir`), the first well-formed one of each; malformed ones are
+  skipped like a malformed 'colr'. `ImageMirror` derives Clone and Copy.
+- 'prem' track references are parsed (`BoxType::PremultipliedReference`,
+  `TrackReferenceEntry::Premultiplied`) and `TrackReferenceBox::
+  has_prem_reference` reports them, as `has_auxl_reference` does for 'auxl';
+  other reference types are still skipped.
 - Three `'_` lifetime annotations that current rustc warns about.
 - `u32::MAX`/`u64::MAX` replace the module constants `std::u32::MAX` and
   `std::u64::MAX`, deprecated by rustc 1.99, in `parse_mdhd`, `read_mvhd` and

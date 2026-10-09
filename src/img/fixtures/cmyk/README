@@ -1,0 +1,14 @@
+CMYK JPEG fixtures for src/img/jpeg_cmyk.rs, 32x16 pixels: no ink on the
+left half, 100% cyan on the right half.
+
+- cmyk-adobe.jpg: CMYK stored inverted (0 = full ink) with an Adobe APP14
+  segment, transform 0 (written by Pillow 12.3).
+- ycck-adobe.jpg: the same image as YCCK, Adobe APP14 transform 2 (written
+  by ImageMagick with -define jpeg:colorspace=5).
+- cmyk-straight.jpg: CMYK stored as ink values (0 = no ink) without an
+  APP14 segment (cmyk-adobe's encoder output with its samples complemented
+  and the APP14 segment removed).
+
+Each embeds CGATS001Compat-v2-micro.icc (8464 bytes, a compact CMYK profile
+from Clinton Ingram's compact-icc-profiles, as shipped with pdf.js),
+released under CC0 1.0.

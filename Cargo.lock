@@ -91,6 +91,8 @@ dependencies = [
  "wuff",
  "x11rb",
  "xml",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -112,6 +112,7 @@ box_database!(
     TrackHeaderBox                    0x746b_6864, // "tkhd"
     TrackReferenceBox                 0x7472_6566, // "tref"
     AuxiliaryBox                      0x6175_786C, // "auxl"
+    PremultipliedReference            0x7072_656D, // "prem"
     EditBox                           0x6564_7473, // "edts"
     MediaBox                          0x6d64_6961, // "mdia"
     EditListBox                       0x656c_7374, // "elst"

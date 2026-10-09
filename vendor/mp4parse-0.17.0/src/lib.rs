@@ -1118,6 +1118,20 @@ impl TrackReferenceBox {
     pub fn has_auxl_reference(&self, track_id: u32) -> bool {
         self.references.iter().any(|entry| match entry {
             TrackReferenceEntry::Auxiliary(aux_entry) => aux_entry.track_ids.contains(&track_id),
+            TrackReferenceEntry::Premultiplied(_) => false,
+        })
+    }
+
+    /// Whether a 'prem' reference names `track_id`: this track's colour
+    /// values are premultiplied by that alpha auxiliary track's values, as
+    /// a 'prem' item reference from a master image to its alpha image
+    /// states for items (see `prem` in MIAF (ISO 23000-22:2019) § 7.3.5.2).
+    pub fn has_prem_reference(&self, track_id: u32) -> bool {
+        self.references.iter().any(|entry| match entry {
+            TrackReferenceEntry::Premultiplied(prem_entry) => {
+                prem_entry.track_ids.contains(&track_id)
+            }
+            TrackReferenceEntry::Auxiliary(_) => false,
         })
     }
 }
@@ -1125,6 +1139,7 @@ impl TrackReferenceBox {
 #[derive(Debug)]
 pub enum TrackReferenceEntry {
     Auxiliary(TrackReference),
+    Premultiplied(TrackReference),
 }
 
 #[derive(Debug)]
@@ -1197,6 +1212,14 @@ pub struct VideoSampleEntry {
     /// The aux_track_type of an 'auxi' AuxiliaryTypeInfoBox (HEIF/MIAF
     /// auxiliary image sequences), as stored (null-terminated).
     pub auxiliary_type: Option<TryVec<u8>>,
+    /// The entry's clean aperture ('clap', ISOBMFF § 12.1.4), the first
+    /// when several are present; a malformed one is skipped.
+    pub clean_aperture: Option<CleanAperture>,
+    /// The entry's 'irot' (HEIF § 6.5.10), which an image sequence's sample
+    /// entry carries like an item property; the first well-formed one.
+    pub image_rotation: Option<ImageRotation>,
+    /// The entry's 'imir' (HEIF § 6.5.12); the first well-formed one.
+    pub image_mirror: Option<ImageMirror>,
 }
 
 /// Represent a Video Partition Codec Configuration 'vpcC' box (aka vp9). The meaning of each
@@ -4361,7 +4384,7 @@ fn read_irot<T: Read>(src: &mut BMFFBox<T>) -> Result<ImageRotation> {
 /// Visualized in terms of starting with (⥠) UPWARDS HARPOON WITH BARB LEFT FROM BAR
 /// similar to a DIGIT ONE (1)
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum ImageMirror {
     /// top and bottom parts exchanged
     /// ⥡ DOWNWARDS HARPOON WITH BARB LEFT FROM BAR
@@ -4891,6 +4914,10 @@ fn read_tref<T: Read>(f: &mut BMFFBox<T>) -> Result<TrackReferenceBox> {
         match b.head.name {
             BoxType::AuxiliaryBox => {
                 references.push(TrackReferenceEntry::Auxiliary(read_tref_auxl(&mut b)?))?
+            }
+            // A TrackReferenceTypeBox lists track_IDs whatever its type.
+            BoxType::PremultipliedReference => {
+                references.push(TrackReferenceEntry::Premultiplied(read_tref_auxl(&mut b)?))?
             }
             _ => skip_box_content(&mut b)?,
         };
@@ -5982,14 +6009,37 @@ fn read_video_sample_entry<T: Read>(src: &mut BMFFBox<T>) -> Result<SampleEntry>
     // Skip uninteresting fields.
     skip(src, 50)?;
 
-    // Skip clap/pasp/etc. for now.
+    // Skip pasp/etc. for now.
     let mut codec_specific = None;
     let mut protection_info = TryVec::new();
     let mut colour_information = TryVec::new();
     let mut auxiliary_type = None;
+    let mut clean_aperture = None;
+    let mut image_rotation = None;
+    let mut image_mirror = None;
     let mut iter = src.box_iter();
     while let Some(mut b) = iter.next_box()? {
         match b.head.name {
+            // Transformative boxes of an image sequence's sample entry: a
+            // malformed one is skipped like a malformed 'colr'.
+            BoxType::CleanApertureBox => match read_clap(&mut b) {
+                Ok(clap) => {
+                    clean_aperture.get_or_insert(clap);
+                }
+                Err(_) => skip_box_remain(&mut b)?,
+            },
+            BoxType::ImageRotation => match read_irot(&mut b) {
+                Ok(irot) => {
+                    image_rotation.get_or_insert(irot);
+                }
+                Err(_) => skip_box_remain(&mut b)?,
+            },
+            BoxType::ImageMirror => match read_imir(&mut b) {
+                Ok(imir) => {
+                    image_mirror.get_or_insert(imir);
+                }
+                Err(_) => skip_box_remain(&mut b)?,
+            },
             BoxType::ColourInformationBox => match read_colr(&mut b, ParseStrictness::Normal) {
                 Ok(colour) => colour_information.push(colour)?,
                 Err(_) => skip_box_remain(&mut b)?,
@@ -6102,6 +6152,9 @@ fn read_video_sample_entry<T: Read>(src: &mut BMFFBox<T>) -> Result<SampleEntry>
                 protection_info,
                 colour_information,
                 auxiliary_type,
+                clean_aperture,
+                image_rotation,
+                image_mirror,
             })
         }),
     )

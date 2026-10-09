@@ -116,6 +116,10 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 png = "0.18.1"
 # Likewise image's GIF decoder, read directly for damaged image data.
 gif = "0.14.2"
+# Likewise image's JPEG decoder, read directly for the raw CMYK/YCCK samples of
+# JPEGs with CMYK ICC profiles (src/img/jpeg_cmyk.rs).
+zune-jpeg = "0.5.15"
+zune-core = { version = "0.5.3", default-features = false }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 # Lumen is the JavaScript engine in every browser and test configuration.
 lumen = { path = "../Lumen/crates/lumen", features = ["embed"] }

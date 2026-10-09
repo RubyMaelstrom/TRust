@@ -23,6 +23,7 @@ use ratatui_image::{FilterType, Resize};
 mod avif;
 mod color;
 mod inline_svg;
+mod jpeg_cmyk;
 mod xml_dtd;
 mod yuv;
 #[cfg(test)]
@@ -1045,6 +1046,19 @@ fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
         None => return Err(String::from("unrecognized image format")),
     };
     let mime = format.to_mime_type();
+    // A CMYK JPEG tagged with a CMYK profile is colour managed from its raw
+    // samples; every other JPEG, and any it cannot convert, decodes below.
+    if format == image::ImageFormat::Jpeg
+        && let Some(image) = jpeg_cmyk::decode(
+            bytes,
+            MAX_DIMENSION,
+            image::Limits::default().max_alloc.unwrap_or(u64::MAX),
+        )
+    {
+        let mut image = DynamicImage::ImageRgb8(image);
+        image.apply_orientation(metadata_orientation(bytes, format));
+        return Ok((image, mime));
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;

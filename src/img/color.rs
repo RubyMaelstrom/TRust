@@ -17,7 +17,9 @@
 //! HDR reference white (203 cd/m², ITU-R BT.2408) at SDR white, and highlights
 //! above a knee rolled off towards the content's peak before conversion to
 //! sRGB primaries and the sRGB transfer function. CSS Color 4 does not define
-//! that tone mapping; it is TRust's choice, kept deterministic.
+//! that tone mapping; it is TRust's choice, kept deterministic. A CMYK
+//! profile cannot describe decoded RGB samples; it converts the raw CMYK
+//! samples of a JPEG instead ([`CmykConversion`], `super::jpeg_cmyk`).
 //!
 //! Work is bounded: profiles over `MAX_PROFILE_BYTES` (and CLUTs and curves
 //! over moxcms's parsing limits) are untagged, a tag whose conversion is the
@@ -169,9 +171,23 @@ fn understood(tag: &Tag) -> bool {
 /// The prepared conversion for a tag, or `None` when its samples are
 /// already sRGB or the tag is invalid (both are then presented as decoded).
 pub(crate) fn conversion(tag: &Tag) -> Option<Arc<Conversion>> {
-    static CACHE: Mutex<Vec<(Tag, Option<Arc<Conversion>>)>> = Mutex::new(Vec::new());
+    static CACHE: Cache<Conversion> = Mutex::new(Vec::new());
+    cached(&CACHE, CACHE_ENTRIES, tag, prepare)
+}
+
+/// Prepared conversions by tag, least recently used first.
+type Cache<T> = Mutex<Vec<(Tag, Option<Arc<T>>)>>;
+
+/// The cached result of `prepare` for `tag`, keeping the `capacity` most
+/// recently used.
+fn cached<T>(
+    cache: &Cache<T>,
+    capacity: usize,
+    tag: &Tag,
+    prepare: fn(&Tag) -> Option<T>,
+) -> Option<Arc<T>> {
     {
-        let mut cache = CACHE
+        let mut cache = cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(index) = cache.iter().position(|(cached, _)| cached == tag) {
@@ -187,28 +203,33 @@ pub(crate) fn conversion(tag: &Tag) -> Option<Arc<Conversion>> {
         .ok()
         .flatten()
         .map(Arc::new);
-    let mut cache = CACHE
+    let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cache.len() >= CACHE_ENTRIES {
+    if cache.len() >= capacity {
         cache.remove(0);
     }
     cache.push((tag.clone(), prepared.clone()));
     prepared
 }
 
+/// An embedded ICC profile, within the parsing limits.
+fn parse_icc(bytes: &[u8]) -> Option<ColorProfile> {
+    ColorProfile::new_from_slice_with_options(
+        bytes,
+        ParsingOptions {
+            max_profile_size: MAX_PROFILE_BYTES,
+            max_allowed_clut_size: 4_000_000,
+            max_allowed_trc_size: 40_000,
+        },
+    )
+    .ok()
+}
+
 fn prepare(tag: &Tag) -> Option<Conversion> {
     match tag {
         Tag::Icc(bytes) => {
-            let profile = ColorProfile::new_from_slice_with_options(
-                bytes,
-                ParsingOptions {
-                    max_profile_size: MAX_PROFILE_BYTES,
-                    max_allowed_clut_size: 4_000_000,
-                    max_allowed_trc_size: 40_000,
-                },
-            )
-            .ok()?;
+            let profile = parse_icc(bytes)?;
             // ICC v4.4 HDR profiles identify PQ or HLG with a cicp tag; their
             // curves are normalized to the format's peak, not SDR white.
             if let Some(cicp) = profile.cicp
@@ -498,6 +519,59 @@ fn unit_to_u8(value: f32) -> u8 {
 
 fn unit_to_u16(value: f32) -> u16 {
     (value.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+}
+
+/// Prepared CMYK conversions kept for reuse. Output profiles are large
+/// (hundreds of KiB) and their LUT transforms are costly to prepare.
+const CMYK_CACHE_ENTRIES: usize = 4;
+
+/// A conversion of CMYK samples to sRGB through a CMYK ICC profile (an
+/// output or input profile whose data colour space is CMYK). Samples are
+/// ICC device values: 0 is no colorant and 255 full coverage.
+pub(crate) struct CmykConversion {
+    rgb8: Arc<moxcms::Transform8BitExecutor>,
+}
+
+/// Whether an ICC profile's header declares a CMYK data colour space
+/// (ICC.1 header bytes 16–19), checked before anything is decoded.
+pub(crate) fn is_cmyk_profile(profile: &[u8]) -> bool {
+    profile.get(16..20) == Some(b"CMYK")
+}
+
+/// The prepared conversion of a CMYK ICC profile tag, or `None` when the
+/// profile is invalid or not CMYK.
+pub(crate) fn cmyk_conversion(tag: &Tag) -> Option<Arc<CmykConversion>> {
+    static CACHE: Cache<CmykConversion> = Mutex::new(Vec::new());
+    cached(&CACHE, CMYK_CACHE_ENTRIES, tag, prepare_cmyk)
+}
+
+fn prepare_cmyk(tag: &Tag) -> Option<CmykConversion> {
+    let Tag::Icc(bytes) = tag else {
+        return None;
+    };
+    let profile = parse_icc(bytes)?;
+    if profile.color_space != DataColorSpace::Cmyk {
+        return None;
+    }
+    // moxcms takes CMYK in the four-channel RGBA layout; RGB output keeps
+    // K from being treated as alpha.
+    let rgb8 = profile
+        .create_transform_8bit(
+            Layout::Rgba,
+            &ColorProfile::new_srgb(),
+            Layout::Rgb,
+            options(),
+        )
+        .ok()?;
+    Some(CmykConversion { rgb8 })
+}
+
+impl CmykConversion {
+    /// Convert interleaved CMYK pixels to interleaved sRGB (`rgb` holds
+    /// three bytes for every four of `cmyk`).
+    pub(crate) fn convert(&self, cmyk: &[u8], rgb: &mut [u8]) -> bool {
+        self.rgb8.transform(cmyk, rgb).is_ok()
+    }
 }
 
 impl Cms {
