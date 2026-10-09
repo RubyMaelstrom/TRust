@@ -30,9 +30,13 @@ use crate::core::{ImeAction, Key, KeyInput, KeyState};
 mod cells;
 mod layout_cache;
 mod outline;
+#[cfg(test)]
+pub(crate) mod test_fonts;
+pub mod typography;
 pub use crate::font_system::FontSet;
 pub use cells::CellMetrics;
 pub(crate) use outline::{append_glyph_path, append_text_path, x_height};
+pub use typography::FontTypography;
 
 /// CSS-facing text style. No Parley, Glifo, or renderer type escapes this
 /// boundary.
@@ -51,6 +55,9 @@ pub struct TextStyle {
     pub line_height: CssLineHeight,
     pub underline: bool,
     pub strikethrough: bool,
+    /// The element's other CSS Fonts 4 properties; `None` when all have
+    /// their initial values.
+    pub typography: Option<Arc<FontTypography>>,
 }
 
 impl Default for TextStyle {
@@ -67,7 +74,24 @@ impl Default for TextStyle {
             line_height: CssLineHeight::Normal,
             underline: false,
             strikethrough: false,
+            typography: None,
         }
+    }
+}
+
+impl TextStyle {
+    /// #font-style-prop as Parley's style: the oblique angle, else italic.
+    fn font_style(&self) -> FontStyle {
+        match self.typography.as_ref().and_then(|t| t.oblique) {
+            Some(angle) => FontStyle::Oblique(Some(angle)),
+            None if self.italic => FontStyle::Italic,
+            None => FontStyle::Normal,
+        }
+    }
+
+    /// #font-width-prop as a ratio of the normal width.
+    fn font_width(&self) -> f32 {
+        self.typography.as_ref().map_or(1.0, |t| t.width)
     }
 }
 
@@ -439,11 +463,23 @@ impl TextEditor {
         styles.insert(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
         )));
-        styles.insert(StyleProperty::FontStyle(if style.italic {
-            FontStyle::Italic
-        } else {
-            FontStyle::Normal
-        }));
+        styles.insert(StyleProperty::FontStyle(style.font_style()));
+        if style.font_width() != 1.0 {
+            styles.insert(StyleProperty::FontWidth(parley::FontWidth::from_ratio(
+                style.font_width(),
+            )));
+        }
+        // CSS Fonts 4 #feature-variation-precedence for editable text, which
+        // is shaped as typed: no synthesized capitals or positions.
+        let typography = style.typography.as_deref().cloned().unwrap_or_default();
+        let features = typography.features(style.letter_spacing, &[], true);
+        if !features.is_empty() {
+            styles.insert(parley_features(&features));
+        }
+        let variations = typography.variations(style.size.max(1.0));
+        if !variations.is_empty() {
+            styles.insert(parley_variations(&variations));
+        }
         styles.insert(StyleProperty::LetterSpacing(style.letter_spacing));
         styles.insert(StyleProperty::WordSpacing(style.word_spacing));
         styles.insert(StyleProperty::LineHeight(match style.line_height {
@@ -898,6 +934,8 @@ struct TextSystem {
     layout_cache: layout_cache::Cache,
     /// Emoji-presentation family lists by (font set, CSS family list).
     emoji_families: HashMap<(u64, String), Arc<str>>,
+    /// `font-size-adjust` metrics by (font resource, index, coordinates).
+    face_metrics: HashMap<(u64, u32, Vec<i16>), FaceMetrics>,
     /// The terminal frontend's cell font, when this thread lays out for it
     /// (see `cells`). `None` keeps proportional shaping.
     cells: Option<CellMetrics>,
@@ -985,6 +1023,7 @@ struct TextStyleKey {
     line_height: (u8, u32),
     underline: bool,
     strikethrough: bool,
+    typography: Option<Arc<FontTypography>>,
 }
 
 impl From<&TextStyle> for TextStyleKey {
@@ -1006,6 +1045,7 @@ impl From<&TextStyle> for TextStyleKey {
             line_height,
             underline: style.underline,
             strikethrough: style.strikethrough,
+            typography: style.typography.clone(),
         }
     }
 }
@@ -1039,6 +1079,7 @@ impl TextSystem {
             shape_cache_bytes: 0,
             layout_cache: Default::default(),
             emoji_families: HashMap::new(),
+            face_metrics: HashMap::new(),
             cells: None,
             #[cfg(test)]
             shaped_input_bytes: 0,
@@ -1111,73 +1152,383 @@ impl TextSystem {
         if text.is_empty() || style.size <= 0.0 {
             return zero_size_shape(text, style);
         }
-        let mut layout = match typography {
-            Some(typography) => self.typographic_layout(text, style, quantize, typography),
-            None => self.styled_layout(text, style, quantize, None),
-        };
+        let prepared = self.prepare(text, style, typography);
+        let mut layout = self.prepared_layout::<()>(&prepared, style, quantize, None, &[]);
         layout.break_all_lines(None);
-        let mut retained = retain_first_line(text, &layout);
+        let mut retained = match layout.lines().next() {
+            Some(line) => retain_line(&prepared.text, &line, &prepared.synthesis),
+            None => ShapedText::default(),
+        };
+        self.finish_line(
+            &mut retained,
+            &prepared,
+            text,
+            0..prepared.text.len(),
+            style,
+        );
+        // The whole piece, as for unwrapped text.
+        retained.text = text.to_string();
         retained.underline = style.underline;
         retained.strikethrough = style.strikethrough;
         retained
     }
 
-    fn styled_layout(
+    /// CSS Fonts 4 #feature-variation-precedence for `text` in `style`, or
+    /// Canvas text preparation's settings: the features and variations to
+    /// shape with, and any synthesized small capitals (#font-variant-caps-prop)
+    /// or superscripts/subscripts (#font-variant-position-prop).
+    fn prepare<'t>(
+        &mut self,
+        text: &'t str,
+        style: &TextStyle,
+        canvas: Option<&CanvasTypography>,
+    ) -> Prepared<'t> {
+        let mut prepared = Prepared {
+            text: Cow::Borrowed(text),
+            map: None,
+            width: style.font_width(),
+            features: Vec::new(),
+            optical_sizing: true,
+            variation_settings: Vec::new(),
+            sized: Vec::new(),
+            unspaced_prefix: 0,
+            position: None,
+            size_adjust: None,
+            synthesis: SynthesisPolicy::default(),
+            emoji: typography::Emoji::Normal,
+            strut: false,
+        };
+        if let Some(canvas) = canvas {
+            prepared.width = canvas.width;
+            prepared.features.clone_from(&canvas.features);
+            prepared.sized.clone_from(&canvas.sized);
+            prepared.unspaced_prefix = canvas.unspaced_prefix;
+            return prepared;
+        }
+        let Some(t) = style.typography.clone() else {
+            prepared.features =
+                FontTypography::default().features(style.letter_spacing, &[], false);
+            return prepared;
+        };
+        prepared.synthesis = SynthesisPolicy {
+            weight: t.synthesis.weight,
+            style: match t.synthesis.style {
+                typography::SynthesisStyle::Auto => true,
+                typography::SynthesisStyle::None => false,
+                // "must not be used as fallback if italic is specified".
+                typography::SynthesisStyle::ObliqueOnly => t.oblique.is_some(),
+            },
+        };
+        prepared.emoji = t.emoji;
+        let face = if t.needs_face_features() {
+            self.primary_face_features(style)
+        } else {
+            Arc::default()
+        };
+        let (caps, synthetic_caps) = typography::caps_plan(t.caps, |tag| face.contains(tag));
+        let synthetic_caps = synthetic_caps.filter(|_| t.synthesis.small_caps);
+        let position = match t.position {
+            typography::Position::Normal => false,
+            _ if !t.synthesis.position => true,
+            position => {
+                let base = t.features(style.letter_spacing, &caps, false);
+                let mut with = base.clone();
+                with.push((
+                    if position == typography::Position::Super {
+                        *b"sups"
+                    } else {
+                        *b"subs"
+                    },
+                    1,
+                ));
+                let available = self.substitutes_every_glyph(text, style, &base, &with);
+                if !available {
+                    prepared.position = typography::position_metrics(position, style.size);
+                }
+                available
+            }
+        };
+        prepared.features = t.features(style.letter_spacing, &caps, position);
+        prepared.optical_sizing = t.optical_sizing;
+        prepared
+            .variation_settings
+            .clone_from(&t.variation_settings);
+        prepared.size_adjust = t.size_adjust;
+        if let Some(caps) = synthetic_caps {
+            let (converted, sized, segments) = typography::synthesize_caps(
+                text,
+                caps,
+                style.size * typography::SMALL_CAPS_SCALE,
+                typography::turkic(style.language.as_deref()),
+            );
+            if !sized.is_empty() {
+                let map = typography::OffsetMap::new(segments);
+                if !map.is_identity() {
+                    prepared.map = Some(map);
+                }
+                prepared.text = Cow::Owned(converted);
+                prepared.sized = sized;
+            }
+        }
+        prepared.strut = !prepared.sized.is_empty() || prepared.position.is_some();
+        prepared
+    }
+
+    /// Whether shaping `text` with `with` replaces the glyphs of every
+    /// non-space cluster shaped with `base` (#font-variant-position-prop:
+    /// "if a variant glyph is not available for all the characters in the
+    /// run, simulated glyphs should be synthesized for all characters").
+    fn substitutes_every_glyph(
         &mut self,
         text: &str,
+        style: &TextStyle,
+        base: &[(typography::Tag, u16)],
+        with: &[(typography::Tag, u16)],
+    ) -> bool {
+        let mut glyphs = |features: &[(typography::Tag, u16)]| {
+            let prepared = Prepared {
+                features: features.to_vec(),
+                ..self.prepare(
+                    text,
+                    &TextStyle {
+                        typography: None,
+                        ..style.clone()
+                    },
+                    None,
+                )
+            };
+            let mut layout = self.prepared_layout::<()>(&prepared, style, false, None, &[]);
+            layout.break_all_lines(None);
+            let mut clusters: Vec<(Range<usize>, Vec<u32>)> = Vec::new();
+            for line in layout.lines() {
+                for run in line.runs() {
+                    for cluster in run.visual_clusters() {
+                        clusters.push((
+                            cluster.text_range(),
+                            cluster.glyphs().map(|glyph| glyph.id).collect(),
+                        ));
+                    }
+                }
+            }
+            clusters
+        };
+        let plain = glyphs(base);
+        let substituted = glyphs(with);
+        plain.iter().all(|(range, ids)| {
+            text[range.clone()].chars().all(char::is_whitespace)
+                || substituted
+                    .iter()
+                    .find(|(other, _)| other == range)
+                    .is_some_and(|(_, other)| other != ids)
+        })
+    }
+
+    /// The OpenType features of the first available font of `style`
+    /// (CSS Fonts 4 #first-available-font): "The availability of these
+    /// glyphs is based on whether a given feature is defined or not in the
+    /// feature list of the font".
+    fn primary_face_features(&mut self, style: &TextStyle) -> Arc<typography::FaceFeatures> {
+        let plain = TextStyle {
+            typography: None,
+            ..style.clone()
+        };
+        let primary = self.shape(" ", &plain);
+        let Some(run) = primary.runs.first() else {
+            return Arc::default();
+        };
+        face_features(&run.font)
+    }
+
+    /// Build the layout of prepared text, then shape again any run whose
+    /// font needs its own size, features or variations: an `@font-face`
+    /// face's `size-adjust`, `font-feature-settings` and
+    /// `font-variation-settings` descriptors (CSS Fonts 5 #size-adjust-desc,
+    /// CSS Fonts 4 #font-rend-desc) and `font-size-adjust` (CSS Fonts 5
+    /// #font-size-adjust-prop) apply per font, not per element. `brushes`
+    /// color byte ranges of the prepared text.
+    fn prepared_layout<B: parley::Brush>(
+        &mut self,
+        prepared: &Prepared<'_>,
         style: &TextStyle,
         quantize: bool,
         breaks: Option<TextBreakStyle>,
-    ) -> Layout<()> {
+        brushes: &[(Range<usize>, B)],
+    ) -> Layout<B>
+    where
+        Self: LayoutsFor<B>,
+    {
         #[cfg(test)]
         {
-            self.shaped_input_bytes += text.len();
+            self.shaped_input_bytes += prepared.text.len();
         }
-        let emoji = self.emoji_presentation(text, style);
-        let mut builder = self
-            .layouts
-            .ranged_builder(&mut self.fonts, text, 1.0, quantize);
-        configure_layout(&mut builder, style, breaks);
-        push_emoji_presentation(&mut builder, emoji);
-        builder.build(text)
+        let emoji = self.emoji_presentation(&prepared.text, style, prepared.emoji);
+        let build = |system: &mut Self, adjust: &[RunAdjust]| {
+            let (layouts, fonts) = system.contexts();
+            let mut builder = layouts.ranged_builder(fonts, &prepared.text, 1.0, quantize);
+            configure_prepared(&mut builder, prepared, style, breaks, &emoji, adjust);
+            for (range, brush) in brushes {
+                builder.push(StyleProperty::Brush(brush.clone()), range.clone());
+            }
+            builder.build(&prepared.text)
+        };
+        let mut layout = build(self, &[]);
+        if !self.per_font_candidates(prepared, style) {
+            return layout;
+        }
+        // The fonts of each run are known once it is shaped; breaking the
+        // probe into lines exposes them. Callers break the result again.
+        layout.break_all_lines(None);
+        let adjust = self.per_font_adjustments(&layout, prepared, style);
+        if adjust.is_empty() {
+            layout
+        } else {
+            build(self, &adjust)
+        }
     }
 
-    fn typographic_layout(
+    /// Whether any run may need per-font shaping (see `prepared_layout`).
+    fn per_font_candidates(&self, prepared: &Prepared<'_>, style: &TextStyle) -> bool {
+        prepared.size_adjust.is_some()
+            || crate::font_system::has_face_renderings(style.font_set.as_ref())
+    }
+
+    fn per_font_adjustments<B: parley::Brush>(
         &mut self,
-        text: &str,
+        layout: &Layout<B>,
+        prepared: &Prepared<'_>,
         style: &TextStyle,
-        quantize: bool,
-        typography: &CanvasTypography,
-    ) -> Layout<()> {
-        let emoji = self.emoji_presentation(text, style);
-        let mut builder = self
-            .layouts
-            .ranged_builder(&mut self.fonts, text, 1.0, quantize);
-        configure_layout(&mut builder, style, None);
-        builder.push_default(StyleProperty::FontWidth(parley::FontWidth::from_ratio(
-            typography.width,
-        )));
-        let features: Vec<parley::FontFeature> = typography
-            .features
-            .iter()
-            .map(|(tag, value)| parley::FontFeature::new(parley::setting::Tag::new(tag), *value))
-            .collect();
-        builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::List(
-            Cow::Owned(features),
-        )));
-        for (range, size) in &typography.sized {
-            if range.start < range.end && range.end <= text.len() {
-                builder.push(StyleProperty::FontSize(size.max(0.01)), range.clone());
+    ) -> Vec<RunAdjust> {
+        let mut adjust: Vec<RunAdjust> = Vec::new();
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let run = glyph_run.run();
+                let font = run.font();
+                let rendering =
+                    crate::font_system::face_rendering(style.font_set.as_ref(), font.data.id());
+                let base = run.font_size();
+                let mut size = base;
+                if let Some((metric, aspect)) = prepared.size_adjust {
+                    // "u = (m / m') s": the font's own metric, before any
+                    // `size-adjust` (#font-metrics-override-desc: font-size-adjust
+                    // "is applied after the size-adjust descriptor").
+                    let coords = run.normalized_coords().to_vec();
+                    if let Some(ratio) = self.face_metric(font, &coords, metric)
+                        && ratio > 0.0
+                    {
+                        size = base * aspect / ratio;
+                    }
+                } else if let Some(rendering) = &rendering {
+                    size = base * rendering.size_adjust;
+                }
+                let features = rendering
+                    .as_ref()
+                    .filter(|r| !r.features.is_empty())
+                    .map(|r| {
+                        let mut list: Vec<(typography::Tag, u16)> = r
+                            .features
+                            .iter()
+                            .map(|&(tag, value)| (tag, u16::try_from(value).unwrap_or(u16::MAX)))
+                            .collect();
+                        list.extend_from_slice(&prepared.features);
+                        list
+                    });
+                let descriptor_variations = rendering
+                    .as_ref()
+                    .map_or(&[][..], |r| r.variations.as_slice());
+                // Step 6 (the descriptor), then 9 (the optical size of the
+                // adjusted size) and 12 (the property).
+                let variations = (size != base || !descriptor_variations.is_empty()).then(|| {
+                    let mut list = descriptor_variations.to_vec();
+                    list.extend(prepared.variations(size));
+                    list
+                });
+                if size == base && features.is_none() && variations.is_none() {
+                    continue;
+                }
+                adjust.push(RunAdjust {
+                    range: run.text_range(),
+                    size: (size != base).then_some(size),
+                    features,
+                    variations,
+                });
             }
         }
-        if typography.unspaced_prefix > 0 && typography.unspaced_prefix <= text.len() {
-            builder.push(
-                StyleProperty::LetterSpacing(0.),
-                0..typography.unspaced_prefix,
-            );
+        adjust
+    }
+
+    /// CSS Fonts 5 #font-size-adjust-prop: font `font`'s `metric` as a
+    /// fraction of its em, or `None` when it "cannot be derived from a font".
+    fn face_metric(
+        &mut self,
+        font: &parley::FontData,
+        coords: &[i16],
+        metric: typography::SizeAdjustMetric,
+    ) -> Option<f32> {
+        let key = (font.data.id(), font.index, coords.to_vec());
+        if !self.face_metrics.contains_key(&key) {
+            if self.face_metrics.len() >= 256 {
+                self.face_metrics.clear();
+            }
+            let metrics = FaceMetrics::read(font.data.as_ref(), font.index, coords);
+            self.face_metrics.insert(key.clone(), metrics);
         }
-        push_emoji_presentation(&mut builder, emoji);
-        builder.build(text)
+        let metrics = self.face_metrics.get(&key)?;
+        match metric {
+            typography::SizeAdjustMetric::ExHeight => metrics.x_height,
+            typography::SizeAdjustMetric::CapHeight => metrics.cap_height,
+            typography::SizeAdjustMetric::ChWidth => metrics.zero_advance,
+            typography::SizeAdjustMetric::IcWidth => metrics.ideograph_advance,
+            typography::SizeAdjustMetric::IcHeight => metrics.ideograph_vertical_advance,
+        }
+    }
+
+    /// Restore source offsets, synthesized-position baselines and the
+    /// strut of one retained line of prepared text. `range` is the line's
+    /// byte range in the prepared text; `source` the source text.
+    fn finish_line(
+        &mut self,
+        shaped: &mut ShapedText,
+        prepared: &Prepared<'_>,
+        source: &str,
+        range: Range<usize>,
+        style: &TextStyle,
+    ) {
+        if let Some(map) = &prepared.map {
+            let start = map.to_source(range.start, false);
+            let end = map.to_source(range.end, true);
+            shaped.text = source[start..end].to_string();
+            let to_source = |r: &Range<usize>| {
+                let mapped = map.range_to_source(r.start + range.start..r.end + range.start);
+                mapped.start - start..mapped.end - start
+            };
+            for cluster in &mut shaped.clusters {
+                cluster.text_range = to_source(&cluster.text_range);
+            }
+            for run in &mut shaped.runs {
+                run.text_range = to_source(&run.text_range);
+            }
+        }
+        if prepared.strut {
+            // Synthesized glyphs are reduced forms: the line keeps the
+            // metrics of the element's font at its own size, and
+            // synthesized superscripts/subscripts move off its baseline
+            // "without affecting the line height".
+            let plain = TextStyle {
+                typography: None,
+                ..style.clone()
+            };
+            let strut = self.shape(" ", &plain);
+            merge_strut(shaped, &strut);
+            if let Some((_, raise)) = prepared.position {
+                let dy = raise * style.size;
+                for glyph in shaped.runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
+                    glyph.y -= dy;
+                }
+            }
+        }
     }
 
     /// The emoji-presentation clusters of `text` and the family list they
@@ -1186,8 +1537,9 @@ impl TextSystem {
         &mut self,
         text: &str,
         style: &TextStyle,
+        variant: typography::Emoji,
     ) -> Option<(Vec<Range<usize>>, Arc<str>)> {
-        let runs = emoji_presentation_runs(text);
+        let runs = emoji_presentation_runs(text, variant);
         if runs.is_empty() {
             return None;
         }
@@ -1218,17 +1570,23 @@ impl TextSystem {
         if text.is_empty() || width <= 0.0 || style.size <= 0.0 {
             return 0;
         }
-        let mut layout = self.styled_layout(text, style, true, Some(breaks));
+        let prepared = self.prepare(text, style, None);
+        let mut layout = self.prepared_layout::<()>(&prepared, style, true, Some(breaks), &[]);
         let mut breaker = layout.break_lines();
         breaker.state_mut().set_layout_max_advance(width.max(0.01));
         breaker.state_mut().set_line_max_advance(width.max(0.01));
         breaker.break_next();
         breaker.finish();
-        layout
+        let end = layout
             .lines()
             .next()
-            .map(|line| line.text_range().end.min(text.len()))
-            .unwrap_or(0)
+            .map(|line| line.text_range().end.min(prepared.text.len()))
+            .unwrap_or(0);
+        prepared
+            .map
+            .as_ref()
+            .map_or(end, |map| map.to_source(end, true))
+            .min(text.len())
     }
 
     fn wrapped_lines_uncached(
@@ -1251,8 +1609,17 @@ impl TextSystem {
         // greedy breaker settles each kept line within the window, so these
         // are the paragraph's own lines. A window without a break opportunity
         // (an unbreakable run of that length) becomes one line.
-        const WINDOW: usize = 1 << 15;
-        if text.len() <= usize::from(u16::MAX) {
+        // Synthesized small capitals can triple a cluster's bytes.
+        let expands = style
+            .typography
+            .as_ref()
+            .is_some_and(|t| t.caps != typography::Caps::Normal);
+        let (limit, window) = if expands {
+            (usize::from(u16::MAX) / 3, 1 << 13)
+        } else {
+            (usize::from(u16::MAX), 1 << 15)
+        };
+        if text.len() <= limit {
             return self
                 .wrapped_window(text, style, first_width, width, breaks)
                 .0;
@@ -1260,7 +1627,7 @@ impl TextSystem {
         let mut lines = Vec::new();
         let mut start = 0;
         while start < text.len() {
-            let mut end = (start + WINDOW).min(text.len());
+            let mut end = (start + window).min(text.len());
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
@@ -1290,8 +1657,8 @@ impl TextSystem {
         lines
     }
 
-    /// Break one paragraph (at most 64 KiB) into lines; also returns the
-    /// byte offset at which its last line starts.
+    /// Break one paragraph (at most 64 KiB once prepared) into lines; also
+    /// returns the byte offset at which its last line starts.
     fn wrapped_window(
         &mut self,
         text: &str,
@@ -1304,7 +1671,8 @@ impl TextSystem {
         // the shrinking tail on every line makes long preserved text quadratic.
         // CSS Text 3 #word-break-shaping also requires joining forms to survive
         // emergency line breaks; retain glyphs from the whole shaped paragraph.
-        let mut layout = self.styled_layout(text, style, true, Some(breaks));
+        let prepared = self.prepare(text, style, None);
+        let mut layout = self.prepared_layout::<()>(&prepared, style, true, Some(breaks), &[]);
         let mut breaker = layout.break_lines();
         breaker.state_mut().set_layout_max_advance(f32::INFINITY);
         breaker
@@ -1318,10 +1686,23 @@ impl TextSystem {
             .lines()
             .last()
             .map_or(0, |line| line.text_range().start);
-        let lines = layout
+        let last_start = prepared
+            .map
+            .as_ref()
+            .map_or(last_start, |map| map.to_source(last_start, false));
+        let retained: Vec<(ShapedText, Range<usize>)> = layout
             .lines()
             .map(|line| {
-                let mut shaped = retain_line(text, &line);
+                (
+                    retain_line(&prepared.text, &line, &prepared.synthesis),
+                    line.text_range(),
+                )
+            })
+            .collect();
+        let lines = retained
+            .into_iter()
+            .map(|(mut shaped, range)| {
+                self.finish_line(&mut shaped, &prepared, text, range, style);
                 shaped.underline = style.underline;
                 shaped.strikethrough = style.strikethrough;
                 shaped
@@ -1340,36 +1721,14 @@ impl TextSystem {
         if text.is_empty() || style.size <= 0.0 {
             return (0.0, 0.0);
         }
-        let emoji = self.emoji_presentation(text, style);
-        let mut builder = self
-            .layouts
-            .ranged_builder(&mut self.fonts, text, 1.0, true);
-        let family = font_family_source(&style.family);
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
-        builder.push_default(StyleProperty::Locale(text_language(style)));
-        builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
-        builder.push_default(StyleProperty::FontWeight(FontWeight::new(
-            style.weight.clamp(1.0, 1000.0),
-        )));
-        builder.push_default(StyleProperty::FontStyle(if style.italic {
-            FontStyle::Italic
-        } else {
-            FontStyle::Normal
-        }));
-        builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
-        builder.push_default(StyleProperty::WordSpacing(style.word_spacing));
-        builder.push_default(StyleProperty::WordBreak(match breaks.word_break {
-            TextWordBreak::Normal => WordBreak::Normal,
-            TextWordBreak::BreakAll => WordBreak::BreakAll,
-            TextWordBreak::KeepAll => WordBreak::KeepAll,
-        }));
-        builder.push_default(StyleProperty::OverflowWrap(match breaks.overflow_wrap {
-            TextOverflowWrap::Normal => OverflowWrap::Normal,
-            TextOverflowWrap::Anywhere => OverflowWrap::Anywhere,
-            TextOverflowWrap::BreakWord => OverflowWrap::BreakWord,
-        }));
-        push_emoji_presentation(&mut builder, emoji);
-        let layout: Layout<()> = builder.build(text);
+        let prepared = self.prepare(text, style, None);
+        // Content widths ignore `text-wrap-mode`: min-content is the widest
+        // unbreakable piece whatever the element's own wrapping.
+        let breaks = TextBreakStyle {
+            wrap: true,
+            ..breaks
+        };
+        let layout = self.prepared_layout::<()>(&prepared, style, true, Some(breaks), &[]);
         let widths = layout.calculate_content_widths();
         (widths.min, widths.max)
     }
@@ -1387,6 +1746,7 @@ impl TextSystem {
         self.shape_cache_bytes = 0;
         self.layout_cache = Default::default();
         self.emoji_families.clear();
+        self.face_metrics.clear();
         self.page_font_epoch = epoch;
         self.active_font_set = 0;
         self.parked_fonts.clear();
@@ -1410,6 +1770,284 @@ impl TextSystem {
     }
 }
 
+/// Text prepared for shaping: CSS Fonts 4 #feature-variation-precedence
+/// resolved for one element's text, or Canvas text preparation's settings.
+struct Prepared<'t> {
+    /// The text to shape: the source, or with synthesized small capitals.
+    text: Cow<'t, str>,
+    /// Offsets of `text` back to the source, when they differ.
+    map: Option<typography::OffsetMap>,
+    /// #font-width-prop as a ratio.
+    width: f32,
+    /// Steps 10, 11 and 13: the features to apply, the last of a tag winning.
+    features: Vec<(typography::Tag, u16)>,
+    /// Step 9: `font-optical-sizing: auto`.
+    optical_sizing: bool,
+    /// Step 12: `font-variation-settings`.
+    variation_settings: Vec<(typography::Tag, f32)>,
+    /// Byte ranges of `text` shaped at another font size.
+    sized: Vec<(Range<usize>, f32)>,
+    /// Leading bytes (a directional mark) that take no letter spacing.
+    unspaced_prefix: usize,
+    /// Synthesized superscripts/subscripts: size scale and raise in ems.
+    position: Option<(f32, f32)>,
+    /// CSS Fonts 5 #font-size-adjust-prop.
+    size_adjust: Option<(typography::SizeAdjustMetric, f32)>,
+    synthesis: SynthesisPolicy,
+    emoji: typography::Emoji,
+    /// Whether synthesized reduced glyphs keep the element font's strut.
+    strut: bool,
+}
+
+impl Prepared<'_> {
+    /// Steps 9 and 12 for glyphs shaped at `size`.
+    fn variations(&self, size: f32) -> Vec<(typography::Tag, f32)> {
+        let mut out = Vec::with_capacity(self.variation_settings.len() + 1);
+        if self.optical_sizing {
+            out.push((*b"opsz", size));
+        }
+        out.extend_from_slice(&self.variation_settings);
+        out
+    }
+}
+
+/// CSS Fonts 4 #font-synthesis: whether a run may draw the synthetic bold
+/// and oblique its font match suggests.
+#[derive(Clone, Copy, Debug)]
+struct SynthesisPolicy {
+    weight: bool,
+    style: bool,
+}
+
+impl Default for SynthesisPolicy {
+    fn default() -> Self {
+        Self {
+            weight: true,
+            style: true,
+        }
+    }
+}
+
+/// A run shaped again with its own font's settings (`prepared_layout`).
+struct RunAdjust {
+    range: Range<usize>,
+    size: Option<f32>,
+    features: Option<Vec<(typography::Tag, u16)>>,
+    variations: Option<Vec<(typography::Tag, f32)>>,
+}
+
+/// The layout context of a brush type, with the font context.
+trait LayoutsFor<B: parley::Brush> {
+    fn contexts(&mut self) -> (&mut LayoutContext<B>, &mut FontContext);
+}
+
+impl LayoutsFor<()> for TextSystem {
+    fn contexts(&mut self) -> (&mut LayoutContext<()>, &mut FontContext) {
+        (&mut self.layouts, &mut self.fonts)
+    }
+}
+
+impl LayoutsFor<Option<[u8; 3]>> for TextSystem {
+    fn contexts(&mut self) -> (&mut LayoutContext<Option<[u8; 3]>>, &mut FontContext) {
+        (&mut self.color_layouts, &mut self.fonts)
+    }
+}
+
+fn parley_features<B: parley::Brush>(
+    features: &[(typography::Tag, u16)],
+) -> StyleProperty<'static, B> {
+    StyleProperty::FontFeatures(parley::FontFeatures::List(Cow::Owned(
+        features
+            .iter()
+            .map(|(tag, value)| parley::FontFeature::new(parley::setting::Tag::new(tag), *value))
+            .collect(),
+    )))
+}
+
+fn parley_variations<B: parley::Brush>(
+    variations: &[(typography::Tag, f32)],
+) -> StyleProperty<'static, B> {
+    StyleProperty::FontVariations(parley::FontVariations::List(Cow::Owned(
+        variations
+            .iter()
+            .map(|(tag, value)| parley::FontVariation::new(parley::setting::Tag::new(tag), *value))
+            .collect(),
+    )))
+}
+
+fn configure_prepared<B: parley::Brush>(
+    builder: &mut parley::RangedBuilder<'_, B>,
+    prepared: &Prepared<'_>,
+    style: &TextStyle,
+    breaks: Option<TextBreakStyle>,
+    emoji: &Option<(Vec<Range<usize>>, Arc<str>)>,
+    adjust: &[RunAdjust],
+) {
+    configure_layout(builder, style, breaks);
+    let scale = prepared.position.map_or(1.0, |(scale, _)| scale);
+    let size = style.size.max(0.01) * scale;
+    if scale != 1.0 {
+        builder.push_default(StyleProperty::FontSize(size));
+    }
+    // CSS Inline 3: a number line-height multiplies the element's computed
+    // font size, not that of reduced or adjusted runs.
+    if (scale != 1.0 || !prepared.sized.is_empty() || !adjust.is_empty())
+        && let CssLineHeight::Number(number) = style.line_height
+    {
+        builder.push_default(StyleProperty::LineHeight(LineHeight::Absolute(
+            (number * style.size).max(0.0),
+        )));
+    }
+    if prepared.width != 1.0 {
+        builder.push_default(StyleProperty::FontWidth(parley::FontWidth::from_ratio(
+            prepared.width,
+        )));
+    }
+    if !prepared.features.is_empty() {
+        builder.push_default(parley_features(&prepared.features));
+    }
+    let variations = prepared.variations(size);
+    if !variations.is_empty() {
+        builder.push_default(parley_variations(&variations));
+    }
+    for (range, sized) in &prepared.sized {
+        if range.start < range.end && range.end <= prepared.text.len() {
+            let sized = sized.max(0.01) * scale;
+            builder.push(StyleProperty::FontSize(sized), range.clone());
+            if prepared.optical_sizing {
+                builder.push(
+                    parley_variations(&prepared.variations(sized)),
+                    range.clone(),
+                );
+            }
+        }
+    }
+    if prepared.unspaced_prefix > 0 && prepared.unspaced_prefix <= prepared.text.len() {
+        builder.push(
+            StyleProperty::LetterSpacing(0.),
+            0..prepared.unspaced_prefix,
+        );
+    }
+    push_emoji_presentation(builder, emoji);
+    for run in adjust {
+        if let Some(size) = run.size {
+            builder.push(StyleProperty::FontSize(size.max(0.01)), run.range.clone());
+        }
+        if let Some(features) = &run.features {
+            builder.push(parley_features(features), run.range.clone());
+        }
+        if let Some(variations) = &run.variations {
+            builder.push(parley_variations(variations), run.range.clone());
+        }
+    }
+}
+
+/// Give `shaped`, a line of reduced (synthesized) glyphs, at least the
+/// line metrics of `strut`, the element's font at its own size, keeping
+/// its glyphs on the baseline.
+fn merge_strut(shaped: &mut ShapedText, strut: &ShapedText) {
+    let above = shaped.baseline.max(strut.baseline);
+    let below = (shaped.line_height - shaped.baseline).max(strut.line_height - strut.baseline);
+    let dy = above - shaped.baseline;
+    if dy != 0.0 {
+        for glyph in shaped.runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
+            glyph.y += dy;
+        }
+    }
+    shaped.baseline = above;
+    shaped.line_height = above + below;
+    shaped.ascent = shaped.ascent.max(strut.ascent);
+    shaped.descent = shaped.descent.max(strut.descent);
+    shaped.leading = shaped.line_height - shaped.ascent - shaped.descent;
+}
+
+/// What CSS Fonts 5 #font-size-adjust-prop normalizes, as fractions of a
+/// face's em at a variation location.
+#[derive(Clone, Copy, Debug, Default)]
+struct FaceMetrics {
+    x_height: Option<f32>,
+    cap_height: Option<f32>,
+    zero_advance: Option<f32>,
+    ideograph_advance: Option<f32>,
+    ideograph_vertical_advance: Option<f32>,
+}
+
+impl FaceMetrics {
+    fn read(font: &[u8], index: u32, coords: &[i16]) -> Self {
+        use skrifa::MetadataProvider as _;
+        use skrifa::instance::{LocationRef, NormalizedCoord, Size};
+        use skrifa::raw::TableProvider as _;
+        let Ok(face) = skrifa::FontRef::from_index(font, index) else {
+            return Self::default();
+        };
+        let coords: Vec<NormalizedCoord> = coords
+            .iter()
+            .copied()
+            .map(NormalizedCoord::from_bits)
+            .collect();
+        let location = LocationRef::new(&coords);
+        let em = Size::new(1.0);
+        let metrics = face.metrics(em, location);
+        let glyphs = face.glyph_metrics(em, location);
+        let charmap = face.charmap();
+        let positive = |value: f32| (value.is_finite() && value > 0.0).then_some(value);
+        let advance = |c: char| {
+            charmap
+                .map(c)
+                .and_then(|glyph| glyphs.advance_width(glyph))
+                .and_then(positive)
+        };
+        // "If the required font metric cannot be derived from a font, then
+        // that font's size is not adjusted."
+        let vertical = charmap.map('\u{6C34}').and_then(|glyph| {
+            let vmtx = face.vmtx().ok()?;
+            let upem = f32::from(face.head().ok()?.units_per_em());
+            let advance = vmtx.advance(glyph)?;
+            positive(f32::from(advance) / upem)
+        });
+        // CSS Values 4 #ex: a font without an x-height metric still has
+        // one, the height of its "x" (and of "H" for the cap height).
+        let top = |c: char| {
+            charmap
+                .map(c)
+                .and_then(|glyph| glyphs.bounds(glyph))
+                .and_then(|bounds| positive(bounds.y_max))
+        };
+        Self {
+            x_height: metrics.x_height.and_then(positive).or_else(|| top('x')),
+            cap_height: metrics.cap_height.and_then(positive).or_else(|| top('H')),
+            zero_advance: advance('0'),
+            ideograph_advance: advance('\u{6C34}'),
+            ideograph_vertical_advance: vertical,
+        }
+    }
+}
+
+thread_local! {
+    /// The OpenType features of recently used faces; small and bounded.
+    static FACE_FEATURES: RefCell<HashMap<(u64, u32), Arc<typography::FaceFeatures>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The GSUB and GPOS features `face` defines.
+pub(crate) fn face_features(face: &FontFace) -> Arc<typography::FaceFeatures> {
+    let key = (face.resource_id(), face.collection_index());
+    FACE_FEATURES.with_borrow_mut(|cache| {
+        if let Some(features) = cache.get(&key) {
+            return features.clone();
+        }
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        let features = Arc::new(typography::FaceFeatures::read(
+            face.data().data.as_ref(),
+            face.collection_index(),
+        ));
+        cache.insert(key, features.clone());
+        features
+    })
+}
+
 fn configure_layout<B: parley::Brush>(
     builder: &mut parley::RangedBuilder<'_, B>,
     style: &TextStyle,
@@ -1422,11 +2060,7 @@ fn configure_layout<B: parley::Brush>(
     builder.push_default(StyleProperty::FontWeight(FontWeight::new(
         style.weight.clamp(1.0, 1000.0),
     )));
-    builder.push_default(StyleProperty::FontStyle(if style.italic {
-        FontStyle::Italic
-    } else {
-        FontStyle::Normal
-    }));
+    builder.push_default(StyleProperty::FontStyle(style.font_style()));
     builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
     builder.push_default(StyleProperty::WordSpacing(style.word_spacing));
     builder.push_default(StyleProperty::LineHeight(match style.line_height {
@@ -1457,7 +2091,7 @@ fn configure_layout<B: parley::Brush>(
 
 fn push_emoji_presentation<B: parley::Brush>(
     builder: &mut parley::RangedBuilder<'_, B>,
-    emoji: Option<(Vec<Range<usize>>, Arc<str>)>,
+    emoji: &Option<(Vec<Range<usize>>, Arc<str>)>,
 ) {
     let Some((runs, family)) = emoji else {
         return;
@@ -1465,7 +2099,7 @@ fn push_emoji_presentation<B: parley::Brush>(
     for range in runs {
         builder.push(
             StyleProperty::FontFamily(FontFamily::Source(Cow::Owned(family.to_string()))),
-            range,
+            range.clone(),
         );
     }
 }
@@ -1477,7 +2111,11 @@ fn push_emoji_presentation<B: parley::Brush>(
 /// `font-variant-emoji: normal` platforms choose (CSS Fonts 4
 /// #font-variant-emoji-prop). A selector, keycap, skin-tone modifier, tag
 /// or zero-width-joined sequence stays in its base's cluster.
-fn emoji_presentation_runs(text: &str) -> Vec<Range<usize>> {
+/// `font-variant-emoji: text` and `emoji` render each emoji "as if U+FE0E
+/// (U+FE0F) was appended"; an explicit selector still overrides them. ASCII
+/// digits, `#` and `*` keep text presentation, since alone they are no
+/// emoji (UTS #51 keycap sequences carry U+20E3).
+fn emoji_presentation_runs(text: &str, variant: typography::Emoji) -> Vec<Range<usize>> {
     use icu_properties::CodePointSetData;
     use icu_properties::props::{Emoji, EmojiPresentation};
     let mut runs: Vec<Range<usize>> = Vec::new();
@@ -1492,9 +2130,10 @@ fn emoji_presentation_runs(text: &str) -> Vec<Range<usize>> {
             continue;
         }
         let selector = chars.peek().map(|&(_, next)| next);
-        let wanted = match selector {
-            Some('\u{FE0F}') => true,
-            Some('\u{FE0E}') => false,
+        let wanted = match (selector, variant) {
+            (Some('\u{FE0F}'), _) => true,
+            (Some('\u{FE0E}'), _) | (_, typography::Emoji::Text) => false,
+            (_, typography::Emoji::Emoji) => !ch.is_ascii(),
             _ => presentation.contains(ch),
         };
         let mut end = start + ch.len_utf8();
@@ -1647,34 +2286,33 @@ pub(crate) fn colored_lines(
 ) -> Vec<ShapedText> {
     TEXT.with_borrow_mut(|system| {
         system.select_fonts(style.font_set.as_ref());
-        let emoji = system.emoji_presentation(text, style);
-        let mut builder = system
-            .color_layouts
-            .ranged_builder(&mut system.fonts, text, 1.0, true);
-        configure_layout(
-            &mut builder,
+        let prepared = system.prepare(text, style, None);
+        let brushes: Vec<(Range<usize>, Option<[u8; 3]>)> = colors
+            .map(|(range, color)| {
+                let range = match &prepared.map {
+                    Some(map) => map.range_to_shaped(range),
+                    None => range,
+                };
+                (range, Some(color))
+            })
+            .collect();
+        let mut layout = system.prepared_layout(
+            &prepared,
             style,
+            true,
             Some(TextBreakStyle {
                 wrap: width.is_some(),
                 overflow_wrap: TextOverflowWrap::Anywhere,
                 ..TextBreakStyle::default()
             }),
+            &brushes,
         );
-        push_emoji_presentation(&mut builder, emoji);
-        for (range, color) in colors {
-            builder.push(StyleProperty::Brush(Some(color)), range);
-        }
-        let mut layout = builder.build(text);
         layout.break_all_lines(width.map(|w| w.max(0.01)));
-        layout
+        let lines: Vec<(ShapedText, Range<usize>)> = layout
             .lines()
             .take(if width.is_some() { usize::MAX } else { 1 })
             .map(|line| {
-                let mut shaped = retain_line(text, &line);
-                if width.is_none() {
-                    // Match shape()/retain_first_line for unwrapped text.
-                    shaped.text = text.to_string();
-                }
+                let mut shaped = retain_line(&prepared.text, &line, &prepared.synthesis);
                 for (run, item) in
                     shaped
                         .runs
@@ -1685,6 +2323,17 @@ pub(crate) fn colored_lines(
                         }))
                 {
                     run.color = item.style().brush;
+                }
+                (shaped, line.text_range())
+            })
+            .collect();
+        lines
+            .into_iter()
+            .map(|(mut shaped, range)| {
+                system.finish_line(&mut shaped, &prepared, text, range, style);
+                if width.is_none() {
+                    // Match shape() for unwrapped text.
+                    shaped.text = text.to_string();
                 }
                 shaped.underline = style.underline;
                 shaped.strikethrough = style.strikethrough;
@@ -1709,6 +2358,25 @@ pub(crate) fn shape_canvas_with(
 ) -> ShapedText {
     TEXT.with_borrow_mut(|system| {
         system.shape_with_typography(text, style, false, Some(typography))
+    })
+}
+
+/// CSS Fonts 5 #font-size-adjust-prop `from-font`: `metric` of the first
+/// available font of `style` (CSS Fonts 4 #first-available-font) as a
+/// fraction of its em, if the font defines it.
+pub(crate) fn first_available_metric(
+    style: &TextStyle,
+    metric: typography::SizeAdjustMetric,
+) -> Option<f32> {
+    TEXT.with_borrow_mut(|system| {
+        let plain = TextStyle {
+            typography: None,
+            ..style.clone()
+        };
+        let primary = system.shape(" ", &plain);
+        let run = primary.runs.first()?;
+        let coords = run.normalized_coords.clone();
+        system.face_metric(run.font.data(), &coords, metric)
     })
 }
 
@@ -1815,12 +2483,16 @@ fn retain_first_line(text: &str, layout: &Layout<()>) -> ShapedText {
             ..ShapedText::default()
         };
     };
-    let mut shaped = retain_line(text, &line);
+    let mut shaped = retain_line(text, &line, &SynthesisPolicy::default());
     shaped.text = text.to_string();
     shaped
 }
 
-fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> ShapedText {
+fn retain_line<B: parley::Brush>(
+    text: &str,
+    line: &parley::Line<'_, B>,
+    synthesis: &SynthesisPolicy,
+) -> ShapedText {
     let range = line.text_range();
     let line_text = &text[range.clone()];
     let metrics = line.metrics();
@@ -1873,7 +2545,7 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
             continue;
         };
         let run = glyph_run.run();
-        let synthesis = run.synthesis();
+        let (synthesis, policy) = (run.synthesis(), synthesis);
         runs.push(ShapedRun {
             font: FontFace(run.font().clone()),
             font_size: run.font_size(),
@@ -1890,8 +2562,9 @@ fn retain_line<B: parley::Brush>(text: &str, line: &parley::Line<'_, B>) -> Shap
                 .collect(),
             text_range: run.text_range().start - range.start..run.text_range().end - range.start,
             rtl: run.is_rtl(),
-            synth_bold: synthesis.embolden(),
-            synth_skew_degrees: synthesis.skew(),
+            // CSS Fonts 4 #font-synthesis-weight / #font-synthesis-style.
+            synth_bold: synthesis.embolden() && policy.weight,
+            synth_skew_degrees: synthesis.skew().filter(|_| policy.style),
         });
     }
     ShapedText {
@@ -1978,6 +2651,7 @@ mod tests {
             vec![crate::font_system::PageFont {
                 family: "Web".into(),
                 bytes,
+                ..Default::default()
             }],
             None,
             false,
@@ -2085,6 +2759,7 @@ mod tests {
             vec![crate::font_system::PageFont {
                 family: "Web".into(),
                 bytes,
+                ..Default::default()
             }],
             None,
             false,
@@ -2390,7 +3065,7 @@ mod tests {
         // Emoji_Presentation property supplies the default. Modifiers,
         // keycaps and joined sequences stay with their base.
         let text = "a\u{26A0}\u{FE0F} \u{26A0} \u{2728} \u{2728}\u{FE0E} \u{2764}\u{FE0F}\u{200D}\u{1F525} 1\u{FE0F}\u{20E3} \u{1F44B}\u{1F3FD}\u{A9}";
-        let runs: Vec<&str> = emoji_presentation_runs(text)
+        let runs: Vec<&str> = emoji_presentation_runs(text, typography::Emoji::Normal)
             .into_iter()
             .map(|range| &text[range])
             .collect();
@@ -2404,7 +3079,9 @@ mod tests {
                 "\u{1F44B}\u{1F3FD}",
             ]
         );
-        assert!(emoji_presentation_runs("plain ascii 123 #*").is_empty());
+        assert!(
+            emoji_presentation_runs("plain ascii 123 #*", typography::Emoji::Normal).is_empty()
+        );
     }
 
     #[test]
@@ -2549,5 +3226,575 @@ mod tests {
             composing: false,
         });
         assert!(editor.selected_text().is_some_and(|text| !text.is_empty()));
+    }
+
+    // CSS Fonts 4 conformance: typography reaching the shaper.
+
+    fn dejavu(file: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/assets/fonts/dejavu/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    fn web_fonts(faces: Vec<(&str, Vec<u8>, crate::font_system::FaceDescriptors)>) -> Arc<FontSet> {
+        FontSet::new(
+            faces
+                .into_iter()
+                .map(|(family, bytes, descriptors)| {
+                    crate::font_system::PageFont {
+                        family: family.into(),
+                        bytes,
+                        ..Default::default()
+                    }
+                    .with_descriptors(descriptors)
+                })
+                .collect(),
+            None,
+            false,
+        )
+    }
+
+    fn typed(apply: impl FnOnce(&mut FontTypography)) -> Option<Arc<FontTypography>> {
+        let mut typography = FontTypography::default();
+        apply(&mut typography);
+        Some(Arc::new(typography))
+    }
+
+    fn glyph_count(shaped: &ShapedText) -> usize {
+        shaped.runs.iter().map(|run| run.glyphs.len()).sum()
+    }
+
+    #[test]
+    fn kerning_and_ligature_properties_select_opentype_features() {
+        let fonts = web_fonts(vec![("Web", dejavu("DejaVuSans.ttf"), Default::default())]);
+        let style = TextStyle {
+            family: "Web".into(),
+            font_set: Some(fonts),
+            size: 40.,
+            ..TextStyle::default()
+        };
+        // #font-kerning-prop: `none` disables the font's pair kerning.
+        let kerned = shape("AV", &style).advance;
+        let unkerned = shape(
+            "AV",
+            &TextStyle {
+                typography: typed(|t| t.kerning = typography::Kerning::None),
+                ..style.clone()
+            },
+        )
+        .advance;
+        assert!(unkerned > kerned, "{unkerned} > {kerned}");
+        // #font-variant-ligatures-prop: common ligatures are on by default.
+        assert_eq!(glyph_count(&shape("fi", &style)), 1);
+        let none = TextStyle {
+            typography: typed(|t| t.ligatures = typography::parse_ligatures("none").unwrap()),
+            ..style.clone()
+        };
+        assert_eq!(glyph_count(&shape("fi", &none)), 2);
+        // #feature-variation-precedence step 11: letter-spacing disables
+        // optional ligatures; step 13: font-feature-settings wins.
+        let spaced = TextStyle {
+            letter_spacing: 2.,
+            ..style.clone()
+        };
+        assert_eq!(glyph_count(&shape("fi", &spaced)), 2);
+        let forced = TextStyle {
+            typography: typed(|t| {
+                t.feature_settings = typography::parse_feature_settings("\"liga\"").unwrap()
+            }),
+            ..spaced
+        };
+        assert_eq!(glyph_count(&shape("fi", &forced)), 1);
+    }
+
+    #[test]
+    fn small_capitals_are_synthesized_with_source_offsets_and_the_element_strut() {
+        // DejaVu Sans has no `smcp`: lowercase letters become reduced
+        // capitals (#font-variant-caps-prop), yet clusters and the text keep
+        // the source offsets and the line keeps the element font's metrics.
+        let fonts = web_fonts(vec![("Web", dejavu("DejaVuSans.ttf"), Default::default())]);
+        let style = TextStyle {
+            family: "Web".into(),
+            font_set: Some(fonts),
+            size: 40.,
+            ..TextStyle::default()
+        };
+        let small = TextStyle {
+            typography: typed(|t| t.caps = typography::Caps::SmallCaps),
+            ..style.clone()
+        };
+        let text = "Straße x";
+        let plain = shape(text, &style);
+        let shaped = shape(text, &small);
+        assert_eq!(shaped.text, text);
+        assert_eq!(shaped.clusters.last().unwrap().text_range.end, text.len());
+        assert!(
+            shaped
+                .runs
+                .iter()
+                .any(|run| (run.font_size - 28.).abs() < 0.01)
+        );
+        assert!(
+            shaped
+                .runs
+                .iter()
+                .any(|run| (run.font_size - 40.).abs() < 0.01)
+        );
+        assert_eq!(shaped.ascent, plain.ascent);
+        assert_eq!(shaped.line_height, plain.line_height);
+        // An all-lowercase word keeps the strut too.
+        assert_eq!(
+            shape("abc", &small).line_height,
+            shape("abc", &style).line_height
+        );
+        // Line breaking reports source offsets.
+        let end = first_line_end(text, &small, 1000., TextBreakStyle::default());
+        assert_eq!(end, text.len());
+        // font-synthesis-small-caps: none forbids the simulation.
+        let forbidden = TextStyle {
+            typography: typed(|t| {
+                t.caps = typography::Caps::SmallCaps;
+                t.synthesis.small_caps = false;
+            }),
+            ..style
+        };
+        assert_eq!(shape(text, &forbidden).advance, plain.advance);
+    }
+
+    #[test]
+    fn missing_superscripts_are_synthesized_off_the_baseline() {
+        // #font-variant-position-prop: DejaVu Sans lacks `sups`, so reduced
+        // glyphs are raised; the line metrics stay the element font's.
+        let fonts = web_fonts(vec![("Web", dejavu("DejaVuSans.ttf"), Default::default())]);
+        let style = TextStyle {
+            family: "Web".into(),
+            font_set: Some(fonts),
+            size: 40.,
+            ..TextStyle::default()
+        };
+        let plain = shape("2", &style);
+        let sup = shape(
+            "2",
+            &TextStyle {
+                typography: typed(|t| t.position = typography::Position::Super),
+                ..style.clone()
+            },
+        );
+        assert!(sup.runs[0].font_size < 40.);
+        assert!(sup.runs[0].glyphs[0].y < plain.runs[0].glyphs[0].y);
+        assert_eq!(sup.baseline, plain.baseline);
+        assert_eq!(sup.line_height, plain.line_height);
+        let sub = shape(
+            "2",
+            &TextStyle {
+                typography: typed(|t| t.position = typography::Position::Sub),
+                ..style.clone()
+            },
+        );
+        assert!(sub.runs[0].glyphs[0].y > plain.runs[0].glyphs[0].y);
+        // font-synthesis-position: none uses the (absent) feature only.
+        let unsynthesized = shape(
+            "2",
+            &TextStyle {
+                typography: typed(|t| {
+                    t.position = typography::Position::Super;
+                    t.synthesis.position = false;
+                }),
+                ..style
+            },
+        );
+        assert_eq!(unsynthesized.runs[0].font_size, 40.);
+    }
+
+    #[test]
+    fn oblique_angles_and_style_synthesis_policy_reach_rendering() {
+        let fonts = web_fonts(vec![("Web", dejavu("DejaVuSerif.ttf"), Default::default())]);
+        let skew = |italic: bool, apply: &dyn Fn(&mut FontTypography)| {
+            let mut typography = FontTypography::default();
+            apply(&mut typography);
+            shape(
+                "Hello",
+                &TextStyle {
+                    family: "Web".into(),
+                    font_set: Some(fonts.clone()),
+                    italic,
+                    typography: Some(Arc::new(typography)),
+                    ..TextStyle::default()
+                },
+            )
+            .runs[0]
+                .synth_skew_degrees
+        };
+        // #font-style-prop: `oblique 20deg` shears the upright face by 20deg.
+        assert_eq!(skew(true, &|t| t.oblique = Some(20.)), Some(20.));
+        assert_eq!(skew(true, &|t| t.oblique = Some(-8.5)), Some(-8.5));
+        assert_eq!(skew(true, &|_| {}), Some(14.));
+        // #font-synthesis-style.
+        let none = |t: &mut FontTypography| t.synthesis.style = typography::SynthesisStyle::None;
+        assert_eq!(skew(true, &none), None);
+        let oblique_only =
+            |t: &mut FontTypography| t.synthesis.style = typography::SynthesisStyle::ObliqueOnly;
+        assert_eq!(skew(true, &oblique_only), None);
+        assert_eq!(
+            skew(true, &|t| {
+                oblique_only(t);
+                t.oblique = Some(10.);
+            }),
+            Some(10.)
+        );
+    }
+
+    #[test]
+    fn font_synthesis_weight_none_suppresses_synthetic_bold() {
+        let fonts = web_fonts(vec![("Web", dejavu("DejaVuSerif.ttf"), Default::default())]);
+        let bold = |typography| {
+            shape(
+                "Hello",
+                &TextStyle {
+                    family: "Web".into(),
+                    font_set: Some(fonts.clone()),
+                    weight: 700.,
+                    typography,
+                    ..TextStyle::default()
+                },
+            )
+            .runs[0]
+                .synth_bold
+        };
+        assert!(bold(None));
+        assert!(!bold(typed(|t| t.synthesis.weight = false)));
+    }
+
+    fn descriptors(apply: &[(&str, &str)]) -> crate::font_system::FaceDescriptors {
+        let mut descriptors = crate::font_system::FaceDescriptors::default();
+        for (name, value) in apply {
+            assert!(descriptors.apply(name, value), "{name}: {value}");
+        }
+        descriptors
+    }
+
+    #[test]
+    fn face_descriptor_ranges_take_part_in_font_matching() {
+        // CSS Fonts 4 #font-style-matching with #font-prop-desc ranges: the
+        // descriptors, not the font data, place each face.
+        let serif = dejavu("DejaVuSerif.ttf");
+        let sans = dejavu("DejaVuSans.ttf");
+        let fonts = web_fonts(vec![
+            (
+                "Ranged",
+                serif.clone(),
+                descriptors(&[("font-weight", "100 399")]),
+            ),
+            (
+                "Ranged",
+                sans.clone(),
+                descriptors(&[("font-weight", "400 700")]),
+            ),
+        ]);
+        let face = |weight: f32| {
+            let shaped = shape(
+                "a",
+                &TextStyle {
+                    family: "Ranged".into(),
+                    font_set: Some(fonts.clone()),
+                    weight,
+                    ..TextStyle::default()
+                },
+            );
+            let data = shaped.runs[0].font.data();
+            (data.data.as_ref().len(), shaped.runs[0].synth_bold)
+        };
+        assert_eq!(face(300.).0, serif.len());
+        assert_eq!(face(500.).0, sans.len());
+        // 450: weights 450-500 ascending are in the 400-700 face.
+        assert_eq!(face(450.).0, sans.len());
+        // 800: above 700 nothing; then below 800 descending finds 700.
+        assert_eq!(face(800.), (sans.len(), false));
+        // A face described as bold is not emboldened; one described as
+        // normal (`auto`) is, whatever the font file says.
+        let fonts = web_fonts(vec![(
+            "Described",
+            dejavu("DejaVuSerif.ttf"),
+            descriptors(&[("font-weight", "bold")]),
+        )]);
+        let shaped = shape(
+            "a",
+            &TextStyle {
+                family: "Described".into(),
+                font_set: Some(fonts),
+                weight: 700.,
+                ..TextStyle::default()
+            },
+        );
+        assert!(!shaped.runs[0].synth_bold);
+        // `font-style: italic` describes an italic face: no synthesis.
+        let fonts = web_fonts(vec![(
+            "Slanted",
+            dejavu("DejaVuSerif.ttf"),
+            descriptors(&[("font-style", "italic")]),
+        )]);
+        let shaped = shape(
+            "a",
+            &TextStyle {
+                family: "Slanted".into(),
+                font_set: Some(fonts),
+                italic: true,
+                ..TextStyle::default()
+            },
+        );
+        assert_eq!(shaped.runs[0].synth_skew_degrees, None);
+    }
+
+    /// The value the shaper applied to axis `axis` of the test font.
+    fn axis(style: &TextStyle, axis: usize) -> f32 {
+        let text = test_fonts::AXIS_CHARS[axis].to_string();
+        let shaped = shape(
+            &text,
+            &TextStyle {
+                size: f32::from(test_fonts::UPEM),
+                ..style.clone()
+            },
+        );
+        test_fonts::axis_value(axis, shaped.advance)
+    }
+
+    #[test]
+    fn variation_axes_follow_font_properties_in_precedence_order() {
+        // #feature-variation-precedence: step 2 (font-weight, font-width,
+        // font-style through wght/wdth/slnt/ital), step 9 (optical size),
+        // step 12 (font-variation-settings), clamped to the font's axes.
+        let fonts = web_fonts(vec![(
+            "Axes",
+            test_fonts::variable_font(),
+            Default::default(),
+        )]);
+        let base = TextStyle {
+            family: "Axes".into(),
+            font_set: Some(fonts),
+            ..TextStyle::default()
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        assert!(close(axis(&base, 0), 400.));
+        assert!(close(
+            axis(
+                &TextStyle {
+                    weight: 700.,
+                    ..base.clone()
+                },
+                0
+            ),
+            700.
+        ));
+        let width = TextStyle {
+            typography: typed(|t| t.width = 1.5),
+            ..base.clone()
+        };
+        assert!(close(axis(&width, 1), 150.));
+        // #font-optical-sizing-def: `auto` follows the used font size,
+        // clamped to the axis; `none` leaves the default.
+        assert!(close(axis(&base, 2), 72.), "{}", axis(&base, 2));
+        let off = TextStyle {
+            typography: typed(|t| t.optical_sizing = false),
+            ..base.clone()
+        };
+        assert!(close(axis(&off, 2), 12.));
+        // #font-style-prop: CSS angles are clockwise, `slnt` counter-clockwise.
+        let oblique = TextStyle {
+            italic: true,
+            typography: typed(|t| t.oblique = Some(10.)),
+            ..base.clone()
+        };
+        assert!(close(axis(&oblique, 3), -10.), "{}", axis(&oblique, 3));
+        let italic = TextStyle {
+            italic: true,
+            ..base.clone()
+        };
+        assert!(close(axis(&italic, 4), 1.));
+        // font-variation-settings overrides font-weight.
+        let set = TextStyle {
+            weight: 700.,
+            typography: typed(|t| {
+                t.variation_settings = typography::parse_variation_settings("\"wght\" 850").unwrap()
+            }),
+            ..base.clone()
+        };
+        assert!(close(axis(&set, 0), 850.), "{}", axis(&set, 0));
+    }
+
+    #[test]
+    fn face_descriptors_clamp_and_set_variations() {
+        // #font-prop-desc: variation values applied to an @font-face face
+        // clamp to its descriptor ranges; #font-rend-desc variation settings
+        // apply to that face (step 6), below the property's (step 12).
+        let fonts = web_fonts(vec![(
+            "Clamped",
+            test_fonts::variable_font(),
+            descriptors(&[
+                ("font-weight", "300 500"),
+                ("font-variation-settings", "\"wdth\" 150"),
+            ]),
+        )]);
+        let style = TextStyle {
+            family: "Clamped".into(),
+            font_set: Some(fonts),
+            weight: 700.,
+            ..TextStyle::default()
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        assert!(close(axis(&style, 0), 500.), "{}", axis(&style, 0));
+        assert!(close(axis(&style, 1), 150.), "{}", axis(&style, 1));
+        let overridden = TextStyle {
+            typography: typed(|t| {
+                t.variation_settings = typography::parse_variation_settings("\"wdth\" 120").unwrap()
+            }),
+            ..style
+        };
+        assert!(close(axis(&overridden, 1), 120.));
+    }
+
+    #[test]
+    fn named_instance_descriptor_applies_before_face_variation_settings() {
+        // #font-named-instance, #feature-variation-precedence steps 5 and 6.
+        let fonts = web_fonts(vec![
+            (
+                "Named",
+                test_fonts::variable_font(),
+                descriptors(&[("font-named-instance", "\"heavy wide\"")]),
+            ),
+            (
+                "Overridden",
+                test_fonts::variable_font(),
+                descriptors(&[
+                    ("font-named-instance", "\"Heavy Wide\""),
+                    ("font-variation-settings", "\"wght\" 600"),
+                ]),
+            ),
+        ]);
+        let style = |family: &str| TextStyle {
+            family: family.into(),
+            font_set: Some(fonts.clone()),
+            ..TextStyle::default()
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        assert!(close(axis(&style("Named"), 0), 900.));
+        assert!(close(axis(&style("Named"), 1), 200.));
+        assert!(close(axis(&style("Overridden"), 0), 600.));
+        assert!(close(axis(&style("Overridden"), 1), 200.));
+    }
+
+    #[test]
+    fn size_adjust_and_metric_overrides_apply_to_their_face() {
+        // CSS Fonts 5 #size-adjust-desc scales the face's glyphs and metrics;
+        // #font-metrics-override-desc replaces ascent, descent and line gap.
+        let plain = web_fonts(vec![("Web", dejavu("DejaVuSans.ttf"), Default::default())]);
+        let adjusted = web_fonts(vec![(
+            "Web",
+            dejavu("DejaVuSans.ttf"),
+            descriptors(&[
+                ("size-adjust", "150%"),
+                ("ascent-override", "50%"),
+                ("descent-override", "25%"),
+                ("line-gap-override", "0%"),
+            ]),
+        )]);
+        let style = |fonts: &Arc<FontSet>| TextStyle {
+            family: "Web".into(),
+            font_set: Some(fonts.clone()),
+            size: 20.,
+            ..TextStyle::default()
+        };
+        let before = shape("Hello", &style(&plain));
+        let after = shape("Hello", &style(&adjusted));
+        assert!((after.advance - before.advance * 1.5).abs() < 0.5);
+        assert_eq!(after.runs[0].font_size, 30.);
+        // The overrides are fractions of the used (adjusted) size.
+        assert!((after.ascent - 15.).abs() < 0.1, "{}", after.ascent);
+        assert!((after.descent - 7.5).abs() < 0.1, "{}", after.descent);
+        // A number line-height still multiplies the computed font size.
+        let numbered = shape(
+            "Hello",
+            &TextStyle {
+                line_height: CssLineHeight::Number(2.),
+                ..style(&adjusted)
+            },
+        );
+        assert_eq!(numbered.line_height, 40.);
+    }
+
+    #[test]
+    fn font_size_adjust_normalizes_each_font_metric() {
+        // CSS Fonts 5 #font-size-adjust-prop: u = (m / m') s per font.
+        let fonts = web_fonts(vec![("Web", dejavu("DejaVuSans.ttf"), Default::default())]);
+        let style = TextStyle {
+            family: "Web".into(),
+            font_set: Some(fonts),
+            size: 20.,
+            ..TextStyle::default()
+        };
+        let aspect =
+            first_available_metric(&style, typography::SizeAdjustMetric::ExHeight).unwrap();
+        assert!(aspect > 0.4 && aspect < 0.7, "{aspect}");
+        let adjusted = shape(
+            "x",
+            &TextStyle {
+                typography: typed(|t| {
+                    t.size_adjust = Some((typography::SizeAdjustMetric::ExHeight, 0.5))
+                }),
+                ..style.clone()
+            },
+        );
+        assert!((adjusted.runs[0].font_size - 20. * 0.5 / aspect).abs() < 0.01);
+        // The value equal to the font's own aspect leaves its size.
+        let same = shape(
+            "x",
+            &TextStyle {
+                typography: typed(|t| {
+                    t.size_adjust = Some((typography::SizeAdjustMetric::ExHeight, aspect))
+                }),
+                ..style
+            },
+        );
+        assert!((same.runs[0].font_size - 20.).abs() < 0.01);
+    }
+
+    #[test]
+    fn face_feature_settings_descriptor_applies_to_its_face_only() {
+        let fonts = web_fonts(vec![
+            (
+                "NoLiga",
+                dejavu("DejaVuSans.ttf"),
+                descriptors(&[("font-feature-settings", "\"liga\" 0")]),
+            ),
+            ("Liga", dejavu("DejaVuSans.ttf"), Default::default()),
+        ]);
+        let count = |family: &str| {
+            glyph_count(&shape(
+                "fi",
+                &TextStyle {
+                    family: family.into(),
+                    font_set: Some(fonts.clone()),
+                    ..TextStyle::default()
+                },
+            ))
+        };
+        assert_eq!(count("NoLiga"), 2);
+        assert_eq!(count("Liga"), 1);
+    }
+
+    #[test]
+    fn font_variant_emoji_sets_the_default_presentation() {
+        let runs = |text, variant| emoji_presentation_runs(text, variant);
+        // U+263A has text presentation by default, U+1F600 emoji.
+        assert!(runs("\u{263A}", typography::Emoji::Normal).is_empty());
+        assert_eq!(runs("\u{263A}", typography::Emoji::Emoji).len(), 1);
+        assert!(runs("\u{1F600}", typography::Emoji::Text).is_empty());
+        // An explicit selector still wins.
+        assert_eq!(runs("\u{263A}\u{FE0F}", typography::Emoji::Text).len(), 1);
+        // ASCII digits are not emoji alone.
+        let digit = runs("1\u{263A}", typography::Emoji::Emoji);
+        assert_eq!(digit.len(), 1);
+        assert_eq!(digit[0], 1..4);
     }
 }

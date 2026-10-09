@@ -33,6 +33,11 @@ use parley::fontique::{
 use roxmltree::{Document, Node, ParsingOptions};
 use unicode_casefold::UnicodeCaseFold as _;
 
+mod faces;
+#[allow(unused_imports)]
+pub(crate) use faces::FontDisplay;
+pub(crate) use faces::{FaceDescriptors, FaceRendering, local_face};
+
 const MAX_CONFIG_FILES: usize = 1_024;
 const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
@@ -67,6 +72,15 @@ static PAGE_FONT_EPOCH: AtomicU64 = AtomicU64::new(0);
 static PAGE_FONT_FAMILIES: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
 static NEXT_FONT_SET: AtomicU64 = AtomicU64::new(1);
 static FONT_SOURCES: OnceLock<SourceCache> = OnceLock::new();
+/// The face renderings (`FaceRendering`) of the foreground page's installed
+/// downloadable faces, by font resource id; `PAGE_HAS_RENDERINGS` lets
+/// shaping skip the lookup for the common page that has none.
+static PAGE_RENDERINGS: Mutex<Option<Renderings>> = Mutex::new(None);
+
+/// Face renderings by font resource id.
+type Renderings = Arc<HashMap<u64, Arc<FaceRendering>>>;
+static PAGE_HAS_RENDERINGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn font_source_cache() -> SourceCache {
     // Font environments choose faces independently, but installed faces keep
@@ -85,6 +99,9 @@ pub struct FontSet {
     /// The same downloadable faces for inline SVG text (`None` when the set
     /// adds nothing to the installed fonts).
     svg: Option<Arc<SvgFontEnvironment>>,
+    /// The per-face shaping settings of the set's downloadable faces, by
+    /// font resource id.
+    renderings: Arc<HashMap<u64, Arc<FaceRendering>>>,
 }
 
 impl std::fmt::Debug for FontSet {
@@ -105,19 +122,29 @@ impl FontSet {
         parent: Option<&Arc<Self>>,
         foreground: bool,
     ) -> Arc<Self> {
-        let (mut collection, mut svg_faces) = if let Some(parent) = parent {
+        let (mut collection, mut svg_faces, inherited_renderings) = if let Some(parent) = parent {
             (
                 parent.collection.clone(),
                 parent
                     .svg
                     .as_ref()
                     .map_or_else(Vec::new, |svg| svg.faces.clone()),
+                parent.renderings.clone(),
             )
         } else if foreground {
-            (font_context().collection, page_svg_faces())
+            (
+                font_context().collection,
+                page_svg_faces(),
+                page_renderings(),
+            )
         } else {
-            (catalog().base_text_collection.clone(), Vec::new())
+            (
+                catalog().base_text_collection.clone(),
+                Vec::new(),
+                Arc::default(),
+            )
         };
+        let mut renderings: Option<HashMap<u64, Arc<FaceRendering>>> = None;
         let mut declared = HashSet::new();
         for font in fonts {
             // CSS Shadow 1 #shadow-names: a local @font-face family hides
@@ -140,10 +167,17 @@ impl FontSet {
                 }
             }
             let bytes = Arc::new(font.bytes);
+            let blob = Blob::new(bytes.clone());
+            if let Some(rendering) = font.descriptors.rendering() {
+                renderings
+                    .get_or_insert_with(|| (*inherited_renderings).clone())
+                    .insert(blob.id(), Arc::new(rendering));
+            }
             collection.register_fonts(
-                Blob::new(bytes.clone()),
+                blob,
                 Some(FontInfoOverride {
                     family_name: Some(&font.family),
+                    descriptors: font.descriptors.matching(),
                     ..FontInfoOverride::default()
                 }),
             );
@@ -164,6 +198,7 @@ impl FontSet {
             id: NEXT_FONT_SET.fetch_add(1, Ordering::Relaxed),
             collection,
             svg,
+            renderings: renderings.map_or(inherited_renderings, Arc::new),
         })
     }
 
@@ -200,9 +235,12 @@ struct Catalog {
 /// One already-fetched `@font-face` resource. The CSS descriptor's family
 /// name intentionally overrides the font file's internal name (CSS Fonts 4
 /// §4.1 permits authors to assign an arbitrary family to a face).
+#[derive(Default)]
 pub(crate) struct PageFont {
     pub family: String,
     pub bytes: Vec<u8>,
+    /// The rule's other descriptors (CSS Fonts 4 #font-prop-desc).
+    pub descriptors: FaceDescriptors,
 }
 
 impl PageFont {
@@ -219,7 +257,78 @@ impl PageFont {
             [0, 1, 0, 0] | b"OTTO" | b"true" | b"ttcf" => bytes,
             _ => return None,
         };
-        Some(Self { family, bytes })
+        Some(Self {
+            family,
+            bytes,
+            descriptors: FaceDescriptors::default(),
+        })
+    }
+
+    /// #local-font-fallback: the installed face named `name`.
+    pub(crate) fn from_local(family: String, name: &str) -> Option<Self> {
+        Some(Self {
+            family,
+            bytes: local_face(name)?,
+            descriptors: FaceDescriptors::default(),
+        })
+    }
+
+    /// CSS Fonts 4 #font-face-src-loading: "font container formats that can
+    /// contain more than one font must load one and only one of the fonts
+    /// for a given @font-face rule. Fragment identifiers are used to indicate
+    /// which font to load; these use the PostScript name of the font", and a
+    /// face "unless its PostScript name exactly matches the fragment
+    /// identifier" must not be used. Without a fragment, the first face.
+    pub(crate) fn select_face(mut self, fragment: Option<&str>) -> Option<Self> {
+        if self.bytes.get(..4) != Some(b"ttcf") {
+            return Some(self);
+        }
+        let index = match fragment.filter(|fragment| !fragment.is_empty()) {
+            None => 0,
+            Some(fragment) => {
+                let fragment = percent_decode(fragment)?;
+                (0..ttf_parser::fonts_in_collection(&self.bytes)?).find(|&index| {
+                    ttf_parser::Face::parse(&self.bytes, index)
+                        .ok()
+                        .is_some_and(|face| {
+                            face.names().into_iter().any(|name| {
+                                name.name_id == ttf_parser::name_id::POST_SCRIPT_NAME
+                                    && name.to_string().as_deref() == Some(fragment.as_str())
+                            })
+                        })
+                })?
+            }
+        };
+        self.bytes = faces::collection_face(&self.bytes, index)?;
+        Some(self)
+    }
+
+    /// Apply the rule's descriptors. CSS Fonts 5 #font-metrics-override-desc
+    /// replaces the face's ascent, descent and line gap in its tables, so
+    /// every consumer (layout, canvas and SVG text) reads the overrides.
+    pub(crate) fn with_descriptors(mut self, mut descriptors: FaceDescriptors) -> Self {
+        // CSS Fonts 4 #font-named-instance: the instance's variation values
+        // apply before the face's font-variation-settings (steps 5 and 6).
+        if let Some(name) = &descriptors.named_instance
+            && let Some(mut coords) = faces::named_instance_coords(&self.bytes, name)
+        {
+            coords.append(&mut descriptors.variations);
+            descriptors.variations = coords;
+        }
+        if (descriptors.ascent_override.is_some()
+            || descriptors.descent_override.is_some()
+            || descriptors.line_gap_override.is_some())
+            && let Some(bytes) = faces::override_metrics(
+                &self.bytes,
+                descriptors.ascent_override,
+                descriptors.descent_override,
+                descriptors.line_gap_override,
+            )
+        {
+            self.bytes = bytes;
+        }
+        self.descriptors = descriptors;
+        self
     }
 
     /// CSS Fonts 4 #unicode-range-desc: a face is used only for the code
@@ -449,23 +558,34 @@ pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
     // and inline SVG text, which is document text as well (CSS Fonts 4
     // #font-face-rule: the rules define fonts "for use within the documents
     // that contain these rules").
-    let faces = fonts
+    let (faces, descriptors): (Vec<SvgPageFace>, Vec<FaceDescriptors>) = fonts
         .into_iter()
         .filter(|font| !font.family.trim().is_empty() && !font.bytes.is_empty())
-        .map(|font| SvgPageFace {
-            family: font.family.trim().to_string(),
-            bytes: Arc::new(font.bytes),
+        .map(|font| {
+            (
+                SvgPageFace {
+                    family: font.family.trim().to_string(),
+                    bytes: Arc::new(font.bytes),
+                },
+                font.descriptors,
+            )
         })
-        .collect::<Vec<_>>();
+        .unzip();
+    let mut renderings = HashMap::new();
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         let catalog = catalog();
         let mut collection = catalog.base_text_collection.clone();
-        for face in &faces {
+        for (face, descriptors) in faces.iter().zip(&descriptors) {
+            let blob = Blob::new(face.bytes.clone());
+            if let Some(rendering) = descriptors.rendering() {
+                renderings.insert(blob.id(), Arc::new(rendering));
+            }
             collection.register_fonts(
-                Blob::new(face.bytes.clone()),
+                blob,
                 Some(FontInfoOverride {
                     family_name: Some(&face.family),
+                    descriptors: descriptors.matching(),
                     ..FontInfoOverride::default()
                 }),
             );
@@ -475,11 +595,97 @@ pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = collection;
     }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    let _ = &descriptors;
+    PAGE_HAS_RENDERINGS.store(!renderings.is_empty(), Ordering::Release);
+    *PAGE_RENDERINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(renderings));
     *PAGE_SVG_FONTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         (faces.clone(), SvgFontEnvironment::register(faces));
     PAGE_FONT_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// A URL fragment's percent-decoded text.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(byte) = text
+                .get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// A downloadable face of the foreground navigation still loading when its
+/// block period ended (CSS Fonts 4 #font-display-timeline). `result` yields
+/// the source URL that loaded and its bytes, or `None` once every source
+/// failed; `failure` is when its swap period ends (`None`: never).
+pub(crate) struct LateFace {
+    pub sources: Vec<String>,
+    pub result: LateResult,
+    pub failure: Option<std::time::Instant>,
+}
+
+/// A late face's eventual (source URL, bytes), `Some(None)` when it failed.
+pub(crate) type LateResult = tokio::sync::watch::Receiver<Option<Option<(String, Vec<u8>)>>>;
+
+static LATE_PAGE_FACES: Mutex<Vec<LateFace>> = Mutex::new(Vec::new());
+
+/// Record the late faces of a new foreground navigation.
+pub(crate) fn set_late_page_faces(faces: Vec<LateFace>) {
+    *LATE_PAGE_FACES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = faces;
+}
+
+/// The pending load of `url` begun by the foreground navigation, if it is a
+/// source of a late face: its eventual bytes (`None` when another source
+/// of the face loaded, or none did) and the face's failure time.
+pub(crate) fn late_page_face(url: &str) -> Option<(LateResult, Option<std::time::Instant>)> {
+    LATE_PAGE_FACES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|face| face.sources.iter().any(|source| source == url))
+        .map(|face| (face.result.clone(), face.failure))
+}
+
+fn page_renderings() -> Arc<HashMap<u64, Arc<FaceRendering>>> {
+    PAGE_RENDERINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Whether text shaped in `set` (`None`: the foreground page's installed
+/// fonts) can meet a face with its own shaping settings.
+pub(crate) fn has_face_renderings(set: Option<&Arc<FontSet>>) -> bool {
+    match set {
+        Some(set) => !set.renderings.is_empty(),
+        None => PAGE_HAS_RENDERINGS.load(Ordering::Acquire),
+    }
+}
+
+/// The shaping settings of the face with font resource `id` in `set`.
+pub(crate) fn face_rendering(set: Option<&Arc<FontSet>>, id: u64) -> Option<Arc<FaceRendering>> {
+    match set {
+        Some(set) => set.renderings.get(&id).cloned(),
+        None => page_renderings().get(&id).cloned(),
+    }
 }
 
 /// One downloadable face as inline SVG text sees it: the `@font-face`
@@ -2253,6 +2459,7 @@ mod tests {
         let face = |family: &str| PageFont {
             family: family.into(),
             bytes: sans.to_vec(),
+            ..Default::default()
         };
         let first = FontSet::new(vec![face("Stable Inline Face")], None, false);
         let rebuilt = FontSet::new(vec![face("Stable Inline Face")], None, false);

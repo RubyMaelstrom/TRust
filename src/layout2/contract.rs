@@ -255,11 +255,25 @@ impl Units {
         let italic = dom
             .computed_value_resolved(id, "font-style")
             .is_some_and(|value| css_is_italic(&value));
+        // CSS Fonts 5 #font-size-adjust-prop: the adjustment "affects the
+        // size of relative units that are based on font metrics such as ex
+        // and ch but does not affect the size of em units".
+        let typography = dom
+            .computed_value_resolved(id, "font-size-adjust")
+            .as_deref()
+            .and_then(crate::text::typography::parse_size_adjust)
+            .map(|size_adjust| {
+                std::sync::Arc::new(crate::text::FontTypography {
+                    size_adjust: Some(size_adjust),
+                    ..crate::text::FontTypography::default()
+                })
+            });
         let ch = crate::text::zero_advance(&crate::text::TextStyle {
             family,
             size: fs,
             weight,
             italic,
+            typography,
             ..crate::text::TextStyle::default()
         });
         Units {
@@ -1593,10 +1607,16 @@ pub(crate) fn relative_font_weight(value: &str, parent: f32) -> Option<f32> {
 
 /// A CSS `font-style` value reads as italic (`italic`/`oblique`).
 pub(crate) fn css_is_italic(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "italic" | "oblique"
-    )
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "italic" | "oblique" => true,
+        // CSS Fonts 4 #font-style-prop: `oblique <angle>` slants unless the
+        // angle is zero.
+        _ => value
+            .strip_prefix("oblique ")
+            .and_then(|angle| crate::text::typography::parse_angle_deg(angle.trim()))
+            .is_some_and(|degrees| degrees != 0.0),
+    }
 }
 
 /// An absolute CSS length as CSS px, resolved in `u`'s font context: `em`

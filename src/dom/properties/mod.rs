@@ -6,6 +6,7 @@
 //! #consume-syntax-definition, and #calculation-of-computed-values.
 //! That draft permits omitted descriptors and comma-separated registration
 //! names. Its multi-name CSSOM issue (#14227) is still unresolved.
+pub(super) mod fonts;
 mod gradients;
 mod math;
 mod matrix;

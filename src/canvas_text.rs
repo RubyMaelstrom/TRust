@@ -6,11 +6,10 @@
 //! WHATWG e5071a20 and CSSWG 81c27f68 snapshots).
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::Arc;
 
+use crate::text::typography::{self, SMALL_CAPS_SCALE};
 use crate::text::{CanvasTypography, ShapedText, TextStyle};
-use unicode_segmentation::UnicodeSegmentation as _;
 use vello_common::paint::{Image, ImageSource, PaintType, Tint};
 use vello_cpu::color::{AlphaColor, Srgb, palette::css::BLACK};
 use vello_cpu::kurbo::{Affine, BezPath, Rect, Shape};
@@ -45,10 +44,6 @@ const RENDERING: [&str; 4] = [
     "optimizeLegibility",
     "geometricPrecision",
 ];
-/// Synthesized small capitals: uppercase glyphs scaled to this fraction of
-/// the font size (CSS leaves the factor to the UA; this is Chromium's).
-const SMALL_CAPS_SCALE: f32 = 0.7;
-
 /// The CanvasTextDrawingStyles attributes the host exposes by index.
 pub(crate) const FONT: u8 = 0;
 pub(crate) const TEXT_ALIGN: u8 = 1;
@@ -501,62 +496,25 @@ impl TextState {
             features.push((*b"clig", 0));
         }
         // 'font-variant-caps', synthesizing small capitals when the first
-        // available font lacks them.
-        let supports = |tag: &[u8; 4]| {
-            face.as_ref()
-                .is_some_and(|face| face.features.contains(tag))
-        };
-        let synthesize = match self.variant_caps {
-            "small-caps" if supports(b"smcp") => {
-                features.push((*b"smcp", 1));
-                None
-            }
-            "small-caps" => Some(Caps::Lower),
-            "all-small-caps" if supports(b"smcp") && supports(b"c2sc") => {
-                features.extend([(*b"smcp", 1), (*b"c2sc", 1)]);
-                None
-            }
-            "all-small-caps" => Some(Caps::All),
-            "petite-caps" if supports(b"pcap") => {
-                features.push((*b"pcap", 1));
-                None
-            }
-            // "behaves as if small-caps ... had been specified".
-            "petite-caps" if supports(b"smcp") => {
-                features.push((*b"smcp", 1));
-                None
-            }
-            "petite-caps" => Some(Caps::Lower),
-            "all-petite-caps" if supports(b"pcap") && supports(b"c2pc") => {
-                features.extend([(*b"pcap", 1), (*b"c2pc", 1)]);
-                None
-            }
-            "all-petite-caps" if supports(b"smcp") && supports(b"c2sc") => {
-                features.extend([(*b"smcp", 1), (*b"c2sc", 1)]);
-                None
-            }
-            "all-petite-caps" => Some(Caps::All),
-            "unicase" if supports(b"unic") => {
-                features.push((*b"unic", 1));
-                None
-            }
-            // "as if small-caps was applied only to lowercased uppercase letters".
-            "unicase" => Some(Caps::Upper),
-            "titling-caps" => {
-                // Without the feature the property has no visible effect.
-                if supports(b"titl") {
-                    features.push((*b"titl", 1));
-                }
-                None
-            }
-            _ => None,
-        };
-        let turkic = language.as_deref().is_some_and(|tag| {
-            let primary = tag.split(['-', '_']).next().unwrap_or("");
-            primary.eq_ignore_ascii_case("tr") || primary.eq_ignore_ascii_case("az")
+        // available font lacks them (shared with CSS text shaping).
+        let face_features = primary
+            .runs
+            .first()
+            .map(|run| crate::text::face_features(&run.font));
+        let caps = typography::parse_caps(self.variant_caps).unwrap_or_default();
+        let (caps_features, synthesize) = typography::caps_plan(caps, |tag| {
+            face_features
+                .as_ref()
+                .is_some_and(|features| features.contains(tag))
         });
+        features.extend(caps_features);
+        let turkic = typography::turkic(language.as_deref());
         let (mut shaped_text, mut sized) = match synthesize {
-            Some(caps) => synthesize_caps(&text, caps, size * SMALL_CAPS_SCALE, turkic),
+            Some(caps) => {
+                let (text, sized, _) =
+                    typography::synthesize_caps(&text, caps, size * SMALL_CAPS_SCALE, turkic);
+                (text, sized)
+            }
             None => (text.clone(), Vec::new()),
         };
         // 'direction' sets the paragraph's base direction: a strong mark
@@ -644,63 +602,10 @@ impl TextState {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Caps {
-    /// Lowercase letters become small capitals.
-    Lower,
-    /// Lowercase and uppercase letters become small capitals.
-    All,
-    /// Uppercase letters become small capitals.
-    Upper,
-}
-
-/// CSS Fonts 4 #font-variant-caps-prop simulation: the letters selected by
-/// `caps` become their uppercase forms (the text-transform casing, full case
-/// mappings, Turkic dotted I) shaped at `size`. Caseless characters keep
-/// their glyphs. A grapheme cluster is converted as a unit, so combining
-/// marks stay with their base.
-fn synthesize_caps(
-    text: &str,
-    caps: Caps,
-    size: f32,
-    turkic: bool,
-) -> (String, Vec<(Range<usize>, f32)>) {
-    let mut out = String::with_capacity(text.len());
-    let mut sized: Vec<(Range<usize>, f32)> = Vec::new();
-    for cluster in text.graphemes(true) {
-        let first = cluster.chars().next().unwrap_or(' ');
-        let lower = first.is_lowercase() && first.to_uppercase().next() != Some(first);
-        let upper = first.is_uppercase();
-        let small = match caps {
-            Caps::Lower => lower,
-            Caps::All => lower || upper,
-            Caps::Upper => upper,
-        };
-        if !small {
-            out.push_str(cluster);
-            continue;
-        }
-        let start = out.len();
-        for c in cluster.chars() {
-            if turkic && c == 'i' {
-                out.push('\u{130}');
-            } else {
-                out.extend(c.to_uppercase());
-            }
-        }
-        match sized.last_mut() {
-            Some((range, _)) if range.end == start => range.end = out.len(),
-            _ => sized.push((start..out.len(), size)),
-        }
-    }
-    (out, sized)
-}
-
-/// What text preparation reads from a face beyond its shaping: the GSUB
-/// features it defines, OS/2 heights and BASE baselines, in ems.
+/// What text preparation reads from a face beyond its shaping: OS/2
+/// heights and BASE baselines, in ems.
 #[derive(Default)]
 struct FaceTables {
-    features: Vec<[u8; 4]>,
     x_height: Option<f32>,
     cap_height: Option<f32>,
     /// BASE horizontal axis: per script tag, the baseline tag/coordinate
@@ -732,16 +637,6 @@ impl FaceTables {
             .unwrap_or(1000.)
             .max(1.);
         let mut tables = Self::default();
-        if let Ok(gsub) = font.gsub()
-            && let Ok(list) = gsub.feature_list()
-        {
-            for record in list.feature_records() {
-                let tag = record.feature_tag().to_be_bytes();
-                if !tables.features.contains(&tag) {
-                    tables.features.push(tag);
-                }
-            }
-        }
         if let Ok(os2) = font.os2() {
             tables.x_height = os2
                 .sx_height()
@@ -1228,26 +1123,6 @@ mod tests {
         assert_eq!(px("10vw"), 80.);
         assert_eq!(px("10vmin"), 60.);
         assert_eq!(px("3pt"), 4.);
-    }
-
-    #[test]
-    fn small_capital_synthesis_follows_text_transform_casing() {
-        // CSS Fonts 4 #font-variant-caps-prop: lowercase letters become
-        // uppercase glyphs at a smaller size; capitals and caseless
-        // characters keep theirs; casing matches 'text-transform'.
-        let (text, sized) = synthesize_caps("aB1ß", Caps::Lower, 7., false);
-        assert_eq!(text, "AB1SS");
-        assert_eq!(sized, vec![(0..1, 7.), (3..5, 7.)]);
-        let (text, sized) = synthesize_caps("aB", Caps::All, 7., false);
-        assert_eq!((text.as_str(), sized), ("AB", vec![(0..2, 7.)]));
-        let (text, sized) = synthesize_caps("aB", Caps::Upper, 7., false);
-        assert_eq!((text.as_str(), sized), ("aB", vec![(1..2, 7.)]));
-        // Turkic dotted capital I, and a combining mark stays with its base.
-        let (text, _) = synthesize_caps("i", Caps::Lower, 7., true);
-        assert_eq!(text, "\u{130}");
-        let (text, sized) = synthesize_caps("e\u{301}x", Caps::Lower, 7., false);
-        assert_eq!(text, "E\u{301}X");
-        assert_eq!(sized, vec![(0..text.len(), 7.)]);
     }
 
     #[test]

@@ -864,7 +864,15 @@ impl Dom {
         let mut root_style = String::new();
         if let Some((top, parent)) = html_context {
             for &property in HTML_INHERITED_TEXT_PROPERTIES {
-                if let Some(value) = self.computed_value_resolved(parent, property)
+                // The SVG text engine reads the CSS Fonts 3 names: the
+                // legacy `font-stretch` alias of `font-width`, and the CSS 2
+                // `font-variant` values of `font-variant-caps`.
+                let source = match property {
+                    "font-stretch" => "font-width",
+                    "font-variant" => "font-variant-caps",
+                    property => property,
+                };
+                if let Some(value) = self.computed_value_resolved(parent, source)
                     && !value.trim().is_empty()
                     && !value.contains([';', '"', '<'])
                 {

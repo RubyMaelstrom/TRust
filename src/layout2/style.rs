@@ -1396,6 +1396,9 @@ pub(crate) struct InlineStyle {
     pub font_size: f32,
     pub font_weight: f32,
     pub font_italic: bool,
+    /// CSS Fonts 4 width, oblique angle, kerning, variants, settings,
+    /// optical sizing, synthesis and size adjustment; `None` when initial.
+    pub typography: Option<std::sync::Arc<crate::text::FontTypography>>,
     pub line_height: crate::text::CssLineHeight,
     pub vertical_align: VerticalAlign,
     /// Within-word break opportunities (`overflow-wrap`/`word-break`).
@@ -1530,6 +1533,7 @@ impl InlineStyle {
             font_size: crate::dom::FONT_SIZE_INITIAL,
             font_weight: 400.0,
             font_italic: false,
+            typography: None,
             line_height: crate::text::CssLineHeight::Normal,
             vertical_align: VerticalAlign::Baseline,
             brk: WordBrk::Normal,
@@ -1639,6 +1643,10 @@ impl InlineStyle {
         s.font_italic = dom
             .computed_value_resolved(id, "font-style")
             .is_some_and(|v| css_is_italic(&v));
+        s.typography = typography_of(
+            |name| dom.computed_value_resolved(id, name),
+            parent.typography.as_ref(),
+        );
         s.emph.bold = s.font_weight >= 600.0;
         s.emph.italic = s.font_italic;
         (s.emph.underline, s.emph.strike) = dom.text_decoration(id);
@@ -1749,6 +1757,7 @@ impl InlineStyle {
             line_height: self.line_height,
             underline: self.emph.underline,
             strikethrough: self.emph.strike,
+            typography: self.typography.clone(),
         }
     }
 
@@ -1806,6 +1815,20 @@ impl InlineStyle {
         }
         if declared("font-style") {
             s.font_italic = value("font-style").is_some_and(|v| css_is_italic(&v));
+        }
+        let own: Vec<&'static str> = TYPOGRAPHY_PROPERTIES
+            .iter()
+            .copied()
+            .filter(|p| declared(p))
+            .collect();
+        if !own.is_empty() {
+            s.typography = typography_of(
+                |name| match own.iter().find(|p| **p == name) {
+                    Some(p) => value(p),
+                    None => dom.computed_value_resolved(id, name),
+                },
+                self.typography.as_ref(),
+            );
         }
         s.emph.bold = s.font_weight >= 600.;
         s.emph.italic = s.font_italic;
@@ -1952,6 +1975,41 @@ impl InlineStyle {
         s.line_height = self.line_height;
         s.vertical_align = self.vertical_align;
         std::borrow::Cow::Owned(s)
+    }
+}
+
+/// The inherited CSS Fonts 4 properties `FontTypography` holds.
+const TYPOGRAPHY_PROPERTIES: [&str; 18] = [
+    "font-width",
+    "font-style",
+    "font-kerning",
+    "font-optical-sizing",
+    "font-variant-ligatures",
+    "font-variant-caps",
+    "font-variant-numeric",
+    "font-variant-east-asian",
+    "font-variant-position",
+    "font-variant-alternates",
+    "font-variant-emoji",
+    "font-feature-settings",
+    "font-variation-settings",
+    "font-synthesis-weight",
+    "font-synthesis-style",
+    "font-synthesis-small-caps",
+    "font-synthesis-position",
+    "font-size-adjust",
+];
+
+/// An element's typography from its computed values, sharing the parent's
+/// when equal (the properties all inherit).
+fn typography_of(
+    computed: impl Fn(&str) -> Option<String>,
+    parent: Option<&std::sync::Arc<crate::text::FontTypography>>,
+) -> Option<std::sync::Arc<crate::text::FontTypography>> {
+    let typography = crate::text::FontTypography::from_computed(computed)?;
+    match parent {
+        Some(parent) if **parent == typography => Some(parent.clone()),
+        _ => Some(std::sync::Arc::new(typography)),
     }
 }
 

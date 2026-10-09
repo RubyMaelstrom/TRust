@@ -40,7 +40,11 @@ pub fn install_application_fonts(fonts: Vec<(String, Vec<u8>)>) {
     crate::font_system::install_page_fonts(
         fonts
             .into_iter()
-            .map(|(family, bytes)| crate::font_system::PageFont { family, bytes })
+            .map(|(family, bytes)| crate::font_system::PageFont {
+                family,
+                bytes,
+                ..Default::default()
+            })
             .collect(),
     );
 }

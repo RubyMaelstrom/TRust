@@ -5124,6 +5124,26 @@ mod desktop {
         };
         for url in urls {
             let name = url.to_string();
+            // CSS Fonts 4 #font-display-timeline: a face of the navigation
+            // still loading after its block period. Wait for that load, not
+            // a second one, and refuse it after its swap period.
+            if let Some((mut late, failure)) = crate::font_system::late_page_face(&name) {
+                let events = events.clone();
+                cache.spawn(&handle, async move {
+                    let result = late
+                        .wait_for(Option::is_some)
+                        .await
+                        .ok()
+                        .and_then(|result| result.clone())
+                        .flatten();
+                    let bytes = result
+                        .filter(|(winner, _)| *winner == name)
+                        .map(|(_, bytes)| bytes)
+                        .filter(|_| failure.is_none_or(|end| std::time::Instant::now() <= end));
+                    let _ = events.send(LumenHostTask::FontDone { url: name, bytes });
+                });
+                continue;
+            }
             if !crate::http::subresource_allowed(&client, &url) {
                 let _ = events.send(LumenHostTask::FontDone {
                     url: name,
@@ -20287,6 +20307,14 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
             _ => String::from("null"),
         };
         return Ok(Value::from_string(json));
+    }
+    // CSS Font Loading 3 #fontface-interface: a FontFace attribute parsed
+    // as its @font-face descriptor `text`, serialized, or null.
+    if op == "font-face-descriptor" {
+        let value = crate::dom::font_face_descriptor(&text, &extra);
+        return Ok(Value::from_string(
+            serde_json::to_string(&value).unwrap_or_else(|_| String::from("null")),
+        ));
     }
     if op == "legacy-color" || op == "legacy-font-size" {
         let value = if op == "legacy-color" {
@@ -41763,6 +41791,34 @@ mod tests {
                 "quirks: {quirks}"
             );
         }
+    }
+
+    #[test]
+    fn font_face_attributes_parse_as_font_face_descriptors() {
+        // CSS Font Loading 3 #fontface-interface / #font-face-constructor:
+        // attributes hold the serialization of their parsed @font-face
+        // descriptor; an invalid one throws SyntaxError, and an invalid
+        // constructor argument makes the face an error face.
+        let mut engine = platform_engine();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"(() => {
+                const face = new FontFace("Test Face", "url(a.woff2) format('woff2')", {
+                    weight: "700 700", stretch: "Condensed", style: "oblique 10deg 10deg",
+                    display: "SWAP", sizeAdjust: "90%", featureSettings: "'liga' on",
+                });
+                let thrown = "";
+                try { face.weight = "bolder"; } catch (e) { thrown = e.name; }
+                face.ascentOverride = "80%";
+                const bad = new FontFace("Bad", "url(a.woff2)", { weight: "lighter" });
+                return [face.family, face.weight, face.stretch, face.width, face.style,
+                    face.display, face.sizeAdjust, face.featureSettings, face.ascentOverride,
+                    face.unicodeRange, face.status, thrown, bad.status, bad.weight === ""].join("|");
+            })()"#
+            ),
+            "Test Face|700|condensed|condensed|oblique 10deg|swap|90%|\"liga\"|80%|U+0-10FFFF|unloaded|SyntaxError|error|true"
+        );
     }
 
     #[test]

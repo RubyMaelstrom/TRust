@@ -974,7 +974,8 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
                     .parse::<f32>()
                     .is_ok_and(|n| (1. ..=1000.).contains(&n))
         }
-        "font-style" => one_of("normal italic oblique"),
+        "font-style" => properties::fonts::font_style(value).is_some(),
+        p if properties::fonts::owns(p) => properties::fonts::specified(p, value).is_some(),
         "text-decoration-style" => one_of("solid double dotted dashed wavy"),
         "-webkit-text-stroke-width" => text_stroke_width_px(
             value,
@@ -1077,6 +1078,16 @@ pub(super) fn accepts_longhand(property: &str, value: &str) -> bool {
 #[cfg(test)]
 fn parse(text: &str) -> Vec<(String, String, bool)> {
     parse_in(text, false)
+}
+
+#[cfg(test)]
+pub(super) fn tests_parse(text: &str) -> Vec<(String, String, bool)> {
+    parse(text)
+}
+
+#[cfg(test)]
+pub(super) fn tests_get(property: &str, declarations: &[(String, String, bool)]) -> String {
+    get(property, declarations)
 }
 
 /// `parse` for a declaration block whose Document is in quirks mode.
@@ -1191,7 +1202,22 @@ fn get(property: &str, declarations: &[(String, String, bool)]) -> String {
                 String::new()
             }
         }
-        "font" if v.len() == 5 => format!("{} {} {} / {} {}", v[0], v[1], v[2], v[3], v[4]),
+        "font" | "font-variant" | "font-synthesis" => {
+            let names = property_names(property);
+            let longhand = |name: &str| {
+                names
+                    .iter()
+                    .position(|n| n == name)
+                    .and_then(|index| v.get(index))
+                    .map(|value| value.to_string())
+            };
+            match property {
+                "font" => properties::fonts::serialize_font(&longhand),
+                "font-variant" => properties::fonts::serialize_variant(&longhand),
+                _ => properties::fonts::serialize_synthesis(&longhand),
+            }
+            .unwrap_or_default()
+        }
         "grid-row" | "grid-column" | "grid-area" => v.join(" / "),
         "gap" | "place-items" | "place-self" | "place-content" | "overflow"
             if v.len() == 2 && v[0] == v[1] =>
@@ -1354,6 +1380,8 @@ const SERIALIZED_SHORTHANDS: &[&str] = &[
     "padding",
     "inset",
     "font",
+    "font-variant",
+    "font-synthesis",
     "flex",
     "flex-flow",
     "grid-area",
@@ -1748,56 +1776,18 @@ fn resolved_shorthand_of(name: &str, longhand: &dyn Fn(&str) -> Option<String>) 
             all(&["flex-direction", "flex-wrap"]).map_or_else(String::new, |parts| parts.join(" "))
         }
         "font" => resolved_font(longhand).unwrap_or_default(),
+        "font-variant" => properties::fonts::serialize_variant(longhand).unwrap_or_default(),
+        "font-synthesis" => properties::fonts::serialize_synthesis(longhand).unwrap_or_default(),
         "background" => resolved_background(longhand).unwrap_or_default(),
         _ => return None,
     })
 }
 
-/// CSS Fonts 4 #font-prop: `[style] [small-caps] [weight] [stretch] size
+/// CSS Fonts 4 #font-prop: `[style] [small-caps] [weight] [width] size
 /// [/ line-height] family`, omitting the components at their initial value.
 /// Values the shorthand cannot express make it unrepresentable.
 fn resolved_font(longhand: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    let style = longhand("font-style")?;
-    let weight = longhand("font-weight")?;
-    let size = longhand("font-size")?;
-    let line_height = longhand("line-height")?;
-    let family = longhand("font-family")?;
-    let variant = longhand("font-variant").unwrap_or_else(|| "normal".into());
-    let stretch = longhand("font-stretch").unwrap_or_else(|| "100%".into());
-    let stretch = match stretch.as_str() {
-        "normal" | "100%" => None,
-        "50%" | "ultra-condensed" => Some("ultra-condensed"),
-        "62.5%" | "extra-condensed" => Some("extra-condensed"),
-        "75%" | "condensed" => Some("condensed"),
-        "87.5%" | "semi-condensed" => Some("semi-condensed"),
-        "112.5%" | "semi-expanded" => Some("semi-expanded"),
-        "125%" | "expanded" => Some("expanded"),
-        "150%" | "extra-expanded" => Some("extra-expanded"),
-        "200%" | "ultra-expanded" => Some("ultra-expanded"),
-        _ => return None,
-    };
-    let mut parts = Vec::new();
-    if style != "normal" {
-        parts.push(style);
-    }
-    match variant.as_str() {
-        "normal" => {}
-        "small-caps" => parts.push(variant),
-        _ => return None,
-    }
-    if !matches!(weight.as_str(), "normal" | "400") {
-        parts.push(weight);
-    }
-    if let Some(stretch) = stretch {
-        parts.push(stretch.into());
-    }
-    parts.push(size);
-    if line_height != "normal" {
-        parts.push("/".into());
-        parts.push(line_height);
-    }
-    parts.push(family);
-    Some(parts.join(" "))
+    properties::fonts::serialize_font(longhand)
 }
 
 /// CSS Backgrounds 3 #background, from resolved longhands: the shortest

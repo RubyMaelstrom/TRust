@@ -310,6 +310,26 @@ current behavior and limits; consult the governing standards before changing it.
   only its stream. Never blindly replay a possibly processed POST after
   network failure. The owned h3-quinn adapter fixes pending-read cancellation
   without copying receive buffers; keep its focused regression coverage.
+- CSS Fonts 4/5 properties beyond family/size/weight cascade in
+  `dom::properties::fonts` and reach shaping as a typed `FontTypography`
+  (`src/text/typography.rs`), resolved into Parley features and variations
+  in #feature-variation-precedence order (`opsz` follows the used size by
+  default). Small capitals and superscripts/subscripts a font lacks are
+  synthesized in `text.rs`, which maps offsets back to the source text and
+  keeps the element font's strut; the terminal cell font ignores all of it.
+  Per-face `@font-face` settings (`size-adjust`, feature/variation
+  descriptors, named instances) and `font-size-adjust` re-shape the runs of
+  the affected fonts; metric overrides rewrite the face's `hhea`/`OS/2`.
+  The vendored fontique matches with descriptor and axis ranges. Navigation
+  waits for each face through its `font-display` block period (a one-shot
+  CSS-only render waits through its swap period); later faces reach the live
+  page through `Dom::face_font` until their failure time. Faces first used
+  by dynamically added rules draw fallback text (not invisible text) during
+  their block period. Not implemented: `@font-feature-values` (the
+  functional `font-variant-alternates` values select nothing),
+  `font-language-override`, `font-palette`, the super/subscript override
+  descriptors, CSS-connected `document.fonts` faces and FontFace loading,
+  `size-adjust` in SVG text, and transitions of the new properties.
 - XMLHttpRequest, WebSocket and EventSource are shared Window/Worker platform
   blocks (`/*__XHR_BEGIN__*/`, `/*__WEBSOCKET_BEGIN__*/` and
   `/*__EVENTSOURCE_BEGIN__*/` in `src/js_platform.js`, assembled for workers by

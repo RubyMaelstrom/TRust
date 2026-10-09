@@ -543,6 +543,7 @@ mod tests {
             vec![crate::font_system::PageFont {
                 family: String::from("TRust Inline Face"),
                 bytes: mono.to_vec(),
+                ..Default::default()
             }],
             None,
             false,

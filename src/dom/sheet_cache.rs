@@ -169,8 +169,18 @@ impl Entry {
                 .iter()
                 .map(|face| {
                     face.family.capacity()
-                        + face.sources.capacity() * std::mem::size_of::<String>()
-                        + face.sources.iter().map(String::capacity).sum::<usize>()
+                        + face.sources.capacity()
+                            * std::mem::size_of::<crate::http::CssFontSource>()
+                        + face
+                            .sources
+                            .iter()
+                            .map(|source| match source {
+                                crate::http::CssFontSource::Url(text)
+                                | crate::http::CssFontSource::Local(text) => text.capacity(),
+                            })
+                            .sum::<usize>()
+                        + face.descriptors.features.capacity() * 8
+                        + face.descriptors.variations.capacity() * 8
                 })
                 .sum::<usize>()
     }

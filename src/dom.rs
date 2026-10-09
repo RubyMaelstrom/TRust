@@ -593,8 +593,9 @@ pub struct Dom {
     /// the host fetched for this arena, by absolute URL (`None` = failed).
     downloaded_fonts: FxHashMap<String, Option<std::sync::Arc<[u8]>>>,
     /// Network font sources a font set is waiting for, for the host to fetch,
-    /// and every source ever requested.
-    font_requests: RefCell<(Vec<url::Url>, FxHashSet<String>)>,
+    /// and every source ever requested with the end of its face's swap
+    /// period (CSS Fonts 4 #font-display-timeline; `None`: infinite).
+    font_requests: RefCell<FontRequests>,
     /// Style sheets `@import` rules need that no fetch obtained yet: the
     /// importing sheet's owner node and the absolute URL, each URL once
     /// (CSS Cascade 4 #fetch-an-import), for the page actor to fetch.
@@ -1319,8 +1320,8 @@ impl Dom {
         {
             let (pending, requested) = &*font_requests.borrow();
             fixed_map!(pending, url::Url);
-            fixed_map!(requested, String);
-            for url in requested {
+            fixed_map!(requested, (String, Option<std::time::Instant>));
+            for url in requested.keys() {
                 bytes = bytes.saturating_add(url.capacity());
             }
         }
@@ -5896,6 +5897,18 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
         } else {
             v
         };
+        // CSS Fonts 4: `font-width` computes to a percentage, an oblique
+        // angle to degrees and the feature and variation settings to maps
+        // sorted by tag; CSS Fonts 5 #font-size-adjust-prop: `from-font`
+        // computes to the first available font's metric.
+        let v = if (name == "font-style" || properties::fonts::owns(name))
+            && v.as_deref().is_some_and(|value| {
+                wide_keyword(value).is_none() && find_var_function(value).is_none()
+            }) {
+            v.map(|value| self.font_computed_value(id, name, &value))
+        } else {
+            v
+        };
         // CSS Color 4 #currentcolor-color: `currentcolor` in `color` is the
         // inherited color, so it computes against the parent's color here,
         // before inheritance: descendants inherit the mixed color instead of
@@ -5930,6 +5943,53 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
 }
 
 impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
+    /// The computed value of a CSS Fonts longhand from its canonical
+    /// specified value (`properties::fonts`).
+    fn font_computed_value(&self, id: NodeId, name: &str, value: &str) -> String {
+        if name == "font-size-adjust"
+            && let Some(metric) = value.strip_suffix("from-font")
+        {
+            // "Computes to the <number> corresponding to the specified
+            // metric of the first available font, if it exists. Otherwise,
+            // the same as none."
+            let metric = metric.trim();
+            let kind = crate::text::typography::SizeAdjustMetric::parse(if metric.is_empty() {
+                "ex-height"
+            } else {
+                metric
+            })
+            .unwrap_or_default();
+            let style = crate::text::TextStyle {
+                family: self
+                    .computed_value_resolved(id, "font-family")
+                    .unwrap_or_else(|| "sans-serif".into()),
+                font_set: self.document_font_set(id),
+                size: self.font_px(id).max(1.0),
+                weight: self
+                    .computed_value_resolved(id, "font-weight")
+                    .as_deref()
+                    .and_then(crate::layout2::css_font_weight)
+                    .unwrap_or(400.),
+                italic: self
+                    .computed_value_resolved(id, "font-style")
+                    .is_some_and(|v| crate::layout2::css_is_italic(&v)),
+                ..crate::text::TextStyle::default()
+            };
+            return match crate::text::first_available_metric(&style, kind) {
+                Some(ratio) => {
+                    let number = cssom::css_number(f64::from(ratio));
+                    if metric.is_empty() || metric == "ex-height" {
+                        number
+                    } else {
+                        format!("{metric} {number}")
+                    }
+                }
+                None => "none".into(),
+            };
+        }
+        properties::fonts::computed(name, value)
+    }
+
     /// `computed_value` with `var()` references substituted — what
     /// getComputedStyle exposes to JS. CSS variables resolve in computed
     /// style (`Supports.variable` sets `margin-right:var(--x)` and reads
@@ -6088,6 +6148,26 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             Ok(computed) => computed.unwrap_or(value),
             Err(()) => "unset".to_owned(),
         };
+        // A substituted font value outside its grammar is invalid at
+        // computed-value time; a valid one takes its computed form.
+        let value = if (name == "font-style" || properties::fonts::owns(name))
+            && resolved_wide_keyword(&value).is_none()
+            && self
+                .computed_value(id, name)
+                .is_some_and(|raw| find_var_function(&raw).is_some())
+        {
+            let specified = if name == "font-style" {
+                properties::fonts::font_style(&value)
+            } else {
+                properties::fonts::specified(name, &value)
+            };
+            specified.map_or_else(
+                || "unset".to_owned(),
+                |specified| self.font_computed_value(id, name, &specified),
+            )
+        } else {
+            value
+        };
         let inherited = || prop_index(name).is_some_and(|index| PROPS[index].inherited);
         match resolved_wide_keyword(&value) {
             Some(WideKeyword::Initial) => None,
@@ -6155,6 +6235,11 @@ impl Dom {
     }
 
     pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
+        // WHATWG Compatibility #css-simple-aliases: a legacy name alias
+        // reads its standard property (`font-stretch` is `font-width`).
+        if let Some(standard) = legacy_name_alias(name) {
+            return self.cssom_resolved_value(id, standard);
+        }
         if let Some(physical) = self.logical_property(id, None, name) {
             return self.cssom_resolved_value(id, &physical);
         }
@@ -7014,7 +7099,13 @@ impl<B: StyleBackend + ?Sized> ComputeView<'_, B> {
             // inherit these from its context.
             "font-weight"
             | "font-style"
-            | "font-variant"
+            | "font-variant-ligatures"
+            | "font-variant-caps"
+            | "font-variant-alternates"
+            | "font-variant-numeric"
+            | "font-variant-east-asian"
+            | "font-variant-position"
+            | "font-variant-emoji"
             | "line-height"
             | "white-space"
             | "white-space-collapse"
@@ -8701,22 +8792,44 @@ impl Dom {
         }
     }
 
-    /// CSS Fonts 4 #src-desc: the first of a face's sources that loads. Data
-    /// URLs decode at once; a network source the host has not fetched yet is
-    /// queued for it, and the face is unavailable (falling back) meanwhile.
-    /// The foreground document's load already installed its initial sheets'
-    /// downloaded faces globally.
+    /// CSS Fonts 4 #src-desc: the first of a face's sources that loads.
+    /// `local()` faces come from the installed fonts and data URLs decode at
+    /// once; a network source the host has not fetched yet is queued for it,
+    /// and the face is unavailable (falling back) meanwhile. The foreground
+    /// document's load already installed its initial sheets' downloadable
+    /// faces globally, except those still loading after their block period.
     fn face_font(
         &self,
         face: crate::http::CssFontFace,
         foreground: bool,
     ) -> Option<crate::font_system::PageFont> {
+        let finish = |font: crate::font_system::PageFont, fragment: Option<&str>| {
+            Some(
+                font.select_face(fragment)?
+                    .restrict_to(&face.unicode_range)
+                    .with_descriptors(face.descriptors.clone()),
+            )
+        };
+        let installed = foreground && crate::font_system::page_font_family_installed(&face.family);
         for source in &face.sources {
+            let source = match source {
+                crate::http::CssFontSource::Local(name) => {
+                    if let Some(font) =
+                        crate::font_system::PageFont::from_local(face.family.clone(), name)
+                    {
+                        return finish(font, None);
+                    }
+                    continue;
+                }
+                crate::http::CssFontSource::Url(source) => source,
+            };
             if source.starts_with("data:") {
+                let fragment = source.rsplit_once('#').map(|(_, fragment)| fragment);
                 if let Some(font) = crate::img::decode_data_url(source).and_then(|bytes| {
                     crate::font_system::PageFont::from_web_resource(face.family.clone(), bytes)
-                }) {
-                    return Some(font.restrict_to(&face.unicode_range));
+                }) && let Some(font) = finish(font, fragment)
+                {
+                    return Some(font);
                 }
                 continue;
             }
@@ -8731,17 +8844,22 @@ impl Dom {
                     if let Some(font) = crate::font_system::PageFont::from_web_resource(
                         face.family.clone(),
                         bytes.to_vec(),
-                    ) {
-                        return Some(font.restrict_to(&face.unicode_range));
+                    ) && let Some(font) = finish(font, url.fragment())
+                    {
+                        return Some(font);
                     }
                 }
                 Some(None) => {}
                 None => {
-                    if foreground && crate::font_system::page_font_family_installed(&face.family) {
+                    if installed && crate::font_system::late_page_face(url.as_str()).is_none() {
                         return None;
                     }
                     let mut requests = self.font_requests.borrow_mut();
-                    if requests.1.insert(url.to_string()) {
+                    if !requests.1.contains_key(url.as_str()) {
+                        // The font download timer starts at this first use.
+                        let (block, swap) = face.descriptors.display.periods();
+                        let failure = swap.map(|swap| std::time::Instant::now() + block + swap);
+                        requests.1.insert(url.to_string(), failure);
                         requests.0.push(url);
                     }
                     return None;
@@ -8760,6 +8878,11 @@ impl Dom {
     /// Record a fetched `@font-face` source (`None` when it failed), so the
     /// rebuilt font sets use it or move on to the face's next source.
     pub(crate) fn install_downloaded_font(&mut self, url: &str, bytes: Option<Vec<u8>>) {
+        // CSS Fonts 4 #font-display-timeline: a face not loaded when its
+        // failure period starts "is marked as a failed load, causing normal
+        // font fallback"; it is not swapped in afterwards.
+        let failure = self.font_requests.borrow().1.get(url).copied().flatten();
+        let bytes = bytes.filter(|_| failure.is_none_or(|end| std::time::Instant::now() <= end));
         self.downloaded_fonts
             .insert(url.to_string(), bytes.map(Into::into));
         self.touch_style();
@@ -16695,6 +16818,23 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "font-family",
     "font-weight",
     "font-style",
+    "font-width",
+    "font-kerning",
+    "font-optical-sizing",
+    "font-variant-ligatures",
+    "font-variant-caps",
+    "font-variant-numeric",
+    "font-variant-east-asian",
+    "font-variant-position",
+    "font-variant-alternates",
+    "font-variant-emoji",
+    "font-feature-settings",
+    "font-variation-settings",
+    "font-synthesis-weight",
+    "font-synthesis-style",
+    "font-synthesis-small-caps",
+    "font-synthesis-position",
+    "font-size-adjust",
     "line-height",
     "white-space",
     "white-space-collapse",
@@ -16817,6 +16957,28 @@ const PROPS: &[PropDef] = &[
     prop("font-family", true, true),
     prop("font-weight", true, true),
     prop("font-style", true, true),
+    // CSS Fonts 4 #font-width-prop (`font-stretch` is its legacy name
+    // alias), #font-kerning-prop, #font-variant-*-prop, #font-feature-
+    // settings-prop, #font-variation-settings-def, #font-optical-sizing-def,
+    // #font-synthesis and CSS Fonts 5 #font-size-adjust-prop: all inherited
+    // (`properties::fonts` owns their grammars and computed values).
+    prop("font-width", true, true),
+    prop("font-kerning", true, true),
+    prop("font-optical-sizing", true, true),
+    prop("font-variant-ligatures", true, true),
+    prop("font-variant-caps", true, true),
+    prop("font-variant-numeric", true, true),
+    prop("font-variant-east-asian", true, true),
+    prop("font-variant-position", true, true),
+    prop("font-variant-alternates", true, true),
+    prop("font-variant-emoji", true, true),
+    prop("font-feature-settings", true, true),
+    prop("font-variation-settings", true, true),
+    prop("font-synthesis-weight", true, true),
+    prop("font-synthesis-style", true, true),
+    prop("font-synthesis-small-caps", true, true),
+    prop("font-synthesis-position", true, true),
+    prop("font-size-adjust", true, true),
     prop("line-height", true, true),
     prop("white-space", true, true),
     // CSS Text 4: `white-space` and `text-wrap` expand to these inherited
@@ -17167,7 +17329,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         | "row-gap"
         | "column-gap"
         | "line-break" => Some("normal"),
-        "font-stretch" => Some("100%"),
+        "font-stretch" | "font-width" => Some("100%"),
         "text-align" => Some("start"),
         "color-scheme" => Some("normal"),
         "text-align-last" => Some("auto"),
@@ -17196,7 +17358,7 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         "column-rule-width" => Some("medium"),
         "break-before" | "break-after" | "break-inside" => Some("auto"),
         "orphans" | "widows" => Some("2"),
-        _ => None,
+        _ => properties::fonts::initial(name),
     }
 }
 
@@ -18531,52 +18693,57 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ("flex-basis".to_string(), b),
         ];
     }
-    // `font`: `<style> || <variant> || <weight> || <stretch> <size>
-    // [/ <line-height>] <family>` (CSS Fonts §6.3) — expand the components we
-    // track. The size is the first size-shaped token; everything after it is
-    // the optional line-height and family. System-font keywords
+    // CSS Fonts 4 #font-prop: `[ <'font-style'> || <font-variant-css2> ||
+    // <'font-weight'> || <font-width-css3> ]? <'font-size'> [ / <'line-height'>
+    // ]? <'font-family'>#`. "All subproperties of the font property in the
+    // Set Explicitly and Reset Implicitly groups are first reset to their
+    // initial values"; the given ones are then set. System-font keywords
     // (`caption`, `menu`, …) expand to nothing.
     if prop == "font" {
+        let resets = properties::fonts::FONT_RESETS
+            .iter()
+            .filter(|(name, _)| *name != "font-width");
         if wide_keyword(value).is_some() {
-            return vec![
-                ("font-style".to_string(), value.to_string()),
-                ("font-weight".to_string(), value.to_string()),
-                ("font-size".to_string(), value.to_string()),
-                ("line-height".to_string(), value.to_string()),
-                ("font-family".to_string(), value.to_string()),
-            ];
+            return properties::fonts::FONT_SET
+                .iter()
+                .copied()
+                .chain(resets.map(|(name, _)| *name))
+                .map(|name| (name.to_string(), value.to_string()))
+                .collect();
         }
         let tokens = split_top_level_ws(value);
-        let (mut style, mut weight, mut size) = (None, None, None);
         let mut size_index = None;
         for (index, tok) in tokens.iter().copied().enumerate() {
             // CSS Syntax 3 #consume-component-value: a slash inside a
             // calculation is not the font-size/line-height separator.
             let t = split_top_level_slash(tok).map_or(tok, |(size, _)| size);
-            match t.to_ascii_lowercase().as_str() {
-                "italic" | "oblique" => style = Some(t.to_string()),
-                "bold" | "bolder" | "lighter" => weight = Some(t.to_string()),
-                w if w
-                    .parse::<u16>()
-                    .is_ok_and(|n| (100..=900).contains(&n) && n % 100 == 0) =>
-                {
-                    weight = Some(t.to_string());
-                }
-                s if font_size_token(s) => {
-                    size = Some(t.to_string());
-                    size_index = Some(index);
-                    break;
-                }
-                _ => {}
+            let lower = t.to_ascii_lowercase();
+            let angle = index > 0
+                && tokens[index - 1].eq_ignore_ascii_case("oblique")
+                && t.ends_with(|c: char| c.is_ascii_alphabetic())
+                && crate::text::typography::parse_angle_deg(t).is_some();
+            // Numbers from 1 to 1000 are weights; a font size has a unit
+            // (or is a unitless zero).
+            let weight = t.parse::<f32>().is_ok_and(|n| (1.0..=1000.0).contains(&n));
+            if !angle && !weight && font_size_token(&lower) {
+                size_index = Some(index);
+                break;
             }
         }
         // No size ⇒ not a valid `font` shorthand (a system-font keyword or
-        // garbage) — drop whole, as before. With a size, the shorthand
-        // RESETS the omitted longhands to `normal` (CSS Fonts §6.3).
-        let Some(size) = size else {
+        // garbage) — drop whole.
+        let Some(index) = size_index else {
             return Vec::new();
         };
-        let index = size_index.unwrap_or(0);
+        let Some((style, variant, weight, width)) =
+            properties::fonts::font_prefix(&tokens[..index])
+        else {
+            return Vec::new();
+        };
+        let tok = tokens[index];
+        let size = split_top_level_slash(tok)
+            .map_or(tok, |(size, _)| size)
+            .to_string();
         // CSS Fonts 4 #font-prop allows whitespace on either side of '/'.
         // Rejoin component values so both `16px/ 1.5 serif` and functional
         // sizes/line heights preserve the following family list intact.
@@ -18594,29 +18761,46 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         if family.is_empty() || split_top_level_slash(&family).is_some() {
             return Vec::new();
         }
-        return vec![
+        let normal = || String::from("normal");
+        let mut out = vec![
+            ("font-style".to_string(), style.unwrap_or_else(normal)),
             (
-                "font-style".to_string(),
-                style.unwrap_or_else(|| "normal".into()),
+                "font-variant-caps".to_string(),
+                variant.unwrap_or_else(normal),
             ),
-            (
-                "font-weight".to_string(),
-                weight.unwrap_or_else(|| "normal".into()),
-            ),
+            ("font-weight".to_string(), weight.unwrap_or_else(normal)),
+            ("font-width".to_string(), width.unwrap_or_else(normal)),
             ("font-size".to_string(), size),
             (
                 "line-height".to_string(),
-                line_height.unwrap_or_else(|| "normal".into()),
+                line_height.unwrap_or_else(normal),
             ),
-            (
-                "font-family".to_string(),
-                if family.is_empty() {
-                    "serif".into()
-                } else {
-                    family
-                },
-            ),
+            ("font-family".to_string(), family),
         ];
+        out.extend(resets.map(|(name, initial)| (name.to_string(), initial.to_string())));
+        return out;
+    }
+    // CSS Fonts 4 #font-variant-prop and #font-synthesis: shorthands that
+    // reset their unspecified longhands.
+    if prop == "font-variant" || prop == "font-synthesis" {
+        let longhands = if prop == "font-variant" {
+            properties::fonts::expand_variant("normal")
+        } else {
+            properties::fonts::expand_synthesis("none")
+        }
+        .unwrap_or_default();
+        if wide_keyword(value).is_some() {
+            return longhands
+                .into_iter()
+                .map(|(name, _)| (name, value.to_string()))
+                .collect();
+        }
+        return if prop == "font-variant" {
+            properties::fonts::expand_variant(value)
+        } else {
+            properties::fonts::expand_synthesis(value)
+        }
+        .unwrap_or_default();
     }
     // `background`: only the color and the image longhands are consumed (the
     // layout paints no color, but a declared background is an OPAQUE FILL in
@@ -21045,6 +21229,10 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
                 | "negative"
                 | "fallback"
                 | "system"
+                // CSS Fonts 4 #font-variant-alternates-prop: feature value
+                // names are case-sensitive identifiers.
+                | "font-variant"
+                | "font-variant-alternates"
         )
     {
         v.to_string()
@@ -21142,6 +21330,21 @@ fn parse_decl_in(decl: &str, quirks: bool) -> Option<(String, String, bool)> {
     {
         return None;
     }
+    // CSS Fonts 4 (#font-style-prop, #font-width-prop, … CSS Fonts 5
+    // #font-size-adjust-prop): a value outside the property's grammar is
+    // invalid at parse time; a valid one is kept in its canonical form.
+    let value = if (k == "font-style" || properties::fonts::owns(&k))
+        && wide_keyword(&value).is_none()
+        && find_var_function(&value).is_none()
+    {
+        if k == "font-style" {
+            properties::fonts::font_style(&value)?
+        } else {
+            properties::fonts::specified(&k, &value)?
+        }
+    } else {
+        value
+    };
     // CSS Fonts 4 #font-size-prop: anything but an <absolute-size>,
     // <relative-size>, non-negative <length-percentage> or `math` is invalid,
     // so an earlier declaration stays in force. A missing semicolon made
@@ -21952,7 +22155,8 @@ fn parse_sheet(
                     // CSS Values 4 #relative-urls: against the sheet's URL.
                     if let Some(base) = base {
                         for source in &mut face.sources {
-                            if !source.starts_with("data:")
+                            if let crate::http::CssFontSource::Url(source) = source
+                                && !source.starts_with("data:")
                                 && let Ok(url) = base.join(source)
                             {
                                 *source = url.to_string();
@@ -22187,6 +22391,16 @@ fn parse_sheet(
 
 /// WHATWG Compatibility #css-legacy-name-aliases: a `-webkit-` name that
 /// parses exactly as its unprefixed property.
+/// The network font sources a document waits for, and each requested
+/// source's failure time (`Dom::font_requests`).
+type FontRequests = (Vec<url::Url>, FxHashMap<String, Option<std::time::Instant>>);
+
+/// CSS Font Loading 3: a FontFace attribute value as its `@font-face`
+/// descriptor `name` serializes it; `None` when invalid.
+pub(crate) fn font_face_descriptor(name: &str, value: &str) -> Option<String> {
+    properties::fonts::font_face_descriptor(name, value)
+}
+
 fn legacy_name_alias(name: &str) -> Option<&'static str> {
     Some(match name {
         "-webkit-align-items" => "align-items",
@@ -22245,6 +22459,8 @@ fn legacy_name_alias(name: &str) -> Option<&'static str> {
         "-webkit-transition-property" => "transition-property",
         "-webkit-transition-timing-function" => "transition-timing-function",
         "-webkit-transition" => "transition",
+        // CSS Fonts 4 #font-stretch-prop.
+        "font-stretch" => "font-width",
         _ => return None,
     })
 }

@@ -2,12 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Implementation of the CSS font matching algorithm.
+//!
+//! TRust: CSS Fonts 4 #font-style-matching (csswg-drafts 81c27f686901) with
+//! ranges. A face supports a range of widths, weights, and italic values or
+//! oblique angles: a variable font through its `wdth`, `wght`, `ital` and
+//! `slnt` axes, an `@font-face` face through its descriptors. "The algorithm
+//! proceeds as if each supported combination of values is a unique font in
+//! the set": each step finds the value nearest the desired one in the
+//! specified search order among those the remaining faces support, then
+//! removes the faces that do not support it.
 
-use super::font::FontInfo;
+use super::font::{FontInfo, StyleRange};
 use crate::{FontStyle, FontWeight, FontWidth};
 use smallvec::SmallVec;
 
-const DEFAULT_OBLIQUE_ANGLE: f32 = 14.0;
+/// The default `oblique` angle (#font-style-prop: "the lack of an <angle>
+/// represents 14deg").
+pub(crate) const DEFAULT_OBLIQUE_ANGLE: f32 = 14.0;
+
+/// The angle at which an `oblique` request prefers larger angles and the
+/// italic search looks for oblique faces (#font-style-matching uses 11deg).
+const OBLIQUE_THRESHOLD: f32 = 11.0;
+
+#[derive(Copy, Clone)]
+struct Candidate {
+    index: usize,
+    width: [f32; 2],
+    weight: [f32; 2],
+    style: StyleRange,
+}
 
 pub fn match_font(
     set: &[FontInfo],
@@ -16,449 +39,330 @@ pub fn match_font(
     weight: FontWeight,
     synthesize_style: bool,
 ) -> Option<usize> {
-    const OBLIQUE_THRESHOLD: f32 = DEFAULT_OBLIQUE_ANGLE;
     match set.len() {
         0 => return None,
         1 => return Some(0),
         _ => {}
     }
-    #[derive(Copy, Clone)]
-    struct Candidate {
-        index: usize,
-        width: i32,
-        style: FontStyle,
-        weight: f32,
-        has_slnt: bool,
-    }
     let mut set: SmallVec<[Candidate; 16]> = set
         .iter()
         .enumerate()
-        .map(|(i, font)| Candidate {
-            index: i,
-            width: (font.width().ratio() * 100.0) as i32,
-            style: font.style(),
-            weight: font.weight().value(),
-            has_slnt: font.has_slant_axis(),
+        .map(|(index, font)| Candidate {
+            index,
+            width: font.width_range(),
+            weight: font.weight_range(),
+            style: font.style_range(),
         })
         .collect();
-    let width = (width.ratio() * 100.0) as i32;
-    let weight = weight.value();
-    // font-width is tried first:
-    let mut use_width = set[0].width;
-    if !set.iter().any(|f| f.width == width) {
-        // If the desired width value is less than or equal to 100%...
-        if width <= 100 {
-            // width values below the desired width value are checked in
-            // descending order...
-            if let Some(found) = set
-                .iter()
-                .filter(|f| f.width < width)
-                .max_by_key(|f| f.width)
-            {
-                use_width = found.width;
-            }
-            // followed by width values above the desired width value in
-            // ascending order until a match is found.
-            else if let Some(found) = set
-                .iter()
-                .filter(|f| f.width > width)
-                .min_by_key(|f| f.width)
-            {
-                use_width = found.width;
-            }
-        }
-        // Otherwise, ...
-        else {
-            // width values above the desired width value are checked in
-            // ascending order...
-            if let Some(found) = set
-                .iter()
-                .filter(|f| f.width > width)
-                .min_by_key(|f| f.width)
-            {
-                use_width = found.width;
-            }
-            // followed by width values below the desired width value in
-            // descending order until a match is found.
-            else if let Some(found) = set
-                .iter()
-                .filter(|f| f.width < width)
-                .max_by_key(|f| f.width)
-            {
-                use_width = found.width;
-            }
-        }
+    // Step 4.1: 'font-width' is tried first.
+    let desired = width.ratio();
+    let widths: SmallVec<[[f32; 2]; 16]> = set.iter().map(|f| f.width).collect();
+    let found = if contains_any(&widths, desired) {
+        Some(desired)
+    } else if desired <= 1.0 {
+        below(&widths, desired, f32::NEG_INFINITY).or_else(|| above(&widths, desired, f32::INFINITY))
     } else {
-        use_width = width;
+        above(&widths, desired, f32::INFINITY).or_else(|| below(&widths, desired, f32::NEG_INFINITY))
+    };
+    if let Some(found) = found {
+        set.retain(|f| contains(f.width, found));
     }
-    set.retain(|f| f.width == use_width);
-    use core::cmp::Ordering::*;
-    let oblique_fonts = set.iter().filter_map(|f| oblique_style(f.style));
-    // font-style is tried next:
-    // NOTE: this code uses an oblique threshold of 14deg rather than
-    // the current value of 20deg in the spec.
-    // See: https://github.com/w3c/csswg-drafts/issues/2295
-    let mut use_style = style;
-    let mut _use_slnt = false;
-    if !set.iter().any(|f| f.style == use_style) {
-        // If the value of font-style is italic:
-        if style == FontStyle::Italic {
-            // oblique values greater than or equal to 14deg are checked in
-            // ascending order
-            if let Some(found) = oblique_fonts
-                .clone()
-                .filter(|(_, a)| *a >= OBLIQUE_THRESHOLD)
-                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-            {
-                use_style = found.0;
-            }
-            // followed by positive oblique values below 14deg in descending order
-            else if let Some(found) = oblique_fonts
-                .clone()
-                .filter(|(_, a)| *a > 0. && *a < OBLIQUE_THRESHOLD)
-                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-            {
-                use_style = found.0;
-            }
-            // If no match is found, oblique values less than or equal to 0deg
-            // are checked in descending order until a match is found.
-            else if let Some(found) = oblique_fonts
-                .clone()
-                .filter(|(_, a)| *a < 0.)
-                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-            {
-                use_style = found.0;
-            } else {
-                use_style = set[0].style;
-            }
+    // Step 4.2: 'font-style' is tried next.
+    match style_match(&set, style, synthesize_style) {
+        Some(StyleMatch::Oblique(angle)) => {
+            set.retain(|f| f.style.oblique.is_some_and(|range| contains(range, angle)));
         }
-        // If the value of font-style is oblique...
-        else if let Some(angle) = oblique_angle(style) {
-            // and the requested angle is greater than or equal to 14deg
-            if angle >= OBLIQUE_THRESHOLD {
-                // oblique values greater than or equal to angle are checked in
-                // ascending order
-                if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a >= angle)
-                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                }
-                // followed by positive oblique values below angle in descending order
-                else if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a > 0. && *a < angle)
-                    .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                } else {
-                    // If font-synthesis-style has the value auto, then for variable
-                    // fonts with a slnt axis a match is created by setting the slnt
-                    // value with the specified oblique value; otherwise, a fallback
-                    // match is produced by geometric shearing to the specified
-                    // oblique value.
-                    if synthesize_style {
-                        if set.iter().any(|f| f.has_slnt) {
-                            _use_slnt = true;
-                        } else {
-                            use_style = if set.iter().any(|f| f.style == FontStyle::Normal) {
-                                FontStyle::Normal
-                            } else {
-                                set[0].style
-                            };
-                        }
-                    } else {
-                        // Choose an italic style
-                        if set.iter().any(|f| f.style == FontStyle::Italic) {
-                            use_style = FontStyle::Italic;
-                        }
-                        // oblique values less than or equal to 0deg are checked in descending order
-                        else if let Some(found) = oblique_fonts
-                            .clone()
-                            .filter(|(_, a)| *a <= 0.)
-                            .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                        {
-                            use_style = found.0;
-                        } else {
-                            use_style = set[0].style;
-                        }
-                    }
-                }
-            }
-            // if the requested angle is greater than or equal to 0deg
-            // and less than 14deg
-            else if angle >= 0. {
-                // positive oblique values below angle in descending order
-                if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a > 0. && *a < angle)
-                    .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                }
-                // followed by oblique values greater than or equal to angle in
-                // ascending order
-                else if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a >= angle)
-                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                } else {
-                    // If font-synthesis-style has the value auto, then for variable
-                    // fonts with a slnt axis a match is created by setting the slnt
-                    // value with the specified oblique value; otherwise, a fallback
-                    // match is produced by geometric shearing to the specified
-                    // oblique value.
-                    if synthesize_style {
-                        if set.iter().any(|f| f.has_slnt) {
-                            _use_slnt = true;
-                        } else {
-                            use_style = if set.iter().any(|f| f.style == FontStyle::Normal) {
-                                FontStyle::Normal
-                            } else {
-                                set[0].style
-                            };
-                        }
-                    } else {
-                        // Choose an italic style
-                        if set.iter().any(|f| f.style == FontStyle::Italic) {
-                            use_style = FontStyle::Italic;
-                        }
-                        // oblique values less than or equal to 0deg are checked in descending order
-                        else if let Some(found) = oblique_fonts
-                            .clone()
-                            .filter(|(_, a)| *a <= 0.)
-                            .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                        {
-                            use_style = found.0;
-                        } else {
-                            use_style = set[0].style;
-                        }
-                    }
-                }
-            }
-            // -14deg < angle < 0deg
-            else if angle > -OBLIQUE_THRESHOLD {
-                // negative oblique values above angle in ascending order
-                if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a < 0. && *a > angle)
-                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                }
-                // followed by oblique values less than or equal to angle in
-                // descending order
-                else if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a <= angle)
-                    .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                } else {
-                    // If font-synthesis-style has the value auto, then for variable
-                    // fonts with a slnt axis a match is created by setting the slnt
-                    // value with the specified oblique value; otherwise, a fallback
-                    // match is produced by geometric shearing to the specified
-                    // oblique value.
-                    if synthesize_style {
-                        if set.iter().any(|f| f.has_slnt) {
-                            _use_slnt = true;
-                        } else {
-                            use_style = if set.iter().any(|f| f.style == FontStyle::Normal) {
-                                FontStyle::Normal
-                            } else {
-                                set[0].style
-                            };
-                        }
-                    } else {
-                        // Choose an italic style
-                        if set.iter().any(|f| f.style == FontStyle::Italic) {
-                            use_style = FontStyle::Italic;
-                        }
-                        // oblique values greater than or equal to 0deg are checked in ascending order
-                        else if let Some(found) = oblique_fonts
-                            .clone()
-                            .filter(|(_, a)| *a >= 0.)
-                            .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                        {
-                            use_style = found.0;
-                        } else {
-                            use_style = set[0].style;
-                        }
-                    }
-                }
-            }
-            // angle < -14 deg
-            else {
-                // oblique values less than or equal to angle are checked in
-                // descending order
-                if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a <= angle)
-                    .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                }
-                // followed by negative oblique values above angle in ascending order
-                else if let Some(found) = oblique_fonts
-                    .clone()
-                    .filter(|(_, a)| *a < 0. && *a > angle)
-                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                {
-                    use_style = found.0;
-                } else {
-                    // If font-synthesis-style has the value auto, then for variable
-                    // fonts with a slnt axis a match is created by setting the slnt
-                    // value with the specified oblique value; otherwise, a fallback
-                    // match is produced by geometric shearing to the specified
-                    // oblique value.
-                    if synthesize_style {
-                        if set.iter().any(|f| f.has_slnt) {
-                            _use_slnt = true;
-                        } else {
-                            use_style = if set.iter().any(|f| f.style == FontStyle::Normal) {
-                                FontStyle::Normal
-                            } else {
-                                set[0].style
-                            };
-                        }
-                    } else {
-                        // Choose an italic style
-                        if set.iter().any(|f| f.style == FontStyle::Italic) {
-                            use_style = FontStyle::Italic;
-                        }
-                        // oblique values greater than or equal to 0deg are checked in ascending order
-                        else if let Some(found) = oblique_fonts
-                            .clone()
-                            .filter(|(_, a)| *a >= 0.)
-                            .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-                        {
-                            use_style = found.0;
-                        } else {
-                            use_style = set[0].style;
-                        }
-                    }
-                }
-            }
+        Some(StyleMatch::Italic(value)) => {
+            set.retain(|f| f.style.italic.is_some_and(|range| contains(range, value)));
         }
-        // If the value of font-style is normal...
-        else {
-            // oblique values greater than or equal to 0deg are checked in
-            // ascending order
-            if let Some(found) = oblique_fonts
-                .clone()
-                .filter(|(_, a)| *a >= 0.)
-                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-            {
-                use_style = found.0;
-            }
-            // followed by italic fonts
-            else if let Some(found) = set.iter().find(|f| f.style == FontStyle::Italic) {
-                use_style = found.style;
-            }
-            // followed by oblique values less than 0deg in descending order
-            else if let Some(found) = oblique_fonts
-                .clone()
-                .filter(|(_, a)| *a < 0.)
-                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Less))
-            {
-                use_style = found.0;
-            } else {
-                use_style = set[0].style;
-            }
-        }
+        None => {}
     }
-    set.retain(|f| f.style == use_style);
-    // font-weight is matched next:
-    if let Some(f) = set.iter().find(|f| f.weight == weight) {
-        return Some(f.index);
+    // Step 4.3: 'font-weight' is matched next.
+    let desired = weight.value();
+    let weights: SmallVec<[[f32; 2]; 16]> = set.iter().map(|f| f.weight).collect();
+    let found = if contains_any(&weights, desired) {
+        Some(desired)
+    } else if (400.0..=500.0).contains(&desired) {
+        // Weights at or above the target up to 500, then below the target
+        // in descending order, then above 500.
+        above(&weights, desired, 500.0)
+            .or_else(|| below(&weights, desired, f32::NEG_INFINITY))
+            .or_else(|| above(&weights, 500.0, f32::INFINITY))
+    } else if desired < 400.0 {
+        below(&weights, desired, f32::NEG_INFINITY)
+            .or_else(|| above(&weights, desired, f32::INFINITY))
     } else {
-        // If the desired weight is inclusively between 400 and 500...
-        if (400.0..=500.0).contains(&weight) {
-            // weights greater than or equal to the target weight are checked in ascending
-            // order until 500 is hit and checked
-            if let Some(found) = set
-                .iter()
-                .enumerate()
-                .filter(|f| f.1.weight >= weight && f.1.weight <= 500.0)
-                .min_by(|x, y| x.1.weight.partial_cmp(&y.1.weight).unwrap_or(Less))
-            {
-                return Some(found.1.index);
-            }
-            // followed by weights less than the target weight in descending order
-            if let Some(found) = set
-                .iter()
-                .enumerate()
-                .filter(|f| f.1.weight < weight)
-                .max_by(|x, y| x.1.weight.partial_cmp(&y.1.weight).unwrap_or(Less))
-            {
-                return Some(found.1.index);
-            }
-            // followed by weights greater than 500, until a match is found.
-            if let Some(found) = set
-                .iter()
-                .enumerate()
-                .filter(|f| f.1.weight > 500.0)
-                .min_by(|x, y| x.1.weight.partial_cmp(&y.1.weight).unwrap_or(Less))
-            {
-                return Some(found.1.index);
-            }
-        }
-        // If the desired weight is less than 400...
-        else if weight < 400.0 {
-            // weights less than or equal to the target weight are checked in descending
-            if let Some(found) = set
-                .iter()
-                .filter(|f| f.weight <= weight)
-                .max_by(|x, y| x.weight.partial_cmp(&y.weight).unwrap_or(Less))
-            {
-                return Some(found.index);
-            }
-            // followed by weights greater than the target weight in ascending order
-            if let Some(found) = set
-                .iter()
-                .filter(|f| f.weight > weight)
-                .min_by(|x, y| x.weight.partial_cmp(&y.weight).unwrap_or(Less))
-            {
-                return Some(found.index);
-            }
-        }
-        // If the desired weight is greater than 500...
-        else {
-            // weights greater than or equal to the target weight are checked in ascending
-            if let Some(found) = set
-                .iter()
-                .filter(|f| f.weight >= weight)
-                .min_by(|x, y| x.weight.partial_cmp(&y.weight).unwrap_or(Less))
-            {
-                return Some(found.index);
-            }
-            // followed by weights less than the target weight in descending order
-            if let Some(found) = set
-                .iter()
-                .filter(|f| f.weight < weight)
-                .max_by(|x, y| x.weight.partial_cmp(&y.weight).unwrap_or(Less))
-            {
-                return Some(found.index);
-            }
-        }
+        above(&weights, desired, f32::INFINITY)
+            .or_else(|| below(&weights, desired, f32::NEG_INFINITY))
+    };
+    if let Some(found) = found {
+        set.retain(|f| contains(f.weight, found));
     }
-    None
+    // "more than one font might be remaining ... it must not differ between
+    // two elements in the same document": the first in registration order.
+    set.first().map(|f| f.index)
 }
 
-fn oblique_angle(style: FontStyle) -> Option<f32> {
+/// The value the style search settled on: the faces kept are those whose
+/// oblique (or italic) range includes it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum StyleMatch {
+    Oblique(f32),
+    Italic(f32),
+}
+
+fn style_match(set: &[Candidate], style: FontStyle, synthesize: bool) -> Option<StyleMatch> {
+    let obliques: SmallVec<[[f32; 2]; 16]> = set.iter().filter_map(|f| f.style.oblique).collect();
+    let italics: SmallVec<[[f32; 2]; 16]> = set.iter().filter_map(|f| f.style.italic).collect();
+    let oblique = |value: Option<f32>| value.map(StyleMatch::Oblique);
+    let italic = |value: Option<f32>| value.map(StyleMatch::Italic);
+    // The faces a synthetic oblique of the default (upright) face can serve.
+    let synthetic = || {
+        (synthesize && contains_any(&obliques, 0.0)).then_some(StyleMatch::Oblique(0.0))
+    };
+    let inf = f32::INFINITY;
     match style {
-        FontStyle::Oblique(angle) => Some(angle.unwrap_or(DEFAULT_OBLIQUE_ANGLE)),
-        _ => None,
+        FontStyle::Italic => {
+            // 1. Faces whose italic values include 1.
+            if contains_any(&italics, 1.0) {
+                return Some(StyleMatch::Italic(1.0));
+            }
+            // 2. Italic values above 1 ascending, then below 1 descending
+            //    until 0 (positive values only). 3. An `ital` axis already
+            //    makes its range include 1.
+            italic(above(&italics, 1.0, inf))
+                .or_else(|| italic(below_exclusive(&italics, 1.0, 0.0)))
+                // 4. Oblique values >= 11deg ascending, then below 11deg
+                //    descending until 0.
+                .or_else(|| oblique(above(&obliques, OBLIQUE_THRESHOLD, inf)))
+                .or_else(|| oblique(below_exclusive(&obliques, OBLIQUE_THRESHOLD, 0.0)))
+                // 5. Italic values <= 0 descending. 6. Oblique values <= 0deg
+                //    descending.
+                .or_else(|| italic(below(&italics, 0.0, f32::NEG_INFINITY)))
+                .or_else(|| oblique(below(&obliques, 0.0, f32::NEG_INFINITY)))
+        }
+        FontStyle::Oblique(angle) => {
+            let angle = angle.unwrap_or(DEFAULT_OBLIQUE_ANGLE);
+            if contains_any(&obliques, angle) {
+                return Some(StyleMatch::Oblique(angle));
+            }
+            // Negative requests follow the same steps "with the negated
+            // values and opposite directions".
+            let sign = if angle < 0.0 { -1.0 } else { 1.0 };
+            let flipped: SmallVec<[[f32; 2]; 16]> =
+                obliques.iter().map(|r| negate(*r, sign)).collect();
+            let a = angle * sign;
+            let found = if a >= OBLIQUE_THRESHOLD {
+                // 2. Above the angle ascending, then below it descending
+                //    until 0 (positive values only).
+                above(&flipped, a, inf).or_else(|| below_exclusive(&flipped, a, 0.0))
+            } else {
+                // 2. Below the angle descending until 0, then above it.
+                below_exclusive(&flipped, a, 0.0).or_else(|| above(&flipped, a, inf))
+            };
+            if let Some(found) = found {
+                return Some(StyleMatch::Oblique(found * sign));
+            }
+            // 3. A `slnt` axis already makes its range include the angle;
+            //    otherwise a synthetic oblique of an upright face.
+            if let Some(found) = synthetic() {
+                return Some(found);
+            }
+            // 4. Italic values >= 1 ascending then below 1 descending until
+            //    0 (for angles >= 11deg); below 1 descending until 0 then
+            //    above 1 (for smaller angles).
+            let italic_found = if a >= OBLIQUE_THRESHOLD {
+                above(&italics, 1.0, inf).or_else(|| below_exclusive(&italics, 1.0, 0.0))
+            } else {
+                below_exclusive(&italics, 1.0, 0.0).or_else(|| above(&italics, 1.0, inf))
+            };
+            italic(italic_found)
+                // 5. Oblique values <= 0deg descending (with the opposite
+                //    direction for negative requests). 6. Italic values <= 0.
+                .or_else(|| {
+                    oblique(below(&flipped, 0.0, f32::NEG_INFINITY).map(|found| found * sign))
+                })
+                .or_else(|| italic(below(&italics, 0.0, f32::NEG_INFINITY)))
+        }
+        FontStyle::Normal => {
+            // 1. Oblique values >= 0 ascending. 2. Italic values >= 0
+            //    ascending. 3. Oblique values < 0 descending. 4. Italic
+            //    values < 0 descending.
+            oblique(above(&obliques, 0.0, inf))
+                .or_else(|| italic(above(&italics, 0.0, inf)))
+                .or_else(|| oblique(below(&obliques, 0.0, f32::NEG_INFINITY)))
+                .or_else(|| italic(below(&italics, 0.0, f32::NEG_INFINITY)))
+        }
     }
 }
 
-fn oblique_style(style: FontStyle) -> Option<(FontStyle, f32)> {
-    match style {
-        FontStyle::Oblique(angle) => Some((style, angle.unwrap_or(DEFAULT_OBLIQUE_ANGLE))),
-        _ => None,
+fn negate(range: [f32; 2], sign: f32) -> [f32; 2] {
+    if sign < 0.0 {
+        [-range[1], -range[0]]
+    } else {
+        range
+    }
+}
+
+fn contains(range: [f32; 2], value: f32) -> bool {
+    range[0] <= value && value <= range[1]
+}
+
+fn contains_any(ranges: &[[f32; 2]], value: f32) -> bool {
+    ranges.iter().any(|range| contains(*range, value))
+}
+
+/// The smallest supported value in `[from, to]` ("values above `from`
+/// checked in ascending order", up to `to`).
+fn above(ranges: &[[f32; 2]], from: f32, to: f32) -> Option<f32> {
+    ranges
+        .iter()
+        .filter(|range| range[1] >= from && range[0] <= to)
+        .map(|range| range[0].max(from))
+        .min_by(f32::total_cmp)
+}
+
+/// The largest supported value in `[to, from]` ("values below `from`
+/// checked in descending order", down to `to`).
+fn below(ranges: &[[f32; 2]], from: f32, to: f32) -> Option<f32> {
+    ranges
+        .iter()
+        .filter(|range| range[0] <= from && range[1] >= to)
+        .map(|range| range[1].min(from))
+        .max_by(f32::total_cmp)
+}
+
+/// [`below`], excluding `to` itself: "until 0 is hit. Only positive values
+/// ... are checked in this stage".
+fn below_exclusive(ranges: &[[f32; 2]], from: f32, to: f32) -> Option<f32> {
+    below(ranges, from, to).filter(|found| *found > to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(width: [f32; 2], weight: [f32; 2], style: StyleRange) -> Candidate {
+        Candidate {
+            index: 0,
+            width,
+            weight,
+            style,
+        }
+    }
+
+    const NORMAL: StyleRange = StyleRange {
+        italic: None,
+        oblique: Some([0.0, 0.0]),
+    };
+    const ITALIC: StyleRange = StyleRange {
+        italic: Some([1.0, 1.0]),
+        oblique: None,
+    };
+
+    #[test]
+    fn weight_search_orders_follow_the_desired_weight() {
+        // #font-style-matching step 4.3, "weight: 450": 450-500 ascending,
+        // then below 450 descending, then above 500.
+        let ranges = [[300.0, 300.0], [400.0, 400.0], [500.0, 500.0], [600.0, 600.0]];
+        assert_eq!(above(&ranges, 450.0, 500.0), Some(500.0));
+        assert_eq!(below(&ranges, 450.0, f32::NEG_INFINITY), Some(400.0));
+        // A range containing the desired value supplies it exactly.
+        assert!(contains_any(&[[100.0, 900.0]], 750.0));
+        // Ranges contribute their nearest endpoint.
+        assert_eq!(above(&[[620.0, 800.0]], 550.0, f32::INFINITY), Some(620.0));
+        assert_eq!(below(&[[100.0, 399.0]], 700.0, f32::NEG_INFINITY), Some(399.0));
+    }
+
+    #[test]
+    fn italic_prefers_italic_then_large_obliques() {
+        let set = [
+            candidate([1.0; 2], [400.0; 2], NORMAL),
+            candidate(
+                [1.0; 2],
+                [400.0; 2],
+                StyleRange {
+                    italic: None,
+                    oblique: Some([12.0, 12.0]),
+                },
+            ),
+        ];
+        assert_eq!(
+            style_match(&set, FontStyle::Italic, true),
+            Some(StyleMatch::Oblique(12.0))
+        );
+        let set = [set[0], candidate([1.0; 2], [400.0; 2], ITALIC)];
+        assert_eq!(
+            style_match(&set, FontStyle::Italic, true),
+            Some(StyleMatch::Italic(1.0))
+        );
+    }
+
+    #[test]
+    fn oblique_requests_use_slant_ranges_or_synthesize_from_upright() {
+        // A `slnt` axis -15..0 supports clockwise obliques 0..15deg.
+        let variable = StyleRange {
+            italic: None,
+            oblique: Some([0.0, 15.0]),
+        };
+        let set = [candidate([1.0; 2], [400.0; 2], variable), candidate([1.0; 2], [400.0; 2], ITALIC)];
+        assert_eq!(
+            style_match(&set, FontStyle::Oblique(Some(10.0)), true),
+            Some(StyleMatch::Oblique(10.0))
+        );
+        // Beyond the range: the nearest supported angle below.
+        assert_eq!(
+            style_match(&set, FontStyle::Oblique(Some(20.0)), true),
+            Some(StyleMatch::Oblique(15.0))
+        );
+        // Upright and italic faces only: a synthetic oblique of the upright
+        // face, unless synthesis is disabled, when the italic face serves.
+        let set = [candidate([1.0; 2], [400.0; 2], NORMAL), candidate([1.0; 2], [400.0; 2], ITALIC)];
+        assert_eq!(
+            style_match(&set, FontStyle::Oblique(Some(20.0)), true),
+            Some(StyleMatch::Oblique(0.0))
+        );
+        assert_eq!(
+            style_match(&set, FontStyle::Oblique(Some(20.0)), false),
+            Some(StyleMatch::Italic(1.0))
+        );
+        // Negative angles search with negated values.
+        let set = [
+            candidate([1.0; 2], [400.0; 2], NORMAL),
+            candidate(
+                [1.0; 2],
+                [400.0; 2],
+                StyleRange {
+                    italic: None,
+                    oblique: Some([-20.0, -12.0]),
+                },
+            ),
+        ];
+        assert_eq!(
+            style_match(&set, FontStyle::Oblique(Some(-14.0)), true),
+            Some(StyleMatch::Oblique(-14.0))
+        );
+        assert_eq!(
+            style_match(&set, FontStyle::Oblique(Some(-30.0)), true),
+            Some(StyleMatch::Oblique(-20.0))
+        );
+    }
+
+    #[test]
+    fn normal_prefers_upright_then_italic() {
+        let set = [candidate([1.0; 2], [400.0; 2], ITALIC)];
+        assert_eq!(
+            style_match(&set, FontStyle::Normal, true),
+            Some(StyleMatch::Italic(1.0))
+        );
+        let ital_axis = StyleRange {
+            italic: Some([0.0, 1.0]),
+            oblique: None,
+        };
+        let set = [candidate([1.0; 2], [400.0; 2], ital_axis)];
+        assert_eq!(
+            style_match(&set, FontStyle::Normal, true),
+            Some(StyleMatch::Italic(0.0))
+        );
     }
 }

@@ -6296,7 +6296,7 @@ async fn execute_js_with_presentation(
         let inline = fetch_inline_style_imports(&html, &response.url, document_encoding).await;
         push_imported_sheets(&mut sheets, inline);
     }
-    install_stylesheet_fonts(&html, &sheets, &response.url).await;
+    install_stylesheet_fonts(&html, &sheets, &response.url, true).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
     // and decodes blob: image srcs from it even after the page froze.
     let blobs = crate::js::BlobMap::default();
@@ -7327,14 +7327,27 @@ fn css_unescape_url(raw: &str) -> String {
     out
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CssFontFace {
     pub family: String,
-    pub sources: Vec<String>,
+    pub sources: Vec<CssFontSource>,
     /// CSS Fonts 4 #unicode-range-desc: the inclusive code point ranges the
     /// face is used for; empty when the descriptor is absent or invalid
     /// (the initial value, all of Unicode).
     pub unicode_range: Vec<(u32, u32)>,
+    /// The rule's other descriptors (CSS Fonts 4 #font-prop-desc,
+    /// #font-rend-desc, #font-display-desc; CSS Fonts 5 #size-adjust-desc,
+    /// #font-metrics-override-desc).
+    pub descriptors: crate::font_system::FaceDescriptors,
+}
+
+/// One supported item of a `src` descriptor (CSS Fonts 4 #src-desc).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CssFontSource {
+    /// An external reference, as written (resolved by the caller).
+    Url(String),
+    /// #local-font-fallback: an installed face's full or PostScript name.
+    Local(String),
 }
 
 fn stylesheet_font_faces(css: &str) -> Vec<CssFontFace> {
@@ -7363,48 +7376,151 @@ pub(crate) fn font_face_descriptors(block: &str) -> Option<CssFontFace> {
     let mut family = None;
     let mut sources = Vec::new();
     let mut unicode_range = Vec::new();
+    let mut descriptors = crate::font_system::FaceDescriptors::default();
     // CSS Syntax: semicolons inside strings/functions are component
-    // values, not declaration separators (notably data: font URLs).
+    // values, not declaration separators (notably data: font URLs). "When a
+    // given descriptor occurs multiple times in a given @font-face rule,
+    // only the last descriptor declaration is used"; an invalid one is
+    // ignored like any invalid declaration.
     for declaration in crate::dom::split_top_level(block, ';') {
         let Some((name, value)) = declaration.split_once(':') else {
             continue;
         };
         // A comment before a descriptor is not part of its name.
-        let name = name.rsplit("*/").next().unwrap_or(name);
-        if name.trim().eq_ignore_ascii_case("unicode-range") {
-            unicode_range = unicode_ranges(value).unwrap_or_default();
-        } else if name.trim().eq_ignore_ascii_case("font-family") {
-            family = font_family_name(value);
-        } else if name.trim().eq_ignore_ascii_case("src") {
-            sources.clear();
-            for source in crate::dom::split_top_level(value, ',') {
-                let mut parser = cssparser::Parser::new(source);
-                if let Ok(url) = parser.expect_url() {
-                    sources.push(url.to_string());
-                }
+        let name = name.rsplit("*/").next().unwrap_or(name).trim();
+        if name.eq_ignore_ascii_case("unicode-range") {
+            if let Some(ranges) = unicode_ranges(value) {
+                unicode_range = ranges;
             }
+        } else if name.eq_ignore_ascii_case("font-family") {
+            if let Some(name) = font_family_name(value) {
+                family = Some(name);
+            }
+        } else if name.eq_ignore_ascii_case("src") {
+            let parsed = font_sources(value);
+            if !parsed.is_empty() {
+                sources = parsed;
+            }
+        } else {
+            descriptors.apply(name, value);
         }
     }
-    if let Some(family) = family
-        && !family.trim().is_empty()
-        && !sources.is_empty()
+    // "@font-face rules require a font-family and src descriptor".
+    let family = family.filter(|family| !family.trim().is_empty())?;
+    (!sources.is_empty()).then_some(CssFontFace {
+        family,
+        sources,
+        unicode_range,
+        descriptors,
+    })
+}
+
+/// CSS Fonts 4 #font-face-src-parsing: the supported items of a `src`
+/// list, `<url> [ format(<font-format>) ]? [ tech(<font-tech>#) ]? |
+/// local(<font-family-name>)`. An item that fails to parse, or whose format
+/// or technology TRust does not support, is not added (#font-face-src-
+/// formats: the resource is never downloaded).
+pub(crate) fn font_sources(value: &str) -> Vec<CssFontSource> {
+    crate::dom::split_top_level(value, ',')
+        .into_iter()
+        .filter_map(font_source)
+        .collect()
+}
+
+fn font_source(item: &str) -> Option<CssFontSource> {
+    let mut parser = cssparser::Parser::new(item.trim());
+    if let Ok(name) = parser.try_parse(|p| {
+        p.expect_function_matching("local")?;
+        p.parse_nested_block(|p| {
+            let start = p.position();
+            while p.next().is_ok() {}
+            Ok::<_, cssparser::ParseError<()>>(p.slice_from(start).to_string())
+        })
+    }) {
+        return (parser.is_exhausted())
+            .then(|| font_family_name(&name))
+            .flatten()
+            .map(CssFontSource::Local);
+    }
+    let url = parser.expect_url().ok()?.to_string();
+    if url.trim().is_empty() {
+        return None;
+    }
+    if parser
+        .try_parse(|p| p.expect_function_matching("format"))
+        .is_ok()
     {
-        sources.retain(|url| !url.trim().is_empty());
-        if !sources.is_empty() {
-            return Some(CssFontFace {
-                family,
-                sources,
-                unicode_range,
-            });
+        let supported = parser
+            .parse_nested_block(|p| {
+                let format = match p.next()?.clone() {
+                    cssparser::Token::Ident(word) => match word.to_ascii_lowercase().as_str() {
+                        "woff" | "woff2" | "truetype" | "opentype" | "collection" => true,
+                        "embedded-opentype" | "svg" => false,
+                        _ => return Err(cssparser::ParseError::<()>::unexpected_token()),
+                    },
+                    // The backwards-compatible strings, including the
+                    // `-variations` forms (`format(woff2) tech(variations)`).
+                    cssparser::Token::QuotedString(text) => matches!(
+                        text.to_ascii_lowercase().as_str(),
+                        "woff"
+                            | "woff2"
+                            | "truetype"
+                            | "opentype"
+                            | "collection"
+                            | "woff-variations"
+                            | "woff2-variations"
+                            | "truetype-variations"
+                            | "opentype-variations"
+                    ),
+                    _ => return Err(cssparser::ParseError::unexpected_token()),
+                };
+                p.expect_exhausted()?;
+                Ok::<_, cssparser::ParseError<()>>(format)
+            })
+            .ok()?;
+        if !supported {
+            return None;
         }
     }
-    None
+    if parser
+        .try_parse(|p| p.expect_function_matching("tech"))
+        .is_ok()
+    {
+        let supported = parser
+            .parse_nested_block(|p| {
+                let techs = p.parse_comma_separated(|p| {
+                    Ok::<_, cssparser::ParseError<()>>(p.expect_ident()?.to_ascii_lowercase())
+                })?;
+                Ok::<_, cssparser::ParseError<()>>(techs.iter().all(|tech| {
+                    // CSS Fonts 4 #font-tech-definitions TRust renders:
+                    // OpenType and AAT layout (HarfRust), variations, and
+                    // COLR, CBDT and sbix color glyphs (Glifo). Not SVG
+                    // glyphs, palettes (`font-palette`), Graphite or
+                    // incremental transfer.
+                    matches!(
+                        tech.as_str(),
+                        "features-opentype"
+                            | "features-aat"
+                            | "variations"
+                            | "color-colrv0"
+                            | "color-colrv1"
+                            | "color-cbdt"
+                            | "color-sbix"
+                    )
+                }))
+            })
+            .ok()?;
+        if !supported {
+            return None;
+        }
+    }
+    parser.is_exhausted().then_some(CssFontSource::Url(url))
 }
 
 /// CSS Fonts 4 #unicode-range-desc: a comma-separated list of CSS Syntax 3
 /// `<urange>`s (`U+26`, `U+0-7F`, `U+4??`) as inclusive ranges. `None` when
 /// any is invalid, which makes the whole descriptor invalid.
-fn unicode_ranges(value: &str) -> Option<Vec<(u32, u32)>> {
+pub(crate) fn unicode_ranges(value: &str) -> Option<Vec<(u32, u32)>> {
     let hex = |digits: &str| {
         (!digits.is_empty() && digits.len() <= 6)
             .then(|| u32::from_str_radix(digits, 16).ok())
@@ -7440,7 +7556,7 @@ fn unicode_ranges(value: &str) -> Option<Vec<(u32, u32)>> {
 /// CSS Fonts 4 #family-name-syntax: `<string> | <custom-ident>+`, whose
 /// unquoted form cannot begin with a generic family or CSS-wide keyword
 /// (`font-family: Cursive` names no face; only `"Cursive"` does).
-fn font_family_name(value: &str) -> Option<String> {
+pub(crate) fn font_family_name(value: &str) -> Option<String> {
     let mut parser = cssparser::Parser::new(value);
     if let Ok(name) = parser.try_parse(|p| p.expect_string().map(|name| name.to_string())) {
         return parser.is_exhausted().then_some(name);
@@ -7512,8 +7628,25 @@ fn css_block_end(css: &str, open: usize) -> Option<usize> {
 /// A document `@font-face` rule with its usable sources made absolute.
 struct DocumentFontFace {
     family: String,
-    sources: Vec<Url>,
+    sources: Vec<DocumentFontSource>,
     unicode_range: Vec<(u32, u32)>,
+    descriptors: crate::font_system::FaceDescriptors,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DocumentFontSource {
+    Url(Url),
+    Local(String),
+}
+
+#[cfg(test)]
+impl DocumentFontSource {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Url(url) => url.as_str(),
+            Self::Local(name) => name,
+        }
+    }
 }
 
 fn document_font_faces(html: &str, sheets: &[PageSheet], page_url: &Url) -> Vec<DocumentFontFace> {
@@ -7531,76 +7664,177 @@ fn document_font_faces(html: &str, sheets: &[PageSheet], page_url: &Url) -> Vec<
             let sources = face
                 .sources
                 .into_iter()
-                .filter_map(|source| document_base.join(&source).ok())
-                .filter(|url| {
-                    url.scheme() == "data"
-                        || (matches!(url.scheme(), "http" | "https" | "file")
-                            && subresource_allowed(page_url, url))
+                .filter_map(|source| match source {
+                    CssFontSource::Local(name) => Some(DocumentFontSource::Local(name)),
+                    CssFontSource::Url(url) => document_base
+                        .join(&url)
+                        .ok()
+                        .filter(|url| {
+                            url.scheme() == "data"
+                                || (matches!(url.scheme(), "http" | "https" | "file")
+                                    && subresource_allowed(page_url, url))
+                        })
+                        .map(DocumentFontSource::Url),
                 })
                 .collect::<Vec<_>>();
             (!sources.is_empty()).then_some(DocumentFontFace {
                 family: face.family,
                 sources,
                 unicode_range: face.unicode_range,
+                descriptors: face.descriptors,
             })
         })
         .collect()
 }
 
-async fn install_stylesheet_fonts(html: &str, sheets: &[PageSheet], page_url: &Url) {
-    let faces = document_font_faces(html, sheets, page_url);
-    let fonts = futures::stream::iter(faces.into_iter().map(
-        |DocumentFontFace {
-             family,
-             sources,
-             unicode_range: ranges,
-         }| async move {
-            // CSS Fonts 4 §4.3.3: try external references in specified order and
-            // proceed to the next item when loading or format decoding fails.
-            for url in sources {
-                // CSS Fonts #font-fetching-requirements / Fetch's data-URL
-                // processor: local data URLs are valid font sources, with no
-                // HTTP request or cross-origin response headers required.
-                if url.scheme() == "data" {
-                    if let Some(font) =
-                        crate::img::decode_data_url(url.as_str()).and_then(|bytes| {
-                            crate::font_system::PageFont::from_web_resource(family.clone(), bytes)
-                        })
-                    {
-                        return Some(font.restrict_to(&ranges));
-                    }
-                    continue;
-                }
-                let Ok(response) = fetch(&Request::subresource(
-                    url,
-                    page_url,
-                    "font",
-                    Some(CredentialsMode::SameOrigin),
-                ))
+/// CSS Fonts 4 #src-desc: the first source of `face` that can be activated,
+/// `local()` faces read from the installed fonts and URLs fetched in order,
+/// "proceed[ing] to the next item when loading or format decoding fails".
+/// Also reports each fetched URL's outcome to `report`.
+async fn load_document_face(
+    face: &DocumentFontFace,
+    page_url: &Url,
+    report: impl Fn(&Url, bool),
+) -> Option<crate::font_system::PageFont> {
+    let family = &face.family;
+    let finish = |font: crate::font_system::PageFont| {
+        font.restrict_to(&face.unicode_range)
+            .with_descriptors(face.descriptors.clone())
+    };
+    for source in &face.sources {
+        let url = match source {
+            DocumentFontSource::Local(name) => {
+                let name = name.clone();
+                let family = family.clone();
+                let font = tokio::task::spawn_blocking(move || {
+                    crate::font_system::PageFont::from_local(family, &name)
+                })
                 .await
-                else {
-                    continue;
-                };
-                if !(200..300).contains(&response.status) {
-                    continue;
+                .ok()
+                .flatten();
+                if let Some(font) = font {
+                    return Some(finish(font));
                 }
-                if let Some(font) =
-                    crate::font_system::PageFont::from_web_resource(family.clone(), response.body)
-                {
-                    return Some(font.restrict_to(&ranges));
-                }
+                continue;
             }
-            None
-        },
-    ))
+            DocumentFontSource::Url(url) => url,
+        };
+        // CSS Fonts #font-fetching-requirements / Fetch's data-URL
+        // processor: local data URLs are valid font sources, with no
+        // HTTP request or cross-origin response headers required.
+        if url.scheme() == "data" {
+            if let Some(font) = crate::img::decode_data_url(url.as_str()).and_then(|bytes| {
+                crate::font_system::PageFont::from_web_resource(family.clone(), bytes)
+            }) {
+                return Some(finish(font.select_face(url.fragment())?));
+            }
+            continue;
+        }
+        let response = fetch(&Request::subresource(
+            url.clone(),
+            page_url,
+            "font",
+            Some(CredentialsMode::SameOrigin),
+        ))
+        .await
+        .ok()
+        .filter(|response| (200..300).contains(&response.status));
+        let font = response.and_then(|response| {
+            crate::font_system::PageFont::from_web_resource(family.clone(), response.body)
+                .and_then(|font| font.select_face(url.fragment()))
+        });
+        report(url, font.is_some());
+        if let Some(font) = font {
+            return Some(finish(font));
+        }
+    }
+    None
+}
+
+/// Load the document's downloadable faces before its first rendering.
+/// CSS Fonts 4 #font-display-timeline: a face's font download timer starts
+/// with the navigation. The first rendering waits for each face through its
+/// block period (during which its text would be invisible). A `live` page
+/// keeps loading the rest: they reach its document (`Dom::face_font`) as
+/// late faces, used if they load within their swap period. A document
+/// rendered once (`!live`) waits through the swap period instead, so each
+/// face is either used or, after it, a failed load.
+async fn install_stylesheet_fonts(html: &str, sheets: &[PageSheet], page_url: &Url, live: bool) {
+    let started = tokio::time::Instant::now();
+    let faces = document_font_faces(html, sheets, page_url);
+    let mut late = Vec::new();
+    let fonts = futures::stream::iter(faces.into_iter().map(|face| {
+        let (block, swap) = face.descriptors.display.periods();
+        let wait = if live {
+            Some(block)
+        } else {
+            swap.map(|swap| block + swap)
+        };
+        let failure = swap.map(|swap| std::time::Instant::now() + block + swap);
+        let page_url = page_url.clone();
+        async move {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            let urls: Vec<String> = face
+                .sources
+                .iter()
+                .filter_map(|source| match source {
+                    DocumentFontSource::Url(url) => Some(url.to_string()),
+                    DocumentFontSource::Local(_) => None,
+                })
+                .collect();
+            let mut task = tokio::spawn(async move {
+                let winner = std::sync::Mutex::new(None);
+                let font = load_document_face(&face, &page_url, |url, loaded| {
+                    if loaded {
+                        *winner
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(url.to_string());
+                    }
+                })
+                .await;
+                let winner = winner
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = sender.send(Some(
+                    font.as_ref()
+                        .zip(winner)
+                        .map(|(font, url)| (url, font.bytes.clone())),
+                ));
+                font
+            });
+            let outcome = match wait {
+                Some(wait) => tokio::time::timeout_at(started + wait, &mut task).await,
+                None => Ok((&mut task).await),
+            };
+            match outcome {
+                Ok(font) => (font.ok().flatten(), None),
+                // Still loading after the block period: a late face.
+                Err(_) => (
+                    None,
+                    Some(crate::font_system::LateFace {
+                        sources: urls,
+                        result: receiver,
+                        failure,
+                    }),
+                ),
+            }
+        }
+    }))
     .buffered(PREFETCH_CONCURRENCY)
-    .filter_map(|font| async move { font })
-    .collect()
+    .filter_map(|(font, pending)| {
+        if let Some(pending) = pending {
+            late.push(pending);
+        }
+        async move { font }
+    })
+    .collect::<Vec<_>>()
     .await;
     // A new foreground document: its inline SVG must not draw document
     // images another page loaded under its own cookies and credentials.
     crate::img::begin_document_svg_navigation();
     crate::font_system::install_page_fonts(fonts);
+    crate::font_system::set_late_page_faces(late);
 }
 
 /// Render an HTML page with ONLY its CSS cascade applied (no JS): fetch its
@@ -7668,7 +7902,7 @@ async fn css_only_with_sheets(
 ) -> Response {
     let decoded = decode_document_body(&response.url, &response.content_type, &response.body);
     let (html, document_encoding) = (decoded.text, decoded.encoding);
-    install_stylesheet_fonts(&html, &sheets, &response.url).await;
+    install_stylesheet_fonts(&html, &sheets, &response.url, false).await;
     let base = base_with_doc_base(&html, &response.url);
     fetch_svg_sprite_sheets(&html, &base, &response.url).await;
     // The frame documents are fetched up front into a url→content map (Dom is
@@ -11096,19 +11330,52 @@ mod tests {
             faces,
             vec![CssFontFace {
                 family: "Site Icons".into(),
-                sources: vec!["https://cdn.test/icons.woff2".into()],
+                sources: vec![
+                    CssFontSource::Local("Site Icons".into()),
+                    CssFontSource::Url("https://cdn.test/icons.woff2".into())
+                ],
                 unicode_range: Vec::new(),
+                descriptors: Default::default(),
             }]
         );
 
+        // CSS Fonts 4 #font-face-src-formats: a source whose format hint
+        // names an unsupported format is not added, nor downloaded.
         let faces = stylesheet_font_faces(
             "@font-face{font-family:Site;src:url(site.eot?#iefix) format('embedded-opentype'),\
-             url(site.woff2) format('woff2'),url(site.ttf) format('truetype')}",
+             url(site.woff2) format('woff2'),url(site.ttf) format('truetype'),\
+             url(site.svg#f) format(svg),url(var.woff2) format('woff2-variations'),\
+             url(color.ttf) tech(color-COLRv1, variations),url(pal.ttf) tech(palettes),\
+             url(odd.ttf) format(zebra),local(inherit)}",
+        );
+        let urls = |sources: &[CssFontSource]| {
+            sources
+                .iter()
+                .map(|source| match source {
+                    CssFontSource::Url(url) => url.clone(),
+                    CssFontSource::Local(name) => format!("local:{name}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            urls(&faces[0].sources),
+            ["site.woff2", "site.ttf", "var.woff2", "color.ttf"]
+        );
+        // A `src` without a supported item is invalid: the earlier one stays.
+        let faces = stylesheet_font_faces(
+            "@font-face{font-family:Kept;src:url(a.woff);src:url(b.eot) format(embedded-opentype);\
+             font-weight:100 900;font-style:oblique 10deg 20deg;font-display:swap;size-adjust:110%}",
+        );
+        assert_eq!(urls(&faces[0].sources), ["a.woff"]);
+        assert_eq!(
+            faces[0].descriptors.weight,
+            parley::fontique::Descriptor::Value([100.0, 900.0])
         );
         assert_eq!(
-            faces[0].sources,
-            vec!["site.eot?#iefix", "site.woff2", "site.ttf"]
+            faces[0].descriptors.display,
+            crate::font_system::FontDisplay::Swap
         );
+        assert_eq!(faces[0].descriptors.size_adjust, 1.1);
 
         // CSS Fonts 4 #family-name-syntax: unquoted names are identifier
         // sequences that cannot start with a generic or CSS-wide keyword.

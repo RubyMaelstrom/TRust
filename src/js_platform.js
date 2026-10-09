@@ -8829,45 +8829,69 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             || (internalsFor(element).trustRelList = createDOMTokenList(element, "rel", supported));
     }
 
-    // CSS Font Loading 3: the setlike interface is present, but runtime face
-    // loading remains a shell. Navigation installs @font-face resources in
-    // font_system; the actor lacks a document-owned face registry connecting
-    // these objects, descriptors, loading tasks, and layout invalidation.
-    // See CSS_REVIEW.md for the remaining dependencies.
+    // CSS Font Loading 3 #fontface-interface. Each attribute is parsed as
+    // its @font-face descriptor and holds the serialization; an invalid
+    // value throws a SyntaxError (and in the constructor makes the face an
+    // error). Runtime face loading remains a shell: navigation installs
+    // @font-face resources in font_system; the actor lacks a document-owned
+    // face registry connecting these objects, loading tasks, and layout
+    // invalidation. See CSS_REVIEW.md for the remaining dependencies.
+    const FONT_FACE_DESCRIPTORS = [
+        ["style", "font-style", "normal"],
+        ["weight", "font-weight", "normal"],
+        ["stretch", "font-stretch", "normal"],
+        ["unicodeRange", "unicode-range", "U+0-10FFFF"],
+        ["variant", "font-variant", "normal"],
+        ["featureSettings", "font-feature-settings", "normal"],
+        ["variationSettings", "font-variation-settings", "normal"],
+        ["display", "font-display", "auto"],
+        ["ascentOverride", "ascent-override", "normal"],
+        ["descentOverride", "descent-override", "normal"],
+        ["lineGapOverride", "line-gap-override", "normal"],
+        ["sizeAdjust", "size-adjust", "100%"],
+    ];
+    function fontFaceDescriptor(name, value) {
+        return cssOp("font-face-descriptor", name, domString(value));
+    }
+    function fontFaceSet(face, attribute, name, value) {
+        const parsed = fontFaceDescriptor(name, value);
+        if (parsed === null) throw new DOMException("Invalid " + name + " value", "SyntaxError");
+        internalsFor(face).descriptors[attribute] = parsed;
+    }
     class FontFace {
         constructor(family, source, descriptors) {
-            this.family = String(family);
-            internalsFor(this).source = source;
-            internalsFor(this).status = "unloaded";
-            internalsFor(this).sets = new Set();
-            internalsFor(this).resolveLoaded = null;
-            internalsFor(this).rejectLoaded = null;
-            internalsFor(this).loaded = new Promise((resolve, reject) => {
-                internalsFor(this).resolveLoaded = resolve;
-                internalsFor(this).rejectLoaded = reject;
+            const own = internalsFor(this);
+            own.source = source;
+            own.status = "unloaded";
+            own.sets = new Set();
+            own.resolveLoaded = null;
+            own.rejectLoaded = null;
+            own.loaded = new Promise((resolve, reject) => {
+                own.resolveLoaded = resolve;
+                own.rejectLoaded = reject;
             });
             descriptors = descriptors || {};
-            this.style = descriptors.style === undefined ? "normal" : String(descriptors.style);
-            this.weight = descriptors.weight === undefined ? "normal" : String(descriptors.weight);
-            this.stretch = descriptors.stretch === undefined
-                ? (descriptors.width === undefined ? "normal" : String(descriptors.width))
-                : String(descriptors.stretch);
-            this.width = this.stretch;
-            this.unicodeRange = descriptors.unicodeRange === undefined
-                ? "U+0-10FFFF" : String(descriptors.unicodeRange);
-            this.variant = descriptors.variant === undefined ? "normal" : String(descriptors.variant);
-            this.featureSettings = descriptors.featureSettings === undefined
-                ? "normal" : String(descriptors.featureSettings);
-            this.variationSettings = descriptors.variationSettings === undefined
-                ? "normal" : String(descriptors.variationSettings);
-            this.display = descriptors.display === undefined ? "auto" : String(descriptors.display);
-            this.ascentOverride = descriptors.ascentOverride === undefined
-                ? "normal" : String(descriptors.ascentOverride);
-            this.descentOverride = descriptors.descentOverride === undefined
-                ? "normal" : String(descriptors.descentOverride);
-            this.lineGapOverride = descriptors.lineGapOverride === undefined
-                ? "normal" : String(descriptors.lineGapOverride);
+            // #font-face-constructor step 1.
+            const values = { family: fontFaceDescriptor("font-family", family) };
+            let valid = values.family !== null;
+            for (const [attribute, name, initial] of FONT_FACE_DESCRIPTORS) {
+                let raw = descriptors[attribute];
+                if (raw === undefined && attribute === "stretch") raw = descriptors.width;
+                values[attribute] = raw === undefined ? initial : fontFaceDescriptor(name, raw);
+                if (values[attribute] === null) valid = false;
+            }
+            if (typeof source === "string" && fontFaceDescriptor("src", source) === null) valid = false;
+            if (!valid) {
+                for (const key of Object.keys(values)) values[key] = "";
+                own.status = "error";
+                own.rejectLoaded(new DOMException("Invalid FontFace descriptor", "SyntaxError"));
+            }
+            own.descriptors = values;
         }
+        get family() { return internalsFor(this).descriptors.family; }
+        set family(value) { fontFaceSet(this, "family", "font-family", value); }
+        get width() { return internalsFor(this).descriptors.stretch; }
+        set width(value) { fontFaceSet(this, "stretch", "font-stretch", value); }
         get status() { return internalsFor(this).status; }
         get loaded() { return internalsFor(this).loaded; }
         load() {
@@ -8881,6 +8905,13 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             return internalsFor(this).loaded;
         }
+    }
+    for (const [attribute, name] of FONT_FACE_DESCRIPTORS) {
+        Object.defineProperty(FontFace.prototype, attribute, {
+            get() { return internalsFor(this).descriptors[attribute]; },
+            set(value) { fontFaceSet(this, attribute, name, value); },
+            enumerable: true, configurable: true,
+        });
     }
     class FontFaceSetLoadEvent extends Event {
         constructor(type, init) {
