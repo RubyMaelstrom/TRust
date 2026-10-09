@@ -75,7 +75,7 @@
     check(CSS.supports('--name', 'a;b') === false && CSS.supports('--name', '"a;b"'), 'custom component validation');
     const keyframes = new CSSStyleSheet(); keyframes.replaceSync('@keyframes fade { from {opacity:0} to {opacity:1} }');
     const frames = keyframes.cssRules[0], list = frames.cssRules;
-    frames.appendRule('50% {opacity:.5}'); check(list.length === 3 && frames.findRule('50%').style.opacity === '.5', 'keyframe insertion');
+    frames.appendRule('50% {opacity:.5}'); check(list.length === 3 && frames.findRule('50%').style.opacity === '0.5', 'keyframe insertion');
     frames.deleteRule('from'); check(list.length === 2 && frames.findRule('0%') === null, 'keyframe deletion');
     const variableSheet = new CSSStyleSheet();
     variableSheet.replaceSync('#target{--Edges:3px 5px;padding:var(--Edges)}');

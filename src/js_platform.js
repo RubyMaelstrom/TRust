@@ -8565,9 +8565,10 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             if (direct) {
                 const value = direct[1];
                 if (value.startsWith("\0trust-pending-box:") || value.startsWith("\0trust-pending-background:")) return "";
-                // CSSOM #serialize-a-css-component-value: <string>s and <url>s
-                // as #serialize-a-string and #serialize-a-url make them.
-                return name.startsWith("--") || value.indexOf("'") < 0 && value.indexOf('"') < 0 && value.indexOf("(") < 0
+                // CSSOM #serialize-a-css-component-value: <string>s, <url>s
+                // and numbers as #serialize-a-string, #serialize-a-url and
+                // <number> make them (`.5` reads back as `0.5`).
+                return name.startsWith("--") || !/["'(0-9]/.test(value)
                     ? value : cssOp("public-value", name, value);
             }
             return state.descriptors ? "" : cssOp("get", name, JSON.stringify(state.pairs));

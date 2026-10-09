@@ -6442,6 +6442,32 @@ impl Dom {
         false
     }
 
+    /// CSSOM #serialize-a-css-value of a value read through
+    /// getComputedStyle (#resolved-values): its component values serialized
+    /// per #serialize-a-css-component-value. CSS Variables 2
+    /// #serializing-custom-props: a custom property's computed value is its
+    /// token sequence exactly as specified, var() substitution aside, so it
+    /// is kept as is unless a registration gives it a typed syntax (CSS
+    /// Properties and Values API #calculation-of-computed-values), whose
+    /// computed value serializes like any other property's.
+    pub(crate) fn cssom_serialize_resolved<'a>(
+        &self,
+        id: NodeId,
+        name: &str,
+        value: &'a str,
+    ) -> Cow<'a, str> {
+        if name.starts_with("--")
+            && ComputeView(self)
+                .property_registration(id, name)
+                .is_none_or(|registration| {
+                    matches!(registration.syntax, properties::Syntax::Universal)
+                })
+        {
+            return Cow::Borrowed(value);
+        }
+        serialize_css_value_components(value)
+    }
+
     pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
         // WHATWG Compatibility #css-simple-aliases: a legacy name alias
         // reads its standard property (`font-stretch` is `font-width`).
@@ -22576,24 +22602,57 @@ fn is_bare_nonzero_css_number(value: &str) -> bool {
             .is_ok_and(|number| number.is_finite() && number != 0.0)
 }
 
-/// CSSOM #serialize-a-string and #serialize-a-url applied to the <string>
-/// and <url> components of a CSS value: each string becomes a double-quoted
-/// string with `"`, `\` and control characters escaped, and each URL (a
-/// url-token or a `url()` function with a string) becomes `url("…")`, any
-/// URL modifiers following it. Everything else, comments and bad tokens
-/// included, is kept as written. Borrowed when nothing changes.
-pub(crate) fn serialize_css_strings(value: &str) -> Cow<'_, str> {
+/// CSSOM #serialize-a-css-component-value for the declared or resolved value
+/// of a non-custom property. Each string becomes a double-quoted string with
+/// `"`, `\` and control characters escaped (#serialize-a-string), and each
+/// URL (a url-token or a `url()` function with a string) becomes `url("…")`,
+/// any URL modifiers following it (#serialize-a-url). Each `<number>`,
+/// `<integer>`, `<percentage>` and dimension becomes its number in the
+/// shortest base-ten form (at most six decimals, a leading zero, no exponent
+/// or `+`) followed by its unit in lowercase (CSS Values 4 #lengths: "units …
+/// serialize as lowercase"), so `.55` reads back as `0.55` and `1E1PX` as
+/// `10px`. A value containing an arbitrary substitution function (CSS
+/// Values 5 #arbitrary-substitution) is a token sequence until substitution,
+/// so its numbers stay as written, as browsers keep them. Where a rewritten
+/// token would run into an unseparated neighbor, CSS Syntax 3
+/// #serialization's empty comment keeps the two tokens apart. Everything
+/// else, comments and bad tokens included, is kept as written. Borrowed when
+/// nothing changes.
+pub(crate) fn serialize_css_value_components(value: &str) -> Cow<'_, str> {
     let bytes = value.as_bytes();
-    if !bytes.iter().any(|b| matches!(b, b'"' | b'\'' | b'(')) {
+    let numbers = bytes.iter().any(u8::is_ascii_digit)
+        && !(bytes.contains(&b'(') && has_arbitrary_substitution(value));
+    if !numbers && !bytes.iter().any(|b| matches!(b, b'"' | b'\'' | b'(')) {
         return Cow::Borrowed(value);
     }
-    fn walk(parser: &mut cssparser::Parser<'_>, out: &mut String) {
+    fn walk(parser: &mut cssparser::Parser<'_>, out: &mut String, numbers: bool) {
+        use cssparser::TokenSerializationType;
+        // The last token written at this nesting level, and whether its
+        // text differs from the source.
+        let mut previous = (TokenSerializationType::Nothing, false);
         loop {
             let start = parser.state();
             let token = match parser.next_including_whitespace_and_comments() {
                 Ok(token) => token.clone(),
                 Err(_) => return,
             };
+            let kind = token.serialization_type();
+            let numeric = numbers
+                .then(|| canonical_css_numeric(&token, parser.slice_from(start.position())))
+                .flatten();
+            let rewritten = numeric
+                .as_deref()
+                .is_some_and(|text| text != parser.slice_from(start.position()));
+            // CSS Syntax 3 #serialization: tokens written as their source
+            // tokenize as they did; a rewritten one may need a separator.
+            if (rewritten || previous.1) && previous.0.needs_separator_when_before(kind) {
+                out.push_str("/**/");
+            }
+            previous = (kind, rewritten);
+            if let Some(numeric) = numeric {
+                out.push_str(&numeric);
+                continue;
+            }
             match token {
                 cssparser::Token::QuotedString(text) => {
                     let _ = cssparser::serialize_string(&text, out);
@@ -22614,7 +22673,7 @@ pub(crate) fn serialize_css_strings(value: &str) -> Cow<'_, str> {
                             url = true;
                             let _ = cssparser::serialize_string(&text, &mut inner);
                             let mut rest = String::new();
-                            walk(nested, &mut rest);
+                            walk(nested, &mut rest, numbers);
                             let rest = rest.trim();
                             if !rest.is_empty() {
                                 inner.push(' ');
@@ -22630,6 +22689,7 @@ pub(crate) fn serialize_css_strings(value: &str) -> Cow<'_, str> {
                     } else {
                         out.push_str(parser.slice_from(start.position()));
                     }
+                    previous = (TokenSerializationType::Other, false);
                 }
                 cssparser::Token::Function(_)
                 | cssparser::Token::ParenthesisBlock
@@ -22638,7 +22698,7 @@ pub(crate) fn serialize_css_strings(value: &str) -> Cow<'_, str> {
                     out.push_str(parser.slice_from(start.position()));
                     let mut end = None;
                     let _ = parser.parse_nested_block(|nested| {
-                        walk(nested, out);
+                        walk(nested, out, numbers);
                         end = Some(nested.position());
                         Ok::<_, cssparser::ParseError<()>>(())
                     });
@@ -22646,18 +22706,107 @@ pub(crate) fn serialize_css_strings(value: &str) -> Cow<'_, str> {
                     if let Some(end) = end {
                         out.push_str(parser.slice(end..parser.position()));
                     }
+                    previous = (TokenSerializationType::Other, false);
                 }
                 _ => out.push_str(parser.slice_from(start.position())),
             }
         }
     }
     let mut out = String::with_capacity(value.len() + 8);
-    walk(&mut cssparser::Parser::new(value), &mut out);
+    walk(&mut cssparser::Parser::new(value), &mut out, numbers);
     if out == value {
         Cow::Borrowed(value)
     } else {
         Cow::Owned(out)
     }
+}
+
+/// CSSOM #serialize-a-css-component-value for a numeric token whose source
+/// text is `source`: `<number>` (and `<integer>`) as their value in the
+/// shortest form, `<percentage>` followed by `%`, and a dimension followed by
+/// its unit, ASCII-lowercased and serialized as an identifier. The number is
+/// read again from the token's own digits in double precision (CSS Syntax 3
+/// #consume-number), since the tokenizer's single-precision value would
+/// otherwise surface as `20.700001`. `None` for other tokens.
+fn canonical_css_numeric(token: &cssparser::Token<'_>, source: &str) -> Option<String> {
+    let number = || {
+        let bytes = source.as_bytes();
+        let digits = |mut at: usize| {
+            while bytes.get(at).is_some_and(u8::is_ascii_digit) {
+                at += 1;
+            }
+            at
+        };
+        let mut end = digits(usize::from(matches!(bytes.first(), Some(b'+' | b'-'))));
+        if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(u8::is_ascii_digit) {
+            end = digits(end + 1);
+        }
+        if matches!(bytes.get(end), Some(b'e' | b'E')) {
+            let sign = usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+            if bytes.get(end + 1 + sign).is_some_and(u8::is_ascii_digit) {
+                end = digits(end + 1 + sign);
+            }
+        }
+        source[..end]
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(cssom::css_number)
+    };
+    match token {
+        cssparser::Token::Number { .. } => number(),
+        cssparser::Token::Percentage { .. } => number().map(|number| number + "%"),
+        cssparser::Token::Dimension { unit, .. } => {
+            let mut text = number()?;
+            let unit = unit.to_ascii_lowercase();
+            // A unit read as an exponent would change the number.
+            if unit == "e" || unit.starts_with("e-") {
+                text.push_str("\\65 ");
+                let _ = cssparser::serialize_name(&unit[1..], &mut text);
+            } else {
+                let _ = cssparser::serialize_identifier(&unit, &mut text);
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a CSS value contains an arbitrary substitution function (CSS
+/// Values 5 #arbitrary-substitution: `var()`, `env()`, `attr()`, `if()`,
+/// `inherit()`, `ident()`, `random-item()`) at any nesting depth.
+fn has_arbitrary_substitution(value: &str) -> bool {
+    // `parse_nested_block` fails unless its closure consumes the whole
+    // block, so each level reads to its end before answering.
+    fn walk(parser: &mut cssparser::Parser<'_>) -> bool {
+        let mut found = false;
+        while let Ok(token) = parser.next() {
+            match token {
+                cssparser::Token::Function(name) => {
+                    found |= [
+                        "var",
+                        "env",
+                        "attr",
+                        "if",
+                        "inherit",
+                        "ident",
+                        "random-item",
+                    ]
+                    .iter()
+                    .any(|function| name.eq_ignore_ascii_case(function));
+                }
+                cssparser::Token::ParenthesisBlock
+                | cssparser::Token::SquareBracketBlock
+                | cssparser::Token::CurlyBracketBlock => {}
+                _ => continue,
+            }
+            found |= parser
+                .parse_nested_block(|nested| Ok::<_, cssparser::ParseError<()>>(walk(nested)))
+                .unwrap_or(false);
+        }
+        found
+    }
+    walk(&mut cssparser::Parser::new(value))
 }
 
 fn normalize_css_value(value: &str) -> String {
@@ -25139,10 +25288,43 @@ mod tests {
             ("'open", "\"open\""),
         ];
         for (value, expected) in cases {
-            assert_eq!(serialize_css_strings(value), expected, "{value}");
+            assert_eq!(serialize_css_value_components(value), expected, "{value}");
         }
         assert!(matches!(
-            serialize_css_strings("10px solid red"),
+            serialize_css_value_components("10px solid red"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn css_value_components_serialize_numbers_in_the_shortest_form() {
+        // CSSOM #serialize-a-css-component-value: <number>, <percentage> and
+        // dimensions in base ten, at most six decimals, with a leading zero
+        // and no exponent, and units in lowercase (CSS Values 4 #lengths).
+        let cases = [
+            (".55", "0.55"),
+            ("+.25e1 -.5 1.50 00", "2.5 -0.5 1.5 0"),
+            ("50.0% .5em 1E1PX 2X", "50% 0.5em 10px 2x"),
+            ("calc(.5px + 10%)", "calc(0.5px + 10%)"),
+            ("12px/.5 serif", "12px/0.5 serif"),
+            ("rgba(0, 0, 0, .5)", "rgba(0, 0, 0, 0.5)"),
+            ("20.7px 0.000001 1e-7", "20.7px 0.000001 0"),
+            ("#0e5 #1E3 h1", "#0e5 #1E3 h1"),
+            ("'.5' url(a1.png)", "\".5\" url(\"a1.png\")"),
+            // Escaped units, and a unit that would read back as an exponent.
+            ("1\\70 x 1\\65 ", "1px 1\\65 "),
+            // Rewriting a token never merges it with an unseparated neighbor
+            // (CSS Syntax 3 #serialization).
+            ("1.0.5 a+.5", "1/**/0.5 a/**/0.5"),
+            // Arbitrary substitution functions keep the token sequence.
+            ("calc(var(--a) * .5)", "calc(var(--a) * .5)"),
+            ("ENV(x, .5px)", "ENV(x, .5px)"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(serialize_css_value_components(value), expected, "{value}");
+        }
+        assert!(matches!(
+            serialize_css_value_components("10px solid red"),
             Cow::Borrowed(_)
         ));
     }

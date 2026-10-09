@@ -1454,16 +1454,41 @@ fn serialized_shorthands_of(longhand: &str) -> &'static [&'static str] {
 
 /// A declared value as CSSOM serializes it (#serialize-a-css-component-
 /// value): its <string>s and <url>s as #serialize-a-string and
-/// #serialize-a-url make them. TRust stores values as written, which every
-/// consumer reads; a custom property keeps its token stream.
+/// #serialize-a-url make them, and its numbers in their shortest form
+/// ([`crate::dom::serialize_css_value_components`]). TRust stores values as
+/// written, which every consumer reads. A custom property keeps its token
+/// stream (CSS Variables 2 #serializing-custom-props), and so does
+/// `unicode-range` (CSS Fonts 4 #unicode-range-desc), whose `<urange>`s
+/// tokenize as unrelated numbers and dimensions.
 fn public_value(property: &str, value: String) -> String {
-    if property.starts_with("--") {
+    if property.starts_with("--") || property.eq_ignore_ascii_case("unicode-range") {
         return value;
     }
-    match crate::dom::serialize_css_strings(&value) {
+    if let Some(number) = opacity_percentage_number(property, &value) {
+        return number;
+    }
+    match crate::dom::serialize_css_value_components(&value) {
         std::borrow::Cow::Borrowed(_) => value,
         std::borrow::Cow::Owned(serialized) => serialized,
     }
+}
+
+/// CSS Color 4 #serializing-opacity-values: a specified `<opacity-value>`
+/// that is a literal percentage serializes as the equivalent number (0% is
+/// 0, 100% is 1), unclamped. The SVG fill, stroke, stop and flood opacities
+/// share the `opacity` grammar.
+fn opacity_percentage_number(property: &str, value: &str) -> Option<String> {
+    if !matches!(
+        property,
+        "opacity" | "fill-opacity" | "stroke-opacity" | "stop-opacity" | "flood-opacity"
+    ) {
+        return None;
+    }
+    let percent = value.trim().strip_suffix('%')?;
+    if percent.ends_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    number_token(percent).map(|percent| css_number(percent / 100.0))
 }
 
 /// CSSOM #serialize-a-css-declaration-block. Internal transport preserves
@@ -2134,6 +2159,53 @@ mod tests {
             json!("\"a\" url(\"b.png\")")
         );
         assert!(serialize(&block, true).contains("content: 'a' url(b.png);"));
+    }
+
+    #[test]
+    fn declared_numbers_serialize_as_cssom_components() {
+        // CSSOM #serialize-a-css-component-value: a declared <number>,
+        // <percentage> or dimension reads back in its shortest form with a
+        // lowercase unit (GSAP's opacity probe tests `/^0.55/` against
+        // `opacity: .55`); CSS Color 4 #serializing-opacity-values turns a
+        // literal opacity percentage into its number, unclamped. Custom
+        // properties, var() values and unicode-range keep what was written.
+        let block = parse_in(
+            "top: 1px; opacity: .55; margin: -.5EM +0; z-index: +03; \
+             transition-duration: .30S; --n: .5; width: calc(var(--n) * .5px)",
+            false,
+        );
+        assert_eq!(
+            serialize(&block, false),
+            "top: 1px; opacity: 0.55; margin: -0.5em 0; z-index: 3; \
+             transition-duration: 0.3s; --n: .5; width: calc(var(--n) * .5px);"
+        );
+        assert!(serialize(&block, true).contains("opacity: .55;"));
+        for (name, value, text) in [
+            ("opacity", ".55", "0.55"),
+            ("opacity", "50%", "0.5"),
+            ("opacity", "150%", "1.5"),
+            ("fill-opacity", "+25.0%", "0.25"),
+            ("opacity", "calc(50%)", "calc(50%)"),
+            ("flex-grow", "1e1", "10"),
+            ("font-size", "1.0E1PX", "10px"),
+            ("width", "100.1234567px", "100.123457px"),
+            ("line-height", "-.0", "0"),
+            (
+                "transform",
+                "translate3d(-20PX, 0, 0) scale(.5)",
+                "translate3d(-20px, 0, 0) scale(0.5)",
+            ),
+            ("content", "'.5' counter(c)", "\".5\" counter(c)"),
+            ("background-color", "#0e5", "#0e5"),
+            ("--x", "+.50", "+.50"),
+            ("unicode-range", "U+0025-00FF, u+4??", "U+0025-00FF, u+4??"),
+        ] {
+            assert_eq!(
+                public_value(name, value.to_string()),
+                text,
+                "{name}: {value}"
+            );
+        }
     }
 
     #[test]

@@ -21798,7 +21798,9 @@ fn host_css_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
                     serde_json::json!(
                         which
                             .and_then(|which| dom.cssom_pseudo_resolved_value(id, which, &extra))
-                            .map(|value| crate::dom::serialize_css_strings(&value).into_owned())
+                            .map(|value| dom
+                                .cssom_serialize_resolved(id, &extra, &value)
+                                .into_owned())
                     )
                 }
             } else {
@@ -22612,10 +22614,14 @@ fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     }
     Ok(read_layout_dependent_style(
         ctx,
-        // CSSOM #serialize-a-css-component-value: <string>s and <url>s
-        // serialize as #serialize-a-string and #serialize-a-url make them.
-        |dom| match host_arg_node(dom, args, 0).and_then(|id| dom.cssom_resolved_value(id, &name)) {
-            Some(value) => Value::from_engine_text(crate::dom::serialize_css_strings(&value)),
+        // CSSOM #serialize-a-css-component-value, as written for custom
+        // properties (`Dom::cssom_serialize_resolved`).
+        |dom| match host_arg_node(dom, args, 0)
+            .and_then(|id| Some((id, dom.cssom_resolved_value(id, &name)?)))
+        {
+            Some((id, value)) => {
+                Value::from_engine_text(dom.cssom_serialize_resolved(id, &name, &value))
+            }
             None => Value::Null,
         },
     ))
@@ -28955,6 +28961,34 @@ mod tests {
                 "{tier:?}"
             );
         }
+    }
+
+    #[test]
+    fn computed_custom_properties_serialize_as_specified() {
+        // CSS Variables 2 #serializing-custom-props: a custom property's
+        // computed value is serialized exactly as specified (WPT
+        // registered-property-computation.html `*` `url(why)`), while a typed
+        // registration and ordinary properties serialize their component
+        // values per CSSOM #serialize-a-css-component-value.
+        let mut engine = platform_engine_with_body();
+        assert_eq!(
+            string_value(
+                &mut engine,
+                r#"
+            CSS.registerProperty({name: '--any', syntax: '*', inherits: false});
+            CSS.registerProperty({name: '--len', syntax: '<length>', inherits: false,
+                initialValue: '0px'});
+            const el = document.createElement('div');
+            document.body.append(el);
+            el.style.cssText = "--any: url(why) 'q' .5; --raw:  'a'  +.50; --len: 1.50px; " +
+                "background-position: 50.0% .5px; content: 'x' counter(c)";
+            const cs = getComputedStyle(el);
+            ['--any', '--raw', '--len', 'background-position', 'content']
+                .map((name) => cs.getPropertyValue(name)).join('|')
+        "#
+            ),
+            "url(why) 'q' .5|'a'  +.50|1.5px|50% 0.5px|\"x\" counter(c)"
+        );
     }
 
     #[test]
