@@ -1098,13 +1098,7 @@ impl Dom {
             }) else {
                 continue;
             };
-            let markup = self.serialize_svg_for_image_with(
-                node,
-                &mut SvgImageRefs {
-                    page: None,
-                    urls: Vec::new(),
-                },
-            );
+            let markup = self.serialize_svg_for_image_with(node, &mut SvgImageRefs::new(None));
             if defs.len() + markup.len() > MAX_RESOURCE_BYTES {
                 break;
             }

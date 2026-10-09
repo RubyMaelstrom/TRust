@@ -218,19 +218,21 @@ impl State {
 
 impl Dom {
     /// SVG2 #UseShadowTree requires referenced-input changes to reach instances.
-    /// Track the existing serializer's inputs without changing its lookup or
-    /// expanding its one imported subtree. Internal renderer references can
-    /// only read those serialized subtrees. Unproven CSS/projection inputs keep
-    /// explicit conservative Document watches, not an invented precise proof.
+    /// Track the serializer's inputs: the outer SVG and every element its
+    /// `use` closure imports (`Dom::svg_use_closure`). Resources imported
+    /// through `url()` or non-`use` `href` references are watched by the
+    /// conservative Document scope their references install below.
+    /// Unproven CSS/projection inputs keep explicit conservative Document
+    /// watches, not an invented precise proof.
     pub(super) fn svg_input_dependencies(
         &self,
         root: NodeId,
-        selected_target: Option<NodeId>,
+        imported: &[NodeId],
         track_styles: bool,
     ) -> Proof {
         let mut proof = Proof::default();
         let mut visited = FxHashSet::default();
-        for source in std::iter::once(root).chain(selected_target) {
+        for source in std::iter::once(root).chain(imported.iter().copied()) {
             proof.sources.push(source);
             for node in std::iter::once(source).chain(self.descendants(source)) {
                 if !visited.insert(node) {
@@ -317,12 +319,11 @@ impl Dom {
                 if fragment.is_empty() {
                     continue;
                 }
-                // local_svg_use_target uses the *consumer's* native scope for
-                // all descendant uses and selects only its first eligible
-                // target. Watch misses as well as hits. Additional imports,
-                // first-invalid duplicates and instance CSS remain renderer
-                // conformance work, not silently changed by this optimization.
-                proof.bindings.push(self.tree_scope(root));
+                // The `use` binds the first element with the ID in its own
+                // tree (DOM getElementById): any insertion, removal, reorder
+                // or ID change in that scope can rebind it. Watch misses as
+                // well as hits.
+                proof.bindings.push(self.tree_scope(node));
             }
         }
         proof
@@ -606,7 +607,6 @@ fn resolved_css_may_reference_resource(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{localize_svg_sprites, sprite_has_symbol};
     use super::*;
     use crate::layout2::{
         ControlMap, ImageSizes, Viewport, measure_retained_layout, paint_retained_layout,
@@ -690,243 +690,132 @@ mod tests {
         dom.layout_cache.borrow_mut().cold = false;
     }
 
-    // Frozen C6 source oracle: candidate6-browser-formatted-source.tar
-    // SHA ed333b0c800913f161bb5c56609777737e5e92340c69d653ca4b1fb13b9a854c.
-    // The two methods below are copied with only names/internal call renamed,
-    // then rustfmt applied. Remaining serializer helpers are unchanged
-    // by this optimization. This checks behavioral preservation, not conformance.
-    impl Dom {
-        fn c6_svg_render_markup(&self, id: NodeId, base: Option<&url::Url>) -> Option<String> {
-            let external = self.svg_sprite_ref(id);
-            let mut svg = if let Some((file, frag)) = &external {
-                // Keep the authored outer SVG and <use> boxes/paint/transforms.
-                // Replacing them with the naked symbol discarded host inheritance.
-                let abs = base?.join(file).ok()?;
-                if !sprite_has_symbol(abs.as_str(), frag) {
-                    return None;
-                }
-                self.serialize_svg_for_image(id)
-            } else if let Some(target) = self.c6_local_svg_use_target(id) {
-                let mut outer = self.serialize(id);
-                if !self.descendants(id).any(|node| node == target) {
-                    let open = outer.find('>')? + 1;
-                    let definition = format!("<defs>{}</defs>", self.serialize(target));
-                    outer.insert_str(open, &definition);
-                }
-                outer
-            } else if self.svg_is_renderable(id) {
-                self.serialize_svg_for_image(id)
-            } else {
-                return None;
-            };
-            // resvg needs the namespace; inline SVG in HTML may omit it.
-            if !svg.contains("xmlns") {
-                svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
-            }
-            if svg.contains("xlink:") && !svg.contains("xmlns:xlink") {
-                svg = svg.replacen(
-                    "<svg",
-                    r#"<svg xmlns:xlink="http://www.w3.org/1999/xlink""#,
-                    1,
-                );
-            }
-            if external.is_some() {
-                svg = localize_svg_sprites(svg, base?)?;
-            }
-            // The isolated resource decoder has no access to the embedding
-            // cascade. SVG 2 §8.12 requires definite CSS sizing winners to be
-            // the resource's intrinsic dimensions, not superseded XML attributes.
-            // Preserve percentages/auto for layout rather than inventing an
-            // intrinsic size from a containing block.
-            let units = crate::layout2::Units::of(self, id);
-            let dimensions = ["width", "height"].map(|property| {
-                self.computed_value_resolved(id, property)
-                    .and_then(|value| {
-                        crate::layout2::svg_resource_dimension(&value, units, self.viewport_px())
-                    })
-            });
-            if dimensions.iter().any(Option::is_some)
-                && let Ok(document) = resvg::usvg::roxmltree::Document::parse(&svg)
-            {
-                let root = document.root_element();
-                let mut edits = Vec::new();
-                for (property, dimension) in ["width", "height"].into_iter().zip(dimensions) {
-                    if let Some(dimension) = dimension {
-                        let replacement = format!(" {property}=\"{dimension}\"");
-                        let range = root
-                            .attributes()
-                            .find(|attribute| {
-                                attribute.name() == property && attribute.namespace().is_none()
-                            })
-                            .map(|attribute| attribute.range())
-                            .unwrap_or_else(|| root.range().start + 4..root.range().start + 4);
-                        edits.push((range, replacement));
-                    }
-                }
-                edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-                for (range, replacement) in edits {
-                    svg.replace_range(range, &replacement);
-                }
-            }
-            Some(svg)
-        }
-
-        fn c6_local_svg_use_target(&self, id: NodeId) -> Option<NodeId> {
-            let scope = self.tree_scope(id);
-            self.descendants(id).find_map(|use_node| {
-                if self.tag_name(use_node) != Some("use") {
-                    return None;
-                }
-                let fragment = self
-                    .attr(use_node, "href")
-                    .or_else(|| self.attr(use_node, "xlink:href"))?
-                    .trim()
-                    .strip_prefix('#')?;
-                (!fragment.is_empty()).then_some(())?;
-                std::iter::once(scope)
-                    .chain(self.descendants(scope))
-                    .find(|&candidate| {
-                        self.attr(candidate, "id") == Some(fragment)
-                            && matches!(
-                                self.tag_name(candidate),
-                                Some(
-                                    "svg"
-                                        | "symbol"
-                                        | "g"
-                                        | "path"
-                                        | "rect"
-                                        | "circle"
-                                        | "ellipse"
-                                        | "line"
-                                        | "polyline"
-                                        | "polygon"
-                                        | "text"
-                                        | "image"
-                                        | "use"
-                                )
-                            )
-                    })
-            })
-        }
-    }
-
     fn markup(dom: &Dom, name: &str) -> String {
         let root = dom.get_by_id(name).unwrap();
         dom.svg_render_markup(root, None).expect("renderable SVG")
     }
 
+    fn raster(dom: &Dom, root: NodeId) -> crate::render::ImageResource {
+        let (data, _) = dom.svg_image_data(root, None).unwrap();
+        let bytes = crate::img::decode_data_url(&data).unwrap();
+        crate::img::decode_graphical(&bytes).unwrap()
+    }
+
+    fn pixel(image: &crate::render::ImageResource, x: u32, y: u32) -> [u8; 4] {
+        let at = ((y * image.width + x) * 4) as usize;
+        image.rgba[at..at + 4].try_into().unwrap()
+    }
+
     #[test]
-    fn svg_dependency_serialization_matches_c6_for_multiple_transitive_duplicate_invalid_and_detached_inputs()
+    fn svg_dependency_imports_every_valid_target_transitively_and_detached_lookup_stays_in_its_tree()
      {
-        for fixture in [
-            r##"<svg><g id="a"><path d="M0 0h7v8z"/></g><circle id="b" r="3"/></svg>
+        // SVG 2 struct.html #UseElement / linking.html #processingURL-target:
+        // each `use` binds the first element with its ID in the use's tree,
+        // which must be an SVG element; every such target outside the outer
+        // SVG is imported, including targets reached from imported content.
+        let fixtures: [(&str, Option<&[&str]>); 6] = [
+            (
+                r##"<svg><g id="a"><path d="M0 0h7v8z"/></g><circle id="b" r="3"/></svg>
                 <svg id="consumer"><use href="#a"/><use href="#b"/></svg>"##,
-            r##"<svg><g id="a"><use href="#b"/></g><path id="b" d="M0 0h7v8z"/></svg>
+                Some(&["M0 0h7v8z", "<circle"]),
+            ),
+            (
+                r##"<svg><g id="a"><use href="#b"/></g><path id="b" d="M0 0h7v8z"/></svg>
                 <svg id="consumer"><use href="#a"/></svg>"##,
-            r##"<svg><g id="b"><rect id="same" width="3"/></g><g id="a"><circle id="same" r="2"/></g></svg>
+                Some(&[r#"<g id="a">"#, r#"<path id="b""#]),
+            ),
+            (
+                r##"<svg><g id="b"><rect id="same" width="3"/></g><g id="a"><circle id="same" r="2"/></g></svg>
                 <svg id="consumer"><use href="#a"/><use href="#b"/><use href="#same"/></svg>"##,
-            r##"<div id="same"></div><svg><path id="same" d="M0 0h7v8z"/></svg>
+                Some(&[
+                    r#"<rect id="trust-ref-0""#,
+                    r##"href="#trust-ref-0""##,
+                    r#"<circle id="same""#,
+                ]),
+            ),
+            // The first element with the ID is not an SVG element: invalid.
+            (
+                r##"<div id="same"></div><svg><path id="same" d="M0 0h7v8z"/></svg>
                 <svg id="consumer"><use href="#same"/></svg>"##,
-            r##"<svg id="consumer"><use href="#missing"/></svg>"##,
-            r##"<svg id="consumer"><rect width="4" height="3" fill="url(#missing)"/></svg>"##,
-        ] {
+                None,
+            ),
+            (r##"<svg id="consumer"><use href="#missing"/></svg>"##, None),
+            (
+                r##"<svg id="consumer"><rect width="4" height="3" fill="url(#missing)"/></svg>"##,
+                Some(&["url(#missing)"]),
+            ),
+        ];
+        for (fixture, expected) in fixtures {
             let mut dom = Dom::parse_document(fixture);
             let root = dom.get_by_id("consumer").unwrap();
-            assert_eq!(
-                dom.local_svg_use_target(root),
-                dom.c6_local_svg_use_target(root)
-            );
-            assert_eq!(
-                dom.svg_render_markup(root, None),
-                dom.c6_svg_render_markup(root, None),
-                "{fixture}"
-            );
+            let rendered = dom.svg_render_markup(root, None);
+            match expected {
+                Some(needles) => {
+                    let markup = rendered.expect(fixture);
+                    for needle in needles {
+                        assert!(markup.contains(needle), "{needle} in {markup}");
+                    }
+                }
+                None => assert!(rendered.is_none(), "{fixture}"),
+            }
+            // A detached consumer looks up IDs in its own tree only.
             dom.detach(root);
+            assert!(dom.local_svg_use_target(root).is_none(), "{fixture}");
             assert_eq!(
-                dom.local_svg_use_target(root),
-                dom.c6_local_svg_use_target(root)
-            );
-            assert_eq!(
-                dom.svg_render_markup(root, None),
-                dom.c6_svg_render_markup(root, None),
+                dom.svg_render_markup(root, None).is_some(),
+                fixture.contains("url(#missing)"),
                 "detached: {fixture}"
             );
         }
     }
 
     #[test]
-    fn svg_dependency_selected_input_renders_and_rebuilds_after_source_change() {
+    fn svg_dependency_selected_inputs_render_and_rebuild_after_source_change() {
         let mut dom = Dom::parse_document(
             r##"<svg style="display:none"><g id="a"><rect id="red" width="10" height="10" fill="red"/></g>
-            <g id="b"><rect width="10" height="10" fill="blue"/></g></svg>
+            <g id="b"><rect id="blue" width="10" height="10" fill="blue"/></g></svg>
             <svg id="consumer" width="20" height="10" viewBox="0 0 20 10"><use href="#a"/><use href="#b" x="10"/></svg>"##,
         );
         let root = dom.get_by_id("consumer").unwrap();
-        let raster = |dom: &Dom| {
-            let (data, _) = dom.svg_image_data(root, None).unwrap();
-            let bytes = crate::img::decode_data_url(&data).unwrap();
-            crate::img::decode_graphical(&bytes).unwrap()
-        };
-        let image = raster(&dom);
+        let image = raster(&dom, root);
         assert_eq!((image.width, image.height), (20, 10));
-        assert_eq!(
-            &image.rgba[(2 * 20 + 2) * 4..(2 * 20 + 2) * 4 + 4],
-            &[255, 0, 0, 255]
-        );
-        // The old serializer imports only one target. Its independent second
-        // use remains an explicit renderer gap, not changed by invalidation.
-        assert_eq!(
-            dom.svg_render_markup(root, None),
-            dom.c6_svg_render_markup(root, None)
-        );
+        assert_eq!(pixel(&image, 2, 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&image, 12, 2), [0, 0, 255, 255]);
         let state = dom.svg_dependencies.borrow();
-        assert!(
-            state.consumers[&root]
-                .sources
-                .contains(&dom.get_by_id("a").unwrap())
-        );
-        assert!(
-            !state.consumers[&root]
-                .sources
-                .contains(&dom.get_by_id("b").unwrap())
-        );
+        for source in ["a", "b"] {
+            assert!(
+                state.consumers[&root]
+                    .sources
+                    .contains(&dom.get_by_id(source).unwrap())
+            );
+        }
         drop(state);
         dom.set_attr(dom.get_by_id("red").unwrap(), "fill", "lime");
-        let image = raster(&dom);
-        assert_eq!(
-            &image.rgba[(2 * 20 + 2) * 4..(2 * 20 + 2) * 4 + 4],
-            &[0, 255, 0, 255]
-        );
+        dom.set_attr(dom.get_by_id("blue").unwrap(), "fill", "yellow");
+        let image = raster(&dom, root);
+        assert_eq!(pixel(&image, 2, 2), [0, 255, 0, 255]);
+        assert_eq!(pixel(&image, 12, 2), [255, 255, 0, 255]);
     }
 
     #[test]
-    #[ignore = "OPEN SVG renderer gap: invalid first native ID binds a later eligible duplicate; run explicitly with --ignored"]
-    fn svg_renderer_known_gap_invalid_native_first_target_cannot_bind_later_serialized_duplicate() {
+    fn svg_renderer_invalid_native_first_target_cannot_bind_later_serialized_duplicate() {
         let dom = Dom::parse_document(
             r##"<div id="duplicate"></div>
             <svg id="consumer" width="20" height="10" viewBox="0 0 20 10">
             <defs><path id="duplicate" d="M10 0h10v10H10z" fill="blue"/></defs>
             <rect width="4" height="4" fill="red"/><use href="#duplicate"/></svg>"##,
         );
-        let (data, _) = dom
-            .svg_image_data(dom.get_by_id("consumer").unwrap(), None)
-            .unwrap();
-        let bytes = crate::img::decode_data_url(&data).unwrap();
-        let image = crate::img::decode_graphical(&bytes).unwrap();
+        let image = raster(&dom, dom.get_by_id("consumer").unwrap());
+        assert_eq!(pixel(&image, 2, 2), [255, 0, 0, 255]);
         assert_eq!(
-            &image.rgba[(2 * 20 + 2) * 4..(2 * 20 + 2) * 4 + 4],
-            &[255, 0, 0, 255]
-        );
-        assert_eq!(
-            image.rgba[(2 * 20 + 12) * 4 + 3],
+            pixel(&image, 12, 2)[3],
             0,
             "an invalid canonical target must not bind to a later SVG duplicate"
         );
     }
 
     #[test]
-    #[ignore = "OPEN SVG renderer gap: per-use canonical multiple/duplicate bindings are not preserved by single-import serialization; run explicitly with --ignored"]
-    fn svg_renderer_known_gap_import_order_cannot_change_canonical_duplicate_target() {
+    fn svg_renderer_import_order_cannot_change_canonical_duplicate_target() {
         let dom = Dom::parse_document(
             r##"<svg style="display:none">
             <g id="b"><rect id="duplicate" width="10" height="10" fill="red"/></g>
@@ -934,45 +823,55 @@ mod tests {
             <svg id="consumer" width="30" height="10" viewBox="0 0 30 10">
             <use href="#a"/><use href="#b" x="10"/><use href="#duplicate" x="20"/></svg>"##,
         );
-        let (data, _) = dom
-            .svg_image_data(dom.get_by_id("consumer").unwrap(), None)
-            .unwrap();
-        let bytes = crate::img::decode_data_url(&data).unwrap();
-        let image = crate::img::decode_graphical(&bytes).unwrap();
+        let image = raster(&dom, dom.get_by_id("consumer").unwrap());
+        assert_eq!(pixel(&image, 2, 2), [0, 0, 255, 255]);
+        assert_eq!(pixel(&image, 12, 2), [255, 0, 0, 255]);
         assert_eq!(
-            &image.rgba[(2 * 30 + 2) * 4..(2 * 30 + 2) * 4 + 4],
-            &[0, 0, 255, 255]
-        );
-        assert_eq!(
-            &image.rgba[(2 * 30 + 12) * 4..(2 * 30 + 12) * 4 + 4],
-            &[255, 0, 0, 255]
-        );
-        assert_eq!(
-            &image.rgba[(2 * 30 + 22) * 4..(2 * 30 + 22) * 4 + 4],
-            &[255, 0, 0, 255],
+            pixel(&image, 22, 2),
+            [255, 0, 0, 255],
             "native first-ID lookup is independent of use/import order"
         );
+        // Reversing the reference order imports the duplicate before its
+        // container; the container then carries it, still bound once.
+        let dom = Dom::parse_document(
+            r##"<svg style="display:none">
+            <g id="b"><rect id="duplicate" width="10" height="10" fill="red"/></g>
+            <g id="a"><rect id="duplicate" width="10" height="10" fill="blue"/></g></svg>
+            <svg id="consumer" width="30" height="10" viewBox="0 0 30 10">
+            <use href="#duplicate" x="20"/><use href="#b" x="10"/><use href="#a"/></svg>"##,
+        );
+        let image = raster(&dom, dom.get_by_id("consumer").unwrap());
+        assert_eq!(pixel(&image, 2, 2), [0, 0, 255, 255]);
+        assert_eq!(pixel(&image, 12, 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&image, 22, 2), [255, 0, 0, 255]);
     }
 
     #[test]
-    fn svg_dependency_lookup_tracks_existing_eligible_target_and_href_precedence() {
-        let dom = Dom::parse_document(
+    fn svg_dependency_lookup_binds_first_id_in_tree_and_href_precedence() {
+        // linking.html #processingURL: `xlink:href` applies only without an
+        // `href`; the `href` names a `<div>` first, an invalid `use` target.
+        let mut dom = Dom::parse_document(
             r##"<div id="duplicate"></div>
             <svg><path id="duplicate" d="M0 0h7v8z"/><path id="valid" d="M0 0h1v1z"/></svg>
             <svg id="consumer"><use href="#duplicate" xlink:href="#valid"/></svg>"##,
         );
         let root = dom.get_by_id("consumer").unwrap();
+        assert!(dom.local_svg_use_target(root).is_none());
+        assert!(dom.svg_render_markup(root, None).is_none());
+        let proof = dom.svg_input_dependencies(root, &[], true);
+        assert!(proof.bindings.contains(&super::super::DOCUMENT));
+        assert!(dom.svg_dependencies.borrow().consumers.contains_key(&root));
+        // Removing the invalid first binding is a binding change that
+        // reaches the consumer; the path then binds.
+        let div = dom.get_by_id("duplicate").unwrap();
+        assert!(dom.svg_dirty_consumers(&[div], true).contains(&root));
+        dom.detach(div);
         let selected = dom.local_svg_use_target(root).unwrap();
         assert_eq!(dom.tag_name(selected), Some("path"));
         assert_eq!(dom.attr(selected, "id"), Some("duplicate"));
-        let proof = dom.svg_input_dependencies(root, Some(selected), true);
-        assert!(proof.bindings.contains(&super::super::DOCUMENT));
-        assert!(proof.sources.contains(&selected));
-        assert_eq!(
-            dom.svg_render_markup(root, None),
-            dom.c6_svg_render_markup(root, None)
-        );
-        assert!(dom.svg_dependencies.borrow().consumers.contains_key(&root));
+        let markup = dom.svg_render_markup(root, None).unwrap();
+        assert!(markup.contains("M0 0h7v8z"), "{markup}");
+        assert!(!markup.contains("M0 0h1v1z"), "{markup}");
     }
 
     #[test]
@@ -1318,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn svg_dependency_binding_watches_cover_legacy_presentation_lookup_without_retired_documents() {
+    fn svg_dependency_lookup_stays_in_its_document_while_binding_watches_cover_frames() {
         let mut dom = Dom::parse_document(
             r##"<svg id="consumer"><use href="#late"/></svg><iframe id="frame"></iframe>"##,
         );
@@ -1331,15 +1230,14 @@ mod tests {
             .unwrap();
         dom.append(frame, document);
         assert!(dom.svg_render_markup(consumer, None).is_none());
-        // The old native descendant lookup crosses this presentation edge.
-        // Cover it conservatively here; correcting that lookup is separate.
+        // The binding watch conservatively covers the presentation edge into
+        // the frame's document.
         assert!(dom.svg_dirty_consumers(&[path], true).contains(&consumer));
+        // DOM getElementById searches the consumer's own document only: an
+        // element of the frame's document never binds.
         dom.set_attr(path, "id", "late");
-        assert_eq!(dom.local_svg_use_target(consumer), Some(path));
-        assert_eq!(
-            dom.svg_render_markup(consumer, None),
-            dom.c6_svg_render_markup(consumer, None)
-        );
+        assert!(dom.local_svg_use_target(consumer).is_none());
+        assert!(dom.svg_render_markup(consumer, None).is_none());
         dom.detach(document);
         assert!(dom.svg_render_markup(consumer, None).is_none());
         assert!(!dom.svg_dirty_consumers(&[path], true).contains(&consumer));
@@ -1356,10 +1254,7 @@ mod tests {
         let text = dom.create_element("span");
         dom.append(shadow, text);
         let consumer = dom.get_by_id("consumer").unwrap();
-        assert_eq!(
-            dom.svg_render_markup(consumer, None),
-            dom.c6_svg_render_markup(consumer, None)
-        );
+        assert!(dom.svg_render_markup(consumer, None).is_some());
         assert!(
             dom.svg_dependencies.borrow().consumers[&consumer]
                 .conservative

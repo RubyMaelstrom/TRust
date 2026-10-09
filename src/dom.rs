@@ -67,6 +67,7 @@ mod sheet_cache;
 mod slotting;
 mod svg_dependencies;
 pub(crate) mod svg_geometry;
+mod svg_references;
 mod transitions;
 mod validity;
 mod xml;
@@ -4869,10 +4870,7 @@ impl Dom {
             }
             current = self.nodes[node].parent;
         }
-        let mut images = SvgImageRefs {
-            page: None,
-            urls: Vec::new(),
-        };
+        let mut images = SvgImageRefs::new(None);
         let mut svg = self.serialize_svg_for_image_with(root, &mut images);
         if root == target {
             svg = format!(r#"<svg xmlns="{SVG}">{svg}</svg>"#);
@@ -11327,12 +11325,12 @@ impl Dom {
     /// Publish the SVG2 dependency proof of `id`'s image resource, as every
     /// resolution of the resource does before it is serialized.
     fn publish_svg_resource_proof(&self, id: NodeId) -> Option<NodeId> {
-        let local_target = self.local_svg_use_target(id);
-        let proof = self.svg_input_dependencies(id, local_target, true);
+        let closure = self.svg_use_closure(id);
+        let proof = self.svg_input_dependencies(id, &closure.targets, true);
         // Publish negative/unresolved lookups too: a parent box may cache the
         // absence of an image until a later ID insertion makes it renderable.
         self.svg_dependencies.borrow_mut().publish(id, proof);
-        local_target
+        closure.first_valid
     }
 
     /// The image source for an inline SVG resource, marked with its host
@@ -11479,10 +11477,14 @@ impl Dom {
 
     /// Resolve the SVG 2 §5.6 `use` instance tree into self-contained markup
     /// for the image decoder. External references use the fetched sprite table;
-    /// a same-tree `#fragment` target outside the outer `<svg>` is injected into
-    /// that SVG's `<defs>` so the authored `<use>` resolves without changing
-    /// the canonical DOM. Also returns the absolute URLs of the external
-    /// `<image>` resources the markup references, in document order.
+    /// same-document `#fragment` targets outside the outer `<svg>` (`use`
+    /// targets, paint servers, clip paths, masks, markers, filters and what
+    /// they reference) are imported into that SVG's `<defs>`, with IDs named
+    /// so each reference binds as in this document (`svg_references`),
+    /// without changing the canonical DOM. SVG 2 §6.6: author-sheet
+    /// presentation properties apply to the imported content too. Also
+    /// returns the absolute URLs of the external `<image>` resources the
+    /// markup references, in document order.
     fn svg_render_resource(
         &self,
         id: NodeId,
@@ -11490,38 +11492,18 @@ impl Dom {
     ) -> Option<(String, Vec<String>)> {
         let local_target = self.publish_svg_resource_proof(id);
         let external = self.svg_sprite_ref(id);
-        let mut images = SvgImageRefs {
-            page: base,
-            urls: Vec::new(),
-        };
-        let mut svg = if let Some((file, frag)) = &external {
+        let mut images = SvgImageRefs::new(base);
+        if let Some((file, frag)) = &external {
             // Keep the authored outer SVG and <use> boxes/paint/transforms.
             // Replacing them with the naked symbol discarded host inheritance.
             let abs = base?.join(file).ok()?;
             if !sprite_has_symbol(abs.as_str(), frag) {
                 return None;
             }
-            self.serialize_svg_for_image_with(id, &mut images)
-        } else if let Some(target) = local_target {
-            // SVG 2 §6.6: author-sheet presentation properties apply to an
-            // icon built from local `<use>` references too, so the resource
-            // carries them like any other inline SVG (a stylesheet's
-            // `.wave > use { fill: url(#water) }` otherwise drew black).
-            let mut outer = self.serialize_svg_for_image_with(id, &mut images);
-            if !self.descendants(id).any(|node| node == target) {
-                let open = outer.find('>')? + 1;
-                let definition = format!(
-                    "<defs>{}</defs>",
-                    self.serialize_svg_for_image_with(target, &mut images)
-                );
-                outer.insert_str(open, &definition);
-            }
-            outer
-        } else if self.svg_is_renderable(id) {
-            self.serialize_svg_for_image_with(id, &mut images)
-        } else {
+        } else if local_target.is_none() && !self.svg_is_renderable(id) {
             return None;
-        };
+        }
+        let mut svg = self.svg_resource_markup(id, &mut images);
         // resvg needs the namespace; inline SVG in HTML may omit it.
         if !svg.contains("xmlns") {
             svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
@@ -11578,17 +11560,6 @@ impl Dom {
     /// The ordinary HTML serializer intentionally drops `<style>` elements;
     /// this small SVG serializer keeps their text and applies the same
     /// computed-color substitution to each element's authored/baked attrs.
-    #[cfg(test)]
-    fn serialize_svg_for_image(&self, root: NodeId) -> String {
-        self.serialize_svg_for_image_with(
-            root,
-            &mut SvgImageRefs {
-                page: None,
-                urls: Vec::new(),
-            },
-        )
-    }
-
     fn serialize_svg_for_image_with(&self, root: NodeId, images: &mut SvgImageRefs) -> String {
         let mut out = String::new();
         self.serialize_svg_node_for_image(root, None, &mut out, images);
@@ -11629,11 +11600,21 @@ impl Dom {
                 out.push_str(&text.replace("--", "- -"));
                 out.push_str("-->");
             }
-            NodeData::Text(text) => out.push_str(&escape_text(text)),
+            NodeData::Text(text) => {
+                let rewritten = self.nodes[id]
+                    .parent
+                    .filter(|&parent| self.tag_name(parent) == Some("style"))
+                    .and_then(|style| images.references.style_text(self, style, text));
+                out.push_str(&escape_text(rewritten.as_deref().unwrap_or(text)));
+            }
             NodeData::Element { name, attrs, .. } => {
                 let tag = name.local.as_ref();
+                // Never-rendered resources stay referencable when hidden
+                // (`svg_references`).
                 if matches!(tag, "script" | "noscript" | "template")
-                    || (tag != "style" && self.is_hidden(id))
+                    || (tag != "style"
+                        && !svg_references::referencable_when_hidden(tag)
+                        && self.is_hidden(id))
                 {
                     return;
                 }
@@ -11656,13 +11637,18 @@ impl Dom {
                     }
                     return;
                 }
+                let entered = images.references.enter(id);
+                let keep_current_color = images.references.keeps_current_color();
                 let color = self.svg_used_color(id);
                 // SVG 2 §6.6 maps presentation attributes into the author
                 // cascade at specificity zero, while ordinary author rules
                 // (including shadow-scoped component rules) can override
                 // them. The standalone raster resource has no document CSS,
                 // so materialize each direct cascade winner as inline style.
-                let paint = self.svg_resource_style(id);
+                let mut paint = self.svg_resource_style(id);
+                if let Some(inherited) = images.references.root_style(self, id, &color) {
+                    paint.insert_str(0, &inherited);
+                }
                 let image =
                     tag == "image" && self.namespace_uri(id) == Some("http://www.w3.org/2000/svg");
                 let mut serialized_attrs = String::new();
@@ -11683,14 +11669,22 @@ impl Dom {
                         } else {
                             value.to_string()
                         };
-                        Some(replace_css_current_color(&value, &color))
+                        Some(if keep_current_color {
+                            value
+                        } else {
+                            replace_css_current_color(&value, &color)
+                        })
                     },
                     &paint,
                     &mut serialized_attrs,
                 );
+                if !keep_current_color {
+                    serialized_attrs = replace_css_current_color(&serialized_attrs, &color);
+                }
+                let serialized_attrs = images.references.element(self, id, tag, serialized_attrs);
                 out.push('<');
                 out.push_str(tag);
-                out.push_str(&replace_css_current_color(&serialized_attrs, &color));
+                out.push_str(&serialized_attrs);
                 out.push('>');
                 if !VOID_ELEMENTS.contains(&tag) {
                     if let Some(root) = self.shadow_root(id) {
@@ -11706,6 +11700,7 @@ impl Dom {
                     out.push_str(tag);
                     out.push('>');
                 }
+                images.references.leave(entered);
             }
         }
     }
@@ -11731,45 +11726,14 @@ impl Dom {
         out
     }
 
-    /// The first resolvable same-tree fragment referenced by a descendant
-    /// `<use>`. SVG 2 reference lookup is tree-scoped: a shadow tree must not
-    /// capture an equal id from the outer document.
+    /// The element referenced by the first `<use>` in the outer SVG `id`
+    /// whose reference is valid: SVG 2 struct.html #UseElement binds the
+    /// first element with the fragment's ID in the `use`'s tree (DOM
+    /// getElementById, never an equal ID in another tree), which must be an
+    /// SVG element and not an ancestor of the `use`.
+    #[cfg(test)]
     fn local_svg_use_target(&self, id: NodeId) -> Option<NodeId> {
-        let scope = self.tree_scope(id);
-        self.descendants(id).find_map(|use_node| {
-            if self.tag_name(use_node) != Some("use") {
-                return None;
-            }
-            let fragment = self
-                .attr(use_node, "href")
-                .or_else(|| self.attr(use_node, "xlink:href"))?
-                .trim()
-                .strip_prefix('#')?;
-            (!fragment.is_empty()).then_some(())?;
-            std::iter::once(scope)
-                .chain(self.descendants(scope))
-                .find(|&candidate| {
-                    self.attr(candidate, "id") == Some(fragment)
-                        && matches!(
-                            self.tag_name(candidate),
-                            Some(
-                                "svg"
-                                    | "symbol"
-                                    | "g"
-                                    | "path"
-                                    | "rect"
-                                    | "circle"
-                                    | "ellipse"
-                                    | "line"
-                                    | "polyline"
-                                    | "polygon"
-                                    | "text"
-                                    | "image"
-                                    | "use"
-                            )
-                        )
-                })
-        })
+        self.svg_use_closure(id).first_valid
     }
 
     /// A paintable inline SVG: not hidden, and carrying a graphics element
@@ -11816,12 +11780,12 @@ impl Dom {
                 .and_then(|b| b.join(&file).ok())
                 .is_some_and(|abs| sprite_has_symbol(abs.as_str(), &frag));
         }
-        let target = self.local_svg_use_target(id);
-        let proof = self.svg_input_dependencies(id, target, false);
+        let closure = self.svg_use_closure(id);
+        let proof = self.svg_input_dependencies(id, &closure.targets, false);
         self.svg_dependencies
             .borrow_mut()
             .publish_candidate(id, proof);
-        target.is_some() || self.svg_is_renderable(id)
+        closure.first_valid.is_some() || self.svg_is_renderable(id)
     }
 
     /// Whether the subtree under `id` (inclusive) will PAINT an icon in the
@@ -14372,6 +14336,9 @@ fn append_style(style: &mut String, declarations: &str) {
 struct SvgImageRefs<'a> {
     page: Option<&'a url::Url>,
     urls: Vec<String>,
+    /// Same-document references of the resource being serialized
+    /// (`svg_references`).
+    references: svg_references::References,
 }
 
 impl SvgImageRefs<'_> {
