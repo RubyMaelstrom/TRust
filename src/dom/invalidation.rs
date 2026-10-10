@@ -2632,6 +2632,82 @@ mod tests {
         assert_shadow_dependencies_match_roots(&dom);
     }
 
+    /// DOM #concept-node-adopt retargets a detached tree's node document. Only
+    /// that tree can observe it, so no other element's style may be dropped.
+    #[test]
+    fn adopting_a_detached_tree_restyles_only_that_tree() {
+        let mut dom = Dom::parse_document(
+            "<body><main id=outer>outer</main><section id=stable></section>\
+             <iframe id=left></iframe><iframe id=right></iframe></body>",
+        );
+        let (left, right) = (
+            dom.get_by_id("left").unwrap(),
+            dom.get_by_id("right").unwrap(),
+        );
+        for (frame, color) in [(left, "red"), (right, "blue")] {
+            dom.install_frame_document(
+                frame,
+                &format!("<head><style>p {{ color:{color} }}</style></head><body></body>"),
+                "https://frame.test/",
+            )
+            .unwrap();
+        }
+        let (left_body, right_body) = (
+            dom.frame_body(left).unwrap(),
+            dom.frame_body(right).unwrap(),
+        );
+        let (left_document, right_document) = (
+            dom.frame_document(left).unwrap(),
+            dom.frame_document(right).unwrap(),
+        );
+        let outer = dom.get_by_id("outer").unwrap();
+        let stable = dom.get_by_id("stable").unwrap();
+        let stable_text = dom.child_iter(outer).next().unwrap();
+        let fragment = dom.create_element("div");
+        let paragraph = dom.create_element("p");
+        dom.append(fragment, paragraph);
+        dom.adopt_node(left_document, fragment).unwrap();
+        dom.append(left_body, fragment);
+        assert_eq!(
+            dom.computed_value_resolved(paragraph, "color").as_deref(),
+            Some("red")
+        );
+
+        let retained_outer = dom.cascaded_maps(outer);
+        let retained_stable = dom.cascaded_maps(stable);
+        let retained_text = dom.computed_value_resolved(stable_text, "color");
+        let values = dom.style_value_epoch;
+        dom.detach(fragment);
+        let values_after_detach = dom.style_value_epoch;
+        dom.adopt_node(right_document, fragment).unwrap();
+        assert_eq!(
+            dom.style_value_epoch, values_after_detach,
+            "adoption left the whole document's values alone"
+        );
+        assert!(values_after_detach >= values);
+        assert!(std::rc::Rc::ptr_eq(
+            &retained_outer,
+            &dom.cascaded_maps(outer)
+        ));
+        assert!(std::rc::Rc::ptr_eq(
+            &retained_stable,
+            &dom.cascaded_maps(stable)
+        ));
+        assert_eq!(
+            dom.computed_value_resolved(stable_text, "color"),
+            retained_text
+        );
+
+        // The adopted tree takes its new Document's sheets.
+        dom.append(right_body, fragment);
+        assert_eq!(dom.owner_document(paragraph), Some(right_document));
+        assert_eq!(
+            dom.computed_value_resolved(paragraph, "color").as_deref(),
+            Some("blue")
+        );
+        assert_style_values_match_cold(&mut dom);
+    }
+
     #[test]
     fn shadow_dependencies_stop_at_document_roots_and_follow_adoption() {
         let mut dom = Dom::parse_document(

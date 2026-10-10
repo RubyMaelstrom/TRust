@@ -4574,8 +4574,14 @@ impl Dom {
             // DOM #concept-node-adopt changes the node document even for an
             // already detached tree, including its shadow descendants. There
             // may be no removal/insertion to expire those style dependencies.
-            self.selector_epoch = self.selector_epoch.wrapping_add(1);
-            self.invalidate_all_style_values();
+            // `detach` has already settled the old position, so the adopted
+            // tree is the only place the new node document can be observed:
+            // its sheets, `:root` and `:scope` are the new Document's. Every
+            // other element's style and layout stay valid, which matters to
+            // scripts that adopt a freshly parsed fragment (jQuery's
+            // `parseHTML` builds one in a separate document) before each
+            // insertion.
+            self.invalidate_style_subtree(id, true);
         }
         Ok(old_document)
     }
