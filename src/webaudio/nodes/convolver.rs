@@ -358,6 +358,7 @@ mod tests {
                 frames: quantum,
                 node: 1,
                 inputs_active: true,
+                connected: true,
                 notices: &mut notices,
             };
             convolver.process(

@@ -12967,8 +12967,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
     //
     // Objects are released to the rendering thread when collected; a started
     // source node is kept until it ends, and a running context until it is
-    // suspended or closed. A ScriptProcessorNode renders silence and
-    // dispatches no audioprocess events.
+    // suspended or closed.
     function installAudioContexts() {
         const binding = g.__audio_context_binding;
         delete g.__audio_context_binding;
@@ -13686,14 +13685,58 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             }
             get maxChannelCount() { return nodeRecord(this, "destination").maxChannels; }
         }
+        // ScriptProcessorNode (#ScriptProcessorNode): the rendering thread
+        // sends each input chunk as an audioprocess task; the outputBuffer
+        // goes back once the event is dispatched. The context keeps its
+        // processors, whose events can fire at any time.
         class ScriptProcessorNode extends AudioNode {
             constructor(key, context, bufferSize, inputs, outputs) {
-                super(key, context, "processor", inputs, [], [outputs]);
+                super(key, context, "processor", inputs, [], [bufferSize, outputs]);
                 const state = nodeRecord(this);
                 state.bufferSize = bufferSize;
+                state.inputChannels = inputs;
                 state.outputChannels = outputs;
+                apply(mapSet, get(context).processors, [state.id, this]);
             }
             get bufferSize() { return nodeRecord(this, "processor").bufferSize; }
+        }
+        // #AudioProcessingEvent
+        class AudioProcessingEvent extends Event {
+            constructor(type, eventInitDict) {
+                if (arguments.length < 2) throw new TypeError("AudioProcessingEvent requires type and init");
+                const init = dictionary(eventInitDict, "AudioProcessingEventInit");
+                const base = {bubbles: !!member(init, "bubbles"), cancelable: !!member(init, "cancelable"),
+                    composed: !!member(init, "composed")};
+                const input = member(init, "inputBuffer");
+                if (input === undefined) throw new TypeError("inputBuffer is required");
+                bufferRecord(input);
+                const output = member(init, "outputBuffer");
+                if (output === undefined) throw new TypeError("outputBuffer is required");
+                bufferRecord(output);
+                const time = member(init, "playbackTime");
+                if (time === undefined) throw new TypeError("playbackTime is required");
+                const playbackTime = double(time, "playbackTime");
+                super(`${type}`, base);
+                set(this, {kind: "processing", playbackTime, input, output});
+            }
+            get playbackTime() { return processingRecord(this).playbackTime; }
+            get inputBuffer() { return processingRecord(this).input; }
+            get outputBuffer() { return processingRecord(this).output; }
+        }
+        function processingRecord(event) {
+            const state = get(event);
+            if (!state || state.kind !== "processing") throw new TypeError("Illegal AudioProcessingEvent invocation");
+            return state;
+        }
+        function audioProcess(state, node, input, playbackTime) {
+            const nodeState = nodeRecord(node);
+            const size = nodeState.bufferSize;
+            const inputBuffer = contentBuffer(input, size, state.rate, max(1, nodeState.inputChannels));
+            const outputBuffer = createBuffer(max(1, nodeState.outputChannels), size, state.rate);
+            const event = createTrustedEvent(AudioProcessingEvent, "audioprocess",
+                {playbackTime, inputBuffer, outputBuffer});
+            dispatch(node, event, false);
+            host("scriptOutput", state.id, nodeState.id, acquireContent(outputBuffer));
         }
         class GainNode extends AudioNode {
             constructor(context, options = undefined) {
@@ -14467,7 +14510,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
         function contextState(kind, fields) {
             const state = {kind, id: 0, object: null, destination: null, state: "suspended",
                 reported: "suspended", closed: false, tokens: new MapCtor(), nextToken: 0,
-                sources: new MapCtor(), decodes: new MapCtor()};
+                sources: new MapCtor(), decodes: new MapCtor(), processors: new MapCtor()};
             for (const key in fields) state[key] = fields[key];
             return state;
         }
@@ -14746,6 +14789,12 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
                 case "rendered":
                     offlineRendered(context, state, contentBuffer(a, b, state.rate, c));
                     break;
+                case "audioprocess": {
+                    const node = apply(mapGet, state.processors, [a]);
+                    if (node) audioProcess(state, node, b, c);
+                    else host("scriptOutput", state.id, a, 0);
+                    break;
+                }
                 case "decoded": {
                     const pending = apply(mapGet, state.decodes, [a]);
                     apply(mapDelete, state.decodes, [a]);
@@ -14826,7 +14875,7 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             AudioBufferSourceNode, AudioParam, AudioBuffer, PeriodicWave, OfflineAudioCompletionEvent,
             ConstantSourceNode, BiquadFilterNode, IIRFilterNode, DelayNode, StereoPannerNode, ChannelSplitterNode,
             ChannelMergerNode, WaveShaperNode, AnalyserNode, ConvolverNode, AudioListener,
-            MediaElementAudioSourceNode]) {
+            MediaElementAudioSourceNode, AudioProcessingEvent]) {
             for (const name of Object.getOwnPropertyNames(ctor.prototype)) {
                 if (name === "constructor") continue;
                 const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, name);
@@ -14843,7 +14892,8 @@ globalThis.__engine_global_names = Object.getOwnPropertyNames(globalThis);
             [OfflineAudioContext, 1], [OfflineAudioCompletionEvent, 2], [ConstantSourceNode, 1],
             [BiquadFilterNode, 1], [IIRFilterNode, 2], [DelayNode, 1], [StereoPannerNode, 1],
             [ChannelSplitterNode, 1], [ChannelMergerNode, 1], [WaveShaperNode, 1], [AnalyserNode, 1],
-            [ConvolverNode, 1], [AudioListener, 0], [MediaElementAudioSourceNode, 2]])
+            [ConvolverNode, 1], [AudioListener, 0], [MediaElementAudioSourceNode, 2],
+            [AudioProcessingEvent, 2]])
             define(ctor, "length", {value: length, configurable: true});
     }
     for (const [name,value] of [["NETWORK_EMPTY",0],["NETWORK_IDLE",1],["NETWORK_LOADING",2],

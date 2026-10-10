@@ -751,7 +751,11 @@ current behavior and limits; consult the governing standards before changing it.
   suspended) the element plays on with its output ignored, consumed in real
   time. A CORS-cross-origin resource (a no-cors response from another
   origin, after redirects) is heard as silence. `ScriptProcessorNode`
-  renders silence without `audioprocess`; worklets are unimplemented. A collected node is released to the rendering thread and
+  sends each `bufferSize` chunk of input as an `audioprocess` task while it
+  is connected; the filled `outputBuffer` plays two buffers later (double
+  buffering), and an `OfflineAudioContext` waits for each answer (closing
+  the context, or 10 s without one, ends the wait). Worklets are
+  unimplemented. A collected node is released to the rendering thread and
   leaves the graph once silent; a started source and a running context stay
   alive until they end or suspend.
 - WebAssembly exception handling runs both the legacy (`try`/`catch`/

@@ -96,6 +96,8 @@ struct Node {
     tail: bool,
     /// Part of a cycle without a delay: muted.
     muted: bool,
+    /// Something is connected to an input or an output.
+    connected: bool,
 }
 
 /// One entry of the processing order.
@@ -321,6 +323,7 @@ impl Graph {
             active: false,
             tail: false,
             muted: false,
+            connected: false,
         });
         self.node_ids.insert(id, index);
         self.dirty = true;
@@ -396,9 +399,23 @@ impl Graph {
             }
         }
         order.extend(breakers.iter().map(|&index| Step::Write(index)));
+        // Nodes with a connection on either side.
+        let mut connected = vec![false; count];
+        for (index, list) in depends.iter().enumerate() {
+            if !list.is_empty() {
+                connected[index] = true;
+            }
+            for &source in list {
+                connected[source] = true;
+            }
+        }
+        for &breaker in &breakers {
+            connected[breaker] = true;
+        }
         for (index, node) in self.nodes.iter_mut().enumerate() {
             if let Some(node) = node {
                 node.muted = muted[index];
+                node.connected = connected[index];
             }
         }
         self.order = order;
@@ -484,6 +501,7 @@ impl Graph {
                     frames,
                     node: node.id,
                     inputs_active,
+                    connected: node.connected,
                     notices,
                 };
                 node.processor.write(&mut scope, &node.input_buses, &params);
@@ -516,6 +534,7 @@ impl Graph {
                     frames,
                     node: node.id,
                     inputs_active,
+                    connected: node.connected,
                     notices,
                 };
                 if let Step::Read(_) = step {

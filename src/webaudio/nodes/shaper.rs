@@ -201,6 +201,7 @@ mod tests {
             frames: 128,
             node: 1,
             inputs_active: true,
+            connected: true,
             notices: &mut notices,
         };
         let mut input = Bus::new(1, 128);

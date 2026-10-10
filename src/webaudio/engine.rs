@@ -55,6 +55,13 @@ pub enum Notice {
     Rendered(Arc<AudioData>),
     /// A startRendering() buffer could not be allocated.
     RenderFailed,
+    /// A ScriptProcessorNode collected a buffer of input
+    /// (#AudioProcessingEvent).
+    ScriptProcess {
+        node: u32,
+        playback_time: f64,
+        input: Arc<AudioData>,
+    },
     /// A decodeAudioData() job finished (`None`: the bytes could not be
     /// decoded).
     Decoded {
@@ -475,7 +482,9 @@ fn run_offline(shared: &Arc<Shared>, mut graph: Graph, channels: usize, notify: 
                 }
                 break;
             }
-            if shared.pending() || notices.len() >= 64 {
+            // Script answers (a ScriptProcessorNode's events) must reach
+            // the control thread before rendering waits for them.
+            if shared.pending() || !notices.is_empty() {
                 break;
             }
         }

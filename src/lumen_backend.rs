@@ -35628,6 +35628,71 @@ mod tests {
     }
 
     #[test]
+    fn script_processors_process_buffers_in_both_kinds_of_context() {
+        // Web Audio 1.1 (local WebAudio/web-audio-api@2047f16)
+        // #ScriptProcessorNode and #AudioProcessingEvent: input arrives in
+        // bufferSize chunks and the filled outputBuffer plays two buffers
+        // later; an OfflineAudioContext waits for each answer. Events go out
+        // only while the node is connected.
+        let probe = r#"
+            (async () => {
+                const context = new OfflineAudioContext(1, 2048, 8000);
+                const source = new ConstantSourceNode(context, {offset: 0.5});
+                const processor = context.createScriptProcessor(256, 1, 1);
+                const idle = context.createScriptProcessor(256, 1, 1);
+                const events = [];
+                let idleEvents = 0;
+                idle.onaudioprocess = () => idleEvents++;
+                processor.onaudioprocess = event => {
+                    check(event instanceof AudioProcessingEvent && event.isTrusted &&
+                        event.inputBuffer.length === 256 && event.outputBuffer.numberOfChannels === 1, 'event shape');
+                    events.push(event.playbackTime * 8000);
+                    const input = event.inputBuffer.getChannelData(0), output = event.outputBuffer.getChannelData(0);
+                    for (let i = 0; i < input.length; i++) output[i] = input[i] * 2;
+                };
+                source.connect(processor).connect(context.destination);
+                source.start();
+                const rendered = (await context.startRendering()).getChannelData(0);
+                check(rendered[511] === 0 && rendered[512] === 1 && rendered[2047] === 1, 'double-buffered output: ' +
+                    [rendered[511], rendered[512], rendered[2047]]);
+                check(events.slice(0, 3).join() === '512,768,1024' && idleEvents === 0, 'events: ' + events + ' / ' + idleEvents);
+                throws(() => new AudioProcessingEvent('audioprocess', {}));
+                // A running AudioContext dispatches while connected.
+                __trust.key(document.body.__id, 'a', 'KeyA', false, false, false, false, false, false);
+                const live = new AudioContext();
+                const node = live.createScriptProcessor(1024, 0, 1);
+                let live_events = 0;
+                node.onaudioprocess = event => {
+                    live_events++;
+                    event.outputBuffer.getChannelData(0).fill(0.25);
+                };
+                node.connect(live.destination);
+                await new Promise(resolve => { const poll = () => live_events >= 3 ? resolve() : setTimeout(poll, 10); poll(); });
+                await live.close();
+                return 'ok';
+            })().then(value => globalThis.scriptProbe = value,
+                error => globalThis.scriptProbe = 'ERROR:' + error.message);
+            function check(ok, message) { if (!ok) throw Error(message); }
+            function throws(fn) { try { fn(); } catch (e) { check(e instanceof TypeError, 'TypeError'); return; } throw Error('no error'); }
+        "#;
+        let (mut engine, mut tasks) = audio_engine();
+        eval(
+            &mut engine,
+            "const root = document.createElement('html'), body = document.createElement('body'); document.append(root); root.append(body);",
+            "document",
+        )
+        .unwrap();
+        eval(&mut engine, probe, "script probe").unwrap();
+        pump_audio_until(
+            &mut engine,
+            &mut tasks,
+            "globalThis.scriptProbe !== undefined",
+            30,
+        );
+        assert_eq!(string_value(&mut engine, "scriptProbe"), "ok");
+    }
+
+    #[test]
     fn audio_context_window_ownership_and_worker_exposure() {
         let mut engine = configured_engine(
             HostState::new(

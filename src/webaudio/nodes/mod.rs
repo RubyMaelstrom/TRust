@@ -21,6 +21,7 @@ mod gain;
 pub mod iir;
 mod media_element;
 mod oscillator;
+pub mod script;
 mod shaper;
 mod stereo_panner;
 
@@ -36,6 +37,7 @@ pub use gain::Gain;
 pub use iir::Iir;
 pub use media_element::MediaElementSource;
 pub use oscillator::Oscillator;
+pub use script::ScriptProcessor;
 pub use shaper::WaveShaper;
 pub use stereo_panner::StereoPanner;
 
@@ -50,6 +52,8 @@ pub struct Scope<'a> {
     pub node: u32,
     /// Whether any node connected to an input is actively processing.
     pub inputs_active: bool,
+    /// Whether anything is connected to the node's inputs or outputs.
+    pub connected: bool,
     pub notices: &'a mut Vec<Notice>,
 }
 

@@ -37,6 +37,18 @@ struct ContextEntry {
     filters: HashMap<u32, Filter>,
     /// AnalyserNodes' shared analysis state.
     analysers: HashMap<u32, nodes::analyser::Shared>,
+    /// ScriptProcessorNodes' answers to their events.
+    scripts: HashMap<u32, nodes::script::Shared>,
+    offline: bool,
+}
+
+impl Drop for ContextEntry {
+    fn drop(&mut self) {
+        // An offline rendering thread may be waiting for script.
+        for script in self.scripts.values() {
+            script.close();
+        }
+    }
 }
 
 /// What getFrequencyResponse() evaluates.
@@ -350,6 +362,12 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
     } else {
         None
     };
+    // A ScriptProcessorNode's filled outputBuffer, acquired by script.
+    let answer = if op == "scriptOutput" {
+        content(host, whole(args, 3))
+    } else {
+        None
+    };
     let Some(entry) = host.contexts.get_mut(&context) else {
         return Ok(Value::Undefined);
     };
@@ -358,7 +376,20 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
     match op {
         "start" => entry.engine.send(Command::Start(whole(args, 2) as u32)),
         "suspend" => entry.engine.send(Command::Suspend(whole(args, 2) as u32)),
-        "close" => entry.engine.send(Command::Close(whole(args, 2) as u32)),
+        "close" => {
+            for script in entry.scripts.values() {
+                script.close();
+            }
+            entry.engine.send(Command::Close(whole(args, 2) as u32))
+        }
+        "scriptOutput" => {
+            // A ScriptProcessorNode's filled outputBuffer.
+            if let (Some(script), Some(data)) =
+                (entry.scripts.get(&(whole(args, 2) as u32)), answer)
+            {
+                script.answer(data);
+            }
+        }
         "render" => entry.engine.send(Command::Render(whole(args, 2) as usize)),
         "suspendAt" => entry.engine.send(Command::SuspendAt(whole(args, 2))),
         "frame" => return Ok(Value::Num(entry.engine.frame() as f64)),
@@ -453,6 +484,17 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
                     Box::new(nodes::Analyser::new(shared))
                 }
                 "convolver" => Box::new(nodes::Convolver::new()),
+                "processor" => {
+                    let shared = nodes::script::Shared::default();
+                    entry.scripts.insert(id, shared.clone());
+                    Box::new(nodes::ScriptProcessor::new(
+                        whole(args, 9) as usize,
+                        channel.count,
+                        whole(args, 10) as usize,
+                        entry.offline,
+                        shared,
+                    ))
+                }
                 "media-element" => match element_tap {
                     Some(tap) => Box::new(nodes::MediaElementSource::new(tap)),
                     None => Box::new(nodes::Silent { channels: 1 }),
@@ -484,6 +526,9 @@ pub(super) fn binding(ctx: &mut Ctx, op: &str, args: &[Value]) -> Result<Value, 
             }
             entry.filters.remove(&node);
             entry.analysers.remove(&node);
+            if let Some(script) = entry.scripts.remove(&node) {
+                script.close();
+            }
             send(entry, GraphMessage::Release(node));
         }
         "connect" | "disconnect" => {
@@ -667,6 +712,8 @@ fn create(ctx: &mut Ctx, realtime: bool, args: &[Value]) -> Value {
             node_values: HashMap::new(),
             filters: HashMap::new(),
             analysers: HashMap::new(),
+            scripts: HashMap::new(),
+            offline: !realtime,
         },
     );
     Value::Num(id as f64)
@@ -897,6 +944,16 @@ pub(super) fn dispatch(engine: &mut lumen::Engine, task: WebAudioTask) -> Result
                     return Ok(());
                 };
                 ("rendered", id, length, channels, 0.0)
+            }
+            Notice::ScriptProcess {
+                node,
+                playback_time,
+                input,
+            } => {
+                let Some((id, _, _)) = store(engine, input) else {
+                    return Ok(());
+                };
+                ("audioprocess", f64::from(node), id, playback_time, 0.0)
             }
             Notice::Decoded { job, data } => match data.and_then(|data| store(engine, data)) {
                 Some((id, length, channels)) => ("decoded", job as f64, id, length, channels),
