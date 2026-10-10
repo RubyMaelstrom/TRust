@@ -1546,6 +1546,17 @@ impl Canvas {
                     let target = (((sy + dy) * self.width as i64 + x + dx) * 4) as usize;
                     let from = &bytes[source..source + columns * 4];
                     let to = &mut bitmap.data_mut()[target..target + columns * 4];
+                    // Opaque rows (video, emulators, games) are a straight copy; a canvas
+                    // without an alpha channel only has to force its alpha bytes.
+                    if opaque_alpha(from) {
+                        to.copy_from_slice(from);
+                        continue;
+                    }
+                    if opaque {
+                        to.copy_from_slice(from);
+                        to.chunks_exact_mut(4).for_each(|pixel| pixel[3] = 255);
+                        continue;
+                    }
                     for (out, pixel) in to.chunks_exact_mut(4).zip(from.chunks_exact(4)) {
                         let alpha = if opaque { 255 } else { u32::from(pixel[3]) };
                         if alpha == 255 {
@@ -1610,13 +1621,38 @@ impl Canvas {
             return None;
         }
         let mut out = vec![0; len];
+        let translucent = self.write_straight_rgba(x, y, width, height, &mut out);
+        Some((out, translucent))
+    }
+
+    /// The whole bitmap as shared straight-alpha RGBA, written once into its final allocation
+    /// (a canvas that changes every frame presents its pixels without an intermediate copy).
+    fn straight_rgba_shared(&self) -> Option<(Arc<[u8]>, bool)> {
+        let len = (self.width as usize)
+            .checked_mul(self.height as usize)?
+            .checked_mul(4)?;
+        if len > MAX_BITMAP_BYTES {
+            return None;
+        }
+        // SAFETY: all-zero bytes are a valid `[u8]`.
+        let mut out: Arc<[u8]> = unsafe { Arc::<[u8]>::new_zeroed_slice(len).assume_init() };
+        let bytes = Arc::get_mut(&mut out).expect("a fresh Arc is unique");
+        let translucent = self.write_straight_rgba(0, 0, self.width, self.height, bytes);
+        Some((out, translucent))
+    }
+
+    /// Writes the straight-alpha RGBA of a rectangle into `out` (zeroed, `width * height * 4`
+    /// bytes: transparent black outside the bitmap) and returns whether any pixel is
+    /// translucent.
+    fn write_straight_rgba(&self, x: i64, y: i64, width: u32, height: u32, out: &mut [u8]) -> bool {
+        let len = out.len();
         let Some(bitmap) = &self.bitmap else {
-            return Some((out, len > 0));
+            return len > 0;
         };
         let (x0, x1) = (x.max(0), (x + width as i64).min(self.width as i64));
         let mut translucent = x1 - x0 < width as i64;
         if x1 <= x0 {
-            return Some((out, len > 0));
+            return len > 0;
         }
         let pixels = bitmap.pixels();
         let (y0, y1) = (y.max(0), (y + height as i64).min(self.height as i64));
@@ -1625,9 +1661,14 @@ impl Canvas {
             let row = (sy * self.width as i64) as usize;
             let source = &pixels[row + x0 as usize..row + x1 as usize];
             let target = (((sy - y) * width as i64 + x0 - x) * 4) as usize;
-            let target = out[target..target + source.len() * 4]
-                .as_chunks_mut::<4>()
-                .0;
+            let target = &mut out[target..target + source.len() * 4];
+            // An opaque row needs no demultiplying: copy its bytes.
+            let source_bytes = &bitmap.data()[(row + x0 as usize) * 4..(row + x1 as usize) * 4];
+            if opaque_alpha(source_bytes) {
+                target.copy_from_slice(source_bytes);
+                continue;
+            }
+            let target = target.as_chunks_mut::<4>().0;
             for (pixel, out) in source.iter().zip(target) {
                 *out = if pixel.alpha() == 255 {
                     [pixel.red(), pixel.green(), pixel.blue(), 255]
@@ -1643,7 +1684,7 @@ impl Canvas {
                 };
             }
         }
-        Some((out, translucent))
+        translucent
     }
 
     pub fn snapshot(&self) -> Option<sk::Pixmap> {
@@ -1825,7 +1866,7 @@ impl Canvas {
             return Some(image.clone());
         }
         self.bitmap.as_ref()?;
-        let (rgba, has_alpha) = self.straight_rgba(0, 0, self.width, self.height)?;
+        let (rgba, has_alpha) = self.straight_rgba_shared()?;
         let image = crate::render::CanvasImage::new(
             self.image_handle,
             self.bitmap_revision,
@@ -1834,7 +1875,7 @@ impl Canvas {
                 width: self.width,
                 height: self.height,
                 has_alpha,
-                rgba: rgba.into(),
+                rgba,
             },
         );
         self.presentation = Some(image.clone());
@@ -1905,6 +1946,14 @@ impl Canvas {
             .and_then(|image| image.data_url())
             .unwrap_or_else(|| "data:,".into())
     }
+}
+
+/// Whether every RGBA8 pixel of `rgba` has alpha 255. A bitwise AND over all of them (no early
+/// exit), which the compiler vectorizes; the answer equals "all alpha bytes are 255".
+fn opaque_alpha(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4)
+        .fold(255u8, |all, pixel| all & pixel[3])
+        == 255
 }
 
 // CSS Color 4 color-conversion algorithm, relative-colorimetric; all four
@@ -2172,6 +2221,54 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The presentation image is the straight-alpha RGBA of the bitmap, whichever of the
+    /// copy (opaque rows) and demultiply (translucent rows) paths each row takes.
+    #[test]
+    fn presentation_image_equals_the_straight_alpha_read_back() {
+        let (width, height) = (33u32, 17u32);
+        let mut bytes = Vec::new();
+        for i in 0..width * height {
+            let row = i / width;
+            // Rows 3 and 9 are translucent, the rest opaque; row 5 mixes both.
+            let alpha = match row {
+                3 | 9 => (i * 37 % 251) as u8,
+                5 if i % 2 == 0 => 128,
+                _ => 255,
+            };
+            bytes.extend_from_slice(&[(i * 7) as u8, (i * 13) as u8, (i * 29) as u8, alpha]);
+        }
+        let mut canvas = Canvas::new(width, height, true).unwrap();
+        canvas.put(
+            &bytes,
+            width,
+            height,
+            &[0., 0., 0., 0., width as f64, height as f64],
+            false,
+            0,
+        );
+        let read = canvas.get(0, 0, width, height).unwrap();
+        let image = canvas.image().unwrap();
+        assert_eq!(&*image.image.rgba, &read[..]);
+        assert!(image.image.has_alpha);
+        // A fully opaque frame presents as opaque pixels and the same bytes.
+        let opaque: Vec<u8> = bytes
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect();
+        let mut canvas = Canvas::new(width, height, true).unwrap();
+        canvas.put(
+            &opaque,
+            width,
+            height,
+            &[0., 0., 0., 0., width as f64, height as f64],
+            false,
+            0,
+        );
+        let image = canvas.image().unwrap();
+        assert_eq!(&*image.image.rgba, &opaque[..]);
+        assert!(!image.image.has_alpha);
     }
 
     #[test]
